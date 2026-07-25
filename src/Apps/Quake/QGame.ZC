@@ -1,0 +1,377 @@
+// QGame.ZC - drives the QuakeC VM: spawning, per-frame thinking, drawing.
+//
+// The map's entity text is the input to the game, not just scenery data. Each
+// block becomes an entity whose fields are filled from the key/value pairs,
+// after which the QuakeC spawn function named by its classname runs. That is
+// what turns "monster_army" from a string into a soldier with a model, a
+// bounding box and a think schedule.
+//
+// Once spawned, entities are advanced by running any think function whose
+// nextthink has come due. That single mechanism is what animates monsters,
+// opens doors and bobs items.
+
+#define QGAME_MAX_EDICTS	600
+#define QGAME_FRAME_TIME	0.1		//QuakeC assumes 10Hz thinking
+#define QGAME_LIGHT			170		//flat shade until models sample lightmaps
+
+//QuakeC value types, as emitted in the def tables.
+#define QTYPE_VOID		0
+#define QTYPE_STRING	1
+#define QTYPE_FLOAT		2
+#define QTYPE_VECTOR	3
+#define QTYPE_ENTITY	4
+#define QTYPE_FIELD		5
+#define QTYPE_FUNCTION	6
+#define QTYPE_POINTER	7
+
+Bool q_game_active	= FALSE;
+F64	 q_game_time	= 0.0;
+I64	 q_game_spawned	= 0;
+I64	 q_game_thinks	= 0;
+
+I64 QGameFindFieldDef(U8 *name, I64 *_type)
+{//Field defs carry the type, which decides how a map value is converted.
+	I64 i;
+
+	for (i = 0; i < q_pr_num_fielddefs; i++)
+	{
+		if (!StrCompare(QPrStr(q_pr_fielddefs[i].name), name))
+		{
+			if (_type)
+				*_type = q_pr_fielddefs[i].type & 0x7FFF;	//high bit is a flag
+			return q_pr_fielddefs[i].ofs;
+		}
+	}
+
+	if (_type)
+		*_type = QTYPE_VOID;
+
+	return -1;
+}
+
+Bool QGameSetField(I64 ent, U8 *key, U8 *value)
+{//Convert one map key/value onto an entity field.
+	I64 ftype;
+	I64 ofs;
+	F64 v[3];
+	I64 fn;
+
+	ofs = QGameFindFieldDef(key, &ftype);
+	if (ofs < 0)
+		return FALSE;
+
+	switch (ftype)
+	{
+		case QTYPE_FLOAT:
+			QPrSetFieldF(ent, ofs, QAtoF(value));
+			break;
+
+		case QTYPE_VECTOR:
+			QParseVec(value, v);
+			QPrSetFieldF(ent, ofs, v[0]);
+			QPrSetFieldF(ent, ofs + 1, v[1]);
+			QPrSetFieldF(ent, ofs + 2, v[2]);
+			break;
+
+		case QTYPE_STRING:
+			//Map strings are not in the compiled blob, so they are copied into
+			//the runtime string heap first.
+			QPrSetFieldI(ent, ofs, QPrNewString(value));
+			break;
+
+		case QTYPE_ENTITY:
+			QPrSetFieldI(ent, ofs, QPrEdictValue(ToI64(QAtoF(value))));
+			break;
+
+		case QTYPE_FUNCTION:
+			fn = QPrFindFunction(value);
+			if (fn < 0)
+				fn = 0;
+			QPrSetFieldI(ent, ofs, fn);
+			break;
+
+		default:
+			return FALSE;
+	}
+
+	return TRUE;
+}
+
+I64 QGameSpawnEntities(CQMap *map)
+{//Walk the entity text, build each entity, then run its spawn function.
+	U8	*p;
+	U8	*end;
+	U8	 key[64];
+	U8	 val[160];
+	U8	 classname[64];
+	I64	 ent;
+	I64	 k;
+	I64	 fn;
+	I64	 spawned = 0;
+	Bool first    = TRUE;
+
+	if (!map->entities || map->entities_size <= 0)
+		return 0;
+
+	p   = map->entities;
+	end = map->entities + map->entities_size;
+
+	while (p < end)
+	{
+		if (*p == '{')
+		{
+			//The first block is worldspawn, which owns entity 0.
+			if (first)
+			{
+				ent   = 0;
+				first = FALSE;
+			}
+			else
+				ent = QPrSpawnEdict;
+
+			classname[0] = 0;
+			p++;
+
+			while (p < end && *p != '}')
+			{
+				while (p < end && *p != '"' && *p != '}')
+					p++;
+				if (p >= end || *p == '}')
+					break;
+
+				p++;
+				k = 0;
+				while (p < end && *p != '"' && k < 63)
+				{
+					key[k] = *p;
+					k++;
+					p++;
+				}
+				key[k] = 0;
+				if (p < end)
+					p++;
+
+				while (p < end && *p != '"' && *p != '}')
+					p++;
+				if (p >= end || *p == '}')
+					break;
+
+				p++;
+				k = 0;
+				while (p < end && *p != '"' && k < 159)
+				{
+					val[k] = *p;
+					k++;
+					p++;
+				}
+				val[k] = 0;
+				if (p < end)
+					p++;
+
+				if (!StrCompare(key, "classname"))
+					StrCopy(classname, val);
+
+				QGameSetField(ent, key, val);
+			}
+
+			if (classname[0])
+			{
+				//The spawn function shares the classname. Anything without one
+				//(lights, path corners) is data only and is simply left alone.
+				fn = QPrFindFunction(classname);
+				if (fn > 0)
+				{
+					QPrSetI(q_ofs_self, QPrEdictValue(ent));
+					QPrSetI(q_ofs_other, 0);
+					QPrExecute(fn);
+					spawned++;
+
+					if (q_pr_error)
+					{
+						"QGame: error spawning %s\n", classname;
+						q_pr_error = FALSE;
+					}
+				}
+			}
+		}
+
+		if (p < end)
+			p++;
+	}
+
+	return spawned;
+}
+
+U0 QGameRunThinks()
+{//Run every think that has come due. Entities can spawn or free others while
+ //this runs, so the bound is re-read each iteration.
+	I64 i;
+	I64 think;
+	F64 nextthink;
+
+	i = 0;
+	while (i < q_pr_num_edicts)
+	{
+		if (!q_pr_edict_free[i])
+		{
+			nextthink = QPrFieldF(i, q_fld_nextthink);
+
+			if (nextthink > 0.0 && nextthink <= q_game_time)
+			{
+				//Clear before calling: the think usually reschedules itself,
+				//and clearing afterwards would discard that.
+				QPrSetFieldF(i, q_fld_nextthink, 0.0);
+
+				think = QPrFieldI(i, q_fld_think);
+				if (think > 0 && think < q_pr_num_functions)
+				{
+					QPrSetI(q_ofs_self, QPrEdictValue(i));
+					QPrSetI(q_ofs_other, 0);
+					QPrExecute(think);
+					q_game_thinks++;
+
+					if (q_pr_error)
+						q_pr_error = FALSE;
+				}
+			}
+		}
+
+		i++;
+	}
+}
+
+U0 QGameFrame(F64 dt)
+{//Advance game time and run one round of thinking.
+	I64 fn;
+
+	if (!q_game_active)
+		return;
+
+	q_game_time += dt;
+
+	QPrSetF(q_ofs_time, q_game_time);
+	QPrSetF(q_ofs_frametime, dt);
+
+	fn = QPrFindFunction("StartFrame");
+	if (fn > 0)
+	{
+		QPrSetI(q_ofs_self, 0);
+		QPrExecute(fn);
+		if (q_pr_error)
+			q_pr_error = FALSE;
+	}
+
+	QGameRunThinks;
+}
+
+Bool QGameInit(CQMap *map)
+{//Load the bytecode, wire the builtins, and populate the world.
+	I64 fn;
+
+	q_game_active  = FALSE;
+	q_game_time    = 1.0;		//QuakeC treats time 0 as "never scheduled"
+	q_game_thinks  = 0;
+	q_game_spawned = 0;
+
+	if (!QPrLoad("progs.dat", QGAME_MAX_EDICTS))
+		return FALSE;
+
+	QPrCacheOffsets;
+	QBiInit;
+	q_bi_map = map;
+
+	//Required symbols. Without these the image is not stock QuakeC and
+	//running it would fault in confusing ways.
+	if (q_ofs_self < 0 || q_ofs_time < 0 || q_fld_nextthink < 0 ||
+		q_fld_think < 0)
+	{
+		"QGame: progs.dat is missing required symbols\n";
+		return FALSE;
+	}
+
+	QPrSetF(q_ofs_time, q_game_time);
+	QPrSetF(q_ofs_frametime, QGAME_FRAME_TIME);
+
+	//main() is a no-op in stock QuakeC but is called for completeness.
+	fn = QPrFindFunction("main");
+	if (fn > 0)
+	{
+		QPrExecute(fn);
+		q_pr_error = FALSE;
+	}
+
+	q_game_spawned = QGameSpawnEntities(map);
+	q_game_active  = TRUE;
+
+	"QGame: %d entities spawned, %d edicts live\n",
+		q_game_spawned, q_pr_num_edicts;
+
+	return TRUE;
+}
+
+U0 QGameShutdown()
+{
+	q_game_active = FALSE;
+	q_bi_map      = NULL;
+	QBiFreePrecache;
+	QPrFree;
+}
+
+U0 QGameDrawEntities(CQCanvas *c, CQMap *map, F64 *view_origin, F64 max_dist)
+{//Draw every live entity that has a model.
+	F64		eorg[3];
+	F64		eang[3];
+	F64		d[3];
+	CQMdl	*mdl;
+	I64		 i;
+	I64		 idx;
+	I64		 frame;
+	I64		 bm;
+	U8		*name;
+
+	for (i = 1; i < q_pr_num_edicts; i++)
+	{
+		if (q_pr_edict_free[i])
+			goto qg_next;
+
+		idx = ToI64(QPrFieldF(i, q_fld_modelindex));
+		if (idx <= 0 || idx >= q_precache_model_count)
+			goto qg_next;
+
+		eorg[0] = QPrFieldF(i, q_fld_origin);
+		eorg[1] = QPrFieldF(i, q_fld_origin + 1);
+		eorg[2] = QPrFieldF(i, q_fld_origin + 2);
+
+		QVecSub(eorg, view_origin, d);
+		if (QVecLength(d) > max_dist)
+			goto qg_next;
+
+		name = q_precache_model[idx];
+
+		//Brush models are part of the map geometry and draw through the face
+		//path; only alias models go through the triangle path.
+		if (name[0] == '*')
+		{
+			bm = ToI64(QAtoF(name + 1));
+			if (bm > 0)
+				QDrawBrushModel(c, map, bm);
+			goto qg_next;
+		}
+
+		mdl = q_precache_mdl[idx];
+		if (!mdl)
+			goto qg_next;
+
+		eang[0] = QPrFieldF(i, q_fld_angles);
+		eang[1] = QPrFieldF(i, q_fld_angles + 1);
+		eang[2] = QPrFieldF(i, q_fld_angles + 2);
+
+		frame = ToI64(QPrFieldF(i, q_fld_frame));
+		if (frame < 0 || frame >= mdl->num_frames)
+			frame = 0;
+
+		QMdlDraw(c, mdl, frame, eorg, eang[1], QGAME_LIGHT);
+
+qg_next:
+	}
+}

@@ -1,0 +1,1082 @@
+// QProgs.ZC - the QuakeC bytecode virtual machine.
+//
+// progs.dat is a compiled bytecode image: a 60-byte header followed by six
+// sections (statements, global defs, field defs, functions, a string blob and
+// the global pool). Validated against the shareware image, where every section
+// ends exactly where the next begins.
+//
+// The global pool is an array of 32-BIT cells and that width is load-bearing:
+// a vector is three consecutive cells, and QuakeC aliases them (writing
+// .origin then reading .origin_x). So the pool is kept as raw 32-bit storage
+// and converted to F64 only for arithmetic. Storing it as F64 would silently
+// break every vector access.
+//
+// Entity fields live in one contiguous block with a fixed stride, because the
+// bytecode addresses them by byte offset from the start of that block.
+
+#define QPR_VERSION		6
+
+//Reserved global slots the calling convention uses. A return value or a
+//parameter is three cells wide so a vector fits without a special case.
+#define QPR_OFS_RETURN	1
+#define QPR_OFS_PARM0	4
+#define QPR_PARM_STRIDE	3
+#define QPR_MAX_PARMS	8
+
+#define QPR_MAX_STACK	64		//call frames
+#define QPR_MAX_LOCALS	2048	//saved local cells across nested calls
+#define QPR_MAX_RUNAWAY	500000	//statements before assuming an infinite loop
+#define QPR_STRING_HEAP	65536	//room to append map strings after the blob
+
+//Opcodes, in the order the compiler emits them.
+#define OP_DONE			0
+#define OP_MUL_F		1
+#define OP_MUL_V		2
+#define OP_MUL_FV		3
+#define OP_MUL_VF		4
+#define OP_DIV_F		5
+#define OP_ADD_F		6
+#define OP_ADD_V		7
+#define OP_SUB_F		8
+#define OP_SUB_V		9
+#define OP_EQ_F			10
+#define OP_EQ_V			11
+#define OP_EQ_S			12
+#define OP_EQ_E			13
+#define OP_EQ_FNC		14
+#define OP_NE_F			15
+#define OP_NE_V			16
+#define OP_NE_S			17
+#define OP_NE_E			18
+#define OP_NE_FNC		19
+#define OP_LE			20
+#define OP_GE			21
+#define OP_LT			22
+#define OP_GT			23
+#define OP_LOAD_F		24
+#define OP_LOAD_V		25
+#define OP_LOAD_S		26
+#define OP_LOAD_ENT		27
+#define OP_LOAD_FLD		28
+#define OP_LOAD_FNC		29
+#define OP_ADDRESS		30
+#define OP_STORE_F		31
+#define OP_STORE_V		32
+#define OP_STORE_S		33
+#define OP_STORE_ENT	34
+#define OP_STORE_FLD	35
+#define OP_STORE_FNC	36
+#define OP_STOREP_F		37
+#define OP_STOREP_V		38
+#define OP_STOREP_S		39
+#define OP_STOREP_ENT	40
+#define OP_STOREP_FLD	41
+#define OP_STOREP_FNC	42
+#define OP_RETURN		43
+#define OP_NOT_F		44
+#define OP_NOT_V		45
+#define OP_NOT_S		46
+#define OP_NOT_ENT		47
+#define OP_NOT_FNC		48
+#define OP_IF			49
+#define OP_IFNOT		50
+#define OP_CALL0		51
+#define OP_CALL8		59
+#define OP_STATE		60
+#define OP_GOTO			61
+#define OP_AND			62
+#define OP_OR			63
+#define OP_BITAND		64
+#define OP_BITOR		65
+
+class CQPrStatement
+{
+	I64	op;
+	I64	a;
+	I64	b;
+	I64	c;
+};
+
+class CQPrDef
+{
+	I64	type;
+	I64	ofs;
+	I64	name;		//offset into the string blob
+};
+
+class CQPrFunction
+{
+	I64	first_statement;	//negative means it is a builtin, index -n
+	I64	parm_start;
+	I64	locals;
+	I64	name;
+	I64	file;
+	I64	num_parms;
+	U8	parm_size[QPR_MAX_PARMS];
+};
+
+class CQPrStack
+{
+	I64	statement;
+	I64	function;
+};
+
+//--- loaded image ---
+U8				*q_pr_raw			= NULL;
+I64				 q_pr_raw_size		= 0;
+CQPrStatement	*q_pr_statements	= NULL;
+I64				 q_pr_num_statements = 0;
+CQPrDef			*q_pr_globaldefs	= NULL;
+I64				 q_pr_num_globaldefs = 0;
+CQPrDef			*q_pr_fielddefs		= NULL;
+I64				 q_pr_num_fielddefs	= 0;
+CQPrFunction	*q_pr_functions		= NULL;
+I64				 q_pr_num_functions	= 0;
+U8				*q_pr_strings		= NULL;	//owned: blob plus a runtime heap
+I64				 q_pr_strings_size	= 0;
+I64				 q_pr_string_alloc	= 0;	//next free byte in the heap
+U32				*q_pr_globals		= NULL;	//raw 32-bit cells
+I64				 q_pr_num_globals	= 0;
+I64				 q_pr_entity_fields	= 0;
+
+//--- entities ---
+U8	*q_pr_edicts		= NULL;		//contiguous field storage
+I64	 q_pr_edict_stride	= 0;		//bytes per entity
+I64	 q_pr_max_edicts	= 0;
+I64	 q_pr_num_edicts	= 0;
+Bool *q_pr_edict_free	= NULL;
+
+//--- execution state ---
+CQPrStack	 q_pr_stack[QPR_MAX_STACK];
+I64			 q_pr_depth			= 0;
+I64			 q_pr_localstack[QPR_MAX_LOCALS];
+I64			 q_pr_localdepth	= 0;
+I64			 q_pr_xfunction		= 0;
+I64			 q_pr_xstatement	= 0;
+Bool		 q_pr_trace			= FALSE;
+Bool		 q_pr_error			= FALSE;
+
+//Builtins live in a later file, so they are reached through a pointer that is
+//installed at init. A direct call would be a forward reference, which this
+//single-pass compiler cannot resolve.
+U0 (*q_pr_builtin_call)(I64 num) = NULL;
+
+//Hot symbol offsets, resolved by name once at load. Looking these up by name
+//rather than assuming a struct layout keeps this working across QuakeC builds.
+I64 q_ofs_self		= -1;
+I64 q_ofs_other		= -1;
+I64 q_ofs_world		= -1;
+I64 q_ofs_time		= -1;
+I64 q_ofs_frametime	= -1;
+I64 q_ofs_v_forward	= -1;
+I64 q_ofs_v_right	= -1;
+I64 q_ofs_v_up		= -1;
+
+I64 q_fld_frame		= -1;
+I64 q_fld_nextthink	= -1;
+I64 q_fld_think		= -1;
+I64 q_fld_origin	= -1;
+I64 q_fld_angles	= -1;
+I64 q_fld_velocity	= -1;
+I64 q_fld_model		= -1;
+I64 q_fld_modelindex = -1;
+I64 q_fld_classname	= -1;
+I64 q_fld_mins		= -1;
+I64 q_fld_maxs		= -1;
+I64 q_fld_size		= -1;
+I64 q_fld_solid		= -1;
+I64 q_fld_movetype	= -1;
+I64 q_fld_flags		= -1;
+I64 q_fld_health	= -1;
+I64 q_fld_yaw_speed	= -1;
+I64 q_fld_ideal_yaw	= -1;
+I64 q_fld_enemy		= -1;
+I64 q_fld_owner		= -1;
+I64 q_fld_goalentity = -1;
+I64 q_fld_takedamage = -1;
+I64 q_fld_effects	= -1;
+I64 q_fld_skin		= -1;
+I64 q_fld_colormap	= -1;
+I64 q_fld_ltime		= -1;
+I64 q_fld_touch		= -1;
+I64 q_fld_use		= -1;
+I64 q_fld_blocked	= -1;
+
+//--- cell access -----------------------------------------------------------
+// Every read converts a 32-bit cell up to F64; every write converts back.
+
+F64 QPrGetF(I64 ofs)
+{
+	U8 tmp[4];
+	U32 v;
+
+	if (ofs < 0 || ofs >= q_pr_num_globals)
+		return 0.0;
+
+	v      = q_pr_globals[ofs];
+	tmp[0] = v & 0xFF;
+	tmp[1] = (v >> 8) & 0xFF;
+	tmp[2] = (v >> 16) & 0xFF;
+	tmp[3] = (v >> 24) & 0xFF;
+
+	return QRdF32(tmp);
+}
+
+U0 QPrSetF(I64 ofs, F64 v)
+{
+	if (ofs < 0 || ofs >= q_pr_num_globals)
+		return;
+
+	q_pr_globals[ofs] = QWrF32(v);
+}
+
+I64 QPrGetI(I64 ofs)
+{//Cells holding entity numbers, string offsets and function indices are read
+ //as integers, not floats.
+	if (ofs < 0 || ofs >= q_pr_num_globals)
+		return 0;
+
+	return q_pr_globals[ofs];
+}
+
+U0 QPrSetI(I64 ofs, I64 v)
+{
+	if (ofs < 0 || ofs >= q_pr_num_globals)
+		return;
+
+	q_pr_globals[ofs] = v & 0xFFFFFFFF;
+}
+
+U0 QPrGetV(I64 ofs, F64 *out)
+{
+	out[0] = QPrGetF(ofs);
+	out[1] = QPrGetF(ofs + 1);
+	out[2] = QPrGetF(ofs + 2);
+}
+
+U0 QPrSetV(I64 ofs, F64 *v)
+{
+	QPrSetF(ofs, v[0]);
+	QPrSetF(ofs + 1, v[1]);
+	QPrSetF(ofs + 2, v[2]);
+}
+
+U8 *QPrStr(I64 ofs)
+{//String values are byte offsets into the blob.
+	if (ofs < 0 || ofs >= q_pr_strings_size)
+		return "";
+
+	return q_pr_strings + ofs;
+}
+
+//--- entity access ---------------------------------------------------------
+// Entity values are byte offsets into the edict block, so entity 0 (the world)
+// is offset 0 and the bytecode's own pointer arithmetic works unchanged.
+
+I64 QPrEdictNum(I64 ent_value)
+{
+	if (q_pr_edict_stride <= 0)
+		return 0;
+
+	return ent_value / q_pr_edict_stride;
+}
+
+I64 QPrEdictValue(I64 num)
+{
+	return num * q_pr_edict_stride;
+}
+
+F64 QPrFieldF(I64 ent_num, I64 field_ofs)
+{
+	U8 *p;
+
+	if (ent_num < 0 || ent_num >= q_pr_max_edicts)
+		return 0.0;
+	if (field_ofs < 0 || field_ofs >= q_pr_entity_fields)
+		return 0.0;
+
+	p = q_pr_edicts + ent_num * q_pr_edict_stride + field_ofs * 4;
+
+	return QRdF32(p);
+}
+
+U0 QPrSetFieldF(I64 ent_num, I64 field_ofs, F64 v)
+{
+	U8	*p;
+	U32	 bits;
+
+	if (ent_num < 0 || ent_num >= q_pr_max_edicts)
+		return;
+	if (field_ofs < 0 || field_ofs >= q_pr_entity_fields)
+		return;
+
+	p    = q_pr_edicts + ent_num * q_pr_edict_stride + field_ofs * 4;
+	bits = QWrF32(v);
+
+	p[0] = bits & 0xFF;
+	p[1] = (bits >> 8) & 0xFF;
+	p[2] = (bits >> 16) & 0xFF;
+	p[3] = (bits >> 24) & 0xFF;
+}
+
+I64 QPrFieldI(I64 ent_num, I64 field_ofs)
+{
+	U8 *p;
+
+	if (ent_num < 0 || ent_num >= q_pr_max_edicts)
+		return 0;
+	if (field_ofs < 0 || field_ofs >= q_pr_entity_fields)
+		return 0;
+
+	p = q_pr_edicts + ent_num * q_pr_edict_stride + field_ofs * 4;
+
+	return QRdU32(p);
+}
+
+U0 QPrSetFieldI(I64 ent_num, I64 field_ofs, I64 v)
+{
+	U8 *p;
+
+	if (ent_num < 0 || ent_num >= q_pr_max_edicts)
+		return;
+	if (field_ofs < 0 || field_ofs >= q_pr_entity_fields)
+		return;
+
+	p    = q_pr_edicts + ent_num * q_pr_edict_stride + field_ofs * 4;
+	p[0] = v & 0xFF;
+	p[1] = (v >> 8) & 0xFF;
+	p[2] = (v >> 16) & 0xFF;
+	p[3] = (v >> 24) & 0xFF;
+}
+
+//Raw byte-offset access, used by the pointer opcodes.
+F64 QPrPtrGetF(I64 byte_ofs)
+{
+	if (byte_ofs < 0 || byte_ofs + 4 > q_pr_max_edicts * q_pr_edict_stride)
+		return 0.0;
+
+	return QRdF32(q_pr_edicts + byte_ofs);
+}
+
+U0 QPrPtrSetI(I64 byte_ofs, I64 v)
+{
+	U8 *p;
+
+	if (byte_ofs < 0 || byte_ofs + 4 > q_pr_max_edicts * q_pr_edict_stride)
+		return;
+
+	p    = q_pr_edicts + byte_ofs;
+	p[0] = v & 0xFF;
+	p[1] = (v >> 8) & 0xFF;
+	p[2] = (v >> 16) & 0xFF;
+	p[3] = (v >> 24) & 0xFF;
+}
+
+I64 QPrPtrGetI(I64 byte_ofs)
+{
+	if (byte_ofs < 0 || byte_ofs + 4 > q_pr_max_edicts * q_pr_edict_stride)
+		return 0;
+
+	return QRdU32(q_pr_edicts + byte_ofs);
+}
+
+U0 QPrPtrSetF(I64 byte_ofs, F64 v)
+{
+	QPrPtrSetI(byte_ofs, QWrF32(v));
+}
+
+//--- symbol lookup ---------------------------------------------------------
+// Looked up by name rather than by hardcoded offset: the layout of the global
+// struct is a compiler detail and differs between QuakeC builds.
+
+I64 QPrFindGlobal(U8 *name)
+{
+	I64 i;
+
+	for (i = 0; i < q_pr_num_globaldefs; i++)
+	{
+		if (!StrCompare(QPrStr(q_pr_globaldefs[i].name), name))
+			return q_pr_globaldefs[i].ofs;
+	}
+
+	return -1;
+}
+
+I64 QPrFindField(U8 *name)
+{
+	I64 i;
+
+	for (i = 0; i < q_pr_num_fielddefs; i++)
+	{
+		if (!StrCompare(QPrStr(q_pr_fielddefs[i].name), name))
+			return q_pr_fielddefs[i].ofs;
+	}
+
+	return -1;
+}
+
+I64 QPrFindFunction(U8 *name)
+{
+	I64 i;
+
+	for (i = 0; i < q_pr_num_functions; i++)
+	{
+		if (!StrCompare(QPrStr(q_pr_functions[i].name), name))
+			return i;
+	}
+
+	return -1;
+}
+
+//--- loading ---------------------------------------------------------------
+
+U0 QPrFree()
+{
+	if (q_pr_statements)	Free(q_pr_statements);
+	if (q_pr_globaldefs)	Free(q_pr_globaldefs);
+	if (q_pr_fielddefs)		Free(q_pr_fielddefs);
+	if (q_pr_functions)		Free(q_pr_functions);
+	if (q_pr_globals)		Free(q_pr_globals);
+	if (q_pr_strings)		Free(q_pr_strings);
+	if (q_pr_edicts)		Free(q_pr_edicts);
+	if (q_pr_edict_free)	Free(q_pr_edict_free);
+	if (q_pr_raw)			Free(q_pr_raw);
+
+	q_pr_statements		= NULL;
+	q_pr_globaldefs		= NULL;
+	q_pr_fielddefs		= NULL;
+	q_pr_functions		= NULL;
+	q_pr_globals		= NULL;
+	q_pr_strings		= NULL;
+	q_pr_string_alloc	= 0;
+	q_pr_edicts			= NULL;
+	q_pr_edict_free		= NULL;
+	q_pr_raw			= NULL;
+	q_pr_num_edicts		= 0;
+	q_pr_depth			= 0;
+	q_pr_localdepth		= 0;
+	q_pr_error			= FALSE;
+}
+
+Bool QPrLoad(U8 *name, I64 max_edicts)
+{
+	U8	*d;
+	U8	*rec;
+	I64	 size = 0;
+	I64	 ofs_statements;
+	I64	 ofs_globaldefs;
+	I64	 ofs_fielddefs;
+	I64	 ofs_functions;
+	I64	 ofs_strings;
+	I64	 ofs_globals;
+	I64	 i;
+	I64	 j;
+
+	QPrFree;
+
+	d = QPakLoad(name, &size);
+	if (!d)
+	{
+		"QProgs: %s not found\n", name;
+		return FALSE;
+	}
+
+	if (size < 60 || QRdI32(d) != QPR_VERSION)
+	{
+		"QProgs: %s is not a version %d image\n", name, QPR_VERSION;
+		Free(d);
+		return FALSE;
+	}
+
+	q_pr_raw      = d;
+	q_pr_raw_size = size;
+
+	ofs_statements       = QRdI32(d + 8);
+	q_pr_num_statements  = QRdI32(d + 12);
+	ofs_globaldefs       = QRdI32(d + 16);
+	q_pr_num_globaldefs  = QRdI32(d + 20);
+	ofs_fielddefs        = QRdI32(d + 24);
+	q_pr_num_fielddefs   = QRdI32(d + 28);
+	ofs_functions        = QRdI32(d + 32);
+	q_pr_num_functions   = QRdI32(d + 36);
+	ofs_strings          = QRdI32(d + 40);
+	q_pr_strings_size    = QRdI32(d + 44);
+	ofs_globals          = QRdI32(d + 48);
+	q_pr_num_globals     = QRdI32(d + 52);
+	q_pr_entity_fields   = QRdI32(d + 56);
+
+	//--- statements: op, then three signed operands ---
+	q_pr_statements = CAlloc(q_pr_num_statements * sizeof(CQPrStatement));
+	for (i = 0; i < q_pr_num_statements; i++)
+	{
+		rec = d + ofs_statements + i * 8;
+		q_pr_statements[i].op = QRdU16(rec);
+
+		//Signed: jump operands are relative and go backwards for loops.
+		q_pr_statements[i].a = QRdI16(rec + 2);
+		q_pr_statements[i].b = QRdI16(rec + 4);
+		q_pr_statements[i].c = QRdI16(rec + 6);
+	}
+
+	//--- defs ---
+	q_pr_globaldefs = CAlloc(q_pr_num_globaldefs * sizeof(CQPrDef));
+	for (i = 0; i < q_pr_num_globaldefs; i++)
+	{
+		rec = d + ofs_globaldefs + i * 8;
+		q_pr_globaldefs[i].type = QRdU16(rec);
+		q_pr_globaldefs[i].ofs  = QRdU16(rec + 2);
+		q_pr_globaldefs[i].name = QRdI32(rec + 4);
+	}
+
+	q_pr_fielddefs = CAlloc(q_pr_num_fielddefs * sizeof(CQPrDef));
+	for (i = 0; i < q_pr_num_fielddefs; i++)
+	{
+		rec = d + ofs_fielddefs + i * 8;
+		q_pr_fielddefs[i].type = QRdU16(rec);
+		q_pr_fielddefs[i].ofs  = QRdU16(rec + 2);
+		q_pr_fielddefs[i].name = QRdI32(rec + 4);
+	}
+
+	//--- functions ---
+	q_pr_functions = CAlloc(q_pr_num_functions * sizeof(CQPrFunction));
+	for (i = 0; i < q_pr_num_functions; i++)
+	{
+		rec = d + ofs_functions + i * 36;
+		q_pr_functions[i].first_statement = QRdI32(rec);
+		q_pr_functions[i].parm_start      = QRdI32(rec + 4);
+		q_pr_functions[i].locals          = QRdI32(rec + 8);
+		//rec + 12 is a profile counter, unused here.
+		q_pr_functions[i].name            = QRdI32(rec + 16);
+		q_pr_functions[i].file            = QRdI32(rec + 20);
+		q_pr_functions[i].num_parms       = QRdI32(rec + 24);
+		for (j = 0; j < QPR_MAX_PARMS; j++)
+			q_pr_functions[i].parm_size[j] = rec[28 + j];
+	}
+
+	//--- strings ---
+	//The blob is copied into a larger owned buffer so map entity values
+	//(classnames, targets) can be appended at runtime. QuakeC string values
+	//are offsets into this space, so anything handed to the VM must live here.
+	q_pr_strings_size = q_pr_strings_size + QPR_STRING_HEAP;
+	q_pr_strings      = CAlloc(q_pr_strings_size);
+	MemCopy(q_pr_strings, d + ofs_strings, QRdI32(d + 44));
+	q_pr_string_alloc = QRdI32(d + 44);
+
+	q_pr_globals = CAlloc(q_pr_num_globals * 4);
+	for (i = 0; i < q_pr_num_globals; i++)
+		q_pr_globals[i] = QRdU32(d + ofs_globals + i * 4);
+
+	//--- entities ---
+	q_pr_edict_stride = q_pr_entity_fields * 4;
+	q_pr_max_edicts   = max_edicts;
+	q_pr_edicts       = CAlloc(q_pr_max_edicts * q_pr_edict_stride);
+	q_pr_edict_free   = CAlloc(q_pr_max_edicts * sizeof(Bool));
+	q_pr_num_edicts   = 1;		//entity 0 is always the world
+
+	for (i = 0; i < q_pr_max_edicts; i++)
+		q_pr_edict_free[i] = TRUE;
+	q_pr_edict_free[0] = FALSE;
+
+	return TRUE;
+}
+
+//--- execution -------------------------------------------------------------
+
+U0 QPrEnterFunction(I64 fnum)
+{//Push the caller, save the callee's locals, then copy the arguments in.
+	CQPrFunction	*f = &q_pr_functions[fnum];
+	I64				 i;
+	I64				 j;
+	I64				 o;
+	I64				 c;
+
+	if (q_pr_depth >= QPR_MAX_STACK)
+	{
+		"QProgs: call stack overflow\n";
+		q_pr_error = TRUE;
+		return;
+	}
+
+	q_pr_stack[q_pr_depth].statement = q_pr_xstatement;
+	q_pr_stack[q_pr_depth].function  = q_pr_xfunction;
+	q_pr_depth++;
+
+	//QuakeC locals are statically allocated, so recursion works only if the
+	//previous occupant of those cells is saved and restored.
+	c = f->locals;
+	if (q_pr_localdepth + c > QPR_MAX_LOCALS)
+	{
+		"QProgs: local stack overflow\n";
+		q_pr_error = TRUE;
+		return;
+	}
+
+	for (i = 0; i < c; i++)
+	{
+		q_pr_localstack[q_pr_localdepth] = QPrGetI(f->parm_start + i);
+		q_pr_localdepth++;
+	}
+
+	//Arguments arrive in the reserved parameter cells.
+	o = f->parm_start;
+	for (i = 0; i < f->num_parms; i++)
+	{
+		for (j = 0; j < f->parm_size[i]; j++)
+		{
+			QPrSetI(o, QPrGetI(QPR_OFS_PARM0 + i * QPR_PARM_STRIDE + j));
+			o++;
+		}
+	}
+
+	q_pr_xfunction  = fnum;
+	q_pr_xstatement = f->first_statement - 1;	//the loop pre-increments
+}
+
+U0 QPrLeaveFunction()
+{
+	CQPrFunction	*f;
+	I64				 i;
+	I64				 c;
+
+	if (q_pr_depth <= 0)
+	{
+		"QProgs: call stack underflow\n";
+		q_pr_error = TRUE;
+		return;
+	}
+
+	f = &q_pr_functions[q_pr_xfunction];
+	c = f->locals;
+
+	//Restore in reverse: the save loop pushed them forwards.
+	for (i = c - 1; i >= 0; i--)
+	{
+		q_pr_localdepth--;
+		QPrSetI(f->parm_start + i, q_pr_localstack[q_pr_localdepth]);
+	}
+
+	q_pr_depth--;
+	q_pr_xfunction  = q_pr_stack[q_pr_depth].function;
+	q_pr_xstatement = q_pr_stack[q_pr_depth].statement;
+}
+
+U0 QPrExecute(I64 fnum)
+{//Run a QuakeC function to completion.
+	CQPrStatement	*st;
+	CQPrFunction	*newf;
+	F64				 va[3];
+	F64				 vb[3];
+	F64				 vc[3];
+	F64				 fa;
+	F64				 fb;
+	I64				 exit_depth;
+	I64				 runaway = 0;
+	I64				 op;
+	I64				 i;
+	I64				 ptr;
+	I64				 ent;
+	I64				 fld;
+	I64				 newfnum;
+
+	if (fnum <= 0 || fnum >= q_pr_num_functions)
+		return;
+
+	q_pr_error = FALSE;
+	exit_depth = q_pr_depth;
+
+	QPrEnterFunction(fnum);
+
+	while (TRUE)
+	{
+		runaway++;
+		if (runaway > QPR_MAX_RUNAWAY)
+		{
+			"QProgs: runaway loop in %s\n",
+				QPrStr(q_pr_functions[q_pr_xfunction].name);
+			q_pr_error = TRUE;
+			return;
+		}
+
+		if (q_pr_error)
+			return;
+
+		q_pr_xstatement++;
+		if (q_pr_xstatement < 0 || q_pr_xstatement >= q_pr_num_statements)
+		{
+			"QProgs: statement out of range\n";
+			q_pr_error = TRUE;
+			return;
+		}
+
+		st = &q_pr_statements[q_pr_xstatement];
+		op = st->op;
+
+		switch (op)
+		{
+			case OP_DONE:
+			case OP_RETURN:
+				//A bare DONE returns nothing; the operand cells are safe to
+				//copy regardless because they are always in range.
+				QPrSetI(QPR_OFS_RETURN, QPrGetI(st->a));
+				QPrSetI(QPR_OFS_RETURN + 1, QPrGetI(st->a + 1));
+				QPrSetI(QPR_OFS_RETURN + 2, QPrGetI(st->a + 2));
+
+				QPrLeaveFunction;
+				if (q_pr_depth == exit_depth)
+					return;
+				break;
+
+			//--- arithmetic ---
+			case OP_MUL_F:
+				QPrSetF(st->c, QPrGetF(st->a) * QPrGetF(st->b));
+				break;
+			case OP_MUL_V:
+				QPrGetV(st->a, va);
+				QPrGetV(st->b, vb);
+				QPrSetF(st->c, va[0] * vb[0] + va[1] * vb[1] + va[2] * vb[2]);
+				break;
+			case OP_MUL_FV:
+				fa = QPrGetF(st->a);
+				QPrGetV(st->b, vb);
+				QVecScale(vb, fa, vc);
+				QPrSetV(st->c, vc);
+				break;
+			case OP_MUL_VF:
+				QPrGetV(st->a, va);
+				fb = QPrGetF(st->b);
+				QVecScale(va, fb, vc);
+				QPrSetV(st->c, vc);
+				break;
+			case OP_DIV_F:
+				fb = QPrGetF(st->b);
+				if (fb == 0.0)
+					QPrSetF(st->c, 0.0);
+				else
+					QPrSetF(st->c, QPrGetF(st->a) / fb);
+				break;
+			case OP_ADD_F:
+				QPrSetF(st->c, QPrGetF(st->a) + QPrGetF(st->b));
+				break;
+			case OP_ADD_V:
+				QPrGetV(st->a, va);
+				QPrGetV(st->b, vb);
+				QVecAdd(va, vb, vc);
+				QPrSetV(st->c, vc);
+				break;
+			case OP_SUB_F:
+				QPrSetF(st->c, QPrGetF(st->a) - QPrGetF(st->b));
+				break;
+			case OP_SUB_V:
+				QPrGetV(st->a, va);
+				QPrGetV(st->b, vb);
+				QVecSub(va, vb, vc);
+				QPrSetV(st->c, vc);
+				break;
+
+			//--- comparison ---
+			case OP_EQ_F:
+				QPrSetF(st->c, ToF64(QPrGetF(st->a) == QPrGetF(st->b)));
+				break;
+			case OP_EQ_V:
+				QPrGetV(st->a, va);
+				QPrGetV(st->b, vb);
+				QPrSetF(st->c, ToF64(va[0] == vb[0] && va[1] == vb[1] &&
+					va[2] == vb[2]));
+				break;
+			case OP_EQ_S:
+				QPrSetF(st->c, ToF64(!StrCompare(QPrStr(QPrGetI(st->a)),
+					QPrStr(QPrGetI(st->b)))));
+				break;
+			case OP_EQ_E:
+			case OP_EQ_FNC:
+				QPrSetF(st->c, ToF64(QPrGetI(st->a) == QPrGetI(st->b)));
+				break;
+			case OP_NE_F:
+				QPrSetF(st->c, ToF64(QPrGetF(st->a) != QPrGetF(st->b)));
+				break;
+			case OP_NE_V:
+				QPrGetV(st->a, va);
+				QPrGetV(st->b, vb);
+				QPrSetF(st->c, ToF64(va[0] != vb[0] || va[1] != vb[1] ||
+					va[2] != vb[2]));
+				break;
+			case OP_NE_S:
+				QPrSetF(st->c, ToF64(ToBool(StrCompare(QPrStr(QPrGetI(st->a)),
+					QPrStr(QPrGetI(st->b))))));
+				break;
+			case OP_NE_E:
+			case OP_NE_FNC:
+				QPrSetF(st->c, ToF64(QPrGetI(st->a) != QPrGetI(st->b)));
+				break;
+			case OP_LE:
+				QPrSetF(st->c, ToF64(QPrGetF(st->a) <= QPrGetF(st->b)));
+				break;
+			case OP_GE:
+				QPrSetF(st->c, ToF64(QPrGetF(st->a) >= QPrGetF(st->b)));
+				break;
+			case OP_LT:
+				QPrSetF(st->c, ToF64(QPrGetF(st->a) < QPrGetF(st->b)));
+				break;
+			case OP_GT:
+				QPrSetF(st->c, ToF64(QPrGetF(st->a) > QPrGetF(st->b)));
+				break;
+
+			//--- field loads: a is the entity, b the field index ---
+			case OP_LOAD_F:
+			case OP_LOAD_S:
+			case OP_LOAD_ENT:
+			case OP_LOAD_FLD:
+			case OP_LOAD_FNC:
+				ent = QPrEdictNum(QPrGetI(st->a));
+				fld = QPrGetI(st->b);
+				QPrSetI(st->c, QPrFieldI(ent, fld));
+				break;
+			case OP_LOAD_V:
+				ent = QPrEdictNum(QPrGetI(st->a));
+				fld = QPrGetI(st->b);
+				QPrSetI(st->c, QPrFieldI(ent, fld));
+				QPrSetI(st->c + 1, QPrFieldI(ent, fld + 1));
+				QPrSetI(st->c + 2, QPrFieldI(ent, fld + 2));
+				break;
+
+			case OP_ADDRESS:
+				//Produces a byte offset into the edict block.
+				ent = QPrEdictNum(QPrGetI(st->a));
+				fld = QPrGetI(st->b);
+				QPrSetI(st->c, ent * q_pr_edict_stride + fld * 4);
+				break;
+
+			//--- global stores ---
+			case OP_STORE_F:
+			case OP_STORE_S:
+			case OP_STORE_ENT:
+			case OP_STORE_FLD:
+			case OP_STORE_FNC:
+				QPrSetI(st->b, QPrGetI(st->a));
+				break;
+			case OP_STORE_V:
+				QPrSetI(st->b, QPrGetI(st->a));
+				QPrSetI(st->b + 1, QPrGetI(st->a + 1));
+				QPrSetI(st->b + 2, QPrGetI(st->a + 2));
+				break;
+
+			//--- pointer stores ---
+			case OP_STOREP_F:
+			case OP_STOREP_S:
+			case OP_STOREP_ENT:
+			case OP_STOREP_FLD:
+			case OP_STOREP_FNC:
+				ptr = QPrGetI(st->b);
+				QPrPtrSetI(ptr, QPrGetI(st->a));
+				break;
+			case OP_STOREP_V:
+				ptr = QPrGetI(st->b);
+				QPrPtrSetI(ptr, QPrGetI(st->a));
+				QPrPtrSetI(ptr + 4, QPrGetI(st->a + 1));
+				QPrPtrSetI(ptr + 8, QPrGetI(st->a + 2));
+				break;
+
+			//--- logic ---
+			case OP_NOT_F:
+			case OP_NOT_FNC:
+				QPrSetF(st->c, ToF64(!QPrGetF(st->a)));
+				break;
+			case OP_NOT_V:
+				QPrGetV(st->a, va);
+				QPrSetF(st->c, ToF64(va[0] == 0.0 && va[1] == 0.0 &&
+					va[2] == 0.0));
+				break;
+			case OP_NOT_S:
+				i = QPrGetI(st->a);
+				QPrSetF(st->c, ToF64(!i || !QPrStr(i)[0]));
+				break;
+			case OP_NOT_ENT:
+				//Only the world counts as "no entity".
+				QPrSetF(st->c, ToF64(QPrEdictNum(QPrGetI(st->a)) == 0));
+				break;
+			case OP_AND:
+				QPrSetF(st->c, ToF64(ToBool(QPrGetF(st->a)) &&
+					ToBool(QPrGetF(st->b))));
+				break;
+			case OP_OR:
+				QPrSetF(st->c, ToF64(ToBool(QPrGetF(st->a)) ||
+					ToBool(QPrGetF(st->b))));
+				break;
+			case OP_BITAND:
+				QPrSetF(st->c, ToF64(ToI64(QPrGetF(st->a)) &
+					ToI64(QPrGetF(st->b))));
+				break;
+			case OP_BITOR:
+				QPrSetF(st->c, ToF64(ToI64(QPrGetF(st->a)) |
+					ToI64(QPrGetF(st->b))));
+				break;
+
+			//--- flow. Jumps are relative and the loop pre-increments. ---
+			case OP_IF:
+				if (QPrGetF(st->a) != 0.0)
+					q_pr_xstatement += st->b - 1;
+				break;
+			case OP_IFNOT:
+				if (QPrGetF(st->a) == 0.0)
+					q_pr_xstatement += st->b - 1;
+				break;
+			case OP_GOTO:
+				q_pr_xstatement += st->a - 1;
+				break;
+
+			case OP_STATE:
+				//Animation step: show frame a now, and run think b one tenth
+				//of a second from now. This is what drives every monster and
+				//door animation, so it must be exact.
+				ent = QPrEdictNum(QPrGetI(q_ofs_self));
+				QPrSetFieldF(ent, q_fld_frame, QPrGetF(st->a));
+				QPrSetFieldF(ent, q_fld_nextthink, QPrGetF(q_ofs_time) + 0.1);
+				QPrSetFieldI(ent, q_fld_think, QPrGetI(st->b));
+				break;
+
+			default:
+				//--- calls: opcodes CALL0..CALL8 encode the argument count ---
+				if (OP_CALL0 <= op <= OP_CALL8)
+				{
+					newfnum = QPrGetI(st->a);
+					if (newfnum <= 0 || newfnum >= q_pr_num_functions)
+					{
+						"QProgs: call to null function\n";
+						q_pr_error = TRUE;
+						return;
+					}
+
+					newf = &q_pr_functions[newfnum];
+
+					if (newf->first_statement < 0)
+					{
+						//Builtin: the index is the negated first statement.
+						if (q_pr_builtin_call)
+							q_pr_builtin_call(-newf->first_statement);
+					}
+					else
+						QPrEnterFunction(newfnum);
+				}
+				else
+				{
+					"QProgs: unknown opcode %d\n", op;
+					q_pr_error = TRUE;
+					return;
+				}
+				break;
+		}
+	}
+}
+
+I64 QPrNewString(U8 *s)
+{//Append a runtime string to the heap and return its offset. Used for map
+ //entity values, which are not present in the compiled blob.
+	I64 len = StrLen(s);
+	I64 ofs;
+
+	if (q_pr_string_alloc + len + 1 > q_pr_strings_size)
+	{
+		"QProgs: string heap full\n";
+		return 0;
+	}
+
+	ofs = q_pr_string_alloc;
+	MemCopy(q_pr_strings + ofs, s, len);
+	q_pr_strings[ofs + len] = 0;
+	q_pr_string_alloc += len + 1;
+
+	return ofs;
+}
+
+U0 QPrCacheOffsets()
+{//Resolve the hot symbols once. A missing entry stays -1 and every accessor
+ //range-checks, so an unexpected QuakeC build degrades rather than faults.
+	q_ofs_self		= QPrFindGlobal("self");
+	q_ofs_other		= QPrFindGlobal("other");
+	q_ofs_world		= QPrFindGlobal("world");
+	q_ofs_time		= QPrFindGlobal("time");
+	q_ofs_frametime	= QPrFindGlobal("frametime");
+	q_ofs_v_forward	= QPrFindGlobal("v_forward");
+	q_ofs_v_right	= QPrFindGlobal("v_right");
+	q_ofs_v_up		= QPrFindGlobal("v_up");
+
+	q_fld_frame			= QPrFindField("frame");
+	q_fld_nextthink		= QPrFindField("nextthink");
+	q_fld_think			= QPrFindField("think");
+	q_fld_origin		= QPrFindField("origin");
+	q_fld_angles		= QPrFindField("angles");
+	q_fld_velocity		= QPrFindField("velocity");
+	q_fld_model			= QPrFindField("model");
+	q_fld_modelindex	= QPrFindField("modelindex");
+	q_fld_classname		= QPrFindField("classname");
+	q_fld_mins			= QPrFindField("mins");
+	q_fld_maxs			= QPrFindField("maxs");
+	q_fld_size			= QPrFindField("size");
+	q_fld_solid			= QPrFindField("solid");
+	q_fld_movetype		= QPrFindField("movetype");
+	q_fld_flags			= QPrFindField("flags");
+	q_fld_health		= QPrFindField("health");
+	q_fld_yaw_speed		= QPrFindField("yaw_speed");
+	q_fld_ideal_yaw		= QPrFindField("ideal_yaw");
+	q_fld_enemy			= QPrFindField("enemy");
+	q_fld_owner			= QPrFindField("owner");
+	q_fld_goalentity	= QPrFindField("goalentity");
+	q_fld_takedamage	= QPrFindField("takedamage");
+	q_fld_effects		= QPrFindField("effects");
+	q_fld_skin			= QPrFindField("skin");
+	q_fld_colormap		= QPrFindField("colormap");
+	q_fld_ltime			= QPrFindField("ltime");
+	q_fld_touch			= QPrFindField("touch");
+	q_fld_use			= QPrFindField("use");
+	q_fld_blocked		= QPrFindField("blocked");
+}
+
+I64 QPrSpawnEdict()
+{//Reuse a freed slot if there is one, otherwise extend the list.
+	I64 i;
+
+	for (i = 1; i < q_pr_num_edicts; i++)
+	{
+		if (q_pr_edict_free[i])
+		{
+			q_pr_edict_free[i] = FALSE;
+			MemSet(q_pr_edicts + i * q_pr_edict_stride, 0, q_pr_edict_stride);
+			return i;
+		}
+	}
+
+	if (q_pr_num_edicts >= q_pr_max_edicts)
+	{
+		"QProgs: out of edicts\n";
+		return 0;
+	}
+
+	i = q_pr_num_edicts;
+	q_pr_num_edicts++;
+	q_pr_edict_free[i] = FALSE;
+	MemSet(q_pr_edicts + i * q_pr_edict_stride, 0, q_pr_edict_stride);
+
+	return i;
+}
+
+U0 QPrFreeEdict(I64 num)
+{
+	if (num <= 0 || num >= q_pr_max_edicts)
+		return;
+
+	MemSet(q_pr_edicts + num * q_pr_edict_stride, 0, q_pr_edict_stride);
+	q_pr_edict_free[num] = TRUE;
+}
+
+U0 QPrReport()
+{
+	"  version      %d\n", QPR_VERSION;
+	"  statements   %6d\n", q_pr_num_statements;
+	"  globaldefs   %6d\n", q_pr_num_globaldefs;
+	"  fielddefs    %6d\n", q_pr_num_fielddefs;
+	"  functions    %6d\n", q_pr_num_functions;
+	"  strings      %6d bytes\n", q_pr_strings_size;
+	"  globals      %6d cells\n", q_pr_num_globals;
+	"  entityfields %6d (stride %d bytes)\n", q_pr_entity_fields,
+		q_pr_edict_stride;
+}

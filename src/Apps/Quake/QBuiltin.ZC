@@ -1,0 +1,671 @@
+// QBuiltin.ZC - the engine services QuakeC calls into.
+//
+// A QuakeC function whose first_statement is negative is a builtin: the
+// negated value is its number. The shareware image references 65 of them in
+// the range 1..78.
+//
+// Arguments arrive in the reserved parameter cells and results go in the
+// return cell. Anything not implemented is a deliberate no-op that returns
+// zero rather than an error, so an unimplemented service degrades the game
+// instead of halting the VM mid-frame.
+
+#define QBI_MAX_PRECACHE	256
+
+//Parameter helpers. Each slot is three cells wide so a vector fits.
+#define QBI_ARG(n)			(QPR_OFS_PARM0 + (n) * QPR_PARM_STRIDE)
+
+CQMap	*q_bi_map		= NULL;		//set by the app before the VM runs
+Bool	 q_bi_dprint	= FALSE;	//QuakeC debug output is noisy; off by default
+
+U8		*q_precache_model[QBI_MAX_PRECACHE];
+CQMdl	*q_precache_mdl[QBI_MAX_PRECACHE];
+I64		 q_precache_model_count = 0;
+U8		*q_precache_sound[QBI_MAX_PRECACHE];
+I64		 q_precache_sound_count = 0;
+
+//Trace result globals, resolved by name at init.
+I64 q_ofs_trace_allsolid	= -1;
+I64 q_ofs_trace_startsolid	= -1;
+I64 q_ofs_trace_fraction	= -1;
+I64 q_ofs_trace_endpos		= -1;
+I64 q_ofs_trace_plane_normal = -1;
+I64 q_ofs_trace_plane_dist	= -1;
+I64 q_ofs_trace_ent			= -1;
+I64 q_ofs_trace_inopen		= -1;
+I64 q_ofs_trace_inwater		= -1;
+
+//--- helpers ---------------------------------------------------------------
+
+F64 QBiArgF(I64 n)
+{
+	return QPrGetF(QBI_ARG(n));
+}
+
+I64 QBiArgI(I64 n)
+{
+	return QPrGetI(QBI_ARG(n));
+}
+
+U0 QBiArgV(I64 n, F64 *out)
+{
+	QPrGetV(QBI_ARG(n), out);
+}
+
+U8 *QBiArgS(I64 n)
+{
+	return QPrStr(QPrGetI(QBI_ARG(n)));
+}
+
+I64 QBiArgEnt(I64 n)
+{
+	return QPrEdictNum(QPrGetI(QBI_ARG(n)));
+}
+
+U0 QBiRetF(F64 v)
+{
+	QPrSetF(QPR_OFS_RETURN, v);
+}
+
+U0 QBiRetV(F64 *v)
+{
+	QPrSetV(QPR_OFS_RETURN, v);
+}
+
+U0 QBiRetEnt(I64 num)
+{
+	QPrSetI(QPR_OFS_RETURN, QPrEdictValue(num));
+}
+
+U0 QBiGetFieldV(I64 ent, I64 fld, F64 *out)
+{
+	out[0] = QPrFieldF(ent, fld);
+	out[1] = QPrFieldF(ent, fld + 1);
+	out[2] = QPrFieldF(ent, fld + 2);
+}
+
+U0 QBiSetFieldV(I64 ent, I64 fld, F64 *v)
+{
+	QPrSetFieldF(ent, fld, v[0]);
+	QPrSetFieldF(ent, fld + 1, v[1]);
+	QPrSetFieldF(ent, fld + 2, v[2]);
+}
+
+I64 QBiPrecacheModel(U8 *name)
+{//Index 0 means "no model", so real entries start at 1.
+	I64 i;
+
+	for (i = 1; i < q_precache_model_count; i++)
+	{
+		if (!StrCompare(q_precache_model[i], name))
+			return i;
+	}
+
+	if (q_precache_model_count >= QBI_MAX_PRECACHE)
+		return 0;
+
+	if (!q_precache_model_count)
+		q_precache_model_count = 1;		//reserve slot 0
+
+	i = q_precache_model_count;
+	q_precache_model_count++;
+
+	q_precache_model[i] = name;
+	q_precache_mdl[i]   = NULL;
+
+	//Brush models ("*N") live in the map; only alias models load here.
+	if (name[0] != '*' && StrLen(name) > 4 &&
+		!StrICompare(name + StrLen(name) - 4, ".mdl"))
+		q_precache_mdl[i] = QMdlLoad(name);
+
+	return i;
+}
+
+U0 QBiFreePrecache()
+{
+	I64 i;
+
+	for (i = 0; i < q_precache_model_count; i++)
+	{
+		if (q_precache_mdl[i])
+		{
+			QMdlFree(q_precache_mdl[i]);
+			q_precache_mdl[i] = NULL;
+		}
+	}
+
+	q_precache_model_count = 0;
+	q_precache_sound_count = 0;
+}
+
+U0 QBiSetMinMaxSize(I64 ent, F64 *mins, F64 *maxs)
+{
+	F64 size[3];
+
+	QBiSetFieldV(ent, q_fld_mins, mins);
+	QBiSetFieldV(ent, q_fld_maxs, maxs);
+	QVecSub(maxs, mins, size);
+	QBiSetFieldV(ent, q_fld_size, size);
+}
+
+U0 QBiStoreTrace(CQTrace *tr, I64 hit_ent)
+{//Publish a trace into the globals QuakeC reads afterwards.
+	QPrSetF(q_ofs_trace_allsolid, ToF64(tr->all_solid));
+	QPrSetF(q_ofs_trace_startsolid, ToF64(tr->start_solid));
+	QPrSetF(q_ofs_trace_fraction, tr->fraction);
+	QPrSetV(q_ofs_trace_endpos, tr->end_pos);
+	QPrSetV(q_ofs_trace_plane_normal, tr->plane_normal);
+	QPrSetF(q_ofs_trace_plane_dist, tr->plane_dist);
+	QPrSetI(q_ofs_trace_ent, QPrEdictValue(hit_ent));
+	QPrSetF(q_ofs_trace_inopen, 0.0);
+	QPrSetF(q_ofs_trace_inwater, 0.0);
+}
+
+//--- individual builtins ---------------------------------------------------
+
+U0 QBiMakeVectors()
+{
+	F64 angles[3];
+	F64 forward[3];
+	F64 right[3];
+	F64 up[3];
+
+	QBiArgV(0, angles);
+	QAngleVectors(angles, forward, right, up);
+
+	QPrSetV(q_ofs_v_forward, forward);
+	QPrSetV(q_ofs_v_right, right);
+	QPrSetV(q_ofs_v_up, up);
+}
+
+U0 QBiSetOrigin()
+{
+	I64 ent = QBiArgEnt(0);
+	F64 org[3];
+
+	QBiArgV(1, org);
+	QBiSetFieldV(ent, q_fld_origin, org);
+}
+
+U0 QBiSetModel()
+{
+	I64 ent  = QBiArgEnt(0);
+	U8 *name = QBiArgS(1);
+	I64 idx  = QBiPrecacheModel(name);
+	I64 bm;
+	F64 mins[3];
+	F64 maxs[3];
+
+	QPrSetFieldI(ent, q_fld_model, QPrGetI(QBI_ARG(1)));
+	QPrSetFieldF(ent, q_fld_modelindex, ToF64(idx));
+
+	//A brush model takes its bounds straight from the BSP.
+	if (name[0] == '*' && q_bi_map)
+	{
+		bm = ToI64(QAtoF(name + 1));
+		if (0 <= bm < q_bi_map->num_models)
+		{
+			QVecCopy(q_bi_map->models[bm].mins, mins);
+			QVecCopy(q_bi_map->models[bm].maxs, maxs);
+			QBiSetMinMaxSize(ent, mins, maxs);
+		}
+	}
+}
+
+U0 QBiSetSize()
+{
+	I64 ent = QBiArgEnt(0);
+	F64 mins[3];
+	F64 maxs[3];
+
+	QBiArgV(1, mins);
+	QBiArgV(2, maxs);
+	QBiSetMinMaxSize(ent, mins, maxs);
+}
+
+U0 QBiTraceLine()
+{
+	CQTrace tr;
+	F64		v1[3];
+	F64		v2[3];
+
+	QBiArgV(0, v1);
+	QBiArgV(1, v2);
+
+	if (!q_bi_map)
+	{
+		//No world to trace against: report a clean miss.
+		tr.all_solid   = FALSE;
+		tr.start_solid = FALSE;
+		tr.fraction    = 1.0;
+		tr.hit         = FALSE;
+		tr.plane_dist  = 0.0;
+		QVecSet(tr.plane_normal, 0.0, 0.0, 0.0);
+		QVecCopy(v2, tr.end_pos);
+	}
+	else
+		QTraceMove(q_bi_map, v1, v2, &tr);
+
+	//Only world geometry is traced for now, so the hit entity is the world.
+	QBiStoreTrace(&tr, 0);
+}
+
+U0 QBiPointContents()
+{
+	F64 p[3];
+	I64 c = QCONTENTS_EMPTY;
+
+	QBiArgV(0, p);
+
+	if (q_bi_map)
+		c = QHullPointContents(q_bi_map, q_bi_map->models[0].head_node[1], p);
+
+	QBiRetF(ToF64(c));
+}
+
+U0 QBiDropToFloor()
+{//Drop the entity up to 256 units and report whether it landed.
+	I64		ent = QPrEdictNum(QPrGetI(q_ofs_self));
+	CQTrace	tr;
+	F64		start[3];
+	F64		end[3];
+
+	QBiGetFieldV(ent, q_fld_origin, start);
+	QVecCopy(start, end);
+	end[2] -= 256.0;
+
+	if (!q_bi_map)
+	{
+		QBiRetF(0.0);
+		return;
+	}
+
+	QTraceMove(q_bi_map, start, end, &tr);
+
+	if (tr.fraction == 1.0 || tr.all_solid)
+		QBiRetF(0.0);
+	else
+	{
+		QBiSetFieldV(ent, q_fld_origin, tr.end_pos);
+		QBiRetF(1.0);
+	}
+}
+
+U0 QBiWalkMove()
+{//Try to step the entity along a yaw for some distance.
+	I64	ent		= QPrEdictNum(QPrGetI(q_ofs_self));
+	F64	yaw		= QBiArgF(0);
+	F64	dist	= QBiArgF(1);
+	F64	origin[3];
+	F64	velocity[3];
+	F64	move[3];
+	F64	rad;
+
+	if (!q_bi_map)
+	{
+		QBiRetF(0.0);
+		return;
+	}
+
+	rad = yaw * QDEG2RAD;
+	QBiGetFieldV(ent, q_fld_origin, origin);
+
+	move[0] = Cos(rad) * dist;
+	move[1] = Sin(rad) * dist;
+	move[2] = 0.0;
+
+	//Reuse the player's step logic so monsters climb the same stairs.
+	QVecSet(velocity, move[0], move[1], 0.0);
+	QStepMove(q_bi_map, origin, velocity, 1.0, TRUE);
+
+	QBiSetFieldV(ent, q_fld_origin, origin);
+	QBiRetF(1.0);
+}
+
+U0 QBiChangeYaw()
+{//Turn toward ideal_yaw at yaw_speed, taking the shorter way around.
+	I64 ent		= QPrEdictNum(QPrGetI(q_ofs_self));
+	F64 current	= QAngleNorm(QPrFieldF(ent, q_fld_angles + 1));
+	F64 ideal	= QPrFieldF(ent, q_fld_ideal_yaw);
+	F64 speed	= QPrFieldF(ent, q_fld_yaw_speed);
+	F64 move;
+
+	if (current == ideal)
+		return;
+
+	move = ideal - current;
+
+	if (ideal > current)
+	{
+		if (move >= 180.0)
+			move -= 360.0;
+	}
+	else
+	{
+		if (move <= -180.0)
+			move += 360.0;
+	}
+
+	if (move > 0.0)
+	{
+		if (move > speed)
+			move = speed;
+	}
+	else
+	{
+		if (move < -speed)
+			move = -speed;
+	}
+
+	QPrSetFieldF(ent, q_fld_angles + 1, QAngleNorm(current + move));
+}
+
+U0 QBiFind()
+{//Linear scan from a start entity for a string field match.
+	I64  start = QBiArgEnt(0);
+	I64  fld   = QPrGetI(QBI_ARG(1));
+	U8  *match = QBiArgS(2);
+	I64  i;
+	U8  *s;
+
+	for (i = start + 1; i < q_pr_num_edicts; i++)
+	{
+		if (!q_pr_edict_free[i])
+		{
+			s = QPrStr(QPrFieldI(i, fld));
+			if (s[0] && !StrCompare(s, match))
+			{
+				QBiRetEnt(i);
+				return;
+			}
+		}
+	}
+
+	QBiRetEnt(0);
+}
+
+U0 QBiFindRadius()
+{
+	F64 org[3];
+	F64 rad = QBiArgF(1);
+	F64 eorg[3];
+	F64 d[3];
+	I64 i;
+
+	QBiArgV(0, org);
+
+	for (i = 1; i < q_pr_num_edicts; i++)
+	{
+		if (!q_pr_edict_free[i])
+		{
+			if (QPrFieldF(i, q_fld_solid) != 0.0)
+			{
+				QBiGetFieldV(i, q_fld_origin, eorg);
+				QVecSub(eorg, org, d);
+				if (QVecLength(d) < rad)
+				{
+					QBiRetEnt(i);
+					return;
+				}
+			}
+		}
+	}
+
+	QBiRetEnt(0);
+}
+
+U0 QBiNextEnt()
+{
+	I64 i = QBiArgEnt(0) + 1;
+
+	while (i < q_pr_num_edicts)
+	{
+		if (!q_pr_edict_free[i])
+		{
+			QBiRetEnt(i);
+			return;
+		}
+		i++;
+	}
+
+	QBiRetEnt(0);
+}
+
+U0 QBiVecToYaw()
+{
+	F64 v[3];
+	F64 yaw;
+
+	QBiArgV(0, v);
+
+	if (v[0] == 0.0 && v[1] == 0.0)
+		yaw = 0.0;
+	else
+	{
+		yaw = Arg(v[0], v[1]) / QDEG2RAD;
+		if (yaw < 0.0)
+			yaw += 360.0;
+	}
+
+	QBiRetF(yaw);
+}
+
+U0 QBiVecToAngles()
+{
+	F64 v[3];
+	F64 out[3];
+	F64 yaw;
+	F64 pitch;
+	F64 fwd;
+
+	QBiArgV(0, v);
+
+	if (v[0] == 0.0 && v[1] == 0.0)
+	{
+		yaw = 0.0;
+		if (v[2] > 0.0)
+			pitch = 90.0;
+		else
+			pitch = 270.0;
+	}
+	else
+	{
+		yaw = Arg(v[0], v[1]) / QDEG2RAD;
+		if (yaw < 0.0)
+			yaw += 360.0;
+
+		fwd   = Sqrt(v[0] * v[0] + v[1] * v[1]);
+		pitch = Arg(fwd, v[2]) / QDEG2RAD;
+		if (pitch < 0.0)
+			pitch += 360.0;
+	}
+
+	//QuakeC's angles put pitch first, and it is inverted relative to atan.
+	out[0] = -pitch;
+	out[1] = yaw;
+	out[2] = 0.0;
+	QBiRetV(out);
+}
+
+U0 QBiFtos()
+{//Number to string. QuakeC string values are byte offsets into the immutable
+ //string blob, so returning a freshly built string needs a scratch-string
+ //allocator that does not exist yet. Returning the empty string is correct
+ //enough: ftos results are only ever printed, and printing is stubbed too.
+	QPrSetI(QPR_OFS_RETURN, 0);
+}
+
+U0 QBiSpawn()
+{
+	QBiRetEnt(QPrSpawnEdict);
+}
+
+U0 QBiRemove()
+{
+	QPrFreeEdict(QBiArgEnt(0));
+}
+
+U0 QBiPrint(I64 first_arg)
+{//bprint/sprint/dprint all funnel here.
+	I64 i;
+
+	if (!q_bi_dprint)
+		return;
+
+	for (i = first_arg; i < QPR_MAX_PARMS; i++)
+	{
+		//Trailing arguments are empty strings, so stop at the first one.
+		if (!QPrGetI(QBI_ARG(i)))
+			break;
+		"%s", QBiArgS(i);
+	}
+}
+
+//--- dispatch --------------------------------------------------------------
+
+U0 QBiDispatch(I64 num)
+{
+	F64 v[3];
+	F64 a[3];
+	F64 len;
+
+	switch (num)
+	{
+		case 1:		QBiMakeVectors;		break;
+		case 2:		QBiSetOrigin;		break;
+		case 3:		QBiSetModel;		break;
+		case 4:		QBiSetSize;			break;
+
+		case 6:		break;				//break: debugger hook, ignored
+
+		case 7:		QBiRetF(ToF64(RandU32 & 0xFFFF) / 65536.0);	break;
+
+		case 8:		break;				//sound: needs the audio mixer
+
+		case 9:
+			QBiArgV(0, v);
+			QVecNormalize(v);
+			QBiRetV(v);
+			break;
+
+		case 10:
+		case 11:
+			"QuakeC error: %s\n", QBiArgS(0);
+			q_pr_error = TRUE;
+			break;
+
+		case 12:
+			QBiArgV(0, v);
+			QBiRetF(QVecLength(v));
+			break;
+
+		case 13:	QBiVecToYaw;		break;
+		case 14:	QBiSpawn;			break;
+		case 15:	QBiRemove;			break;
+		case 16:	QBiTraceLine;		break;
+
+		case 17:	QBiRetEnt(0);		break;	//checkclient: no network clients
+
+		case 18:	QBiFind;			break;
+
+		case 19:	//precache_sound
+		case 76:
+			if (q_precache_sound_count < QBI_MAX_PRECACHE)
+			{
+				q_precache_sound[q_precache_sound_count] = QBiArgS(0);
+				q_precache_sound_count++;
+			}
+			QPrSetI(QPR_OFS_RETURN, QPrGetI(QBI_ARG(0)));
+			break;
+
+		case 20:	//precache_model
+		case 75:
+			QBiPrecacheModel(QBiArgS(0));
+			QPrSetI(QPR_OFS_RETURN, QPrGetI(QBI_ARG(0)));
+			break;
+
+		case 21:	break;				//stuffcmd: no console
+		case 22:	QBiFindRadius;		break;
+		case 23:	QBiPrint(0);		break;	//bprint
+		case 24:	QBiPrint(1);		break;	//sprint, arg 0 is the client
+		case 25:	QBiPrint(0);		break;	//dprint
+		case 26:	QBiFtos;			break;
+
+		case 27:	QPrSetI(QPR_OFS_RETURN, 0);	break;	//vtos
+		case 28:	break;				//coredump
+		case 29:	q_pr_trace = TRUE;	break;
+		case 30:	q_pr_trace = FALSE;	break;
+		case 31:	break;				//eprint
+
+		case 32:	QBiWalkMove;		break;
+		case 34:	QBiDropToFloor;		break;
+		case 35:	break;				//lightstyle: no animated lights yet
+
+		case 36:	QBiRetF(Round(QBiArgF(0)));	break;
+		case 37:	QBiRetF(Floor(QBiArgF(0)));	break;
+		case 38:	QBiRetF(Ceil(QBiArgF(0)));	break;
+
+		case 40:	QBiRetF(1.0);		break;	//checkbottom: assume standable
+		case 41:	QBiPointContents;	break;
+		case 43:	QBiRetF(Abs(QBiArgF(0)));	break;
+
+		case 44:	//aim: fire straight ahead
+			QPrGetV(q_ofs_v_forward, v);
+			QBiRetV(v);
+			break;
+
+		case 45:	QBiRetF(0.0);		break;	//cvar
+		case 46:	break;						//localcmd
+		case 47:	QBiNextEnt;			break;
+		case 48:	break;						//particle
+		case 49:	QBiChangeYaw;		break;
+		case 51:	QBiVecToAngles;		break;
+
+		//Network message writers. Single player with no client/server split
+		//has nowhere to send them.
+		case 52:
+		case 53:
+		case 54:
+		case 55:
+		case 56:
+		case 57:
+		case 58:
+		case 59:
+			break;
+
+		case 67:	//movetogoal: step toward the goal entity
+			QBiWalkMove;
+			break;
+
+		case 68:
+		case 77:
+			QPrSetI(QPR_OFS_RETURN, QPrGetI(QBI_ARG(0)));	break;	//precache_file
+
+		case 69:	break;				//makestatic
+		case 70:	break;				//changelevel
+		case 72:	break;				//cvar_set
+		case 73:	break;				//centerprint
+		case 74:	break;				//ambientsound
+
+		case 78:	break;				//setspawnparms
+
+		default:
+			//Unknown builtins return zero rather than stopping the VM.
+			QPrSetI(QPR_OFS_RETURN, 0);
+			break;
+	}
+}
+
+U0 QBiInit()
+{//Install the dispatcher and resolve the trace globals.
+	q_pr_builtin_call = &QBiDispatch;
+
+	q_ofs_trace_allsolid		= QPrFindGlobal("trace_allsolid");
+	q_ofs_trace_startsolid		= QPrFindGlobal("trace_startsolid");
+	q_ofs_trace_fraction		= QPrFindGlobal("trace_fraction");
+	q_ofs_trace_endpos			= QPrFindGlobal("trace_endpos");
+	q_ofs_trace_plane_normal	= QPrFindGlobal("trace_plane_normal");
+	q_ofs_trace_plane_dist		= QPrFindGlobal("trace_plane_dist");
+	q_ofs_trace_ent				= QPrFindGlobal("trace_ent");
+	q_ofs_trace_inopen			= QPrFindGlobal("trace_inopen");
+	q_ofs_trace_inwater			= QPrFindGlobal("trace_inwater");
+}
