@@ -1,0 +1,338 @@
+// QEnt.ZC - entity lump parsing and static entity spawning.
+//
+// The entity lump is plain text: brace-delimited blocks of quoted key/value
+// pairs. It is a slice of the map buffer and is not guaranteed to be
+// NUL-terminated, so every scan is bounded by an explicit end pointer.
+//
+// Entities fall into two kinds here:
+//
+//   brush entities  carry "model" "*N", an index into the BSP's own model
+//                   list. Doors, platforms and buttons are these, and they
+//                   draw with the ordinary face path.
+//   point entities  carry only an origin. The real engine learns their model
+//                   from QuakeC's precache calls, which do not exist yet, so
+//                   the table below maps the common classnames directly.
+//
+// Everything spawns in its rest pose: no thinking, no movement. That arrives
+// with the QuakeC VM.
+
+#define QENT_MAX	1024
+
+class CQEntity
+{
+	U8		 classname[64];
+	U8		 model_name[64];	//raw "model" value, "*N" for brush models
+	F64		 origin[3];
+	F64		 angles[3];
+	I64		 brush_model;		//BSP model index, or -1
+	CQMdl	*mdl;				//resolved alias model, or NULL
+	I64		 frame;
+};
+
+//Pairs of classname and model path, NUL separated, terminated by an empty
+//entry. A flat string avoids a global struct-array initializer, which this
+//compiler only accepts at file scope and is fussy about.
+U8 *q_ent_models =
+	"item_artifact_invulnerability\0progs/invulner.mdl\0"
+	"item_artifact_super_damage\0progs/quaddama.mdl\0"
+	"item_artifact_envirosuit\0progs/suit.mdl\0"
+	"item_artifact_invisibility\0progs/invisibl.mdl\0"
+	"item_armor1\0progs/armor.mdl\0"
+	"item_armor2\0progs/armor.mdl\0"
+	"item_armorInv\0progs/armor.mdl\0"
+	"weapon_supershotgun\0progs/g_shot.mdl\0"
+	"weapon_nailgun\0progs/g_nail.mdl\0"
+	"weapon_supernailgun\0progs/g_nail2.mdl\0"
+	"weapon_grenadelauncher\0progs/g_rock.mdl\0"
+	"weapon_rocketlauncher\0progs/g_rock2.mdl\0"
+	"weapon_lightning\0progs/g_light.mdl\0"
+	"item_key1\0progs/w_s_key.mdl\0"
+	"item_key2\0progs/w_g_key.mdl\0"
+	"item_backpack\0progs/backpack.mdl\0"
+	"monster_army\0progs/soldier.mdl\0"
+	"monster_dog\0progs/dog.mdl\0"
+	"monster_ogre\0progs/ogre.mdl\0"
+	"monster_knight\0progs/knight.mdl\0"
+	"monster_hell_knight\0progs/hknight.mdl\0"
+	"monster_zombie\0progs/zombie.mdl\0"
+	"monster_wizard\0progs/wizard.mdl\0"
+	"monster_demon1\0progs/demon.mdl\0"
+	"monster_shambler\0progs/shambler.mdl\0"
+	"monster_enforcer\0progs/enforcer.mdl\0"
+	"monster_fish\0progs/fish.mdl\0"
+	"monster_tarbaby\0progs/tarbaby.mdl\0"
+	"monster_boss\0progs/boss.mdl\0"
+	"misc_explobox\0progs/b_explob.bsp\0"
+	"\0";
+
+CQEntity	*q_entities		= NULL;
+I64			 q_num_entities	= 0;
+
+F64 QAtoF(U8 *s)
+{//Small self-contained decimal parser. Map values are simple, and keeping the
+ //conversion local avoids depending on kernel string-to-float behaviour.
+	F64  sign  = 1.0;
+	F64  value = 0.0;
+	F64  scale = 0.1;
+	I64  i     = 0;
+
+	while (s[i] == ' ' || s[i] == '\t')
+		i++;
+
+	if (s[i] == '-')
+	{
+		sign = -1.0;
+		i++;
+	}
+	else if (s[i] == '+')
+		i++;
+
+	while ('0' <= s[i] <= '9')
+	{
+		value = value * 10.0 + ToF64(s[i] - '0');
+		i++;
+	}
+
+	if (s[i] == '.')
+	{
+		i++;
+		while ('0' <= s[i] <= '9')
+		{
+			value += ToF64(s[i] - '0') * scale;
+			scale *= 0.1;
+			i++;
+		}
+	}
+
+	return sign * value;
+}
+
+U0 QParseVec(U8 *s, F64 *out)
+{//"480 -352 88" -> three F64s.
+	U8  tok[64];
+	I64 i = 0;
+	I64 n = 0;
+	I64 k;
+
+	out[0] = 0.0;
+	out[1] = 0.0;
+	out[2] = 0.0;
+
+	while (s[i] && n < 3)
+	{
+		while (s[i] == ' ' || s[i] == '\t')
+			i++;
+
+		k = 0;
+		while (s[i] && s[i] != ' ' && s[i] != '\t' && k < 63)
+		{
+			tok[k] = s[i];
+			k++;
+			i++;
+		}
+		tok[k] = 0;
+
+		if (k > 0)
+		{
+			out[n] = QAtoF(tok);
+			n++;
+		}
+	}
+}
+
+U8 *QEntModelForClass(U8 *classname)
+{//Walk the NUL-separated pair table. Returns NULL when unmapped.
+	U8 *p = q_ent_models;
+
+	while (*p)
+	{
+		if (!StrCompare(p, classname))
+			return p + StrLen(p) + 1;
+
+		p += StrLen(p) + 1;		//skip the classname
+		p += StrLen(p) + 1;		//skip its model
+	}
+
+	return NULL;
+}
+
+U0 QEntFree()
+{
+	I64 i;
+
+	if (!q_entities)
+		return;
+
+	for (i = 0; i < q_num_entities; i++)
+	{
+		if (q_entities[i].mdl)
+		{
+			QMdlFree(q_entities[i].mdl);
+			q_entities[i].mdl = NULL;
+		}
+	}
+
+	Free(q_entities);
+	q_entities     = NULL;
+	q_num_entities = 0;
+}
+
+I64 QEntParse(CQMap *map)
+{//Build the entity list. Returns the count.
+	CQEntity	*e;
+	U8			*p;
+	U8			*end;
+	U8			*model_path;
+	U8			 key[64];
+	U8			 val[160];
+	I64			 k;
+	Bool		 in_block = FALSE;
+
+	QEntFree;
+
+	if (!map->entities || map->entities_size <= 0)
+		return 0;
+
+	q_entities     = CAlloc(QENT_MAX * sizeof(CQEntity));
+	q_num_entities = 0;
+
+	p   = map->entities;
+	end = map->entities + map->entities_size;
+
+	while (p < end && q_num_entities < QENT_MAX)
+	{
+		if (*p == '{')
+		{
+			e = &q_entities[q_num_entities];
+			e->classname[0]  = 0;
+			e->model_name[0] = 0;
+			e->brush_model   = -1;
+			e->mdl           = NULL;
+			e->frame         = 0;
+			QVecSet(e->origin, 0.0, 0.0, 0.0);
+			QVecSet(e->angles, 0.0, 0.0, 0.0);
+			in_block = TRUE;
+			p++;
+
+			while (p < end && *p != '}')
+			{
+				while (p < end && *p != '"' && *p != '}')
+					p++;
+				if (p >= end || *p == '}')
+					break;
+
+				p++;
+				k = 0;
+				while (p < end && *p != '"' && k < 63)
+				{
+					key[k] = *p;
+					k++;
+					p++;
+				}
+				key[k] = 0;
+				if (p < end)
+					p++;
+
+				while (p < end && *p != '"' && *p != '}')
+					p++;
+				if (p >= end || *p == '}')
+					break;
+
+				p++;
+				k = 0;
+				while (p < end && *p != '"' && k < 159)
+				{
+					val[k] = *p;
+					k++;
+					p++;
+				}
+				val[k] = 0;
+				if (p < end)
+					p++;
+
+				if (!StrCompare(key, "classname"))
+					StrCopy(e->classname, val);
+				else if (!StrCompare(key, "model"))
+					StrCopy(e->model_name, val);
+				else if (!StrCompare(key, "origin"))
+					QParseVec(val, e->origin);
+				else if (!StrCompare(key, "angle"))
+					e->angles[1] = QAtoF(val);
+				else if (!StrCompare(key, "angles"))
+					QParseVec(val, e->angles);
+			}
+
+			if (in_block && e->classname[0])
+			{
+				//"*N" refers to a model stored inside this BSP.
+				if (e->model_name[0] == '*')
+					e->brush_model = ToI64(QAtoF(e->model_name + 1));
+
+				q_num_entities++;
+			}
+
+			in_block = FALSE;
+		}
+
+		if (p < end)
+			p++;
+	}
+
+	return q_num_entities;
+}
+
+I64 QEntLoadModels()
+{//Resolve alias models for the point entities. Identical classnames each get
+ //their own copy: simple, and e1m1's 34 soldiers are the worst case at a few
+ //hundred KB. A shared cache is the obvious later win.
+	CQEntity	*e;
+	U8			*path;
+	I64			 i;
+	I64			 loaded = 0;
+
+	for (i = 0; i < q_num_entities; i++)
+	{
+		e = &q_entities[i];
+
+		if (e->brush_model < 0 && !e->mdl)
+		{
+			path = QEntModelForClass(e->classname);
+
+			//Only .mdl is handled here; a few items are brush models stored in
+			//their own .bsp file, which the map loader does not serve.
+			if (path && StrLen(path) > 4 &&
+				!StrICompare(path + StrLen(path) - 4, ".mdl"))
+			{
+				e->mdl = QMdlLoad(path);
+				if (e->mdl)
+					loaded++;
+			}
+		}
+	}
+
+	return loaded;
+}
+
+Bool QEntFindPlayerStart(CQMap *map, F64 *origin, F64 *angles)
+{//Locate the spawn point in the parsed list.
+	I64 i;
+
+	QVecSet(origin, 0.0, 0.0, 0.0);
+	QVecSet(angles, 0.0, 0.0, 0.0);
+
+	for (i = 0; i < q_num_entities; i++)
+	{
+		if (!StrCompare(q_entities[i].classname, "info_player_start"))
+		{
+			//The raw spawn point is the player's ORIGIN. The camera sits above
+			//it by the view height, which the caller adds - keeping the two
+			//separate is what lets physics move the origin while the eye
+			//follows.
+			QVecCopy(q_entities[i].origin, origin);
+			QVecCopy(q_entities[i].angles, angles);
+			return TRUE;
+		}
+	}
+
+	return FALSE;
+}

@@ -1,0 +1,455 @@
+// Quake.ZC - application shell: window, input, frame loop.
+//
+// Rendering happens on this task and the blit happens in the draw_it callback
+// on the window manager task. That callback must never block (it drives the
+// whole compositor), so it only ever copies pixels.
+
+#define QMOVE_SPEED		320.0	//world units per second
+#define QMOVE_FAST		800.0
+#define QMOUSE_SENS		0.12	//degrees per mouse count
+#define QPITCH_LIMIT	89.0
+#define QDEFAULT_MAP	"maps/e1m1.bsp"
+
+//Entities are not in the PVS, so they are range-limited instead. 2000 units
+//covers a large room without submitting the whole level's triangles.
+#define QENT_DRAW_DIST	2000.0
+#define QENT_LIGHT		170		//flat shade until models sample the lightmap
+
+#define QVIEW_HEIGHT	22.0	//eye height above the player origin
+
+CQMap		*q_map		= NULL;
+CQVisState	*q_vis		= NULL;
+CQCanvas	*q_canvas	= NULL;
+
+F64	 q_origin[3];		//player origin, what physics moves
+F64	 q_view[3];			//eye position, origin plus the view height
+F64	 q_velocity[3];
+F64	 q_angles[3];
+Bool q_on_ground	= FALSE;
+Bool q_noclip		= FALSE;
+F64	 q_fov			= 90.0;
+I64	 q_scale		= 2;
+I64	 q_blit_x		= 0;
+I64	 q_blit_y		= 0;
+Bool q_show_stats	= TRUE;
+Bool q_draw_entities = TRUE;
+I64	 q_ent_drawn	= 0;
+Bool q_ready		= FALSE;
+F64	 q_fps			= 0.0;
+I64	 q_frame_count	= 0;
+
+U8 *QMoveModeName()
+{
+	if (q_noclip)
+		return "NOCLIP";
+	if (q_on_ground)
+		return "ground";
+
+	return "air";
+}
+
+U0 QDrawIt(CTask *task, CDC *dc)
+{//Runs on the window manager task: copy only, no work.
+ //Every pointer this touches is cleared before the owning task frees it, so
+ //the guard below is what keeps teardown from pulling memory out from under
+ //an in-flight blit.
+	if (!q_ready || !q_canvas || !q_vis)
+		return;
+
+	QDrawBlit(q_canvas, dc, q_blit_x, q_blit_y, q_scale);
+
+	if (q_show_stats)
+	{
+		dc->color = ColorRGB(255, 255, 0);
+		GrPrint(dc, 8, 8, "%3.0f fps  faces %4d  spans %5d",
+			q_fps, q_canvas->faces_drawn, q_canvas->spans_drawn);
+		GrPrint(dc, 8, 24, "pos %6.0f %6.0f %6.0f  yaw %3.0f  leaf %d  %s",
+			q_origin[0], q_origin[1], q_origin[2], q_angles[1],
+			q_vis->view_leaf, QMoveModeName);
+		GrPrint(dc, 8, 40, "ents %d/%d %s", q_ent_drawn, q_num_entities,
+			"| WASD, space jump, N noclip, T stats, E ents, ESC quit");
+	}
+}
+
+U0 QRenderEntities()
+{//Brush entities first (they are part of the architecture), then the alias
+ //models. Everything is depth tested, so order is a performance detail rather
+ //than a correctness one.
+	CQEntity *e;
+	F64		  dist[3];
+	I64		  i;
+
+	q_ent_drawn = 0;
+
+	//Model 0 is the world itself and is already drawn by the PVS path.
+	for (i = 0; i < q_num_entities; i++)
+	{
+		e = &q_entities[i];
+
+		if (e->brush_model > 0)
+		{
+			QDrawBrushModel(q_canvas, q_map, e->brush_model);
+			q_ent_drawn++;
+		}
+	}
+
+	for (i = 0; i < q_num_entities; i++)
+	{
+		e = &q_entities[i];
+
+		if (e->mdl)
+		{
+			//Cheap distance reject before touching the triangles at all.
+			QVecSub(e->origin, q_origin, dist);
+			if (QVecLength(dist) < QENT_DRAW_DIST)
+			{
+				QMdlDraw(q_canvas, e->mdl, e->frame, e->origin,
+					e->angles[1], QENT_LIGHT);
+				q_ent_drawn++;
+			}
+		}
+	}
+}
+
+U0 QRenderFrame()
+{//One full frame into the private canvas.
+	F64 forward[3];
+	F64 right[3];
+	F64 up[3];
+	F64 fov_y;
+
+	QAngleVectors(q_angles, forward, right, up);
+	fov_y = QDrawFovY(q_fov, q_canvas->width, q_canvas->height);
+
+	//Drives the two sky layers' scroll.
+	q_sky_time = tS;
+
+	//The eye rides above the player origin.
+	QVecCopy(q_origin, q_view);
+	q_view[2] += QVIEW_HEIGHT;
+
+	QDrawClear(q_canvas, 0);
+	QDrawSetView(q_canvas, q_view, q_angles, q_fov);
+	QVisBuildList(q_vis, q_view, forward, right, up, q_fov, fov_y);
+	QDrawWorld(q_canvas, q_map, q_vis);
+
+	if (q_draw_entities)
+		QRenderEntities;
+}
+
+U0 QCenterView(CTask *task)
+{//Pick the largest integer magnification that still fits, then centre it.
+	I64 w = task->pix_width;
+	I64 h = task->pix_height;
+	I64 sx;
+	I64 sy;
+
+	sx = w / QSCR_W;
+	sy = h / QSCR_H;
+
+	if (sx < sy)
+		q_scale = sx;
+	else
+		q_scale = sy;
+
+	if (q_scale < 1)
+		q_scale = 1;
+
+	q_blit_x = (w - QSCR_W * q_scale) / 2;
+	q_blit_y = (h - QSCR_H * q_scale) / 2;
+}
+
+Bool QLoadMap(U8 *mapname)
+{
+	I64 ent_count;
+	I64 mdl_count;
+
+	if (q_vis)
+	{
+		QVisFree(q_vis);
+		q_vis = NULL;
+	}
+	if (q_map)
+	{
+		QBSPFree(q_map);
+		q_map = NULL;
+	}
+
+	q_map = QBSPLoad(mapname);
+	if (!q_map)
+		return FALSE;
+
+	q_vis = QVisNew(q_map);
+
+	//Order matters: models resolve against the parsed list, and the spawn
+	//point is found in it too. These must not be folded into one print, since
+	//argument evaluation order would not guarantee the sequence.
+	ent_count = QEntParse(q_map);
+	mdl_count = QEntLoadModels;
+	"Quake: %d entities, %d alias models\n", ent_count, mdl_count;
+
+	QVecSet(q_velocity, 0.0, 0.0, 0.0);
+	q_on_ground = FALSE;
+
+	if (!QEntFindPlayerStart(q_map, q_origin, q_angles))
+	{
+		//No spawn point: fall back to the centre of the world bounds.
+		//The centre of the world bounds is very likely inside geometry, so
+		//start in noclip rather than trapping the player in a wall.
+		"Quake: no info_player_start, using model bounds (noclip on)\n";
+		q_noclip = TRUE;
+		q_origin[0] = (q_map->models[0].mins[0] + q_map->models[0].maxs[0]) * 0.5;
+		q_origin[1] = (q_map->models[0].mins[1] + q_map->models[0].maxs[1]) * 0.5;
+		q_origin[2] = (q_map->models[0].mins[2] + q_map->models[0].maxs[2]) * 0.5;
+		QVecSet(q_angles, 0.0, 0.0, 0.0);
+	}
+
+	return TRUE;
+}
+
+U0 QGameLoop()
+{
+	F64  forward[3];
+	F64  right[3];
+	F64  up[3];
+	F64  move[3];
+	F64  speed;
+	F64  now;
+	F64  last;
+	F64  dt;
+	F64  fps_time;
+	I64  sc_w		= Char2ScanCode('w');
+	I64  sc_a		= Char2ScanCode('a');
+	I64  sc_s		= Char2ScanCode('s');
+	I64  sc_d		= Char2ScanCode('d');
+	I64  sc_t		= Char2ScanCode('t');
+	I64  sc_e		= Char2ScanCode('e');
+	I64  sc_n		= Char2ScanCode('n');
+	I64  sc_jump	= Char2ScanCode(' ');	//no SC_SPACE define exists
+	I64  dx;
+	I64  dy;
+	I64  fps_frames = 0;
+	Bool stats_held  = FALSE;
+	Bool ents_held   = FALSE;
+	Bool noclip_held = FALSE;
+
+	last     = tS;
+	fps_time = last;
+
+	while (TRUE)
+	{
+		now  = tS;
+		dt   = now - last;
+		last = now;
+
+		//A long stall (first frame, or a map load) must not launch the camera.
+		if (dt > 0.1)
+			dt = 0.1;
+
+		if (Bt(kbd.down_bitmap, SC_ESC))
+			break;
+
+		//--- mouse look: consume the accumulated raw deltas ---
+		dx = mouse_hard.raw_data.x;
+		dy = mouse_hard.raw_data.y;
+		MouseRawReset;
+
+		q_angles[1] -= ToF64(dx) * QMOUSE_SENS;
+		q_angles[0] += ToF64(dy) * QMOUSE_SENS;
+
+		if (q_angles[0] > QPITCH_LIMIT)
+			q_angles[0] = QPITCH_LIMIT;
+		if (q_angles[0] < -QPITCH_LIMIT)
+			q_angles[0] = -QPITCH_LIMIT;
+
+		q_angles[1] = QAngleNorm(q_angles[1]);
+
+		//--- movement ---
+		QAngleVectors(q_angles, forward, right, up);
+		QVecSet(move, 0.0, 0.0, 0.0);
+
+		if (Bt(kbd.down_bitmap, sc_w))
+			QVecAdd(move, forward, move);
+		if (Bt(kbd.down_bitmap, sc_s))
+			QVecSub(move, forward, move);
+		if (Bt(kbd.down_bitmap, sc_d))
+			QVecAdd(move, right, move);
+		if (Bt(kbd.down_bitmap, sc_a))
+			QVecSub(move, right, move);
+
+		if (Bt(kbd.down_bitmap, SC_SHIFT))
+			speed = QMOVE_FAST;
+		else
+			speed = QMOVE_SPEED;
+
+		if (q_noclip)
+		{
+			//Free flight: the old flycam, kept for getting unstuck and for
+			//looking at geometry the player cannot reach.
+			QVecSet(q_velocity, 0.0, 0.0, 0.0);
+			if (QVecLength(move) > 0.0)
+			{
+				QVecNormalize(move);
+				QVecMA(q_origin, speed * dt, move, q_origin);
+			}
+		}
+		else
+		{
+			//Walking: the wish direction is horizontal, so looking up and down
+			//does not drive the player into the floor or launch them.
+			move[2] = 0.0;
+			if (QVecLength(move) > 0.0)
+				QVecNormalize(move);
+
+			QPlayerMove(q_map, q_origin, q_velocity, move, speed,
+				Bt(kbd.down_bitmap, sc_jump), dt, &q_on_ground);
+		}
+
+		//--- toggles, edge triggered so a held key fires once ---
+		if (Bt(kbd.down_bitmap, sc_t))
+		{
+			if (!stats_held)
+			{
+				q_show_stats = !q_show_stats;
+				stats_held   = TRUE;
+			}
+		}
+		else
+			stats_held = FALSE;
+
+		if (Bt(kbd.down_bitmap, sc_e))
+		{
+			if (!ents_held)
+			{
+				q_draw_entities = !q_draw_entities;
+				ents_held       = TRUE;
+			}
+		}
+		else
+			ents_held = FALSE;
+
+		if (Bt(kbd.down_bitmap, sc_n))
+		{
+			if (!noclip_held)
+			{
+				q_noclip    = !q_noclip;
+				noclip_held = TRUE;
+				QVecSet(q_velocity, 0.0, 0.0, 0.0);
+			}
+		}
+		else
+			noclip_held = FALSE;
+
+		QCenterView(Fs);
+		QRenderFrame;
+		q_ready = TRUE;
+
+		q_frame_count++;
+		fps_frames++;
+		if (now - fps_time >= 0.5)
+		{
+			q_fps      = ToF64(fps_frames) / (now - fps_time);
+			fps_frames = 0;
+			fps_time   = now;
+		}
+
+		LBts(&Fs->task_flags, TASKf_IDLE);
+		Yield;
+		LBtr(&Fs->task_flags, TASKf_IDLE);
+	}
+}
+
+U0 Quake(U8 *mapname = QDEFAULT_MAP)
+{
+	CQCanvas	*canvas		= NULL;
+	CQVisState	*vis		= NULL;
+	CQMap		*map		= NULL;
+	Bool		 raw_was_on	= FALSE;
+
+	QPakInit;
+	if (!QPakMount("::/Apps/Quake/id1/PAK0.PAK"))
+	{
+		"Quake: PAK0.PAK not found. See ::/Apps/Quake/README.md\n";
+		return;
+	}
+
+	if (!QPalLoad)
+	{
+		"Quake: palette load failed\n";
+		return;
+	}
+
+	if (!QLoadMap(mapname))
+	{
+		"Quake: could not load %s\n", mapname;
+		return;
+	}
+
+	q_canvas = QDrawNew;
+	q_ready  = FALSE;
+
+	MenuPush(
+		"File {"
+		"  Exit(,CH_ESC);"
+		"}"
+	);
+	SettingsPush;
+
+	try
+	{
+		Fs->win_inhibit = WIG_TASK_DEFAULT - WIF_SELF_FOCUS -
+						  WIF_SELF_GRAB_SCROLL - WIF_FOCUS_TASK_MENU;
+		AutoComplete;
+		WinBorder;
+		WinMax;
+		DocCursor;
+		DocClear;
+
+		QCenterView(Fs);
+
+		//Raw mode gives relative deltas and stops clicks reaching the window
+		//manager. It must be turned back off on every exit path.
+		raw_was_on = MouseRaw(TRUE);
+		MouseRawReset;
+
+		Fs->draw_it = &QDrawIt;
+
+		QGameLoop;
+	}
+	catch
+		PutExcept;
+
+	//--- teardown ---
+	//QDrawIt runs on the window manager task and the blit is long, so the
+	//compositor is very often executing inside it. Detaching the callback is
+	//NOT enough on its own: an already-entered QDrawIt keeps running. So stop
+	//it drawing, detach, let the in-flight call drain, and only then free.
+	q_ready     = FALSE;
+	Fs->draw_it = NULL;
+	Sleep(100);
+
+	//Clear each global before releasing it, so even a late QDrawIt sees NULL
+	//rather than a dangling pointer.
+	canvas   = q_canvas;
+	q_canvas = NULL;
+	vis      = q_vis;
+	q_vis    = NULL;
+	map      = q_map;
+	q_map    = NULL;
+
+	if (!raw_was_on)
+		MouseRaw(FALSE);
+
+	SettingsPop;
+	MenuPop;
+
+	//Entities hold alias models that borrow nothing from the map, but they are
+	//released first so nothing outlives the map it was spawned from.
+	QEntFree;
+
+	QDrawFree(canvas);
+	QVisFree(vis);
+	QBSPFree(map);
+
+	"Quake: %d frames rendered\n", q_frame_count;
+}

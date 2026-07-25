@@ -1,0 +1,789 @@
+// QDraw.ZC - 8bpp span rasterizer.
+//
+// Rendering happens in a private 8-bit indexed buffer and only becomes
+// truecolor at blit time. That is not nostalgia: lighting is a table lookup
+// into the colormap (index, shade) -> index, so keeping indices all the way
+// through costs one byte per pixel and no per-pixel multiply.
+//
+// Pipeline per face:
+//   world verts -> camera space (+ texture coords) -> near clip -> project
+//   -> scanline fill with perspective-correct texture and lightmap lookup.
+//
+// Perspective correction currently divides per pixel. That is the honest slow
+// version; the marked span loop is the thing to subdivide every 8-16 pixels
+// and then hand-write in assembly once the output is known good.
+
+#define QSCR_W			320
+#define QSCR_H			240
+#define QMAX_POLY_VERTS	64
+#define QNEAR_CLIP		4.0		//world units in front of the eye
+
+class CQPolyVert
+{
+	F64	cam[3];		//x right, y up, z forward
+	F64	s;			//texture coords in texel units
+	F64	t;
+};
+
+class CQScreenVert
+{
+	F64	x;
+	F64	y;
+	F64	inv_z;
+	F64	s_over_z;
+	F64	t_over_z;
+};
+
+class CQCanvas
+{
+	U8	*pixels;		//QSCR_W * QSCR_H indices
+	F64	*depth;			//1/z, larger is nearer
+	I64	 width;
+	I64	 height;
+
+	//View state for the frame being drawn.
+	F64	 origin[3];
+	F64	 forward[3];
+	F64	 right[3];
+	F64	 up[3];
+	F64	 x_scale;
+	F64	 y_scale;
+	F64	 center_x;
+	F64	 center_y;
+
+	I64	 faces_drawn;
+	I64	 spans_drawn;
+};
+
+CQCanvas *QDrawNew()
+{
+	CQCanvas *c = CAlloc(sizeof(CQCanvas));
+
+	c->width  = QSCR_W;
+	c->height = QSCR_H;
+	c->pixels = CAlloc(QSCR_W * QSCR_H);
+	c->depth  = CAlloc(QSCR_W * QSCR_H * sizeof(F64));
+
+	return c;
+}
+
+U0 QDrawFree(CQCanvas *c)
+{
+	if (!c)
+		return;
+
+	if (c->pixels)	Free(c->pixels);
+	if (c->depth)	Free(c->depth);
+
+	Free(c);
+}
+
+U0 QDrawClear(CQCanvas *c, I64 color_index)
+{
+	MemSet(c->pixels, color_index, c->width * c->height);
+	MemSet(c->depth, 0, c->width * c->height * sizeof(F64));
+	c->faces_drawn = 0;
+	c->spans_drawn = 0;
+}
+
+U0 QDrawSetView(CQCanvas *c, F64 *origin, F64 *angles, F64 fov_x)
+{//Derive the projection scales from the horizontal field of view. The
+ //vertical scale reuses x_scale so pixels stay square.
+	F64 half = fov_x * 0.5 * QDEG2RAD;
+
+	QVecCopy(origin, c->origin);
+	QAngleVectors(angles, c->forward, c->right, c->up);
+
+	c->center_x = ToF64(c->width) * 0.5;
+	c->center_y = ToF64(c->height) * 0.5;
+	c->x_scale  = c->center_x / Tan(half);
+	c->y_scale  = c->x_scale;
+}
+
+F64 QDrawFovY(F64 fov_x, I64 width, I64 height)
+{//Matching vertical fov for square pixels, in degrees.
+	F64 half = fov_x * 0.5 * QDEG2RAD;
+	F64 t    = Tan(half) * ToF64(height) / ToF64(width);
+
+	return ATan(t) * 2.0 / QDEG2RAD;
+}
+
+I64 QDrawClipNear(CQPolyVert *in, I64 count, CQPolyVert *out)
+{//Sutherland-Hodgman against z = QNEAR_CLIP. Everything else is handled by
+ //clamping at scan time, so this is the only clip plane that must be exact -
+ //without it a vertex behind the eye projects to a wild coordinate.
+	I64 i;
+	I64 j;
+	I64 n = 0;
+	F64 d1;
+	F64 d2;
+	F64 frac;
+
+	for (i = 0; i < count; i++)
+	{
+		j  = (i + 1) % count;
+		d1 = in[i].cam[2] - QNEAR_CLIP;
+		d2 = in[j].cam[2] - QNEAR_CLIP;
+
+		if (d1 >= 0.0)
+		{
+			if (n < QMAX_POLY_VERTS)
+			{
+				MemCopy(&out[n], &in[i], sizeof(CQPolyVert));
+				n++;
+			}
+		}
+
+		//Crossing the plane in either direction contributes one new vertex.
+		if ((d1 >= 0.0) != (d2 >= 0.0))
+		{
+			if (n < QMAX_POLY_VERTS && (d1 - d2) != 0.0)
+			{
+				frac = d1 / (d1 - d2);
+				out[n].cam[0] = in[i].cam[0] + frac * (in[j].cam[0] - in[i].cam[0]);
+				out[n].cam[1] = in[i].cam[1] + frac * (in[j].cam[1] - in[i].cam[1]);
+				out[n].cam[2] = in[i].cam[2] + frac * (in[j].cam[2] - in[i].cam[2]);
+				out[n].s      = in[i].s + frac * (in[j].s - in[i].s);
+				out[n].t      = in[i].t + frac * (in[j].t - in[i].t);
+				n++;
+			}
+		}
+	}
+
+	return n;
+}
+
+U0 QDrawSpan(CQCanvas *c, I64 y, I64 x1, I64 x2,
+	F64 iz1, F64 soz1, F64 toz1, F64 iz2, F64 soz2, F64 toz2,
+	CQTexture *tex, U8 *lightmap, I64 lm_w, I64 lm_h,
+	F64 mins_s, F64 mins_t, I64 flat_light)
+{//Fill one horizontal run. HOT LOOP: this is the function to subdivide and
+ //then rewrite in assembly. Everything else runs a few thousand times a
+ //frame; this runs a few hundred thousand.
+	U8	*row;
+	F64	*zrow;
+	F64	 span;
+	F64	 d_iz;
+	F64	 d_soz;
+	F64	 d_toz;
+	F64	 iz;
+	F64	 soz;
+	F64	 toz;
+	F64	 z;
+	F64	 s;
+	F64	 t;
+	F64	 ls;
+	F64	 lt;
+	I64	 x;
+	I64	 tw;
+	I64	 th;
+	I64	 tx;
+	I64	 ty;
+	I64	 lx;
+	I64	 ly;
+	I64	 light;
+	I64	 shade;
+	I64	 texel;
+	Bool clamp_tex;
+
+	if (y < 0 || y >= c->height)
+		return;
+
+	//Clamp horizontally, carrying the interpolants with the clamp.
+	span = ToF64(x2 - x1);
+	if (span <= 0.0)
+		return;
+
+	d_iz  = (iz2 - iz1) / span;
+	d_soz = (soz2 - soz1) / span;
+	d_toz = (toz2 - toz1) / span;
+
+	if (x1 < 0)
+	{
+		iz1  += d_iz * ToF64(-x1);
+		soz1 += d_soz * ToF64(-x1);
+		toz1 += d_toz * ToF64(-x1);
+		x1 = 0;
+	}
+
+	if (x2 > c->width)
+		x2 = c->width;
+
+	if (x1 >= x2)
+		return;
+
+	tw = tex->width;
+	th = tex->height;
+	if (tw <= 0 || th <= 0 || !tex->texels[0])
+		return;
+
+	clamp_tex = tex->clamp;
+
+	row  = c->pixels + y * c->width;
+	zrow = c->depth + y * c->width;
+
+	iz  = iz1;
+	soz = soz1;
+	toz = toz1;
+
+	for (x = x1; x < x2; x++)
+	{
+		//Depth test first: rejecting early skips the divide.
+		if (iz > zrow[x])
+		{
+			z = 1.0 / iz;
+			s = soz * z;
+			t = toz * z;
+
+			//Floor rather than ToI64: ToI64 truncates toward zero, which lands
+			//on the wrong texel for negative coordinates and leaves a
+			//one-texel seam wherever s or t crosses 0.
+			tx = ToI64(Floor(s));
+			ty = ToI64(Floor(t));
+
+			if (clamp_tex)
+			{
+				//Model skin: arbitrary size, never tiles.
+				tx = ClampI64(tx, 0, tw - 1);
+				ty = ClampI64(ty, 0, th - 1);
+			}
+			else
+			{
+				//World texture: power-of-two, so AND gives the wrap for free
+				//and handles negatives correctly in two's complement.
+				tx = tx & (tw - 1);
+				ty = ty & (th - 1);
+			}
+
+			texel = tex->texels[0][ty * tw + tx];
+
+			if (lightmap && lm_w > 0 && lm_h > 0)
+			{
+				//One luxel per 16 texels, nearest sample.
+				ls = (s - mins_s) / 16.0;
+				lt = (t - mins_t) / 16.0;
+				lx = ClampI64(ToI64(Floor(ls)), 0, lm_w - 1);
+				ly = ClampI64(ToI64(Floor(lt)), 0, lm_h - 1);
+				light = lightmap[ly * lm_w + lx];
+			}
+			else
+				light = flat_light;
+
+			//Colormap row 0 is brightest, row 63 is darkest.
+			shade = (255 - light) >> 2;
+			shade = ClampI64(shade, 0, QPAL_SHADES - 1);
+
+			if (texel >= QPAL_FULLBRIGHT)
+				row[x] = texel;			//fullbrights ignore lighting
+			else
+				row[x] = qpal_colormap[shade * QPAL_COLORS + texel];
+
+			zrow[x] = iz;
+		}
+
+		iz  += d_iz;
+		soz += d_soz;
+		toz += d_toz;
+	}
+
+	c->spans_drawn++;
+}
+
+U0 QDrawPolygon(CQCanvas *c, CQScreenVert *v, I64 count,
+	CQTexture *tex, U8 *lightmap, I64 lm_w, I64 lm_h,
+	F64 mins_s, F64 mins_t, I64 flat_light)
+{//Scanline fill of a convex polygon. For each row every edge is intersected
+ //and the extreme hits become the span. O(edges) per row, but after clipping
+ //there are rarely more than eight edges, and it sidesteps the bookkeeping
+ //(and the winding-order bugs) of an active edge table.
+	F64	 y_min = 1.0e30;
+	F64	 y_max = -1.0e30;
+	F64	 xl;
+	F64	 xr;
+	F64	 izl;
+	F64	 izr;
+	F64	 sozl;
+	F64	 sozr;
+	F64	 tozl;
+	F64	 tozr;
+	F64	 ya;
+	F64	 yb;
+	F64	 frac;
+	F64	 xi;
+	F64	 izi;
+	F64	 sozi;
+	F64	 tozi;
+	F64	 yc;
+	I64	 i;
+	I64	 j;
+	I64	 y;
+	I64	 y0;
+	I64	 y1;
+	Bool found;
+
+	if (count < 3)
+		return;
+
+	for (i = 0; i < count; i++)
+	{
+		if (v[i].y < y_min)
+			y_min = v[i].y;
+		if (v[i].y > y_max)
+			y_max = v[i].y;
+	}
+
+	y0 = ToI64(Ceil(y_min));
+	y1 = ToI64(Floor(y_max));
+
+	if (y0 < 0)
+		y0 = 0;
+	if (y1 >= c->height)
+		y1 = c->height - 1;
+
+	for (y = y0; y <= y1; y++)
+	{
+		yc    = ToF64(y);
+		found = FALSE;
+		xl    = 0.0;
+		xr    = 0.0;
+		izl   = 0.0;
+		izr   = 0.0;
+		sozl  = 0.0;
+		sozr  = 0.0;
+		tozl  = 0.0;
+		tozr  = 0.0;
+
+		for (i = 0; i < count; i++)
+		{
+			j  = (i + 1) % count;
+			ya = v[i].y;
+			yb = v[j].y;
+
+			//Half-open test so a shared vertex is not counted twice.
+			if ((ya <= yc && yb > yc) || (yb <= yc && ya > yc))
+			{
+				frac = (yc - ya) / (yb - ya);
+				xi   = v[i].x + frac * (v[j].x - v[i].x);
+				izi  = v[i].inv_z + frac * (v[j].inv_z - v[i].inv_z);
+				sozi = v[i].s_over_z + frac * (v[j].s_over_z - v[i].s_over_z);
+				tozi = v[i].t_over_z + frac * (v[j].t_over_z - v[i].t_over_z);
+
+				if (!found)
+				{
+					xl = xi; izl = izi; sozl = sozi; tozl = tozi;
+					xr = xi; izr = izi; sozr = sozi; tozr = tozi;
+					found = TRUE;
+				}
+				else
+				{
+					if (xi < xl)
+					{
+						xl = xi; izl = izi; sozl = sozi; tozl = tozi;
+					}
+					if (xi > xr)
+					{
+						xr = xi; izr = izi; sozr = sozi; tozr = tozi;
+					}
+				}
+			}
+		}
+
+		if (found && xr > xl)
+		{
+			QDrawSpan(c, y, ToI64(Ceil(xl)), ToI64(Ceil(xr)),
+				izl, sozl, tozl, izr, sozr, tozr,
+				tex, lightmap, lm_w, lm_h, mins_s, mins_t, flat_light);
+		}
+	}
+}
+
+//--- sky -------------------------------------------------------------------
+//
+// A sky texture is 256x128 carrying two stacked 128x128 layers: the RIGHT half
+// is the solid starfield, the LEFT half is the cloud layer where palette index
+// 0 means "see through to the layer behind". Drawing it as one ordinary tiling
+// texture shows both halves side by side, which is not sky.
+//
+// Sky is also not textured by surface position. It is textured by the
+// direction from the eye through each pixel, so it behaves as if infinitely
+// far away and does not slide as the player walks. The direction is flattened
+// vertically and rescaled onto a fixed-radius dome, then the two layers are
+// sampled at different scroll speeds to give the parallax drift.
+
+#define QSKY_LAYER		128		//each layer is 128x128
+#define QSKY_MASK		127
+#define QSKY_DOME		378.0	//dome radius the direction is rescaled onto
+#define QSKY_FLATTEN	3.0		//vertical squash, so the sky reads as a ceiling
+#define QSKY_SPEED_BG	8.0		//starfield drift, units/sec
+#define QSKY_SPEED_FG	16.0	//clouds drift twice as fast, giving parallax
+
+F64 q_sky_time = 0.0;
+
+U0 QDrawSkySpan(CQCanvas *c, I64 y, I64 x1, I64 x2, F64 iz1, F64 iz2,
+	CQTexture *tex)
+{//Per pixel: build the view ray, warp it onto the dome, sample both layers.
+ //The ray varies linearly across the span, so it is stepped rather than
+ //rebuilt; only the rescale needs a square root.
+	U8	*row;
+	U8	*texels;
+	F64	*zrow;
+	F64	 dir[3];
+	F64	 step[3];
+	F64	 sxf;
+	F64	 syf;
+	F64	 vx;
+	F64	 vy;
+	F64	 vz;
+	F64	 len;
+	F64	 scale;
+	F64	 dx;
+	F64	 dy;
+	F64	 span;
+	F64	 d_iz;
+	F64	 iz;
+	F64	 bg;
+	F64	 fg;
+	I64	 x;
+	I64	 tw;
+	I64	 s1;
+	I64	 t1;
+	I64	 s2;
+	I64	 t2;
+	I64	 texel;
+	I64	 cloud;
+	I64	 i;
+
+	if (y < 0 || y >= c->height)
+		return;
+
+	span = ToF64(x2 - x1);
+	if (span <= 0.0)
+		return;
+
+	d_iz = (iz2 - iz1) / span;
+
+	if (x1 < 0)
+	{
+		iz1 += d_iz * ToF64(-x1);
+		x1 = 0;
+	}
+	if (x2 > c->width)
+		x2 = c->width;
+	if (x1 >= x2)
+		return;
+
+	tw     = tex->width;
+	texels = tex->texels[0];
+	if (!texels || tw < 2 * QSKY_LAYER || tex->height < QSKY_LAYER)
+		return;
+
+	//Ray through the first pixel, and the per-pixel increment along it.
+	sxf = (ToF64(x1) - c->center_x) / c->x_scale;
+	syf = (c->center_y - ToF64(y)) / c->y_scale;
+
+	for (i = 0; i < 3; i++)
+	{
+		dir[i]  = c->forward[i] + c->right[i] * sxf + c->up[i] * syf;
+		step[i] = c->right[i] / c->x_scale;
+	}
+
+	bg = q_sky_time * QSKY_SPEED_BG;
+	fg = q_sky_time * QSKY_SPEED_FG;
+
+	row  = c->pixels + y * c->width;
+	zrow = c->depth + y * c->width;
+	iz   = iz1;
+
+	for (x = x1; x < x2; x++)
+	{
+		if (iz > zrow[x])
+		{
+			vx = dir[0];
+			vy = dir[1];
+			vz = dir[2] * QSKY_FLATTEN;
+
+			len = Sqrt(vx * vx + vy * vy + vz * vz);
+			if (len > 0.0)
+			{
+				scale = QSKY_DOME / len;
+				dx    = vx * scale;
+				dy    = vy * scale;
+
+				//Clouds sit in front; index 0 there lets the starfield show.
+				s2    = ToI64(Floor(fg + dx)) & QSKY_MASK;
+				t2    = ToI64(Floor(fg + dy)) & QSKY_MASK;
+				cloud = texels[t2 * tw + s2];
+
+				if (cloud)
+					texel = cloud;
+				else
+				{
+					s1    = ToI64(Floor(bg + dx)) & QSKY_MASK;
+					t1    = ToI64(Floor(bg + dy)) & QSKY_MASK;
+					texel = texels[t1 * tw + s1 + QSKY_LAYER];
+				}
+
+				//Sky is emissive: never shaded by the colormap.
+				row[x]  = texel;
+				zrow[x] = iz;
+			}
+		}
+
+		dir[0] += step[0];
+		dir[1] += step[1];
+		dir[2] += step[2];
+		iz     += d_iz;
+	}
+
+	c->spans_drawn++;
+}
+
+U0 QDrawSkyPolygon(CQCanvas *c, CQScreenVert *v, I64 count, CQTexture *tex)
+{//Same edge walk as the textured path, but only depth is interpolated: the
+ //texture comes from the view ray instead of from surface coordinates.
+	F64	 y_min = 1.0e30;
+	F64	 y_max = -1.0e30;
+	F64	 xl;
+	F64	 xr;
+	F64	 izl;
+	F64	 izr;
+	F64	 ya;
+	F64	 yb;
+	F64	 frac;
+	F64	 xi;
+	F64	 izi;
+	F64	 yc;
+	I64	 i;
+	I64	 j;
+	I64	 y;
+	I64	 y0;
+	I64	 y1;
+	Bool found;
+
+	if (count < 3)
+		return;
+
+	for (i = 0; i < count; i++)
+	{
+		if (v[i].y < y_min)
+			y_min = v[i].y;
+		if (v[i].y > y_max)
+			y_max = v[i].y;
+	}
+
+	y0 = ToI64(Ceil(y_min));
+	y1 = ToI64(Floor(y_max));
+
+	if (y0 < 0)
+		y0 = 0;
+	if (y1 >= c->height)
+		y1 = c->height - 1;
+
+	for (y = y0; y <= y1; y++)
+	{
+		yc    = ToF64(y);
+		found = FALSE;
+		xl    = 0.0;
+		xr    = 0.0;
+		izl   = 0.0;
+		izr   = 0.0;
+
+		for (i = 0; i < count; i++)
+		{
+			j  = (i + 1) % count;
+			ya = v[i].y;
+			yb = v[j].y;
+
+			if ((ya <= yc && yb > yc) || (yb <= yc && ya > yc))
+			{
+				frac = (yc - ya) / (yb - ya);
+				xi   = v[i].x + frac * (v[j].x - v[i].x);
+				izi  = v[i].inv_z + frac * (v[j].inv_z - v[i].inv_z);
+
+				if (!found)
+				{
+					xl = xi; izl = izi;
+					xr = xi; izr = izi;
+					found = TRUE;
+				}
+				else
+				{
+					if (xi < xl)
+					{
+						xl = xi; izl = izi;
+					}
+					if (xi > xr)
+					{
+						xr = xi; izr = izi;
+					}
+				}
+			}
+		}
+
+		if (found && xr > xl)
+			QDrawSkySpan(c, y, ToI64(Ceil(xl)), ToI64(Ceil(xr)), izl, izr, tex);
+	}
+}
+
+U0 QDrawFace(CQCanvas *c, CQMap *map, I64 face_index)
+{//Transform, clip, project and fill one BSP face.
+	CQFace		*f  = &map->faces[face_index];
+	CQTexInfo	*ti;
+	CQTexture	*tex;
+	CQPolyVert	 poly[QMAX_POLY_VERTS];
+	CQPolyVert	 clipped[QMAX_POLY_VERTS];
+	CQScreenVert scr[QMAX_POLY_VERTS];
+	CQVertex	*wv;
+	U8			*lightmap = NULL;
+	F64			 rel[3];
+	F64			 inv_z;
+	I64			 n = 0;
+	I64			 count;
+	I64			 lm_w = 0;
+	I64			 lm_h = 0;
+	I64			 i;
+	I64			 e;
+
+	if (f->num_edges < 3 || f->num_edges > QMAX_POLY_VERTS)
+		return;
+
+	ti = &map->texinfo[f->tex_info];
+	if (ti->miptex < 0 || ti->miptex >= map->num_textures)
+		return;
+
+	tex = &map->textures[ti->miptex];
+	if (!tex->texels[0] || tex->width <= 0 || tex->height <= 0)
+		return;
+
+	//Gather the face outline. A negative surfedge means the edge runs the
+	//other way, so its second vertex is the leading one.
+	for (i = 0; i < f->num_edges; i++)
+	{
+		e = map->surfedges[f->first_edge + i];
+		if (e >= 0)
+			wv = &map->vertices[map->edges[e].v[0]];
+		else
+			wv = &map->vertices[map->edges[-e].v[1]];
+
+		//Texture coords come from the world position, before the view moves.
+		poly[n].s = QVecDot(wv->pt, &ti->vecs[0]) + ti->vecs[3];
+		poly[n].t = QVecDot(wv->pt, &ti->vecs[4]) + ti->vecs[7];
+
+		QVecSub(wv->pt, c->origin, rel);
+		poly[n].cam[0] = QVecDot(rel, c->right);
+		poly[n].cam[1] = QVecDot(rel, c->up);
+		poly[n].cam[2] = QVecDot(rel, c->forward);
+		n++;
+	}
+
+	count = QDrawClipNear(poly, n, clipped);
+	if (count < 3)
+		return;
+
+	for (i = 0; i < count; i++)
+	{
+		inv_z = 1.0 / clipped[i].cam[2];
+
+		//Screen y grows downward, camera y grows up.
+		scr[i].x = c->center_x + clipped[i].cam[0] * c->x_scale * inv_z;
+		scr[i].y = c->center_y - clipped[i].cam[1] * c->y_scale * inv_z;
+
+		//Interpolating s/z and t/z (not s and t) is what makes the texture
+		//track the surface instead of swimming across it.
+		scr[i].inv_z    = inv_z;
+		scr[i].s_over_z = clipped[i].s * inv_z;
+		scr[i].t_over_z = clipped[i].t * inv_z;
+	}
+
+	if (f->light_offset >= 0 && f->light_offset < map->lightdata_size)
+	{
+		lm_w = f->extent_s / 16 + 1;
+		lm_h = f->extent_t / 16 + 1;
+		if (f->light_offset + lm_w * lm_h <= map->lightdata_size)
+			lightmap = map->lightdata + f->light_offset;
+		else
+		{
+			lm_w = 0;
+			lm_h = 0;
+		}
+	}
+
+	if (tex->is_sky)
+		QDrawSkyPolygon(c, scr, count, tex);
+	else
+	{
+		//Unlit faces (anything the compiler left without a lightmap) render
+		//fullbright, matching how they look in the original.
+		QDrawPolygon(c, scr, count, tex, lightmap, lm_w, lm_h,
+			f->mins_s, f->mins_t, 255);
+	}
+
+	c->faces_drawn++;
+}
+
+U0 QDrawWorld(CQCanvas *c, CQMap *map, CQVisState *vs)
+{//Faces arrive front-to-back, so the depth test rejects most overdraw.
+	I64 i;
+
+	for (i = 0; i < vs->face_count; i++)
+		QDrawFace(c, map, vs->face_list[i]);
+}
+
+U0 QDrawBrushModel(CQCanvas *c, CQMap *map, I64 model_index)
+{//Draw a BSP submodel (door, platform, button) by walking its face range.
+ //These are not in the PVS, so every face is submitted and the depth buffer
+ //sorts it out.
+	CQModel *m;
+	I64		 i;
+
+	if (model_index < 0 || model_index >= map->num_models)
+		return;
+
+	m = &map->models[model_index];
+
+	for (i = 0; i < m->num_faces; i++)
+	{
+		if (m->first_face + i < map->num_faces)
+			QDrawFace(c, map, m->first_face + i);
+	}
+}
+
+U0 QDrawBlit(CQCanvas *c, CDC *dc, I64 dst_x, I64 dst_y, I64 scale)
+{//Expand the indexed buffer into the truecolor CDC, magnifying by an integer
+ //factor. Palette lookup happens exactly once per source pixel.
+	U8	*src;
+	U32	*dst;
+	U32	 color;
+	I64	 x;
+	I64	 y;
+	I64	 sx;
+	I64	 sy;
+	I64	 px;
+	I64	 py;
+	I64	 pitch = dc->width_internal;
+
+	for (y = 0; y < c->height; y++)
+	{
+		src = c->pixels + y * c->width;
+		for (sy = 0; sy < scale; sy++)
+		{
+			py = dst_y + y * scale + sy;
+			if (py < 0 || py >= dc->height)
+				break;
+
+			dst = dc->body + py * pitch;
+
+			for (x = 0; x < c->width; x++)
+			{
+				color = qpal_argb[src[x]];
+				px    = dst_x + x * scale;
+
+				for (sx = 0; sx < scale; sx++)
+				{
+					if (px + sx >= 0 && px + sx < dc->width)
+						dst[px + sx] = color;
+				}
+			}
+		}
+	}
+}
