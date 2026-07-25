@@ -1,0 +1,321 @@
+// QSound.ZC - WAV loading and sound effects.
+//
+// The AC97 driver already provides a 4-stream software mixer and a
+// fire-and-forget one-shot queue (AudioSFXPlay), so nothing here mixes audio.
+// This layer only has to turn a PAK'd WAV into the 48kHz stereo frames that
+// mixer expects, and decide how loud it should be.
+//
+// Format reality of the shareware data: 188 of the 190 sounds are 8-BIT mono
+// at 11025Hz, the other two are 16-bit at 22050Hz. Handling only 16-bit (as
+// the browser's WAV path does) would play almost nothing, so 8-bit unsigned
+// is the important case, not the edge case.
+//
+// Decoding everything up front would cost about 47MB, so sounds are decoded on
+// first use and kept in a bounded cache. Gameplay reuses a small working set,
+// so this stays far below the budget in practice.
+
+#define QSND_MAX_CACHE		96
+#define QSND_CACHE_BUDGET	6291456		//6MB of decoded audio
+#define QSND_RATE			48000		//the mixer's fixed output rate
+#define QSND_CLIP_DIST		1000.0		//attenuation reaches silence here
+
+class CQSound
+{
+	U8	 name[64];
+	U32	*frames;		//48kHz stereo, L16 | R16 << 16
+	I64	 count;
+};
+
+CQSound	 q_snd_cache[QSND_MAX_CACHE];
+I64		 q_snd_count	= 0;
+I64		 q_snd_bytes	= 0;
+Bool	 q_snd_enabled	= TRUE;
+I64		 q_snd_played	= 0;
+I64		 q_snd_dropped	= 0;
+
+//Volume scaling needs a copy, since the cached frames are shared and the
+//mixer consumes whatever it is handed. Grown on demand, reused every play.
+U32		*q_snd_scratch		= NULL;
+I64		 q_snd_scratch_size	= 0;
+
+//Where the player is listening from, refreshed each frame by the app.
+F64		 q_snd_listener[3];
+
+U0 QSndInit()
+{//Globals are not zeroed by the JIT, and this table gets walked and freed.
+	I64 i;
+
+	for (i = 0; i < QSND_MAX_CACHE; i++)
+	{
+		q_snd_cache[i].name[0] = 0;
+		q_snd_cache[i].frames  = NULL;
+		q_snd_cache[i].count   = 0;
+	}
+
+	q_snd_count         = 0;
+	q_snd_bytes         = 0;
+	q_snd_played        = 0;
+	q_snd_dropped       = 0;
+	q_snd_scratch       = NULL;
+	q_snd_scratch_size  = 0;
+
+	QVecSet(q_snd_listener, 0.0, 0.0, 0.0);
+}
+
+U0 QSndFree()
+{
+	I64 i;
+
+	for (i = 0; i < QSND_MAX_CACHE; i++)
+	{
+		if (q_snd_cache[i].frames)
+		{
+			Free(q_snd_cache[i].frames);
+			q_snd_cache[i].frames = NULL;
+		}
+		q_snd_cache[i].name[0] = 0;
+		q_snd_cache[i].count   = 0;
+	}
+
+	if (q_snd_scratch)
+	{
+		Free(q_snd_scratch);
+		q_snd_scratch = NULL;
+	}
+
+	q_snd_scratch_size = 0;
+	q_snd_count        = 0;
+	q_snd_bytes        = 0;
+}
+
+I64 QSndDecodeWav(U8 *raw, I64 size, U32 **_frames)
+{//RIFF/WAVE -> 48kHz stereo frames. Returns the frame count, 0 on failure.
+ //Walks the chunk list rather than assuming a 44-byte header, because some
+ //files carry extra chunks before the data.
+	U8	*p;
+	U8	*end;
+	U8	*data     = NULL;
+	I64	 chunk;
+	I64	 channels = 1;
+	I64	 rate     = 11025;
+	I64	 bits     = 8;
+	I64	 dsize    = 0;
+	I64	 in_count;
+	I64	 out_count;
+	I64	 i;
+	I64	 src;
+	I64	 l;
+	I64	 r;
+	U32	*out;
+
+	*_frames = NULL;
+
+	if (size < 44 || MemCompare(raw, "RIFF", 4) || MemCompare(raw + 8, "WAVE", 4))
+		return 0;
+
+	p   = raw + 12;
+	end = raw + size;
+
+	while (p + 8 <= end)
+	{
+		chunk = QRdU32(p + 4);
+
+		//A truncated final chunk is clamped rather than trusted.
+		if (chunk < 0 || p + 8 + chunk > end)
+			chunk = end - (p + 8);
+
+		if (!MemCompare(p, "fmt ", 4) && chunk >= 16)
+		{
+			channels = QRdU16(p + 10);
+			rate     = QRdU32(p + 12);
+			bits     = QRdU16(p + 22);
+		}
+		else if (!MemCompare(p, "data", 4))
+		{
+			data  = p + 8;
+			dsize = chunk;
+		}
+
+		//Chunks are word aligned, so an odd size carries a pad byte.
+		p += 8 + chunk + (chunk & 1);
+	}
+
+	if (!data || channels < 1 || rate < 1 || dsize < 1)
+		return 0;
+	if (bits != 8 && bits != 16)
+		return 0;
+
+	if (bits == 8)
+		in_count = dsize / channels;
+	else
+		in_count = dsize / (channels * 2);
+
+	if (in_count < 1)
+		return 0;
+
+	out_count = in_count * QSND_RATE / rate;
+	if (out_count < 1)
+		return 0;
+
+	out = MAlloc(out_count * sizeof(U32));
+
+	for (i = 0; i < out_count; i++)
+	{
+		//Nearest-source resample. Good enough for short effects, and it avoids
+		//a filter pass on every load.
+		src = i * rate / QSND_RATE;
+		if (src >= in_count)
+			src = in_count - 1;
+
+		if (bits == 8)
+		{
+			//8-bit WAV is UNSIGNED with 128 as silence.
+			l = (data[src * channels] - 128) << 8;
+			if (channels > 1)
+				r = (data[src * channels + 1] - 128) << 8;
+			else
+				r = l;
+		}
+		else
+		{
+			l = QRdI16(data + src * channels * 2);
+			if (channels > 1)
+				r = QRdI16(data + (src * channels + 1) * 2);
+			else
+				r = l;
+		}
+
+		out[i] = (l & 0xFFFF) | (r << 16);
+	}
+
+	*_frames = out;
+
+	return out_count;
+}
+
+CQSound *QSndLoad(U8 *name)
+{//Fetch from cache, decoding on first use.
+	CQSound	*s;
+	U8		*raw;
+	U8		 path[128];
+	I64		 size   = 0;
+	I64		 count;
+	U32		*frames = NULL;
+	I64		 i;
+
+	for (i = 0; i < q_snd_count; i++)
+	{
+		if (!StrICompare(q_snd_cache[i].name, name))
+		{
+			//A cached miss is remembered too, so a missing file is not
+			//re-read from the archive on every single play.
+			if (!q_snd_cache[i].frames)
+				return NULL;
+			return &q_snd_cache[i];
+		}
+	}
+
+	if (q_snd_count >= QSND_MAX_CACHE || q_snd_bytes >= QSND_CACHE_BUDGET)
+		return NULL;
+
+	//QuakeC passes names relative to the sound directory.
+	StrPrint(path, "sound/%s", name);
+
+	raw = QPakData(path, &size);
+	if (raw)
+		count = QSndDecodeWav(raw, size, &frames);
+	else
+		count = 0;
+
+	s = &q_snd_cache[q_snd_count];
+	QStrCopy(s->name, name, 64);
+	s->frames = frames;
+	s->count  = count;
+	q_snd_count++;
+
+	if (frames)
+	{
+		q_snd_bytes += count * sizeof(U32);
+		return s;
+	}
+
+	return NULL;
+}
+
+U0 QSndPlayAt(U8 *name, F64 *origin, F64 volume, F64 attenuation)
+{//Play one sound, attenuated by distance from the listener.
+	CQSound	*s;
+	F64		 d[3];
+	F64		 dist;
+	F64		 gain;
+	I64		 i;
+	I64		 l;
+	I64		 r;
+	I64		 stream;
+
+	if (!q_snd_enabled || !name || !name[0])
+		return;
+
+	s = QSndLoad(name);
+	if (!s || !s->frames || s->count < 1)
+		return;
+
+	gain = volume;
+	if (gain > 1.0)
+		gain = 1.0;
+
+	//A positioned sound fades with distance; attenuation 0 means it plays at
+	//full volume everywhere, which is how QuakeC does music and pickups.
+	if (origin && attenuation > 0.0)
+	{
+		QVecSub(origin, q_snd_listener, d);
+		dist = QVecLength(d);
+		gain = gain * (1.0 - dist * attenuation / QSND_CLIP_DIST);
+	}
+
+	if (gain <= 0.0)
+		return;
+	if (gain > 1.0)
+		gain = 1.0;
+
+	//The mixer consumes the buffer it is given, and the cached copy is shared,
+	//so the scaled result goes into scratch.
+	if (q_snd_scratch_size < s->count)
+	{
+		if (q_snd_scratch)
+			Free(q_snd_scratch);
+		q_snd_scratch      = MAlloc(s->count * sizeof(U32));
+		q_snd_scratch_size = s->count;
+	}
+
+	for (i = 0; i < s->count; i++)
+	{
+		l = s->frames[i] & 0xFFFF;
+		r = (s->frames[i] >> 16) & 0xFFFF;
+
+		//Frames hold packed signed 16-bit halves; sign extend before scaling.
+		if (l & 0x8000)
+			l -= 0x10000;
+		if (r & 0x8000)
+			r -= 0x10000;
+
+		l = ToI64(ToF64(l) * gain);
+		r = ToI64(ToF64(r) * gain);
+
+		q_snd_scratch[i] = (l & 0xFFFF) | ((r & 0xFFFF) << 16);
+	}
+
+	stream = AudioSFXPlay(q_snd_scratch, s->count);
+
+	//Only four streams exist, so a busy moment drops sounds rather than
+	//queueing them. Counted so the cost is visible instead of mysterious.
+	if (stream < 0)
+		q_snd_dropped++;
+	else
+		q_snd_played++;
+}
+
+U0 QSndListener(F64 *origin)
+{
+	QVecCopy(origin, q_snd_listener);
+}

@@ -1,0 +1,658 @@
+//YDE Demo - "DIVINE INTELLECT". A demoscene-style vector intro for y4mOS,
+//and the engine behind the optional screen saver.
+//
+//Run it:      YDEDemo;            (any key / mouse move exits)
+//Screensaver: YDESaverOn(120);    (idle seconds; YDESaverOff to stop)
+//
+//HOW IT DRAWS
+//Like ::/DE/Splash.ZC, this paints through gr.fp_final_screen_update - a hook
+//the Window Manager calls with the finished frame, so we cover everything
+//without fighting z-order or hiding windows.
+//
+//The hook must stay cheap (it runs on the WinMgr's frame path), so it only
+//blits. All rendering happens in a separate task into yd_buf, an offscreen
+//U32 buffer at HALF screen resolution, upscaled 2x on blit. Half res is both
+//the speed budget (a full-screen phosphor-decay pass at 1280x720 is 921K
+//pixels every frame) and the look - chunky pixels are the point.
+//
+//Everything is drawn with YDAdd(), a saturating ADDITIVE blend straight into
+//dc->body (U32 0x00RRGGBB, truecolor tree). Additive is what makes the rest
+//work: overlapping thin lines bloom to white, and the three chromatic-
+//aberration passes recombine to white only where they align.
+//
+//CHROMATIC ABERRATION is real, not a post-filter: each frame projects the
+//mesh three times at slightly different focal lengths - red wide, green
+//nominal, blue narrow - each drawn into its own colour channel. Geometry near
+//the centre lands on itself and reads white; toward the edges the channels
+//separate into red/cyan fringes, exactly like a cheap lens. Cost is 3x the
+//line drawing, which is why the meshes stay low-poly.
+//
+//PHOSPHOR DECAY: the buffer is never cleared, only scaled by 3/4 each frame
+//(two shifts, no divide), so every moving vertex drags a fading trail.
+
+#define YD_W			(GR_WIDTH / 2)		//offscreen buffer is half-res,
+#define YD_H			(GR_HEIGHT / 2)		//blitted 2x - see YDOverlay
+#define YD_MAXV			512
+#define YD_MAXE			1200
+#define YD_STARS		220
+#define YD_SCENES		5
+#define YD_SCENE_SECS	11.0
+
+U32	 *yd_buf	= NULL;		//YD_W * YD_H offscreen, 0x00RRGGBB
+U32	 *yd_row	= NULL;		//one upscaled destination row (2 * YD_W)
+Bool  yd_up		= FALSE;	//overlay installed
+Bool  yd_stop	= FALSE;	//ask the render task to wind down
+Bool  yd_saver_on	= FALSE;
+I64	  yd_saver_secs	= 120;
+U0	(*yd_old_hook)(CDC *dc) = NULL;
+
+//Mesh: plain global arrays rather than a class, so nothing large lands on a
+//task stack. Rebuilt in place whenever the scene changes.
+F64 yd_vx[YD_MAXV], yd_vy[YD_MAXV], yd_vz[YD_MAXV];	//model space
+F64 yd_rx[YD_MAXV], yd_ry[YD_MAXV], yd_rz[YD_MAXV];	//after rotation
+I16 yd_ea[YD_MAXE], yd_eb[YD_MAXE];
+I64 yd_px[YD_MAXV], yd_py[YD_MAXV];		//projected screen coords, per pass
+Bool yd_ok[YD_MAXV];					//vertex survived the near-plane clip
+I64 yd_nv = 0, yd_ne = 0;
+I64 yd_mesh_id = -1;	//which mesh is currently built
+
+F64 yd_sx[YD_STARS], yd_sy[YD_STARS], yd_sz[YD_STARS];
+
+/* ---------------- pixel layer ---------------- */
+
+U0 YDAdd(I64 x, I64 y, I64 r, I64 g, I64 b)
+{//Saturating additive blend of one pixel. Clipped.
+	U32 *p;
+	I64	 c, nr, ng, nb;
+
+	if (x < 0 || y < 0 || x >= YD_W || y >= YD_H)
+		return;
+	p  = yd_buf + y * YD_W + x;
+	c  = *p;
+	nr = (c >> 16 & 0xFF) + r;
+	ng = (c >> 8 & 0xFF) + g;
+	nb = (c & 0xFF) + b;
+	if (nr > 255)
+		nr = 255;
+	if (ng > 255)
+		ng = 255;
+	if (nb > 255)
+		nb = 255;
+	*p = (nr << 16) + (ng << 8) + nb;	//parenthesised: << binds looser than +
+}
+
+U0 YDFade()
+{//Phosphor decay: buf *= 3/4 via two masked shifts, no divide, no clear.
+	I64	 i, n = YD_W * YD_H;
+	U32	 c;
+
+	for (i = 0; i < n; i++)
+	{
+		c = yd_buf[i];
+		if (c)
+			yd_buf[i] = (c >> 1 & 0x7F7F7F) + (c >> 2 & 0x3F3F3F);
+	}
+}
+
+U0 YDLine(I64 x1, I64 y1, I64 x2, I64 y2, I64 r, I64 g, I64 b)
+{//Additive Bresenham. Bails on absurd spans so a vertex behind the camera
+//cannot turn into a million-pixel scanline.
+	I64 dx, dy, sx, sy, err, e2;
+
+	dx = x2 - x1;
+	if (dx < 0)
+		dx = -dx;
+	dy = y2 - y1;
+	if (dy < 0)
+		dy = -dy;
+	if (dx > 4 * YD_W || dy > 4 * YD_H)
+		return;
+	sx = -1;
+	if (x1 < x2)
+		sx = 1;
+	sy = -1;
+	if (y1 < y2)
+		sy = 1;
+	err = dx - dy;
+	while (TRUE)
+	{
+		YDAdd(x1, y1, r, g, b);
+		if (x1 == x2 && y1 == y2)
+			break;
+		e2 = 2 * err;
+		if (e2 > -dy)
+		{
+			err -= dy;
+			x1 += sx;
+		}
+		if (e2 < dx)
+		{
+			err += dx;
+			y1 += sy;
+		}
+	}
+}
+
+U0 YDText(I64 x, I64 y, U8 *st, I64 sc, I64 r, I64 g, I64 b)
+{//System-font text, pixel-upscaled by sc, drawn additively.
+	I64 i, px, py, qx, qy;
+	U64 bits;
+
+	for (i = 0; st[i]; i++)
+	{
+		bits = text.font[st[i]];
+		for (py = 0; py < FONT_HEIGHT; py++)
+			for (px = 0; px < FONT_WIDTH; px++)
+				if (bits >> (py * 8 + px) & 1)
+					for (qy = 0; qy < sc; qy++)
+						for (qx = 0; qx < sc; qx++)
+							YDAdd(x + (i * FONT_WIDTH + px) * sc + qx,
+								  y + py * sc + qy, r, g, b);
+	}
+}
+
+U0 YDTextCA(I64 cx, I64 y, U8 *st, I64 sc, I64 amt)
+{//Centred text with the same red/blue split as the geometry.
+	I64 w = StrLen(st) * FONT_WIDTH * sc, x = cx - w / 2;
+
+	YDText(x - amt, y, st, sc, 200, 0, 0);
+	YDText(x + amt, y, st, sc, 0, 0, 200);
+	YDText(x, y, st, sc, 90, 200, 130);
+}
+
+/* ---------------- mesh builders ---------------- */
+
+U0 YDEdgeAdd(I64 a, I64 b)
+{
+	if (yd_ne >= YD_MAXE)
+		return;
+	yd_ea[yd_ne] = a;
+	yd_eb[yd_ne] = b;
+	yd_ne++;
+}
+
+U0 YDEdgesByLen(F64 target)
+{//Connect every vertex pair whose separation is ~target. Cheaper to write and
+//far less error-prone than transcribing an edge table for a solid.
+	I64 i, j;
+	F64 dx, dy, dz, d2, lo = target * target * 0.85, hi = target * target * 1.15;
+
+	yd_ne = 0;
+	for (i = 0; i < yd_nv; i++)
+		for (j = i + 1; j < yd_nv; j++)
+		{
+			dx = yd_vx[i] - yd_vx[j];
+			dy = yd_vy[i] - yd_vy[j];
+			dz = yd_vz[i] - yd_vz[j];
+			d2 = dx * dx + dy * dy + dz * dz;
+			if (lo < d2 < hi)
+				YDEdgeAdd(i, j);
+		}
+}
+
+U0 YDVert(F64 x, F64 y, F64 z)
+{
+	if (yd_nv >= YD_MAXV)
+		return;
+	yd_vx[yd_nv] = x;
+	yd_vy[yd_nv] = y;
+	yd_vz[yd_nv] = z;
+	yd_nv++;
+}
+
+U0 YDMeshCube()
+{//F64 loop vars throughout: YDVert takes F64, and an implicit I64->F64 at a
+//call site is exactly the class of silent no-op this tree has been bitten by.
+	F64 i, j, k;
+
+	yd_nv = 0;
+	for (i = -1.0; i <= 1.0; i += 2.0)
+		for (j = -1.0; j <= 1.0; j += 2.0)
+			for (k = -1.0; k <= 1.0; k += 2.0)
+				YDVert(i, j, k);
+	YDEdgesByLen(2.0);
+}
+
+U0 YDMeshIco()
+{//Icosahedron: (0, +-1, +-p) and its two cyclic permutations. Edge length 2.
+	F64 p = 1.6180339887;
+	F64 a, b;
+
+	yd_nv = 0;
+	for (a = -1.0; a <= 1.0; a += 2.0)
+		for (b = -1.0; b <= 1.0; b += 2.0)
+		{
+			YDVert(0.0, a, b * p);
+			YDVert(a, b * p, 0.0);
+			YDVert(b * p, 0.0, a);
+		}
+	YDEdgesByLen(2.0);
+}
+
+U0 YDMeshTorus()
+{
+	I64 nu = 20, nv = 10, i, j;
+	F64 R = 1.5, r = 0.55, u, v, cu, su, cv, sv;
+
+	yd_nv = 0;
+	yd_ne = 0;
+	for (i = 0; i < nu; i++)
+		for (j = 0; j < nv; j++)
+		{
+			u  = 2 * pi * ToF64(i) / ToF64(nu);
+			v  = 2 * pi * ToF64(j) / ToF64(nv);
+			cu = Cos(u);
+			su = Sin(u);
+			cv = Cos(v);
+			sv = Sin(v);
+			YDVert((R + r * cv) * cu, (R + r * cv) * su, r * sv);
+		}
+	for (i = 0; i < nu; i++)
+		for (j = 0; j < nv; j++)
+		{//ring-to-ring and around-the-ring, both wrapping
+			YDEdgeAdd(i * nv + j, ((i + 1) % nu) * nv + j);
+			YDEdgeAdd(i * nv + j, i * nv + (j + 1) % nv);
+		}
+}
+
+U0 YDMeshGrid(F64 phase)
+{//Sine terrain. Rebuilt every frame so it undulates - it is only ~380 verts.
+	I64 nx = 22, nz = 16, i, j;
+	F64 x, z;
+
+	yd_nv = 0;
+	yd_ne = 0;
+	for (j = 0; j < nz; j++)
+		for (i = 0; i < nx; i++)
+		{
+			x = ToF64(i - nx / 2) * 0.34;
+			z = ToF64(j - nz / 2) * 0.42;
+			YDVert(x, 0.55 * Sin(x * 1.6 + phase) * Cos(z * 1.2 - phase * 0.7) - 0.7, z);
+		}
+	for (j = 0; j < nz; j++)
+		for (i = 0; i < nx; i++)
+		{
+			if (i + 1 < nx)
+				YDEdgeAdd(j * nx + i, j * nx + i + 1);
+			if (j + 1 < nz)
+				YDEdgeAdd(j * nx + i, (j + 1) * nx + i);
+		}
+}
+
+/* ---------------- 3D ---------------- */
+
+U0 YDRotate(F64 ax, F64 ay, F64 az)
+{
+	I64 i;
+	F64 sa = Sin(ax), ca = Cos(ax);
+	F64 sb = Sin(ay), cb = Cos(ay);
+	F64 sc = Sin(az), cc = Cos(az);
+	F64 x, y, z, x1, y1, z1;
+
+	for (i = 0; i < yd_nv; i++)
+	{
+		x = yd_vx[i];
+		y = yd_vy[i];
+		z = yd_vz[i];
+		y1 = y * ca - z * sa;	//X
+		z1 = y * sa + z * ca;
+		x1 = x * cb + z1 * sb;	//Y
+		z  = z1 * cb - x * sb;
+		x  = x1 * cc - y1 * sc;	//Z
+		y  = x1 * sc + y1 * cc;
+		yd_rx[i] = x;
+		yd_ry[i] = y;
+		yd_rz[i] = z;
+	}
+}
+
+U0 YDDrawChan(F64 dist, F64 focal, I64 r, I64 g, I64 b)
+{//Perspective-project the rotated mesh at one focal length and stroke its
+//edges into one colour channel. Called three times per frame with slightly
+//different focals - that difference IS the chromatic aberration.
+	I64 i, a, e, x1, y1, x2, y2;
+	F64 z, cx = YD_W / 2, cy = YD_H / 2;
+	//px/py/ok are globals, not locals: 512 verts would put ~9K on a task
+	//stack, three times per frame.
+
+	for (i = 0; i < yd_nv; i++)
+	{
+		z = yd_rz[i] + dist;
+		if (z < 0.25)
+		{
+			yd_ok[i] = FALSE;
+			yd_px[i] = 0;
+			yd_py[i] = 0;
+		}
+		else
+		{
+			yd_ok[i] = TRUE;
+			yd_px[i] = ToI64(cx + yd_rx[i] * focal / z);
+			yd_py[i] = ToI64(cy + yd_ry[i] * focal / z);
+		}
+	}
+	for (e = 0; e < yd_ne; e++)
+	{
+		i = yd_ea[e];
+		a = yd_eb[e];
+		if (yd_ok[i] && yd_ok[a])
+		{//ZealC has no `continue` - invert the guard instead
+			x1 = yd_px[i];
+			y1 = yd_py[i];
+			x2 = yd_px[a];
+			y2 = yd_py[a];
+			YDLine(x1, y1, x2, y2, r, g, b);
+		}
+	}
+}
+
+U0 YDDrawCA(F64 dist, F64 focal, F64 amt, I64 bright)
+{//Three passes, one per channel, focal spread by amt.
+	YDDrawChan(dist, focal * (1.0 + amt), bright, 0, 0);
+	YDDrawChan(dist, focal, 0, bright, 0);
+	YDDrawChan(dist, focal * (1.0 - amt), 0, 0, bright);
+}
+
+/* ---------------- starfield ---------------- */
+
+U0 YDStarsInit()
+{
+	I64 i;
+
+	for (i = 0; i < YD_STARS; i++)
+	{
+		yd_sx[i] = ToF64(RandU16 % 4000) / 1000.0 - 2.0;
+		yd_sy[i] = ToF64(RandU16 % 4000) / 1000.0 - 2.0;
+		yd_sz[i] = ToF64(RandU16 % 6000) / 1000.0 + 0.2;
+	}
+}
+
+U0 YDStars(F64 dt, F64 speed)
+{//Classic receding starfield; nearer stars are brighter and streak more.
+	I64 i, x, y, x2, y2, v;
+	F64 z, cx = YD_W / 2, cy = YD_H / 2, f = 260.0;
+
+	for (i = 0; i < YD_STARS; i++)
+	{
+		yd_sz[i] -= dt * speed;
+		if (yd_sz[i] < 0.2)
+		{
+			yd_sx[i] = ToF64(RandU16 % 4000) / 1000.0 - 2.0;
+			yd_sy[i] = ToF64(RandU16 % 4000) / 1000.0 - 2.0;
+			yd_sz[i] = 6.0;
+		}
+		z = yd_sz[i];
+		x = ToI64(cx + yd_sx[i] * f / z);
+		y = ToI64(cy + yd_sy[i] * f / z);
+		v = ToI64(200.0 / (z + 0.4));
+		if (v > 200)
+			v = 200;
+		if (v < 12)
+			v = 12;
+		//short streak toward the vanishing point = motion blur for free
+		x2 = ToI64(cx + yd_sx[i] * f / (z + dt * speed));
+		y2 = ToI64(cy + yd_sy[i] * f / (z + dt * speed));
+		YDLine(x, y, x2, y2, v * 3 / 4, v * 4 / 5, v);
+	}
+}
+
+/* ---------------- scroller ---------------- */
+
+U8 *yd_scroll_msg =
+	"y4mOS / YDE  ...  A ZEALOS FORK IN PURE ZEALC - NO ELF, NO FFI, RING 0 ALL "
+	"THE WAY DOWN  ...  TRUECOLOR FRAMEBUFFER, A WEB BROWSER WITH ITS OWN JS "
+	"ENGINE, AND A COMPILER THAT REBUILDS THE WHOLE SYSTEM AT EVERY BOOT  ...  "
+	"IN MEMORY OF TERRY A. DAVIS, 1969-2018, WHO WROTE AN ENTIRE OPERATING "
+	"SYSTEM BY HIMSELF AND CALLED IT A TEMPLE  ...  AN IDIOT ADMIRES COMPLEXITY, "
+	"A GENIUS ADMIRES SIMPLICITY  ...  GREETINGS TO EVERYONE STILL WRITING "
+	"THEIR OWN OS IN 2026  ...  ";
+
+U0 YDScroller(F64 t)
+{//Sine-warped bottom scroller, one character at a time so each can ride its
+//own point on the wave.
+	I64	 n = StrLen(yd_scroll_msg), i, cw = FONT_WIDTH * 2, x, y;
+	U8	 ch[2];
+	F64	 base = ToF64(YD_W + 40) - t * 78.0;
+	F64	 total = ToF64(n * cw + YD_W + 80);
+	F64	 pos;
+
+	ch[1] = 0;
+	//Wrap the base ONCE per frame. Left to the per-character loop, an hour of
+	//screen-saver uptime means base is ~ -280000 and every glyph re-adds
+	//`total` dozens of times, every frame.
+	while (base < -total)
+		base += total;
+	for (i = 0; i < n; i++)
+	{
+		pos = base + ToF64(i * cw);
+		while (pos < ToF64(-cw))
+			pos += total;	//wrap so the banner is endless
+		x = ToI64(pos);
+		if (-cw <= x <= YD_W)
+		{//only glyphs actually on screen (ZealC has no `continue`)
+			y = ToI64(ToF64(YD_H - 34) + 9.0 * Sin(t * 2.6 + ToF64(i) * 0.32));
+			ch[0] = yd_scroll_msg[i];
+			YDText(x, y, ch, 2, 120, 90, 30);
+			YDText(x, y - 1, ch, 2, 60, 150, 200);
+		}
+	}
+}
+
+/* ---------------- scenes ---------------- */
+
+U0 YDScene(F64 t)
+{
+	I64 sc = ToI64(t / YD_SCENE_SECS) % YD_SCENES;
+	F64 lt = t - ToF64(ToI64(t / YD_SCENE_SECS)) * YD_SCENE_SECS; //time in scene
+	F64 pulse = 0.5 + 0.5 * Sin(t * 3.1);	//stands in for a beat
+	F64 amt, dist;
+	I64 cx = YD_W / 2;
+
+	switch (sc)
+	{
+		case 0:	//icosahedron, gentle
+			if (yd_mesh_id != 0)
+			{
+				YDMeshIco;
+				yd_mesh_id = 0;
+			}
+			YDRotate(t * 0.5, t * 0.73, t * 0.21);
+			dist = 4.8 + 1.0 * Sin(t * 0.7);
+			YDDrawCA(dist, 235.0, 0.012 + 0.010 * pulse, 150);
+			YDTextCA(cx, 30, "y4mOS", 5, 2);
+			YDTextCA(cx, 78, "DIVINE INTELLECT", 2, 1);
+			break;
+
+		case 1:	//cube, hard aberration, tumbling in close
+			if (yd_mesh_id != 1)
+			{
+				YDMeshCube;
+				yd_mesh_id = 1;
+			}
+			YDRotate(t * 1.1, t * 0.8, t * 0.6);
+			dist = 4.2 + 1.8 * Sin(lt * 0.9);
+			amt	 = 0.030 + 0.026 * pulse;
+			YDDrawCA(dist, 210.0, amt, 170);
+			YDTextCA(cx, 30, "ZEALC ONLY", 3, 3);
+			YDTextCA(cx, 66, "NO ELF   NO FFI   NO EXCUSES", 2, 1);
+			break;
+
+		case 2:	//torus
+			if (yd_mesh_id != 2)
+			{
+				YDMeshTorus;
+				yd_mesh_id = 2;
+			}
+			//Fixed tilt + single-axis spin: tumbling on all three axes kept
+			//catching the ring edge-on, where a torus just reads as a pill.
+			YDRotate(0.65 + 0.30 * Sin(t * 0.45), t * 0.35, 0);
+			dist = 4.6 + 0.7 * Sin(t * 0.55);
+			YDDrawCA(dist, 250.0, 0.014 + 0.012 * pulse, 130);
+			YDTextCA(cx, 30, "ZEALOS", 4, 2);
+			YDTextCA(cx, 72, "COMPILES ITSELF AT EVERY BOOT", 2, 1);
+			break;
+
+		case 3:	//flying over sine terrain
+			YDMeshGrid(t * 1.7);	//rebuilt per frame: it has to move
+			yd_mesh_id = 3;
+			YDRotate(0.62, t * 0.10, 0);
+			YDDrawCA(3.4, 230.0, 0.016 + 0.014 * pulse, 120);
+			YDTextCA(cx, 26, "TEMPLEOS", 4, 2);
+			YDTextCA(cx, 68, "640x480  16 COLORS  BY DESIGN", 2, 1);
+			break;
+
+		case 4:	//tribute: fast spin, pulls away
+			if (yd_mesh_id != 4)
+			{
+				YDMeshIco;
+				yd_mesh_id = 4;
+			}
+			YDRotate(t * 1.6, t * 1.9, t * 0.9);
+			dist = 4.2 + lt * 0.30;
+			YDDrawCA(dist, 230.0, 0.010 + 0.030 * pulse, 160);
+			YDTextCA(cx, 28, "TERRY A. DAVIS", 3, 2);
+			YDTextCA(cx, 64, "1969 - 2018", 2, 1);
+			YDTextCA(cx, YD_H / 2 + 96, "AN IDIOT ADMIRES COMPLEXITY", 1, 1);
+			YDTextCA(cx, YD_H / 2 + 110, "A GENIUS ADMIRES SIMPLICITY", 1, 1);
+			break;
+
+		default:
+			//Unreachable (sc is % YD_SCENES), but a HolyC switch throws on an
+			//unmatched value and this runs unattended as a screen saver.
+			break;
+	}
+}
+
+/* ---------------- overlay + task ---------------- */
+
+U0 YDOverlay(CDC *dc)
+{//WinMgr frame hook: blit only, 2x nearest upscale. Each source row is
+//doubled once into yd_row, then MemCopy'd to both destination rows.
+	I64	 y, x, dw = YD_W * 2;
+	U32	*src, *d0;
+
+	if (yd_up && yd_buf && yd_row)
+	{
+		if (dw > dc->width)
+			dw = dc->width;
+		for (y = 0; y < YD_H; y++)
+		{
+			if (2 * y + 1 >= dc->height)
+				break;
+			src = yd_buf + y * YD_W;
+			for (x = 0; x < YD_W; x++)
+			{
+				yd_row[2 * x]	  = src[x];
+				yd_row[2 * x + 1] = src[x];
+			}
+			d0 = dc->body + (2 * y) * dc->width_internal;
+			MemCopy(d0, yd_row, dw * sizeof(U32));
+			MemCopy(d0 + dc->width_internal, yd_row, dw * sizeof(U32));
+		}
+	}
+	if (yd_old_hook)
+		(*yd_old_hook)(dc);
+}
+
+U0 YDRenderTask()
+{//Owns the animation and the teardown. Exits on any key or mouse activity.
+	F64	 t0 = tS, t, prev = 0, dt;
+	I64	 snap = kbd.last_down_scan_code;
+	I64	 mx = mouse.pos.x, my = mouse.pos.y;
+
+	while (!yd_stop)
+	{
+		t  = tS - t0;
+		dt = t - prev;
+		if (dt > 0.15)
+			dt = 0.15;	//a long stall must not teleport the starfield
+		prev = t;
+
+		YDFade;
+		YDStars(dt, 1.15);
+		YDScene(t);
+		YDScroller(t);
+
+		if (t > 0.7)
+		{//grace period so the keypress that launched it does not close it
+			if (kbd.last_down_scan_code != snap || mouse.lb || mouse.rb ||
+				mouse.pos.x != mx || mouse.pos.y != my)
+				break;
+		}
+		Sleep(28);	//~30fps target
+	}
+
+	yd_up = FALSE;
+	gr.fp_final_screen_update = yd_old_hook;
+	yd_old_hook = NULL;
+	Sleep(80);	//let the in-flight frame finish reading the buffer
+	if (yd_buf)
+	{
+		Free(yd_buf);
+		yd_buf = NULL;
+	}
+	if (yd_row)
+	{
+		Free(yd_row);
+		yd_row = NULL;
+	}
+	yd_mesh_id = -1;
+}
+
+public U0 YDEDemo()
+{//Start the demo. Returns immediately; it runs in its own task.
+	if (yd_up)
+		return;
+	yd_buf = MAlloc(YD_W * YD_H * sizeof(U32), sys_task);
+	yd_row = MAlloc(YD_W * 2 * sizeof(U32), sys_task);
+	MemSet(yd_buf, 0, YD_W * YD_H * sizeof(U32));	//globals are not zeroed
+	yd_nv = 0;
+	yd_ne = 0;
+	yd_mesh_id = -1;
+	YDStarsInit;
+
+	yd_stop		= FALSE;
+	yd_old_hook	= gr.fp_final_screen_update;
+	yd_up		= TRUE;
+	gr.fp_final_screen_update = &YDOverlay;
+	Spawn(&YDRenderTask, NULL, "YDE Demo");
+}
+
+/* ---------------- screen saver ---------------- */
+
+U0 YDESaverTask()
+{//Poll for idle. Any key, button or mouse movement resets the countdown.
+	I64	 snap = kbd.last_down_scan_code;
+	I64	 mx = mouse.pos.x, my = mouse.pos.y;
+	F64	 idle0 = tS;
+
+	while (yd_saver_on)
+	{
+		if (kbd.last_down_scan_code != snap || mouse.lb || mouse.rb ||
+			mouse.pos.x != mx || mouse.pos.y != my)
+		{
+			snap  = kbd.last_down_scan_code;
+			mx	  = mouse.pos.x;
+			my	  = mouse.pos.y;
+			idle0 = tS;
+		}
+		else if (!yd_up && tS - idle0 >= ToF64(yd_saver_secs))
+			YDEDemo;
+		Sleep(400);
+	}
+}
+
+public U0 YDESaverOn(I64 secs=120)
+{//Enable the screen saver after `secs` idle seconds.
+	yd_saver_secs = secs;
+	if (yd_saver_on)
+		return;
+	yd_saver_on = TRUE;
+	Spawn(&YDESaverTask, NULL, "YDE Saver");
+}
+
+public U0 YDESaverOff()
+{
+	yd_saver_on = FALSE;
+	yd_stop		= TRUE;
+}
