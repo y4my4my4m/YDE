@@ -210,6 +210,246 @@ I64 QGameSpawnEntities(CQMap *map)
 	return spawned;
 }
 
+//--- entity physics --------------------------------------------------------
+//
+// Think functions decide what an entity WANTS to do; physics is what actually
+// moves it. Without this pass a rocket gets a velocity, animates, and expires
+// on schedule while hanging motionless in the air - and doors never travel.
+//
+// Each entity's .movetype selects the rule, exactly as the original server
+// does. The important distinction is between things that simply translate
+// (NOCLIP, PUSH), things that fall (TOSS, BOUNCE, STEP), and things that must
+// report a collision to QuakeC so it can explode them (FLYMISSILE).
+
+#define QMOVETYPE_NONE			0
+#define QMOVETYPE_ANGLENOCLIP	1
+#define QMOVETYPE_ANGLECLIP		2
+#define QMOVETYPE_WALK			3
+#define QMOVETYPE_STEP			4
+#define QMOVETYPE_FLY			5
+#define QMOVETYPE_TOSS			6
+#define QMOVETYPE_PUSH			7
+#define QMOVETYPE_NOCLIP		8
+#define QMOVETYPE_FLYMISSILE	9
+#define QMOVETYPE_BOUNCE		10
+
+#define QSOLID_NOT_			0
+#define QSOLID_TRIGGER_		1
+#define QSOLID_BBOX_		2
+#define QSOLID_SLIDEBOX_	3
+#define QSOLID_BSP_			4
+
+#define QPHYS_SV_GRAVITY	800.0
+#define QFL_ONGROUND_		512
+
+U0 QGameCallTouch(I64 self_ent, I64 other_ent)
+{//Run an entity's touch function with the pair the original would pass.
+	I64 fn = QPrFieldI(self_ent, q_fld_touch);
+
+	if (fn <= 0 || fn >= q_pr_num_functions)
+		return;
+
+	QPrSetI(q_ofs_self, QPrEdictValue(self_ent));
+	QPrSetI(q_ofs_other, QPrEdictValue(other_ent));
+	QPrExecute(fn);
+	q_pr_error = FALSE;
+}
+
+I64 QGameEntityAt(I64 mover, F64 *point)
+{//Which solid entity, if any, contains this point. Only the world is traced
+ //geometrically, so this is what lets a rocket hit a monster at all.
+	F64 eorg[3];
+	F64 emins[3];
+	F64 emaxs[3];
+	I64 i;
+	I64 j;
+	I64 solid;
+	I64 owner;
+	Bool inside;
+
+	owner = QPrEdictNum(QPrFieldI(mover, q_fld_owner));
+
+	for (i = 1; i < q_pr_num_edicts; i++)
+	{
+		if (q_pr_edict_free[i] || i == mover)
+			goto qe_next;
+
+		//A rocket must not detonate on the player who fired it.
+		if (i == owner)
+			goto qe_next;
+
+		solid = ToI64(QPrFieldF(i, q_fld_solid));
+		if (solid != QSOLID_BBOX_ && solid != QSOLID_SLIDEBOX_)
+			goto qe_next;
+
+		eorg[0] = QPrFieldF(i, q_fld_origin);
+		eorg[1] = QPrFieldF(i, q_fld_origin + 1);
+		eorg[2] = QPrFieldF(i, q_fld_origin + 2);
+
+		inside = TRUE;
+		for (j = 0; j < 3; j++)
+		{
+			emins[j] = eorg[j] + QPrFieldF(i, q_fld_mins + j);
+			emaxs[j] = eorg[j] + QPrFieldF(i, q_fld_maxs + j);
+
+			if (point[j] < emins[j] || point[j] > emaxs[j])
+				inside = FALSE;
+		}
+
+		if (inside)
+			return i;
+
+qe_next:
+	}
+
+	return -1;
+}
+
+U0 QGamePhysicsEntity(I64 ent, F64 dt)
+{//One entity, one tick.
+	CQTrace	tr;
+	F64		origin[3];
+	F64		velocity[3];
+	F64		avelocity[3];
+	F64		end[3];
+	F64		grav;
+	I64		movetype;
+	I64		hit;
+	I64		j;
+
+	movetype = ToI64(QPrFieldF(ent, q_fld_movetype));
+
+	//The player is moved by the engine's own player code, and NONE means the
+	//entity is deliberately static.
+	if (movetype == QMOVETYPE_NONE || movetype == QMOVETYPE_WALK ||
+		ent == q_player_edict)
+		return;
+
+	for (j = 0; j < 3; j++)
+	{
+		origin[j]    = QPrFieldF(ent, q_fld_origin + j);
+		velocity[j]  = QPrFieldF(ent, q_fld_velocity + j);
+		avelocity[j] = QPrFieldF(ent, q_fld_avelocity + j);
+	}
+
+	//Spinning applies to everything that has an angular velocity - it is what
+	//makes rockets and gibs tumble.
+	if (avelocity[0] != 0.0 || avelocity[1] != 0.0 || avelocity[2] != 0.0)
+	{
+		for (j = 0; j < 3; j++)
+			QPrSetFieldF(ent, q_fld_angles + j,
+				QAngleNorm(QPrFieldF(ent, q_fld_angles + j) +
+					avelocity[j] * dt));
+	}
+
+	if (movetype == QMOVETYPE_ANGLENOCLIP || movetype == QMOVETYPE_ANGLECLIP)
+		return;		//angles only, no translation
+
+	//Gravity, scaled by the entity's own multiplier where it has one.
+	if (movetype == QMOVETYPE_TOSS || movetype == QMOVETYPE_BOUNCE ||
+		movetype == QMOVETYPE_STEP)
+	{
+		grav = QPrFieldF(ent, q_fld_gravity);
+		if (grav <= 0.0)
+			grav = 1.0;
+
+		//A STEP entity resting on the floor should not accumulate fall speed.
+		if (movetype != QMOVETYPE_STEP ||
+			!(ToI64(QPrFieldF(ent, q_fld_flags)) & QFL_ONGROUND_))
+			velocity[2] -= QPHYS_SV_GRAVITY * grav * dt;
+	}
+
+	if (velocity[0] == 0.0 && velocity[1] == 0.0 && velocity[2] == 0.0)
+	{
+		QPrSetFieldF(ent, q_fld_velocity + 2, velocity[2]);
+		return;
+	}
+
+	QVecMA(origin, dt, velocity, end);
+
+	//NOCLIP and PUSH pass through geometry: PUSH is how doors and platforms
+	//travel, and they are meant to move through their own brush volume.
+	if (movetype == QMOVETYPE_NOCLIP || movetype == QMOVETYPE_PUSH)
+	{
+		for (j = 0; j < 3; j++)
+			QPrSetFieldF(ent, q_fld_origin + j, end[j]);
+
+		QPrSetFieldF(ent, q_fld_velocity + 2, velocity[2]);
+
+		//Brush movers run their think on their own local clock.
+		if (movetype == QMOVETYPE_PUSH && q_fld_ltime >= 0)
+			QPrSetFieldF(ent, q_fld_ltime, QPrFieldF(ent, q_fld_ltime) + dt);
+
+		return;
+	}
+
+	//Everything else sweeps against the world.
+	QTraceMove(q_bi_map, origin, end, &tr);
+
+	//Did it pass through a solid entity on the way?
+	hit = QGameEntityAt(ent, tr.end_pos);
+
+	for (j = 0; j < 3; j++)
+		QPrSetFieldF(ent, q_fld_origin + j, tr.end_pos[j]);
+
+	if (tr.fraction < 1.0 || hit >= 0)
+	{
+		if (movetype == QMOVETYPE_BOUNCE)
+		{
+			//Reflect and lose energy; QuakeC stops the entity itself once it
+			//is slow enough.
+			QClipVelocity(velocity, tr.plane_normal, 1.5, velocity);
+			for (j = 0; j < 3; j++)
+				QPrSetFieldF(ent, q_fld_velocity + j, velocity[j]);
+		}
+		else if (movetype == QMOVETYPE_TOSS || movetype == QMOVETYPE_STEP)
+		{
+			//Slide along the surface and mark it grounded when it lands flat.
+			QClipVelocity(velocity, tr.plane_normal, 1.0, velocity);
+			for (j = 0; j < 3; j++)
+				QPrSetFieldF(ent, q_fld_velocity + j, velocity[j]);
+
+			if (tr.plane_normal[2] > 0.7)
+				QPrSetFieldF(ent, q_fld_flags,
+					ToF64(ToI64(QPrFieldF(ent, q_fld_flags)) | QFL_ONGROUND_));
+		}
+		else
+		{
+			//FLY and FLYMISSILE just stop; the touch handler decides what that
+			//means, which for a rocket is exploding.
+			for (j = 0; j < 3; j++)
+				QPrSetFieldF(ent, q_fld_velocity + j, 0.0);
+		}
+
+		//Tell QuakeC about the collision. Touching the world is entity 0,
+		//which is exactly what the missile code expects.
+		if (hit >= 0)
+		{
+			QGameCallTouch(ent, hit);
+			QGameCallTouch(hit, ent);
+		}
+		else
+			QGameCallTouch(ent, 0);
+	}
+	else
+	{
+		for (j = 0; j < 3; j++)
+			QPrSetFieldF(ent, q_fld_velocity + j, velocity[j]);
+	}
+}
+
+U0 QGameRunPhysics(F64 dt)
+{//Move every entity that has a movetype. Entities can be removed by a touch
+ //handler mid-pass, so the free flag is rechecked each step.
+	I64 i;
+
+	for (i = 1; i < q_pr_num_edicts; i++)
+	{
+		if (!q_pr_edict_free[i])
+			QGamePhysicsEntity(i, dt);
+	}
+}
+
 U0 QGameRunThinks()
 {//Run every think that has come due. Entities can spawn or free others while
  //this runs, so the bound is re-read each iteration.
@@ -269,6 +509,10 @@ U0 QGameFrame(F64 dt)
 			q_pr_error = FALSE;
 	}
 
+	//Physics before thinks, matching the server order: an entity moves, its
+	//touch handlers fire, and only then does its think decide what happens
+	//next. Reversing this makes rockets explode a tick late.
+	QGameRunPhysics(dt);
 	QGameRunThinks;
 }
 
@@ -416,6 +660,12 @@ U0 QGameDrawEntities(CQCanvas *c, CQMap *map, F64 *view_origin, F64 max_dist)
 	for (i = 1; i < q_pr_num_edicts; i++)
 	{
 		if (q_pr_edict_free[i])
+			goto qg_next;
+
+		//Never draw the player's own body in first person. QuakeC gives the
+		//client progs/player.mdl so other players and demos can see it, but
+		//from inside the head it just wraps the camera in geometry.
+		if (i == q_player_edict)
 			goto qg_next;
 
 		idx = ToI64(QPrFieldF(i, q_fld_modelindex));

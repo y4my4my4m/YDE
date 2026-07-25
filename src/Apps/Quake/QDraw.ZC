@@ -41,7 +41,7 @@ class CQScreenVert
 
 class CQCanvas
 {
-	U8	*pixels;		//QSCR_W * QSCR_H indices
+	U8	*pixels;		//width * height palette indices
 	F64	*depth;			//1/z, larger is nearer
 	I64	 width;
 	I64	 height;
@@ -60,14 +60,21 @@ class CQCanvas
 	I64	 spans_drawn;
 };
 
-CQCanvas *QDrawNew()
-{
+CQCanvas *QDrawNew(I64 w, I64 h)
+{//The render target is allocated at whatever size is asked for. Cost scales
+ //with the pixel count, so this is the main performance dial: 640x480 is four
+ //times the work of 320x240.
 	CQCanvas *c = CAlloc(sizeof(CQCanvas));
 
-	c->width  = QSCR_W;
-	c->height = QSCR_H;
-	c->pixels = CAlloc(QSCR_W * QSCR_H);
-	c->depth  = CAlloc(QSCR_W * QSCR_H * sizeof(F64));
+	if (w < 64)		w = 64;
+	if (h < 64)		h = 64;
+	if (w > 1920)	w = 1920;
+	if (h > 1200)	h = 1200;
+
+	c->width  = w;
+	c->height = h;
+	c->pixels = CAlloc(w * h);
+	c->depth  = CAlloc(w * h * sizeof(F64));
 
 	return c;
 }
@@ -161,11 +168,12 @@ I64 QDrawClipNear(CQPolyVert *in, I64 count, CQPolyVert *out)
 U0 QDrawSpan(CQCanvas *c, I64 y, I64 x1, I64 x2,
 	F64 iz1, F64 soz1, F64 toz1, F64 iz2, F64 soz2, F64 toz2,
 	CQTexture *tex, U8 *lightmap, I64 lm_w, I64 lm_h,
-	F64 mins_s, F64 mins_t, I64 flat_light)
+	F64 mins_s, F64 mins_t, I64 flat_light, I64 mip)
 {//Fill one horizontal run. HOT LOOP: this is the function to subdivide and
  //then rewrite in assembly. Everything else runs a few thousand times a
  //frame; this runs a few hundred thousand.
 	U8	*row;
+	U8	*texels;
 	F64	*zrow;
 	F64	 span;
 	F64	 d_iz;
@@ -226,9 +234,23 @@ U0 QDrawSpan(CQCanvas *c, I64 y, I64 x1, I64 x2,
 	if (x1 >= x2)
 		return;
 
-	tw = tex->width;
-	th = tex->height;
-	if (tw <= 0 || th <= 0 || !tex->texels[0])
+	//Mip selection. The BSP ships four levels per texture, each half the size
+	//of the last; using the smaller ones on distant surfaces removes the
+	//shimmer of point sampling and is faster, because far-away geometry then
+	//walks a texture small enough to stay in cache.
+	if (mip < 0)
+		mip = 0;
+	if (mip > 3)
+		mip = 3;
+
+	while (mip > 0 && !tex->texels[mip])
+		mip--;
+
+	texels = tex->texels[mip];
+	tw     = tex->width >> mip;
+	th     = tex->height >> mip;
+
+	if (tw <= 0 || th <= 0 || !texels)
 		return;
 
 	clamp_tex = tex->clamp;
@@ -293,8 +315,12 @@ U0 QDrawSpan(CQCanvas *c, I64 y, I64 x1, I64 x2,
 			//Floor rather than ToI64: ToI64 truncates toward zero, which lands
 			//on the wrong texel for negative coordinates and leaves a
 			//one-texel seam wherever s or t crosses 0.
-			tx = ToI64(Floor(s));
-			ty = ToI64(Floor(t));
+			//
+			//s and t stay in level-0 texel space and are shifted down to the
+			//chosen mip here, so the lightmap lookup below - which needs the
+			//unshifted values - is unaffected.
+			tx = ToI64(Floor(s)) >> mip;
+			ty = ToI64(Floor(t)) >> mip;
 
 			if (clamp_tex)
 			{
@@ -310,7 +336,7 @@ U0 QDrawSpan(CQCanvas *c, I64 y, I64 x1, I64 x2,
 				ty = ty & (th - 1);
 			}
 
-			texel = tex->texels[0][ty * tw + tx];
+			texel = texels[ty * tw + tx];
 
 			if (lightmap && lm_w > 0 && lm_h > 0)
 			{
@@ -356,7 +382,7 @@ U0 QDrawSpan(CQCanvas *c, I64 y, I64 x1, I64 x2,
 
 U0 QDrawPolygon(CQCanvas *c, CQScreenVert *v, I64 count,
 	CQTexture *tex, U8 *lightmap, I64 lm_w, I64 lm_h,
-	F64 mins_s, F64 mins_t, I64 flat_light)
+	F64 mins_s, F64 mins_t, I64 flat_light, I64 mip)
 {//Scanline fill of a convex polygon. For each row every edge is intersected
  //and the extreme hits become the span. O(edges) per row, but after clipping
  //there are rarely more than eight edges, and it sidesteps the bookkeeping
@@ -457,7 +483,7 @@ U0 QDrawPolygon(CQCanvas *c, CQScreenVert *v, I64 count,
 		{
 			QDrawSpan(c, y, ToI64(Ceil(xl)), ToI64(Ceil(xr)),
 				izl, sozl, tozl, izr, sozr, tozr,
-				tex, lightmap, lm_w, lm_h, mins_s, mins_t, flat_light);
+				tex, lightmap, lm_w, lm_h, mins_s, mins_t, flat_light, mip);
 		}
 	}
 }
@@ -758,6 +784,9 @@ U0 QDrawFace(CQCanvas *c, CQMap *map, I64 face_index)
 	I64			 lm_h = 0;
 	I64			 i;
 	I64			 e;
+	I64			 mip;
+	F64			 near_z;
+	F64			 ratio;
 
 	if (f->num_edges < 3 || f->num_edges > QMAX_POLY_VERTS)
 		return;
@@ -827,10 +856,32 @@ U0 QDrawFace(CQCanvas *c, CQMap *map, I64 face_index)
 		QDrawSkyPolygon(c, scr, count, tex);
 	else
 	{
+		//Pick a mip from how far the nearest part of the surface is, measured
+		//relative to the projection scale so the choice holds at any
+		//resolution: a wall that fills the screen at 320 wide must not drop to
+		//a blurrier level just because the render target grew.
+		near_z = 1.0e30;
+		for (i = 0; i < count; i++)
+		{
+			if (clipped[i].cam[2] < near_z)
+				near_z = clipped[i].cam[2];
+		}
+
+		ratio = near_z / c->x_scale;
+
+		if (ratio < 0.5)
+			mip = 0;
+		else if (ratio < 1.5)
+			mip = 1;
+		else if (ratio < 4.0)
+			mip = 2;
+		else
+			mip = 3;
+
 		//Unlit faces (anything the compiler left without a lightmap) render
 		//fullbright, matching how they look in the original.
 		QDrawPolygon(c, scr, count, tex, lightmap, lm_w, lm_h,
-			f->mins_s, f->mins_t, 255);
+			f->mins_s, f->mins_t, 255, mip);
 	}
 
 	c->faces_drawn++;

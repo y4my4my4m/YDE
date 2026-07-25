@@ -1,4 +1,4 @@
-# YKD SSH Client — User Guide
+# YKD SSH Client - User Guide
 
 An SSH-2 client for ZealOS/YKD: interactive shells, one-off commands, and
 Ed25519 public-key authentication. Password and public-key auth are supported.
@@ -30,7 +30,7 @@ auth, channel, keygen, and terminal modules.
 Before trusting anything, run the built-in self-tests.
 
 ```
-SSHCryptoTest;            // SHA-512 + Ed25519 known-answer tests — both must be GREEN
+SSHCryptoTest;            // SHA-512 + Ed25519 known-answer tests - both must be GREEN
 SSHTransportTest("HOST", 22);   // full handshake + cipher against a real server
 ```
 
@@ -103,7 +103,7 @@ This:
 ssh-ed25519 AAAAC3NzaC1lZDI1NTE5AAAAI... YKD@zealos
 ```
 
-> Keys live in a **visible** directory (`C:/Home/Config/SSH/`) — no hidden
+> Keys live in a **visible** directory (`C:/Home/Config/SSH/`) - no hidden
 > dotfolders. This is deliberate: ZealOS is flat and everything-is-visible.
 
 ### 5.2 Install the public key on the server
@@ -117,7 +117,7 @@ echo 'ssh-ed25519 AAAA... YKD@zealos' >> ~/.ssh/authorized_keys
 chmod 600 ~/.ssh/authorized_keys
 ```
 
-(Getting the key text out of the VM: use the network clipboard —
+(Getting the key text out of the VM: use the network clipboard -
 `ClipCopy` after `SSHKeyShow`, see `Programs/Clip`.)
 
 ### 5.3 Use it
@@ -159,18 +159,18 @@ SSHKeyShow;     // reprint the public authorized_keys line for the loaded key
 
 ## 7. Troubleshooting
 
-- **"Transport handshake failed" / stops at ECDH** — usually an algorithm
+- **"Transport handshake failed" / stops at ECDH** - usually an algorithm
   mismatch. The client offers `curve25519-sha256` + `chacha20-poly1305` only.
   Very old servers that disable these will drop the connection. Check the
   inline `[ssh]` stage and the Network Log.
-- **"Authentication failed"** — wrong password, or the public key isn't in the
+- **"Authentication failed"** - wrong password, or the public key isn't in the
   server's `authorized_keys`, or the server disallows the user (e.g. root login
   disabled).
-- **Nothing prints / freezes** — the network fetch/handshake blocks the
+- **Nothing prints / freezes** - the network fetch/handshake blocks the
   terminal; give it a few seconds. If it never returns, the server/port may be
   unreachable (from the QEMU guest, a LAN host is only reachable if the host
   itself can reach it).
-- **`SSHCryptoTest` red** — do not use public-key auth; the crypto build is
+- **`SSHCryptoTest` red** - do not use public-key auth; the crypto build is
   wrong. Report it.
 
 ---

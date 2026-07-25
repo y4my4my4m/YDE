@@ -1,15 +1,15 @@
-# YKD Git Client — User Guide
+# YKD Git Client - User Guide
 
 A git client for ZealOS/YKD. Clones repositories two ways:
 
-- **over HTTPS** (`GitClone`) — uses the TLS/HTTP stack, no auth needed for
+- **over HTTPS** (`GitClone`) - uses the TLS/HTTP stack, no auth needed for
   public repos.
-- **over SSH** (`GitCloneSSH`) — uses the SSH client + your Ed25519 key, like
+- **over SSH** (`GitCloneSSH`) - uses the SSH client + your Ed25519 key, like
   `git clone git@host:repo.git`.
 
 It fetches the packfile, inflates and delta-resolves the objects, and writes
 the working tree to disk. It does **not** create a `.git` directory or loose
-objects (ZealOS has no DEFLATE encoder) — you get the checked-out files.
+objects (ZealOS has no DEFLATE encoder) - you get the checked-out files.
 
 ---
 
@@ -34,7 +34,7 @@ SHA1Test;        // GREEN = object naming is sound
 
 ## 2. List remote refs
 
-The lightest operation — good for checking connectivity and that a repo is
+The lightest operation - good for checking connectivity and that a repo is
 reachable:
 
 ```
@@ -80,7 +80,7 @@ GitFetchToFile("https://host/user/repo", "::/Tmp/repo.pack");
 ## 4. Clone over SSH
 
 This works like `git clone git@host:repo.git` and uses your **Ed25519 key**
-(no password). You must set the key up first — see §5.
+(no password). You must set the key up first - see §5.
 
 ### 4.1 Load the SSH + git + bridge modules
 
@@ -95,7 +95,7 @@ then the bridge:
 
 ### 4.2 Clone
 
-`GitCloneSSH` does **not** take a `git@host:repo` URL string — split it into
+`GitCloneSSH` does **not** take a `git@host:repo` URL string - split it into
 `(host, port, user, repo)`:
 
 ```
@@ -125,13 +125,13 @@ GitCloneSSH(host, port, user, repo, dir=NULL, password=NULL)
 | before `@` | `user` | `git` |
 | after `:` | `repo` | `y4my4my4m/procpixel.git` |
 
-- `user` — the SSH login (almost always `git` on GitHub/gitea; sometimes
+- `user` - the SSH login (almost always `git` on GitHub/gitea; sometimes
   `root` on a homemade server).
-- `repo` — the **server-side path** to the bare repository: GitHub-style
+- `repo` - the **server-side path** to the bare repository: GitHub-style
   `owner/name.git`, or an absolute path like `/srv/git/project.git`. Not a
   full URL.
-- `dir` — target directory (default `<cwd>/<repo-name>`).
-- `password` — optional; only needed if you have **no** key on the server.
+- `dir` - target directory (default `<cwd>/<repo-name>`).
+- `password` - optional; only needed if you have **no** key on the server.
 
 Password fallback (no key):
 
@@ -186,7 +186,7 @@ a reboot, run `SSHKeyLoad;` once to reload the key into memory.
 
 ## 7. Notes & limitations
 
-- **Read-only clone.** No `push`, no commit, no `.git` metadata — you get the
+- **Read-only clone.** No `push`, no commit, no `.git` metadata - you get the
   working tree of the default branch (`HEAD`).
 - **Default branch only.** It fetches whatever `HEAD` points to.
 - **GitHub over HTTPS** sometimes gates on a `git/` User-Agent. If `GitLsRemote`
@@ -196,7 +196,7 @@ a reboot, run `SSHKeyLoad;` once to reload the key into memory.
   with any git install) and read access to the repo.
 - Big repositories: the network fetch and delta resolution can take a while;
   progress prints during unpack/checkout, and Esc cancels those phases.
-- The working tree is written directly — existing files in the target are
+- The working tree is written directly - existing files in the target are
   overwritten (you're warned if the directory already exists).
 
 ---

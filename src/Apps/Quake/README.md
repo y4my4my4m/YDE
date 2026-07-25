@@ -16,7 +16,7 @@ the game-logic SDK is public.
 ## Game data
 
 `id1/PAK0.PAK` is the shareware archive (id's freely redistributable episode 1).
-It is gitignored — fetch it separately:
+It is gitignored - fetch it separately:
 
     curl -O https://ftp.gwdg.de/pub/misc/ftp.idsoftware.com/idstuff/quake/quake106.zip
     unzip quake106.zip                 # yields resource.1, an LHA self-extractor
