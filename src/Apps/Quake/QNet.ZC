@@ -1,0 +1,315 @@
+// QNet.ZC - message buffers and the loopback link.
+//
+// FIRST STEP of the client/server split, and deliberately only that.
+//
+// The engine currently simulates the world straight against engine globals -
+// q_origin, q_angles, q_velocity - with the renderer reading the same variables
+// the physics writes. That works for one player on one machine and cannot be
+// extended: a second client has no way to be told what happened, and a demo
+// file is nothing but a recording of those tellings.
+//
+// So the split is introduced from the BOTTOM: a byte-level message writer and
+// reader matching the original's wire format, plus a loopback link that hands a
+// written message straight back to the reader on the same machine. Nothing goes
+// over a socket yet. That ordering is on purpose - it makes the protocol layer
+// testable with no network involved, and the pieces that follow (a real server
+// edict list, then UDP) plug into an interface that has already been exercised.
+//
+// The formats are the original's, because both demos and other Quake clients
+// depend on them exactly:
+//
+//   coord  16-bit signed, 1/8 unit    (MSG_WriteCoord: (int)(f*8))
+//   angle  8-bit,  256 units per turn (MSG_WriteAngle: (int)(f*256/360) & 255)
+//   short  16-bit little endian
+//   long   32-bit little endian
+//
+// A coordinate therefore has a range of +/- 4096 units and a resolution of an
+// eighth, which is why the original nudges the view by 1/32 to keep it off
+// node planes - the protocol simply cannot express a finer position.
+
+#define QNET_MAX_MSG		8192	//one datagram, matching MAX_DATAGRAM
+#define QNET_MAX_BACKLOG	4		//loopback messages held before dropping
+
+//--- svc_: server to client -------------------------------------------------
+#define QSVC_BAD			0
+#define QSVC_NOP			1
+#define QSVC_DISCONNECT		2
+#define QSVC_UPDATESTAT		3
+#define QSVC_VERSION		4
+#define QSVC_SETVIEW		5
+#define QSVC_SOUND			6
+#define QSVC_TIME			7
+#define QSVC_PRINT			8
+#define QSVC_STUFFTEXT		9
+#define QSVC_SETANGLE		10
+#define QSVC_SERVERINFO		11
+#define QSVC_LIGHTSTYLE		12
+#define QSVC_UPDATENAME		13
+#define QSVC_UPDATEFRAGS	14
+#define QSVC_CLIENTDATA		15
+#define QSVC_STOPSOUND		16
+#define QSVC_UPDATECOLORS	17
+#define QSVC_PARTICLE		18
+#define QSVC_DAMAGE			19
+#define QSVC_SPAWNSTATIC	20
+#define QSVC_SPAWNBASELINE	22
+#define QSVC_TEMPENTITY_	23
+#define QSVC_SETPAUSE		24
+#define QSVC_SIGNONNUM		25
+#define QSVC_CENTERPRINT	26
+#define QSVC_KILLEDMONSTER	27
+#define QSVC_FOUNDSECRET	28
+#define QSVC_SPAWNSTATICSOUND 29
+#define QSVC_INTERMISSION_	30
+#define QSVC_FINALE_		31
+#define QSVC_CDTRACK		32
+#define QSVC_SELLSCREEN		33
+#define QSVC_CUTSCENE_		34
+
+//--- clc_: client to server -------------------------------------------------
+#define QCLC_BAD			0
+#define QCLC_NOP			1
+#define QCLC_DISCONNECT		2
+#define QCLC_MOVE			3
+#define QCLC_STRINGCMD		4
+
+class CQMsg
+{
+	U8	 data[QNET_MAX_MSG];
+	I64	 len;			//bytes written
+	I64	 read;			//read cursor
+	Bool overflowed;	//a write did not fit; the message is unusable
+	Bool badread;		//a read ran past the end
+};
+
+//--- writing ----------------------------------------------------------------
+
+U0 QMsgClear(CQMsg *m)
+{
+	m->len        = 0;
+	m->read       = 0;
+	m->overflowed = FALSE;
+	m->badread    = FALSE;
+}
+
+U0 QMsgWriteByte(CQMsg *m, I64 v)
+{//Overflow is RECORDED, not silently truncated. A half-written message is
+ //worse than a dropped one: the reader would resynchronise mid-field and
+ //misinterpret everything after it.
+	if (m->len + 1 > QNET_MAX_MSG)
+	{
+		m->overflowed = TRUE;
+		return;
+	}
+
+	m->data[m->len] = v & 0xFF;
+	m->len++;
+}
+
+U0 QMsgWriteShort(CQMsg *m, I64 v)
+{//Little endian, as the wire format is.
+	QMsgWriteByte(m, v & 0xFF);
+	QMsgWriteByte(m, (v >> 8) & 0xFF);
+}
+
+U0 QMsgWriteLong(CQMsg *m, I64 v)
+{
+	QMsgWriteByte(m, v & 0xFF);
+	QMsgWriteByte(m, (v >> 8) & 0xFF);
+	QMsgWriteByte(m, (v >> 16) & 0xFF);
+	QMsgWriteByte(m, (v >> 24) & 0xFF);
+}
+
+U0 QMsgWriteCoord(CQMsg *m, F64 f)
+{//MSG_WriteCoord: eighths of a unit in a signed short.
+	QMsgWriteShort(m, ToI64(f * 8.0));
+}
+
+U0 QMsgWriteAngle(CQMsg *m, F64 f)
+{//MSG_WriteAngle: a whole turn in 256 steps. Deliberately coarse - this is why
+ //other players' aim looks quantised in the original too.
+	QMsgWriteByte(m, ToI64(f * 256.0 / 360.0) & 255);
+}
+
+U0 QMsgWriteString(CQMsg *m, U8 *s)
+{//NUL terminated, as the reader expects.
+	I64 i = 0;
+
+	if (s)
+	{
+		while (s[i])
+		{
+			QMsgWriteByte(m, s[i]);
+			i++;
+		}
+	}
+
+	QMsgWriteByte(m, 0);
+}
+
+//--- reading ----------------------------------------------------------------
+//
+// Every read is bounds checked and sets badread on failure, because a truncated
+// or corrupt message must not be able to walk off the buffer. The original
+// returns -1 and sets msg_badread for the same reason.
+
+I64 QMsgReadByte(CQMsg *m)
+{
+	I64 v;
+
+	if (m->read + 1 > m->len)
+	{
+		m->badread = TRUE;
+		return -1;
+	}
+
+	v = m->data[m->read];
+	m->read++;
+
+	return v;
+}
+
+I64 QMsgReadShort(CQMsg *m)
+{//Sign extended: coordinates are signed.
+	I64 v;
+
+	if (m->read + 2 > m->len)
+	{
+		m->badread = TRUE;
+		return -1;
+	}
+
+	v = m->data[m->read] | (m->data[m->read + 1] << 8);
+	m->read += 2;
+
+	if (v & 0x8000)
+		v -= 0x10000;
+
+	return v;
+}
+
+I64 QMsgReadLong(CQMsg *m)
+{
+	I64 v;
+
+	if (m->read + 4 > m->len)
+	{
+		m->badread = TRUE;
+		return -1;
+	}
+
+	v = m->data[m->read] | (m->data[m->read + 1] << 8) |
+		(m->data[m->read + 2] << 16) | (m->data[m->read + 3] << 24);
+	m->read += 4;
+
+	return v;
+}
+
+F64 QMsgReadCoord(CQMsg *m)
+{
+	return ToF64(QMsgReadShort(m)) * 0.125;
+}
+
+F64 QMsgReadAngle(CQMsg *m)
+{
+	return ToF64(QMsgReadByte(m)) * 360.0 / 256.0;
+}
+
+U0 QMsgReadString(CQMsg *m, U8 *out, I64 max)
+{//Always NUL terminates and never writes past max.
+	I64 i = 0;
+	I64 c;
+
+	while (i < max - 1)
+	{
+		c = QMsgReadByte(m);
+		if (c <= 0)
+			break;
+
+		out[i] = c;
+		i++;
+	}
+
+	out[i] = 0;
+}
+
+//--- loopback link ----------------------------------------------------------
+//
+// A queue of whole messages. The server writes into its send buffer and calls
+// QNetSendToClient; the client drains with QNetGetMessage. Swapping this for a
+// UDP socket later means replacing these two functions and nothing else, which
+// is the entire point of routing through them now.
+
+class CQNetLink
+{
+	CQMsg	queue[QNET_MAX_BACKLOG];
+	I64		head;			//next slot to write
+	I64		tail;			//next slot to read
+	I64		count;
+	I64		dropped;		//messages lost to a full queue
+};
+
+CQNetLink	q_net_loop;
+CQMsg		q_net_send;		//server's scratch message being built
+Bool		q_net_active = FALSE;
+
+U0 QNetInit()
+{//Globals are not zeroed here, so every field is set explicitly.
+	I64 i;
+
+	q_net_loop.head    = 0;
+	q_net_loop.tail    = 0;
+	q_net_loop.count   = 0;
+	q_net_loop.dropped = 0;
+
+	for (i = 0; i < QNET_MAX_BACKLOG; i++)
+		QMsgClear(&q_net_loop.queue[i]);
+
+	QMsgClear(&q_net_send);
+	q_net_active = TRUE;
+}
+
+Bool QNetSendToClient(CQMsg *m)
+{//Hand a finished message to the local client. FALSE if it was dropped.
+	CQMsg *slot;
+
+	if (!q_net_active || m->overflowed || m->len < 1)
+		return FALSE;
+
+	if (q_net_loop.count >= QNET_MAX_BACKLOG)
+	{
+		//Dropping a WHOLE message is correct; a partial one would desynchronise
+		//the reader. Counted so the loss is visible.
+		q_net_loop.dropped++;
+		return FALSE;
+	}
+
+	slot = &q_net_loop.queue[q_net_loop.head];
+	QMsgClear(slot);
+	MemCopy(slot->data, m->data, m->len);
+	slot->len = m->len;
+
+	q_net_loop.head = (q_net_loop.head + 1) % QNET_MAX_BACKLOG;
+	q_net_loop.count++;
+
+	return TRUE;
+}
+
+Bool QNetGetMessage(CQMsg *out)
+{//Take the next message for the client, if any.
+	CQMsg *slot;
+
+	if (!q_net_active || q_net_loop.count < 1)
+		return FALSE;
+
+	slot = &q_net_loop.queue[q_net_loop.tail];
+
+	QMsgClear(out);
+	MemCopy(out->data, slot->data, slot->len);
+	out->len = slot->len;
+
+	q_net_loop.tail = (q_net_loop.tail + 1) % QNET_MAX_BACKLOG;
+	q_net_loop.count--;
+
+	return TRUE;
+}
