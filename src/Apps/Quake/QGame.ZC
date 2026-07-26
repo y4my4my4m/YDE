@@ -12,7 +12,8 @@
 
 #define QGAME_MAX_EDICTS	600
 #define QGAME_FRAME_TIME	0.1		//QuakeC assumes 10Hz thinking
-#define QGAME_LIGHT			170		//flat shade until models sample lightmaps
+#define QGAME_LIGHT			170		//fallback when no lit surface is found
+#define QGAME_STATIC_DIST	2000.0	//static props are range limited like entities
 
 //QuakeC value types, as emitted in the def tables.
 #define QTYPE_VOID		0
@@ -271,7 +272,6 @@ I64 QGameSpawnEntities(CQMap *map)
 #define QMOVETYPE_FLYMISSILE	9
 #define QMOVETYPE_BOUNCE		10
 
-
 #define QPHYS_SV_GRAVITY	800.0
 #define QFL_ONGROUND_		512
 
@@ -352,56 +352,6 @@ U0 QGameCallTouch(I64 self_ent, I64 other_ent)
 	q_pr_error = FALSE;
 }
 
-I64 QGameEntityAt(I64 mover, F64 *point)
-{//Which solid entity, if any, contains this point. Only the world is traced
- //geometrically, so this is what lets a rocket hit a monster at all.
-	F64 eorg[3];
-	F64 emins[3];
-	F64 emaxs[3];
-	I64 i;
-	I64 j;
-	I64 solid;
-	I64 owner;
-	Bool inside;
-
-	owner = QPrEdictNum(QPrFieldI(mover, q_fld_owner));
-
-	for (i = 1; i < q_pr_num_edicts; i++)
-	{
-		if (q_pr_edict_free[i] || i == mover)
-			goto qe_next;
-
-		//A rocket must not detonate on the player who fired it.
-		if (i == owner)
-			goto qe_next;
-
-		solid = ToI64(QPrFieldF(i, q_fld_solid));
-		if (solid != QSOLID_BBOX_ && solid != QSOLID_SLIDEBOX_)
-			goto qe_next;
-
-		eorg[0] = QPrFieldF(i, q_fld_origin);
-		eorg[1] = QPrFieldF(i, q_fld_origin + 1);
-		eorg[2] = QPrFieldF(i, q_fld_origin + 2);
-
-		inside = TRUE;
-		for (j = 0; j < 3; j++)
-		{
-			emins[j] = eorg[j] + QPrFieldF(i, q_fld_mins + j);
-			emaxs[j] = eorg[j] + QPrFieldF(i, q_fld_maxs + j);
-
-			if (point[j] < emins[j] || point[j] > emaxs[j])
-				inside = FALSE;
-		}
-
-		if (inside)
-			return i;
-
-qe_next:
-	}
-
-	return -1;
-}
-
 U0 QGamePhysicsEntity(I64 ent, F64 dt)
 {//One entity, one tick.
 	CQTrace	tr;
@@ -409,6 +359,8 @@ U0 QGamePhysicsEntity(I64 ent, F64 dt)
 	F64		velocity[3];
 	F64		avelocity[3];
 	F64		end[3];
+	F64		emins[3];
+	F64		emaxs[3];
 	F64		grav;
 	I64		movetype;
 	I64		hit;
@@ -487,11 +439,16 @@ U0 QGamePhysicsEntity(I64 ent, F64 dt)
 		return;
 	}
 
-	//Everything else sweeps against the world.
-	QTraceMove(q_bi_map, origin, end, &tr);
+	//Everything else sweeps against the world AND every solid entity, so the
+	//impact point is where it really hit rather than where the world stopped it.
+	for (j = 0; j < 3; j++)
+	{
+		emins[j] = QPrFieldF(ent, q_fld_mins + j);
+		emaxs[j] = QPrFieldF(ent, q_fld_maxs + j);
+	}
 
-	//Did it pass through a solid entity on the way?
-	hit = QGameEntityAt(ent, tr.end_pos);
+	QTraceEntity(q_bi_map, origin, end, emins, emaxs, ent, FALSE, &tr);
+	hit = tr.ent;
 
 	for (j = 0; j < 3; j++)
 		QPrSetFieldF(ent, q_fld_origin + j, tr.end_pos[j]);
@@ -554,6 +511,185 @@ U0 QGamePhysicsEntity(I64 ent, F64 dt)
 	}
 }
 
+#define QGAME_MAX_PUSHED	256
+
+I64 q_pushed_ent[QGAME_MAX_PUSHED];
+F64 q_pushed_from[QGAME_MAX_PUSHED * 3];
+
+U0 QGamePushMove(I64 pusher, F64 movetime)
+{//Translate a door or platform and carry, or crush, whatever is in its way.
+ //Ported from SV_PushMove.
+ //
+ //A pusher is the world as far as riders are concerned, so it moves first and
+ //then anything found inside its new volume is shoved by the same offset. If a
+ //rider cannot be shoved clear, the WHOLE move is rolled back - pusher and
+ //every entity moved so far - and the pusher's .blocked is called. That
+ //rollback is the mechanism behind a door reversing on you rather than
+ //quietly passing through, and behind a crusher doing damage.
+	F64  move[3];
+	F64  mins[3];
+	F64  maxs[3];
+	F64  pushorig[3];
+	F64  entorig[3];
+	F64  velocity[3];
+	CQTrace tr;
+	I64  num_pushed = 0;
+	I64  i;
+	I64  j;
+	I64  movetype;
+	I64  solid;
+	I64  blocked_fn;
+	I64  ground;
+	Bool overlaps;
+
+	for (j = 0; j < 3; j++)
+		velocity[j] = QPrFieldF(pusher, q_fld_velocity + j);
+
+	//Standing still: just advance its clock.
+	if (velocity[0] == 0.0 && velocity[1] == 0.0 && velocity[2] == 0.0)
+	{
+		QPrSetFieldF(pusher, q_fld_ltime,
+			QPrFieldF(pusher, q_fld_ltime) + movetime);
+		return;
+	}
+
+	for (j = 0; j < 3; j++)
+	{
+		move[j]     = velocity[j] * movetime;
+		pushorig[j] = QPrFieldF(pusher, q_fld_origin + j);
+		mins[j]     = QPrFieldF(pusher, q_fld_absmin + j) + move[j];
+		maxs[j]     = QPrFieldF(pusher, q_fld_absmax + j) + move[j];
+	}
+
+	//Move the pusher to its final position first.
+	for (j = 0; j < 3; j++)
+		QPrSetFieldF(pusher, q_fld_origin + j, pushorig[j] + move[j]);
+
+	QPrSetFieldF(pusher, q_fld_ltime,
+		QPrFieldF(pusher, q_fld_ltime) + movetime);
+	QGameLinkEdict(pusher);
+
+	for (i = 1; i < q_pr_num_edicts; i++)
+	{
+		if (q_pr_edict_free[i] || i == pusher)
+			goto qpm_next;
+
+		movetype = ToI64(QPrFieldF(i, q_fld_movetype));
+		if (movetype == QMOVETYPE_PUSH || movetype == QMOVETYPE_NONE ||
+			movetype == QMOVETYPE_NOCLIP)
+			goto qpm_next;
+
+		//Anything standing ON the pusher rides it unconditionally. Otherwise it
+		//only matters if it ends up inside the pusher's new volume.
+		ground = QPrEdictNum(QPrFieldI(i, q_fld_groundentity));
+
+		if (!(ToI64(QPrFieldF(i, q_fld_flags)) & QFL_ONGROUND_) ||
+			ground != pusher)
+		{
+			overlaps = TRUE;
+			for (j = 0; j < 3; j++)
+			{
+				if (QPrFieldF(i, q_fld_absmin + j) >= maxs[j] ||
+					QPrFieldF(i, q_fld_absmax + j) <= mins[j])
+					overlaps = FALSE;
+			}
+
+			if (!overlaps)
+				goto qpm_next;
+
+			if (QTestEntityPosition(q_bi_map, i) < 0)
+				goto qpm_next;
+		}
+
+		//Riders other than the player lose their ground contact while carried.
+		if (movetype != QMOVETYPE_WALK)
+			QPrSetFieldF(i, q_fld_flags,
+				ToF64(ToI64(QPrFieldF(i, q_fld_flags)) & ~QFL_ONGROUND_));
+
+		for (j = 0; j < 3; j++)
+			entorig[j] = QPrFieldF(i, q_fld_origin + j);
+
+		if (num_pushed < QGAME_MAX_PUSHED)
+		{
+			q_pushed_ent[num_pushed] = i;
+			for (j = 0; j < 3; j++)
+				q_pushed_from[num_pushed * 3 + j] = entorig[j];
+			num_pushed++;
+		}
+
+		//The pusher is made non-solid for the shove so the rider is not
+		//immediately blocked by the very thing carrying it.
+		solid = ToI64(QPrFieldF(pusher, q_fld_solid));
+		QPrSetFieldF(pusher, q_fld_solid, ToF64(QSOLID_NOT_));
+
+		QPushEntity(q_bi_map, i, move, &tr);
+
+		QPrSetFieldF(pusher, q_fld_solid, ToF64(solid));
+		QGameLinkEdict(i);
+
+		//Still stuck in the pusher, so this move cannot happen.
+		if (QTestEntityPosition(q_bi_map, i) >= 0)
+		{
+			//A zero-width entity cannot block anything.
+			if (QPrFieldF(i, q_fld_mins + 0) == QPrFieldF(i, q_fld_maxs + 0))
+				goto qpm_next;
+
+			//Corpses and triggers get flattened out of the way instead of
+			//stopping the door, which is what keeps bodies from jamming it.
+			solid = ToI64(QPrFieldF(i, q_fld_solid));
+			if (solid == QSOLID_NOT_ || solid == QSOLID_TRIGGER_)
+			{
+				QPrSetFieldF(i, q_fld_mins + 0, 0.0);
+				QPrSetFieldF(i, q_fld_mins + 1, 0.0);
+				for (j = 0; j < 3; j++)
+					QPrSetFieldF(i, q_fld_maxs + j,
+						QPrFieldF(i, q_fld_mins + j));
+				QGameLinkEdict(i);
+				goto qpm_next;
+			}
+
+			//Put the rider back.
+			for (j = 0; j < 3; j++)
+				QPrSetFieldF(i, q_fld_origin + j, entorig[j]);
+			QGameLinkEdict(i);
+
+			//Put the pusher back and un-advance its clock.
+			for (j = 0; j < 3; j++)
+				QPrSetFieldF(pusher, q_fld_origin + j, pushorig[j]);
+			QPrSetFieldF(pusher, q_fld_ltime,
+				QPrFieldF(pusher, q_fld_ltime) - movetime);
+			QGameLinkEdict(pusher);
+
+			//Let QuakeC decide what being blocked means: a door reverses, a
+			//crusher does damage. With no handler it simply waits.
+			blocked_fn = QPrFieldI(pusher, q_fld_blocked);
+			if (blocked_fn > 0 && blocked_fn < q_pr_num_functions)
+			{
+				QPrSetI(q_ofs_self, QPrEdictValue(pusher));
+				QPrSetI(q_ofs_other, QPrEdictValue(i));
+				QPrExecute(blocked_fn);
+				q_pr_error = FALSE;
+			}
+
+			//Undo everything already carried this move.
+			for (j = 0; j < num_pushed; j++)
+			{
+				QPrSetFieldF(q_pushed_ent[j], q_fld_origin + 0,
+					q_pushed_from[j * 3 + 0]);
+				QPrSetFieldF(q_pushed_ent[j], q_fld_origin + 1,
+					q_pushed_from[j * 3 + 1]);
+				QPrSetFieldF(q_pushed_ent[j], q_fld_origin + 2,
+					q_pushed_from[j * 3 + 2]);
+				QGameLinkEdict(q_pushed_ent[j]);
+			}
+
+			return;
+		}
+
+qpm_next:
+	}
+}
+
 U0 QGamePhysicsPusher(I64 ent, F64 dt)
 {//Doors, platforms and buttons.
  //
@@ -589,27 +725,18 @@ U0 QGamePhysicsPusher(I64 ent, F64 dt)
 	if (movetime > 0.0)
 	{
 		for (j = 0; j < 3; j++)
-		{
-			origin[j]    = QPrFieldF(ent, q_fld_origin + j);
-			velocity[j]  = QPrFieldF(ent, q_fld_velocity + j);
 			avelocity[j] = QPrFieldF(ent, q_fld_avelocity + j);
-		}
 
-		//A pusher moves through its own volume; it is the world for anything
-		//riding it, so there is no trace here.
+		//Rotation is applied directly; only translation can shove anything.
 		for (j = 0; j < 3; j++)
 		{
-			QPrSetFieldF(ent, q_fld_origin + j,
-				origin[j] + velocity[j] * movetime);
-
 			if (avelocity[j] != 0.0)
 				QPrSetFieldF(ent, q_fld_angles + j,
 					QAngleNorm(QPrFieldF(ent, q_fld_angles + j) +
 						avelocity[j] * movetime));
 		}
 
-		QPrSetFieldF(ent, q_fld_ltime, old_ltime + movetime);
-		QGameLinkEdict(ent);
+		QGamePushMove(ent, movetime);
 	}
 
 	//Think when the local clock reaches the scheduled time.
@@ -814,8 +941,13 @@ U0 QGameRestoreParms()
 		QPrSetF(q_ofs_serverflags, q_saved_serverflags);
 }
 
-Bool QGameInit(CQMap *map)
+Bool QGameInit(CQMap *map, Bool spawn_entities = TRUE)
 {//Load the bytecode, wire the builtins, and populate the world.
+ //
+ //spawn_entities is FALSE when a savegame is about to supply the entity state:
+ //the bytecode and builtins still have to come up, but running the spawn
+ //functions would build a fresh world that the restore then has to overwrite -
+ //and any side effects they had (precaches aside) would linger.
 	I64 fn;
 
 	q_game_active  = FALSE;
@@ -859,7 +991,14 @@ Bool QGameInit(CQMap *map)
 		q_pr_error = FALSE;
 	}
 
-	q_game_spawned = QGameSpawnEntities(map);
+	if (spawn_entities)
+		q_game_spawned = QGameSpawnEntities(map);
+	else
+	{
+		//A savegame still needs the precache lists, which the spawn functions
+		//would normally build. They are restored from the file instead.
+		q_game_spawned = 0;
+	}
 
 	//The world must never be damageable. QuakeC relies on that to bail out of
 	//T_Damage early; if it ever gets through, the world is "killed", and since
@@ -882,8 +1021,42 @@ U0 QGameShutdown()
 {
 	q_game_active = FALSE;
 	q_bi_map      = NULL;
+
+	//Per-map state, all of which points at things about to be freed or refers
+	//to entities that will not exist in the next map.
+	QBiStaticClear;
+	QBiBeamsClear;
+	QBiIntermissionClear;
+	QSndAmbientClear;
+	QLightInit;
+
 	QBiFreePrecache;
 	QPrFree;
+}
+
+U0 QGameDrawStatics(CQCanvas *c, CQMap *map)
+{//Static entities are not edicts any more, so they are drawn from their own
+ //list. Lit from the world like any other model.
+	CQStaticEnt	*se;
+	F64			 d[3];
+	I64			 i;
+
+	for (i = 0; i < q_static_count; i++)
+	{
+		se = &q_static_ent[i];
+
+		if (!se->mdl)
+			goto qds_next;
+
+		QVecSub(se->origin, c->origin, d);
+		if (QVecLength(d) > QGAME_STATIC_DIST)
+			goto qds_next;
+
+		QMdlDraw(c, se->mdl, se->frame, se->origin, se->angles[1],
+			QLightPoint(map, se->origin));
+
+qds_next:
+	}
 }
 
 U0 QGameDrawEntities(CQCanvas *c, CQMap *map, F64 *view_origin, F64 max_dist)
@@ -945,7 +1118,9 @@ U0 QGameDrawEntities(CQCanvas *c, CQMap *map, F64 *view_origin, F64 max_dist)
 		if (frame < 0 || frame >= mdl->num_frames)
 			frame = 0;
 
-		QMdlDraw(c, mdl, frame, eorg, eang[1], QGAME_LIGHT);
+		//Lit from the surface underneath rather than a flat constant, so a
+		//monster in shadow renders dark and one under a lamp renders bright.
+		QMdlDraw(c, mdl, frame, eorg, eang[1], QLightPoint(map, eorg));
 
 qg_next:
 	}

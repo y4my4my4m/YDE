@@ -131,7 +131,7 @@ I64 QBiPrecacheModel(U8 *name)
 	//Brush models ("*N") live in the map; only alias models load here.
 	if (name[0] != '*' && StrLen(name) > 4 &&
 		!StrICompare(name + StrLen(name) - 4, ".mdl"))
-		q_precache_mdl[i] = QMdlLoad(name);
+		q_precache_mdl[i] = QMdlCacheGet(name);
 
 	return i;
 }
@@ -153,6 +153,70 @@ CQMdl *QBiFindModel(U8 *name)
 	return NULL;
 }
 
+//--- static entities -------------------------------------------------------
+//
+// makestatic() takes an entity that will never move, think or be touched again
+// (torches, gibs that have settled, decorative models) and hands it to the
+// client permanently. The edict is then freed, which is the point: a large map
+// would otherwise burn hundreds of edict slots on scenery.
+//
+// So the drawable state is copied out here and the edict released.
+
+#define QBI_MAX_STATIC	256
+
+class CQStaticEnt
+{
+	CQMdl	*mdl;
+	F64		 origin[3];
+	F64		 angles[3];
+	I64		 frame;
+};
+
+CQStaticEnt	q_static_ent[QBI_MAX_STATIC];
+I64			q_static_count = 0;
+
+U0 QBiStaticClear()
+{
+	q_static_count = 0;
+}
+
+U0 QBiMakeStatic()
+{//Builtin 69.
+	CQStaticEnt	*se;
+	I64			 ent = QBiArgEnt(0);
+	I64			 idx;
+	I64			 j;
+
+	if (ent <= 0)
+		return;
+
+	if (q_static_count < QBI_MAX_STATIC)
+	{
+		se  = &q_static_ent[q_static_count];
+		idx = ToI64(QPrFieldF(ent, q_fld_modelindex));
+
+		se->mdl = NULL;
+		if (idx > 0 && idx < q_precache_model_count)
+			se->mdl = q_precache_mdl[idx];
+
+		for (j = 0; j < 3; j++)
+		{
+			se->origin[j] = QPrFieldF(ent, q_fld_origin + j);
+			se->angles[j] = QPrFieldF(ent, q_fld_angles + j);
+		}
+
+		se->frame = ToI64(QPrFieldF(ent, q_fld_frame));
+
+		//Only models are drawable here; a static entity with no model would
+		//occupy a slot for nothing.
+		if (se->mdl)
+			q_static_count++;
+	}
+
+	//Freed either way - that is what makestatic means.
+	QPrFreeEdict(ent);
+}
+
 U0 QBiFreePrecache()
 {
 	I64 i;
@@ -161,7 +225,7 @@ U0 QBiFreePrecache()
 	{
 		if (q_precache_mdl[i])
 		{
-			QMdlFree(q_precache_mdl[i]);
+			//The cache owns these; freeing here would be a double free.
 			q_precache_mdl[i] = NULL;
 		}
 	}
@@ -201,6 +265,27 @@ U0 QBiStoreTrace(CQTrace *tr, I64 hit_ent)
 // into an effect and handed straight to the particle system.
 
 #define QSVC_TEMPENTITY		23
+#define QSVC_INTERMISSION	30
+#define QSVC_FINALE			31
+#define QSVC_CUTSCENE		34
+
+//--- intermission and finale -----------------------------------------------
+//
+// QuakeC ends a level by broadcasting svc_intermission, or svc_finale followed
+// by a string for the episode-ending text. The camera is already parked by
+// QuakeC (it moves the player to an info_intermission and sets .fixangle), so
+// all the engine owes is the overlay and leaving input alone - QuakeC's own
+// IntermissionThink watches button0 and exits when the player fires.
+Bool q_intermission	= FALSE;
+Bool q_finale		= FALSE;
+U8	 q_finale_text[256];
+
+U0 QBiIntermissionClear()
+{
+	q_intermission   = FALSE;
+	q_finale         = FALSE;
+	q_finale_text[0] = 0;
+}
 
 #define QTE_SPIKE			0
 #define QTE_SUPERSPIKE		1
@@ -218,6 +303,12 @@ U0 QBiStoreTrace(CQTrace *tr, I64 hit_ent)
 #define QMSG_IDLE			0
 #define QMSG_WANT_TYPE		1
 #define QMSG_WANT_COORDS	2
+#define QMSG_WANT_BEAM_ENT	3
+#define QMSG_WANT_BEAM		4
+#define QMSG_WANT_TEXT		5
+
+//Beams are drawn bright: they are self-illuminated in the original.
+#define QBEAM_LIGHT			240
 
 //Movement diagnostics. If failures dominate, the step geometry is refusing
 //legal moves; if successes dominate while monsters still grind into walls,
@@ -244,6 +335,7 @@ I64 q_msg_state	= QMSG_IDLE;
 I64 q_msg_type	= 0;
 I64 q_msg_axis	= 0;
 F64 q_msg_org[3];
+F64 q_msg_end[3];
 I64 q_te_count	= 0;
 
 U0 QBiTempEntity(I64 type, F64 *org)
@@ -286,12 +378,142 @@ U0 QBiTempEntity(I64 type, F64 *org)
 	}
 }
 
+//--- lightning beams -------------------------------------------------------
+//
+// TE_LIGHTNING1/2/3 carry an entity index and TWO points rather than the single
+// point every other temp entity uses, which is why they had to be skipped
+// before: feeding six coordinates into a three-coordinate parser would have
+// produced garbage positions for the following effect too.
+//
+// The original renders a beam by tiling its bolt model along the vector every
+// 30 units, with a random roll per segment so it looks like it is crackling.
+
+#define QBI_MAX_BEAMS	16
+#define QBEAM_SEGMENT	30.0
+#define QBEAM_LIFE		0.2		//seconds, matching the original
+
+class CQBeam
+{
+	F64		 start[3];
+	F64		 end[3];
+	F64		 die_time;
+	CQMdl	*mdl;
+};
+
+CQBeam	q_beam[QBI_MAX_BEAMS];
+I64		q_beam_count = 0;
+
+U0 QBiBeamsClear()
+{
+	q_beam_count = 0;
+}
+
+U0 QBiBeamAdd(I64 type, F64 *start, F64 *end, F64 time)
+{//Record a beam. Beams are short lived, so the oldest is recycled when full.
+	CQBeam	*b;
+	U8		*name;
+	I64		 i;
+	I64		 slot = -1;
+
+	if (type == QTE_LIGHTNING1)
+		name = "progs/bolt.mdl";
+	else if (type == QTE_LIGHTNING2)
+		name = "progs/bolt2.mdl";
+	else
+		name = "progs/bolt3.mdl";
+
+	//Prefer an expired slot.
+	for (i = 0; i < q_beam_count; i++)
+	{
+		if (q_beam[i].die_time <= time)
+		{
+			slot = i;
+			break;
+		}
+	}
+
+	if (slot < 0)
+	{
+		if (q_beam_count < QBI_MAX_BEAMS)
+		{
+			slot = q_beam_count;
+			q_beam_count++;
+		}
+		else
+			slot = 0;
+	}
+
+	b = &q_beam[slot];
+	QVecCopy(start, b->start);
+	QVecCopy(end, b->end);
+	b->die_time = time + QBEAM_LIFE;
+	b->mdl      = QBiFindModel(name);
+}
+
+U0 QBiDrawBeams(CQCanvas *c, F64 time)
+{//Tile each live beam's model along its length.
+	CQBeam	*b;
+	F64		 dir[3];
+	F64		 org[3];
+	F64		 ang[3];
+	F64		 len;
+	I64		 i;
+	I64		 seg;
+	I64		 steps;
+
+	for (i = 0; i < q_beam_count; i++)
+	{
+		b = &q_beam[i];
+
+		if (b->die_time <= time || !b->mdl)
+			goto qb_next;
+
+		QVecSub(b->end, b->start, dir);
+		len = QVecLength(dir);
+
+		if (len < 1.0)
+			goto qb_next;
+
+		QVecScale(dir, 1.0 / len, dir);
+
+		//Pitch and yaw point the segment down the beam; the roll is random so
+		//consecutive segments do not line up into a smooth tube.
+		QVecToAngles(dir, ang);
+
+		steps = ToI64(len / QBEAM_SEGMENT) + 1;
+		QVecCopy(b->start, org);
+
+		for (seg = 0; seg < steps; seg++)
+		{
+			ang[2] = ToF64(RandU32() % 360);
+
+			QMdlDrawAngles(c, b->mdl, 0, org, ang, QBEAM_LIGHT);
+
+			org[0] += dir[0] * QBEAM_SEGMENT;
+			org[1] += dir[1] * QBEAM_SEGMENT;
+			org[2] += dir[2] * QBEAM_SEGMENT;
+		}
+
+qb_next:
+	}
+}
+
 U0 QBiWriteByte(I64 value)
 {//Drives the little reassembly state machine.
 	if (q_msg_state == QMSG_IDLE)
 	{
 		if (value == QSVC_TEMPENTITY)
 			q_msg_state = QMSG_WANT_TYPE;
+		else if (value == QSVC_INTERMISSION)
+			q_intermission = TRUE;
+		else if (value == QSVC_FINALE || value == QSVC_CUTSCENE)
+		{
+			//The text arrives as the next WriteString.
+			q_intermission   = TRUE;
+			q_finale         = TRUE;
+			q_finale_text[0] = 0;
+			q_msg_state      = QMSG_WANT_TEXT;
+		}
 		return;
 	}
 
@@ -300,18 +522,54 @@ U0 QBiWriteByte(I64 value)
 		q_msg_type = value;
 		q_msg_axis = 0;
 
-		//Beam effects carry an entity index and six coordinates. Nothing here
-		//draws beams yet, so they are skipped rather than mis-parsed.
+		//A beam carries an entity index and then SIX coordinates - a start and
+		//an end - where every other effect carries three.
 		if (q_msg_type == QTE_LIGHTNING1 || q_msg_type == QTE_LIGHTNING2 ||
 			q_msg_type == QTE_LIGHTNING3)
-			q_msg_state = QMSG_IDLE;
+			q_msg_state = QMSG_WANT_BEAM_ENT;
 		else
 			q_msg_state = QMSG_WANT_COORDS;
 	}
 }
 
+U0 QBiWriteString(U8 *str)
+{//Only the finale text is consumed; every other string message is ignored.
+	if (q_msg_state == QMSG_WANT_TEXT)
+	{
+		if (str)
+			QStrCopy(q_finale_text, str, 256);
+		q_msg_state = QMSG_IDLE;
+	}
+}
+
+U0 QBiWriteEntity(I64 value)
+{//A beam's owning entity. Not used for placement - the coordinates that follow
+ //carry that - but it has to be consumed so the coordinates land correctly.
+	if (q_msg_state == QMSG_WANT_BEAM_ENT)
+		q_msg_state = QMSG_WANT_BEAM;
+}
+
 U0 QBiWriteCoord(F64 value)
 {
+	if (q_msg_state == QMSG_WANT_BEAM)
+	{
+		//Six coordinates: start then end.
+		if (q_msg_axis < 3)
+			q_msg_org[q_msg_axis] = value;
+		else if (q_msg_axis < 6)
+			q_msg_end[q_msg_axis - 3] = value;
+
+		q_msg_axis++;
+
+		if (q_msg_axis >= 6)
+		{
+			QBiBeamAdd(q_msg_type, q_msg_org, q_msg_end, tS);
+			q_msg_state = QMSG_IDLE;
+		}
+
+		return;
+	}
+
 	if (q_msg_state != QMSG_WANT_COORDS)
 		return;
 
@@ -858,36 +1116,9 @@ U0 QBiVecToAngles()
 {
 	F64 v[3];
 	F64 out[3];
-	F64 yaw;
-	F64 pitch;
-	F64 fwd;
 
 	QBiArgV(0, v);
-
-	if (v[0] == 0.0 && v[1] == 0.0)
-	{
-		yaw = 0.0;
-		if (v[2] > 0.0)
-			pitch = 90.0;
-		else
-			pitch = 270.0;
-	}
-	else
-	{
-		yaw = Arg(v[0], v[1]) / QDEG2RAD;
-		if (yaw < 0.0)
-			yaw += 360.0;
-
-		fwd   = Sqrt(v[0] * v[0] + v[1] * v[1]);
-		pitch = Arg(fwd, v[2]) / QDEG2RAD;
-		if (pitch < 0.0)
-			pitch += 360.0;
-	}
-
-	//QuakeC's angles put pitch first, and it is inverted relative to atan.
-	out[0] = -pitch;
-	out[1] = yaw;
-	out[2] = 0.0;
+	QVecToAngles(v, out);
 	QBiRetV(out);
 }
 
@@ -1029,7 +1260,7 @@ U0 QBiDispatch(I64 num)
 
 		case 32:	QBiWalkMove;		break;
 		case 34:	QBiDropToFloor;		break;
-		case 35:	break;				//lightstyle: no animated lights yet
+		case 35:	QLightStyleSet(ToI64(QBiArgF(0)), QBiArgS(1));	break;
 
 		case 36:	QBiRetF(Round(QBiArgF(0)));	break;
 		case 37:	QBiRetF(Floor(QBiArgF(0)));	break;
@@ -1091,13 +1322,13 @@ U0 QBiDispatch(I64 num)
 		case 53:	QBiWriteByte(ToI64(QBiArgF(1)));	break;	//WriteChar
 		case 56:	QBiWriteCoord(QBiArgF(1));			break;	//WriteCoord
 
+		case 58:	QBiWriteString(QBiArgS(1));			break;	//WriteString
+		case 59:	QBiWriteEntity(QBiArgEnt(1));		break;	//WriteEntity
+
 		case 54:
 		case 55:
 		case 57:
-		case 58:
-		case 59:
-			//Short/long/angle/string/entity: only ever appear in messages the
-			//effect decoder does not consume.
+			//Short/long/angle: only appear in messages nothing here decodes.
 			break;
 
 		case 67:	QBiMoveToGoal;		break;	//movetogoal(dist)
@@ -1106,7 +1337,7 @@ U0 QBiDispatch(I64 num)
 		case 77:
 			QPrSetI(QPR_OFS_RETURN, QPrGetI(QBiArg(0)));	break;	//precache_file
 
-		case 69:	break;				//makestatic
+		case 69:	QBiMakeStatic;		break;
 		case 70:
 			//changelevel(mapname). Recorded, not acted on: tearing the world
 			//down from inside a running think would free the bytecode that is
@@ -1117,10 +1348,10 @@ U0 QBiDispatch(I64 num)
 		case 72:	break;				//cvar_set
 		case 73:	break;				//centerprint
 		case 74:
-			//ambientsound(pos, sample, volume, attenuation). Looping ambience
-			//is not supported, so this plays once at map load.
+			//ambientsound(pos, sample, volume, attenuation). Registered as a
+			//permanent looping source rather than played once at load.
 			QBiArgV(0, v);
-			QSndPlayAt(QBiArgS(1), v, QBiArgF(2), QBiArgF(3));
+			QSndAmbientAdd(v, QBiArgS(1), QBiArgF(2), QBiArgF(3));
 			break;
 
 		case 78:	break;				//setspawnparms

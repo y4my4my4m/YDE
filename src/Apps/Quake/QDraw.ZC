@@ -60,6 +60,227 @@ class CQCanvas
 	I64	 spans_drawn;
 };
 
+//--- animated light styles -------------------------------------------------
+//
+// A style is a string of letters sampled at 10Hz: 'a' is black, 'm' is normal
+// brightness, 'z' is roughly double. R_AnimateLight turns the current letter
+// into a scale, and a face's lightmap is the sum of one block per style it
+// references, each scaled by that style's current value.
+//
+// Unlit faces and faces whose styles are all steady take the fast path and use
+// the map's lightmap data directly; only animated faces get recombined.
+
+#define QMAX_LIGHTSTYLES	64
+#define QLIGHTSTYLE_LEN		64
+#define QLIGHTSTYLE_NORMAL	256		//value used when a style has no string
+#define QLIGHT_SCRATCH		4096	//one face's lightmap block, generously
+
+//Used when no lit surface can be found under a model. Matches what entities
+//were unconditionally drawn at before any of this existed.
+#define QLIGHT_FALLBACK		170
+
+U8	q_lightstyle[QMAX_LIGHTSTYLES * QLIGHTSTYLE_LEN];
+I64	q_lightstyle_value[QMAX_LIGHTSTYLES];
+U8	q_light_scratch[QLIGHT_SCRATCH];
+
+U0 QLightInit()
+{//Globals are not zeroed here, so every style starts explicitly steady.
+	I64 i;
+
+	for (i = 0; i < QMAX_LIGHTSTYLES; i++)
+	{
+		q_lightstyle[i * QLIGHTSTYLE_LEN] = 0;
+		q_lightstyle_value[i]             = QLIGHTSTYLE_NORMAL;
+	}
+}
+
+U0 QLightStyleSet(I64 style, U8 *str)
+{//The lightstyle builtin. QuakeC calls this at spawn for every switchable and
+ //flickering light in the map.
+	if (style < 0 || style >= QMAX_LIGHTSTYLES || !str)
+		return;
+
+	QStrCopy(&q_lightstyle[style * QLIGHTSTYLE_LEN], str, QLIGHTSTYLE_LEN);
+}
+
+U0 QLightAnimate(F64 time)
+{//Advance every style to the letter for this moment. R_AnimateLight.
+	U8	*str;
+	I64	 frame = ToI64(time * 10.0);
+	I64	 len;
+	I64	 i;
+	I64	 k;
+
+	for (i = 0; i < QMAX_LIGHTSTYLES; i++)
+	{
+		str = &q_lightstyle[i * QLIGHTSTYLE_LEN];
+		len = StrLen(str);
+
+		if (!len)
+		{
+			q_lightstyle_value[i] = QLIGHTSTYLE_NORMAL;
+			goto ql_next;
+		}
+
+		k = frame % len;
+		if (k < 0)
+			k = 0;
+
+		//'a'..'z' maps to 0..550 in steps of 22.
+		q_lightstyle_value[i] = (str[k] - 'a') * 22;
+
+ql_next:
+	}
+}
+
+U8 *QLightFaceMap(CQMap *map, CQFace *f, I64 lm_w, I64 lm_h)
+{//The lightmap to render this face with, combining its animated styles.
+ //
+ //Returns the map's own data untouched whenever nothing is animated, so the
+ //common case costs one comparison rather than a per-texel recombine.
+	U8	*base;
+	I64	 size = lm_w * lm_h;
+	I64	 count;
+	I64	 acc;
+	I64	 scale;
+	I64	 i;
+	I64	 j;
+
+	if (f->light_offset < 0 || !map->lightdata)
+		return NULL;
+
+	base = map->lightdata + f->light_offset;
+
+	//How many styles this face actually uses. 255 terminates the list.
+	count = 0;
+	while (count < 4 && f->styles[count] != 255)
+		count++;
+
+	if (!count)
+		return base;
+
+	//One steady style is the overwhelmingly common case.
+	if (count == 1 && q_lightstyle_value[f->styles[0]] == QLIGHTSTYLE_NORMAL)
+		return base;
+
+	if (size <= 0 || size > QLIGHT_SCRATCH)
+		return base;
+
+	//Every style adds another block of the same size after the first, so the
+	//multi-style read is longer than the caller's single-block bounds check.
+	if (f->light_offset + count * size > map->lightdata_size)
+		return base;
+
+	for (i = 0; i < size; i++)
+	{
+		acc = 0;
+
+		for (j = 0; j < count; j++)
+		{
+			scale = q_lightstyle_value[f->styles[j]];
+			acc  += ToI64(base[j * size + i]) * scale;
+		}
+
+		//The scales are fixed point with 256 as unity.
+		acc >>= 8;
+
+		if (acc > 255)
+			acc = 255;
+
+		q_light_scratch[i] = acc;
+	}
+
+	return q_light_scratch;
+}
+
+I64 QLightPoint(CQMap *map, F64 *point)
+{//How brightly lit a spot in the world is, by sampling the lightmap of the
+ //surface below it. R_LightPoint.
+ //
+ //Alias models have no lightmap of their own, so this is what makes a monster
+ //standing in shadow render dark and one under a lamp render bright, instead of
+ //every model being drawn at the same flat value regardless of where it stands.
+	F64		  end[3];
+	CQTrace	  tr;
+	CQFace	 *f;
+	CQTexInfo *ti;
+	CQLeaf	 *leaf;
+	F64		  s_coord;
+	F64		 t_coord;
+	I64		 ds;
+	I64		 dt;
+	I64		 lm_w;
+	I64		 lm_h;
+	I64		 i;
+	I64		 node;
+	I64		 best = -1;
+
+	if (!map || !map->lightdata)
+		return QLIGHT_FALLBACK;
+
+	//Straight down, far enough to clear any room height.
+	QVecCopy(point, end);
+	end[2] -= 2048.0;
+
+	QTraceMove(map, point, end, &tr);
+
+	if (!tr.hit || tr.fraction == 1.0)
+		return QLIGHT_FALLBACK;
+
+	//The trace gives a position but not which face was struck, so the face is
+	//found by testing the leaf's surfaces for one containing the impact.
+	node = QVisLeafForPoint(map, tr.end_pos);
+	if (node <= 0 || node >= map->num_leafs)
+		return QLIGHT_FALLBACK;
+
+	leaf = &map->leafs[node];
+
+	for (i = 0; i < leaf->num_marksurfaces; i++)
+	{
+		f = &map->faces[map->marksurfaces[leaf->first_marksurface + i]];
+
+		if (f->light_offset < 0)
+			goto qlp_next;
+
+		//Texture axes live on the texinfo, not the face.
+		ti      = &map->texinfo[f->tex_info];
+		s_coord = QVecDot(tr.end_pos, &ti->vecs[0]) + ti->vecs[3] - f->mins_s;
+		t_coord = QVecDot(tr.end_pos, &ti->vecs[4]) + ti->vecs[7] - f->mins_t;
+
+		if (s_coord < 0.0 || t_coord < 0.0)
+			goto qlp_next;
+		if (s_coord > ToF64(f->extent_s) || t_coord > ToF64(f->extent_t))
+			goto qlp_next;
+
+		lm_w = f->extent_s / 16 + 1;
+		lm_h = f->extent_t / 16 + 1;
+		ds   = ToI64(s_coord) / 16;
+		dt   = ToI64(t_coord) / 16;
+
+		if (ds < 0)   ds = 0;
+		if (dt < 0)   dt = 0;
+		if (ds >= lm_w) ds = lm_w - 1;
+		if (dt >= lm_h) dt = lm_h - 1;
+
+		if (f->light_offset + dt * lm_w + ds >= map->lightdata_size)
+			goto qlp_next;
+
+		best = ToI64(map->lightdata[f->light_offset + dt * lm_w + ds]);
+		break;
+
+qlp_next:
+	}
+
+	if (best < 0)
+		return QLIGHT_FALLBACK;
+
+	//Keep models from going completely black in unlit corners.
+	if (best < 24)
+		best = 24;
+
+	return best;
+}
+
 CQCanvas *QDrawNew(I64 w, I64 h)
 {//The render target is allocated at whatever size is asked for. Cost scales
  //with the pixel count, so this is the main performance dial: 640x480 is four
@@ -849,7 +1070,7 @@ U0 QDrawFace(CQCanvas *c, CQMap *map, I64 face_index)
 		lm_w = f->extent_s / 16 + 1;
 		lm_h = f->extent_t / 16 + 1;
 		if (f->light_offset + lm_w * lm_h <= map->lightdata_size)
-			lightmap = map->lightdata + f->light_offset;
+			lightmap = QLightFaceMap(map, f, lm_w, lm_h);
 		else
 		{
 			lm_w = 0;
