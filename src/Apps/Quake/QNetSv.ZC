@@ -73,6 +73,7 @@ CQMsg			q_net_udp_in;		//datagram staging before it joins the queue
 //beside the move code because QNetClientClear below resets them.
 //Who the client believes it is. Arrives over the wire like everything else.
 U8		q_cl_name[24];
+I64		q_cl_cdtrack	= 0;	//track the server asked for, 0 = none
 I64		q_cl_top	= 0;
 I64		q_cl_bottom	= 0;
 
@@ -127,6 +128,7 @@ U0 QNetClientClear()
 	q_cl_name[0] = 0;
 	q_cl_top     = 0;
 	q_cl_bottom  = 0;
+	q_cl_cdtrack = 0;
 
 	q_net_dropped = 0;
 	q_net_parsed  = 0;
@@ -265,6 +267,21 @@ U0 QNetWriteIdentity(CQMsg *m, I64 ent, U8 *name, I64 top, I64 bottom)
 	QMsgWriteByte(m, QSVC_UPDATECOLORS);
 	QMsgWriteByte(m, 0);
 	QMsgWriteByte(m, ((top & 15) << 4) | (bottom & 15));
+}
+
+U0 QNetWriteCDTrack(CQMsg *m)
+{//SV_SpawnServer writes svc_cdtrack from WORLDSPAWN's .sounds field - that is
+ //how a map says which CD track belongs to it, and the byte is sent twice
+ //because the protocol carries a track for the game and one for a looping
+ //ambient source that nothing ever used.
+	I64 track = 0;
+
+	if (q_fld_sounds >= 0)
+		track = ToI64(QPrFieldF(0, q_fld_sounds));
+
+	QMsgWriteByte(m, QSVC_CDTRACK);
+	QMsgWriteByte(m, track);
+	QMsgWriteByte(m, track);
 }
 
 //--- the client's own state ------------------------------------------------
@@ -637,6 +654,11 @@ Bool QNetClientParse(CQMsg *m)
 				QNetParseBaseline(m);
 				break;
 
+			case QSVC_CDTRACK:
+				q_cl_cdtrack = QMsgReadByte(m);
+				QMsgReadByte(m);		//the unused loop track
+				break;
+
 			case QSVC_UPDATENAME:
 				QMsgReadByte(m);		//client number
 				QMsgReadString(m, q_cl_name, 16);
@@ -689,6 +711,176 @@ qnp_next:
 	}
 
 	return TRUE;
+}
+
+U0 QSvCallPlayerFunc(I64 ent, U8 *name)
+{//Run a named QuakeC function with self set to this client.
+	I64 fn = QPrFindFunction(name);
+
+	if (fn <= 0 || ent <= 0)
+		return;
+
+	QPrSetI(q_ofs_self, QPrEdictValue(ent));
+	QPrSetI(q_ofs_other, 0);
+	QPrExecute(fn);
+	q_pr_error = FALSE;
+}
+
+//--- server client slots ---------------------------------------------------
+//
+// A listen server has one LOCAL client - the person at the keyboard, whose
+// moves arrive over the loopback link - and room for remote ones that arrive as
+// datagrams. Both kinds get a real player edict through the same QuakeC path,
+// because a client the game logic cannot see is not a player: it would not be
+// hit by rockets, would trigger nothing, and would not appear in anyone else's
+// entity updates.
+
+#define QSV_MAX_CLIENTS		4
+#define QSV_TIMEOUT			10.0	//seconds of silence before a drop
+
+class CQSvClient
+{
+	I64		edict;
+	U32		ip;			//0 for the local client
+	Bool	active;
+	Bool	local;
+
+	//The last move read for this client, held until its tick runs.
+	F64		angles[3];
+	F64		cmd[3];		//forward, side, up
+	Bool	attack;
+	Bool	jump;
+	I64		impulse;
+	F64		last_msg;
+
+	//The engine's own copy of where this client is, the same pair the local
+	//player keeps in the app shell.
+	F64		origin[3];
+	F64		velocity[3];
+	Bool	on_ground;
+};
+
+CQSvClient	q_sv_clients[QSV_MAX_CLIENTS];
+I64			q_sv_client_count = 0;
+
+U0 QSvClientsClear()
+{//Globals are not zeroed.
+	I64 i;
+	I64 j;
+
+	for (i = 0; i < QSV_MAX_CLIENTS; i++)
+	{
+		q_sv_clients[i].edict     = 0;
+		q_sv_clients[i].ip        = 0;
+		q_sv_clients[i].active    = FALSE;
+		q_sv_clients[i].local     = FALSE;
+		q_sv_clients[i].attack    = FALSE;
+		q_sv_clients[i].jump      = FALSE;
+		q_sv_clients[i].impulse   = 0;
+		q_sv_clients[i].last_msg  = 0.0;
+		q_sv_clients[i].on_ground = FALSE;
+
+		for (j = 0; j < 3; j++)
+		{
+			q_sv_clients[i].angles[j]   = 0.0;
+			q_sv_clients[i].cmd[j]      = 0.0;
+			q_sv_clients[i].origin[j]   = 0.0;
+			q_sv_clients[i].velocity[j] = 0.0;
+		}
+	}
+
+	q_sv_client_count = 0;
+}
+
+I64 QSvFindClient(U32 ip)
+{//Slot for a sender address, or -1. The local client owns ip 0.
+	I64 i;
+
+	for (i = 0; i < QSV_MAX_CLIENTS; i++)
+		if (q_sv_clients[i].active && q_sv_clients[i].ip == ip)
+			return i;
+
+	return -1;
+}
+
+I64 QSvAddClient(U32 ip, Bool local, I64 edict, F64 now)
+{//Take a free slot and give it a body. -1 if the server is full.
+	F64	org[3];
+	F64	ang[3];
+	I64	i;
+
+	for (i = 0; i < QSV_MAX_CLIENTS; i++)
+	{
+		if (q_sv_clients[i].active)
+			goto qsv_next;
+
+		QVecSet(org, 0.0, 0.0, 0.0);
+		QVecSet(ang, 0.0, 0.0, 0.0);
+
+		//A REMOTE client needs a fresh edict; the local one already has the
+		//reserved player edict and must not be given a second body.
+		if (edict <= 0)
+		{
+			edict = QPrSpawnEdict;
+			if (edict <= 0)
+				return -1;
+
+			if (!QClientSpawnAt(edict, org, ang))
+				return -1;
+		}
+		else
+		{
+			org[0] = QPrFieldF(edict, q_fld_origin);
+			org[1] = QPrFieldF(edict, q_fld_origin + 1);
+			org[2] = QPrFieldF(edict, q_fld_origin + 2);
+		}
+
+		q_sv_clients[i].edict    = edict;
+		q_sv_clients[i].ip       = ip;
+		q_sv_clients[i].active   = TRUE;
+		q_sv_clients[i].local    = local;
+		q_sv_clients[i].last_msg = now;
+
+		QVecCopy(org, q_sv_clients[i].origin);
+		QVecSet(q_sv_clients[i].velocity, 0.0, 0.0, 0.0);
+
+		q_sv_client_count++;
+
+		return i;
+
+qsv_next:
+	}
+
+	return -1;
+}
+
+U0 QSvDropClient(I64 slot)
+{//SV_DropClient. The body is removed, or it stands in the level forever.
+	if (slot < 0 || slot >= QSV_MAX_CLIENTS || !q_sv_clients[slot].active)
+		return;
+
+	if (!q_sv_clients[slot].local && q_sv_clients[slot].edict > 0)
+		QPrFreeEdict(q_sv_clients[slot].edict);
+
+	q_sv_clients[slot].active = FALSE;
+	q_sv_clients[slot].edict  = 0;
+	q_sv_client_count--;
+}
+
+U0 QSvCheckTimeouts(F64 now)
+{//A client that has stopped sending moves is gone. Without this its body stays
+ //standing in the level being shot at forever.
+	I64 i;
+
+	for (i = 0; i < QSV_MAX_CLIENTS; i++)
+	{
+		if (q_sv_clients[i].active && !q_sv_clients[i].local &&
+			now - q_sv_clients[i].last_msg > QSV_TIMEOUT)
+		{
+			QLog("net: client timed out\n");
+			QSvDropClient(i);
+		}
+	}
 }
 
 //--- upstream: the client's move ------------------------------------------
@@ -744,7 +936,7 @@ U0 QNetClientSendMove(F64 *view_angles, F64 forward, F64 side, F64 up,
 		q_net_moves_sent++;
 }
 
-Bool QNetServerReadMove(CQMsg *m, I64 ent, F64 server_time)
+Bool QNetServerReadMove(CQMsg *m, I64 ent, F64 server_time, I64 slot = -1)
 {//SV_ReadClientMove. The clc_move byte has already been consumed.
 	I64 bits;
 	I64 imp;
@@ -788,24 +980,109 @@ Bool QNetServerReadMove(CQMsg *m, I64 ent, F64 server_time)
 		QPrSetFieldF(ent, q_fld_button2, ToF64(q_net_move_jump));
 	}
 
+	//Park the move on the sender's slot. Its tick applies it; doing it here
+	//would run one client's input inside another's read.
+	if (slot >= 0)
+	{
+		QVecCopy(q_net_move_angles, q_sv_clients[slot].angles);
+		QVecCopy(q_net_move_cmd, q_sv_clients[slot].cmd);
+		q_sv_clients[slot].attack   = q_net_move_attack;
+		q_sv_clients[slot].jump     = q_net_move_jump;
+		q_sv_clients[slot].last_msg = server_time;
+
+		if (imp)
+			q_sv_clients[slot].impulse = imp;
+	}
+
 	q_net_moves_read++;
 
 	return TRUE;
 }
 
+Bool QNetParseFromClient(CQMsg *in, I64 slot, F64 server_time)
+{//One client's message, whatever the transport was.
+	I64 cmd;
+	I64 ent = 0;
+
+	if (slot >= 0)
+		ent = q_sv_clients[slot].edict;
+
+	in->read    = 0;
+	in->badread = FALSE;
+
+	while (in->read < in->len)
+	{
+		cmd = QMsgReadByte(in);
+		if (in->badread)
+			return FALSE;
+
+		switch (cmd)
+		{
+			case QCLC_NOP:
+				break;
+
+			case QCLC_MOVE:
+				if (!QNetServerReadMove(in, ent, server_time, slot))
+					return FALSE;
+				break;
+
+			case QCLC_DISCONNECT:
+				if (slot >= 0)
+					QSvDropClient(slot);
+				return TRUE;
+
+			case QCLC_STRINGCMD:
+				QMsgReadString(in, q_net_cmd_line, 128);
+				break;
+
+			default:
+				return FALSE;
+		}
+	}
+
+	return TRUE;
+}
+
 Bool QNetServerReadClient(I64 ent, F64 server_time)
-{//SV_RunClients' read half: drain whatever the client sent us.
+{//SV_RunClients' read half: drain whatever the clients sent us.
 	CQMsg	*in = &q_net_recv_c2s;
 	I64		 cmd;
+	I64		 slot;
 
 	//Remote moves are pulled into the SAME queue the local client writes to, so
 	//the parse below cannot tell them apart - which is the point. The first
 	//datagram to arrive also fixes the peer address, so hosting needs no prior
 	//configuration: whoever speaks first becomes the client.
+	//REMOTE clients are parsed here, per sender, rather than being folded into
+	//the local queue. Their moves belong to their own bodies, and a datagram
+	//from an address with no slot yet IS the connection request - a listen
+	//server has nothing else to go on.
 	if (q_udp_ready && q_udp_server)
 	{
 		while (QNetUdpRecv(&q_net_udp_in))
-			QNetSendToServer(&q_net_udp_in);
+		{
+			slot = QSvFindClient(q_udp_from_ip);
+
+			if (slot < 0 && q_udp_from_ip)
+			{
+				slot = QSvAddClient(q_udp_from_ip, FALSE, 0, server_time);
+
+				if (slot >= 0)
+				{
+					StrPrint(q_net_cmd_line,
+						"net: client %d.%d.%d.%d joined as edict %d\n",
+						q_udp_from_ip & 255, (q_udp_from_ip >> 8) & 255,
+						(q_udp_from_ip >> 16) & 255,
+						(q_udp_from_ip >> 24) & 255,
+						q_sv_clients[slot].edict);
+					QLog(q_net_cmd_line);
+					QLogFlush;
+				}
+			}
+
+			if (slot >= 0)
+				QNetParseFromClient(&q_net_udp_in, slot, server_time);
+		}
 	}
 
 	while (QNetServerGetMessage(in))
@@ -847,6 +1124,110 @@ Bool QNetServerReadClient(I64 ent, F64 server_time)
 	}
 
 	return TRUE;
+}
+
+U0 QSvRunClients(F64 dt, F64 now)
+{//SV_RunClients for the REMOTE clients only - the local one is driven by the
+ //app shell, which owns the keyboard and the view.
+ //
+ //The wish direction is rebuilt from the angles and the move command the client
+ //sent, exactly as SV_ClientThink does: the client transmits intent along its
+ //own axes, and the server turns that into a world direction. It is never sent
+ //a world vector, which is what stops a client from simply claiming to move
+ //wherever it likes.
+	F64	forward[3];
+	F64	right[3];
+	F64	up[3];
+	F64	wishdir[3];
+	F64	wishvel[3];
+	F64	ang[3];
+	F64	wishspeed;
+	I64	ent;
+	I64	i;
+	I64	j;
+
+	for (i = 0; i < QSV_MAX_CLIENTS; i++)
+	{
+		if (!q_sv_clients[i].active || q_sv_clients[i].local)
+			goto qsr_next;
+
+		ent = q_sv_clients[i].edict;
+		if (ent <= 0)
+			goto qsr_next;
+
+		//The body angles carry yaw only; v_angle carries the full view, which
+		//is what the weapon code aims along.
+		QVecCopy(q_sv_clients[i].angles, ang);
+
+		QPrSetFieldF(ent, q_fld_angles, 0.0);
+		QPrSetFieldF(ent, q_fld_angles + 1, ang[1]);
+		QPrSetFieldF(ent, q_fld_angles + 2, 0.0);
+
+		for (j = 0; j < 3; j++)
+			QPrSetFieldF(ent, q_fld_v_angle + j, ang[j]);
+
+		QPrSetFieldF(ent, q_fld_button0, ToF64(q_sv_clients[i].attack));
+		QPrSetFieldF(ent, q_fld_button2, ToF64(q_sv_clients[i].jump));
+
+		if (q_sv_clients[i].impulse)
+		{
+			QPrSetFieldF(ent, q_fld_impulse,
+				ToF64(q_sv_clients[i].impulse));
+			q_sv_clients[i].impulse = 0;
+		}
+
+		//PlayerPreThink, then the move, then PlayerPostThink - the same order
+		//the local client runs in.
+		QSvCallPlayerFunc(ent, "PlayerPreThink");
+
+		for (j = 0; j < 3; j++)
+		{
+			q_sv_clients[i].origin[j]   = QPrFieldF(ent, q_fld_origin + j);
+			q_sv_clients[i].velocity[j] = QPrFieldF(ent, q_fld_velocity + j);
+		}
+
+		QAngleVectors(ang, forward, right, up);
+
+		//Flattened out of water, so looking up does not drive them into the
+		//floor - the same treatment the local player's wish direction gets.
+		forward[2] = 0.0;
+		right[2]   = 0.0;
+		QVecNormalize(forward);
+		QVecNormalize(right);
+
+		for (j = 0; j < 3; j++)
+			wishvel[j] = forward[j] * q_sv_clients[i].cmd[0] +
+						 right[j]   * q_sv_clients[i].cmd[1];
+
+		QVecCopy(wishvel, wishdir);
+		wishspeed = QVecLength(wishdir);
+
+		if (wishspeed > 0.0)
+			QVecScale(wishdir, 1.0 / wishspeed, wishdir);
+
+		if (wishspeed > QPHYS_MAXSPEED)
+			wishspeed = QPHYS_MAXSPEED;
+
+		q_move_pass = ent;
+
+		QPlayerMove(q_bi_map, q_sv_clients[i].origin,
+			q_sv_clients[i].velocity, wishdir, wishspeed, FALSE, dt,
+			&q_sv_clients[i].on_ground, 0, FALSE, ang);
+
+		q_move_pass = 0;
+
+		for (j = 0; j < 3; j++)
+		{
+			QPrSetFieldF(ent, q_fld_origin + j, q_sv_clients[i].origin[j]);
+			QPrSetFieldF(ent, q_fld_velocity + j, q_sv_clients[i].velocity[j]);
+		}
+
+		QSvCallPlayerFunc(ent, "PlayerPostThink");
+
+qsr_next:
+	}
+
+	QSvCheckTimeouts(now);
 }
 
 //--- drawing from the client's own tables -----------------------------------
