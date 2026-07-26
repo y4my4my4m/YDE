@@ -60,6 +60,101 @@ class CQCanvas
 	I64	 spans_drawn;
 };
 
+//--- dynamic lights --------------------------------------------------------
+//
+// Muzzle flashes, explosions, and the glow a rocket carries with it. These are
+// not in the compiled lightmap - they move - so they are added to a face's
+// light at draw time, which is what R_AddDynamicLights does.
+//
+// A light is projected onto the surface's plane, and each luxel is brightened by
+// how far it is from that impact point, using the original's cheap approximation
+// of distance (larger axis plus half the smaller) rather than a square root.
+
+#define QMAX_DLIGHTS		32
+#define QDLIGHT_MINLIGHT	4.0
+
+class CQDlight
+{
+	F64	origin[3];
+	F64	radius;
+	F64	die;			//absolute time it expires
+	F64	decay;			//radius lost per second
+	F64	min_light;
+};
+
+CQDlight	q_dlight[QMAX_DLIGHTS];
+I64			q_dlight_count = 0;
+
+U0 QDlightClear()
+{
+	q_dlight_count = 0;
+}
+
+U0 QDlightAdd(F64 *origin, F64 radius, F64 life, F64 decay, F64 time)
+{//Register a light. The oldest slot is recycled when full, since these are all
+ //short lived and losing the stalest one is unnoticeable.
+	CQDlight	*d;
+	I64			 slot = -1;
+	I64			 i;
+
+	for (i = 0; i < q_dlight_count; i++)
+	{
+		if (q_dlight[i].die <= time)
+		{
+			slot = i;
+			break;
+		}
+	}
+
+	if (slot < 0)
+	{
+		if (q_dlight_count < QMAX_DLIGHTS)
+		{
+			slot = q_dlight_count;
+			q_dlight_count++;
+		}
+		else
+			slot = 0;
+	}
+
+	d = &q_dlight[slot];
+	QVecCopy(origin, d->origin);
+	d->radius    = radius;
+	d->die       = time + life;
+	d->decay     = decay;
+	d->min_light = QDLIGHT_MINLIGHT;
+}
+
+U0 QDlightUpdate(F64 dt, F64 time)
+{//Shrink live lights and drop expired ones.
+	I64 i;
+
+	for (i = 0; i < q_dlight_count; i++)
+	{
+		if (q_dlight[i].die <= time)
+			goto qdl_next;
+
+		q_dlight[i].radius -= dt * q_dlight[i].decay;
+		if (q_dlight[i].radius < 0.0)
+			q_dlight[i].die = 0.0;
+
+qdl_next:
+	}
+}
+
+Bool QDlightsActive(F64 time)
+{//Cheap gate: most frames have none at all.
+	I64 i;
+
+	for (i = 0; i < q_dlight_count; i++)
+	{
+		if (q_dlight[i].die > time && q_dlight[i].radius > 0.0)
+			return TRUE;
+	}
+
+	return FALSE;
+}
+
 //--- animated light styles -------------------------------------------------
 //
 // A style is a string of letters sampled at 10Hz: 'a' is black, 'm' is normal
@@ -94,13 +189,23 @@ U8	q_light_scratch[QLIGHT_SCRATCH];
 
 //Counters, so it is possible to tell whether the recombine path is even active
 //rather than guessing from a screenshot.
+I64	q_light_acc[QLIGHT_SCRATCH];	//per-luxel accumulator, 8 bits of fraction
+Bool q_dlight_any	= FALSE;		//any live dynamic light this frame
 I64	q_light_fast	= 0;
 I64	q_light_slow	= 0;
 I64	q_light_clamped	= 0;
 
+F64 q_light_time = 0.0;		//time the current frame is being drawn at
+F64 q_light_last = 0.0;		//previous frame's time, for the dynamic-light decay
+
 U0 QLightInit()
 {//Globals are not zeroed here, so every style starts explicitly steady.
 	I64 i;
+
+	q_dlight_any  = FALSE;
+	q_dlight_count = 0;
+	q_light_last  = 0.0;
+	q_light_time  = 0.0;
 
 	for (i = 0; i < QMAX_LIGHTSTYLES; i++)
 	{
@@ -116,6 +221,25 @@ U0 QLightStyleSet(I64 style, U8 *str)
 		return;
 
 	QStrCopy(&q_lightstyle[style * QLIGHTSTYLE_LEN], str, QLIGHTSTYLE_LEN);
+}
+
+U0 QLightFrame(F64 time)
+{//Per-frame light bookkeeping: expire and shrink dynamic lights, and cache
+ //whether any survive so the per-face path can skip them cheaply.
+ //
+ //The delta is tracked here rather than passed in: dynamic lights decay in real
+ //time, independently of the fixed server step.
+	F64 dt = time - q_light_last;
+
+	q_light_last = time;
+
+	//A long stall (a level load) must not decay everything at once.
+	if (dt < 0.0 || dt > 0.25)
+		dt = 0.0;
+
+	q_light_time = time;
+	QDlightUpdate(dt, time);
+	q_dlight_any = QDlightsActive(time);
 }
 
 U0 QLightAnimate(F64 time)
@@ -148,11 +272,102 @@ ql_next:
 	}
 }
 
-U8 *QLightFaceMap(CQMap *map, CQFace *f, I64 lm_w, I64 lm_h)
-{//The lightmap to render this face with, combining its animated styles.
+U0 QLightAddDynamic(CQMap *map, CQFace *f, I64 lm_w, I64 lm_h, F64 time)
+{//Fold every dynamic light touching this face into the accumulator.
+ //R_AddDynamicLights.
+	CQDlight	*d;
+	CQPlane		*plane;
+	CQTexInfo	*ti;
+	F64			 impact[3];
+	F64			 local_s;
+	F64			 local_t;
+	F64			 dist;
+	F64			 rad;
+	F64			 minlight;
+	F64			 sd;
+	F64			 td;
+	F64			 adist;
+	I64			 lnum;
+	I64			 sx;
+	I64			 ty;
+	I64			 j;
+
+	plane = &map->planes[f->plane_num];
+	ti    = &map->texinfo[f->tex_info];
+
+	for (lnum = 0; lnum < q_dlight_count; lnum++)
+	{
+		d = &q_dlight[lnum];
+
+		if (d->die <= time || d->radius <= 0.0)
+			goto qad_next;
+
+		//How far the light sits off this face's plane. A face on the back side
+		//has its normal flipped, so the sign has to follow.
+		dist = QVecDot(d->origin, plane->normal) - plane->dist;
+		if (f->side)
+			dist = -dist;
+
+		rad = d->radius;
+		if (dist < 0.0)
+			rad -= -dist;
+		else
+			rad -= dist;
+
+		minlight = d->min_light;
+		if (rad < minlight)
+			goto qad_next;
+
+		minlight = rad - minlight;
+
+		//Project the light onto the surface.
+		for (j = 0; j < 3; j++)
+		{
+			if (f->side)
+				impact[j] = d->origin[j] + plane->normal[j] * dist;
+			else
+				impact[j] = d->origin[j] - plane->normal[j] * dist;
+		}
+
+		local_s = QVecDot(impact, &ti->vecs[0]) + ti->vecs[3] - f->mins_s;
+		local_t = QVecDot(impact, &ti->vecs[4]) + ti->vecs[7] - f->mins_t;
+
+		for (ty = 0; ty < lm_h; ty++)
+		{
+			td = local_t - ToF64(ty * 16);
+			if (td < 0.0)
+				td = -td;
+
+			for (sx = 0; sx < lm_w; sx++)
+			{
+				sd = local_s - ToF64(sx * 16);
+				if (sd < 0.0)
+					sd = -sd;
+
+				//The original's cheap distance: the larger axis plus half the
+				//smaller, rather than a square root per luxel.
+				if (sd > td)
+					adist = sd + td * 0.5;
+				else
+					adist = td + sd * 0.5;
+
+				if (adist < minlight)
+					q_light_acc[ty * lm_w + sx] +=
+						ToI64((rad - adist) * 256.0);
+			}
+		}
+
+qad_next:
+	}
+}
+
+U8 *QLightFaceMap(CQMap *map, CQFace *f, I64 lm_w, I64 lm_h, F64 time)
+{//The lightmap to render this face with: its compiled lighting, scaled by the
+ //current value of each style it uses, plus any dynamic lights on it.
  //
- //Returns the map's own data untouched whenever nothing is animated, so the
- //common case costs one comparison rather than a per-texel recombine.
+ //Returns the map's own data untouched whenever nothing is animated and no
+ //dynamic light reaches the face, so the common case costs one comparison
+ //rather than a per-texel recombine.
 	U8	*base;
 	I64	 size = lm_w * lm_h;
 	I64	 count;
@@ -160,6 +375,7 @@ U8 *QLightFaceMap(CQMap *map, CQFace *f, I64 lm_w, I64 lm_h)
 	I64	 scale;
 	I64	 i;
 	I64	 j;
+	Bool dyn;
 
 	if (f->light_offset < 0 || !map->lightdata)
 		return NULL;
@@ -176,16 +392,19 @@ U8 *QLightFaceMap(CQMap *map, CQFace *f, I64 lm_w, I64 lm_h)
 	if (!count)
 		return base;
 
-	//One steady style is the overwhelmingly common case, and for it the whole
-	//recombine is a no-op, so hand back the map's own data untouched.
-	if (count == 1 && q_lightstyle_value[f->styles[0]] == QLIGHT_UNITY)
+	if (size <= 0 || size > QLIGHT_SCRATCH)
+		return base;
+
+	dyn = q_dlight_any;
+
+	//One steady style and no dynamic light means the whole recombine is a
+	//no-op, so hand back the map's own data.
+	if (!dyn && count == 1 &&
+		q_lightstyle_value[f->styles[0]] == QLIGHT_UNITY)
 	{
 		q_light_fast++;
 		return base;
 	}
-
-	if (size <= 0 || size > QLIGHT_SCRATCH)
-		return base;
 
 	//Every style adds another block of the same size after the first, so the
 	//multi-style read is longer than the caller's single-block bounds check.
@@ -194,6 +413,8 @@ U8 *QLightFaceMap(CQMap *map, CQFace *f, I64 lm_w, I64 lm_h)
 
 	q_light_slow++;
 
+	//Accumulate at 8 bits of fraction so dynamic lights can be added before
+	//anything is rounded or clamped.
 	for (i = 0; i < size; i++)
 	{
 		acc = 0;
@@ -204,14 +425,24 @@ U8 *QLightFaceMap(CQMap *map, CQFace *f, I64 lm_w, I64 lm_h)
 			acc  += ToI64(base[j * size + i]) * scale;
 		}
 
+		q_light_acc[i] = acc;
+	}
+
+	if (dyn)
+		QLightAddDynamic(map, f, lm_w, lm_h, time);
+
+	for (i = 0; i < size; i++)
+	{
 		//The scales are fixed point with 256 as unity.
-		acc >>= 8;
+		acc = q_light_acc[i] >> 8;
 
 		if (acc > 255)
 		{
 			acc = 255;
 			q_light_clamped++;
 		}
+		if (acc < 0)
+			acc = 0;
 
 		q_light_scratch[i] = acc;
 	}
@@ -1096,7 +1327,7 @@ U0 QDrawFace(CQCanvas *c, CQMap *map, I64 face_index)
 		lm_w = f->extent_s / 16 + 1;
 		lm_h = f->extent_t / 16 + 1;
 		if (f->light_offset + lm_w * lm_h <= map->lightdata_size)
-			lightmap = QLightFaceMap(map, f, lm_w, lm_h);
+			lightmap = QLightFaceMap(map, f, lm_w, lm_h, q_light_time);
 		else
 		{
 			lm_w = 0;

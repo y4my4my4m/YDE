@@ -19,6 +19,38 @@
 #define QSOLID_SLIDEBOX_	3
 #define QSOLID_BSP_			4
 
+//Precache index -> BSP brush model number.
+//
+// .modelindex is an index into the PRECACHE list, not into the map's model
+// array. Those two are unrelated: the world is precache slot 1 but BSP model 0,
+// and a door named "*3" can land in any precache slot at all.
+//
+// Confusing them meant every solid brush entity was traced against the WRONG
+// clipnodes - and the world entity, precache slot 1, was traced as brush model
+// 1 (some door) sitting at the world origin. The result was invisible collision
+// scattered through the level that refused moves in open space.
+//
+// -1 means "not a brush model", which is every alias model and sprite.
+#define QCLIP_MAX_PRECACHE	1024
+
+I64 q_precache_bmodel[QCLIP_MAX_PRECACHE];
+
+U0 QClipPrecacheReset()
+{//Globals are not zeroed, so every slot must be marked explicitly.
+	I64 i;
+
+	for (i = 0; i < QCLIP_MAX_PRECACHE; i++)
+		q_precache_bmodel[i] = -1;
+}
+
+I64 QClipBrushModel(I64 precache_index)
+{//The BSP model number for a precache slot, or -1 if it is not a brush model.
+	if (precache_index < 1 || precache_index >= QCLIP_MAX_PRECACHE)
+		return -1;
+
+	return q_precache_bmodel[precache_index];
+}
+
 //Which clipping hull suits a bounding box, by SV_HullForEntity's rule. Point
 //entities like rockets get hull 0, man-sized things hull 1, big monsters hull 2.
 //Tracing everything through hull 1 - which is what this used to do - makes a
@@ -202,7 +234,10 @@ U0 QClipToEntities(CQMap *map, F64 *start, F64 *end, F64 *mins, F64 *maxs,
 	I64		movetype;
 	I64		model;
 
-	for (i = 0; i < q_pr_num_edicts; i++)
+	//From 1: edict 0 is the world, and QTraceEntity has already traced it
+	//through the real world hull. Including it here would trace it a second
+	//time as though it were an ordinary brush entity.
+	for (i = 1; i < q_pr_num_edicts; i++)
 	{
 		if (q_pr_edict_free[i] || i == pass)
 			goto qc_next;
@@ -236,8 +271,10 @@ U0 QClipToEntities(CQMap *map, F64 *start, F64 *end, F64 *mins, F64 *maxs,
 		if (solid == QSOLID_BSP_)
 		{
 			//A brush model: trace its own clipnodes, offset to where it sits.
-			model = ToI64(QPrFieldF(i, q_fld_modelindex));
-			if (model <= 0)
+			//The precache slot has to be translated to a BSP model number - it
+			//is NOT the same number.
+			model = QClipBrushModel(ToI64(QPrFieldF(i, q_fld_modelindex)));
+			if (model < 0)
 				goto qc_next;
 
 			QTraceHull(map, model, QHullForSize(mins, maxs), eorg, start, end,
@@ -354,6 +391,8 @@ U0 QClipInit()
 	QVecSet(q_player_mins, -16.0, -16.0, -24.0);
 	QVecSet(q_player_maxs,  16.0,  16.0,  32.0);
 	q_move_pass = 0;
+
+	QClipPrecacheReset;
 }
 
 U0 QTracePlayer(CQMap *map, F64 *start, F64 *end, CQTrace *trace)
@@ -369,7 +408,8 @@ U0 QTracePlayer(CQMap *map, F64 *start, F64 *end, CQTrace *trace)
 #define QBLOCK_FLOOR		1
 #define QBLOCK_WALL		2
 
-I64 QFlyMove(CQMap *map, F64 *origin, F64 *velocity, F64 dt, Bool *_ground)
+I64 QFlyMove(CQMap *map, F64 *origin, F64 *velocity, F64 dt, Bool *_ground,
+	CQTrace *_steptrace)
 {//Sweep the player through the world, sliding along whatever is hit, and report
  //what got in the way. A faithful port of SV_FlyMove.
  //
@@ -442,7 +482,14 @@ I64 QFlyMove(CQMap *map, F64 *origin, F64 *velocity, F64 dt, Bool *_ground)
 		}
 
 		if (trace.plane_normal[2] == 0.0)
+		{
 			blocked |= QBLOCK_WALL;
+
+			//Kept for the caller: wall friction needs the plane, and the step
+			//retry needs to know what stopped the move.
+			if (_steptrace)
+				MemCopy(_steptrace, &trace, sizeof(CQTrace));
+		}
 
 		time_left -= time_left * trace.fraction;
 
@@ -506,7 +553,7 @@ I64 QFlyMove(CQMap *map, F64 *origin, F64 *velocity, F64 dt, Bool *_ground)
 
 Bool QSlideMove(CQMap *map, F64 *origin, F64 *velocity, F64 dt)
 {//Move and slide, discarding the detail of what was hit.
-	return ToBool(QFlyMove(map, origin, velocity, dt, NULL) != 0);
+	return ToBool(QFlyMove(map, origin, velocity, dt, NULL, NULL) != 0);
 }
 
 U0 QPushMove(CQMap *map, F64 *origin, F64 *push, CQTrace *trace)
@@ -519,8 +566,97 @@ U0 QPushMove(CQMap *map, F64 *origin, F64 *push, CQTrace *trace)
 	QVecCopy(trace->end_pos, origin);
 }
 
+U0 QWallFriction(F64 *velocity, F64 *view_angles, F64 *normal)
+{//Bleed off speed when running at a wall face-on. SV_WallFriction.
+ //
+ //Scaled by how directly the player is FACING the wall, not by how hard they
+ //hit it: sliding along at a glancing angle keeps its speed, while walking
+ //straight into a surface stops dead. Without it a player can hold forward
+ //against a wall and retain full sideways speed.
+	F64 fwd[3];
+	F64 rgt[3];
+	F64 upv[3];
+	F64 into[3];
+	F64 side[3];
+	F64 d;
+	F64 i;
+
+	QAngleVectors(view_angles, fwd, rgt, upv);
+
+	d = QVecDot(normal, fwd) + 0.5;
+	if (d >= 0.0)
+		return;
+
+	//Remove the component heading into the wall, then scale what is left.
+	i = QVecDot(normal, velocity);
+	QVecScale(normal, i, into);
+	QVecSub(velocity, into, side);
+
+	velocity[0] = side[0] * (1.0 + d);
+	velocity[1] = side[1] * (1.0 + d);
+}
+
+I64 QTryUnstick(CQMap *map, F64 *origin, F64 *velocity, F64 *oldvel)
+{//Nudge out of a spot the clipping hulls will not let the player leave.
+ //SV_TryUnstick.
+ //
+ //Stepping up sometimes makes no progress at all because the hulls are built
+ //from integer planes and the player ends up in a seam a legal move cannot
+ //escape. Eight small axial shoves are tried, each followed by a retry of the
+ //original move, and the first one that actually travels wins.
+	F64		oldorg[3];
+	F64		dir[3];
+	CQTrace	tr;
+	F64		dx;
+	F64		dy;
+	I64		clip;
+	I64		i;
+
+	QVecCopy(origin, oldorg);
+
+	for (i = 0; i < 8; i++)
+	{
+		QVecSet(dir, 0.0, 0.0, 0.0);
+
+		switch (i)
+		{
+			case 0:	dir[0] =  2.0;					break;
+			case 1:	dir[1] =  2.0;					break;
+			case 2:	dir[0] = -2.0;					break;
+			case 3:	dir[1] = -2.0;					break;
+			case 4:	dir[0] =  2.0; dir[1] =  2.0;	break;
+			case 5:	dir[0] = -2.0; dir[1] =  2.0;	break;
+			case 6:	dir[0] =  2.0; dir[1] = -2.0;	break;
+			default: dir[0] = -2.0; dir[1] = -2.0;	break;
+		}
+
+		QPushMove(map, origin, dir, &tr);
+
+		//Retry the move that was refused.
+		velocity[0] = oldvel[0];
+		velocity[1] = oldvel[1];
+		velocity[2] = 0.0;
+
+		clip = QFlyMove(map, origin, velocity, 0.1, NULL, NULL);
+
+		dx = origin[0] - oldorg[0];
+		dy = origin[1] - oldorg[1];
+		if (dx < 0.0) dx = -dx;
+		if (dy < 0.0) dy = -dy;
+
+		if (dx > 4.0 || dy > 4.0)
+			return clip;
+
+		//No progress: back to the start and try the next direction.
+		QVecCopy(oldorg, origin);
+	}
+
+	QVecSet(velocity, 0.0, 0.0, 0.0);
+	return QBLOCK_FLOOR | QBLOCK_WALL;
+}
+
 U0 QWalkMove(CQMap *map, F64 *origin, F64 *velocity, F64 dt, Bool old_ground,
-	Bool *_ground)
+	Bool *_ground, F64 *view_angles)
 {//Walk, climbing steps where a step is what blocked the move. Ported from
  //SV_WalkMove.
  //
@@ -541,7 +677,10 @@ U0 QWalkMove(CQMap *map, F64 *origin, F64 *velocity, F64 dt, Bool old_ground,
 	F64		upmove[3];
 	F64		downmove[3];
 	CQTrace	downtrace;
+	CQTrace	steptrace;
 	CQTrace	tr;
+	F64		dx;
+	F64		dy;
 	I64		clip;
 	Bool	flat_ground = FALSE;
 	Bool	step_ground = FALSE;
@@ -549,7 +688,7 @@ U0 QWalkMove(CQMap *map, F64 *origin, F64 *velocity, F64 dt, Bool old_ground,
 	QVecCopy(origin, oldorg);
 	QVecCopy(velocity, oldvel);
 
-	clip = QFlyMove(map, origin, velocity, dt, &flat_ground);
+	clip = QFlyMove(map, origin, velocity, dt, &flat_ground, &steptrace);
 
 	//Nothing wall-like stopped it, so there is no step to climb.
 	if ((clip & QBLOCK_WALL) == 0)
@@ -583,7 +722,24 @@ U0 QWalkMove(CQMap *map, F64 *origin, F64 *velocity, F64 dt, Bool old_ground,
 	velocity[1] = oldvel[1];
 	velocity[2] = 0.0;
 
-	clip = QFlyMove(map, origin, velocity, dt, &step_ground);
+	clip = QFlyMove(map, origin, velocity, dt, &step_ground, &steptrace);
+
+	//The step may have made no progress at all, which the hull seams can cause
+	//even when a legal move exists a couple of units away.
+	if (clip)
+	{
+		dx = origin[0] - oldorg[0];
+		dy = origin[1] - oldorg[1];
+		if (dx < 0.0) dx = -dx;
+		if (dy < 0.0) dy = -dy;
+
+		if (dx < 0.03125 && dy < 0.03125)
+			clip = QTryUnstick(map, origin, velocity, oldvel);
+	}
+
+	//Extra friction for running at a wall head-on.
+	if ((clip & QBLOCK_WALL) && view_angles)
+		QWallFriction(velocity, view_angles, steptrace.plane_normal);
 
 	//Settle back down onto whatever is below.
 	QPushMove(map, origin, downmove, &downtrace);
@@ -683,7 +839,7 @@ U0 QWaterMove(CQMap *map, F64 *origin, F64 *velocity, F64 *wishdir,
 
 U0 QPlayerMove(CQMap *map, F64 *origin, F64 *velocity, F64 *wishdir,
 	F64 wishspeed, Bool jump, F64 dt, Bool *_on_ground, I64 water_level,
-	Bool waterjump)
+	Bool waterjump, F64 *view_angles = NULL)
 {//One tick of player movement.
 	Bool on_ground;
 
@@ -754,7 +910,7 @@ U0 QPlayerMove(CQMap *map, F64 *origin, F64 *velocity, F64 *wishdir,
 	//removes the component heading into it.
 	velocity[2] -= QPHYS_GRAVITY * dt;
 
-	QWalkMove(map, origin, velocity, dt, on_ground, &on_ground);
+	QWalkMove(map, origin, velocity, dt, on_ground, &on_ground, view_angles);
 
 	if (_on_ground)
 		*_on_ground = on_ground;
