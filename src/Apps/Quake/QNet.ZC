@@ -313,3 +313,174 @@ Bool QNetGetMessage(CQMsg *out)
 
 	return TRUE;
 }
+
+//--- entity state -----------------------------------------------------------
+//
+// The second step of the split: the server describes the world as MESSAGES, and
+// the client keeps its own copy of what it has been told. Until now the renderer
+// read the same edict fields the physics wrote, which is only possible when both
+// live in one process.
+//
+// Each entity gets a baseline (sent once) and deltas (sent when something
+// changes). svc_spawnbaseline carries the full state; the update byte-mask says
+// which fields follow, so an entity that only moved costs a few bytes instead of
+// a full record. That compression is not an optimisation detail - it is why the
+// protocol fits a 28.8k modem, and it is what a .dem file contains.
+
+#define QNET_MAX_ENTS	600
+
+//Bits in an svc_update byte. U_MOREBITS chains a second byte.
+#define QU_MOREBITS		1
+#define QU_ORIGIN1		2
+#define QU_ORIGIN2		4
+#define QU_ORIGIN3		8
+#define QU_ANGLE2		16
+#define QU_NOLERP		32
+#define QU_FRAME		64
+#define QU_SIGNAL		128
+#define QU_ANGLE1		256
+#define QU_ANGLE3		512
+#define QU_MODEL		1024
+#define QU_COLORMAP		2048
+#define QU_SKIN			4096
+#define QU_EFFECTS		8192
+#define QU_LONGENTITY	16384
+
+class CQEntState
+{
+	F64	 origin[3];
+	F64	 angles[3];
+	I64	 modelindex;
+	I64	 frame;
+	I64	 colormap;
+	I64	 skin;
+	I64	 effects;
+	Bool active;		//the client has been told about this entity
+};
+
+//Two copies: what the server last SENT, and what the client currently BELIEVES.
+//The delta is the difference between them, which is why both must be kept.
+CQEntState	q_net_sent[QNET_MAX_ENTS];
+CQEntState	q_net_cl[QNET_MAX_ENTS];
+I64			q_net_num_ents = 0;
+
+U0 QNetStateClear(CQEntState *e)
+{
+	QVecSet(e->origin, 0.0, 0.0, 0.0);
+	QVecSet(e->angles, 0.0, 0.0, 0.0);
+	e->modelindex = 0;
+	e->frame      = 0;
+	e->colormap   = 0;
+	e->skin       = 0;
+	e->effects    = 0;
+	e->active     = FALSE;
+}
+
+U0 QNetStatesClear()
+{//Globals are not zeroed here, so both tables are cleared explicitly.
+	I64 i;
+
+	for (i = 0; i < QNET_MAX_ENTS; i++)
+	{
+		QNetStateClear(&q_net_sent[i]);
+		QNetStateClear(&q_net_cl[i]);
+	}
+
+	q_net_num_ents = 0;
+}
+
+U0 QNetWriteEntityUpdate(CQMsg *m, I64 num, CQEntState *now,
+	CQEntState *was)
+{//One delta-compressed entity update, in the original's field order.
+ //
+ //The mask is built FIRST and only then written, because svc_update puts the
+ //mask before the fields it describes - the reader has no other way to know
+ //what is coming.
+	I64 bits = 0;
+
+	if (now->origin[0] != was->origin[0])	bits |= QU_ORIGIN1;
+	if (now->origin[1] != was->origin[1])	bits |= QU_ORIGIN2;
+	if (now->origin[2] != was->origin[2])	bits |= QU_ORIGIN3;
+	if (now->angles[0] != was->angles[0])	bits |= QU_ANGLE1;
+	if (now->angles[1] != was->angles[1])	bits |= QU_ANGLE2;
+	if (now->angles[2] != was->angles[2])	bits |= QU_ANGLE3;
+	if (now->frame      != was->frame)		bits |= QU_FRAME;
+	if (now->modelindex != was->modelindex)	bits |= QU_MODEL;
+	if (now->colormap   != was->colormap)	bits |= QU_COLORMAP;
+	if (now->skin       != was->skin)		bits |= QU_SKIN;
+	if (now->effects    != was->effects)	bits |= QU_EFFECTS;
+
+	if (!bits)
+		return;				//nothing changed: send nothing at all
+
+	if (num >= 256)
+		bits |= QU_LONGENTITY;
+	if (bits >= 256)
+		bits |= QU_MOREBITS;
+
+	QMsgWriteByte(m, bits & 255);
+	if (bits & QU_MOREBITS)
+		QMsgWriteByte(m, (bits >> 8) & 255);
+
+	if (bits & QU_LONGENTITY)
+		QMsgWriteShort(m, num);
+	else
+		QMsgWriteByte(m, num);
+
+	if (bits & QU_MODEL)	QMsgWriteByte(m, now->modelindex);
+	if (bits & QU_FRAME)	QMsgWriteByte(m, now->frame);
+	if (bits & QU_COLORMAP)	QMsgWriteByte(m, now->colormap);
+	if (bits & QU_SKIN)		QMsgWriteByte(m, now->skin);
+	if (bits & QU_EFFECTS)	QMsgWriteByte(m, now->effects);
+
+	if (bits & QU_ORIGIN1)	QMsgWriteCoord(m, now->origin[0]);
+	if (bits & QU_ANGLE1)	QMsgWriteAngle(m, now->angles[0]);
+	if (bits & QU_ORIGIN2)	QMsgWriteCoord(m, now->origin[1]);
+	if (bits & QU_ANGLE2)	QMsgWriteAngle(m, now->angles[1]);
+	if (bits & QU_ORIGIN3)	QMsgWriteCoord(m, now->origin[2]);
+	if (bits & QU_ANGLE3)	QMsgWriteAngle(m, now->angles[2]);
+}
+
+Bool QNetReadEntityUpdate(CQMsg *m, I64 bits)
+{//Apply one update to the client's copy. The low mask byte has already been
+ //read by the message dispatcher, since that is what identified this as an
+ //update in the first place.
+	CQEntState	*e;
+	I64			 num;
+
+	if (bits & QU_MOREBITS)
+		bits |= QMsgReadByte(m) << 8;
+
+	if (bits & QU_LONGENTITY)
+		num = QMsgReadShort(m);
+	else
+		num = QMsgReadByte(m);
+
+	if (num < 0 || num >= QNET_MAX_ENTS || m->badread)
+		return FALSE;
+
+	e = &q_net_cl[num];
+
+	//Anything NOT in the mask keeps its previous value. That is the whole point
+	//of the delta: the client's copy is the accumulation of every update it has
+	//ever applied, not a snapshot.
+	if (bits & QU_MODEL)	e->modelindex = QMsgReadByte(m);
+	if (bits & QU_FRAME)	e->frame      = QMsgReadByte(m);
+	if (bits & QU_COLORMAP)	e->colormap   = QMsgReadByte(m);
+	if (bits & QU_SKIN)		e->skin       = QMsgReadByte(m);
+	if (bits & QU_EFFECTS)	e->effects    = QMsgReadByte(m);
+
+	if (bits & QU_ORIGIN1)	e->origin[0] = QMsgReadCoord(m);
+	if (bits & QU_ANGLE1)	e->angles[0] = QMsgReadAngle(m);
+	if (bits & QU_ORIGIN2)	e->origin[1] = QMsgReadCoord(m);
+	if (bits & QU_ANGLE2)	e->angles[1] = QMsgReadAngle(m);
+	if (bits & QU_ORIGIN3)	e->origin[2] = QMsgReadCoord(m);
+	if (bits & QU_ANGLE3)	e->angles[2] = QMsgReadAngle(m);
+
+	e->active = TRUE;
+
+	if (num >= q_net_num_ents)
+		q_net_num_ents = num + 1;
+
+	return ToBool(!m->badread);
+}
