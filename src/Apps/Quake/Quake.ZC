@@ -16,9 +16,6 @@
 //the world rather than a menu page.
 #define QDEFAULT_MAP	"maps/start.bsp"
 
-//The path of the map currently up. A savegame has to record it.
-U8 q_map_name[96];
-
 //Entities are not in the PVS, so they are range-limited instead. 2000 units
 //covers a large room without submitting the whole level's triangles.
 #define QENT_DRAW_DIST	2000.0
@@ -183,6 +180,22 @@ U0 QStuckCheck(F64 *wishdir, F64 wishspeed)
 	if (q_stuck_steps != QSTUCK_STEPS || q_stuck_said >= QSTUCK_REPORTS)
 		return;
 
+	//Walking straight into a wall legitimately does not move the player, so a
+	//refused move is only interesting when the sweep is CLEAR. Reporting the
+	//blocked case as well made the detector fire constantly against ordinary
+	//geometry and buried the cases that matter.
+	QVecMA(q_origin, 4.0, wishdir, probe);
+	QTracePlayer(q_map, q_origin, probe, &tr);
+
+	if (tr.fraction < 1.0)
+	{
+		//Something really is in the way - a wall, a door, a button. Standing
+		//against it and not moving is correct, not stuck, so this is not worth
+		//a line either way. Only a REFUSED move with a clear sweep is a bug.
+		q_stuck_steps = 0;
+		return;
+	}
+
 	q_stuck_said++;
 
 	blocker = -1;
@@ -225,6 +238,24 @@ U0 QStuckCheck(F64 *wishdir, F64 wishspeed)
 		StrPrint(q_stuck_line, "stuck: blocked by edict %d (%s) solid=%d\n",
 			tr.ent, QPrStr(QPrFieldI(tr.ent, q_fld_classname)),
 			ToI64(QPrFieldF(tr.ent, q_fld_solid)));
+		QLog(q_stuck_line);
+
+		//The blocker's OWN geometry, so a phantom collision is provable rather
+		//than inferred. If the player is nowhere near these bounds then the
+		//trace is being run against the wrong submodel, and the brush number it
+		//resolved to is printed for exactly that comparison.
+		StrPrint(q_stuck_line,
+			"stuck:   bmodel=%d org %.0f %.0f %.0f  mins %.0f %.0f %.0f  maxs %.0f %.0f %.0f\n",
+			QClipBrushModel(ToI64(QPrFieldF(tr.ent, q_fld_modelindex))),
+			QPrFieldF(tr.ent, q_fld_origin + 0),
+			QPrFieldF(tr.ent, q_fld_origin + 1),
+			QPrFieldF(tr.ent, q_fld_origin + 2),
+			QPrFieldF(tr.ent, q_fld_mins + 0),
+			QPrFieldF(tr.ent, q_fld_mins + 1),
+			QPrFieldF(tr.ent, q_fld_mins + 2),
+			QPrFieldF(tr.ent, q_fld_maxs + 0),
+			QPrFieldF(tr.ent, q_fld_maxs + 1),
+			QPrFieldF(tr.ent, q_fld_maxs + 2));
 		QLog(q_stuck_line);
 	}
 
@@ -1044,6 +1075,31 @@ Bool QChangeLevel(U8 *mapname)
 	return TRUE;
 }
 
+U0 QInputDrain()
+{//Consume queued keyboard messages.
+ //
+ //Quake reads the keyboard as RAW STATE through kbd.down_bitmap - the menu, the
+ //console and the game all do - and never calls MessageGet. But the window
+ //still receives a MESSAGE_KEY_DOWN/UP pair for every keystroke, and nothing
+ //takes them off the queue, so an entire session's worth of WASD, jump and
+ //weapon keys sits there.
+ //
+ //When the app returns, the terminal drains that backlog AS TYPED INPUT. The
+ //shell then hands whatever it reassembles to the compiler: a mangled line like
+ //"ww`map e1m1" is the visible form, and a pointer built from that garbage
+ //faulting inside ExeCmdLine is the crash. It happens with no typing at all,
+ //because the game's own keys are the input.
+ //
+ //Bounded rather than unbounded: a frame should never hold many, and a runaway
+ //loop here would hang the game rather than crash it later.
+	I64 ch;
+	I64 sc;
+	I64 guard = 0;
+
+	while (guard < 64 && KeyScan(&ch, &sc))
+		guard++;
+}
+
 U0 QGameLoop()
 {
 	F64  forward[3];
@@ -1097,6 +1153,10 @@ U0 QGameLoop()
 		//and the menu is exactly where they are requested.
 		if (q_res_dirty)
 			QApplyVideo;
+
+		//Keep the message queue empty. Left to accumulate, the shell replays
+		//the whole session's keystrokes as a command line on exit.
+		QInputDrain;
 
 		//--- F2 saves, F3 loads ---
 		//
@@ -1184,6 +1244,26 @@ U0 QGameLoop()
 				q_noclip = !q_noclip;
 				QVecSet(q_velocity, 0.0, 0.0, 0.0);
 				q_con_want_noclip = FALSE;
+			}
+
+			//Console requests that touch app-shell state, applied here because
+			//this file is compiled after the console.
+			if (q_con_fov_want != 0.0)
+			{
+				q_fov          = q_con_fov_want;
+				q_con_fov_want = 0.0;
+			}
+
+			if (q_con_want_save)
+			{
+				q_con_want_save = FALSE;
+				q_con_save_ok   = QSaveGame;
+			}
+
+			if (q_con_want_load)
+			{
+				q_con_want_load = FALSE;
+				q_load_request  = TRUE;
 			}
 
 			if (q_con_want_quit)
@@ -1443,6 +1523,39 @@ ql_next_frame:
 	}
 }
 
+U0 QDocCursorPark()
+{//Put the terminal's document cursor back at the END of the document.
+ //
+ //Quake calls DocClear on startup and then prints a great deal - the load
+ //report, the exit summary - into the terminal's own document. That leaves the
+ //cursor wherever the last write or the last mouse click put it, which for a
+ //DolDoc terminal is a real editing position, not a prompt.
+ //
+ //Anything the user types afterwards is then inserted INTO existing document
+ //text rather than appended at the prompt, so a typed command comes out merged
+ //with whatever was on that line: "map e1m1" becomes something like
+ //"ww`map e1m1". The shell hands that to the compiler, which either reports an
+ //undefined identifier or dereferences a pointer built from the mangled text
+ //and faults inside ExeCmdLine - a crash that looks like it belongs to Quake
+ //but happens after Quake has fully exited.
+ //
+ //Parking the cursor at the tail is the same idiom the doc utilities use.
+	CDoc *doc;
+	Bool  unlock;
+
+	doc = Fs->put_doc;
+	if (!doc)
+		return;
+
+	unlock = DocLock(doc);
+
+	doc->cur_entry = &doc->head;
+	doc->cur_col   = 0;
+
+	if (unlock)
+		DocUnlock(doc);
+}
+
 U0 Quake(U8 *mapname = QDEFAULT_MAP)
 {
 	CQCanvas	*canvas			= NULL;
@@ -1630,25 +1743,8 @@ U0 Quake(U8 *mapname = QDEFAULT_MAP)
 			final_snd, final_drop);
 		QLog(line);
 
-		StrPrint(line,
-			"sound: %d silent, %d ambient sources, %d of %d voices busy\n",
-			q_snd_silent, q_ambient_count, AudioSFXVoicesActive,
-			AUDIO_MAX_SFX_VOICES);
-		QLog(line);
 
-		//Says whether the lightstyle recombine is actually running. If slow is
-		//near zero the styles are steady and cannot be the cause of a lighting
-		//problem; a high clamped count means faces are saturating.
-		StrPrint(line, "light: %d faces direct, %d recombined, %d clamped\n",
-			q_light_fast, q_light_slow, q_light_clamped);
-		QLog(line);
 
-		//Which way this leans says what is wrong with the monsters: mostly
-		//failures means legal moves are being refused, mostly successes means
-		//they are moving happily in the wrong direction.
-		StrPrint(line, "monster moves: %d ok, %d blocked\n",
-			final_move_ok, final_move_fail);
-		QLog(line);
 
 		//Total VM errors, including the ones the console suppressed. A large
 		//number here with a healthy think count means errors are being
@@ -1666,4 +1762,9 @@ U0 Quake(U8 *mapname = QDEFAULT_MAP)
 
 	QLogFlush;
 	"\nLog written to ::/Apps/Quake/QUAKELOG.TXT\n";
+
+	//LAST. Anything queued during teardown must not reach the shell either, and
+	//the cursor is parked only once nothing further will write to the document.
+	QInputDrain;
+	QDocCursorPark;
 }
