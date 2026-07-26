@@ -1,8 +1,9 @@
-// YKD native GIF decoder (GIF87a / GIF89a, FIRST frame only). Pure ZealC - no
+// YKD native GIF decoder (GIF87a / GIF89a, ANIMATED). Pure ZealC - no
 // ELF, no FFI. LZW-decompresses the first image into palette indices, expands
 // via the global/local colour table into a truecolor CDC. The transparent
 // colour index (from a Graphic Control Extension) becomes PIXF_TRANSPARENT so
-// GrBlot() sees through it. Animation beyond frame #1 is ignored (static view).
+// GrBlot() sees through it. GIFReadAnim*() returns every frame with disposal
+// applied; GIFRead/GIFReadBuf still hand back just frame #1 for static callers.
 // API mirrors PNGReadBuf / JPGReadBuf. GIF uses LZW, NOT DEFLATE, so none of the
 // Inflate.ZC machinery applies - this is a self-contained LZW.
 
@@ -122,13 +123,78 @@ I64 GifLZW(U8 *data, I64 data_len, I64 min_cs, U8 *out, I64 out_max, CTask *mt)
 	return oc;
 }
 
-public CDC *GIFReadBuf(U8 *buf, I64 size, CTask *mem_task=NULL)
-{ // decode the first image of a GIF into a truecolor CDC. NULL on error.
+#define GIF_MAXFRAMES	512
+
+public class CGifAnim
+{ // A decoded animation. Every frame is a FULL logical-screen canvas with the
+  // disposal already applied, so a player only has to blit frames[i] - it does
+  // not need to know anything about GIF composition rules.
+	I64	  count;
+	I64	  width, height;
+	I64	  loop_count;		// 0 = loop forever
+	CDC	**frames;
+	I64	 *delays;			// milliseconds per frame
+};
+
+public U0 GIFAnimDel(CGifAnim *anim)
+{
+	I64 i;
+
+	if (!anim)
+		return;
+	if (anim->frames)
+	{
+		for (i = 0; i < anim->count; i++)
+			if (anim->frames[i])
+				DCDel(anim->frames[i]);
+		Free(anim->frames);
+	}
+	if (anim->delays)
+		Free(anim->delays);
+	Free(anim);
+}
+
+U0 GifCanvasCopy(CDC *dst, CDC *src)
+{ // straight copy between two same-size canvases
+	I64 y;
+
+	for (y = 0; y < src->height; y++)
+		MemCopy(dst->body + y * dst->width_internal,
+				src->body + y * src->width_internal,
+				src->width * sizeof(U32));
+}
+
+U0 GifClearRect(CDC *dc, I64 x0, I64 y0, I64 rw, I64 rh)
+{ // restore-to-background = punch the frame's rect back to transparent
+	I64	 x, y;
+	U32	*row;
+
+	for (y = y0; y < y0 + rh; y++)
+		if (0 <= y < dc->height)
+		{
+			row = dc->body + y * dc->width_internal;
+			for (x = x0; x < x0 + rw; x++)
+				if (0 <= x < dc->width)
+					row[x] = PIXF_TRANSPARENT;
+		}
+}
+
+public CGifAnim *GIFReadAnimBuf(U8 *buf, I64 size, CTask *mem_task=NULL,
+								I64 max_frames=GIF_MAXFRAMES)
+{ // Decode every frame of a GIF. NULL on error.
+  // Frames are composited onto a persistent canvas exactly as the spec wants:
+  // the PREVIOUS frame's disposal method is applied before the next frame is
+  // drawn (0/1 leave as-is, 2 restore-to-background, 3 restore-to-previous),
+  // then the canvas is snapshotted. That ordering is the whole trick - GIF
+  // disposal describes what to do AFTER a frame has been shown.
 	U8	*p = buf, *gct = NULL, *act, *lzw, *idx, *pal;
-	CDC	*dc = NULL;
+	CDC	*canvas = NULL, *saved = NULL, *snap;
+	CGifAnim *anim;
 	I64	 w, h, packed, gct_flag, gct_sz, c, label, len, lzw_len, npix, i, x, y, py;
 	I64	 left, top, iw, ih, ipacked, lct_flag, interlace, lct_sz, min_cs, srcrow;
 	I64	 trans_flag = 0, trans_idx = -1, act_n = 0;
+	I64	 delay = 0, disposal = 0, n = 0;
+	I64	 pend_disp = 0, pend_x = 0, pend_y = 0, pend_w = 0, pend_h = 0;
 	U32	*row;
 
 	if (size < 13 || buf[0] != 'G' || buf[1] != 'I' || buf[2] != 'F')
@@ -137,39 +203,59 @@ public CDC *GIFReadBuf(U8 *buf, I64 size, CTask *mem_task=NULL)
 	h = GifU16(buf + 8);
 	if (w < 1 || h < 1 || w > GIF_MAXDIM || h > GIF_MAXDIM)
 		return NULL;
+	if (max_frames < 1)
+		max_frames = 1;
+	if (max_frames > GIF_MAXFRAMES)
+		max_frames = GIF_MAXFRAMES;
+
 	packed	 = buf[10];
 	gct_flag = packed >> 7 & 1;
 	gct_sz	 = 2 << (packed & 7);
 	p = buf + 13;
 	if (gct_flag)
 	{
-		gct = p;
+		gct	 = p;
 		p	+= gct_sz * 3;
 	}
 
-	while (p < buf + size)
+	anim = MAlloc(sizeof(CGifAnim), mem_task);
+	anim->count		 = 0;
+	anim->width		 = w;
+	anim->height	 = h;
+	anim->loop_count = 0;
+	anim->frames	 = MAlloc(max_frames * sizeof(CDC *), mem_task);
+	anim->delays	 = MAlloc(max_frames * sizeof(I64), mem_task);
+
+	canvas = DCNew(w, h, mem_task);
+	MemSetU32(canvas->body, PIXF_TRANSPARENT,
+			  canvas->width_internal * canvas->height);
+
+	while (p < buf + size && n < max_frames)
 	{
 		c = *p++;
 		if (c == 0x3B)					// trailer
 			break;
 		if (c == 0x21)
-		{ // extension
+		{ // extension. Application extensions (0xFF, e.g. NETSCAPE2.0) need no
+		  // special case: the generic sub-block skipper below walks them.
 			label = *p++;
 			if (label == 0xF9)
-			{ // graphic control extension: transparency
+			{ // graphic control: transparency, delay AND disposal
 				len = *p++;
 				if (len >= 4)
 				{
 					trans_flag = p[0] & 1;
+					disposal   = p[0] >> 2 & 7;
+					delay	   = GifU16(p + 1) * 10;	// 1/100s -> ms
 					trans_idx  = p[3];
 				}
 				p += len;
 			}
-			while (p < buf + size && (len = *p++) != 0)	// skip sub-blocks
+			while (p < buf + size && (len = *p++) != 0)
 				p += len;
 		}
 		else if (c == 0x2C)
-		{ // image descriptor: decode this first image
+		{ // image descriptor
 			left	 = GifU16(p);
 			top		 = GifU16(p + 2);
 			iw		 = GifU16(p + 4);
@@ -179,19 +265,19 @@ public CDC *GIFReadBuf(U8 *buf, I64 size, CTask *mem_task=NULL)
 			lct_flag  = ipacked >> 7 & 1;
 			interlace = ipacked >> 6 & 1;
 			lct_sz	  = 2 << (ipacked & 7);
-			act = gct;
+			act	  = gct;
 			act_n = gct_sz;
 			if (lct_flag)
 			{
-				act = p;
+				act	  = p;
 				act_n = lct_sz;
-				p	+= lct_sz * 3;
+				p	 += lct_sz * 3;
 			}
 			if (!act || iw < 1 || ih < 1 || iw > GIF_MAXDIM || ih > GIF_MAXDIM)
-				return NULL;
+				break;
 			min_cs = *p++;
-			if (min_cs < 1 || min_cs > 8)	// spec max 8: indices must fit a byte
-				return NULL;
+			if (min_cs < 1 || min_cs > 8)	// spec max 8: indices fit a byte
+				break;
 
 			// concatenate the LZW data sub-blocks into one buffer
 			lzw		= MAlloc(size, mem_task);
@@ -211,9 +297,19 @@ public CDC *GIFReadBuf(U8 *buf, I64 size, CTask *mem_task=NULL)
 			GifLZW(lzw, lzw_len, min_cs, idx, npix, mem_task);
 			Free(lzw);
 
-			// build the canvas (logical screen size), transparent, place image
-			dc = DCNew(w, h, mem_task);
-			MemSetU32(dc->body, PIXF_TRANSPARENT, dc->width_internal * dc->height);
+			// the PREVIOUS frame's disposal, applied now
+			if (pend_disp == 2)
+				GifClearRect(canvas, pend_x, pend_y, pend_w, pend_h);
+			else if (pend_disp == 3 && saved)
+				GifCanvasCopy(canvas, saved);
+			// if THIS frame restores-to-previous, snapshot before drawing
+			if (disposal == 3)
+			{
+				if (!saved)
+					saved = DCNew(w, h, mem_task);
+				GifCanvasCopy(saved, canvas);
+			}
+
 			for (y = 0; y < ih; y++)
 			{
 				if (interlace)
@@ -222,29 +318,82 @@ public CDC *GIFReadBuf(U8 *buf, I64 size, CTask *mem_task=NULL)
 					py = y;
 				if (top + py < h)
 				{
-					row	   = dc->body + (top + py) * dc->width_internal;
+					row	   = canvas->body + (top + py) * canvas->width_internal;
 					srcrow = y * iw;
 					for (x = 0; x < iw; x++)
-					{
 						if (left + x < w)
 						{
 							i = idx[srcrow + x];
 							if (!(trans_flag && i == trans_idx) && i < act_n)
-							{//i >= palette size (corrupt stream): leave transparent
-								pal			 = act + i * 3;
+							{//i >= palette size (corrupt): leave transparent
+								pal			  = act + i * 3;
 								row[left + x] = pal[0] << 16 | pal[1] << 8 | pal[2];
 							}
 						}
-					}
 				}
 			}
-
 			Free(idx);
-			return dc;					// first frame only
+
+			snap = DCNew(w, h, mem_task);
+			GifCanvasCopy(snap, canvas);
+			anim->frames[n] = snap;
+			anim->delays[n] = delay;
+			n++;
+
+			pend_disp = disposal;
+			pend_x	  = left;
+			pend_y	  = top;
+			pend_w	  = iw;
+			pend_h	  = ih;
+			// GCE state is per-frame: it must not leak into the next one
+			delay	   = 0;
+			disposal   = 0;
+			trans_flag = 0;
+			trans_idx  = -1;
 		}
 		else
 			break;						// unknown block type
 	}
+
+	anim->count = n;
+	if (canvas)
+		DCDel(canvas);
+	if (saved)
+		DCDel(saved);
+	if (!n)
+	{
+		GIFAnimDel(anim);
+		return NULL;
+	}
+	return anim;
+}
+
+public CGifAnim *GIFReadAnim(U8 *filename, CTask *mem_task=NULL,
+							 I64 max_frames=GIF_MAXFRAMES)
+{
+	I64	 size;
+	U8	*buf = FileRead(filename, &size);
+	CGifAnim *a;
+
+	if (!buf)
+		return NULL;
+	a = GIFReadAnimBuf(buf, size, mem_task, max_frames);
+	Free(buf);
+
+	return a;
+}
+
+public CDC *GIFReadBuf(U8 *buf, I64 size, CTask *mem_task=NULL)
+{ // First frame only, as before - now a thin wrapper so there is exactly ONE
+  // decode path and the static and animated cases cannot drift apart.
+	CGifAnim *a = GIFReadAnimBuf(buf, size, mem_task, 1);
+	CDC		 *dc;
+
+	if (!a)
+		return NULL;
+	dc = a->frames[0];
+	a->frames[0] = NULL;	// ownership passes to the caller
+	GIFAnimDel(a);
 
 	return dc;
 }

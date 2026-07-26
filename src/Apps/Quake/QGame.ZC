@@ -36,6 +36,7 @@ I64	 q_game_thinks	= 0;
 F64	 q_saved_parms[QGAME_MAX_PARMS];
 F64	 q_saved_serverflags	= 0.0;
 Bool q_have_saved_parms		= FALSE;
+Bool q_world_warned			= FALSE;
 
 I64 QGameFindFieldDef(U8 *name, I64 *_type)
 {//Field defs carry the type, which decides how a map value is converted.
@@ -112,6 +113,7 @@ I64 QGameSpawnEntities(CQMap *map)
 	U8	 key[64];
 	U8	 val[160];
 	U8	 classname[64];
+	U8	 line[128];
 	I64	 ent;
 	I64	 k;
 	I64	 fn;
@@ -199,6 +201,22 @@ I64 QGameSpawnEntities(CQMap *map)
 						"QGame: error spawning %s\n", classname;
 						q_pr_error = FALSE;
 					}
+
+					//The world must stay non-damageable. If a spawn function
+					//just made it damageable, that function ran with self
+					//pointing at entity 0 instead of its own entity - which is
+					//how the world ends up being "killed" later. Name it and
+					//repair the invariant rather than letting it poison the
+					//rest of the level.
+					if (QPrFieldF(0, q_fld_takedamage) != 0.0)
+					{
+						StrPrint(line, "QGame: %s corrupted world.takedamage\n",
+							classname);
+						QLog(line);
+
+						QPrSetFieldF(0, q_fld_takedamage, 0.0);
+						QPrSetFieldF(0, q_fld_health, 0.0);
+					}
 				}
 			}
 		}
@@ -242,9 +260,73 @@ I64 QGameSpawnEntities(CQMap *map)
 #define QPHYS_SV_GRAVITY	800.0
 #define QFL_ONGROUND_		512
 
+#define QFL_ITEM_			256
+
+U0 QGameLinkEdict(I64 ent)
+{//Recompute an entity's absolute bounds from its origin and box.
+ //
+ //These are ENGINE-owned: QuakeC reads absmin/absmax constantly but never
+ //writes them. Leaving them at zero meant FireBullets, which derives its muzzle
+ //height from absmin_z, fired from near the world origin instead of the
+ //monster's chest - so shots came out sideways from nowhere. findradius and
+ //T_RadiusDamage measure with them too.
+	F64 org[3];
+	F64 pad;
+	I64 j;
+
+	if (ent < 0 || ent >= q_pr_max_edicts)
+		return;
+	if (q_fld_absmin < 0 || q_fld_absmax < 0)
+		return;
+
+	for (j = 0; j < 3; j++)
+		org[j] = QPrFieldF(ent, q_fld_origin + j);
+
+	//Items get a generous margin so they are easy to walk into; everything
+	//else gets one unit, because movement stops an epsilon short of surfaces
+	//and touching boxes would otherwise just miss each other.
+	if (ToI64(QPrFieldF(ent, q_fld_flags)) & QFL_ITEM_)
+		pad = 15.0;
+	else
+		pad = 1.0;
+
+	for (j = 0; j < 3; j++)
+	{
+		QPrSetFieldF(ent, q_fld_absmin + j,
+			org[j] + QPrFieldF(ent, q_fld_mins + j) - pad);
+		QPrSetFieldF(ent, q_fld_absmax + j,
+			org[j] + QPrFieldF(ent, q_fld_maxs + j) + pad);
+	}
+}
+
+U0 QGameLinkAll()
+{//Refresh every live entity's bounds. Called once per frame before thinking,
+ //so anything that moved last frame is measured correctly this frame.
+	I64 i;
+
+	for (i = 0; i < q_pr_num_edicts; i++)
+	{
+		if (!q_pr_edict_free[i])
+			QGameLinkEdict(i);
+	}
+}
+
 U0 QGameCallTouch(I64 self_ent, I64 other_ent)
 {//Run an entity's touch function with the pair the original would pass.
-	I64 fn = QPrFieldI(self_ent, q_fld_touch);
+	I64 fn;
+
+	//The world has no touch behaviour, and asking it to run one is how the
+	//world ends up as "self" inside damage code that was never meant to see it.
+	if (self_ent <= 0)
+		return;
+
+	//The original only dispatches touch for entities that are actually solid.
+	//Without this, entities that have switched themselves off (a trigger sets
+	//solid to SOLID_NOT the moment it fires) keep receiving impacts.
+	if (QPrFieldF(self_ent, q_fld_solid) == ToF64(QSOLID_NOT_))
+		return;
+
+	fn = QPrFieldI(self_ent, q_fld_touch);
 
 	if (fn <= 0 || fn >= q_pr_num_functions)
 		return;
@@ -456,6 +538,7 @@ U0 QGameRunThinks()
 	I64 i;
 	I64 think;
 	F64 nextthink;
+	U8  wline[128];
 
 	i = 0;
 	while (i < q_pr_num_edicts)
@@ -480,6 +563,26 @@ U0 QGameRunThinks()
 
 					if (q_pr_error)
 						q_pr_error = FALSE;
+
+					//Same invariant check as at spawn, but for think
+					//functions. Whichever entity's think leaves the world
+					//damageable is the one running with self pointing at
+					//entity 0, and it is reported once so the log names it
+					//instead of drowning in the consequences.
+					if (QPrFieldF(0, q_fld_takedamage) != 0.0)
+					{
+						if (!q_world_warned)
+						{
+							StrPrint(wline,
+								"QGame: think of %s corrupted world.takedamage\n",
+								QPrStr(QPrFieldI(i, q_fld_classname)));
+							QLog(wline);
+							q_world_warned = TRUE;
+						}
+
+						QPrSetFieldF(0, q_fld_takedamage, 0.0);
+						QPrSetFieldF(0, q_fld_health, 0.0);
+					}
 				}
 			}
 		}
@@ -508,6 +611,10 @@ U0 QGameFrame(F64 dt)
 		if (q_pr_error)
 			q_pr_error = FALSE;
 	}
+
+	//Bounds first: everything that reads absmin/absmax this frame must see
+	//values that match where entities actually are.
+	QGameLinkAll;
 
 	//Physics before thinks, matching the server order: an entity moves, its
 	//touch handlers fire, and only then does its think decide what happens
@@ -629,6 +736,16 @@ Bool QGameInit(CQMap *map)
 	}
 
 	q_game_spawned = QGameSpawnEntities(map);
+
+	//The world must never be damageable. QuakeC relies on that to bail out of
+	//T_Damage early; if it ever gets through, the world is "killed", and since
+	//entity 0 has no death function that surfaces as a null-function call on
+	//every hit. Enforcing the invariant here is cheap and matches what the
+	//original guarantees by construction.
+	QPrSetFieldF(0, q_fld_takedamage, 0.0);
+	QPrSetFieldF(0, q_fld_health, 0.0);
+	QPrSetFieldF(0, q_fld_solid, ToF64(QSOLID_BSP_));
+
 	q_game_active  = TRUE;
 
 	"QGame: %d entities spawned, %d edicts live\n",

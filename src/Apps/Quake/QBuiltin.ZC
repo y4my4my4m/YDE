@@ -226,6 +226,18 @@ U0 QBiStoreTrace(CQTrace *tr, I64 hit_ent)
 I64 q_move_ok	= 0;
 I64 q_move_fail	= 0;
 
+//FL_ONGROUND. Declared here because the move step sets it directly, and the
+//physics pass keys gravity off it.
+#define QFL_ONGROUND_MOVE	512
+
+//Solidity values. Declared here as well as in the game layer because this file
+//is compiled first and traceline needs them.
+#define QBI_SOLID_NOT		0
+#define QBI_SOLID_TRIGGER	1
+#define QBI_SOLID_BBOX		2
+#define QBI_SOLID_SLIDEBOX	3
+#define QBI_SOLID_BSP		4
+
 I64 q_msg_state	= QMSG_IDLE;
 I64 q_msg_type	= 0;
 I64 q_msg_axis	= 0;
@@ -376,18 +388,80 @@ U0 QBiSetSize()
 	QBiSetMinMaxSize(ent, mins, maxs);
 }
 
+F64 QBiRayBox(F64 *start, F64 *dir, F64 *mins, F64 *maxs)
+{//Fraction along start->dir at which the ray enters the box, or -1 for a
+ //miss. Slab method: clip the ray against each axis pair and keep the widest
+ //entry and narrowest exit.
+	F64 tmin = 0.0;
+	F64 tmax = 1.0;
+	F64 t1;
+	F64 t2;
+	F64 tmp;
+	I64 i;
+
+	for (i = 0; i < 3; i++)
+	{
+		if (dir[i] > -0.000001 && dir[i] < 0.000001)
+		{
+			//Parallel to this slab: a miss unless it starts inside it.
+			if (start[i] < mins[i] || start[i] > maxs[i])
+				return -1.0;
+		}
+		else
+		{
+			t1 = (mins[i] - start[i]) / dir[i];
+			t2 = (maxs[i] - start[i]) / dir[i];
+
+			if (t1 > t2)
+			{
+				tmp = t1;
+				t1  = t2;
+				t2  = tmp;
+			}
+
+			if (t1 > tmin)
+				tmin = t1;
+			if (t2 < tmax)
+				tmax = t2;
+
+			if (tmin > tmax)
+				return -1.0;
+		}
+	}
+
+	return tmin;
+}
+
 U0 QBiTraceLine()
-{
-	CQTrace tr;
+{//traceline(v1, v2, nomonsters, ignore).
+ //
+ //This must test ENTITIES as well as world geometry. QuakeC's shooting code
+ //damages whatever trace_ent names, so a traceline that only ever reports the
+ //world means no bullet can hit a monster and no monster can see or shoot the
+ //player - combat simply does nothing in either direction.
+	CQTrace	tr;
 	F64		v1[3];
 	F64		v2[3];
+	F64		dir[3];
+	F64		emins[3];
+	F64		emaxs[3];
+	F64		eorg[3];
+	F64		frac;
+	F64		best;
+	I64		ignore;
+	I64		hit;
+	I64		solid;
+	I64		i;
+	I64		j;
+	Bool	nomonsters;
 
 	QBiArgV(0, v1);
 	QBiArgV(1, v2);
+	nomonsters = ToBool(QBiArgF(2) != 0.0);
+	ignore     = QBiArgEnt(3);
 
 	if (!q_bi_map)
 	{
-		//No world to trace against: report a clean miss.
 		tr.all_solid   = FALSE;
 		tr.start_solid = FALSE;
 		tr.fraction    = 1.0;
@@ -399,8 +473,53 @@ U0 QBiTraceLine()
 	else
 		QTraceMove(q_bi_map, v1, v2, &tr);
 
-	//Only world geometry is traced for now, so the hit entity is the world.
-	QBiStoreTrace(&tr, 0);
+	//Entities are tested against the FULL ray, then accepted only if they are
+	//nearer than whatever the world trace found.
+	QVecSub(v2, v1, dir);
+	best = tr.fraction;
+	hit  = 0;
+
+	for (i = 1; i < q_pr_num_edicts; i++)
+	{
+		if (q_pr_edict_free[i] || i == ignore)
+			goto qt_next;
+
+		solid = ToI64(QPrFieldF(i, q_fld_solid));
+		if (solid != QBI_SOLID_BBOX && solid != QBI_SOLID_SLIDEBOX)
+			goto qt_next;
+
+		//"nomonsters" asks for world-and-doors only, used by sight checks that
+		//should see through other monsters.
+		if (nomonsters && solid == QBI_SOLID_SLIDEBOX)
+			goto qt_next;
+
+		for (j = 0; j < 3; j++)
+		{
+			eorg[j]  = QPrFieldF(i, q_fld_origin + j);
+			emins[j] = eorg[j] + QPrFieldF(i, q_fld_mins + j);
+			emaxs[j] = eorg[j] + QPrFieldF(i, q_fld_maxs + j);
+		}
+
+		frac = QBiRayBox(v1, dir, emins, emaxs);
+
+		if (frac >= 0.0 && frac < best)
+		{
+			best = frac;
+			hit  = i;
+		}
+
+qt_next:
+	}
+
+	if (hit > 0)
+	{
+		//An entity was struck before the wall behind it.
+		tr.fraction = best;
+		QVecMA(v1, best, dir, tr.end_pos);
+		tr.hit = TRUE;
+	}
+
+	QBiStoreTrace(&tr, hit);
 }
 
 U0 QBiPointContents()
@@ -445,18 +564,23 @@ U0 QBiDropToFloor()
 }
 
 Bool QBiMoveStep(I64 ent, F64 yaw, F64 dist)
-{//Walk an entity one step along a heading, the way the original server does:
- //lift by one step height, move horizontally, then settle back down.
+{//Walk an entity one step along a heading.
  //
- //Returning honestly matters more than moving far. The AI reacts to failure by
- //choosing another heading, so a step that always claims success leaves the
- //monster convinced it is making progress while it grinds into a wall.
+ //This does NOT sweep horizontally toward the destination. The original
+ //projects straight to the destination raised by one step height, then traces
+ //DOWNWARD looking for floor. Walls are rejected because a destination inside
+ //geometry makes that downward trace start solid, and ledges are rejected
+ //because it finds no floor within two step heights.
+ //
+ //The horizontal sweep this replaced refused essentially every move (measured:
+ //0 succeeded, 1554 blocked), because a trace starting one step height above a
+ //monster's origin is already inside the expanded collision hull.
 	CQTrace	tr;
 	F64		origin[3];
-	F64		start[3];
+	F64		neworg[3];
 	F64		end[3];
-	F64		down[3];
 	F64		rad;
+	I64		flags;
 
 	if (!q_bi_map)
 		return FALSE;
@@ -464,31 +588,43 @@ Bool QBiMoveStep(I64 ent, F64 yaw, F64 dist)
 	QBiGetFieldV(ent, q_fld_origin, origin);
 	rad = yaw * QDEG2RAD;
 
-	//Raised start and end, so low steps and thresholds do not block the move.
-	QVecCopy(origin, start);
-	start[2] += QPHYS_STEPSIZE;
+	//Destination, lifted so ordinary steps and thresholds are cleared.
+	neworg[0] = origin[0] + Cos(rad) * dist;
+	neworg[1] = origin[1] + Sin(rad) * dist;
+	neworg[2] = origin[2] + QPHYS_STEPSIZE;
 
-	end[0] = origin[0] + Cos(rad) * dist;
-	end[1] = origin[1] + Sin(rad) * dist;
-	end[2] = start[2];
+	QVecCopy(neworg, end);
+	end[2] -= QPHYS_STEPSIZE * 2.0;
 
-	QTraceMove(q_bi_map, start, end, &tr);
-	if (tr.all_solid || tr.fraction < 1.0)
-		return FALSE;			//something solid in the way
+	QTraceMove(q_bi_map, neworg, end, &tr);
 
-	//Settle onto the floor. Falling further than two step heights means there
-	//is no floor there at all, so the move would walk off a ledge.
-	QVecCopy(tr.end_pos, down);
-	down[2] -= QPHYS_STEPSIZE * 2.0;
+	if (tr.all_solid)
+		return FALSE;
 
-	QTraceMove(q_bi_map, tr.end_pos, down, &tr);
+	//Starting inside solid means the lift put it into a ceiling; retry from
+	//the unlifted height before giving up.
+	if (tr.start_solid)
+	{
+		neworg[2] -= QPHYS_STEPSIZE;
+		QTraceMove(q_bi_map, neworg, end, &tr);
 
+		if (tr.all_solid || tr.start_solid)
+			return FALSE;
+	}
+
+	//Nothing underneath within two step heights: walking there would be
+	//stepping off a ledge.
 	if (tr.fraction == 1.0)
-		return FALSE;			//no ground under the destination
+		return FALSE;
+
 	if (tr.plane_normal[2] < 0.7)
 		return FALSE;			//too steep to stand on
 
 	QBiSetFieldV(ent, q_fld_origin, tr.end_pos);
+
+	//It is standing on something now, so gravity must stop pulling it down.
+	flags = ToI64(QPrFieldF(ent, q_fld_flags));
+	QPrSetFieldF(ent, q_fld_flags, ToF64(flags | QFL_ONGROUND_MOVE));
 
 	return TRUE;
 }

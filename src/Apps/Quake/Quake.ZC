@@ -20,17 +20,19 @@
 
 #define QVIEW_HEIGHT	22.0	//eye height above the player origin
 
-//View-model placement, in camera units. The models are already authored in
-//first-person position (the shotgun sits 6-12 units below the eye), but they
-//extend backwards past the eye, so they need pushing forward far enough to
-//clear the near clip plane or the back of the weapon gets sliced off.
-//Tunable: raise FORWARD if the weapon still balloons, lower SCALE if it is
-//too large. The model extends behind the eye, so the near clip plane decides
-//how much of it survives and how violently the survivors are magnified.
-//World-space offsets from the eye, in Quake units.
-#define QVM_FORWARD		22.0
-#define QVM_RIGHT		6.0
-#define QVM_UP			-10.0
+//View-model placement: world-space offsets from the eye, in Quake units.
+//
+//The models already carry their own first-person offset - v_shot occupies
+//z -12..-6.5 in its own coordinates, i.e. below the eye. So UP must be about
+//ZERO; adding a further -10 stacked two downward offsets and pushed the weapon
+//off the bottom of the view.
+//
+//FORWARD also has a floor. The model extends 14 units BEHIND its origin, so at
+//22 the nearest geometry sits 8 units from the eye - close enough to the clip
+//plane to magnify violently. 30 keeps it clear.
+#define QVM_FORWARD		30.0
+#define QVM_RIGHT		5.0
+#define QVM_UP			0.0
 #define QVM_LIGHT		200		//weapons read brighter than world entities
 
 CQMap		*q_map		= NULL;
@@ -45,8 +47,10 @@ Bool q_on_ground	= FALSE;
 Bool q_noclip		= FALSE;
 I64	 q_water_level	= 0;
 I64	 q_water_type	= 0;
+I64	 q_water_last	= 0;	//water level last frame, for surface crossings
 F64	 q_fov			= 90.0;
-I64	 q_scale		= 2;
+I64	 q_blit_w		= 320;
+I64	 q_blit_h		= 240;
 I64	 q_blit_x		= 0;
 I64	 q_blit_y		= 0;
 Bool q_draw_entities = TRUE;
@@ -73,7 +77,7 @@ U0 QDrawIt(CTask *task, CDC *dc)
 	if (!q_ready || !q_canvas || !q_vis)
 		return;
 
-	QDrawBlit(q_canvas, dc, q_blit_x, q_blit_y, q_scale);
+	QDrawBlitFit(q_canvas, dc, q_blit_x, q_blit_y, q_blit_w, q_blit_h);
 
 	if (q_opt_show_stats)
 	{
@@ -85,7 +89,7 @@ U0 QDrawIt(CTask *task, CDC *dc)
 			q_vis->view_leaf, QMoveModeName);
 		GrPrint(dc, 8, 40, "edicts %d  thinks %d  touches %d  t %4.1f",
 			q_pr_num_edicts, q_game_thinks, q_player_touches, q_game_time);
-		GrPrint(dc, 8, 56, "WASD, space jump, mouse1 attack, 1-8 weapon, N noclip, ESC quit");
+		GrPrint(dc, 8, 56, "WASD, space jump, mouse1 attack, 1-8 weapon, ~ console, ESC menu");
 	}
 
 	//Health, armor and ammo are deliberately NOT printed here any more. The
@@ -133,6 +137,137 @@ U0 QRenderEntities()
 	}
 }
 
+//--- view bob and roll -----------------------------------------------------
+//
+// Both are cosmetic and VIEW-ONLY. They are applied to a copy of the angles
+// used for rendering, never to q_angles itself: that feeds .v_angle, and
+// leaning it would make the player's aim lean with the camera.
+
+#define QBOB_AMOUNT		0.02	//bob per unit of horizontal speed
+#define QBOB_CYCLE		0.6		//seconds for a full step cycle
+#define QBOB_UP			0.5		//fraction of the cycle spent rising
+#define QROLL_ANGLE		2.0		//degrees of lean at full strafe
+#define QROLL_SPEED		200.0	//strafe speed at which the lean maxes out
+
+F64 q_bob_time = 0.0;
+
+F64 QViewBob()
+{//Vertical head movement while walking.
+	F64 cycle;
+	F64 bob;
+	F64 speed;
+
+	//Airborne means no footfalls, so no bob.
+	if (!q_on_ground)
+		return 0.0;
+
+	q_bob_time = tS;
+
+	cycle = q_bob_time - ToF64(ToI64(q_bob_time / QBOB_CYCLE)) * QBOB_CYCLE;
+	cycle /= QBOB_CYCLE;
+
+	//Rise and fall occupy different fractions of the cycle, which is what
+	//gives the footstep its uneven, weighted feel.
+	if (cycle < QBOB_UP)
+		cycle = pi * cycle / QBOB_UP;
+	else
+		cycle = pi + pi * (cycle - QBOB_UP) / (1.0 - QBOB_UP);
+
+	//Proportional to speed across the ground only - falling must not bob.
+	speed = Sqrt(q_velocity[0] * q_velocity[0] +
+				 q_velocity[1] * q_velocity[1]);
+
+	bob = speed * QBOB_AMOUNT;
+	bob = bob * 0.3 + bob * 0.7 * Sin(cycle);
+
+	if (bob > 4.0)
+		bob = 4.0;
+	if (bob < -7.0)
+		bob = -7.0;
+
+	return bob;
+}
+
+F64 QViewRoll(F64 *angles, F64 *velocity)
+{//Lean into a strafe, proportional to sideways speed.
+	F64 fwd[3];
+	F64 rgt[3];
+	F64 upv[3];
+	F64 side;
+	F64 sign;
+
+	QAngleVectors(angles, fwd, rgt, upv);
+	side = QVecDot(velocity, rgt);
+
+	if (side < 0.0)
+	{
+		sign = -1.0;
+		side = -side;
+	}
+	else
+		sign = 1.0;
+
+	if (side < QROLL_SPEED)
+		side = side * QROLL_ANGLE / QROLL_SPEED;
+	else
+		side = QROLL_ANGLE;
+
+	return side * sign;
+}
+
+U0 QLiquidView()
+{//Screen wash and view warp for whatever the eye is submerged in, plus the
+ //one-shot sounds for crossing the surface.
+ //
+ //The tint values are the originals': lava burns orange, slime is a dark
+ //green, water a murky brown. They are folded into the palette rather than
+ //blended per pixel, because 8bpp indices cannot be averaged.
+	I64 r = 0;
+	I64 g = 0;
+	I64 b = 0;
+	I64 a = 0;
+
+	//Only a submerged EYE tints the view; wading to the waist does not.
+	if (q_water_level >= 3)
+	{
+		switch (q_water_type)
+		{
+			case QCONTENTS_LAVA:
+				r = 255; g = 80;  b = 0;  a = 150;
+				break;
+			case QCONTENTS_SLIME:
+				r = 0;   g = 25;  b = 5;  a = 150;
+				break;
+			default:
+				r = 130; g = 80;  b = 50; a = 128;
+				break;
+		}
+
+		q_warp_amount = 4.0;
+	}
+	else
+		q_warp_amount = 0.0;
+
+	q_warp_time = tS;
+	QPalSetTint(r, g, b, a);
+
+	//Surface crossings. Compared against the previous frame so each transition
+	//fires exactly once rather than every frame while submerged.
+	if (q_water_level > 0 && q_water_last == 0)
+	{
+		if (q_water_type == QCONTENTS_LAVA)
+			QSndPlayAt("player/inlava.wav", q_view, 1.0, 0.0);
+		else if (q_water_type == QCONTENTS_SLIME)
+			QSndPlayAt("player/slimbrn2.wav", q_view, 1.0, 0.0);
+		else
+			QSndPlayAt("player/inh2o.wav", q_view, 1.0, 0.0);
+	}
+	else if (q_water_level == 0 && q_water_last > 0)
+		QSndPlayAt("misc/outwater.wav", q_view, 1.0, 0.0);
+
+	q_water_last = q_water_level;
+}
+
 U0 QRenderFrame()
 {//One full frame into the private canvas.
 	F64		 forward[3];
@@ -140,6 +275,7 @@ U0 QRenderFrame()
 	F64		 up[3];
 	F64		 fov_y;
 	F64		 vm_org[3];
+	F64		 view_angles[3];
 	CQMdl	*vm_mdl;
 
 	QAngleVectors(q_angles, forward, right, up);
@@ -148,15 +284,26 @@ U0 QRenderFrame()
 	//Drives the two sky layers' scroll.
 	q_sky_time = tS;
 
-	//The eye rides above the player origin.
+	//The eye rides above the player origin, plus the walk bob.
+	//
+	//Bob is proportional to horizontal speed and rides a cycle, so it grows
+	//with running and stops when standing still. Roll leans the view into a
+	//strafe. Both are VIEW-only: they must not touch q_angles, because that
+	//feeds v_angle and would make the player's shots lean too.
 	QVecCopy(q_origin, q_view);
-	q_view[2] += QVIEW_HEIGHT;
+	q_view[2] += QVIEW_HEIGHT + QViewBob;
+
+	QVecCopy(q_angles, view_angles);
+	view_angles[2] = QViewRoll(q_angles, q_velocity);
 
 	//Sounds attenuate from wherever the player is listening.
 	QSndListener(q_view);
 
+	//Liquid wash, view warp and surface sounds.
+	QLiquidView;
+
 	QDrawClear(q_canvas, 0);
-	QDrawSetView(q_canvas, q_view, q_angles, q_fov);
+	QDrawSetView(q_canvas, q_view, view_angles, q_fov);
 	QVisBuildList(q_vis, q_view, forward, right, up, q_fov, fov_y);
 	QDrawWorld(q_canvas, q_map, q_vis);
 
@@ -204,15 +351,13 @@ U0 QRenderFrame()
 }
 
 U0 QCenterView(CTask *task)
-{//Pick the largest integer magnification that still fits, then centre it.
- //Driven by the canvas's real size, so changing resolution rescales
- //automatically: a small target magnifies, a large one renders closer to 1:1.
+{//Fit the canvas to the window, preserving aspect ratio and centring the
+ //result. Every render resolution therefore fills the same area of screen -
+ //raising it adds detail rather than shrinking the picture.
 	I64 w = task->pix_width;
 	I64 h = task->pix_height;
 	I64 cw;
 	I64 ch;
-	I64 sx;
-	I64 sy;
 
 	if (!q_canvas)
 		return;
@@ -220,19 +365,21 @@ U0 QCenterView(CTask *task)
 	cw = q_canvas->width;
 	ch = q_canvas->height;
 
-	sx = w / cw;
-	sy = h / ch;
+	//Widest fit that still leaves the height inside the window.
+	q_blit_w = w;
+	q_blit_h = (w * ch) / cw;
 
-	if (sx < sy)
-		q_scale = sx;
-	else
-		q_scale = sy;
+	if (q_blit_h > h)
+	{
+		q_blit_h = h;
+		q_blit_w = (h * cw) / ch;
+	}
 
-	if (q_scale < 1)
-		q_scale = 1;
+	if (q_blit_w < 1) q_blit_w = 1;
+	if (q_blit_h < 1) q_blit_h = 1;
 
-	q_blit_x = (w - cw * q_scale) / 2;
-	q_blit_y = (h - ch * q_scale) / 2;
+	q_blit_x = (w - q_blit_w) / 2;
+	q_blit_y = (h - q_blit_h) / 2;
 }
 
 U0 QApplyVideo()
@@ -389,8 +536,21 @@ Bool QChangeLevel(U8 *mapname)
 		return FALSE;
 	}
 
+	//Carried-over motion state would otherwise persist into the new level:
+	//stale velocity keeps shoving the player, and a stale water level makes
+	//the move code swim on dry land - which reads as being frozen in place.
+	QVecSet(q_velocity, 0.0, 0.0, 0.0);
+	q_water_level  = 0;
+	q_water_type   = 0;
+	q_on_ground    = FALSE;
+	q_world_warned = FALSE;
+
 	if (q_game_active)
 		QPlayerSpawn(q_origin, q_angles);
+
+	StrPrint(line, "changelevel: spawned at %.0f %.0f %.0f\n",
+		q_origin[0], q_origin[1], q_origin[2]);
+	QLog(line);
 
 	StrPrint(line, "changelevel -> %s\n", path);
 	QLog(line);
@@ -415,18 +575,11 @@ U0 QGameLoop()
 	I64  sc_a		= Char2ScanCode('a');
 	I64  sc_s		= Char2ScanCode('s');
 	I64  sc_d		= Char2ScanCode('d');
-	I64  sc_t		= Char2ScanCode('t');
-	I64  sc_e		= Char2ScanCode('e');
-	I64  sc_n		= Char2ScanCode('n');
 	I64  sc_jump	= Char2ScanCode(' ');	//no SC_SPACE define exists
+	I64  sc_tilde	= Char2ScanCode('`');
 	I64  dx;
 	I64  dy;
-	I64  fps_frames = 0;
-	Bool stats_held  = FALSE;
-	Bool ents_held   = FALSE;
-	Bool noclip_held = FALSE;
-	F64  game_accum  = 0.0;
-	I64  ticks       = 0;
+	I64  fps_frames   = 0;
 	I64  impulse      = 0;
 	I64  i            = 0;
 	I64  menu_sc      = 0;
@@ -434,10 +587,6 @@ U0 QGameLoop()
 	Bool attack       = FALSE;
 	Bool esc_held     = FALSE;
 	Bool start_game   = FALSE;
-	Bool jump_latch   = FALSE;
-	Bool attack_latch = FALSE;
-	I64  impulse_latch = 0;
-	I64  sc_tilde     = Char2ScanCode('`');
 	Bool tilde_held   = FALSE;
 
 	last     = tS;
@@ -453,24 +602,35 @@ U0 QGameLoop()
 		if (dt > 0.1)
 			dt = 0.1;
 
-		//--- Tilde drops the console, as in the original. It overlays whatever
-		//--- is behind it, so the world keeps running underneath.
+		//Video changes are serviced FIRST, before any state branch can jump
+		//past them: the menu path ends in a goto to the bottom of the loop,
+		//and the menu is exactly where they are requested.
+		if (q_res_dirty)
+			QApplyVideo;
+
+		//--- tilde drops the console, as in the original ---
 		if (Bt(kbd.down_bitmap, sc_tilde))
 		{
 			if (!tilde_held)
 			{
 				tilde_held = TRUE;
+
 				if (q_state == QST_CONSOLE)
 					q_state = QST_PLAYING;
 				else if (q_state == QST_PLAYING)
+				{
 					q_state = QST_CONSOLE;
+
+					//Clear edge state, or keys held as the console opens
+					//register as fresh presses.
+					QConInputReset;
+				}
 			}
 		}
 		else
 			tilde_held = FALSE;
 
-		//--- ESC toggles the menu rather than quitting outright, which is how
-		//--- the original behaves. Quit is a menu choice.
+		//--- ESC toggles the menu; quitting is a menu choice ---
 		if (Bt(kbd.down_bitmap, SC_ESC))
 		{
 			if (!esc_held)
@@ -488,7 +648,33 @@ U0 QGameLoop()
 		else
 			esc_held = FALSE;
 
-		//--- menu state: no world simulation, just navigation ---
+		//--- console: typing owns the keyboard, world keeps running ---
+		if (q_state == QST_CONSOLE)
+		{
+			QConInput;
+
+			if (q_con_want_noclip)
+			{
+				q_noclip = !q_noclip;
+				QVecSet(q_velocity, 0.0, 0.0, 0.0);
+				q_con_want_noclip = FALSE;
+			}
+
+			if (q_con_want_quit)
+				break;
+
+			QPartUpdate(dt, tS);
+			QCenterView(Fs);
+			QRenderFrame;
+			q_ready = TRUE;
+
+			LBts(&Fs->task_flags, TASKf_IDLE);
+			Yield;
+			LBtr(&Fs->task_flags, TASKf_IDLE);
+			goto ql_next_frame;
+		}
+
+		//--- menu: no world simulation, just navigation ---
 		if (q_state == QST_MENU)
 		{
 			menu_sc = 0;
@@ -498,18 +684,16 @@ U0 QGameLoop()
 			if (Bt(kbd.down_bitmap, SC_CURSOR_RIGHT))	menu_sc = SC_CURSOR_RIGHT;
 			if (Bt(kbd.down_bitmap, SC_ENTER))			menu_sc = SC_ENTER;
 
-			//Edge trigger, or a held arrow would run the whole list.
+			//Edge trigger, or a held arrow runs the whole list.
 			if (menu_sc && menu_sc != last_menu_sc)
 			{
 				if (QMenuKey(menu_sc, &start_game))
 				{
-					if (start_game && !q_menu_ingame)
+					if (start_game)
 					{
 						q_menu_ingame = TRUE;
 						q_state       = QST_PLAYING;
 					}
-					else if (start_game)
-						q_state = QST_PLAYING;
 				}
 			}
 			last_menu_sc = menu_sc;
@@ -533,27 +717,6 @@ U0 QGameLoop()
 		attack = ToBool(mouse_hard.raw_bttns[0]);
 		MouseRawReset;
 
-		//Number keys request a weapon switch. QuakeC consumes an impulse once
-		//and the field is cleared after PreThink, so a held key is harmless.
-		impulse = 0;
-		for (i = 1; i <= 8; i++)
-		{
-			if (Bt(kbd.down_bitmap, Char2ScanCode('0' + i)))
-				impulse = i;
-		}
-
-		//Buttons are LATCHED between game ticks. The world thinks at 10Hz
-		//while rendering runs an order of magnitude faster, so sampling the
-		//key only at tick time silently drops any press that begins and ends
-		//inside a single tick - which is most taps. Latching keeps the press
-		//until the tick actually consumes it.
-		if (Bt(kbd.down_bitmap, sc_jump))
-			jump_latch = TRUE;
-		if (attack)
-			attack_latch = TRUE;
-		if (impulse)
-			impulse_latch = impulse;
-
 		q_angles[1] -= ToF64(dx) * q_opt_sensitivity;
 		q_angles[0] += ToF64(dy) * q_opt_sensitivity;
 
@@ -564,7 +727,15 @@ U0 QGameLoop()
 
 		q_angles[1] = QAngleNorm(q_angles[1]);
 
-		//--- movement ---
+		//Number keys request a weapon switch. QuakeC consumes an impulse once.
+		impulse = 0;
+		for (i = 1; i <= 8; i++)
+		{
+			if (Bt(kbd.down_bitmap, Char2ScanCode('0' + i)))
+				impulse = i;
+		}
+
+		//--- movement wish direction ---
 		QAngleVectors(q_angles, forward, right, up);
 		QVecSet(move, 0.0, 0.0, 0.0);
 
@@ -584,8 +755,7 @@ U0 QGameLoop()
 
 		if (q_noclip)
 		{
-			//Free flight: the old flycam, kept for getting unstuck and for
-			//looking at geometry the player cannot reach.
+			//Free flight, for getting unstuck and inspecting geometry.
 			QVecSet(q_velocity, 0.0, 0.0, 0.0);
 			if (QVecLength(move) > 0.0)
 			{
@@ -595,9 +765,6 @@ U0 QGameLoop()
 		}
 		else
 		{
-			//Walking: the wish direction is horizontal, so looking up and down
-			//does not drive the player into the floor or launch them.
-			//Sample liquid depth before moving, and tell QuakeC about it.
 			q_water_level = QWaterLevelGet(q_map, q_origin, &q_water_type);
 			QPlayerWater(q_water_level, q_water_type);
 
@@ -609,85 +776,40 @@ U0 QGameLoop()
 
 			if (QVecLength(move) > 0.0)
 				QVecNormalize(move);
-
-			//When the VM is live QuakeC owns jumping: PlayerJump sets the
-			//velocity, plays the sound, and gates on FL_JUMPRELEASED so a held
-			//key does not pogo. Jumping here as well would double the impulse
-			//and bypass that gate entirely.
-			QPlayerMove(q_map, q_origin, q_velocity, move, speed,
-				ToBool(!q_game_active && Bt(kbd.down_bitmap, sc_jump)),
-				dt, &q_on_ground, q_water_level);
 		}
 
-		//--- toggles, edge triggered so a held key fires once ---
-		if (Bt(kbd.down_bitmap, sc_t))
-		{
-			if (!stats_held)
-			{
-				q_opt_show_stats = !q_opt_show_stats;
-				stats_held   = TRUE;
-			}
-		}
-		else
-			stats_held = FALSE;
-
-		if (Bt(kbd.down_bitmap, sc_e))
-		{
-			if (!ents_held)
-			{
-				q_draw_entities = !q_draw_entities;
-				ents_held       = TRUE;
-			}
-		}
-		else
-			ents_held = FALSE;
-
-		if (Bt(kbd.down_bitmap, sc_n))
-		{
-			if (!noclip_held)
-			{
-				q_noclip    = !q_noclip;
-				noclip_held = TRUE;
-				QVecSet(q_velocity, 0.0, 0.0, 0.0);
-			}
-		}
-		else
-			noclip_held = FALSE;
-
-		//QuakeC is written against a fixed 10Hz think rate, so game time is
-		//advanced in whole ticks rather than by the render frame time. The
-		//catch-up is capped so a long stall cannot spiral into a burst of
-		//hundreds of ticks.
+		//--- one server frame, in the original's order ---
+		//
+		//PreThink -> move -> world -> touch -> PostThink, EVERY RENDERED
+		//FRAME. The original runs its client this way; the 0.1s figure people
+		//associate with QuakeC is nextthink SCHEDULING, not a frame rate.
+		//Running it at 10Hz is what made short taps vanish and forced the
+		//input latching that then caused double jumps.
 		if (q_game_active)
 		{
-			game_accum += dt;
-			ticks = 0;
-			while (game_accum >= QGAME_FRAME_TIME && ticks < 5)
-			{
-				//Order matches the original server frame: give QuakeC the
-				//player's state, let the world think, resolve what the player
-				//is standing in, then accept whatever QuakeC changed.
-				//Consume the latched buttons, then clear them so each press
-				//registers exactly once.
-				QPlayerPreThink(q_origin, q_velocity, q_angles, q_on_ground,
-					attack_latch, jump_latch, impulse_latch);
+			QPlayerPreThink(q_origin, q_velocity, q_angles, q_on_ground,
+				attack, ToBool(Bt(kbd.down_bitmap, sc_jump)), impulse);
 
-				jump_latch    = FALSE;
-				attack_latch  = FALSE;
-				impulse_latch = 0;
-				QGameFrame(QGAME_FRAME_TIME);
-				QPlayerTouchTriggers(q_origin);
-				QPlayerPostThink(q_origin, q_velocity, q_angles);
+			//QuakeC owns jumping while the VM is live: PlayerJump has already
+			//set the vertical velocity during pre-think.
+			if (!q_noclip)
+				QPlayerMove(q_map, q_origin, q_velocity, move, speed,
+					FALSE, dt, &q_on_ground, q_water_level,
+					QPlayerWaterJump(q_velocity, q_game_time));
 
-				game_accum -= QGAME_FRAME_TIME;
-				ticks++;
-			}
-			if (game_accum > QGAME_FRAME_TIME)
-				game_accum = 0.0;
+			QGameFrame(dt);
+			QPlayerTouchTriggers(q_origin, q_velocity);
+			QPlayerPostThink(q_origin, q_velocity, q_angles);
+		}
+		else if (!q_noclip)
+		{
+			//No bytecode loaded, so the engine owns jumping.
+			QPlayerMove(q_map, q_origin, q_velocity, move, speed,
+				ToBool(Bt(kbd.down_bitmap, sc_jump)), dt, &q_on_ground,
+				q_water_level, FALSE);
 		}
 
-		//Particles age on the render clock, not the 10Hz game clock, so
-		//explosions stay smooth regardless of think rate.
+		//Particles age on the render clock, not the game clock.
 		QPartUpdate(dt, tS);
 
 		QCenterView(Fs);
@@ -702,12 +824,6 @@ U0 QGameLoop()
 			fps_frames = 0;
 			fps_time   = now;
 		}
-
-		//A resolution or window change is requested from the menu, which
-		//cannot reallocate the render target itself. Serviced here, between
-		//frames, where nothing is drawing.
-		if (q_res_dirty)
-			QApplyVideo;
 
 		//A level change is requested from inside a think, so it is serviced
 		//here, between frames, once nothing is executing.
@@ -739,6 +855,7 @@ U0 Quake(U8 *mapname = QDEFAULT_MAP)
 	I64			 final_drop		= 0;
 	I64			 final_move_ok	= 0;
 	I64			 final_move_fail = 0;
+	I64			 final_errors	= 0;
 	F64			 final_time		= 0.0;
 	U8			 line[256];
 
@@ -843,6 +960,7 @@ U0 Quake(U8 *mapname = QDEFAULT_MAP)
 	final_drop     = q_snd_dropped;
 	final_move_ok  = q_move_ok;
 	final_move_fail = q_move_fail;
+	final_errors    = q_pr_errors;
 
 	//Teardown is breadcrumbed and flushed after every step. This has crashed
 	//twice and been mis-diagnosed twice, so the log is written as we go: the
@@ -902,6 +1020,12 @@ U0 Quake(U8 *mapname = QDEFAULT_MAP)
 		//they are moving happily in the wrong direction.
 		StrPrint(line, "monster moves: %d ok, %d blocked\n",
 			final_move_ok, final_move_fail);
+		QLog(line);
+
+		//Total VM errors, including the ones the console suppressed. A large
+		//number here with a healthy think count means errors are being
+		//survived; a large number with a low think count means they are not.
+		StrPrint(line, "QuakeC errors: %d\n", final_errors);
 		QLog(line);
 
 		//Spawning but never thinking is a different fault from failing to

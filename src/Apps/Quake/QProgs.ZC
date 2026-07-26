@@ -156,6 +156,41 @@ I64			 q_pr_xstatement	= 0;
 Bool		 q_pr_trace			= FALSE;
 Bool		 q_pr_error			= FALSE;
 
+//Error reporting is RATE LIMITED. These messages fire from inside the
+//per-frame execution loop, so an error that repeats every tick prints
+//thousands of lines a second; each one allocates a document entry, and the
+//console eventually exhausts its heap and faults inside the print path. The
+//crash then looks like it comes from somewhere else entirely.
+#define QPR_MAX_REPORTS	8
+I64	 q_pr_errors	= 0;		//total, including suppressed
+I64	 q_pr_reported	= 0;		//how many were actually printed
+U8	 q_pr_detail[128];			//scratch for building a diagnostic string
+
+U0 QPrReport2(U8 *msg, U8 *detail)
+{//One diagnostic line, printed only while under the cap.
+ //
+ //Also written to the log: console lines scroll away and the window is torn
+ //down on exit, so the log is the only place these survive to be read.
+	U8 line[192];
+
+	q_pr_errors++;
+
+	if (q_pr_reported >= QPR_MAX_REPORTS)
+		return;
+
+	q_pr_reported++;
+
+	if (detail)
+		StrPrint(line, "QProgs: %s (%s)\n", msg, detail);
+	else
+		StrPrint(line, "QProgs: %s\n", msg);
+
+	QLog(line);
+
+	if (q_pr_reported == QPR_MAX_REPORTS)
+		QLog("QProgs: further errors suppressed\n");
+}
+
 //Builtins live in a later file, so they are reached through a pointer that is
 //installed at init. A direct call would be a forward reference, which this
 //single-pass compiler cannot resolve.
@@ -225,8 +260,14 @@ I64 q_fld_watertype		= -1;
 I64 q_fld_avelocity		= -1;
 I64 q_fld_gravity		= -1;
 I64 q_fld_groundentity	= -1;
-I64 q_fld_ltime			= -1;
-I64 q_fld_nextthink2	= -1;
+
+//Engine-maintained bounds. QuakeC READS these constantly (FireBullets aims
+//from absmin_z, T_RadiusDamage and findradius measure with them) but never
+//writes them - the server recomputes them whenever an entity moves.
+I64 q_fld_absmin		= -1;
+I64 q_fld_absmax		= -1;
+I64 q_fld_movedir		= -1;
+I64 q_fld_teleport_time	= -1;
 
 //The player's edict. Reserved before map entities spawn so it always lands in
 //the client slot QuakeC expects, and read by checkclient so monsters can find
@@ -638,7 +679,7 @@ U0 QPrEnterFunction(I64 fnum)
 
 	if (q_pr_depth >= QPR_MAX_STACK)
 	{
-		"QProgs: call stack overflow\n";
+		QPrReport2("call stack overflow", NULL);
 		q_pr_error = TRUE;
 		return;
 	}
@@ -652,7 +693,7 @@ U0 QPrEnterFunction(I64 fnum)
 	c = f->locals;
 	if (q_pr_localdepth + c > QPR_MAX_LOCALS)
 	{
-		"QProgs: local stack overflow\n";
+		QPrReport2("local stack overflow", NULL);
 		q_pr_error = TRUE;
 		return;
 	}
@@ -686,7 +727,7 @@ U0 QPrLeaveFunction()
 
 	if (q_pr_depth <= 0)
 	{
-		"QProgs: call stack underflow\n";
+		QPrReport2("call stack underflow", NULL);
 		q_pr_error = TRUE;
 		return;
 	}
@@ -716,6 +757,7 @@ U0 QPrExecute(I64 fnum)
 	F64				 fa;
 	F64				 fb;
 	I64				 exit_depth;
+	I64				 entry_local;
 	I64				 runaway = 0;
 	I64				 op;
 	I64				 i;
@@ -723,12 +765,14 @@ U0 QPrExecute(I64 fnum)
 	I64				 ent;
 	I64				 fld;
 	I64				 newfnum;
+	I64				 caller;
 
 	if (fnum <= 0 || fnum >= q_pr_num_functions)
 		return;
 
-	q_pr_error = FALSE;
-	exit_depth = q_pr_depth;
+	q_pr_error  = FALSE;
+	exit_depth  = q_pr_depth;
+	entry_local = q_pr_localdepth;
 
 	QPrEnterFunction(fnum);
 
@@ -737,21 +781,22 @@ U0 QPrExecute(I64 fnum)
 		runaway++;
 		if (runaway > QPR_MAX_RUNAWAY)
 		{
-			"QProgs: runaway loop in %s\n",
-				QPrStr(q_pr_functions[q_pr_xfunction].name);
+			QPrReport2("runaway loop in",
+				QPrStr(q_pr_functions[q_pr_xfunction].name));
 			q_pr_error = TRUE;
-			return;
+			goto qpr_abort;
 		}
 
 		if (q_pr_error)
-			return;
+			goto qpr_abort;
 
 		q_pr_xstatement++;
 		if (q_pr_xstatement < 0 || q_pr_xstatement >= q_pr_num_statements)
 		{
-			"QProgs: statement out of range\n";
+			QPrReport2("statement out of range",
+				QPrStr(q_pr_functions[q_pr_xfunction].name));
 			q_pr_error = TRUE;
-			return;
+			goto qpr_abort;
 		}
 
 		st = &q_pr_statements[q_pr_xstatement];
@@ -987,9 +1032,37 @@ U0 QPrExecute(I64 fnum)
 					newfnum = QPrGetI(st->a);
 					if (newfnum <= 0 || newfnum >= q_pr_num_functions)
 					{
-						"QProgs: call to null function\n";
+						//Name the caller AND the entity it was acting on.
+						//"Killed" calling a null th_die tells us a death
+						//function is missing, but not on what - and the
+						//classname is what identifies the culprit.
+						//Include the entity NUMBER and its damage state. If the
+						//number is genuinely 0 the world really is the target;
+						//if it is garbage that merely floors to 0, the fault is
+						//a corrupted self rather than a damage-routing bug -
+						//and those need opposite fixes.
+						//Name the CALLER as well. "Killed" reaching the world
+						//with takedamage 0 should be impossible via T_Damage,
+						//which gates on exactly that - so knowing who invoked
+						//it separates a bad damage path from a bad gate.
+						ent = QPrEdictNum(QPrGetI(q_ofs_self));
+
+						if (q_pr_depth > 0)
+							caller = q_pr_stack[q_pr_depth - 1].function;
+						else
+							caller = 0;
+
+						StrPrint(q_pr_detail, "%s<-%s self=%s #%d dmg=%d mt=%d",
+							QPrStr(q_pr_functions[q_pr_xfunction].name),
+							QPrStr(q_pr_functions[caller].name),
+							QPrStr(QPrFieldI(ent, q_fld_classname)),
+							ent,
+							ToI64(QPrFieldF(ent, q_fld_takedamage)),
+							ToI64(QPrFieldF(ent, q_fld_movetype)));
+
+						QPrReport2("call to null function from", q_pr_detail);
 						q_pr_error = TRUE;
-						return;
+						goto qpr_abort;
 					}
 
 					newf = &q_pr_functions[newfnum];
@@ -1005,13 +1078,23 @@ U0 QPrExecute(I64 fnum)
 				}
 				else
 				{
-					"QProgs: unknown opcode %d\n", op;
+					QPrReport2("unknown opcode in",
+						QPrStr(q_pr_functions[q_pr_xfunction].name));
 					q_pr_error = TRUE;
-					return;
+					goto qpr_abort;
 				}
 				break;
 		}
 	}
+
+qpr_abort:
+	//An aborted execution MUST put the stacks back where it found them.
+	//Returning without unwinding leaks a call frame per error, and since the
+	//callers simply clear the flag and continue, the depth ratchets upward
+	//until it hits the ceiling - at which point every later think, touch and
+	//builtin fails too. One bad function then looks like the whole VM dying.
+	q_pr_depth      = exit_depth;
+	q_pr_localdepth = entry_local;
 }
 
 I64 QPrNewString(U8 *s)
@@ -1022,7 +1105,7 @@ I64 QPrNewString(U8 *s)
 
 	if (q_pr_string_alloc + len + 1 > q_pr_strings_size)
 	{
-		"QProgs: string heap full\n";
+		QPrReport2("string heap full", NULL);
 		return 0;
 	}
 
@@ -1098,6 +1181,10 @@ U0 QPrCacheOffsets()
 	q_fld_avelocity		= QPrFindField("avelocity");
 	q_fld_gravity		= QPrFindField("gravity");
 	q_fld_groundentity	= QPrFindField("groundentity");
+	q_fld_absmin		= QPrFindField("absmin");
+	q_fld_absmax		= QPrFindField("absmax");
+	q_fld_movedir		= QPrFindField("movedir");
+	q_fld_teleport_time	= QPrFindField("teleport_time");
 	q_fld_ltime			= QPrFindField("ltime");
 
 	//Spawn parameters, resolved by explicit name rather than a built string.
@@ -1137,7 +1224,7 @@ I64 QPrSpawnEdict()
 
 	if (q_pr_num_edicts >= q_pr_max_edicts)
 	{
-		"QProgs: out of edicts\n";
+		QPrReport2("out of edicts", NULL);
 		return 0;
 	}
 
