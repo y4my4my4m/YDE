@@ -14,8 +14,11 @@
 // first use and kept in a bounded cache. Gameplay reuses a small working set,
 // so this stays far below the budget in practice.
 
-#define QSND_MAX_CACHE		96
-#define QSND_CACHE_BUDGET	6291456		//6MB of decoded audio
+#define QSND_MAX_CACHE		256
+//Storing at native rate cut the footprint by roughly 4x, and the whole
+//shareware sound set now fits comfortably. Still bounded, and exceeding it is
+//reported rather than silently failing every later load.
+#define QSND_CACHE_BUDGET	16777216	//16MB of decoded audio
 #define QSND_RATE			48000		//the mixer's fixed output rate
 #define QSND_CLIP_DIST		1000.0		//attenuation reaches silence here
 
@@ -28,8 +31,9 @@ U8  q_snd_line[160];
 class CQSound
 {
 	U8	 name[64];
-	U32	*frames;		//48kHz stereo, L16 | R16 << 16
+	U32	*frames;		//stereo L16 | R16 << 16, at the file's OWN rate
 	I64	 count;
+	I64	 rate;			//samples per second of the stored data
 };
 
 CQSound	 q_snd_cache[QSND_MAX_CACHE];
@@ -88,10 +92,19 @@ U0 QSndFree()
 	q_snd_bytes        = 0;
 }
 
-I64 QSndDecodeWav(U8 *raw, I64 size, U32 **_frames)
-{//RIFF/WAVE -> 48kHz stereo frames. Returns the frame count, 0 on failure.
- //Walks the chunk list rather than assuming a 44-byte header, because some
- //files carry extra chunks before the data.
+I64 QSndDecodeWav(U8 *raw, I64 size, U32 **_frames, I64 *_rate)
+{//RIFF/WAVE -> stereo frames AT THE FILE'S OWN RATE. Returns the frame count,
+ //0 on failure. Walks the chunk list rather than assuming a 44-byte header,
+ //because some files carry extra chunks before the data.
+ //
+ //Deliberately does NOT resample. Quake's effects are 11025Hz 8-bit mono, and
+ //converting them to 48kHz stereo on load inflates them about SEVENTEEN times -
+ //one source byte becomes 4.35 frames of 4 bytes. That exhausted the decoded
+ //audio budget after a handful of files, and every sound loaded afterwards
+ //failed outright: ambience (precached first) played while every monster,
+ //weapon and door sound silently did not.
+ //
+ //The mixer resamples per voice instead, which is where a real engine does it.
 	U8	*p;
 	U8	*end;
 	U8	*data     = NULL;
@@ -153,19 +166,12 @@ I64 QSndDecodeWav(U8 *raw, I64 size, U32 **_frames)
 	if (in_count < 1)
 		return 0;
 
-	out_count = in_count * QSND_RATE / rate;
-	if (out_count < 1)
-		return 0;
-
-	out = MAlloc(out_count * sizeof(U32));
+	out_count = in_count;
+	out       = MAlloc(out_count * sizeof(U32));
 
 	for (i = 0; i < out_count; i++)
 	{
-		//Nearest-source resample. Good enough for short effects, and it avoids
-		//a filter pass on every load.
-		src = i * rate / QSND_RATE;
-		if (src >= in_count)
-			src = in_count - 1;
+		src = i;
 
 		if (bits == 8)
 		{
@@ -190,6 +196,9 @@ I64 QSndDecodeWav(U8 *raw, I64 size, U32 **_frames)
 
 	*_frames = out;
 
+	if (_rate)
+		*_rate = rate;
+
 	return out_count;
 }
 
@@ -200,6 +209,7 @@ CQSound *QSndLoad(U8 *name)
 	U8		 path[128];
 	I64		 size   = 0;
 	I64		 count;
+	I64		 rate;
 	U32		*frames = NULL;
 	I64		 i;
 
@@ -216,14 +226,27 @@ CQSound *QSndLoad(U8 *name)
 	}
 
 	if (q_snd_count >= QSND_MAX_CACHE || q_snd_bytes >= QSND_CACHE_BUDGET)
+	{
+		//Say so. This used to return NULL indistinguishably from a missing
+		//file, so a full cache looked exactly like a decode failure.
+		if (q_snd_reports < QSND_MAX_REPORTS)
+		{
+			q_snd_reports++;
+			StrPrint(q_snd_line,
+				"snd: CACHE FULL (%d entries, %d bytes) - %s not loaded\n",
+				q_snd_count, q_snd_bytes, name);
+			QLog(q_snd_line);
+		}
 		return NULL;
+	}
 
 	//QuakeC passes names relative to the sound directory.
 	StrPrint(path, "sound/%s", name);
 
 	raw = QPakData(path, &size);
+	rate = QSND_RATE;
 	if (raw)
-		count = QSndDecodeWav(raw, size, &frames);
+		count = QSndDecodeWav(raw, size, &frames, &rate);
 	else
 		count = 0;
 
@@ -231,6 +254,7 @@ CQSound *QSndLoad(U8 *name)
 	QStrCopy(s->name, name, 64);
 	s->frames = frames;
 	s->count  = count;
+	s->rate   = rate;
 	q_snd_count++;
 
 	if (frames)
@@ -304,7 +328,7 @@ U0 QSndPlayAt(U8 *name, F64 *origin, F64 volume, F64 attenuation)
 	//buffer - so only one sound could be in flight through it. The cache never
 	//evicts, so the frames stay valid for the life of the map; QSndFree stops
 	//all voices before releasing them.
-	stream = AudioSFXPlayRef(s->frames, s->count,
+	stream = AudioSFXPlayRef(s->frames, s->count, s->rate,
 		ToI64(gain * ToF64(AUDIO_VOL_UNITY)),
 		ToI64(gain * ToF64(AUDIO_VOL_UNITY)));
 
@@ -383,7 +407,7 @@ U0 QSndAmbientAdd(F64 *origin, U8 *name, F64 volume, F64 attenuation)
 	a->volume      = volume;
 	a->attenuation = attenuation;
 	a->next_time   = 0.0;
-	a->duration    = ToF64(snd->count) / ToF64(QSND_RATE);
+	a->duration    = ToF64(snd->count) / ToF64(snd->rate);
 
 	//A source shorter than this would re-trigger every few frames and eat the
 	//whole mixer, so treat it as at least a reasonable loop length.
