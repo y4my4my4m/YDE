@@ -20,7 +20,7 @@
 #define QSND_CLIP_DIST		1000.0		//attenuation reaches silence here
 
 //Diagnostics for the "nothing is audible" case.
-#define QSND_MAX_REPORTS	24
+#define QSND_MAX_REPORTS	64
 I64 q_snd_reports	= 0;
 I64 q_snd_silent	= 0;
 U8  q_snd_line[160];
@@ -41,8 +41,6 @@ I64		 q_snd_dropped	= 0;
 
 //Volume scaling needs a copy, since the cached frames are shared and the
 //mixer consumes whatever it is handed. Grown on demand, reused every play.
-U32		*q_snd_scratch		= NULL;
-I64		 q_snd_scratch_size	= 0;
 
 //Where the player is listening from, refreshed each frame by the app.
 F64		 q_snd_listener[3];
@@ -62,8 +60,6 @@ U0 QSndInit()
 	q_snd_bytes         = 0;
 	q_snd_played        = 0;
 	q_snd_dropped       = 0;
-	q_snd_scratch       = NULL;
-	q_snd_scratch_size  = 0;
 
 	QVecSet(q_snd_listener, 0.0, 0.0, 0.0);
 }
@@ -71,6 +67,11 @@ U0 QSndInit()
 U0 QSndFree()
 {
 	I64 i;
+
+	//CRITICAL ORDER: voices reference the cached PCM directly, so every voice
+	//must be silenced before any of it is released. AudioSFXStopAll also waits
+	//out any mix pass already in flight.
+	AudioSFXStopAll;
 
 	for (i = 0; i < QSND_MAX_CACHE; i++)
 	{
@@ -83,13 +84,6 @@ U0 QSndFree()
 		q_snd_cache[i].count   = 0;
 	}
 
-	if (q_snd_scratch)
-	{
-		Free(q_snd_scratch);
-		q_snd_scratch = NULL;
-	}
-
-	q_snd_scratch_size = 0;
 	q_snd_count        = 0;
 	q_snd_bytes        = 0;
 }
@@ -254,9 +248,6 @@ U0 QSndPlayAt(U8 *name, F64 *origin, F64 volume, F64 attenuation)
 	F64		 d[3];
 	F64		 dist;
 	F64		 gain;
-	I64		 i;
-	I64		 l;
-	I64		 r;
 	I64		 stream;
 
 	if (!q_snd_enabled || !name || !name[0])
@@ -305,39 +296,33 @@ U0 QSndPlayAt(U8 *name, F64 *origin, F64 volume, F64 attenuation)
 	if (gain > 1.0)
 		gain = 1.0;
 
-	//The mixer consumes the buffer it is given, and the cached copy is shared,
-	//so the scaled result goes into scratch.
-	if (q_snd_scratch_size < s->count)
-	{
-		if (q_snd_scratch)
-			Free(q_snd_scratch);
-		q_snd_scratch      = MAlloc(s->count * sizeof(U32));
-		q_snd_scratch_size = s->count;
-	}
+	//Played by REFERENCE straight out of the cache, with the volume handed to
+	//the mixer instead of baked into a copy.
+	//
+	//This used to scale every sample into a scratch buffer and hand that over,
+	//which meant one full copy of the PCM per play AND a single shared scratch
+	//buffer - so only one sound could be in flight through it. The cache never
+	//evicts, so the frames stay valid for the life of the map; QSndFree stops
+	//all voices before releasing them.
+	stream = AudioSFXPlayRef(s->frames, s->count,
+		ToI64(gain * ToF64(AUDIO_VOL_UNITY)),
+		ToI64(gain * ToF64(AUDIO_VOL_UNITY)));
 
-	for (i = 0; i < s->count; i++)
-	{
-		l = s->frames[i] & 0xFFFF;
-		r = (s->frames[i] >> 16) & 0xFFFF;
-
-		//Frames hold packed signed 16-bit halves; sign extend before scaling.
-		if (l & 0x8000)
-			l -= 0x10000;
-		if (r & 0x8000)
-			r -= 0x10000;
-
-		l = ToI64(ToF64(l) * gain);
-		r = ToI64(ToF64(r) * gain);
-
-		q_snd_scratch[i] = (l & 0xFFFF) | ((r & 0xFFFF) << 16);
-	}
-
-	stream = AudioSFXPlay(q_snd_scratch, s->count);
-
-	//Only four streams exist, so a busy moment drops sounds rather than
-	//queueing them. Counted so the cost is visible instead of mysterious.
+	//A busy moment drops the sound rather than queueing it. Counted so the cost
+	//is visible instead of mysterious.
 	if (stream < 0)
+	{
 		q_snd_dropped++;
+
+		//Name the losers: a dropped sound is indistinguishable from one that
+		//was never requested unless it says so.
+		if (q_snd_reports < QSND_MAX_REPORTS)
+		{
+			q_snd_reports++;
+			StrPrint(q_snd_line, "snd: %s DROPPED (no free voice)\n", name);
+			QLog(q_snd_line);
+		}
+	}
 	else
 		q_snd_played++;
 }
@@ -353,7 +338,13 @@ U0 QSndPlayAt(U8 *name, F64 *origin, F64 volume, F64 attenuation)
 // below the stream count so gunfire is never starved by ambience.
 
 #define QSND_MAX_AMBIENT	64
-#define QSND_AMBIENT_VOICES	2
+//Ambient voices.
+//
+//This was cut to 1 as a workaround when the mixer had only four buffered
+//streams and a two-second ambience loop held one for its whole length. With a
+//proper voice bank in the driver that constraint is gone, so ambience can run
+//at a useful count again.
+#define QSND_AMBIENT_VOICES	3
 
 class CQAmbient
 {

@@ -73,10 +73,41 @@ class CAudioStream
 	CFifoI64 *data;
 };
 
+//SFX voices.
+//
+//AC'97 hardware has exactly ONE PCM-Out DMA engine - there are no hardware
+//voices to enable - so every AC'97 driver mixes in software, and the voice count
+//is purely a software choice. This costs nothing on real hardware because it
+//changes no hardware interaction at all: the same single DMA buffer is filled,
+//just from more sources.
+//
+//A voice REFERENCES the caller's PCM rather than copying it into a FIFO, which
+//is what makes many of them affordable: a FIFO stream is 2MB (one I64 slot per
+//4-byte frame), while a voice is a few dozen bytes. The streams stay for
+//continuous feeds - ZealAmp, Tracker, the browser's <audio> - which genuinely
+//need buffering; one-shot effects do not.
+//
+//CONTRACT: the frames passed in must stay valid until playback finishes or
+//AudioSFXStopAll is called. The caller owns that memory.
+#define AUDIO_MAX_SFX_VOICES	24
+#define AUDIO_VOL_UNITY			256
+
+class CAudioVoice
+{
+	U32	*frames;	//borrowed, NOT owned
+	I64	 count;
+	I64	 pos;
+	I64	 vol_l;		//0..AUDIO_VOL_UNITY
+	I64	 vol_r;
+	Bool active;
+};
+
 class CAudio
 {
 	CAudioStream output[AUDIO_MAX_STREAMS];
 	I64			 output_frames[AUDIO_MAX_STREAMS];
+	CAudioVoice	 voice[AUDIO_MAX_SFX_VOICES];
+	I64			 voice_lock;
 } audio;
 
 U0 AudioInit()
@@ -85,6 +116,97 @@ U0 AudioInit()
 
 	for (i = 0; i < AUDIO_MAX_STREAMS; i++)
 		audio.output[i].data = FifoI64New(AUDIO_STREAM_FIFO_FRAMES, sys_task);
+
+	audio.voice_lock = 0;
+	for (i = 0; i < AUDIO_MAX_SFX_VOICES; i++)
+	{
+		audio.voice[i].active = FALSE;
+		audio.voice[i].frames = NULL;
+		audio.voice[i].count  = 0;
+		audio.voice[i].pos    = 0;
+	}
+}
+
+public I64 AudioSFXPlayRef(U32 *frames, I64 count,
+	I64 vol_l = AUDIO_VOL_UNITY, I64 vol_r = AUDIO_VOL_UNITY)
+{//Play a one-shot buffer WITHOUT copying it. Returns the voice, or -1 if all
+ //are busy. The buffer must outlive playback - see the contract above.
+	I64 i;
+	I64 slot = -1;
+
+	if (!frames || count < 1)
+		return -1;
+
+	if (vol_l < 0)					vol_l = 0;
+	if (vol_l > AUDIO_VOL_UNITY)	vol_l = AUDIO_VOL_UNITY;
+	if (vol_r < 0)					vol_r = 0;
+	if (vol_r > AUDIO_VOL_UNITY)	vol_r = AUDIO_VOL_UNITY;
+
+	//Task-only contention (the mixer is a task, not an interrupt), so a plain
+	//spin with Yield is safe here.
+	while (LBts(&audio.voice_lock, 0))
+		Yield;
+
+	for (i = 0; i < AUDIO_MAX_SFX_VOICES; i++)
+	{
+		if (!audio.voice[i].active)
+		{
+			slot = i;
+			break;
+		}
+	}
+
+	if (slot >= 0)
+	{
+		audio.voice[slot].frames = frames;
+		audio.voice[slot].count  = count;
+		audio.voice[slot].pos    = 0;
+		audio.voice[slot].vol_l  = vol_l;
+		audio.voice[slot].vol_r  = vol_r;
+
+		//Set LAST: the mixer reads this flag to decide whether the rest of the
+		//slot is meaningful.
+		audio.voice[slot].active = TRUE;
+	}
+
+	LBtr(&audio.voice_lock, 0);
+
+	return slot;
+}
+
+public U0 AudioSFXStopAll()
+{//Silence every voice. Must be called BEFORE freeing any referenced PCM.
+	I64 i;
+
+	while (LBts(&audio.voice_lock, 0))
+		Yield;
+
+	for (i = 0; i < AUDIO_MAX_SFX_VOICES; i++)
+	{
+		audio.voice[i].active = FALSE;
+		audio.voice[i].frames = NULL;
+	}
+
+	LBtr(&audio.voice_lock, 0);
+
+	//The mixer may be part way through a buffer holding a pointer it already
+	//read. It runs every millisecond, so this is comfortably long enough for
+	//any in-flight pass to finish before the caller frees the samples.
+	Sleep(4);
+}
+
+public I64 AudioSFXVoicesActive()
+{//How many voices are playing. Useful for diagnosing dropped effects.
+	I64 i;
+	I64 n = 0;
+
+	for (i = 0; i < AUDIO_MAX_SFX_VOICES; i++)
+	{
+		if (audio.voice[i].active)
+			n++;
+	}
+
+	return n;
 }
 
 public I64 AudioAvailableOutputStreamGet()
@@ -183,9 +305,18 @@ public U0 AC97MasterVolumeSet(I64 pct)
 }
 
 U0 AC97OutputMix(U32 *buf, I64 length)
-{
+{//Sum every live source into one hardware buffer.
+ //
+ //Two kinds of source, mixed differently on purpose:
+ //  streams - buffered continuous feeds, averaged the way they always were so
+ //            existing players sound exactly as before
+ //  voices  - one-shot effects, SUMMED and then clamped, because averaging
+ //            would make every effect quieter as more of them played, which is
+ //            wrong for game audio: a second gunshot must not halve the first
+	CAudioVoice *v;
 	I64 i, j, acc_l, acc_r, acc_streams;
 	I64 sample;
+	I64 vs;
 
 	for (i = 0; i < length / 4; i++)
 	{
@@ -203,13 +334,42 @@ U0 AC97OutputMix(U32 *buf, I64 length)
 				acc_r += sample.i16[1];
 			}
 		}
+
 		if (acc_streams)
 		{
-			buf[i].i16[0] = ToI64(acc_l / Sqrt(acc_streams));
-			buf[i].i16[1] = ToI64(acc_r / Sqrt(acc_streams));
+			acc_l = ToI64(acc_l / Sqrt(acc_streams));
+			acc_r = ToI64(acc_r / Sqrt(acc_streams));
 		}
-		else
-			buf[i] = 0; //Silence; the original NaN'd here.
+
+		for (j = 0; j < AUDIO_MAX_SFX_VOICES; j++)
+		{
+			v = &audio.voice[j];
+
+			if (v->active && v->frames && v->pos < v->count)
+			{
+				vs = v->frames[v->pos];
+
+				//Parenthesised deliberately: shift and multiply precedence
+				//differs from C here, so mixed arithmetic gets explicit
+				//grouping rather than relying on it.
+				acc_l += (vs.i16[0] * v->vol_l) / AUDIO_VOL_UNITY;
+				acc_r += (vs.i16[1] * v->vol_r) / AUDIO_VOL_UNITY;
+
+				v->pos++;
+				if (v->pos >= v->count)
+					v->active = FALSE;
+			}
+		}
+
+		//Clamp rather than wrap. Wrapping an overloaded sum inverts the
+		//waveform and is heard as a loud crack.
+		if (acc_l >  32767)	acc_l =  32767;
+		if (acc_l < -32768)	acc_l = -32768;
+		if (acc_r >  32767)	acc_r =  32767;
+		if (acc_r < -32768)	acc_r = -32768;
+
+		buf[i].i16[0] = acc_l;
+		buf[i].i16[1] = acc_r;
 	}
 }
 
