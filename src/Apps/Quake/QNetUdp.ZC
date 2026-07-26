@@ -1,0 +1,221 @@
+// QNetUdp.ZC - the real transport under the loopback link.
+//
+// ZealOS already has everything below this file: RTL8139 and E1000 drivers,
+// Ethernet, ARP, IPV4 and a UDP socket layer with bind/recvfrom. So there is no
+// netstack and no driver to write here - only the Quake-shaped transport that
+// sits on top, which is the same two operations the loopback link provides:
+// hand over a whole message, take back a whole message.
+//
+// The net stack is NOT part of the kernel. It is loaded on demand by running
+// ::/Home/Net/Start, so Quake has to compile whether or not it is present -
+// hence the #ifdef. ZealOS keeps #defines system-wide once a file has been
+// included, so UDP_MAX_PORT existing IS the test for "the UDP layer is loaded".
+//
+// Datagram boundaries line up exactly with what the protocol wants. A Quake
+// message is already sized to fit one datagram (MAX_DATAGRAM), delivery is
+// unreliable and unordered by design, and the delta encoding is measured from
+// the baseline rather than the last packet - so a dropped datagram costs one
+// frame of smoothness and never desynchronises anything.
+
+#define QNET_PORT_DEFAULT	26000	//the original's port
+
+I64		q_udp_port		= QNET_PORT_DEFAULT;
+U32		q_udp_peer_ip	= 0;		//who we are talking to, 0 = nobody
+Bool	q_udp_ready		= FALSE;	//socket open and bound
+Bool	q_udp_server	= FALSE;	//TRUE when hosting
+I64		q_udp_sent		= 0;
+I64		q_udp_recvd		= 0;
+I64		q_udp_errors	= 0;
+U8		q_udp_status[96];
+
+#ifdef UDP_MAX_PORT
+
+CUDPSocket			*q_udp_socket	= NULL;
+CSocketAddressIPV4	*q_udp_bind		= NULL;
+
+Bool QNetUdpOpen(I64 port)
+{//Open and bind. Both ends bind the same port, as the original does.
+	if (q_udp_ready)
+		return TRUE;
+
+	if (!ipv4_globals.local_ip)
+	{
+		QStrCopy(q_udp_status, "no ip - run ::/Home/Net/Start first", 96);
+		return FALSE;
+	}
+
+	q_udp_socket = UDPSocket(AF_INET);
+	if (!q_udp_socket)
+	{
+		QStrCopy(q_udp_status, "UDPSocket failed", 96);
+		return FALSE;
+	}
+
+	q_udp_bind = CAlloc(sizeof(CSocketAddressIPV4));
+
+	//Ports go on the wire big endian; the socket layer does not swap for us.
+	q_udp_bind->family			= AF_INET;
+	q_udp_bind->port			= EndianU16(port);
+	q_udp_bind->address.address	= ipv4_globals.local_ip;
+
+	if (UDPSocketBind(q_udp_socket, q_udp_bind) == -1)
+	{
+		QStrCopy(q_udp_status, "UDPSocketBind failed", 96);
+		Free(q_udp_bind);
+		q_udp_bind = NULL;
+		UDPSocketClose(q_udp_socket);
+		q_udp_socket = NULL;
+		return FALSE;
+	}
+
+	//NON-BLOCKING, and this is the load-bearing part. UDPSocketReceiveFrom
+	//returns -1 immediately when the queue is empty and no timeout is set;
+	//with a timeout it SLEEPS, which in a frame loop would stall rendering
+	//for as long as the peer stays quiet.
+	q_udp_socket->receive_timeout_ms = 0;
+
+	q_udp_port  = port;
+	q_udp_ready = TRUE;
+	q_udp_sent  = 0;
+	q_udp_recvd = 0;
+
+	StrPrint(q_udp_status, "bound to port %d", port);
+
+	return TRUE;
+}
+
+U0 QNetUdpClose()
+{
+	if (!q_udp_ready)
+		return;
+
+	if (q_udp_socket)
+		UDPSocketClose(q_udp_socket);
+
+	if (q_udp_bind)
+		Free(q_udp_bind);
+
+	q_udp_socket = NULL;
+	q_udp_bind   = NULL;
+	q_udp_ready  = FALSE;
+	q_udp_server = FALSE;
+	q_udp_peer_ip = 0;
+}
+
+Bool QNetUdpSend(CQMsg *m)
+{//One Quake message, one datagram.
+	U8	*payload;
+	I64	 de_index;
+
+	if (!q_udp_ready || !q_udp_peer_ip || m->len < 1 || m->overflowed)
+		return FALSE;
+
+	de_index = UDPPacketAllocate(&payload, ipv4_globals.local_ip, q_udp_port,
+		q_udp_peer_ip, q_udp_port, m->len);
+
+	if (de_index < 0)
+	{
+		q_udp_errors++;
+		return FALSE;
+	}
+
+	MemCopy(payload, m->data, m->len);
+	UDPPacketFinish(de_index);
+
+	q_udp_sent++;
+
+	return TRUE;
+}
+
+Bool QNetUdpRecv(CQMsg *out)
+{//Take one datagram, if one is waiting. Never blocks.
+	CSocketAddressStorage	from;
+	CSocketAddressIPV4		*v4;
+	I64						 got;
+
+	if (!q_udp_ready)
+		return FALSE;
+
+	MemSet(&from, 0, sizeof(CSocketAddressStorage));
+
+	got = UDPSocketReceiveFrom(q_udp_socket, out->data, QNET_MAX_MSG, &from);
+	if (got < 1)
+		return FALSE;
+
+	QMsgClear(out);
+	out->len = got;
+
+	//The first datagram to arrive TELLS the server who its client is. A
+	//listen server has no address to reply to until someone speaks first,
+	//which is what makes "host" work without any prior configuration.
+	if (!q_udp_peer_ip && from.family == AF_INET)
+	{
+		v4 = &from;
+		q_udp_peer_ip = v4->address.address;
+	}
+
+	q_udp_recvd++;
+
+	return TRUE;
+}
+
+Bool QNetUdpAvailable()
+{
+	return TRUE;
+}
+
+#else
+
+//Net stack not loaded at compile time. The transport still has to EXIST,
+//because the menu and the shell reference it either way - it simply reports
+//that it cannot run, rather than silently pretending to connect.
+
+Bool QNetUdpOpen(I64 port)
+{
+	QStrCopy(q_udp_status,
+		"net stack not loaded - run ::/Home/Net/Start, then rebuild", 96);
+
+	return FALSE;
+}
+
+U0 QNetUdpClose()
+{
+}
+
+Bool QNetUdpSend(CQMsg *m)
+{
+	return FALSE;
+}
+
+Bool QNetUdpRecv(CQMsg *out)
+{
+	return FALSE;
+}
+
+Bool QNetUdpAvailable()
+{
+	return FALSE;
+}
+
+#endif
+
+U0 QNetUdpInit()
+{//Globals are not zeroed.
+	q_udp_port    = QNET_PORT_DEFAULT;
+	q_udp_peer_ip = 0;
+	q_udp_ready   = FALSE;
+	q_udp_server  = FALSE;
+	q_udp_sent    = 0;
+	q_udp_recvd   = 0;
+	q_udp_errors  = 0;
+
+	if (QNetUdpAvailable())
+		QStrCopy(q_udp_status, "udp available", 96);
+	else
+		QStrCopy(q_udp_status, "udp not compiled in", 96);
+}
+
+U0 QNetUdpSetPeer(U32 ip)
+{
+	q_udp_peer_ip = ip;
+}

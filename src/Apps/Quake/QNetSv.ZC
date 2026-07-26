@@ -67,9 +67,15 @@ CQMsg			q_net_datagram;		//the server's outgoing message
 CQMsg			q_net_recv;			//the client's receive buffer
 CQMsg			q_net_recv_c2s;		//the server's receive buffer
 U8				q_net_cmd_line[128];
+CQMsg			q_net_udp_in;		//datagram staging before it joins the queue
 
 //Upstream counters and the last move the server read. Declared here rather than
 //beside the move code because QNetClientClear below resets them.
+//Who the client believes it is. Arrives over the wire like everything else.
+U8		q_cl_name[24];
+I64		q_cl_top	= 0;
+I64		q_cl_bottom	= 0;
+
 I64		q_net_moves_sent = 0;
 I64		q_net_moves_read = 0;
 F64		q_net_move_angles[3];
@@ -117,6 +123,10 @@ U0 QNetClientClear()
 	q_cl.angles_forced  = FALSE;
 	q_cl.time           = 0.0;
 	q_cl.stats_received = 0;
+
+	q_cl_name[0] = 0;
+	q_cl_top     = 0;
+	q_cl_bottom  = 0;
 
 	q_net_dropped = 0;
 	q_net_parsed  = 0;
@@ -229,6 +239,32 @@ qnb_next:
 		QLog("net: BASELINES OVERFLOWED - signon truncated\n");
 		QLogFlush;
 	}
+}
+
+U0 QNetWriteIdentity(CQMsg *m, I64 ent, U8 *name, I64 top, I64 bottom)
+{//svc_updatename and svc_updatecolors, the pair that carries who a player is.
+ //
+ //Both are signon messages in the original, sent once per client. The colours
+ //pack into one byte - shirt in the high nibble, trousers in the low - which is
+ //the same layout the colormap generator expects, and is why there are fourteen
+ //of each and not sixteen.
+	if (ent <= 0)
+		return;
+
+	//.netname is deliberately NOT written. QuakeC string values are byte offsets
+	//into the immutable string blob loaded from progs.dat, and there is no
+	//scratch-string allocator to place a runtime name in it - the same gap that
+	//leaves ftos stubbed. Nothing reads .netname yet either: it exists for
+	//obituaries, which need a working ftos to print anyway. The name still goes
+	//on the wire, where it is the client's own copy that matters.
+
+	QMsgWriteByte(m, QSVC_UPDATENAME);
+	QMsgWriteByte(m, 0);			//client number; there is one
+	QMsgWriteString(m, name);
+
+	QMsgWriteByte(m, QSVC_UPDATECOLORS);
+	QMsgWriteByte(m, 0);
+	QMsgWriteByte(m, ((top & 15) << 4) | (bottom & 15));
 }
 
 //--- the client's own state ------------------------------------------------
@@ -445,11 +481,18 @@ Bool QNetServerFrame(I64 client_ent, CQVisState *vis, F64 time)
 		return FALSE;
 	}
 
+	//The LOCAL client always gets it over the loopback link - a listen server
+	//has a player sitting on the same machine, and that path must not depend on
+	//a network being up. A remote client gets the same bytes as a datagram.
+	//Both, when hosting for someone else.
 	if (!QNetSendToClient(&q_net_datagram))
 	{
 		q_net_dropped++;
 		return FALSE;
 	}
+
+	if (q_udp_ready && q_udp_peer_ip)
+		QNetUdpSend(&q_net_datagram);
 
 	return TRUE;
 }
@@ -591,6 +634,18 @@ Bool QNetClientParse(CQMsg *m)
 				QNetParseBaseline(m);
 				break;
 
+			case QSVC_UPDATENAME:
+				QMsgReadByte(m);		//client number
+				QMsgReadString(m, q_cl_name, 16);
+				break;
+
+			case QSVC_UPDATECOLORS:
+				QMsgReadByte(m);		//client number
+				i = QMsgReadByte(m);
+				q_cl_top    = (i >> 4) & 15;
+				q_cl_bottom = i & 15;
+				break;
+
 			case QSVC_SETANGLE:
 				for (i = 0; i < 3; i++)
 					q_cl.view_angles[i] = QMsgReadAngle(m);
@@ -672,6 +727,16 @@ U0 QNetClientSendMove(F64 *view_angles, F64 forward, F64 side, F64 up,
 
 	QMsgWriteByte(&q_net_cmd, impulse);
 
+	//A joined client's move has to leave the machine; a listen server's local
+	//client hands it to the loopback queue it also reads from.
+	if (q_udp_ready && !q_udp_server)
+	{
+		if (QNetUdpSend(&q_net_cmd))
+			q_net_moves_sent++;
+
+		return;
+	}
+
 	if (QNetSendToServer(&q_net_cmd))
 		q_net_moves_sent++;
 }
@@ -729,6 +794,16 @@ Bool QNetServerReadClient(I64 ent, F64 server_time)
 {//SV_RunClients' read half: drain whatever the client sent us.
 	CQMsg	*in = &q_net_recv_c2s;
 	I64		 cmd;
+
+	//Remote moves are pulled into the SAME queue the local client writes to, so
+	//the parse below cannot tell them apart - which is the point. The first
+	//datagram to arrive also fixes the peer address, so hosting needs no prior
+	//configuration: whoever speaks first becomes the client.
+	if (q_udp_ready && q_udp_server)
+	{
+		while (QNetUdpRecv(&q_net_udp_in))
+			QNetSendToServer(&q_net_udp_in);
+	}
 
 	while (QNetServerGetMessage(in))
 	{
@@ -832,6 +907,19 @@ Bool QNetClientFrame()
 		q_net_parsed++;
 		if (!QNetClientParse(in))
 			ok = FALSE;
+	}
+
+	//A client that JOINED a remote server has no loopback traffic at all - its
+	//world arrives entirely as datagrams. Drained here rather than in a
+	//separate path so both kinds of client run identical parsing code.
+	if (q_udp_ready && !q_udp_server)
+	{
+		while (QNetUdpRecv(in))
+		{
+			q_net_parsed++;
+			if (!QNetClientParse(in))
+				ok = FALSE;
+		}
 	}
 
 	return ok;
