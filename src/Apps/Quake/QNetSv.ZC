@@ -1,0 +1,838 @@
+// QNetSv.ZC - the server's outgoing datagram and the client's parse of it.
+//
+// This is the actual client/server split. Everything up to now read the QuakeC
+// world directly to draw it; here the server SERIALISES that world into a
+// message and the client reconstructs it from the bytes alone. The loopback
+// link carries it, so single player runs the same path a network game would -
+// which is the point. A bug that only shows up over a wire shows up here too.
+//
+// Split out from QNet.ZC because these functions need the q_fld_* field
+// bindings, and QNet.ZC is compiled before QProgs.ZC. QNet.ZC holds the pure
+// wire codecs, which depend on nothing.
+//
+// Ported from SV_SendClientDatagram, SV_WriteClientdataToMessage,
+// SV_WriteEntitiesToClient, SV_CreateBaseline and CL_ParseServerMessage.
+
+//Bits in svc_clientdata. SU_ITEMS is always set in practice, but the bit is
+//still sent because the client reads the mask before the fields.
+#define QSU_VIEWHEIGHT		1
+#define QSU_IDEALPITCH		2
+#define QSU_PUNCH1			4
+#define QSU_PUNCH2			8
+#define QSU_PUNCH3			16
+#define QSU_VELOCITY1		32
+#define QSU_VELOCITY2		64
+#define QSU_VELOCITY3		128
+#define QSU_ITEMS			512
+#define QSU_ONGROUND		1024
+#define QSU_INWATER			2048
+#define QSU_WEAPONFRAME		4096
+#define QSU_ARMOR			8192
+#define QSU_WEAPON			16384
+
+#define QDEFAULT_VIEWHEIGHT	22.0
+
+//What the client knows about ITSELF. The entity tables carry everything else,
+//but the player's own state arrives through svc_clientdata instead, because the
+//client needs it at full precision for the view and the status bar.
+class CQClientState
+{
+	F64	 view_height;
+	F64	 punchangle[3];
+	F64	 velocity[3];
+	I64	 items;
+	Bool on_ground;
+	Bool in_water;
+	I64	 weaponframe;
+	I64	 armorvalue;
+	I64	 weaponmodel;
+	I64	 health;
+	I64	 currentammo;
+	I64	 ammo_shells;
+	I64	 ammo_nails;
+	I64	 ammo_rockets;
+	I64	 ammo_cells;
+	I64	 weapon;
+
+	//Set by svc_setangle and svc_time respectively.
+	F64	 view_angles[3];
+	Bool angles_forced;
+	F64	 time;
+
+	I64	 stats_received;
+};
+
+CQClientState	q_cl;
+CQMsg			q_net_datagram;		//the server's outgoing message
+CQMsg			q_net_recv;			//the client's receive buffer
+CQMsg			q_net_recv_c2s;		//the server's receive buffer
+U8				q_net_cmd_line[128];
+
+//Upstream counters and the last move the server read. Declared here rather than
+//beside the move code because QNetClientClear below resets them.
+I64		q_net_moves_sent = 0;
+I64		q_net_moves_read = 0;
+F64		q_net_move_angles[3];
+F64		q_net_move_cmd[3];		//forward, side, up
+Bool	q_net_move_attack	= FALSE;
+Bool	q_net_move_jump		= FALSE;
+I64		q_net_move_impulse	= 0;
+F64		q_net_move_ping		= 0.0;
+
+//svc_damage arrives on the client but the screen blend that shows it lives in
+//the app shell, which is compiled later. Parked here and picked up there.
+Bool	q_net_damage_pending = FALSE;
+I64		q_net_damage_save	 = 0;
+I64		q_net_damage_take	 = 0;
+F64		q_net_damage_from[3];
+I64				q_net_dropped = 0;	//datagrams the link refused
+I64				q_net_parsed  = 0;	//messages the client consumed
+
+U0 QNetClientClear()
+{//Globals are not zeroed, so every field is set explicitly.
+	I64 i;
+
+	q_cl.view_height = QDEFAULT_VIEWHEIGHT;
+
+	for (i = 0; i < 3; i++)
+	{
+		q_cl.punchangle[i]  = 0.0;
+		q_cl.velocity[i]    = 0.0;
+		q_cl.view_angles[i] = 0.0;
+	}
+
+	q_cl.items          = 0;
+	q_cl.on_ground      = FALSE;
+	q_cl.in_water       = FALSE;
+	q_cl.weaponframe    = 0;
+	q_cl.armorvalue     = 0;
+	q_cl.weaponmodel    = 0;
+	q_cl.health         = 0;
+	q_cl.currentammo    = 0;
+	q_cl.ammo_shells    = 0;
+	q_cl.ammo_nails     = 0;
+	q_cl.ammo_rockets   = 0;
+	q_cl.ammo_cells     = 0;
+	q_cl.weapon         = 0;
+	q_cl.angles_forced  = FALSE;
+	q_cl.time           = 0.0;
+	q_cl.stats_received = 0;
+
+	q_net_dropped = 0;
+	q_net_parsed  = 0;
+
+	q_net_damage_pending = FALSE;
+	q_net_damage_save    = 0;
+	q_net_damage_take    = 0;
+	QVecSet(q_net_damage_from, 0.0, 0.0, 0.0);
+
+	q_net_moves_sent = 0;
+	q_net_moves_read = 0;
+	q_net_move_ping  = 0.0;
+	QVecSet(q_net_move_angles, 0.0, 0.0, 0.0);
+	QVecSet(q_net_move_cmd, 0.0, 0.0, 0.0);
+	q_net_move_attack  = FALSE;
+	q_net_move_jump    = FALSE;
+	q_net_move_impulse = 0;
+}
+
+//--- capturing an entity's visible state -----------------------------------
+
+U0 QNetCaptureState(I64 ent, CQEntState *st)
+{//Everything svc_update can carry, and nothing else. The fields NOT here -
+ //health, velocity, think times - are server-side truth the client never sees,
+ //which is precisely why this is a serialisation boundary rather than a copy.
+	I64 j;
+
+	for (j = 0; j < 3; j++)
+	{
+		st->origin[j] = QPrFieldF(ent, q_fld_origin + j);
+		st->angles[j] = QPrFieldF(ent, q_fld_angles + j);
+	}
+
+	st->modelindex = ToI64(QPrFieldF(ent, q_fld_modelindex));
+	st->frame      = ToI64(QPrFieldF(ent, q_fld_frame));
+	st->colormap   = ToI64(QPrFieldF(ent, q_fld_colormap));
+	st->skin       = ToI64(QPrFieldF(ent, q_fld_skin));
+	st->effects    = ToI64(QPrFieldF(ent, q_fld_effects));
+	st->step       = ToBool(ToI64(QPrFieldF(ent, q_fld_movetype)) ==
+						QMOVETYPE_STEP);
+	st->active     = TRUE;
+}
+
+Bool QNetEntityVisible(I64 ent)
+{//An entity with no model index, or whose .model string is empty, is invisible
+ //and is never sent - SV_WriteEntitiesToClient rejects on exactly those two.
+ //The second test is not redundant: removing a model sets the string without
+ //clearing the index.
+	U8 *name;
+
+	if (ToI64(QPrFieldF(ent, q_fld_modelindex)) == 0)
+		return FALSE;
+
+	name = QPrStr(QPrFieldI(ent, q_fld_model));
+	if (!name || !name[0])
+		return FALSE;
+
+	return TRUE;
+}
+
+//--- baselines -------------------------------------------------------------
+
+U0 QNetWriteBaselines(CQMsg *m)
+{//SV_CreateBaseline: one svc_spawnbaseline per entity that exists at map load,
+ //recorded on BOTH sides. The server keeps it to delta against; the client
+ //keeps it as the starting state for any entity it later hears about.
+	CQEntState	*b;
+	I64			 i;
+
+	for (i = 1; i < q_pr_num_edicts && i < QNET_MAX_ENTS; i++)
+	{
+		if (q_pr_edict_free[i] || !QNetEntityVisible(i))
+			goto qnb_next;
+
+		b = &q_net_baseline[i];
+		QNetCaptureState(i, b);
+
+		//The client's own baseline table is filled directly rather than by
+		//parsing what was just written. Over a real socket the parse is the
+		//only path; on loopback both ends share this address space, and the
+		//round trip is exercised by QTest instead of on every map load.
+		MemCopy(&q_net_cl[i], b, sizeof(CQEntState));
+		q_net_cl[i].active = FALSE;
+
+		QMsgWriteByte(m, QSVC_SPAWNBASELINE);
+		QMsgWriteShort(m, i);
+		QMsgWriteByte(m, b->modelindex);
+		QMsgWriteByte(m, b->frame);
+		QMsgWriteByte(m, b->colormap);
+		QMsgWriteByte(m, b->skin);
+		QMsgWriteCoord(m, b->origin[0]);
+		QMsgWriteAngle(m, b->angles[0]);
+		QMsgWriteCoord(m, b->origin[1]);
+		QMsgWriteAngle(m, b->angles[1]);
+		QMsgWriteCoord(m, b->origin[2]);
+		QMsgWriteAngle(m, b->angles[2]);
+
+		if (i >= q_net_num_ents)
+			q_net_num_ents = i + 1;
+
+qnb_next:
+	}
+
+	//The original splits the signon across several buffers for exactly this
+	//reason. One buffer is enough for the id maps - e1m1's baselines come to a
+	//few thousand bytes - but the limit is real and a silent truncation here
+	//would leave entities with no baseline to delta against.
+	if (m->overflowed)
+	{
+		QLog("net: BASELINES OVERFLOWED - signon truncated\n");
+		QLogFlush;
+	}
+}
+
+//--- the client's own state ------------------------------------------------
+
+U0 QNetWriteClientdata(CQMsg *m, I64 ent)
+{//SV_WriteClientdataToMessage.
+	F64	 inflictor_org[3];
+	I64	 inflictor;
+	I64	 bits = 0;
+	I64	 items;
+	I64	 dmg_take;
+	I64	 dmg_save;
+	I64	 j;
+
+	//Damage first, and it CONSUMES the fields: dmg_take and dmg_save are a
+	//one-frame signal from QuakeC, and leaving them set replays the same hit
+	//every frame - which is what pinned the red flash on permanently.
+	dmg_take = ToI64(QPrFieldF(ent, q_fld_dmg_take));
+	dmg_save = ToI64(QPrFieldF(ent, q_fld_dmg_save));
+
+	if (dmg_take || dmg_save)
+	{
+		inflictor = QPrEdictNum(QPrFieldI(ent, q_fld_dmg_inflictor));
+
+		//The blow is reported as coming from the CENTRE of the inflictor's box,
+		//not its origin - for a brush model the origin is usually nowhere near
+		//the thing that hit you.
+		for (j = 0; j < 3; j++)
+			inflictor_org[j] = QPrFieldF(inflictor, q_fld_origin + j) +
+				0.5 * (QPrFieldF(inflictor, q_fld_mins + j) +
+					   QPrFieldF(inflictor, q_fld_maxs + j));
+
+		QMsgWriteByte(m, QSVC_DAMAGE);
+		QMsgWriteByte(m, dmg_save);
+		QMsgWriteByte(m, dmg_take);
+		for (j = 0; j < 3; j++)
+			QMsgWriteCoord(m, inflictor_org[j]);
+
+		QPrSetFieldF(ent, q_fld_dmg_take, 0.0);
+		QPrSetFieldF(ent, q_fld_dmg_save, 0.0);
+	}
+
+	//.fixangle is also consumed. QuakeC sets it when it teleports or respawns
+	//the player, and it means "stop using the client's aim for one frame".
+	if (q_fld_fixangle >= 0 && QPrFieldF(ent, q_fld_fixangle) != 0.0)
+	{
+		QMsgWriteByte(m, QSVC_SETANGLE);
+		for (j = 0; j < 3; j++)
+			QMsgWriteAngle(m, QPrFieldF(ent, q_fld_angles + j));
+
+		QPrSetFieldF(ent, q_fld_fixangle, 0.0);
+	}
+
+	if (QPrFieldF(ent, q_fld_view_ofs + 2) != QDEFAULT_VIEWHEIGHT)
+		bits |= QSU_VIEWHEIGHT;
+
+	//SU_IDEALPITCH is never set: it needs SV_SetIdealPitch, which exists only to
+	//drive the original's look-spring on slopes. Nothing else reads it.
+
+	//The sigils ride in the HIGH bits of items so the status bar can draw them
+	//without a second field. Without this the four runes never appear.
+	items = ToI64(QPrFieldF(ent, q_fld_items));
+	if (q_ofs_serverflags >= 0)
+		items |= ToI64(QPrGetF(q_ofs_serverflags)) << 28;
+
+	bits |= QSU_ITEMS;
+
+	if (ToI64(QPrFieldF(ent, q_fld_flags)) & QFL_ONGROUND_)
+		bits |= QSU_ONGROUND;
+
+	if (QPrFieldF(ent, q_fld_waterlevel) >= 2.0)
+		bits |= QSU_INWATER;
+
+	for (j = 0; j < 3; j++)
+	{
+		if (QPrFieldF(ent, q_fld_punchangle + j) != 0.0)
+			bits |= QSU_PUNCH1 << j;
+		if (QPrFieldF(ent, q_fld_velocity + j) != 0.0)
+			bits |= QSU_VELOCITY1 << j;
+	}
+
+	if (QPrFieldF(ent, q_fld_weaponframe) != 0.0)	bits |= QSU_WEAPONFRAME;
+	if (QPrFieldF(ent, q_fld_armorvalue) != 0.0)	bits |= QSU_ARMOR;
+	if (QPrFieldF(ent, q_fld_weapon) != 0.0)		bits |= QSU_WEAPON;
+
+	QMsgWriteByte(m, QSVC_CLIENTDATA);
+	QMsgWriteShort(m, bits);
+
+	if (bits & QSU_VIEWHEIGHT)
+		QMsgWriteChar(m, ToI64(QPrFieldF(ent, q_fld_view_ofs + 2)));
+
+	for (j = 0; j < 3; j++)
+	{
+		if (bits & (QSU_PUNCH1 << j))
+			QMsgWriteChar(m, ToI64(QPrFieldF(ent, q_fld_punchangle + j)));
+
+		//Velocity is sent in SIXTEENTHS, which is why other players' movement
+		//looks slightly steppy in the original.
+		if (bits & (QSU_VELOCITY1 << j))
+			QMsgWriteChar(m, ToI64(QPrFieldF(ent, q_fld_velocity + j) / 16.0));
+	}
+
+	QMsgWriteLong(m, items);
+
+	if (bits & QSU_WEAPONFRAME)
+		QMsgWriteByte(m, ToI64(QPrFieldF(ent, q_fld_weaponframe)));
+	if (bits & QSU_ARMOR)
+		QMsgWriteByte(m, ToI64(QPrFieldF(ent, q_fld_armorvalue)));
+	if (bits & QSU_WEAPON)
+		QMsgWriteByte(m,
+			QBiPrecacheModel(QPrStr(QPrFieldI(ent, q_fld_weaponmodel))));
+
+	//Health is a SHORT: it goes negative on death and the status bar shows it.
+	QMsgWriteShort(m, ToI64(QPrFieldF(ent, q_fld_health)));
+	QMsgWriteByte(m, ToI64(QPrFieldF(ent, q_fld_currentammo)));
+	QMsgWriteByte(m, ToI64(QPrFieldF(ent, q_fld_ammo_shells)));
+	QMsgWriteByte(m, ToI64(QPrFieldF(ent, q_fld_ammo_nails)));
+	QMsgWriteByte(m, ToI64(QPrFieldF(ent, q_fld_ammo_rockets)));
+	QMsgWriteByte(m, ToI64(QPrFieldF(ent, q_fld_ammo_cells)));
+
+	//standard_quake: the weapon is a bit FIELD in the mission packs and a plain
+	//number in Quake itself. This is Quake.
+	QMsgWriteByte(m, ToI64(QPrFieldF(ent, q_fld_weapon)));
+}
+
+//--- the entity sweep ------------------------------------------------------
+
+U0 QNetWriteEntities(CQMsg *m, I64 client_ent, CQVisState *vis)
+{//SV_WriteEntitiesToClient.
+ //
+ //DEVIATION, and a knowing one: the original culls with SV_FatPVS - the union
+ //of the PVS rows for every leaf within 8 units of the eye - and tests it
+ //against the leaf list SV_LinkEdict recorded for each entity. Neither the fat
+ //row nor the per-entity leaf list exists here, so visibility is decided by the
+ //single leaf the entity's origin falls in, against the row the renderer has
+ //already decompressed. That is stricter than the original: a large entity
+ //whose origin sits in an unseen leaf while part of its body is visible will
+ //pop. The client entity itself is ALWAYS sent, exactly as in the original,
+ //because the player must never vanish from their own view.
+	CQEntState	 now;
+	F64			 eorg[3];
+	I64			 leaf;
+	I64			 i;
+	I64			 j;
+
+	for (i = 1; i < q_pr_num_edicts && i < QNET_MAX_ENTS; i++)
+	{
+		if (q_pr_edict_free[i])
+			goto qne_next;
+
+		if (i != client_ent)
+		{
+			if (!QNetEntityVisible(i))
+				goto qne_next;
+
+			if (vis && vis->pvs)
+			{
+				for (j = 0; j < 3; j++)
+					eorg[j] = QPrFieldF(i, q_fld_origin + j);
+
+				leaf = QVisLeafForPoint(vis->map, eorg);
+
+				//Leaf 0 is the shared solid leaf and has no PVS row. An entity
+				//there is inside the world - send it rather than lose it.
+				//
+				//Rows are indexed from leaf 1, so the bit for leaf N is N-1.
+				if (leaf > 0)
+				{
+					leaf--;
+					if (!(vis->pvs[leaf >> 3] & (1 << (leaf & 7))))
+						goto qne_next;
+				}
+			}
+		}
+
+		//Bail before the message can be half-written. 16 bytes is the original's
+		//own headroom check and covers the largest possible update.
+		if (QNET_MAX_MSG - m->len < 16)
+		{
+			QLog("net: packet overflow, entities dropped\n");
+			return;
+		}
+
+		QNetCaptureState(i, &now);
+		QNetWriteEntityUpdate(m, i, &now, &q_net_baseline[i]);
+
+		MemCopy(&q_net_sent[i], &now, sizeof(CQEntState));
+
+		if (i >= q_net_num_ents)
+			q_net_num_ents = i + 1;
+
+qne_next:
+	}
+}
+
+Bool QNetServerFrame(I64 client_ent, CQVisState *vis, F64 time)
+{//SV_SendClientDatagram: one datagram per client per frame.
+	QMsgClear(&q_net_datagram);
+
+	//svc_time comes FIRST and is what advances the client's clock. Everything
+	//after it is understood to describe that moment.
+	QMsgWriteByte(&q_net_datagram, QSVC_TIME);
+	QMsgWriteFloat(&q_net_datagram, time);
+
+	QNetWriteClientdata(&q_net_datagram, client_ent);
+	QNetWriteEntities(&q_net_datagram, client_ent, vis);
+
+	//An overflowed datagram is DISCARDED whole, not truncated. The original
+	//does the same: a partial message would resynchronise the reader mid-field
+	//and every byte after it would be misread.
+	if (q_net_datagram.overflowed)
+	{
+		q_net_dropped++;
+		return FALSE;
+	}
+
+	if (!QNetSendToClient(&q_net_datagram))
+	{
+		q_net_dropped++;
+		return FALSE;
+	}
+
+	return TRUE;
+}
+
+//--- the client's parse ----------------------------------------------------
+
+U0 QNetParseClientdata(CQMsg *m)
+{//CL_ParseClientdata, reading the fields back in exactly the order written.
+	I64 bits = QMsgReadShort(m) & 0xFFFF;
+	I64 j;
+
+	if (bits & QSU_VIEWHEIGHT)
+		q_cl.view_height = ToF64(QMsgReadChar(m));
+	else
+		q_cl.view_height = QDEFAULT_VIEWHEIGHT;
+
+	if (bits & QSU_IDEALPITCH)
+		QMsgReadChar(m);		//parsed and discarded; nothing here reads it
+
+	//A field absent from the mask is ZERO, not "unchanged". svc_clientdata is a
+	//full snapshot of the player every frame, unlike the entity deltas.
+	for (j = 0; j < 3; j++)
+	{
+		if (bits & (QSU_PUNCH1 << j))
+			q_cl.punchangle[j] = ToF64(QMsgReadChar(m));
+		else
+			q_cl.punchangle[j] = 0.0;
+
+		if (bits & (QSU_VELOCITY1 << j))
+			q_cl.velocity[j] = ToF64(QMsgReadChar(m)) * 16.0;
+		else
+			q_cl.velocity[j] = 0.0;
+	}
+
+	q_cl.items     = QMsgReadLong(m);
+	q_cl.on_ground = ToBool((bits & QSU_ONGROUND) != 0);
+	q_cl.in_water  = ToBool((bits & QSU_INWATER) != 0);
+
+	if (bits & QSU_WEAPONFRAME)
+		q_cl.weaponframe = QMsgReadByte(m);
+	else
+		q_cl.weaponframe = 0;
+
+	if (bits & QSU_ARMOR)
+		q_cl.armorvalue = QMsgReadByte(m);
+	else
+		q_cl.armorvalue = 0;
+
+	if (bits & QSU_WEAPON)
+		q_cl.weaponmodel = QMsgReadByte(m);
+	else
+		q_cl.weaponmodel = 0;
+
+	q_cl.health       = QMsgReadShort(m);
+	q_cl.currentammo  = QMsgReadByte(m);
+	q_cl.ammo_shells  = QMsgReadByte(m);
+	q_cl.ammo_nails   = QMsgReadByte(m);
+	q_cl.ammo_rockets = QMsgReadByte(m);
+	q_cl.ammo_cells   = QMsgReadByte(m);
+	q_cl.weapon       = QMsgReadByte(m);
+}
+
+U0 QNetParseBaseline(CQMsg *m)
+{
+	CQEntState	*b;
+	I64			 num = QMsgReadShort(m);
+
+	if (num < 1 || num >= QNET_MAX_ENTS)
+		return;
+
+	b = &q_net_baseline[num];
+
+	b->modelindex = QMsgReadByte(m);
+	b->frame      = QMsgReadByte(m);
+	b->colormap   = QMsgReadByte(m);
+	b->skin       = QMsgReadByte(m);
+	b->origin[0]  = QMsgReadCoord(m);
+	b->angles[0]  = QMsgReadAngle(m);
+	b->origin[1]  = QMsgReadCoord(m);
+	b->angles[1]  = QMsgReadAngle(m);
+	b->origin[2]  = QMsgReadCoord(m);
+	b->angles[2]  = QMsgReadAngle(m);
+	b->effects    = 0;
+	b->step       = FALSE;
+	b->active     = FALSE;
+
+	if (num >= q_net_num_ents)
+		q_net_num_ents = num + 1;
+}
+
+Bool QNetClientParse(CQMsg *m)
+{//CL_ParseServerMessage: read commands until the message runs out.
+ //
+ //The loop is bounded by the message length rather than by a terminator, and an
+ //unrecognised opcode ABORTS rather than skipping. There is no way to know how
+ //many bytes an unknown command occupies, so continuing would misread
+ //everything after it - the original calls Host_Error here for the same reason.
+	U8	line[128];
+	I64	cmd;
+	I64	i;
+
+	m->read   = 0;
+	m->badread = FALSE;
+
+	while (TRUE)
+	{
+		if (m->read >= m->len)
+			return TRUE;
+
+		cmd = QMsgReadByte(m);
+		if (m->badread)
+			return FALSE;
+
+		//THE HIGH BIT IS AN ENTITY UPDATE, not an opcode. Every svc_ command is
+		//under 128, so the top bit is free to mean "the rest of this byte is a
+		//delta mask". This is the single most load-bearing bit in the protocol.
+		if (cmd & 128)
+		{
+			if (!QNetReadEntityUpdate(m, cmd & 127))
+				return FALSE;
+
+			goto qnp_next;
+		}
+
+		switch (cmd)
+		{
+			case QSVC_NOP:
+				break;
+
+			case QSVC_TIME:
+				q_cl.time = QMsgReadFloat(m);
+				break;
+
+			case QSVC_CLIENTDATA:
+				QNetParseClientdata(m);
+				break;
+
+			case QSVC_SPAWNBASELINE:
+				QNetParseBaseline(m);
+				break;
+
+			case QSVC_SETANGLE:
+				for (i = 0; i < 3; i++)
+					q_cl.view_angles[i] = QMsgReadAngle(m);
+				q_cl.angles_forced = TRUE;
+				break;
+
+			case QSVC_DAMAGE:
+				//The blend itself is owned by the app shell's cshift code; this
+				//only has to consume the right number of bytes.
+				q_net_damage_save = QMsgReadByte(m);
+				q_net_damage_take = QMsgReadByte(m);
+				for (i = 0; i < 3; i++)
+					q_net_damage_from[i] = QMsgReadCoord(m);
+				q_net_damage_pending = TRUE;
+				break;
+
+			case QSVC_UPDATESTAT:
+				QMsgReadByte(m);
+				QMsgReadLong(m);
+				q_cl.stats_received++;
+				break;
+
+			case QSVC_DISCONNECT:
+				return TRUE;
+
+			default:
+				StrPrint(line, "net: unknown svc %d at byte %d\n",
+					cmd, m->read - 1);
+				QLog(line);
+				QLogFlush;
+				return FALSE;
+		}
+
+		if (m->badread)
+			return FALSE;
+
+qnp_next:
+	}
+
+	return TRUE;
+}
+
+//--- upstream: the client's move ------------------------------------------
+//
+//The other half of the protocol. Until now the app shell wrote the player's
+//buttons and view angles straight onto the edict; here the client SENDS them and
+//the server reads them back off the wire, which is what CL_SendMove and
+//SV_ReadClientMove do. It is the path a second player would arrive on.
+
+U0 QNetClientSendMove(F64 *view_angles, F64 forward, F64 side, F64 up,
+	Bool attack, Bool jump, I64 impulse, F64 time)
+{//CL_SendMove.
+	I64 bits = 0;
+
+	if (!q_net_active)
+		return;
+
+	QMsgClear(&q_net_cmd);
+
+	QMsgWriteByte(&q_net_cmd, QCLC_MOVE);
+
+	//The client's timestamp is echoed so the SERVER can measure the round trip.
+	//It is the client's clock, not the server's, and is never used as a time.
+	QMsgWriteFloat(&q_net_cmd, time);
+
+	QMsgWriteAngle(&q_net_cmd, view_angles[0]);
+	QMsgWriteAngle(&q_net_cmd, view_angles[1]);
+	QMsgWriteAngle(&q_net_cmd, view_angles[2]);
+
+	//Move intent goes as SHORTS in units per second, not as a direction: the
+	//server applies the player's angles to them itself.
+	QMsgWriteShort(&q_net_cmd, ToI64(forward));
+	QMsgWriteShort(&q_net_cmd, ToI64(side));
+	QMsgWriteShort(&q_net_cmd, ToI64(up));
+
+	if (attack)	bits |= 1;
+	if (jump)	bits |= 2;
+	QMsgWriteByte(&q_net_cmd, bits);
+
+	QMsgWriteByte(&q_net_cmd, impulse);
+
+	if (QNetSendToServer(&q_net_cmd))
+		q_net_moves_sent++;
+}
+
+Bool QNetServerReadMove(CQMsg *m, I64 ent, F64 server_time)
+{//SV_ReadClientMove. The clc_move byte has already been consumed.
+	I64 bits;
+	I64 imp;
+	I64 j;
+
+	q_net_move_ping = server_time - QMsgReadFloat(m);
+
+	for (j = 0; j < 3; j++)
+		q_net_move_angles[j] = QMsgReadAngle(m);
+
+	q_net_move_cmd[0] = ToF64(QMsgReadShort(m));
+	q_net_move_cmd[1] = ToF64(QMsgReadShort(m));
+	q_net_move_cmd[2] = ToF64(QMsgReadShort(m));
+
+	bits = QMsgReadByte(m);
+	imp  = QMsgReadByte(m);
+
+	if (m->badread)
+		return FALSE;
+
+	q_net_move_attack = ToBool(bits & 1);
+	q_net_move_jump   = ToBool((bits & 2) != 0);
+
+	//IMPULSE IS ONLY OVERWRITTEN WHEN NON-ZERO - `if (i) ent->v.impulse = i;`.
+	//The server does not clear it on a move that carries none, because
+	//ImpulseCommands is what clears it, and that runs in PlayerPostThink. A
+	//move arriving in between must not wipe the pending request.
+	if (imp)
+	{
+		q_net_move_impulse = imp;
+		if (ent > 0 && q_fld_impulse >= 0)
+			QPrSetFieldF(ent, q_fld_impulse, ToF64(imp));
+	}
+
+	if (ent > 0)
+	{
+		for (j = 0; j < 3; j++)
+			QPrSetFieldF(ent, q_fld_v_angle + j, q_net_move_angles[j]);
+
+		QPrSetFieldF(ent, q_fld_button0, ToF64(q_net_move_attack));
+		QPrSetFieldF(ent, q_fld_button2, ToF64(q_net_move_jump));
+	}
+
+	q_net_moves_read++;
+
+	return TRUE;
+}
+
+Bool QNetServerReadClient(I64 ent, F64 server_time)
+{//SV_RunClients' read half: drain whatever the client sent us.
+	CQMsg	*in = &q_net_recv_c2s;
+	I64		 cmd;
+
+	while (QNetServerGetMessage(in))
+	{
+		in->read    = 0;
+		in->badread = FALSE;
+
+		while (in->read < in->len)
+		{
+			cmd = QMsgReadByte(in);
+			if (in->badread)
+				return FALSE;
+
+			switch (cmd)
+			{
+				case QCLC_NOP:
+					break;
+
+				case QCLC_MOVE:
+					if (!QNetServerReadMove(in, ent, server_time))
+						return FALSE;
+					break;
+
+				case QCLC_DISCONNECT:
+					return TRUE;
+
+				case QCLC_STRINGCMD:
+					//Consumed and ignored. A real server would hand this to
+					//Cmd_ExecuteString; nothing here generates one yet, but the
+					//bytes have to be skipped correctly or the rest of the
+					//message is misread.
+					QMsgReadString(in, q_net_cmd_line, 128);
+					break;
+
+				default:
+					return FALSE;
+			}
+		}
+	}
+
+	return TRUE;
+}
+
+I64 QNetVerify(I64 client_ent)
+{//Count entities whose reconstructed state does not match the server's world.
+ //
+ //This is the whole justification for routing single player through the
+ //protocol: the client's copy was built ONLY from bytes, so any disagreement
+ //here is a real encode/decode fault rather than a rendering opinion. The
+ //tolerance is an eighth of a unit plus a hair, which is the coord format's own
+ //resolution - anything tighter would report quantisation as corruption.
+	CQEntState	*c;
+	F64			 d;
+	I64			 bad = 0;
+	I64			 i;
+	I64			 j;
+
+	for (i = 1; i < q_pr_num_edicts && i < QNET_MAX_ENTS; i++)
+	{
+		if (q_pr_edict_free[i] || i == client_ent)
+			goto qnv_next;
+
+		if (!QNetEntityVisible(i))
+			goto qnv_next;
+
+		c = &q_net_cl[i];
+		if (!c->active)
+			goto qnv_next;		//never sent: out of the PVS, not a mismatch
+
+		if (c->modelindex != ToI64(QPrFieldF(i, q_fld_modelindex)))
+		{
+			bad++;
+			goto qnv_next;
+		}
+
+		for (j = 0; j < 3; j++)
+		{
+			d = c->origin[j] - QPrFieldF(i, q_fld_origin + j);
+			if (d < 0.0)
+				d = -d;
+
+			if (d > 0.13)
+			{
+				bad++;
+				goto qnv_next;
+			}
+		}
+
+qnv_next:
+	}
+
+	return bad;
+}
+
+Bool QNetClientFrame()
+{//Drain every message the link has for us. More than one can arrive per frame.
+	CQMsg	*in = &q_net_recv;
+	Bool	 ok  = TRUE;
+
+	while (QNetGetMessage(in))
+	{
+		q_net_parsed++;
+		if (!QNetClientParse(in))
+			ok = FALSE;
+	}
+
+	return ok;
+}

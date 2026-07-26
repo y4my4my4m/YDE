@@ -427,6 +427,10 @@ I64 q_items_last	= 0;	//.items last frame, for the pickup flash
 I64 q_wheel_last	= 0;	//mouse.pos.z last frame, for wheel deltas
 I64 q_con_return_state = QST_PLAYING;	//state the console was opened from
 
+//Entities whose reconstructed client state disagreed with the server's world on
+//the last tick. Should be 0; anything else is an encode or decode fault.
+I64 q_net_mismatch = 0;
+
 U0 QViewKickInit()
 {
 	q_dmg_roll  = 0.0;
@@ -1091,6 +1095,21 @@ Bool QLoadMap(U8 *mapname)
 		StrPrint(line, "QuakeC: %d spawn functions ran, %d edicts live\n",
 			q_game_spawned, q_pr_num_edicts);
 		QLog(line);
+
+		//Baselines are part of the SIGNON, not the per-frame datagram: they are
+		//sent once, after the world has spawned and before any update, because
+		//every later delta is measured from them. Sending them late would leave
+		//the client differencing against zeroes.
+		QNetStatesClear;
+		QNetClientClear;
+		QMsgClear(&q_net_send);
+		QNetWriteBaselines(&q_net_send);
+		QNetSendToClient(&q_net_send);
+		QNetClientFrame;
+
+		StrPrint(line, "net: %d baselines, %d bytes signon\n",
+			q_net_num_ents, q_net_send.len);
+		QLog(line);
 	}
 	else
 		QLog("QuakeC: FAILED to load - entities will be static\n");
@@ -1192,6 +1211,16 @@ Bool QLoadGame()
 		QLog("load: restore failed\n");
 		return FALSE;
 	}
+
+	//A restored world is a NEW world as far as the protocol is concerned, so it
+	//gets fresh baselines. Reusing the previous map's would delta every entity
+	//against a reference that no longer describes it.
+	QNetStatesClear;
+	QNetClientClear;
+	QMsgClear(&q_net_send);
+	QNetWriteBaselines(&q_net_send);
+	QNetSendToClient(&q_net_send);
+	QNetClientFrame;
 
 	//Derived state that must agree with the restored origin.
 	QVecCopy(q_origin, q_old_origin);
@@ -1317,6 +1346,8 @@ U0 QGameLoop()
 	I64  dy;
 	I64  fps_frames   = 0;
 	I64  impulse      = 0;
+	I64  impulse_down = 0;	//number key held this frame, 0 = none
+	I64  impulse_last = 0;	//and the previous frame, for the edge
 	I64  i            = 0;
 	I64  menu_sc      = 0;
 	I64  last_menu_sc = 0;
@@ -1575,13 +1606,26 @@ U0 QGameLoop()
 
 		q_angles[1] = QAngleNorm(q_angles[1]);
 
-		//Number keys request a weapon switch. QuakeC consumes an impulse once.
-		impulse = 0;
+		//Number keys request a weapon switch. EDGE TRIGGERED, because an impulse
+		//is a one-shot event, not a state: the original's +impulse binding fires
+		//once on the key going down and CL_SendMove zeroes in_impulse straight
+		//after transmitting it. Sampling the held state instead re-sent the same
+		//impulse every tick, which is harmless for a direct weapon select but
+		//makes the cycle impulses unusable.
+		impulse      = 0;
+		impulse_down = 0;
+
 		for (i = 1; i <= 8; i++)
 		{
 			if (Bt(kbd.down_bitmap, Char2ScanCode('0' + i)))
-				impulse = i;
+			{
+				impulse_down = i;
+				if (i != impulse_last)
+					impulse = i;
+			}
 		}
+
+		impulse_last = impulse_down;
 
 		//Wheel cycles weapons. The original has no wheel binding - it predates
 		//the convention - but it exposes the two impulses such a binding would
@@ -1594,6 +1638,14 @@ U0 QGameLoop()
 			impulse = 10;
 		else if (wheel_dz < 0)
 			impulse = 12;
+
+		//A console `impulse N` is delivered here rather than written to the edict,
+		//so it goes through the same one-tick path a key press does.
+		if (q_con_impulse_want)
+		{
+			impulse            = q_con_impulse_want;
+			q_con_impulse_want = 0;
+		}
 
 		//--- movement wish direction ---
 		QAngleVectors(q_angles, forward, right, up);
@@ -1689,8 +1741,38 @@ U0 QGameLoop()
 
 			if (q_game_active)
 			{
+				//--- upstream: the client's move goes over the wire ------------
+				//
+				//CL_SendMove then SV_ReadClientMove. The view angles, the two
+				//buttons and the impulse now reach the edict by being SERIALISED
+				//and read back, not by being written across - so the input path
+				//is a real client/server boundary too, and a second player would
+				//arrive down exactly this route.
+				//
+				//The move vector itself is sent and read back for the ping and
+				//for symmetry, but the engine still applies its own copy: the
+				//server-side move would have to reconstruct the wish direction
+				//from angles the way SV_ClientThink does, and that swap belongs
+				//with the renderer flip rather than here.
+				if (q_net_active)
+				{
+					QNetClientSendMove(q_angles,
+						move[0] * speed, move[1] * speed, move[2] * speed,
+						attack, ToBool(Bt(kbd.down_bitmap, sc_jump)),
+						impulse, q_game_time);
+
+					QNetServerReadClient(q_player_edict, q_game_time);
+				}
+
 				QPlayerPreThink(q_origin, q_velocity, q_angles, q_on_ground,
 					attack, ToBool(Bt(kbd.down_bitmap, sc_jump)), impulse);
+
+				//CONSUMED, because this loop can run several catch-up ticks for
+				//one rendered frame. The original carries an impulse in a single
+				//move message, so exactly one server frame ever sees it; leaving
+				//it set here would hand the same key press to ImpulseCommands
+				//two or three times and cycle straight past the weapon asked for.
+				impulse = 0;
 
 				//QuakeC owns jumping while the VM is live: PlayerJump has
 				//already set the vertical velocity during pre-think.
@@ -1732,6 +1814,28 @@ U0 QGameLoop()
 				QPlayerPostThink(q_origin, q_velocity, q_angles);
 				QViewKickUpdate(QSERVER_STEP);
 				QStuckCheck(move, speed);
+
+				//Anything QuakeC printed this tick goes to the console.
+				QConDrainProgs;
+
+				//--- the client/server boundary --------------------------------
+				//
+				//The world is now settled for this tick, which is exactly where
+				//SV_SendClientDatagram runs. The server serialises it and the
+				//local client rebuilds its copy from the bytes.
+				//
+				//The RENDERER still reads the world directly. Flipping it over to
+				//the client's tables is the last step and a separate one: this
+				//pass has to be proved to reconstruct the world correctly first,
+				//which is what QNetVerify measures - and it can only measure it
+				//while a known-good reference is still there to compare against.
+				if (q_net_active && q_player_edict > 0)
+				{
+					QNetServerFrame(q_player_edict, q_vis, q_game_time);
+					QNetClientFrame;
+					q_net_mismatch        = QNetVerify(q_player_edict);
+					q_net_mismatch_report = q_net_mismatch;
+				}
 			}
 			else if (!q_noclip)
 			{

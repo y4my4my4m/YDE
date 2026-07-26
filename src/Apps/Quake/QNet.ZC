@@ -120,6 +120,18 @@ U0 QMsgWriteLong(CQMsg *m, I64 v)
 	QMsgWriteByte(m, (v >> 24) & 0xFF);
 }
 
+U0 QMsgWriteChar(CQMsg *m, I64 v)
+{//MSG_WriteChar. Same byte on the wire as MSG_WriteByte; the distinction is
+ //that the READER sign extends it, so the range is -128..127.
+	QMsgWriteByte(m, v & 0xFF);
+}
+
+U0 QMsgWriteFloat(CQMsg *m, F64 f)
+{//MSG_WriteFloat: a raw IEEE-754 binary32, little endian. Used only by
+ //svc_time and svc_version, which need more range than a coord.
+	QMsgWriteLong(m, QWrF32(f));
+}
+
 U0 QMsgWriteCoord(CQMsg *m, F64 f)
 {//MSG_WriteCoord: eighths of a unit in a signed short.
 	QMsgWriteShort(m, ToI64(f * 8.0));
@@ -202,7 +214,41 @@ I64 QMsgReadLong(CQMsg *m)
 		(m->data[m->read + 2] << 16) | (m->data[m->read + 3] << 24);
 	m->read += 4;
 
+	//MSG_ReadLong returns a signed int. Without the sign extension a negative
+	//value read back as a large positive one, which matters for svc_updatestat
+	//and for frag counts.
+	if (v & 0x80000000)
+		v -= 0x100000000;
+
 	return v;
+}
+
+I64 QMsgReadChar(CQMsg *m)
+{//MSG_ReadChar: one byte, sign extended.
+	I64 v = QMsgReadByte(m);
+
+	if (v < 0)
+		return -1;			//badread already recorded
+
+	if (v & 0x80)
+		v -= 0x100;
+
+	return v;
+}
+
+F64 QMsgReadFloat(CQMsg *m)
+{
+	U8 b[4];
+	I64 i;
+
+	for (i = 0; i < 4; i++)
+	{
+		b[i] = QMsgReadByte(m) & 0xFF;
+		if (m->badread)
+			return 0.0;
+	}
+
+	return QRdF32(b);
 }
 
 F64 QMsgReadCoord(CQMsg *m)
@@ -211,8 +257,10 @@ F64 QMsgReadCoord(CQMsg *m)
 }
 
 F64 QMsgReadAngle(CQMsg *m)
-{
-	return ToF64(QMsgReadByte(m)) * 360.0 / 256.0;
+{//MSG_ReadAngle reads a CHAR, so the result lands in -180..178.6 rather than
+ //0..358.6. Equivalent modulo a turn, and kept signed to match the original
+ //byte for byte.
+	return ToF64(QMsgReadChar(m)) * 360.0 / 256.0;
 }
 
 U0 QMsgReadString(CQMsg *m, U8 *out, I64 max)
@@ -249,83 +297,102 @@ class CQNetLink
 	I64		dropped;		//messages lost to a full queue
 };
 
-CQNetLink	q_net_loop;
+//TWO queues, because the protocol is not one-way. The server sends entity
+//updates down q_net_s2c and the client sends its moves back up q_net_c2s. A
+//real game needs both; on loopback they are simply two rings.
+CQNetLink	q_net_s2c;
+CQNetLink	q_net_c2s;
 CQMsg		q_net_send;		//server's scratch message being built
+CQMsg		q_net_cmd;		//client's scratch message being built
 Bool		q_net_active = FALSE;
+
+U0 QNetLinkClear(CQNetLink *l)
+{
+	I64 i;
+
+	l->head    = 0;
+	l->tail    = 0;
+	l->count   = 0;
+	l->dropped = 0;
+
+	for (i = 0; i < QNET_MAX_BACKLOG; i++)
+		QMsgClear(&l->queue[i]);
+}
 
 U0 QNetInit()
 {//Globals are not zeroed here, so every field is set explicitly.
-	I64 i;
-
-	q_net_loop.head    = 0;
-	q_net_loop.tail    = 0;
-	q_net_loop.count   = 0;
-	q_net_loop.dropped = 0;
-
-	for (i = 0; i < QNET_MAX_BACKLOG; i++)
-		QMsgClear(&q_net_loop.queue[i]);
+	QNetLinkClear(&q_net_s2c);
+	QNetLinkClear(&q_net_c2s);
 
 	QMsgClear(&q_net_send);
+	QMsgClear(&q_net_cmd);
 	q_net_active = TRUE;
 }
 
-Bool QNetSendToClient(CQMsg *m)
-{//Hand a finished message to the local client. FALSE if it was dropped.
+Bool QNetLinkSend(CQNetLink *l, CQMsg *m)
+{//Queue a finished message. FALSE if it was dropped.
 	CQMsg *slot;
 
 	if (!q_net_active || m->overflowed || m->len < 1)
 		return FALSE;
 
-	if (q_net_loop.count >= QNET_MAX_BACKLOG)
+	if (l->count >= QNET_MAX_BACKLOG)
 	{
 		//Dropping a WHOLE message is correct; a partial one would desynchronise
 		//the reader. Counted so the loss is visible.
-		q_net_loop.dropped++;
+		l->dropped++;
 		return FALSE;
 	}
 
-	slot = &q_net_loop.queue[q_net_loop.head];
+	slot = &l->queue[l->head];
 	QMsgClear(slot);
 	MemCopy(slot->data, m->data, m->len);
 	slot->len = m->len;
 
-	q_net_loop.head = (q_net_loop.head + 1) % QNET_MAX_BACKLOG;
-	q_net_loop.count++;
+	l->head = (l->head + 1) % QNET_MAX_BACKLOG;
+	l->count++;
 
 	return TRUE;
 }
 
-Bool QNetGetMessage(CQMsg *out)
-{//Take the next message for the client, if any.
+Bool QNetLinkGet(CQNetLink *l, CQMsg *out)
+{//Take the next queued message, if any.
 	CQMsg *slot;
 
-	if (!q_net_active || q_net_loop.count < 1)
+	if (!q_net_active || l->count < 1)
 		return FALSE;
 
-	slot = &q_net_loop.queue[q_net_loop.tail];
+	slot = &l->queue[l->tail];
 
 	QMsgClear(out);
 	MemCopy(out->data, slot->data, slot->len);
 	out->len = slot->len;
 
-	q_net_loop.tail = (q_net_loop.tail + 1) % QNET_MAX_BACKLOG;
-	q_net_loop.count--;
+	l->tail = (l->tail + 1) % QNET_MAX_BACKLOG;
+	l->count--;
 
 	return TRUE;
 }
 
-//--- entity state -----------------------------------------------------------
-//
-// The second step of the split: the server describes the world as MESSAGES, and
-// the client keeps its own copy of what it has been told. Until now the renderer
-// read the same edict fields the physics wrote, which is only possible when both
-// live in one process.
-//
-// Each entity gets a baseline (sent once) and deltas (sent when something
-// changes). svc_spawnbaseline carries the full state; the update byte-mask says
-// which fields follow, so an entity that only moved costs a few bytes instead of
-// a full record. That compression is not an optimisation detail - it is why the
-// protocol fits a 28.8k modem, and it is what a .dem file contains.
+Bool QNetSendToClient(CQMsg *m)
+{//Server -> client.
+	return QNetLinkSend(&q_net_s2c, m);
+}
+
+Bool QNetGetMessage(CQMsg *out)
+{//Client reads what the server sent.
+	return QNetLinkGet(&q_net_s2c, out);
+}
+
+Bool QNetSendToServer(CQMsg *m)
+{//Client -> server.
+	return QNetLinkSend(&q_net_c2s, m);
+}
+
+Bool QNetServerGetMessage(CQMsg *out)
+{//Server reads what the client sent.
+	return QNetLinkGet(&q_net_c2s, out);
+}
 
 #define QNET_MAX_ENTS	600
 
@@ -355,11 +422,17 @@ class CQEntState
 	I64	 colormap;
 	I64	 skin;
 	I64	 effects;
+	Bool step;			//MOVETYPE_STEP: the client must not interpolate it
 	Bool active;		//the client has been told about this entity
 };
 
-//Two copies: what the server last SENT, and what the client currently BELIEVES.
-//The delta is the difference between them, which is why both must be kept.
+//THREE tables, because NQ deltas against the BASELINE - not against the last
+//packet sent. svc_spawnbaseline hands the client a starting state for every
+//entity at signon, and from then on every svc_update is a difference from that
+//fixed reference. It costs bandwidth compared with QuakeWorld's delta-vs-last-
+//sent, and buys statelessness: a lost packet cannot desynchronise the stream,
+//because the next one is still measured from the same baseline.
+CQEntState	q_net_baseline[QNET_MAX_ENTS];
 CQEntState	q_net_sent[QNET_MAX_ENTS];
 CQEntState	q_net_cl[QNET_MAX_ENTS];
 I64			q_net_num_ents = 0;
@@ -373,6 +446,7 @@ U0 QNetStateClear(CQEntState *e)
 	e->colormap   = 0;
 	e->skin       = 0;
 	e->effects    = 0;
+	e->step       = FALSE;
 	e->active     = FALSE;
 }
 
@@ -382,6 +456,7 @@ U0 QNetStatesClear()
 
 	for (i = 0; i < QNET_MAX_ENTS; i++)
 	{
+		QNetStateClear(&q_net_baseline[i]);
 		QNetStateClear(&q_net_sent[i]);
 		QNetStateClear(&q_net_cl[i]);
 	}
@@ -389,8 +464,18 @@ U0 QNetStatesClear()
 	q_net_num_ents = 0;
 }
 
+Bool QNetOriginDiffers(F64 a, F64 b)
+{//SV_WriteEntitiesToClient's own tolerance: `miss < -0.1 || miss > 0.1`. An
+ //exact comparison would flag every entity every frame, because a coord that
+ //survived a round trip through the eighth-unit wire format almost never
+ //compares equal to the float it came from.
+	F64 miss = a - b;
+
+	return ToBool(miss < -0.1 || miss > 0.1);
+}
+
 U0 QNetWriteEntityUpdate(CQMsg *m, I64 num, CQEntState *now,
-	CQEntState *was)
+	CQEntState *baseline)
 {//One delta-compressed entity update, in the original's field order.
  //
  //The mask is built FIRST and only then written, because svc_update puts the
@@ -398,27 +483,47 @@ U0 QNetWriteEntityUpdate(CQMsg *m, I64 num, CQEntState *now,
  //what is coming.
 	I64 bits = 0;
 
-	if (now->origin[0] != was->origin[0])	bits |= QU_ORIGIN1;
-	if (now->origin[1] != was->origin[1])	bits |= QU_ORIGIN2;
-	if (now->origin[2] != was->origin[2])	bits |= QU_ORIGIN3;
-	if (now->angles[0] != was->angles[0])	bits |= QU_ANGLE1;
-	if (now->angles[1] != was->angles[1])	bits |= QU_ANGLE2;
-	if (now->angles[2] != was->angles[2])	bits |= QU_ANGLE3;
-	if (now->frame      != was->frame)		bits |= QU_FRAME;
-	if (now->modelindex != was->modelindex)	bits |= QU_MODEL;
-	if (now->colormap   != was->colormap)	bits |= QU_COLORMAP;
-	if (now->skin       != was->skin)		bits |= QU_SKIN;
-	if (now->effects    != was->effects)	bits |= QU_EFFECTS;
+	if (QNetOriginDiffers(now->origin[0], baseline->origin[0]))
+		bits |= QU_ORIGIN1;
+	if (QNetOriginDiffers(now->origin[1], baseline->origin[1]))
+		bits |= QU_ORIGIN2;
+	if (QNetOriginDiffers(now->origin[2], baseline->origin[2]))
+		bits |= QU_ORIGIN3;
 
-	if (!bits)
-		return;				//nothing changed: send nothing at all
+	if (now->angles[0] != baseline->angles[0])	bits |= QU_ANGLE1;
+	if (now->angles[1] != baseline->angles[1])	bits |= QU_ANGLE2;
+	if (now->angles[2] != baseline->angles[2])	bits |= QU_ANGLE3;
 
+	//U_NOLERP is not a difference from the baseline at all, it is a property of
+	//the entity: a MOVETYPE_STEP mover teleports between fixed positions, and
+	//interpolating that smears the step animation.
+	if (now->step)
+		bits |= QU_NOLERP;
+
+	if (now->frame      != baseline->frame)		bits |= QU_FRAME;
+	if (now->modelindex != baseline->modelindex)	bits |= QU_MODEL;
+	if (now->colormap   != baseline->colormap)	bits |= QU_COLORMAP;
+	if (now->skin       != baseline->skin)		bits |= QU_SKIN;
+	if (now->effects    != baseline->effects)	bits |= QU_EFFECTS;
+
+	//NO early-out on an empty mask. An entity that matches its baseline exactly
+	//still costs two bytes, because the mask byte IS the "this entity is here
+	//and visible" signal - and the entity number that follows is what the
+	//client keys its copy on. Suppressing it, as a delta-vs-last-sent protocol
+	//would, makes an unchanged entity indistinguishable from one that left the
+	//PVS.
 	if (num >= 256)
 		bits |= QU_LONGENTITY;
 	if (bits >= 256)
 		bits |= QU_MOREBITS;
 
-	QMsgWriteByte(m, bits & 255);
+	//U_SIGNAL is the high bit of the first byte and is ALWAYS set. That single
+	//bit is how the client's message loop tells an entity update from an svc_
+	//command: anything with the top bit set is an update, and the remaining
+	//seven bits are the start of the mask. Without it every update would be
+	//dispatched as some unrelated - and mostly invalid - svc_ opcode.
+	QMsgWriteByte(m, (bits | QU_SIGNAL) & 255);
+
 	if (bits & QU_MOREBITS)
 		QMsgWriteByte(m, (bits >> 8) & 255);
 
@@ -460,6 +565,15 @@ Bool QNetReadEntityUpdate(CQMsg *m, I64 bits)
 		return FALSE;
 
 	e = &q_net_cl[num];
+
+	//An entity being described for the FIRST time starts from its baseline, not
+	//from zero - CL_ParseUpdate copies ent->baseline into the entity state when
+	//it sees it appear. Skipping that leaves every field the mask happens to
+	//omit reading as 0, so a static-looking entity arrives with no model.
+	if (!e->active)
+		MemCopy(e, &q_net_baseline[num], sizeof(CQEntState));
+
+	e->step = ToBool((bits & QU_NOLERP) != 0);
 
 	//Anything NOT in the mask keeps its previous value. That is the whole point
 	//of the delta: the client's copy is the accumulation of every update it has
