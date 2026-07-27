@@ -22,11 +22,16 @@ class CNetQueueEntry:CQueue
 
 CQueue *net_queue; // no QueueRemove the Head! only Entries!
 
-/* Cap depth so a flood (host still blasting after guest reboot) cannot
-   CAlloc the heap to death from the NIC IRQ / poll path. */
+/*	Depth cap: a flood must not CAlloc the heap to death from the NIC IRQ.
+
+	net_queue is mutated from TWO interrupt contexts - the NIC IRQ pushes and
+	NetHandler pulls - so the list and the counter need a lock. Without one the
+	counter loses updates and drifts; once it drifts up to NETQUEUE_MAX it never
+	comes back down and every frame is dropped from then on. */
 #define NETQUEUE_MAX	64
 I64 net_queue_depth = 0;
 I64 net_queue_drops = 0;
+I64 net_queue_lock  = 0;
 
 U0 NetQueueInit()
 {
@@ -34,6 +39,7 @@ U0 NetQueueInit()
 	QueueInit(net_queue);
 	net_queue_depth = 0;
 	net_queue_drops = 0;
+	net_queue_lock  = 0;
 }
 
 CNetQueueEntry *NetQueuePull()
@@ -41,6 +47,11 @@ CNetQueueEntry *NetQueuePull()
 	or NULL pointer if Net Queue is empty. */
 
 	CNetQueueEntry *entry;
+
+	PUSHFD
+	CLI
+	while (LBts(&net_queue_lock, 0))
+		PAUSE
 
 	if (net_queue->next != net_queue)
 	{
@@ -54,6 +65,9 @@ CNetQueueEntry *NetQueuePull()
 		entry = NULL;
 	}
 
+	LBtr(&net_queue_lock, 0);
+	POPFD
+
 	return entry;
 }
 
@@ -65,41 +79,38 @@ U0 NetQueuePush(U8 *data, I64 length)
 
 	CNetQueueEntry *entry;
 
-	/*	REJECT IMPLAUSIBLE LENGTHS BEFORE COPYING.
-
-		entry->frame is a fixed ETHERNET_FRAME_SIZE buffer, and this is called
-		straight from the NIC interrupt with a length the driver read out of the
-		receive ring without checking it. RTL8139's TwoRTL8139PacketReceive
-		computes `rx_size - 4` on a U16, so a ring header that is stale or still
-		being DMA'd - rx_size of 0 - underflows to 65532 and this MemCopy runs
-		off the end of the heap block. The corruption surfaces later as a fault
-		in whatever allocates next, which makes it look like a crash caused by
-		merely receiving traffic.
-
-		Dropping the frame is the right response: a packet whose length cannot
-		be true is not a packet. */
+	/*	frame[] is fixed size and the caller is a NIC IRQ passing a length taken
+		from the receive ring, so an impossible length must not reach MemCopy. */
 	if (length < 1 || length > ETHERNET_FRAME_SIZE)
-	{
-		NetErr("NETQUEUE PUSH COPY: Dropping frame, implausible length %d.",
-			   length);
 		return;
-	}
+
+	entry = CAlloc(sizeof(CNetQueueEntry));
+	if (!entry)
+		return;
+
+	entry->packet_length = length;
+	MemCopy(entry->frame, data, length);
+
+	PUSHFD
+	CLI
+	while (LBts(&net_queue_lock, 0))
+		PAUSE
 
 	if (net_queue_depth >= NETQUEUE_MAX)
 	{
 		net_queue_drops++;
-		/* No NetLog - this path runs under packet flood. */
+		LBtr(&net_queue_lock, 0);
+		POPFD
+
+		Free(entry);
 		return;
 	}
 
-	entry = CAlloc(sizeof(CNetQueueEntry));
-
-	entry->packet_length = length;
-
-	MemCopy(entry->frame, data, length);
-
 	QueueInsert(entry, net_queue->last);
 	net_queue_depth++;
+
+	LBtr(&net_queue_lock, 0);
+	POPFD
 
 	MPInt(I_NETHANDLER, INT_DEST_CPU);
 }

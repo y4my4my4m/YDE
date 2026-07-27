@@ -1,27 +1,15 @@
-// QNetUdp.ZC - the real transport under the loopback link.
+// QNetUdp.ZC - UDP transport, same two operations as the loopback link.
 //
-// ZealOS already has everything below this file: RTL8139 and E1000 drivers,
-// Ethernet, ARP, IPV4 and a UDP socket layer with bind/recvfrom. So there is no
-// netstack and no driver to write here - only the Quake-shaped transport that
-// sits on top, which is the same two operations the loopback link provides:
-// hand over a whole message, take back a whole message.
-//
-// The net stack is NOT part of the kernel. It is loaded on demand by running
-// ::/Home/Net/Start, so Quake has to compile whether or not it is present -
-// hence the #ifdef. ZealOS keeps #defines system-wide once a file has been
-// included, so UDP_MAX_PORT existing IS the test for "the UDP layer is loaded".
-//
-// Datagram boundaries line up exactly with what the protocol wants. A Quake
-// message is already sized to fit one datagram (MAX_DATAGRAM), delivery is
-// unreliable and unordered by design, and the delta encoding is measured from
-// the baseline rather than the last packet - so a dropped datagram costs one
-// frame of smoothness and never desynchronises anything.
+// The net stack is not in the kernel; RunNet.ZC loads it. UDP_MAX_PORT being
+// defined is the test for "it is loaded", hence the #ifdef - Quake must still
+// compile without it.
 
 #define QNET_PORT_DEFAULT	26000	//the original's port
 
 I64		q_udp_port		= QNET_PORT_DEFAULT;
 U32		q_udp_peer_ip	= 0;		//who we are talking to, 0 = nobody
 U32		q_udp_from_ip	= 0;		//sender of the datagram just received
+I64		q_udp_from_port	= QNET_PORT_DEFAULT;	//sender UDP port (Ironwail = ephemeral)
 Bool	q_udp_ready		= FALSE;	//socket open and bound
 Bool	q_udp_server	= FALSE;	//TRUE when hosting
 I64		q_udp_sent		= 0;
@@ -40,13 +28,8 @@ Bool QNetUdpOpen(I64 port)
 	if (q_udp_ready)
 		return TRUE;
 
-	//NO DHCP FROM HERE. Calling NetConfigure was a mistake: on a link with no
-	//DHCP server - which is exactly a QEMU socket link between two guests -
-	//DHCP DISCOVER retries to exhaustion and stalls the game for seconds before
-	//failing anyway. An address is a prerequisite, not something to go hunting
-	//for mid-game. `qip` sets one statically, `netdhcp` asks a real server.
-	//ORDER MATTERS and the message says so: the socket is bound to this
-	//machine's address, so there has to BE one before host or connect can run.
+	//No DHCP here: on a link with no server it retries to exhaustion and stalls
+	//the frame loop. `qip` sets an address statically, `netdhcp` asks a server.
 	if (!ipv4_globals.local_ip)
 	{
 		QStrCopy(q_udp_status,
@@ -67,19 +50,9 @@ Bool QNetUdpOpen(I64 port)
 	q_udp_bind->family	= AF_INET;
 	q_udp_bind->port	= EndianU16(port);
 
-	//BOUND TO INADDR_ANY, NOT TO OUR OWN ADDRESS.
-	//
-	//UDPHandler locates the receiving socket with
-	//    UDPTreeNodeQueueIPV4Find(packet->source_ip_address, node)
-	//- it matches the bound address against the SOURCE of the arriving packet,
-	//not the destination. Binding our own address therefore matches nothing a
-	//peer ever sends us, and every datagram is dropped with "address is not in
-	//node queue". UDPChat gets away with binding the REMOTE address for exactly
-	//this reason, which only works when you know your one peer in advance.
-	//
-	//A server does not know its clients ahead of time, so it binds the wildcard
-	//and takes the INADDR_ANY fallback in that same lookup, which accepts any
-	//source.
+	//INADDR_ANY, not our own address: UDPHandler matches the bound address
+	//against the packet's SOURCE, so binding our own matches nothing a peer
+	//sends. The wildcard takes that lookup's INADDR_ANY fallback.
 	q_udp_bind->address.address	= INADDR_ANY;
 
 	if (UDPSocketBind(q_udp_socket, q_udp_bind) == -1)
@@ -126,10 +99,11 @@ U0 QNetUdpClose()
 	q_udp_peer_ip = 0;
 }
 
-Bool QNetUdpSendTo(CQMsg *m, U32 dest_ip)
+Bool QNetUdpSendTo(CQMsg *m, U32 dest_ip, I64 dest_port=0)
 {//One Quake message, one datagram to dest_ip. NEVER BLOCKS.
 	U8	*payload;
 	I64	 de_index;
+	I64	 dport;
 
 	if (!q_udp_ready || !dest_ip || m->len < 1 || m->overflowed)
 		return FALSE;
@@ -139,16 +113,12 @@ Bool QNetUdpSendTo(CQMsg *m, U32 dest_ip)
 	if (m->len > 1472)
 		return FALSE;
 
-	//THE PEER'S MAC MUST ALREADY BE KNOWN.
-	//
-	//IPV4AddressMACGet resolves a cache miss by sending an ARP request and then
-	//sleeping in 10ms steps for up to 500ms, four times over - two seconds of
-	//blocking inside a send. Called from the frame loop that is exactly what it
-	//sounds like: the game grinds to a crawl, and since the address never
-	//resolves anyway not one datagram is transmitted.
-	//
-	//So the cache is consulted first and the send is simply skipped on a miss.
-	//Resolution happens once, deliberately, in QNetUdpResolvePeer.
+	dport = dest_port;
+	if (dport < 1 || dport > 65535)
+		dport = QNET_PORT_DEFAULT;
+
+	//Cache-only: IPV4AddressMACGet blocks up to 2s resolving a miss, which in
+	//the frame loop stalls the game. Resolution happens in QNetUdpResolvePeer.
 	if (!ARPCacheFind(dest_ip))
 	{
 		q_udp_unresolved++;
@@ -156,7 +126,7 @@ Bool QNetUdpSendTo(CQMsg *m, U32 dest_ip)
 	}
 
 	de_index = UDPPacketAllocate(&payload, ipv4_globals.local_ip, q_udp_port,
-		dest_ip, q_udp_port, m->len);
+		dest_ip, dport, m->len);
 
 	if (de_index < 0)
 	{
@@ -175,6 +145,47 @@ Bool QNetUdpSendTo(CQMsg *m, U32 dest_ip)
 Bool QNetUdpSend(CQMsg *m)
 {//To the latched peer. Listen-server remotes use QNetUdpSendTo(slot.ip).
 	return QNetUdpSendTo(m, q_udp_peer_ip);
+}
+
+Bool QNetUdpSendRawTo(U8 *data, I64 len, U32 dest_ip, I64 dest_port=0)
+{//Raw UDP bytes (framed NETFLAG packets). dest_port 0 -> QNET_PORT_DEFAULT.
+ //Ironwail CCREQ comes from an ephemeral port - CTL Accept MUST reply there,
+ //not to 26000 (that is our bind / QEMU hostfwd, not the client socket).
+	U8	*payload;
+	I64	 de_index;
+	I64	 dport;
+
+	if (!q_udp_ready || !dest_ip || !data || len < 1)
+		return FALSE;
+
+	if (len > 1472)
+		return FALSE;
+
+	dport = dest_port;
+	if (dport < 1 || dport > 65535)
+		dport = QNET_PORT_DEFAULT;
+
+	if (!ARPCacheFind(dest_ip))
+	{
+		q_udp_unresolved++;
+		return FALSE;
+	}
+
+	de_index = UDPPacketAllocate(&payload, ipv4_globals.local_ip, q_udp_port,
+		dest_ip, dport, len);
+
+	if (de_index < 0)
+	{
+		q_udp_errors++;
+		return FALSE;
+	}
+
+	MemCopy(payload, data, len);
+	UDPPacketFinish(de_index);
+
+	q_udp_sent++;
+
+	return TRUE;
 }
 
 Bool QNetUdpRecv(CQMsg *out)
@@ -220,9 +231,64 @@ Bool QNetUdpRecv(CQMsg *out)
 		//which is what makes "host" work with no prior configuration.
 		if (!q_udp_peer_ip)
 			q_udp_peer_ip = q_udp_from_ip;
+
+		q_udp_from_port = EndianU16(v4->port);
+		if (q_udp_from_port < 1)
+			q_udp_from_port = QNET_PORT_DEFAULT;
 	}
 	else
+	{
 		q_udp_from_ip = 0;
+		q_udp_from_port = QNET_PORT_DEFAULT;
+	}
+
+	q_udp_recvd++;
+
+	return TRUE;
+}
+
+Bool QNetUdpRecvRaw(U8 *buf, I64 max, I64 *out_len, U32 *from_ip)
+{//Raw UDP bytes for QNetDgrm framing. Never blocks.
+	CSocketAddressStorage	from;
+	CSocketAddressIPV4		*v4;
+	I64						 got;
+
+	if (out_len)
+		*out_len = 0;
+	if (from_ip)
+		*from_ip = 0;
+
+	if (!q_udp_ready || !buf || max < 1)
+		return FALSE;
+
+	MemSet(&from, 0, sizeof(CSocketAddressStorage));
+
+	got = UDPSocketReceiveFrom(q_udp_socket, buf, max, &from);
+	if (got < 1)
+		return FALSE;
+
+	if (out_len)
+		*out_len = got;
+
+	if (from.family == AF_INET)
+	{
+		v4 = &from;
+		q_udp_from_ip = EndianU32(v4->address.address);
+		//sockaddr port is network order (see CSocketAddressIPV4).
+		q_udp_from_port = EndianU16(v4->port);
+		if (q_udp_from_port < 1)
+			q_udp_from_port = QNET_PORT_DEFAULT;
+		if (!q_udp_peer_ip)
+			q_udp_peer_ip = q_udp_from_ip;
+	}
+	else
+	{
+		q_udp_from_ip = 0;
+		q_udp_from_port = QNET_PORT_DEFAULT;
+	}
+
+	if (from_ip)
+		*from_ip = q_udp_from_ip;
 
 	q_udp_recvd++;
 
@@ -257,13 +323,27 @@ Bool QNetUdpSend(CQMsg *m)
 	return FALSE;
 }
 
-Bool QNetUdpSendTo(CQMsg *m, U32 dest_ip)
+Bool QNetUdpSendTo(CQMsg *m, U32 dest_ip, I64 dest_port=0)
+{
+	return FALSE;
+}
+
+Bool QNetUdpSendRawTo(U8 *data, I64 len, U32 dest_ip, I64 dest_port=0)
 {
 	return FALSE;
 }
 
 Bool QNetUdpRecv(CQMsg *out)
 {
+	return FALSE;
+}
+
+Bool QNetUdpRecvRaw(U8 *buf, I64 max, I64 *out_len, U32 *from_ip)
+{
+	if (out_len)
+		*out_len = 0;
+	if (from_ip)
+		*from_ip = 0;
 	return FALSE;
 }
 
@@ -279,6 +359,7 @@ U0 QNetUdpInit()
 	q_udp_port    = QNET_PORT_DEFAULT;
 	q_udp_peer_ip = 0;
 	q_udp_from_ip = 0;
+	q_udp_from_port = QNET_PORT_DEFAULT;
 	q_udp_ready   = FALSE;
 	q_udp_server  = FALSE;
 	q_udp_sent       = 0;
@@ -344,6 +425,19 @@ Bool QNetUdpResolvePeer()
 	return ToBool(ARPCacheFind(q_udp_peer_ip) != NULL);
 }
 
+Bool QNetUdpEnsureArp(U32 ip)
+{//Block briefly until dest MAC known. CTL Accept must not silent-drop on cold cache.
+	U8 *mac = NULL;
+
+	if (!ip)
+		return FALSE;
+	if (ARPCacheFind(ip))
+		return TRUE;
+
+	IPV4AddressMACGet(ip, &mac);
+	return ToBool(ARPCacheFind(ip) != NULL);
+}
+
 #else
 
 U0 QNetUdpArpProbe()
@@ -356,6 +450,11 @@ Bool QNetUdpPeerResolved()
 }
 
 Bool QNetUdpResolvePeer()
+{
+	return FALSE;
+}
+
+Bool QNetUdpEnsureArp(U32 ip)
 {
 	return FALSE;
 }

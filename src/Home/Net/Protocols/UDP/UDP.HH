@@ -14,6 +14,7 @@ class CUDPSocket
 	CSocket					*socket;
 	CUDPMessageQueue		*receive_queue;
 	I64						 receive_queue_depth; //cap: flood during peer map-load must not CAlloc forever
+	I64						 receive_lock;		//queue is touched by UDPHandler (IRQ) and recvfrom (task)
 	CSocketAddressStorage	 receive_address;	// based on ->family, cast or assign to a var as IPV4/IPV6 CSocketAddress
 	I64						 receive_timeout_ms;
 	I64						 receive_max_timeout;

@@ -90,6 +90,7 @@ CUDPSocket *UDPSocket(U16 domain=AF_UNSPEC)
 	udp_socket->receive_queue = CAlloc(sizeof(CUDPMessageQueue));
 	QueueInit(udp_socket->receive_queue); // acts as head. add messages to but don't remove head.
 	udp_socket->receive_queue_depth = 0;
+	udp_socket->receive_lock        = 0;
 
 	return udp_socket;
 
@@ -339,9 +340,20 @@ I64 UDPSocketReceiveFrom(CUDPSocket *udp_socket, U8 *buffer, I64 len, CSocketAdd
 		Yield;
 	}
 
-	NetLog("UDP SOCKET RECEIVE FROM: Saw message in receive queue.");
+	PUSHFD
+	CLI
+	while (LBts(&udp_socket->receive_lock, 0))
+		PAUSE
 
 	message = message->next;
+
+	//Raced with another reader and lost - nothing left to take.
+	if (message == udp_socket->receive_queue)
+	{
+		LBtr(&udp_socket->receive_lock, 0);
+		POPFD
+		return -1;
+	}
 
 	if (address_out)
 	{
@@ -364,24 +376,27 @@ I64 UDPSocketReceiveFrom(CUDPSocket *udp_socket, U8 *buffer, I64 len, CSocketAdd
 
 	if (len >= message->data_length - message->received_length)
 	{
-		NetLog("UDP SOCKET RECEIVE FROM: Requested length longer than data. Truncating.");
 		len = message->data_length - message->received_length;
 		MemCopy(buffer, message->data + message->received_length, len);
 
-		NetWarn("UDP SOCKET RECEIVE FROM: Freeing message and removing from queue.");
-		// all data pulled, release message
 		QueueRemove(message);
-		Free(message->data);
-		Free(message);
 		if (udp_socket->receive_queue_depth > 0)
 			udp_socket->receive_queue_depth--;
+
+		LBtr(&udp_socket->receive_lock, 0);
+		POPFD
+
+		Free(message->data);
+		Free(message);
+
+		return len;
 	}
-	else
-	{
-		NetLog("UDP SOCKET RECEIVE FROM: Requsted length shorter than data at message.");
-		MemCopy(buffer, message->data + message->received_length, len);
-		message->received_length += len;
-	}
+
+	MemCopy(buffer, message->data + message->received_length, len);
+	message->received_length += len;
+
+	LBtr(&udp_socket->receive_lock, 0);
+	POPFD
 
 	return len;
 }
@@ -458,6 +473,7 @@ I64 UDPHandler(CIPV4Packet *packet)
 	CUDPTreeQueue		*queue;
 	CUDPMessageQueue	*messages_head;
 	CUDPMessageQueue	*message;
+	CUDPMessageQueue	*stale;
 	CUDPSocket			*udp_socket;
 	CSocketAddressIPV4	*ipv4_addr;
 
@@ -490,24 +506,20 @@ I64 UDPHandler(CIPV4Packet *packet)
 
 	messages_head = udp_socket->receive_queue;
 
-	//Cap depth. Host Quake keeps sending entity datagrams while a joining
-	//guest loads the map and is not draining - unbounded CAlloc here hard-froze
-	//the guest with no crash. Drop oldest so the newest state survives.
-	while (udp_socket->receive_queue_depth >= UDP_RECV_QUEUE_MAX &&
-		messages_head->next != messages_head)
-	{
-		message = messages_head->next;
-		QueueRemove(message);
-		Free(message->data);
-		Free(message);
-		udp_socket->receive_queue_depth--;
-	}
-
+	/*	Built COMPLETE before it is linked. Linking first left a message on the
+		queue whose data pointer was still null, and recvfrom - which runs in a
+		task while this runs in the NetHandler interrupt - could reach it. */
 	message = CAlloc(sizeof(CUDPMessageQueue));
-	QueueInsertRev(message, messages_head);
-	udp_socket->receive_queue_depth++;
+	if (!message)
+		return -1;
 
 	message->data = CAlloc(length);
+	if (!message->data)
+	{
+		Free(message);
+		return -1;
+	}
+
 	MemCopy(message->data, data, length);
 	message->data_length = length;
 
@@ -516,6 +528,32 @@ I64 UDPHandler(CIPV4Packet *packet)
 	ipv4_addr->family			= AF_INET;
 	ipv4_addr->port				= EndianU16(source_port);
 	ipv4_addr->address.address	= EndianU32(packet->source_ip_address);
+
+	PUSHFD
+	CLI
+	while (LBts(&udp_socket->receive_lock, 0))
+		PAUSE
+
+	/*	Depth cap: a peer keeps sending while this side is busy loading a map
+		and not draining, and an unbounded queue eats the heap. Drop the oldest
+		so the newest state survives. */
+	while (udp_socket->receive_queue_depth >= UDP_RECV_QUEUE_MAX &&
+		messages_head->next != messages_head)
+	{
+		stale = messages_head->next;
+
+		QueueRemove(stale);
+		udp_socket->receive_queue_depth--;
+
+		Free(stale->data);
+		Free(stale);
+	}
+
+	QueueInsertRev(message, messages_head);
+	udp_socket->receive_queue_depth++;
+
+	LBtr(&udp_socket->receive_lock, 0);
+	POPFD
 
 	return error;
 }
