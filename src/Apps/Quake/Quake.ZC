@@ -429,6 +429,10 @@ I64 q_con_return_state = QST_PLAYING;	//state the console was opened from
 //the last tick. Should be 0; anything else is an encode or decode fault.
 I64 q_net_mismatch = 0;
 
+//When the last connection request went out, so it can be repeated.
+F64 q_join_last_try = 0.0;
+U8  q_join_line[96];
+
 U0 QViewKickInit()
 {
 	q_dmg_roll  = 0.0;
@@ -500,7 +504,37 @@ U0 QViewKickUpdate(F64 dt)
 	}
 
 	//--- damage kick ---
-	if (q_fld_dmg_take >= 0 && q_fld_dmg_save >= 0)
+	//
+	//Thin client: QuakeC never writes local dmg_take. svc_damage parks the hit
+	//in q_net_damage_* (V_ParseDamage's inputs) - honour that here.
+	if (q_net_damage_pending)
+	{
+		count = ToF64(q_net_damage_take) + ToF64(q_net_damage_save);
+		if (count < 10.0)
+			count = 10.0;
+		if (count > 255.0)
+			count = 255.0;
+
+		QCShiftDamage(count);
+
+		QVecSub(q_net_damage_from, q_origin, dir);
+		len = QVecLength(dir);
+		if (len > 0.0)
+		{
+			QVecScale(dir, 1.0 / len, dir);
+			QAngleVectors(q_angles, fwd, rgt, upv);
+			side        = QVecDot(dir, rgt);
+			q_dmg_roll  = count * side * QKICK_ROLL;
+			side        = QVecDot(dir, fwd);
+			q_dmg_pitch = count * side * QKICK_PITCH;
+			q_dmg_time  = QKICK_TIME;
+		}
+
+		q_net_damage_pending = FALSE;
+		q_net_damage_take    = 0;
+		q_net_damage_save    = 0;
+	}
+	else if (q_fld_dmg_take >= 0 && q_fld_dmg_save >= 0)
 	{
 		count = QPrFieldF(q_player_edict, q_fld_dmg_take) +
 				QPrFieldF(q_player_edict, q_fld_dmg_save);
@@ -566,6 +600,25 @@ U0 QViewKickUpdate(F64 dt)
 			QPrSetFieldF(q_player_edict, q_fld_dmg_take, 0.0);
 			QPrSetFieldF(q_player_edict, q_fld_dmg_save, 0.0);
 			q_dmg_last = 0.0;
+		}
+	}
+
+	//Thin client: punchangle arrives in clientdata, not on the local edict.
+	if (q_udp_ready && !q_udp_server)
+	{
+		for (j = 0; j < 3; j++)
+		{
+			take = q_cl.punchangle[j];
+			if (take < 0.0)
+			{
+				if (take < q_punch[j])
+					q_punch[j] = take;
+			}
+			else if (take > 0.0)
+			{
+				if (take > q_punch[j])
+					q_punch[j] = take;
+			}
 		}
 	}
 
@@ -846,6 +899,8 @@ U0 QRenderFrame()
 	F64		 view_angles[3];
 	CQMdl	*vm_mdl;
 	F64		 vm_depth;
+	I64		 skip_ent;
+	I64		 vm_frame;
 
 	QAngleVectors(q_angles, forward, right, up);
 	fov_y = QDrawFovY(q_fov, q_canvas->width, q_canvas->height);
@@ -925,13 +980,30 @@ U0 QRenderFrame()
 		//list is only used when the bytecode failed to load.
 		if (q_game_active)
 		{
-			//Two paths to the same picture: the server's edicts, or the
-			//client's reconstruction of them from the wire. cl_netdraw 1
-			//switches over, which is how a remote client will eventually have
-			//to draw - it has no edicts to read.
-			if (QCvarGet("cl_netdraw") != 0.0)
+			//HOST keeps drawing from edicts so the remote body (spawned by
+			//QSvSpawnRemote) is always visible. GUEST has no copy of the host
+			//player in its edict table - force the wire path, and never skip
+			//edict 1 (both ends use it for "the player").
+			if (q_udp_ready && !q_udp_server)
+			{
+				//svc_setview names our body on the host. Fall back to 0 (draw
+				//everyone) only if the host forgot to send it.
+				skip_ent = q_cl_viewent;
+				//No distance cull on the wire path for MP - DM spawns on e1m1
+				//are often >2000 apart, and that alone hid both players.
+				QNetDrawEntities(q_canvas, q_map, q_view, 10000.0,
+					skip_ent);
+			}
+			else if (QCvarGet("cl_netdraw") != 0.0)
 				QNetDrawEntities(q_canvas, q_map, q_view, QENT_DRAW_DIST,
 					q_player_edict);
+			else if (q_udp_ready && q_udp_server)
+			{
+				//Host MP: world from edicts (FL_CLIENT skipped there); remotes
+				//forced via QSvDrawRemoteClients (player.mdl + slot/wire origin).
+				QGameDrawEntities(q_canvas, q_map, q_view, 10000.0);
+				QSvDrawRemoteClients(q_canvas, q_map, q_view);
+			}
 			else
 				QGameDrawEntities(q_canvas, q_map, q_view, QENT_DRAW_DIST);
 			QGameDrawStatics(q_canvas, q_map);
@@ -948,7 +1020,21 @@ U0 QRenderFrame()
 	//which frame, so switching weapons and firing animate for free.
 	if (q_player_active && !QPlayerDead)
 	{
-		vm_mdl = QBiFindModel(QPlayerWeaponModel);
+		vm_mdl = NULL;
+		vm_frame = QPlayerWeaponFrame;
+
+		//Thin client: weaponmodel on the wire is a precache index, not a
+		//QuakeC string. Prefer that so the viewgun tracks the host.
+		if (q_udp_ready && !q_udp_server && q_cl.weaponmodel > 0 &&
+			q_cl.weaponmodel < q_precache_model_count)
+		{
+			vm_mdl   = q_precache_mdl[q_cl.weaponmodel];
+			vm_frame = q_cl.weaponframe;
+		}
+
+		if (!vm_mdl)
+			vm_mdl = QBiFindModel(QPlayerWeaponModel);
+
 		if (vm_mdl)
 		{
 			//SCREEN-LOCKED, not placed in the world.
@@ -978,7 +1064,7 @@ U0 QRenderFrame()
 			else
 				vm_depth = 1.0;
 
-			QMdlDrawView(q_canvas, vm_mdl, QPlayerWeaponFrame,
+			QMdlDrawView(q_canvas, vm_mdl, vm_frame,
 				QVM_FORWARD + QViewBob * 0.4, QVM_RIGHT, QVM_UP,
 				1.0, QVM_LIGHT, vm_depth);
 		}
@@ -1148,8 +1234,17 @@ Bool QLoadMap(U8 *mapname)
 	//q_origin is replaced by whatever the game logic decided.
 	if (q_game_active)
 	{
-		if (QPlayerSpawn(q_origin, q_angles))
+		if (QPlayerSpawn(q_origin, q_angles, q_setup_name))
 		{
+			//Shirt/trousers from the setup page - remotes see these via colormap.
+			QSvApplyClientColors(q_player_edict, q_setup_top, q_setup_bottom);
+			if (q_sv_clients[0].active && q_sv_clients[0].local)
+			{
+				q_sv_clients[0].top    = q_setup_top & 15;
+				q_sv_clients[0].bottom = q_setup_bottom & 15;
+				QStrCopy(q_sv_clients[0].name, q_setup_name, 32);
+			}
+
 			StrPrint(line, "player: edict %d, health %3.0f\n",
 				q_player_edict, QPlayerHealth);
 			QLog(line);
@@ -1312,7 +1407,16 @@ Bool QChangeLevel(U8 *mapname)
 	q_world_warned = FALSE;
 
 	if (q_game_active)
-		QPlayerSpawn(q_origin, q_angles);
+	{
+		QPlayerSpawn(q_origin, q_angles, q_setup_name);
+		QSvApplyClientColors(q_player_edict, q_setup_top, q_setup_bottom);
+		if (q_sv_clients[0].active && q_sv_clients[0].local)
+		{
+			q_sv_clients[0].top    = q_setup_top & 15;
+			q_sv_clients[0].bottom = q_setup_bottom & 15;
+			QStrCopy(q_sv_clients[0].name, q_setup_name, 32);
+		}
+	}
 
 	//The previous map's origin is meaningless here, and the unstick fallback
 	//would otherwise drag the player back to it.
@@ -1452,6 +1556,51 @@ U0 QGameLoop()
 			goto ql_next_frame;
 		}
 
+		//--- joining: the client must run the network OUTSIDE the game loop ---
+		//
+		//A client that has not joined yet is sitting in the menu, so the
+		//in-game tick never runs - and that is exactly when it needs to be
+		//transmitting its connection request and listening for the reply. The
+		//request is repeated because a datagram can simply be lost and there is
+		//nothing else to retry it.
+		//Keep poking the host while the map loads. Once menu_ingame flips TRUE
+		//the old path stopped sending connect, so last_msg went stale during
+		//QLoadGame and the host's timeout killed the body mid-join.
+		if (q_udp_ready && !q_udp_server &&
+			(!q_menu_ingame || q_change_pending || !q_game_active))
+		{
+			if (tS - q_join_last_try > 1.0)
+			{
+				q_join_last_try = tS;
+
+				if (!QNetUdpPeerResolved)
+					QNetUdpArpProbe;
+
+				QNetClientSendConnect(q_setup_name, q_setup_top, q_setup_bottom);
+			}
+
+			QNetClientFrame;
+		}
+
+		//The server named a level: load it and start playing. This is the point
+		//the client actually joins.
+		if (q_net_join_pending)
+		{
+			q_net_join_pending = FALSE;
+
+			//QGameLoop has no scratch line buffer of its own - `line` belongs
+			//to Quake() - so the message is built in the join buffer's own
+			//scratch rather than borrowing a name that is not in scope here.
+			StrPrint(q_join_line, "net: joining, server level %s\n",
+				q_net_join_map);
+			QLog(q_join_line);
+
+			QStrCopy(q_change_map, q_net_join_map, 64);
+			q_change_pending = TRUE;
+			q_menu_ingame    = TRUE;
+			q_state          = QST_PLAYING;
+		}
+
 		//--- tilde drops the console, as in the original ---
 		if (Bt(kbd.down_bitmap, sc_tilde))
 		{
@@ -1589,9 +1738,11 @@ U0 QGameLoop()
 			//The name editor polls the keyboard itself, so it runs before the
 			//scancode dispatch and swallows the frame when it is active.
 			QSetupInput;
+			QLanInput;
 
 			//Edge trigger, or a held arrow runs the whole list.
-			if (menu_sc && menu_sc != last_menu_sc && !q_setup_editing)
+			if (menu_sc && menu_sc != last_menu_sc && !q_setup_editing &&
+				!q_lan_editing)
 			{
 				if (QMenuKey(menu_sc, &start_game))
 				{
@@ -1827,7 +1978,7 @@ U0 QGameLoop()
 					QNetClientSendMove(q_angles,
 						move[0] * speed, move[1] * speed, move[2] * speed,
 						attack, ToBool(Bt(kbd.down_bitmap, sc_jump)),
-						impulse, q_game_time);
+						impulse, q_game_time, q_origin);
 
 					QNetServerReadClient(q_player_edict, q_game_time);
 				}
@@ -1861,7 +2012,14 @@ U0 QGameLoop()
 					QPrSetFieldI(q_player_edict, q_fld_groundentity,
 						QPrEdictValue(q_ground_entity));
 
-				QGameFrame(QSERVER_STEP);
+				//THIN CLIENT: a joined guest must NOT run the full world think
+				//pass. It already loads the map locally (monsters, items, the
+				//lot) and simulating that ON TOP of parsing the host's entity
+				//storm is what froze the guest while the host's netstat kept
+				//climbing. World picture comes from the wire via QNetClientFrame
+				//+ cl_netdraw; local motion is still predicted below.
+				if (!(q_udp_ready && !q_udp_server))
+					QGameFrame(QSERVER_STEP);
 
 				//A corpse is moved by the entity physics pass, which writes the
 				//EDICT. The engine has to adopt that before anything publishes
@@ -1880,7 +2038,9 @@ U0 QGameLoop()
 
 				QPlayerTouchTriggers(q_origin, q_velocity);
 				QPlayerPostThink(q_origin, q_velocity, q_angles);
-				QViewKickUpdate(QSERVER_STEP);
+				//Local player frame chains - same as remotes in QSvRunClients.
+				if (q_player_edict > 0)
+					QSvRunEntityThink(q_player_edict);
 				QStuckCheck(move, speed);
 
 				//Anything QuakeC printed this tick goes to the console, and
@@ -1911,17 +2071,35 @@ U0 QGameLoop()
 				//while a known-good reference is still there to compare against.
 				if (q_net_active && q_player_edict > 0)
 				{
-					//Remote clients are simulated AFTER their moves have been
-					//read and BEFORE the datagram goes out, so what each of
-					//them is told already includes everyone's movement this
-					//tick rather than lagging it by one.
-					QSvRunClients(QSERVER_STEP, q_game_time);
+					if (q_udp_ready && q_udp_server)
+						QSvRunClients(QSERVER_STEP, q_game_time);
 
-					QNetServerFrame(q_player_edict, q_vis, q_game_time);
+					//Host builds the datagram; guest only drains the wire.
+					if (q_udp_server || !q_udp_ready)
+						QNetServerFrame(q_player_edict, q_game_time);
+
 					QNetClientFrame;
-					q_net_mismatch        = QNetVerify(q_player_edict);
-					q_net_mismatch_report = q_net_mismatch;
+
+					//Guest: HUD / death / viewweapon follow host clientdata.
+					QNetSyncLocalFromClient;
+
+					//svc_print / Host_Say may have arrived this tick - show now.
+					QConDrainProgs;
+
+					if (q_udp_server || !q_udp_ready)
+					{
+						q_net_mismatch        = QNetVerify(q_player_edict);
+						q_net_mismatch_report = q_net_mismatch;
+					}
 				}
+
+				//AFTER the wire: guest hit kick reads q_net_damage_pending from
+				//svc_damage parsed above. Host still gets dmg_* from the edict.
+				QViewKickUpdate(QSERVER_STEP);
+
+				//Keep the OS responsive under catch-up bursts.
+				if (q_udp_ready && !q_udp_server)
+					Yield;
 			}
 			else if (!q_noclip)
 			{

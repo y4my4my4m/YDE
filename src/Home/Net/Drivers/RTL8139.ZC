@@ -93,10 +93,12 @@
 #define RxBadAlign  0x0002
 #define RxStatusOK  0x0001
 
-/* Chip Cmd Bits */
+/* Chip Cmd Bits — match Linux/QEMU (Rx=bit3, Tx=bit2).
+   Swapped names still ORed to 0x0C when enabling both, but any
+   single-bit check against QEMU's CmdRxEnb=0x08 would lie. */
 #define RxBufEmpty 0x01
-#define CmdRxEnb   0x04
-#define CmdTxEnb   0x08
+#define CmdTxEnb   0x04
+#define CmdRxEnb   0x08
 #define CmdReset   0x10
 
 #define RX_FIFO_THRESH  4
@@ -210,15 +212,48 @@ U0 RTL8139InterruptMaskSet()
 }
 
 
+U0 RTL8139TxConfigure()
+{
+	// Tx. Kept separate from the Rx setup because the transfer thresholds want
+	// the command register already enabled, while the receive buffer must be
+	// programmed BEFORE it is.
+	OutU32(RTL8139IOBaseGet + TxConfig, 0x00000600);
+}
+
 U0 RTL8139BufferConfigure()
 {
-	// Rx
-	OutU32(RTL8139IOBaseGet + RxConfig, 0xf | (1 << 7) | (1 << 12) | (7 << 8));
-	// Accept all packets which are not errors or "runts", enable ring buffer wrap.
+	/*	RxConfig must match RX_BUF_LEN. Bit 12 is RxCfgRcv32K; with
+		RX_BUF_IDX==0 the ring is only 8K, so that bit must stay clear.
+		Bit 7 is RxNoWrap (Linux name): packets that would straddle the end
+		are written into the WRAP_PAD instead. Bits 13-15 are the FIFO
+		threshold; bits 8-10 are MXDMA. 0xf accepts broadcast/multicast/
+		phys-match/promiscuous so ARP replies are not filtered out. */
+	OutU32(RTL8139IOBaseGet + RxConfig,
+		   0xf | (1 << 7) | (RX_DMA_BURST << 8) | (RX_FIFO_THRESH << 13));
 	OutU32(RTL8139IOBaseGet + RxBuf, rtl8139.rx_buffer_addr_phys);
 
-	// Tx
-	OutU32(RTL8139IOBaseGet + TxConfig, 0x00000600);
+	/*	THE RING READ OFFSET MUST BE INITIALISED.
+
+		rtl8139 is a global, and the compiler does NOT zero globals - they come
+		up holding whatever was on the task heap. current_rx was never assigned
+		anywhere except while advancing past a packet, so the driver began
+		reading the receive ring at a garbage offset while the card began
+		writing at 0. The status word at that offset never has RxStatusOK set,
+		so every read looked like "nothing has arrived" and not one packet was
+		ever delivered - transmit worked fine, which is why the card looked
+		half-alive.
+
+		CAPR (RxBufPtr) is a 16-bit register at 0x38. It must be written with
+		OutU16 - OutU32 also hits CBR at 0x3A and desynchronises the card's
+		write pointer from the ring. Convention is read_pointer - 16, so
+		0 - 16 == 0xFFF0 means "host has consumed nothing". */
+	rtl8139.current_rx = 0;
+	OutU16(RTL8139IOBaseGet + RxBufPtr, rtl8139.current_rx - 16);
+
+	/*	Same reasoning for the transmit index. It is masked into range when it is
+		INCREMENTED, but the first transmit uses it as it stands - so a garbage
+		starting value indexes past the descriptor array on the very first send. */
+	rtl8139.current_tx_de_index = 0;
 }
 
 I64 RTL8139DriverOwns(I64 de_index)
@@ -305,7 +340,7 @@ I64 OneRTL8139PacketReceive(U8 **packet_buffer_out, U16 *packet_length_out)
 		NetErr("Bad Packet, rx_status: %X", rx_status);
 		rtl8139.current_rx = 0;
 		rtl8139.current_rx = (rtl8139.current_rx + rx_size + 4 + 3) & ~3;
-		OutU32(RTL8139IOBaseGet + RxBufPtr, rtl8139.current_rx - 16);
+		OutU16(RTL8139IOBaseGet + RxBufPtr, rtl8139.current_rx - 16);
 		return 0;
 	}
 
@@ -330,23 +365,84 @@ I64 OneRTL8139PacketReceive(U8 **packet_buffer_out, U16 *packet_length_out)
 	}
 
 	rtl8139.current_rx = (rtl8139.current_rx + rx_size + 4 + 3) & ~3;
-	OutU32(RTL8139IOBaseGet + RxBufPtr, rtl8139.current_rx - 16);
+	OutU16(RTL8139IOBaseGet + RxBufPtr, rtl8139.current_rx - 16);
 	return 1;
 }
 
 I64 TwoRTL8139PacketReceive(U8 **packet_buffer_out, U16 *packet_length_out)
 {
-	U32 rx_status;
-	U16 rx_size;
+	U32  rx_status;
+	U16  rx_size;
+	U32 *ring_header;
 
- 	if (rtl8139.current_rx > RX_BUF_LEN)
+ 	if (rtl8139.current_rx >= RX_BUF_LEN)
 	{
 		rtl8139.current_rx = rtl8139.current_rx % RX_BUF_LEN;
 	}
 
-	// rx_status is the dereferenced pointer to the RX buffer start adress and the current ring read offset
-	rx_status = *(rtl8139.rx_buffer_addr_phys + rtl8139.current_rx);
-	rx_size = rx_status >> 16;
+	/*	THE HEADER MUST BE READ UNCACHED, AND AS A U32.
+
+		Two things were wrong here and both produced a garbage length.
+
+		First, the status/length word was read through the plain buffer address
+		while the payload below is handed to the caller with dev.uncached_alias
+		added. The card DMAs this word; reading it through the cached mapping
+		returns whatever the CPU cached earlier, not what just arrived.
+
+		Second, rx_buffer_addr_phys is declared U32, so `*(addr + offset)` is a
+		dereference with no type attached to it - unlike the LAPIC write further
+		down, which spells out (U32*). Reading fewer than 32 bits leaves
+		`rx_status >> 16` with nothing meaningful in it.
+
+		A typed pointer through the uncached alias settles both, without relying
+		on how a postfix cast is treated. */
+	ring_header = rtl8139.rx_buffer_addr_phys + dev.uncached_alias +
+				  rtl8139.current_rx;
+
+	rx_status = *ring_header;
+	rx_size   = rx_status >> 16;
+
+	/*	Reject anything impossible, as OneRTL8139PacketReceive does. An
+		unvalidated rx_size of 0 underflows `rx_size - 4` to 65532 and the
+		caller then copies 65532 bytes out of the ring, which is how merely
+		receiving traffic could take the machine down. */
+	/*	NOT READY YET - and this must NOT touch the read pointer.
+
+		A slot the card has not finished writing reads back with RxStatusOK
+		clear, typically all zeroes. The only correct response is to stop
+		reading and let the next interrupt come back to the same offset.
+
+		Resetting current_rx here, which is what this did first, is actively
+		harmful: it points the host read pointer at the start of the ring while
+		the card keeps writing where it was, so every subsequent read lands on
+		an empty slot and the driver drops frames forever. That is exactly the
+		"one VM is always in the dropping state" behaviour - whichever card
+		desynchronised first never recovers. */
+	if (!(rx_status & RxStatusOK))
+		return 0;
+
+	/*	Genuinely damaged frame. rx_size is trustworthy enough to step over it,
+		because the card set RxStatusOK's companion length field. */
+	if ((rx_status & (RxBadSymbol | RxRunt | RxTooLong | RxCRCErr |
+					  RxBadAlign)) ||
+		rx_size < ETH_ZLEN || rx_size > ETHERNET_FRAME_SIZE + 4)
+	{
+		NetErr("RTL8139 RX: bad frame, rx_status %X size %d",
+			   rx_status, rx_size);
+
+		rtl8139.current_rx = (rtl8139.current_rx + rx_size + 4 + 3) & ~3;
+		OutU16(RTL8139IOBaseGet + RxBufPtr, rtl8139.current_rx - 16);
+		return 0;
+	}
+
+	/*	NO WRAP HANDLING IS NEEDED HERE, and adding some would be a bug.
+
+		RxConfig bit 7 (RxNoWrap) makes a frame that would straddle the end of
+		the ring write CONTIGUOUSLY into the pad past RX_BUF_LEN - which is why
+		the buffer is allocated as RX_BUF_LEN + RX_BUF_PAD + RX_BUF_WRAP_PAD.
+		Reading straight through is correct; rejecting those frames would
+		silently drop every packet that happened to land near the end of the
+		ring. */
 
 	/* First two bytes are the receive status
 	   and next two bytes are frame length
@@ -355,14 +451,49 @@ I64 TwoRTL8139PacketReceive(U8 **packet_buffer_out, U16 *packet_length_out)
 	*packet_buffer_out = rtl8139.rx_buffer_addr_phys + rtl8139.current_rx + 4;
 
 	rtl8139.current_rx = (rtl8139.current_rx + rx_size + 4 + 3) & ~3;
-	OutU32(RTL8139IOBaseGet + RxBufPtr, rtl8139.current_rx - 16);
+	/* CAPR is 16-bit - see BufferConfigure. */
+	OutU16(RTL8139IOBaseGet + RxBufPtr, rtl8139.current_rx - 16);
 	return 1;
+}
+
+U0 RTL8139RxDrain()
+{/*	Pull every ready frame out of the ring into NetQueue.
+
+	Shared by the IRQ path and the poll task. PCIInterruptsReroute only
+	rewires IOAPIC entries 0-3; on QEMU q35 the rtl8139 lands on a higher
+	GSI, so RxOK IRQs often never arrive. Polling still sees ChipCmd's
+	RxBufEmpty clear once QEMU has DMA'd into RBSTART.
+
+	CLI only around the ring read - NEVER across NetQueuePush. Push does
+	CAlloc + DocPrint-via-NetLog + MPInt; holding interrupts off through
+	that under a packet flood (host still sending after guest reboot) is
+	exactly how we got the "Receiving Packet" spam then a GP. */
+	U8  *packet_buffer;
+	U16  packet_length;
+	Bool got;
+
+	while (TRUE)
+	{
+		PUSHFD
+		CLI
+		if (InU8(RTL8139IOBaseGet + ChipCmd) & RxBufEmpty)
+		{
+			POPFD
+			break;
+		}
+		got = ToBool(TwoRTL8139PacketReceive(&packet_buffer, &packet_length));
+		POPFD
+
+		if (!got)
+			break;
+
+		NetQueuePush(packet_buffer + dev.uncached_alias, packet_length);
+	}
 }
 
 interrupt U0 RTL8139IRQ()
 {
-	U8 *packet_buffer;
-	U16 packet_length, isr;
+	U16 isr;
 
 	isr = InU16(RTL8139IOBaseGet + IntrStatus);
 
@@ -370,25 +501,23 @@ interrupt U0 RTL8139IRQ()
 	   reading ISR is not enough to clear it, need to write */
 	OutU16(RTL8139IOBaseGet + IntrStatus, 0xFFFF);
 
-	if (isr & TxOK)
-	{
-		NetLog("Sent Packet, DE: %X", rtl8139.current_tx_de_index);
-	}
+	/* No NetLog here. Host deathmatch traffic is hundreds of frames/sec;
+	   logging each one from the IRQ DocPrint's the system into a GP. */
 	if (isr & RxOK)
-	{
-		NetLog("Receiving Packet");
-		while((InU8(RTL8139IOBaseGet + ChipCmd) & RxBufEmpty) == 0)
-		{
-			if (TwoRTL8139PacketReceive(&packet_buffer, &packet_length))
-			{
-				NetLog("RTL8139 IRQ: Pushing copy into Net Queue");
-				// uncached read
-				NetQueuePush(packet_buffer + dev.uncached_alias, packet_length);						
-			}
-		}
-	}
+		RTL8139RxDrain;
 
 	*(dev.uncached_alias + LAPIC_EOI)(U32*) = 0;
+}
+
+U0 RTL8139PollTask()
+{/*	Backup RX path when PCI IRQs never reach us (q35 + IOAPIC 0-3 hack). */
+	while (TRUE)
+	{
+		if (rtl8139.pci &&
+			!(InU8(RTL8139IOBaseGet + ChipCmd) & RxBufEmpty))
+			RTL8139RxDrain;
+		Sleep(10);
+	}
 }
 
 U0 PCIInterruptsReroute(I64 base)
@@ -438,12 +567,26 @@ U0 RTL8139Init()
 	RTL8139Start;
 	RTL8139MACGet;
 	RTL8139BuffersAllocate;
-	// Enables RX and TX in cmd register,
-	// must do so before setting transfer thresholds
+
+	/*	THE RECEIVE BUFFER MUST BE PROGRAMMED BEFORE RECEIVE IS ENABLED.
+
+		This used to set CmdRxEnb first and only then write RBSTART. The 8139
+		latches the receive buffer address when receive is turned on, so the
+		card spent its life DMAing incoming frames to whatever RBSTART held
+		after reset - address zero - and never wrote a byte into the buffer this
+		driver polls. Every read found an empty ring slot, which is why receive
+		has never worked while transmit always has: a transmit carries its own
+		address in a TSAD register per packet and never depended on this.
+
+		Transmit thresholds still go after the enable, which is what the old
+		comment here was protecting - hence the split into RTL8139TxConfigure. */
+	RTL8139BufferConfigure;
+
+	// Enables RX and TX in cmd register
 	OutU8(RTL8139IOBaseGet + ChipCmd, CmdRxEnb + CmdTxEnb);
 	OutU32(RTL8139IOBaseGet + RxMissed, 0);
 
-	RTL8139BufferConfigure;
+	RTL8139TxConfigure;
 	
 	RTL8139EnableFullDuplex;
 
@@ -452,6 +595,11 @@ U0 RTL8139Init()
 
 	RTL8139InterruptMaskSet;
 	RTL8139InterruptsSetup;
+
+	/* Poll covers the common QEMU-q35 case where our IOAPIC remapping
+	   never catches the card's real GSI. Harmless duplicate drain if IRQs
+	   do fire - RxBufEmpty stops the loop. */
+	Spawn(&RTL8139PollTask,, "RTL8139Poll");
 }
 
 I64 EthernetFrameAllocate(U8 **packet_buffer_out,

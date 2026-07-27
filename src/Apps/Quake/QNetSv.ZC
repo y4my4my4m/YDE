@@ -67,6 +67,11 @@ CQMsg			q_net_datagram;		//the server's outgoing message
 CQMsg			q_net_recv;			//the client's receive buffer
 CQMsg			q_net_recv_c2s;		//the server's receive buffer
 U8				q_net_cmd_line[128];
+
+//Set by the client when the server has told it which level to load. The app
+//shell acts on it, since it owns map loading.
+Bool	q_net_join_pending = FALSE;
+U8		q_net_join_map[64];
 CQMsg			q_net_udp_in;		//datagram staging before it joins the queue
 
 //Upstream counters and the last move the server read. Declared here rather than
@@ -76,6 +81,7 @@ U8		q_cl_name[24];
 I64		q_cl_cdtrack	= 0;	//track the server asked for, 0 = none
 I64		q_cl_top	= 0;
 I64		q_cl_bottom	= 0;
+I64		q_cl_viewent	= 0;	//edict to hide in first person (svc_setview)
 
 I64		q_net_moves_sent = 0;
 I64		q_net_moves_read = 0;
@@ -94,6 +100,43 @@ I64		q_net_damage_take	 = 0;
 F64		q_net_damage_from[3];
 I64				q_net_dropped = 0;	//datagrams the link refused
 I64				q_net_parsed  = 0;	//messages the client consumed
+
+//Server client slots must be declared BEFORE QNetServerFrame, which gates UDP
+//entity floods on seen_move. HolyC has no forward refs for these.
+#define QSV_MAX_CLIENTS		4
+#define QSV_TIMEOUT			10.0	//silence AFTER first clc_move
+#define QSV_CONNECT_GRACE	90.0	//map load: connect done, moves not yet
+
+class CQSvClient
+{
+	I64		edict;
+	U32		ip;			//0 for the local client
+	Bool	active;
+	Bool	local;
+	Bool	seen_move;	//FALSE until first clc_move - do not use move-timeout yet
+
+	//Setup-page shirt/trousers (0-13). Packed into .colormap for the wire.
+	I64		top;
+	I64		bottom;
+	U8		name[32];	//Host_Say / scoreboard; set at connect/spawn
+
+	//The last move read for this client, held until its tick runs.
+	F64		angles[3];
+	F64		cmd[3];		//forward, side, up
+	Bool	attack;
+	Bool	jump;
+	I64		impulse;
+	F64		last_msg;
+
+	//The engine's own copy of where this client is, the same pair the local
+	//player keeps in the app shell.
+	F64		origin[3];
+	F64		velocity[3];
+	Bool	on_ground;
+};
+
+CQSvClient	q_sv_clients[QSV_MAX_CLIENTS];
+I64			q_sv_client_count = 0;
 
 U0 QNetClientClear()
 {//Globals are not zeroed, so every field is set explicitly.
@@ -129,6 +172,8 @@ U0 QNetClientClear()
 	q_cl_top     = 0;
 	q_cl_bottom  = 0;
 	q_cl_cdtrack = 0;
+	//Keep q_cl_viewent: join path parses SETVIEW before QLoadMap, and
+	//QLoadMap calls this clear. Wiping it made the guest draw its own body.
 
 	q_net_dropped = 0;
 	q_net_parsed  = 0;
@@ -178,13 +223,22 @@ Bool QNetEntityVisible(I64 ent)
  //The second test is not redundant: removing a model sets the string without
  //clearing the index.
 	U8 *name;
+	I64 idx;
 
-	if (ToI64(QPrFieldF(ent, q_fld_modelindex)) == 0)
+	idx = ToI64(QPrFieldF(ent, q_fld_modelindex));
+	if (idx == 0)
 		return FALSE;
 
 	name = QPrStr(QPrFieldI(ent, q_fld_model));
 	if (!name || !name[0])
+	{
+		//Remote clients sometimes keep a valid index after PutClientInServer
+		//while .model is still 0 - that alone used to drop them from every
+		//datagram, so the host's loopback never described the guest.
+		if (ToI64(QPrFieldF(ent, q_fld_flags)) & QFL_CLIENT)
+			return TRUE;
 		return FALSE;
+	}
 
 	return TRUE;
 }
@@ -409,76 +463,108 @@ U0 QNetWriteClientdata(CQMsg *m, I64 ent)
 
 //--- the entity sweep ------------------------------------------------------
 
-U0 QNetWriteEntities(CQMsg *m, I64 client_ent, CQVisState *vis)
-{//SV_WriteEntitiesToClient.
- //
- //DEVIATION, and a knowing one: the original culls with SV_FatPVS - the union
- //of the PVS rows for every leaf within 8 units of the eye - and tests it
- //against the leaf list SV_LinkEdict recorded for each entity. Neither the fat
- //row nor the per-entity leaf list exists here, so visibility is decided by the
- //single leaf the entity's origin falls in, against the row the renderer has
- //already decompressed. That is stricter than the original: a large entity
- //whose origin sits in an unseen leaf while part of its body is visible will
- //pop. The client entity itself is ALWAYS sent, exactly as in the original,
- //because the player must never vanish from their own view.
+Bool QNetWriteOneEntity(CQMsg *m, I64 i, I64 client_ent, CQVisState *vis)
+{//TRUE if written (or skipped as not visible). FALSE if the datagram is full.
 	CQEntState	 now;
 	F64			 eorg[3];
 	I64			 leaf;
-	I64			 i;
 	I64			 j;
+	I64			 flags;
 
+	if (q_pr_edict_free[i])
+		return TRUE;
+
+	if (i != client_ent)
+	{
+		if (!QNetEntityVisible(i))
+			return TRUE;
+
+		//Never PVS-cull clients. A player just outside the leaf set used to
+		//vanish from the listen-server's own loopback datagram AND from any
+		//peer whose eyes were in a different cluster - the guest saw the host
+		//(no PVS on the remote datagram) but the host never saw the guest.
+		flags = ToI64(QPrFieldF(i, q_fld_flags));
+		if (!(flags & QFL_CLIENT) && vis && vis->pvs)
+		{
+			for (j = 0; j < 3; j++)
+				eorg[j] = QPrFieldF(i, q_fld_origin + j);
+
+			leaf = QVisLeafForPoint(vis->map, eorg);
+
+			if (leaf > 0)
+			{
+				leaf--;
+				if (!(vis->pvs[leaf >> 3] & (1 << (leaf & 7))))
+					return TRUE;
+			}
+		}
+	}
+
+	//Cap to one Ethernet frame - see QNET_MAX_DATAGRAM.
+	if (QNET_MAX_DATAGRAM - m->len < 16)
+		return FALSE;
+
+	QNetCaptureState(i, &now);
+	QNetWriteEntityUpdate(m, i, &now, &q_net_baseline[i]);
+
+	MemCopy(&q_net_sent[i], &now, sizeof(CQEntState));
+
+	if (i >= q_net_num_ents)
+		q_net_num_ents = i + 1;
+
+	return TRUE;
+}
+
+U0 QNetWriteEntities(CQMsg *m, I64 client_ent, CQVisState *vis)
+{//SV_WriteEntitiesToClient.
+ //
+ //Players first so a full datagram still carries every body. Fat world updates
+ //used to fill the buffer before the remote client's high edict number, so
+ //neither end ever saw the other player on the wire.
+	I64 i;
+	I64 flags;
+
+	//Pass 1: every live client body (and the view client).
 	for (i = 1; i < q_pr_num_edicts && i < QNET_MAX_ENTS; i++)
 	{
 		if (q_pr_edict_free[i])
-			goto qne_next;
+			goto qne_p1;
 
-		if (i != client_ent)
-		{
-			if (!QNetEntityVisible(i))
-				goto qne_next;
+		flags = ToI64(QPrFieldF(i, q_fld_flags));
+		if (i != client_ent && !(flags & QFL_CLIENT))
+			goto qne_p1;
 
-			if (vis && vis->pvs)
-			{
-				for (j = 0; j < 3; j++)
-					eorg[j] = QPrFieldF(i, q_fld_origin + j);
-
-				leaf = QVisLeafForPoint(vis->map, eorg);
-
-				//Leaf 0 is the shared solid leaf and has no PVS row. An entity
-				//there is inside the world - send it rather than lose it.
-				//
-				//Rows are indexed from leaf 1, so the bit for leaf N is N-1.
-				if (leaf > 0)
-				{
-					leaf--;
-					if (!(vis->pvs[leaf >> 3] & (1 << (leaf & 7))))
-						goto qne_next;
-				}
-			}
-		}
-
-		//Bail before the message can be half-written. 16 bytes is the original's
-		//own headroom check and covers the largest possible update.
-		if (QNET_MAX_MSG - m->len < 16)
+		if (!QNetWriteOneEntity(m, i, client_ent, vis))
 		{
 			QLog("net: packet overflow, entities dropped\n");
 			return;
 		}
 
-		QNetCaptureState(i, &now);
-		QNetWriteEntityUpdate(m, i, &now, &q_net_baseline[i]);
+qne_p1:
+	}
 
-		MemCopy(&q_net_sent[i], &now, sizeof(CQEntState));
+	//Pass 2: everything else.
+	for (i = 1; i < q_pr_num_edicts && i < QNET_MAX_ENTS; i++)
+	{
+		if (q_pr_edict_free[i])
+			goto qne_p2;
 
-		if (i >= q_net_num_ents)
-			q_net_num_ents = i + 1;
+		flags = ToI64(QPrFieldF(i, q_fld_flags));
+		if (i == client_ent || (flags & QFL_CLIENT))
+			goto qne_p2;
 
-qne_next:
+		if (!QNetWriteOneEntity(m, i, client_ent, vis))
+		{
+			QLog("net: packet overflow, entities dropped\n");
+			return;
+		}
+
+qne_p2:
 	}
 }
 
-Bool QNetServerFrame(I64 client_ent, CQVisState *vis, F64 time)
-{//SV_SendClientDatagram: one datagram per client per frame.
+Bool QNetBuildClientDatagram(I64 client_ent, CQVisState *vis, F64 time)
+{//Fill q_net_datagram for ONE client's eyes. Caller sends it.
 	QMsgClear(&q_net_datagram);
 
 	//svc_time comes FIRST and is what advances the client's clock. Everything
@@ -498,20 +584,91 @@ Bool QNetServerFrame(I64 client_ent, CQVisState *vis, F64 time)
 		return FALSE;
 	}
 
-	//The LOCAL client always gets it over the loopback link - a listen server
-	//has a player sitting on the same machine, and that path must not depend on
-	//a network being up. A remote client gets the same bytes as a datagram.
-	//Both, when hosting for someone else.
-	if (!QNetSendToClient(&q_net_datagram))
+	return TRUE;
+}
+
+Bool QNetServerFrame(I64 client_ent, F64 time)
+{//SV_SendClientMessages: one datagram PER client. Building a single packet for
+ //the local player and copying it to UDP was the invisibility bug - the host
+ //body is skipped as client_ent, so the guest never received it.
+ //
+ //PVS arg dropped: MP builds every datagram with NULL vis so remotes are never
+ //culled from the host eye (see QNetBuildClientDatagram calls below).
+	I64		i;
+	I64		ent;
+	Bool	ok;
+
+	ok = TRUE;
+
+	//Local (or solo) client - loopback. No PVS: a listen host must see every
+	//remote body in its own client tables, and PVS was dropping the guest from
+	//the only datagram the host ever parses.
+	if (!QNetBuildClientDatagram(client_ent, NULL, time))
+		ok = FALSE;
+	else if (!QNetSendToClient(&q_net_datagram))
 	{
 		q_net_dropped++;
-		return FALSE;
+		ok = FALSE;
 	}
 
-	if (q_udp_ready && q_udp_peer_ip)
-		QNetUdpSend(&q_net_datagram);
+	//Each remote gets a datagram built for THEIR edict so they receive the host
+	//body and their own clientdata. No PVS for remotes yet.
+	if (q_udp_ready && q_udp_server)
+	{
+		for (i = 0; i < QSV_MAX_CLIENTS; i++)
+		{
+			if (!q_sv_clients[i].active || q_sv_clients[i].local)
+				goto qsf_next;
 
-	return TRUE;
+			ent = q_sv_clients[i].edict;
+			if (ent <= 0)
+				goto qsf_next;
+
+			//Do not blast until the peer has finished loading and sent a move.
+			//Flooding their UDP queue during QChangeLevel was the hard freeze.
+			if (!q_sv_clients[i].seen_move)
+				goto qsf_next;
+
+			if (!QNetBuildClientDatagram(ent, NULL, time))
+			{
+				ok = FALSE;
+				goto qsf_next;
+			}
+
+			if (!QNetUdpSendTo(&q_net_datagram, q_sv_clients[i].ip))
+				ok = FALSE;
+
+qsf_next:
+		}
+	}
+
+	return ok;
+}
+
+U0 QNetPrintStrip(U8 *dst, U8 *src, I64 max)
+{//Con_Printf colour prefixes (1/2) are not glyphs - drop leading set byte.
+	I64 i;
+	I64 j;
+
+	if (!dst || max < 2)
+		return;
+
+	dst[0] = 0;
+	if (!src)
+		return;
+
+	i = 0;
+	if (src[0] == 1 || src[0] == 2)
+		i = 1;
+
+	j = 0;
+	while (src[i] && j < max - 1)
+	{
+		dst[j] = src[i];
+		j++;
+		i++;
+	}
+	dst[j] = 0;
 }
 
 //--- the client's parse ----------------------------------------------------
@@ -608,6 +765,7 @@ Bool QNetClientParse(CQMsg *m)
  //many bytes an unknown command occupies, so continuing would misread
  //everything after it - the original calls Host_Error here for the same reason.
 	U8	line[128];
+	U8	shown[128];
 	I64	cmd;
 	I64	i;
 
@@ -639,6 +797,13 @@ Bool QNetClientParse(CQMsg *m)
 			case QSVC_NOP:
 				break;
 
+			case QSVC_PRINT:
+				//CL_ParseServerMessage: Con_Printf("%s", MSG_ReadString()).
+				QMsgReadString(m, line, 128);
+				QNetPrintStrip(shown, line, 128);
+				QBiPrintAppend(shown);
+				break;
+
 			case QSVC_TIME:
 				//svc_time comes before the updates it describes, so stamping
 				//from here is what lets those updates carry the right time.
@@ -652,6 +817,25 @@ Bool QNetClientParse(CQMsg *m)
 
 			case QSVC_SPAWNBASELINE:
 				QNetParseBaseline(m);
+				break;
+
+			case QSVC_SERVERINFO:
+				QMsgReadLong(m);			//protocol
+				QMsgReadByte(m);			//maxclients
+				QMsgReadByte(m);			//gametype
+				QMsgReadString(m, q_net_join_map, 64);
+
+				//The shell loads it; this is only the parse.
+				if (q_net_join_map[0])
+					q_net_join_pending = TRUE;
+				break;
+
+			case QSVC_SETVIEW:
+				q_cl_viewent = QMsgReadShort(m);
+				break;
+
+			case QSVC_SIGNONNUM:
+				QMsgReadByte(m);
 				break;
 
 			case QSVC_CDTRACK:
@@ -726,6 +910,306 @@ U0 QSvCallPlayerFunc(I64 ent, U8 *name)
 	q_pr_error = FALSE;
 }
 
+U0 QSvClientPrintf(I64 slot, U8 *s)
+{//SV_ClientPrintf: svc_print to one client (host.c).
+ //
+ //Local client has no separate reliable stream - park in the QuakeC print
+ //buffer so QConDrainProgs shows it. Remotes get a dedicated datagram.
+	U8	shown[128];
+	CQMsg	*m;
+
+	if (slot < 0 || slot >= QSV_MAX_CLIENTS || !q_sv_clients[slot].active)
+		return;
+	if (!s || !s[0])
+		return;
+
+	if (q_sv_clients[slot].local)
+	{
+		QNetPrintStrip(shown, s, 128);
+		QBiPrintAppend(shown);
+		return;
+	}
+
+	if (!q_udp_ready || !q_sv_clients[slot].ip)
+		return;
+
+	m = &q_net_send;
+	QMsgClear(m);
+	QMsgWriteByte(m, QSVC_PRINT);
+	QMsgWriteString(m, s);
+	QNetUdpSendTo(m, q_sv_clients[slot].ip);
+}
+
+U0 QSvBroadcastPrintf(U8 *s)
+{//SV_BroadcastPrintf - every active client.
+	I64 i;
+
+	if (!s || !s[0])
+		return;
+
+	for (i = 0; i < QSV_MAX_CLIENTS; i++)
+		if (q_sv_clients[i].active)
+			QSvClientPrintf(i, s);
+}
+
+I64 QSvFindLocalSlot()
+{
+	I64 i;
+
+	for (i = 0; i < QSV_MAX_CLIENTS; i++)
+		if (q_sv_clients[i].active && q_sv_clients[i].local)
+			return i;
+
+	return -1;
+}
+
+U0 QHostSay(I64 from_slot, U8 *msg, Bool teamonly)
+{//Host_Say from host_cmd.c. Formats "\1name: text\n" and SV_ClientPrintf
+ //each spawned client. teamonly honours teamplay like the original.
+	U8	 text[64];
+	U8	 body[64];
+	U8	*p;
+	U8	*nm;
+	I64	 i;
+	I64	 j;
+	I64	 room;
+	I64	 from_team;
+	I64	 to_team;
+	I64	 n;
+
+	if (from_slot < 0 || from_slot >= QSV_MAX_CLIENTS ||
+		!q_sv_clients[from_slot].active)
+		return;
+	if (!msg)
+		return;
+
+	//Cmd_Args may be quote-wrapped.
+	p = msg;
+	while (*p == ' ')
+		p++;
+	if (*p == '"')
+	{
+		p++;
+		n = StrLen(p);
+		if (n > 0 && p[n - 1] == '"')
+		{
+			MemCopy(body, p, n - 1);
+			body[n - 1] = 0;
+			p = body;
+		}
+	}
+	if (!p[0])
+		return;
+
+	nm = q_sv_clients[from_slot].name;
+	if (!nm[0])
+		nm = "player";
+
+	//Colour set 1, then "name: ".
+	text[0] = 1;
+	StrPrint(text + 1, "%s: ", nm);
+
+	j = StrLen(text);
+	room = 62 - j;
+	if (room < 1)
+		return;
+
+	n = StrLen(p);
+	if (n > room)
+		n = room;
+
+	MemCopy(text + j, p, n);
+	j += n;
+	text[j] = '\n';
+	j++;
+	text[j] = 0;
+
+	from_team = 0;
+	if (q_fld_team >= 0 && q_sv_clients[from_slot].edict > 0)
+		from_team = ToI64(QPrFieldF(q_sv_clients[from_slot].edict, q_fld_team));
+
+	for (i = 0; i < QSV_MAX_CLIENTS; i++)
+	{
+		if (!q_sv_clients[i].active || q_sv_clients[i].edict <= 0)
+			goto qhs_next;
+
+		if (teamonly && QCvarGet("teamplay") != 0.0)
+		{
+			to_team = 0;
+			if (q_fld_team >= 0)
+				to_team = ToI64(QPrFieldF(q_sv_clients[i].edict, q_fld_team));
+			if (to_team != from_team)
+				goto qhs_next;
+		}
+
+		QSvClientPrintf(i, text);
+
+qhs_next:
+	}
+
+	//Sys_Printf - server log without the colour byte.
+	QNetPrintStrip(body, text, 64);
+	QLog(body);
+}
+
+U0 QHostTell(I64 from_slot, U8 *line)
+{//Host_Tell_f: whisper to one client by name. "tell name message..."
+	U8	 text[64];
+	U8	 target[32];
+	U8	*p;
+	U8	*nm;
+	I64	 i;
+	I64	 j;
+	I64	 n;
+	I64	 room;
+	I64	 dest;
+
+	if (from_slot < 0 || from_slot >= QSV_MAX_CLIENTS ||
+		!q_sv_clients[from_slot].active)
+		return;
+	if (!line)
+		return;
+
+	while (*line == ' ')
+		line++;
+
+	j = 0;
+	while (line[0] && line[0] != ' ' && j < 31)
+	{
+		target[j] = line[0];
+		j++;
+		line++;
+	}
+	target[j] = 0;
+
+	while (*line == ' ')
+		line++;
+	if (!target[0] || !line[0])
+		return;
+
+	dest = -1;
+	for (i = 0; i < QSV_MAX_CLIENTS; i++)
+	{
+		if (!q_sv_clients[i].active)
+			goto qht_next;
+		if (!StrICompare(q_sv_clients[i].name, target))
+		{
+			dest = i;
+			break;
+		}
+qht_next:
+	}
+
+	if (dest < 0)
+		return;
+
+	nm = q_sv_clients[from_slot].name;
+	if (!nm[0])
+		nm = "player";
+
+	StrPrint(text, "%s: ", nm);
+	j = StrLen(text);
+	room = 62 - j;
+	p = line;
+	if (*p == '"')
+	{
+		p++;
+		n = StrLen(p);
+		if (n > 0 && p[n - 1] == '"')
+			n--;
+	}
+	else
+		n = StrLen(p);
+
+	if (n > room)
+		n = room;
+	MemCopy(text + j, p, n);
+	j += n;
+	text[j] = '\n';
+	j++;
+	text[j] = 0;
+
+	QSvClientPrintf(dest, text);
+	QSvClientPrintf(from_slot, text);
+}
+
+U0 QNetClientSendStringCmd(U8 *s)
+{//Cmd_ForwardToServer: whole command line as clc_stringcmd.
+	if (!q_net_active || !s || !s[0])
+		return;
+
+	QMsgClear(&q_net_cmd);
+	QMsgWriteByte(&q_net_cmd, QCLC_STRINGCMD);
+	QMsgWriteString(&q_net_cmd, s);
+
+	//Joined guest: UDP only (thin client has no useful loopback server).
+	if (q_udp_ready && !q_udp_server)
+	{
+		QNetUdpSend(&q_net_cmd);
+		return;
+	}
+
+	//Listen host / solo: loopback, same path as clc_move.
+	QNetSendToServer(&q_net_cmd);
+}
+
+U0 QSvRunEntityThink(I64 ent)
+{//SV_Physics_Client's think half: player_shot / player_run frame chains.
+ //Must run AFTER PlayerPostThink, or the shot pose never advances.
+	I64 think;
+	F64 nextthink;
+
+	if (ent <= 0 || q_pr_edict_free[ent])
+		return;
+
+	nextthink = QPrFieldF(ent, q_fld_nextthink);
+	if (nextthink <= 0.0 || nextthink > q_game_time)
+		return;
+
+	QPrSetFieldF(ent, q_fld_nextthink, 0.0);
+	think = QPrFieldI(ent, q_fld_think);
+	if (think > 0 && think < q_pr_num_functions)
+	{
+		QPrSetI(q_ofs_self, QPrEdictValue(ent));
+		QPrSetI(q_ofs_other, 0);
+		QPrExecute(think);
+		q_pr_error = FALSE;
+		q_game_thinks++;
+	}
+}
+
+U0 QNetSyncLocalFromClient()
+{//Thin-client HUD/death/viewweapon: svc_clientdata is truth. Local edict stays
+ //at spawn health otherwise, so the guest never saw damage or died.
+	if (!q_player_active || q_player_edict <= 0)
+		return;
+	if (!(q_udp_ready && !q_udp_server))
+		return;
+
+	if (q_fld_health >= 0)
+		QPrSetFieldF(q_player_edict, q_fld_health, ToF64(q_cl.health));
+	if (q_fld_armorvalue >= 0)
+		QPrSetFieldF(q_player_edict, q_fld_armorvalue, ToF64(q_cl.armorvalue));
+	if (q_fld_currentammo >= 0)
+		QPrSetFieldF(q_player_edict, q_fld_currentammo, ToF64(q_cl.currentammo));
+	if (q_fld_ammo_shells >= 0)
+		QPrSetFieldF(q_player_edict, q_fld_ammo_shells, ToF64(q_cl.ammo_shells));
+	if (q_fld_ammo_nails >= 0)
+		QPrSetFieldF(q_player_edict, q_fld_ammo_nails, ToF64(q_cl.ammo_nails));
+	if (q_fld_ammo_rockets >= 0)
+		QPrSetFieldF(q_player_edict, q_fld_ammo_rockets, ToF64(q_cl.ammo_rockets));
+	if (q_fld_ammo_cells >= 0)
+		QPrSetFieldF(q_player_edict, q_fld_ammo_cells, ToF64(q_cl.ammo_cells));
+	if (q_fld_weapon >= 0)
+		QPrSetFieldF(q_player_edict, q_fld_weapon, ToF64(q_cl.weapon));
+	if (q_fld_weaponframe >= 0)
+		QPrSetFieldF(q_player_edict, q_fld_weaponframe, ToF64(q_cl.weaponframe));
+	if (q_fld_items >= 0)
+		QPrSetFieldF(q_player_edict, q_fld_items, ToF64(q_cl.items));
+	if (q_fld_view_ofs >= 0)
+		QPrSetFieldF(q_player_edict, q_fld_view_ofs + 2, q_cl.view_height);
+}
+
 //--- server client slots ---------------------------------------------------
 //
 // A listen server has one LOCAL client - the person at the keyboard, whose
@@ -734,34 +1218,7 @@ U0 QSvCallPlayerFunc(I64 ent, U8 *name)
 // because a client the game logic cannot see is not a player: it would not be
 // hit by rockets, would trigger nothing, and would not appear in anyone else's
 // entity updates.
-
-#define QSV_MAX_CLIENTS		4
-#define QSV_TIMEOUT			10.0	//seconds of silence before a drop
-
-class CQSvClient
-{
-	I64		edict;
-	U32		ip;			//0 for the local client
-	Bool	active;
-	Bool	local;
-
-	//The last move read for this client, held until its tick runs.
-	F64		angles[3];
-	F64		cmd[3];		//forward, side, up
-	Bool	attack;
-	Bool	jump;
-	I64		impulse;
-	F64		last_msg;
-
-	//The engine's own copy of where this client is, the same pair the local
-	//player keeps in the app shell.
-	F64		origin[3];
-	F64		velocity[3];
-	Bool	on_ground;
-};
-
-CQSvClient	q_sv_clients[QSV_MAX_CLIENTS];
-I64			q_sv_client_count = 0;
+// Decl/defs of CQSvClient / QSV_* live near the top (QNetServerFrame needs them).
 
 U0 QSvClientsClear()
 {//Globals are not zeroed.
@@ -774,6 +1231,7 @@ U0 QSvClientsClear()
 		q_sv_clients[i].ip        = 0;
 		q_sv_clients[i].active    = FALSE;
 		q_sv_clients[i].local     = FALSE;
+		q_sv_clients[i].seen_move = FALSE;
 		q_sv_clients[i].attack    = FALSE;
 		q_sv_clients[i].jump      = FALSE;
 		q_sv_clients[i].impulse   = 0;
@@ -804,7 +1262,9 @@ I64 QSvFindClient(U32 ip)
 }
 
 I64 QSvAddClient(U32 ip, Bool local, I64 edict, F64 now)
-{//Take a free slot and give it a body. -1 if the server is full.
+{//Take a free slot. Remote clients are NOT spawned yet - that waits for the
+ //"connect <name>" stringcmd so .netname is set before ClientConnect bprints.
+ //-1 if the server is full.
 	F64	org[3];
 	F64	ang[3];
 	I64	i;
@@ -817,29 +1277,28 @@ I64 QSvAddClient(U32 ip, Bool local, I64 edict, F64 now)
 		QVecSet(org, 0.0, 0.0, 0.0);
 		QVecSet(ang, 0.0, 0.0, 0.0);
 
-		//A REMOTE client needs a fresh edict; the local one already has the
-		//reserved player edict and must not be given a second body.
-		if (edict <= 0)
-		{
-			edict = QPrSpawnEdict;
-			if (edict <= 0)
-				return -1;
-
-			if (!QClientSpawnAt(edict, org, ang))
-				return -1;
-		}
-		else
+		//LOCAL client already has the reserved player edict.
+		//REMOTE: leave edict 0 until connect names them.
+		if (local && edict > 0)
 		{
 			org[0] = QPrFieldF(edict, q_fld_origin);
 			org[1] = QPrFieldF(edict, q_fld_origin + 1);
 			org[2] = QPrFieldF(edict, q_fld_origin + 2);
 		}
+		else if (!local)
+			edict = 0;
+		else if (edict <= 0)
+			return -1;
 
-		q_sv_clients[i].edict    = edict;
-		q_sv_clients[i].ip       = ip;
-		q_sv_clients[i].active   = TRUE;
-		q_sv_clients[i].local    = local;
-		q_sv_clients[i].last_msg = now;
+		q_sv_clients[i].edict     = edict;
+		q_sv_clients[i].ip        = ip;
+		q_sv_clients[i].active    = TRUE;
+		q_sv_clients[i].local     = local;
+		q_sv_clients[i].seen_move = FALSE;
+		q_sv_clients[i].last_msg  = now;
+		q_sv_clients[i].top       = 0;
+		q_sv_clients[i].bottom    = 0;
+		q_sv_clients[i].name[0]   = 0;
 
 		QVecCopy(org, q_sv_clients[i].origin);
 		QVecSet(q_sv_clients[i].velocity, 0.0, 0.0, 0.0);
@@ -852,6 +1311,207 @@ qsv_next:
 	}
 
 	return -1;
+}
+
+U0 QSvApplyClientColors(I64 ent, I64 top, I64 bottom)
+{//Pack shirt/trousers into .colormap. QNetCaptureState sends it; draw paths
+ //remap player.mdl skins from the same byte.
+	if (ent <= 0 || q_fld_colormap < 0)
+		return;
+
+	top    = top & 15;
+	bottom = bottom & 15;
+	QPrSetFieldF(ent, q_fld_colormap, ToF64((top << 4) | bottom));
+}
+
+U0 QSvEnsureClientModel(I64 ent)
+{//PutClientInServer should setmodel(progs/player.mdl). If it aborted early the
+ //body has no alias model: QGameDrawEntities silently skips (mdl == NULL) and
+ //the host never sees the guest. Force the player model.
+	I64 idx;
+	U8 *name;
+
+	if (ent <= 0)
+		return;
+
+	idx  = ToI64(QPrFieldF(ent, q_fld_modelindex));
+	name = QPrStr(QPrFieldI(ent, q_fld_model));
+
+	//Need BOTH a live alias slot AND a non-empty .model string. Index alone
+	//left EntityVisible returning FALSE and the guest off every datagram.
+	if (idx > 0 && idx < q_precache_model_count && q_precache_mdl[idx] &&
+		name && name[0])
+		return;
+
+	idx = QBiPrecacheModel("progs/player.mdl");
+	if (idx <= 0)
+		return;
+
+	QPrSetFieldF(ent, q_fld_modelindex, ToF64(idx));
+	QPrSetFieldI(ent, q_fld_model, QPrNewString("progs/player.mdl"));
+}
+
+U0 QSvDrawRemoteClients(CQCanvas *c, CQMap *map, F64 *view_origin)
+{//Listen-server belt: draw every remote body with player.mdl even if the
+ //edict's modelindex path failed. Guest already sees the host via wire.
+	CQMdl		*mdl;
+	CQEntState	*cl;
+	F64			 eorg[3];
+	F64			 d[3];
+	I64			 i;
+	I64			 ent;
+	I64			 frame;
+	I64			 top;
+	I64			 bottom;
+	I64			 cmap;
+	F64			 yaw;
+	Bool		 have;
+
+	for (i = 0; i < QSV_MAX_CLIENTS; i++)
+	{
+		if (!q_sv_clients[i].active || q_sv_clients[i].local)
+			goto qdr_next;
+
+		ent = q_sv_clients[i].edict;
+		if (ent <= 0)
+			goto qdr_next;
+
+		QSvEnsureClientModel(ent);
+
+		have = FALSE;
+		top    = q_sv_clients[i].top;
+		bottom = q_sv_clients[i].bottom;
+
+		//Prefer the loopback-reconstructed state (same bytes the guest draws
+		//the host from). Falls back to the edict / slot if the datagram
+		//dropped this body.
+		if (ent < QNET_MAX_ENTS)
+		{
+			cl = &q_net_cl[ent];
+			if (cl->active && cl->msgtime >= q_cl.time - 0.5)
+			{
+				QVecCopy(cl->origin, eorg);
+				frame = cl->frame;
+				yaw   = cl->angles[1];
+				cmap  = cl->colormap;
+				top   = (cmap >> 4) & 15;
+				bottom = cmap & 15;
+				have  = TRUE;
+			}
+		}
+
+		if (!have)
+		{
+			eorg[0] = QPrFieldF(ent, q_fld_origin);
+			eorg[1] = QPrFieldF(ent, q_fld_origin + 1);
+			eorg[2] = QPrFieldF(ent, q_fld_origin + 2);
+
+			//Edict never moved - use the slot copy QSvRunClients maintains.
+			if (eorg[0] == 0.0 && eorg[1] == 0.0 && eorg[2] == 0.0)
+			{
+				eorg[0] = q_sv_clients[i].origin[0];
+				eorg[1] = q_sv_clients[i].origin[1];
+				eorg[2] = q_sv_clients[i].origin[2];
+			}
+
+			frame = ToI64(QPrFieldF(ent, q_fld_frame));
+			yaw   = QPrFieldF(ent, q_fld_angles + 1);
+			if (q_fld_colormap >= 0)
+			{
+				cmap = ToI64(QPrFieldF(ent, q_fld_colormap));
+				top    = (cmap >> 4) & 15;
+				bottom = cmap & 15;
+			}
+		}
+
+		mdl = QMdlPreviewGet(top, bottom);
+		if (!mdl)
+			mdl = QMdlCacheGet("progs/player.mdl");
+		if (!mdl)
+			goto qdr_next;
+
+		if (frame < 0 || frame >= mdl->num_frames)
+			frame = 0;
+
+		QVecSub(eorg, view_origin, d);
+		if (QVecLength(d) > 10000.0)
+			goto qdr_next;
+
+		//Skip only when sitting exactly on the camera (same spawn, backface
+		//culled into invisibility). Nudge the draw copy up a hair so a shared
+		//spawn pad still shows a body.
+		if (QVecLength(d) < 1.0)
+			eorg[2] = eorg[2] + 8.0;
+
+		QMdlDraw(c, mdl, frame, eorg, yaw, QLightPoint(map, eorg));
+
+qdr_next:
+	}
+}
+
+Bool QSvSpawnRemote(I64 slot, U8 *name, I64 top=0, I64 bottom=0)
+{//Give a deferred remote slot its body, named before ClientConnect runs.
+	F64 org[3];
+	F64 ang[3];
+	I64 edict;
+	U8  join_name[32];
+
+	if (slot < 0 || slot >= QSV_MAX_CLIENTS || !q_sv_clients[slot].active)
+		return FALSE;
+	if (q_sv_clients[slot].local || q_sv_clients[slot].edict > 0)
+		return TRUE;
+
+	//MUST copy off the caller's buffer. Connect parse passes q_net_cmd_line+ni;
+	//StrPrint into that same line would overlap and corrupt the name.
+	if (!name || !name[0])
+		QStrCopy(join_name, "player", 32);
+	else
+	{
+		MemCopy(join_name, name, 31);
+		join_name[31] = 0;
+	}
+
+	QVecSet(org, 0.0, 0.0, 0.0);
+	QVecSet(ang, 0.0, 0.0, 0.0);
+
+	edict = QPrSpawnEdict;
+	if (edict <= 0)
+		return FALSE;
+
+	//Deathmatch rules (DM spawn pads, weapon stay) must be live BEFORE
+	//PutClientInServer picks a spot - otherwise both bodies share
+	//info_player_start and the host stands inside the guest (backface-culled).
+	if (q_ofs_deathmatch >= 0)
+		QPrSetF(q_ofs_deathmatch, QCvarGet("deathmatch"));
+
+	if (!QClientSpawnAt(edict, org, ang, join_name))
+	{
+		QPrFreeEdict(edict);
+		return FALSE;
+	}
+
+	QSvEnsureClientModel(edict);
+	q_sv_clients[slot].top    = top & 15;
+	q_sv_clients[slot].bottom = bottom & 15;
+	QStrCopy(q_sv_clients[slot].name, join_name, 32);
+	QSvApplyClientColors(edict, q_sv_clients[slot].top, q_sv_clients[slot].bottom);
+	QGameLinkEdict(edict);
+
+	q_sv_clients[slot].edict = edict;
+	QVecCopy(org, q_sv_clients[slot].origin);
+
+	StrPrint(q_net_cmd_line,
+		"net: remote spawn edict %d at %.0f %.0f %.0f\n",
+		edict, org[0], org[1], org[2]);
+	QLog(q_net_cmd_line);
+	QLogFlush;
+
+	//Engine-side announce so the join name is visible even when QuakeC's
+	//bprint(self.netname) got an empty string offset (QBiPrint stops on 0).
+	StrPrint(q_net_cmd_line, "%s entered the game\n", join_name);
+	QSvBroadcastPrintf(q_net_cmd_line);
+
+	return TRUE;
 }
 
 U0 QSvDropClient(I64 slot)
@@ -870,17 +1530,220 @@ U0 QSvDropClient(I64 slot)
 U0 QSvCheckTimeouts(F64 now)
 {//A client that has stopped sending moves is gone. Without this its body stays
  //standing in the level being shot at forever.
+ //
+ //Do NOT apply the short timeout before the first clc_move: after svc_serverinfo
+ //the guest loads the map and is silent for many seconds. A 3s cut there dropped
+ //the body while the guest still thought it had joined.
 	I64 i;
+	F64 limit;
 
 	for (i = 0; i < QSV_MAX_CLIENTS; i++)
 	{
-		if (q_sv_clients[i].active && !q_sv_clients[i].local &&
-			now - q_sv_clients[i].last_msg > QSV_TIMEOUT)
+		if (!q_sv_clients[i].active || q_sv_clients[i].local)
+			goto qsv_to_next;
+
+		if (q_sv_clients[i].seen_move)
+			limit = QSV_TIMEOUT;
+		else
+			limit = QSV_CONNECT_GRACE;
+
+		if (now - q_sv_clients[i].last_msg > limit)
 		{
 			QLog("net: client timed out\n");
 			QSvDropClient(i);
 		}
+
+qsv_to_next:
 	}
+}
+
+//--- signon ----------------------------------------------------------------
+//
+// "connect" opening a socket is not joining a game. In the original the client
+// sends a connection request, the server answers with svc_serverinfo naming the
+// level, and only then does the client load that map and start playing. Without
+// that exchange the client sits in its menu forever - its game loop never runs,
+// so it never transmits, and the server never hears from it.
+
+#define QNET_PROTOCOL	15		//NET_PROTOCOL_VERSION
+
+U0 QNetClientSendConnect(U8 *name, I64 top=0, I64 bottom=0)
+{//Connection request carrying the setup-page name + shirt/trousers colours.
+	U8 line[64];
+
+	if (!q_udp_ready || q_udp_server || !q_udp_peer_ip)
+		return;
+
+	if (!name || !name[0])
+		name = "player";
+
+	StrPrint(line, "connect %s %d %d", name, top & 15, bottom & 15);
+
+	QMsgClear(&q_net_cmd);
+	QMsgWriteByte(&q_net_cmd, QCLC_STRINGCMD);
+	QMsgWriteString(&q_net_cmd, line);
+
+	QNetUdpSend(&q_net_cmd);
+}
+
+U0 QNetSendServerInfo(I64 slot)
+{//svc_serverinfo, answering a connection request.
+ //
+ //DEVIATION: the original follows the level name with the full model and sound
+ //precache lists, and the client builds its tables from them. Both ends here
+ //load the same map from the same PAK, so their precache tables come out
+ //identical by construction - and sending several hundred strings would need
+ //the signon splitting across datagrams, which is the only reason the original
+ //has multiple signon buffers.
+	I64 edict;
+
+	edict = 0;
+	if (slot >= 0 && slot < QSV_MAX_CLIENTS)
+		edict = q_sv_clients[slot].edict;
+
+	QMsgClear(&q_net_send);
+
+	QMsgWriteByte(&q_net_send, QSVC_SERVERINFO);
+	QMsgWriteLong(&q_net_send, QNET_PROTOCOL);
+	QMsgWriteByte(&q_net_send, QSV_MAX_CLIENTS);
+	QMsgWriteByte(&q_net_send, 1);				//gametype: deathmatch
+	QMsgWriteString(&q_net_send, q_map_name);
+
+	//Tell the guest which edict is THEIR body so first-person can hide it and
+	//entity updates for everyone else stay on screen.
+	if (edict > 0)
+	{
+		QMsgWriteByte(&q_net_send, QSVC_SETVIEW);
+		QMsgWriteShort(&q_net_send, edict);
+	}
+
+	QMsgWriteByte(&q_net_send, QSVC_SIGNONNUM);
+	QMsgWriteByte(&q_net_send, 1);
+
+	if (!QNetUdpSend(&q_net_send))
+	{
+		//Usually ARP miss on a byte-swapped peer IP - see QNetUdpRecv.
+		QLog("net: svc_serverinfo send FAILED - client will stay in menu\n");
+		QLogFlush;
+	}
+}
+
+Bool QNetServerExecStringCmd(I64 slot, U8 *line)
+{//SV_ReadClientMessage clc_stringcmd allowlist (sv_user.c) + connect.
+ //Returns TRUE if the command was recognised.
+	I64 ni;
+	I64 nj;
+	I64 nk;
+	I64 ctop;
+	I64 cbot;
+	U8  cname[32];
+
+	if (!line)
+		return FALSE;
+
+	//--- connect <name> [top] [bottom] ---
+	if (!StrNICompare(line, "connect", 7) &&
+		(line[7] == 0 || line[7] == ' '))
+	{
+		ni = 7;
+		ctop = 0;
+		cbot = 0;
+		cname[0] = 0;
+
+		while (line[ni] == ' ')
+			ni++;
+
+		nj = 0;
+		while (line[ni] && line[ni] != ' ' && nj < 31)
+		{
+			cname[nj] = line[ni];
+			nj++;
+			ni++;
+		}
+		cname[nj] = 0;
+
+		while (line[ni] == ' ')
+			ni++;
+		if (line[ni] >= '0' && line[ni] <= '9')
+		{
+			ctop = 0;
+			while (line[ni] >= '0' && line[ni] <= '9')
+			{
+				ctop = ctop * 10 + (line[ni] - '0');
+				ni++;
+			}
+			ctop = ctop & 15;
+		}
+
+		while (line[ni] == ' ')
+			ni++;
+		if (line[ni] >= '0' && line[ni] <= '9')
+		{
+			cbot = 0;
+			while (line[ni] >= '0' && line[ni] <= '9')
+			{
+				cbot = cbot * 10 + (line[ni] - '0');
+				ni++;
+			}
+			cbot = cbot & 15;
+		}
+
+		if (slot >= 0)
+		{
+			if (q_sv_clients[slot].edict <= 0)
+			{
+				if (cname[0])
+					QSvSpawnRemote(slot, cname, ctop, cbot);
+				else
+					QSvSpawnRemote(slot, "player", ctop, cbot);
+
+				QNetSendServerInfo(slot);
+			}
+			else
+			{
+				nk = q_sv_clients[slot].edict;
+				QMsgClear(&q_net_send);
+				QMsgWriteByte(&q_net_send, QSVC_SETVIEW);
+				QMsgWriteShort(&q_net_send, nk);
+				QNetUdpSend(&q_net_send);
+			}
+		}
+		return TRUE;
+	}
+
+	//--- say / say_team (Host_Say_f / Host_Say_Team_f) ---
+	if (!StrNICompare(line, "say_team", 8) &&
+		(line[8] == 0 || line[8] == ' '))
+	{
+		ni = 8;
+		while (line[ni] == ' ')
+			ni++;
+		QHostSay(slot, line + ni, TRUE);
+		return TRUE;
+	}
+
+	if (!StrNICompare(line, "say", 3) &&
+		(line[3] == 0 || line[3] == ' '))
+	{
+		ni = 3;
+		while (line[ni] == ' ')
+			ni++;
+		QHostSay(slot, line + ni, FALSE);
+		return TRUE;
+	}
+
+	//--- tell <name> <msg> (Host_Tell_f) ---
+	if (!StrNICompare(line, "tell", 4) &&
+		(line[4] == 0 || line[4] == ' '))
+	{
+		ni = 4;
+		while (line[ni] == ' ')
+			ni++;
+		QHostTell(slot, line + ni);
+		return TRUE;
+	}
+
+	return FALSE;
 }
 
 //--- upstream: the client's move ------------------------------------------
@@ -891,8 +1754,9 @@ U0 QSvCheckTimeouts(F64 now)
 //SV_ReadClientMove do. It is the path a second player would arrive on.
 
 U0 QNetClientSendMove(F64 *view_angles, F64 forward, F64 side, F64 up,
-	Bool attack, Bool jump, I64 impulse, F64 time)
-{//CL_SendMove.
+	Bool attack, Bool jump, I64 impulse, F64 time, F64 *origin=NULL)
+{//CL_SendMove. origin (when set) is where THIS client believes it stands -
+ //the listen host parks remote bodies there so it can see/shoot them.
 	I64 bits = 0;
 
 	if (!q_net_active)
@@ -922,16 +1786,36 @@ U0 QNetClientSendMove(F64 *view_angles, F64 forward, F64 side, F64 up,
 
 	QMsgWriteByte(&q_net_cmd, impulse);
 
-	//A joined client's move has to leave the machine; a listen server's local
-	//client hands it to the loopback queue it also reads from.
+	//Trailing origin - our clients always send it. Without this the host's
+	//server-side hull walk left remote bodies in the void while the guest's
+	//predicted camera stood next to the host (guest saw host; host saw air).
+	if (origin)
+	{
+		QMsgWriteCoord(&q_net_cmd, origin[0]);
+		QMsgWriteCoord(&q_net_cmd, origin[1]);
+		QMsgWriteCoord(&q_net_cmd, origin[2]);
+	}
+
+	//A joined client sends its move to the REMOTE server, and also to its own
+	//loopback queue - NOT one or the other.
+	//
+	//Returning early after the UDP send was wrong: this client still runs a
+	//local world to render from, and that local server reads its input off the
+	//loopback queue. Skipping it left the local simulation with no input at all,
+	//which shows up as moves 0/0 and an empty datagram while the game visibly
+	//keeps playing. Once the renderer draws purely from the client tables this
+	//local half goes away, and with it the double send.
 	if (q_udp_ready && !q_udp_server)
 	{
 		if (QNetUdpSend(&q_net_cmd))
 			q_net_moves_sent++;
 
+		QNetSendToServer(&q_net_cmd);
 		return;
 	}
 
+	//Counted here too, or a listen server reports "0 sent" while happily
+	//feeding its own local client - which reads as the send path being dead.
 	if (QNetSendToServer(&q_net_cmd))
 		q_net_moves_sent++;
 }
@@ -941,6 +1825,7 @@ Bool QNetServerReadMove(CQMsg *m, I64 ent, F64 server_time, I64 slot = -1)
 	I64 bits;
 	I64 imp;
 	I64 j;
+	F64 org[3];
 
 	q_net_move_ping = server_time - QMsgReadFloat(m);
 
@@ -960,7 +1845,7 @@ Bool QNetServerReadMove(CQMsg *m, I64 ent, F64 server_time, I64 slot = -1)
 	q_net_move_attack = ToBool(bits & 1);
 	q_net_move_jump   = ToBool((bits & 2) != 0);
 
-	//IMPULSE IS ONLY OVERWRITTEN WHEN NON-ZERO - `if (i) ent->v.impulse = i;`.
+	//IMPULSE IS ONLY OVERWRITTEN WHEN NON-ZERO - if (i) ent->v.impulse = i.
 	//The server does not clear it on a move that carries none, because
 	//ImpulseCommands is what clears it, and that runs in PlayerPostThink. A
 	//move arriving in between must not wipe the pending request.
@@ -976,8 +1861,15 @@ Bool QNetServerReadMove(CQMsg *m, I64 ent, F64 server_time, I64 slot = -1)
 		for (j = 0; j < 3; j++)
 			QPrSetFieldF(ent, q_fld_v_angle + j, q_net_move_angles[j]);
 
-		QPrSetFieldF(ent, q_fld_button0, ToF64(q_net_move_attack));
-		QPrSetFieldF(ent, q_fld_button2, ToF64(q_net_move_jump));
+		if (q_net_move_attack)
+			QPrSetFieldF(ent, q_fld_button0, 1.0);
+		else
+			QPrSetFieldF(ent, q_fld_button0, 0.0);
+
+		if (q_net_move_jump)
+			QPrSetFieldF(ent, q_fld_button2, 1.0);
+		else
+			QPrSetFieldF(ent, q_fld_button2, 0.0);
 	}
 
 	//Park the move on the sender's slot. Its tick applies it; doing it here
@@ -989,9 +1881,31 @@ Bool QNetServerReadMove(CQMsg *m, I64 ent, F64 server_time, I64 slot = -1)
 		q_sv_clients[slot].attack   = q_net_move_attack;
 		q_sv_clients[slot].jump     = q_net_move_jump;
 		q_sv_clients[slot].last_msg = server_time;
+		q_sv_clients[slot].seen_move = TRUE;
 
 		if (imp)
 			q_sv_clients[slot].impulse = imp;
+	}
+
+	//Trailing client origin (6 bytes). Snap REMOTE bodies to it so the host
+	//draws/shoots where the guest's predicted camera actually is.
+	if (m->read + 6 <= m->len)
+	{
+		org[0] = QMsgReadCoord(m);
+		org[1] = QMsgReadCoord(m);
+		org[2] = QMsgReadCoord(m);
+
+		if (!m->badread && slot >= 0 && !q_sv_clients[slot].local)
+		{
+			QVecCopy(org, q_sv_clients[slot].origin);
+
+			if (ent > 0)
+			{
+				for (j = 0; j < 3; j++)
+					QPrSetFieldF(ent, q_fld_origin + j, org[j]);
+				QGameLinkEdict(ent);
+			}
+		}
 	}
 
 	q_net_moves_read++;
@@ -1003,6 +1917,9 @@ Bool QNetParseFromClient(CQMsg *in, I64 slot, F64 server_time)
 {//One client's message, whatever the transport was.
 	I64 cmd;
 	I64 ent = 0;
+
+	if (slot >= 0 && slot < QSV_MAX_CLIENTS)
+		q_sv_clients[slot].last_msg = server_time;
 
 	if (slot >= 0)
 		ent = q_sv_clients[slot].edict;
@@ -1033,6 +1950,8 @@ Bool QNetParseFromClient(CQMsg *in, I64 slot, F64 server_time)
 
 			case QCLC_STRINGCMD:
 				QMsgReadString(in, q_net_cmd_line, 128);
+				//sv_user.c allowlist: connect / say / say_team / tell / ...
+				QNetServerExecStringCmd(slot, q_net_cmd_line);
 				break;
 
 			default:
@@ -1048,6 +1967,9 @@ Bool QNetServerReadClient(I64 ent, F64 server_time)
 	CQMsg	*in = &q_net_recv_c2s;
 	I64		 cmd;
 	I64		 slot;
+	I64		 local_slot;
+
+	local_slot = QSvFindLocalSlot;
 
 	//Remote moves are pulled into the SAME queue the local client writes to, so
 	//the parse below cannot tell them apart - which is the point. The first
@@ -1081,7 +2003,14 @@ Bool QNetServerReadClient(I64 ent, F64 server_time)
 			}
 
 			if (slot >= 0)
+			{
+				//Ensure the reply path has a MAC before we try svc_serverinfo.
+				//IPV4Handler usually cached it on ingress; probe covers a miss.
+				if (!QNetUdpPeerResolved)
+					QNetUdpArpProbe;
+
 				QNetParseFromClient(&q_net_udp_in, slot, server_time);
+			}
 		}
 	}
 
@@ -1110,11 +2039,10 @@ Bool QNetServerReadClient(I64 ent, F64 server_time)
 					return TRUE;
 
 				case QCLC_STRINGCMD:
-					//Consumed and ignored. A real server would hand this to
-					//Cmd_ExecuteString; nothing here generates one yet, but the
-					//bytes have to be skipped correctly or the rest of the
-					//message is misread.
+					//Cmd_ExecuteString(s, src_client) for the local loopback
+					//client - Host_Say arrives here via Cmd_ForwardToServer.
 					QMsgReadString(in, q_net_cmd_line, 128);
+					QNetServerExecStringCmd(local_slot, q_net_cmd_line);
 					break;
 
 				default:
@@ -1130,21 +2058,13 @@ U0 QSvRunClients(F64 dt, F64 now)
 {//SV_RunClients for the REMOTE clients only - the local one is driven by the
  //app shell, which owns the keyboard and the view.
  //
- //The wish direction is rebuilt from the angles and the move command the client
- //sent, exactly as SV_ClientThink does: the client transmits intent along its
- //own axes, and the server turns that into a world direction. It is never sent
- //a world vector, which is what stops a client from simply claiming to move
- //wherever it likes.
-	F64	forward[3];
-	F64	right[3];
-	F64	up[3];
-	F64	wishdir[3];
-	F64	wishvel[3];
+ //Remote ORIGIN comes from the client's clc_move (see QNetServerReadMove).
+ //Angles/buttons still drive aim and W_WeaponFrame via the QuakeC thinks.
 	F64	ang[3];
-	F64	wishspeed;
 	I64	ent;
 	I64	i;
 	I64	j;
+	I64	flags;
 
 	for (i = 0; i < QSV_MAX_CLIENTS; i++)
 	{
@@ -1154,6 +2074,8 @@ U0 QSvRunClients(F64 dt, F64 now)
 		ent = q_sv_clients[i].edict;
 		if (ent <= 0)
 			goto qsr_next;
+
+		QSvEnsureClientModel(ent);
 
 		//The body angles carry yaw only; v_angle carries the full view, which
 		//is what the weapon code aims along.
@@ -1166,8 +2088,16 @@ U0 QSvRunClients(F64 dt, F64 now)
 		for (j = 0; j < 3; j++)
 			QPrSetFieldF(ent, q_fld_v_angle + j, ang[j]);
 
-		QPrSetFieldF(ent, q_fld_button0, ToF64(q_sv_clients[i].attack));
-		QPrSetFieldF(ent, q_fld_button2, ToF64(q_sv_clients[i].jump));
+		//QuakeC tests if (self.button0) as a float. Write 1.0/0.0 explicitly.
+		if (q_sv_clients[i].attack)
+			QPrSetFieldF(ent, q_fld_button0, 1.0);
+		else
+			QPrSetFieldF(ent, q_fld_button0, 0.0);
+
+		if (q_sv_clients[i].jump)
+			QPrSetFieldF(ent, q_fld_button2, 1.0);
+		else
+			QPrSetFieldF(ent, q_fld_button2, 0.0);
 
 		if (q_sv_clients[i].impulse)
 		{
@@ -1176,53 +2106,45 @@ U0 QSvRunClients(F64 dt, F64 now)
 			q_sv_clients[i].impulse = 0;
 		}
 
-		//PlayerPreThink, then the move, then PlayerPostThink - the same order
-		//the local client runs in.
-		QSvCallPlayerFunc(ent, "PlayerPreThink");
+		//Preserve QuakeC-owned flag bits; only refresh CLIENT + ONGROUND.
+		flags = ToI64(QPrFieldF(ent, q_fld_flags));
+		flags |= QFL_CLIENT;
+		if (q_sv_clients[i].on_ground)
+			flags |= QFL_ONGROUND_;
+		else
+			flags &= ~QFL_ONGROUND_;
+		QPrSetFieldF(ent, q_fld_flags, ToF64(flags));
 
+		//Publish client origin before thinks so tracelines aim from the right spot.
+		for (j = 0; j < 3; j++)
+			QPrSetFieldF(ent, q_fld_origin + j, q_sv_clients[i].origin[j]);
+		QGameLinkEdict(ent);
+
+		//Items/doors/teleporters: touch AFTER the snap. QGameFrame already ran
+		//with last frame's remote origin, so pickups never fired under guests.
+		QGameTouchTriggersFor(ent);
+
+		//PlayerPreThink then PlayerPostThink. Origin already snapped from the
+		//client's clc_move - do NOT re-walk the hull here. Server-side
+		//QPlayerMove was parking remotes in the void while the guest's predicted
+		//camera stood next to the host.
+		QSvCallPlayerFunc(ent, "PlayerPreThink");
+		QSvCallPlayerFunc(ent, "PlayerPostThink");
+
+		//Frame chains (player_shot1 -> player_run) live on .think/.nextthink.
+		//Original runs them in SV_Physics_Client AFTER ClientThink; doing them
+		//only in QGameRunThinks (before PostThink) left remotes stuck on the
+		//first attack frame while still able to fire.
+		QSvRunEntityThink(ent);
+
+		//PostThink may have teleported / knocked; adopt what QuakeC decided.
 		for (j = 0; j < 3; j++)
 		{
 			q_sv_clients[i].origin[j]   = QPrFieldF(ent, q_fld_origin + j);
 			q_sv_clients[i].velocity[j] = QPrFieldF(ent, q_fld_velocity + j);
 		}
 
-		QAngleVectors(ang, forward, right, up);
-
-		//Flattened out of water, so looking up does not drive them into the
-		//floor - the same treatment the local player's wish direction gets.
-		forward[2] = 0.0;
-		right[2]   = 0.0;
-		QVecNormalize(forward);
-		QVecNormalize(right);
-
-		for (j = 0; j < 3; j++)
-			wishvel[j] = forward[j] * q_sv_clients[i].cmd[0] +
-						 right[j]   * q_sv_clients[i].cmd[1];
-
-		QVecCopy(wishvel, wishdir);
-		wishspeed = QVecLength(wishdir);
-
-		if (wishspeed > 0.0)
-			QVecScale(wishdir, 1.0 / wishspeed, wishdir);
-
-		if (wishspeed > QPHYS_MAXSPEED)
-			wishspeed = QPHYS_MAXSPEED;
-
-		q_move_pass = ent;
-
-		QPlayerMove(q_bi_map, q_sv_clients[i].origin,
-			q_sv_clients[i].velocity, wishdir, wishspeed, FALSE, dt,
-			&q_sv_clients[i].on_ground, 0, FALSE, ang);
-
-		q_move_pass = 0;
-
-		for (j = 0; j < 3; j++)
-		{
-			QPrSetFieldF(ent, q_fld_origin + j, q_sv_clients[i].origin[j]);
-			QPrSetFieldF(ent, q_fld_velocity + j, q_sv_clients[i].velocity[j]);
-		}
-
-		QSvCallPlayerFunc(ent, "PlayerPostThink");
+		QGameLinkEdict(ent);
 
 qsr_next:
 	}
@@ -1254,6 +2176,8 @@ U0 QNetDrawEntities(CQCanvas *c, CQMap *map, F64 *view_origin, F64 max_dist,
 	I64			 i;
 	I64			 frame;
 	I64			 bm;
+	I64			 top;
+	I64			 bottom;
 	U8			*name;
 
 	for (i = 1; i < q_net_num_ents && i < QNET_MAX_ENTS; i++)
@@ -1266,11 +2190,12 @@ U0 QNetDrawEntities(CQCanvas *c, CQMap *map, F64 *view_origin, F64 max_dist,
 		if (!e->active)
 			goto qnd_next;
 
-		//NOT IN THE LATEST MESSAGE means not visible. CL_RelinkEntities drops
-		//an entity whose msgtime is not cl.mtime[0] by clearing its model -
-		//without that test an entity that walks out of the PVS is drawn frozen
-		//at the last place the server mentioned it, forever.
-		if (e->msgtime != q_cl.time)
+		//NOT IN A RECENT MESSAGE means not visible. Exact != against q_cl.time
+		//failed whenever two datagrams arrived in one frame: the later svc_time
+		//moved q_cl.time and every entity from the earlier packet vanished for
+		//that frame - including the other player. A short grace matches the
+		//spirit of CL_RelinkEntities without the one-frame wipe.
+		if (e->msgtime < q_cl.time - 0.1)
 			goto qnd_next;
 
 		if (i == client_ent)
@@ -1296,7 +2221,16 @@ U0 QNetDrawEntities(CQCanvas *c, CQMap *map, F64 *view_origin, F64 max_dist,
 		if (QVecLength(d) > max_dist)
 			goto qnd_next;
 
-		mdl = q_precache_mdl[e->modelindex];
+		//Player skins carry shirt/trousers in .colormap (see QSvApplyClientColors).
+		if (!StrICompare(name, "progs/player.mdl"))
+		{
+			top    = (e->colormap >> 4) & 15;
+			bottom = e->colormap & 15;
+			mdl    = QMdlPreviewGet(top, bottom);
+		}
+		else
+			mdl = q_precache_mdl[e->modelindex];
+
 		if (!mdl)
 			goto qnd_next;
 
@@ -1372,6 +2306,7 @@ Bool QNetClientFrame()
 {//Drain every message the link has for us. More than one can arrive per frame.
 	CQMsg	*in = &q_net_recv;
 	Bool	 ok  = TRUE;
+	I64		 n;
 
 	while (QNetGetMessage(in))
 	{
@@ -1381,12 +2316,14 @@ Bool QNetClientFrame()
 	}
 
 	//A client that JOINED a remote server has no loopback traffic at all - its
-	//world arrives entirely as datagrams. Drained here rather than in a
-	//separate path so both kinds of client run identical parsing code.
+	//world arrives entirely as datagrams. Cap how many we chew per call so a
+	//backlog cannot stall the frame forever.
 	if (q_udp_ready && !q_udp_server)
 	{
-		while (QNetUdpRecv(in))
+		n = 0;
+		while (n < 16 && QNetUdpRecv(in))
 		{
+			n++;
 			q_net_parsed++;
 			if (!QNetClientParse(in))
 				ok = FALSE;

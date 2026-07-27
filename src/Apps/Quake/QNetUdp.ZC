@@ -27,6 +27,7 @@ Bool	q_udp_server	= FALSE;	//TRUE when hosting
 I64		q_udp_sent		= 0;
 I64		q_udp_recvd		= 0;
 I64		q_udp_errors	= 0;
+I64		q_udp_unresolved = 0;	//sends skipped because the peer MAC is unknown
 U8		q_udp_status[96];
 
 #ifdef UDP_MAX_PORT
@@ -63,9 +64,23 @@ Bool QNetUdpOpen(I64 port)
 	q_udp_bind = CAlloc(sizeof(CSocketAddressIPV4));
 
 	//Ports go on the wire big endian; the socket layer does not swap for us.
-	q_udp_bind->family			= AF_INET;
-	q_udp_bind->port			= EndianU16(port);
-	q_udp_bind->address.address	= ipv4_globals.local_ip;
+	q_udp_bind->family	= AF_INET;
+	q_udp_bind->port	= EndianU16(port);
+
+	//BOUND TO INADDR_ANY, NOT TO OUR OWN ADDRESS.
+	//
+	//UDPHandler locates the receiving socket with
+	//    UDPTreeNodeQueueIPV4Find(packet->source_ip_address, node)
+	//- it matches the bound address against the SOURCE of the arriving packet,
+	//not the destination. Binding our own address therefore matches nothing a
+	//peer ever sends us, and every datagram is dropped with "address is not in
+	//node queue". UDPChat gets away with binding the REMOTE address for exactly
+	//this reason, which only works when you know your one peer in advance.
+	//
+	//A server does not know its clients ahead of time, so it binds the wildcard
+	//and takes the INADDR_ANY fallback in that same lookup, which accepts any
+	//source.
+	q_udp_bind->address.address	= INADDR_ANY;
 
 	if (UDPSocketBind(q_udp_socket, q_udp_bind) == -1)
 	{
@@ -111,16 +126,37 @@ U0 QNetUdpClose()
 	q_udp_peer_ip = 0;
 }
 
-Bool QNetUdpSend(CQMsg *m)
-{//One Quake message, one datagram.
+Bool QNetUdpSendTo(CQMsg *m, U32 dest_ip)
+{//One Quake message, one datagram to dest_ip. NEVER BLOCKS.
 	U8	*payload;
 	I64	 de_index;
 
-	if (!q_udp_ready || !q_udp_peer_ip || m->len < 1 || m->overflowed)
+	if (!q_udp_ready || !dest_ip || m->len < 1 || m->overflowed)
 		return FALSE;
 
+	//Ethernet MTU. No IP fragmentation on this stack - oversized datagrams
+	//vanish. Entity updates are capped at QNET_MAX_DATAGRAM; this is the belt.
+	if (m->len > 1472)
+		return FALSE;
+
+	//THE PEER'S MAC MUST ALREADY BE KNOWN.
+	//
+	//IPV4AddressMACGet resolves a cache miss by sending an ARP request and then
+	//sleeping in 10ms steps for up to 500ms, four times over - two seconds of
+	//blocking inside a send. Called from the frame loop that is exactly what it
+	//sounds like: the game grinds to a crawl, and since the address never
+	//resolves anyway not one datagram is transmitted.
+	//
+	//So the cache is consulted first and the send is simply skipped on a miss.
+	//Resolution happens once, deliberately, in QNetUdpResolvePeer.
+	if (!ARPCacheFind(dest_ip))
+	{
+		q_udp_unresolved++;
+		return FALSE;
+	}
+
 	de_index = UDPPacketAllocate(&payload, ipv4_globals.local_ip, q_udp_port,
-		q_udp_peer_ip, q_udp_port, m->len);
+		dest_ip, q_udp_port, m->len);
 
 	if (de_index < 0)
 	{
@@ -134,6 +170,11 @@ Bool QNetUdpSend(CQMsg *m)
 	q_udp_sent++;
 
 	return TRUE;
+}
+
+Bool QNetUdpSend(CQMsg *m)
+{//To the latched peer. Listen-server remotes use QNetUdpSendTo(slot.ip).
+	return QNetUdpSendTo(m, q_udp_peer_ip);
 }
 
 Bool QNetUdpRecv(CQMsg *out)
@@ -161,7 +202,19 @@ Bool QNetUdpRecv(CQMsg *out)
 	if (from.family == AF_INET)
 	{
 		v4 = &from;
-		q_udp_from_ip = v4->address.address;
+
+		/*	sockaddr IPv4 is NETWORK byte order (BE). Quake, ARPCache, and
+			UDPPacketAllocate all want HOST order (LE, first octet in the low
+			byte) - the same layout QConParseIPV4 / IPV4AddressParse produce.
+
+			The UDP stack stores EndianU32(packet->source_ip_address) into
+			from_address, and packet->source_ip_address is already LE, so the
+			value here is BE. Taking it raw made the listen server latch a
+			byte-swapped peer: ARPCacheFind missed (cache key is LE from
+			IPV4Handler), QNetUdpSend skipped every reply, svc_serverinfo
+			never left the host, and the joining client sat in the menu
+			forever while netstat still showed the slot from QSvAddClient. */
+		q_udp_from_ip = EndianU32(v4->address.address);
 
 		//A listen server still has no address to reply to until someone speaks,
 		//which is what makes "host" work with no prior configuration.
@@ -204,6 +257,11 @@ Bool QNetUdpSend(CQMsg *m)
 	return FALSE;
 }
 
+Bool QNetUdpSendTo(CQMsg *m, U32 dest_ip)
+{
+	return FALSE;
+}
+
 Bool QNetUdpRecv(CQMsg *out)
 {
 	return FALSE;
@@ -223,9 +281,10 @@ U0 QNetUdpInit()
 	q_udp_from_ip = 0;
 	q_udp_ready   = FALSE;
 	q_udp_server  = FALSE;
-	q_udp_sent    = 0;
-	q_udp_recvd   = 0;
-	q_udp_errors  = 0;
+	q_udp_sent       = 0;
+	q_udp_recvd      = 0;
+	q_udp_errors     = 0;
+	q_udp_unresolved = 0;
 
 	if (QNetUdpAvailable())
 		QStrCopy(q_udp_status, "udp available", 96);
@@ -237,6 +296,71 @@ U0 QNetUdpSetPeer(U32 ip)
 {
 	q_udp_peer_ip = ip;
 }
+
+#ifdef UDP_MAX_PORT
+
+Bool QNetUdpPeerResolved()
+{//Is the peer's hardware address known? Cheap, and never sends anything.
+	if (!q_udp_peer_ip)
+		return FALSE;
+
+	return ToBool(ARPCacheFind(q_udp_peer_ip) != NULL);
+}
+
+U0 QNetUdpArpProbe()
+{//Ask who the peer is WITHOUT waiting for the answer.
+ //
+ //ARPSend returns immediately; the reply is picked up by ARPHandler and lands
+ //in the cache on its own. That makes this safe to call from the frame loop,
+ //unlike IPV4AddressMACGet which sleeps until it gets an answer. It also means
+ //a client whose server was not up yet recovers by itself once it appears.
+	if (!q_udp_ready || !q_udp_peer_ip)
+		return;
+
+	ARPSend(ARP_REQUEST,
+		ethernet_globals.ethernet_broadcast,
+		EthernetMACGet,
+		ipv4_globals.local_ip_be,
+		ethernet_globals.ethernet_null,
+		EndianU32(q_udp_peer_ip));
+}
+
+Bool QNetUdpResolvePeer()
+{//Resolve the peer's MAC ONCE, from a menu or console command where a two
+ //second stall is acceptable. Everything after this can send without blocking.
+ //
+ //This is also the honest reachability test: if ARP does not answer here, the
+ //other machine is not on the wire, and no amount of Quake protocol will help.
+	U8 *mac = NULL;
+
+	if (!q_udp_ready || !q_udp_peer_ip)
+		return FALSE;
+
+	if (ARPCacheFind(q_udp_peer_ip))
+		return TRUE;
+
+	IPV4AddressMACGet(q_udp_peer_ip, &mac);
+
+	return ToBool(ARPCacheFind(q_udp_peer_ip) != NULL);
+}
+
+#else
+
+U0 QNetUdpArpProbe()
+{
+}
+
+Bool QNetUdpPeerResolved()
+{
+	return FALSE;
+}
+
+Bool QNetUdpResolvePeer()
+{
+	return FALSE;
+}
+
+#endif
 
 #ifdef UDP_MAX_PORT
 
@@ -288,7 +412,51 @@ Bool QNetUdpSetLocalIP(U32 ip)
 	return ToBool(got == ip);
 }
 
+Bool QNetAutoIP(U32 server_ip)
+{//Pick a static address when the link has nobody to hand one out.
+ //
+ //A direct VM-to-VM link has no DHCP server, so an address has to come from
+ //somewhere - and making the player supply one by hand before every session is
+ //a step that is easy to miss and gives a failure that looks like the network
+ //is broken. Hosting takes .1 on a private /24; joining takes a neighbouring
+ //address on the SERVER's /24, so the two are on the same wire by construction.
+ //
+ //`qip` still overrides this, and anything already configured - by DHCP or by
+ //hand - is left alone.
+	U32 ip;
+	U32 last;
+
+	if (ipv4_globals.local_ip)
+		return TRUE;
+
+	if (!server_ip)
+		//FIRST octet in the LOW byte, matching IPV4AddressParse. Packing it
+		//the other way round yields 1.0.0.10, which binds without complaint
+		//and then never reaches anyone.
+		ip = 10 | (0 << 8) | (0 << 16) | (1 << 24);	//10.0.0.1, host
+	else
+	{
+		//Neighbour of the server on its own subnet. The top three octets are
+		//kept; only the host part moves, and away from .0 and .255.
+		last = (server_ip >> 24) & 255;
+
+		if (last >= 253)
+			last -= 1;
+		else
+			last += 1;
+
+		ip = (server_ip & 0x00FFFFFF) | (last << 24);
+	}
+
+	return QNetUdpSetLocalIP(ip);
+}
+
 #else
+
+Bool QNetAutoIP(U32 server_ip)
+{
+	return FALSE;
+}
 
 U32 QNetLocalIP()
 {
