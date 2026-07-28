@@ -333,6 +333,109 @@ U0 QBiStaticClear()
 	q_static_count = 0;
 }
 
+#define QMSG_BROADCAST	0
+#define QMSG_ONE		1
+#define QMSG_ALL		2
+#define QMSG_INIT		3
+
+CQMsg *QBiWriteDest()
+{//WriteDest(). Argument 0 of every Write* builtin names the destination.
+ //MSG_ONE reads msg_entity, which QuakeC assigns before writing.
+	I64 dest;
+	I64 entnum;
+
+	dest = ToI64(QBiArgF(0));
+
+	switch (dest)
+	{
+		case QMSG_BROADCAST:
+			return &q_sv_datagram;
+
+		case QMSG_ONE:
+			if (q_ofs_msg_entity < 0)
+				return NULL;
+			entnum = QPrGetI(q_ofs_msg_entity);
+			entnum = QPrEdictNum(entnum);
+			if (entnum < 1 || entnum > QSV_MAX_CLIENTS)
+				return NULL;	//WriteDest: not a client
+			return &q_sv_client_msg[entnum - 1];
+
+		case QMSG_ALL:
+			return &q_sv_reliable_datagram;
+
+		case QMSG_INIT:
+			return &q_sv_signon;
+	}
+
+	return NULL;
+}
+
+Bool QBiWireRoom(CQMsg *m, I64 need)
+{//sv.datagram is capped at the unreliable datagram size; the reliable buffers
+ //may run to MAX_MSGLEN because they are chunked before they go out.
+	I64 cap;
+
+	if (!m)
+		return FALSE;
+
+	if (m == &q_sv_datagram)
+		cap = QNET_MAX_DATAGRAM;
+	else
+		cap = QNET_MAX_MSG;
+
+	return ToBool(m->len < cap - need);
+}
+
+U0 QBiWireByte(CQMsg *m, I64 value)
+{
+	if (!QBiWireRoom(m, 4))
+		return;
+	QMsgWriteByte(m, value);
+}
+
+U0 QBiWireChar(CQMsg *m, I64 value)
+{
+	if (!QBiWireRoom(m, 4))
+		return;
+	QMsgWriteChar(m, value);
+}
+
+U0 QBiWireCoord(CQMsg *m, F64 value)
+{
+	if (!QBiWireRoom(m, 4))
+		return;
+	QMsgWriteCoord(m, value);
+}
+
+U0 QBiWireShort(CQMsg *m, I64 value)
+{
+	if (!QBiWireRoom(m, 4))
+		return;
+	QMsgWriteShort(m, value);
+}
+
+U0 QBiWireLong(CQMsg *m, I64 value)
+{
+	if (!QBiWireRoom(m, 8))
+		return;
+	QMsgWriteLong(m, value);
+}
+
+U0 QBiWireAngle(CQMsg *m, F64 value)
+{
+	if (!QBiWireRoom(m, 4))
+		return;
+	QMsgWriteAngle(m, value);
+}
+
+U0 QBiWireString(CQMsg *m, U8 *str)
+{
+	if (!QBiWireRoom(m, 64))
+		return;
+	QMsgWriteString(m, str);
+}
+
+
 U0 QBiMakeStatic()
 {//Builtin 69.
 	CQStaticEnt	*se;
@@ -364,6 +467,34 @@ U0 QBiMakeStatic()
 		//occupy a slot for nothing.
 		if (se->mdl)
 			q_static_count++;
+	}
+
+	//svc_spawnstatic into sv.signon, so a joining client is told about the
+	//torches and gibs during prespawn. They are never sent again: a static
+	//entity has no edict on the client and cannot be updated.
+	idx = ToI64(QPrFieldF(ent, q_fld_modelindex));
+	if (idx > 0)
+	{
+		QBiWireByte(&q_sv_signon, QSVC_SPAWNSTATIC);
+		QBiWireByte(&q_sv_signon, idx);
+		QBiWireByte(&q_sv_signon, ToI64(QPrFieldF(ent, q_fld_frame)));
+
+		if (q_fld_colormap >= 0)
+			QBiWireByte(&q_sv_signon,
+				ToI64(QPrFieldF(ent, q_fld_colormap)));
+		else
+			QBiWireByte(&q_sv_signon, 0);
+
+		if (q_fld_skin >= 0)
+			QBiWireByte(&q_sv_signon, ToI64(QPrFieldF(ent, q_fld_skin)));
+		else
+			QBiWireByte(&q_sv_signon, 0);
+
+		for (j = 0; j < 3; j++)
+		{
+			QBiWireCoord(&q_sv_signon, QPrFieldF(ent, q_fld_origin + j));
+			QBiWireAngle(&q_sv_signon, QPrFieldF(ent, q_fld_angles + j));
+		}
 	}
 
 	//Freed either way - that is what makestatic means.
@@ -775,32 +906,139 @@ U0 QBiCenterPrint(U8 *str)
 	q_center_until = tS + QCENTER_TIME;
 }
 
-U0 QBiWireByte(I64 value)
-{//Mirror QuakeC Write* onto sv.datagram for remotes (MSG_BROADCAST).
-	if (q_sv_datagram.len >= QNET_MAX_DATAGRAM - 4)
-		return;
-	QMsgWriteByte(&q_sv_datagram, value);
+//--- checkclient ------------------------------------------------------------
+//
+//PF_checkclient. Monsters call this to decide whether a player is worth
+//noticing. Returning one fixed edict made every monster in the level hunt the
+//same body regardless of where it was, so the cycle and the PVS test below are
+//both load-bearing.
+
+//MAX_MAP_LEAFS is 8192 in BSP29, so one PVS row never exceeds 1024 bytes.
+#define QBI_MAX_LEAFS	8192
+#define QBI_PVS_BYTES	(QBI_MAX_LEAFS / 8)
+#define QBI_FL_NOTARGET	128
+
+U8	 q_checkpvs[QBI_PVS_BYTES];
+I64	 q_sv_lastcheck		= 1;
+F64	 q_sv_lastchecktime	= 0.0;
+
+I64 QBiNewCheckClient(I64 check)
+{//PF_newcheckclient: step to the next live client and cache its PVS row.
+	I64 i;
+	I64 leaf;
+	F64 org[3];
+	F64 ofs[3];
+
+	if (check < 1)
+		check = 1;
+	if (check > QSV_MAX_CLIENTS)
+		check = QSV_MAX_CLIENTS;
+
+	if (check == QSV_MAX_CLIENTS)
+		i = 1;
+	else
+		i = check + 1;
+
+	while (TRUE)
+	{
+		if (i == QSV_MAX_CLIENTS + 1)
+			i = 1;
+
+		if (i == check)
+			break;			//nothing else to look at
+
+		if (!q_pr_edict_free[i] && QPrFieldF(i, q_fld_health) > 0.0)
+		{
+			if (q_fld_flags < 0 ||
+				!(ToI64(QPrFieldF(i, q_fld_flags)) & QBI_FL_NOTARGET))
+				break;
+		}
+
+		i++;
+	}
+
+	//Cache the PVS as seen from that client's eyes, not its feet.
+	QBiGetFieldV(i, q_fld_origin, org);
+	if (q_fld_view_ofs >= 0)
+	{
+		QBiGetFieldV(i, q_fld_view_ofs, ofs);
+		org[0] += ofs[0];
+		org[1] += ofs[1];
+		org[2] += ofs[2];
+	}
+
+	leaf = -1;
+	if (q_bi_map)
+		leaf = QVisLeafForPoint(q_bi_map, org);
+
+	if (leaf >= 0 && leaf < q_bi_map->num_leafs)
+		QVisDecompress(q_bi_map, q_bi_map->leafs[leaf].vis_offset,
+			q_checkpvs, QBI_PVS_BYTES);
+	else
+		MemSet(q_checkpvs, 0xFF, QBI_PVS_BYTES);
+
+	return i;
 }
 
-U0 QBiWireCoord(F64 value)
+U0 QBiCheckClient()
 {
-	if (q_sv_datagram.len >= QNET_MAX_DATAGRAM - 4)
-		return;
-	QMsgWriteCoord(&q_sv_datagram, value);
-}
+	I64 ent;
+	I64 self;
+	I64 leaf;
+	I64 l;
+	F64 view[3];
+	F64 ofs[3];
+	F64 now;
 
-U0 QBiWireShort(I64 value)
-{
-	if (q_sv_datagram.len >= QNET_MAX_DATAGRAM - 4)
+	if (q_ofs_self < 0 || q_fld_health < 0 || !q_pr_edict_free)
+	{
+		QBiRetEnt(0);
 		return;
-	QMsgWriteShort(&q_sv_datagram, value);
-}
+	}
 
-U0 QBiWireString(U8 *str)
-{
-	if (q_sv_datagram.len >= QNET_MAX_DATAGRAM - 64)
+	now = QPrGetF(q_ofs_time);
+
+	//One new pick per 0.1s, shared by every monster that asks this frame.
+	if (now - q_sv_lastchecktime >= 0.1)
+	{
+		q_sv_lastcheck     = QBiNewCheckClient(q_sv_lastcheck);
+		q_sv_lastchecktime = now;
+	}
+
+	ent = q_sv_lastcheck;
+	if (q_pr_edict_free[ent] || QPrFieldF(ent, q_fld_health) <= 0.0)
+	{
+		QBiRetEnt(q_player_edict);
 		return;
-	QMsgWriteString(&q_sv_datagram, str);
+	}
+
+	self = QPrEdictNum(QPrGetI(q_ofs_self));
+	QBiGetFieldV(self, q_fld_origin, view);
+	if (q_fld_view_ofs >= 0)
+	{
+		QBiGetFieldV(self, q_fld_view_ofs, ofs);
+		view[0] += ofs[0];
+		view[1] += ofs[1];
+		view[2] += ofs[2];
+	}
+
+	//Leaf 0 is the solid leaf, so PVS bit 0 belongs to leaf 1.
+	l = -1;
+	if (q_bi_map)
+	{
+		leaf = QVisLeafForPoint(q_bi_map, view);
+		if (leaf >= 0 && leaf < q_bi_map->num_leafs)
+			l = leaf - 1;
+	}
+
+	if (l < 0 || l >= QBI_MAX_LEAFS ||
+		!(q_checkpvs[l >> 3] & (1 << (l & 7))))
+	{
+		QBiRetEnt(0);		//world: cannot possibly see the check entity
+		return;
+	}
+
+	QBiRetEnt(ent);
 }
 
 I64 QBiSoundIndex(U8 *sample)
@@ -817,6 +1055,24 @@ I64 QBiSoundIndex(U8 *sample)
 	}
 
 	return 0;
+}
+
+U0 QBiAmbientSignon(F64 *pos, U8 *sample, F64 vol, F64 attenuation)
+{//PF_ambientsound's other half: svc_spawnstaticsound into sv.signon, so a
+ //joining client starts the same water and torch loops the host already has.
+	I64 num;
+	I64 j;
+
+	num = QBiSoundIndex(sample);
+	if (num < 1)
+		return;
+
+	QBiWireByte(&q_sv_signon, QSVC_SPAWNSTATICSOUND);
+	for (j = 0; j < 3; j++)
+		QBiWireCoord(&q_sv_signon, pos[j]);
+	QBiWireByte(&q_sv_signon, num);
+	QBiWireByte(&q_sv_signon, ToI64(vol * 255.0));
+	QBiWireByte(&q_sv_signon, ToI64(attenuation * 64.0));
 }
 
 U0 QSvStartSound(I64 ent, I64 channel, U8 *sample, I64 volume, F64 attenuation)
@@ -880,9 +1136,10 @@ U0 QSvStartSound(I64 ent, I64 channel, U8 *sample, I64 volume, F64 attenuation)
 		QMsgWriteCoord(&q_sv_datagram, org[j]);
 }
 
-U0 QBiWriteByte(I64 value)
-{//Drives the little reassembly state machine + mirrors to sv.datagram.
-	QBiWireByte(value);
+U0 QBiWriteByte(CQMsg *m, I64 value)
+{//Emits to the routed destination, and drives the local reassembly state
+ //machine so the host sees its own temp entities without a round trip.
+	QBiWireByte(m, value);
 
 	if (q_msg_state == QMSG_IDLE)
 	{
@@ -916,9 +1173,9 @@ U0 QBiWriteByte(I64 value)
 	}
 }
 
-U0 QBiWriteString(U8 *str)
-{//Only the finale text is consumed; every other string message is ignored.
-	QBiWireString(str);
+U0 QBiWriteString(CQMsg *m, U8 *str)
+{//Only the finale text is consumed locally; the wire copy always goes out.
+	QBiWireString(m, str);
 
 	if (q_msg_state == QMSG_WANT_TEXT)
 	{
@@ -928,18 +1185,18 @@ U0 QBiWriteString(U8 *str)
 	}
 }
 
-U0 QBiWriteEntity(I64 value)
+U0 QBiWriteEntity(CQMsg *m, I64 value)
 {//A beam's owning entity. Not used for placement - the coordinates that follow
  //carry that - but it has to be consumed so the coordinates land correctly.
-	QBiWireShort(value);
+	QBiWireShort(m, value);
 
 	if (q_msg_state == QMSG_WANT_BEAM_ENT)
 		q_msg_state = QMSG_WANT_BEAM;
 }
 
-U0 QBiWriteCoord(F64 value)
+U0 QBiWriteCoord(CQMsg *m, F64 value)
 {
-	QBiWireCoord(value);
+	QBiWireCoord(m, value);
 
 	if (q_msg_state == QMSG_WANT_BEAM)
 	{
@@ -1700,12 +1957,7 @@ U0 QBiDispatch(I64 num)
 		case 15:	QBiRemove;			break;
 		case 16:	QBiTraceLine;		break;
 
-		case 17:
-			//checkclient: monsters call this to find someone to hunt. The
-			//stub used to return the world, which meant nothing ever noticed
-			//the player. There is exactly one client here.
-			QBiRetEnt(q_player_edict);
-			break;
+		case 17:	QBiCheckClient;		break;	//checkclient
 
 		case 18:	QBiFind;			break;
 
@@ -1797,21 +2049,16 @@ U0 QBiDispatch(I64 num)
 		case 49:	QBiChangeYaw;		break;
 		case 51:	QBiVecToAngles;		break;
 
-		//Network message writers. There is no network, but the temp-entity
-		//effects ride on these, so the byte and coordinate writers feed the
-		//reassembler instead of being discarded.
-		case 52:	QBiWriteByte(ToI64(QBiArgF(1)));	break;	//WriteByte
-		case 53:	QBiWriteByte(ToI64(QBiArgF(1)));	break;	//WriteChar
-		case 56:	QBiWriteCoord(QBiArgF(1));			break;	//WriteCoord
-
-		case 58:	QBiWriteString(QBiArgS(1));			break;	//WriteString
-		case 59:	QBiWriteEntity(QBiArgEnt(1));		break;	//WriteEntity
-
-		case 54:
-		case 55:
-		case 57:
-			//Short/long/angle: only appear in messages nothing here decodes.
-			break;
+		//Network message writers: byte and coordinate writers also feed the
+		//local temp-entity reassembler so the host sees its own effects.
+		case 52:	QBiWriteByte(QBiWriteDest, ToI64(QBiArgF(1)));	break;
+		case 53:	QBiWriteByte(QBiWriteDest, ToI64(QBiArgF(1)));	break;
+		case 54:	QBiWireShort(QBiWriteDest, ToI64(QBiArgF(1)));	break;
+		case 55:	QBiWireLong(QBiWriteDest, ToI64(QBiArgF(1)));	break;
+		case 56:	QBiWriteCoord(QBiWriteDest, QBiArgF(1));		break;
+		case 57:	QBiWireAngle(QBiWriteDest, QBiArgF(1));			break;
+		case 58:	QBiWriteString(QBiWriteDest, QBiArgS(1));		break;
+		case 59:	QBiWriteEntity(QBiWriteDest, QBiArgEnt(1));		break;
 
 		case 67:	QBiMoveToGoal;		break;	//movetogoal(dist)
 
@@ -1836,6 +2083,7 @@ U0 QBiDispatch(I64 num)
 			//permanent looping source rather than played once at load.
 			QBiArgV(0, v);
 			QSndAmbientAdd(v, QBiArgS(1), QBiArgF(2), QBiArgF(3));
+			QBiAmbientSignon(v, QBiArgS(1), QBiArgF(2), QBiArgF(3));
 			break;
 
 		case 78:	break;				//setspawnparms

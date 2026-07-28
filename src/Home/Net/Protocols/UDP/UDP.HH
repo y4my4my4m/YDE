@@ -23,7 +23,6 @@ class CUDPSocket
 
 #define UDP_RECV_QUEUE_MAX	32
 
-
 class CUDPTreeQueue:CQueue
 {
 	CUDPSocket		*socket;

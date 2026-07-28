@@ -127,6 +127,15 @@ class CQSvClient
 	Bool	seen_move;	//FALSE until first clc_move - do not use move-timeout yet
 	I64		signon;		//0..4; entity datagrams only at 4 (remote)
 	Bool	spawned;	//body outfitted by Host_Spawn_f
+	Bool	drop_asap;	//reliable message overflowed; kick at the next timeout sweep
+
+	//Last values actually put on the wire. svc_updatename / updatecolors /
+	//updatefrags are reliable and change-driven, so these are what decides
+	//whether anything needs sending at all.
+	I64		old_frags;
+	I64		old_colors;
+	U8		old_name[32];
+	Bool	sent_ident;
 
 	//Setup-page shirt/trousers (0-13). Packed into .colormap for the wire.
 	I64		top;
@@ -431,8 +440,69 @@ qrs_next:
 	}
 }
 
+U0 QSvUpdateToReliableMessages()
+{//SV_UpdateToReliableMessages. The scoreboard fields are reliable and only go
+ //out when they change - blasting all three for every slot into the unreliable
+ //datagram every frame spent the entity budget on data that almost never moves,
+ //and lost it outright whenever that datagram was dropped.
+	I64 i;
+	I64 ent;
+	I64 frags;
+	I64 colors;
+	U8 *name;
+
+	for (i = 0; i < QSV_MAX_CLIENTS; i++)
+	{
+		if (!q_sv_clients[i].active)
+			goto qur_next;
+
+		name = q_sv_clients[i].name;
+		if (!name[0])
+			name = "player";
+
+		colors = ((q_sv_clients[i].top & 15) << 4) |
+			(q_sv_clients[i].bottom & 15);
+
+		frags = 0;
+		ent = q_sv_clients[i].edict;
+		if (ent > 0 && q_fld_frags >= 0)
+			frags = ToI64(QPrFieldF(ent, q_fld_frags));
+
+		if (!q_sv_clients[i].sent_ident ||
+			StrCompare(q_sv_clients[i].old_name, name))
+		{
+			QMsgWriteByte(&q_sv_reliable_datagram, QSVC_UPDATENAME);
+			QMsgWriteByte(&q_sv_reliable_datagram, i);
+			QMsgWriteString(&q_sv_reliable_datagram, name);
+			QStrCopy(q_sv_clients[i].old_name, name, 32);
+		}
+
+		if (!q_sv_clients[i].sent_ident ||
+			q_sv_clients[i].old_colors != colors)
+		{
+			QMsgWriteByte(&q_sv_reliable_datagram, QSVC_UPDATECOLORS);
+			QMsgWriteByte(&q_sv_reliable_datagram, i);
+			QMsgWriteByte(&q_sv_reliable_datagram, colors);
+			q_sv_clients[i].old_colors = colors;
+		}
+
+		if (!q_sv_clients[i].sent_ident ||
+			q_sv_clients[i].old_frags != frags)
+		{
+			QMsgWriteByte(&q_sv_reliable_datagram, QSVC_UPDATEFRAGS);
+			QMsgWriteByte(&q_sv_reliable_datagram, i);
+			QMsgWriteShort(&q_sv_reliable_datagram, frags);
+			q_sv_clients[i].old_frags = frags;
+		}
+
+		q_sv_clients[i].sent_ident = TRUE;
+
+qur_next:
+	}
+}
+
 U0 QNetWriteFrags(CQMsg *m)
-{//Name + colors + frags for every active slot. ~50 bytes for 2 players.
+{//Signon only: the full scoreboard, so a joining client starts in sync.
 	I64 i;
 	I64 ent;
 	I64 frags;
@@ -767,7 +837,6 @@ Bool QNetBuildClientDatagram(I64 client_ent, CQVisState *vis, F64 time,
 	QMsgWriteFloat(&q_net_datagram, time);
 
 	QNetWriteClientdata(&q_net_datagram, client_ent);
-	QNetWriteFrags(&q_net_datagram);
 	QNetWriteEntities(&q_net_datagram, client_ent, vis);
 
 	if (include_shared)
@@ -794,18 +863,58 @@ Bool QNetServerFrame(I64 client_ent, F64 time)
  //culled from the host eye (see QNetBuildClientDatagram calls below).
 	I64		i;
 	I64		ent;
+	I64		local_slot;
 	Bool	ok;
 
 	ok = TRUE;
+
+	local_slot = -1;
+	for (i = 0; i < QSV_MAX_CLIENTS; i++)
+	{
+		if (q_sv_clients[i].active && q_sv_clients[i].local)
+		{
+			local_slot = i;
+			break;
+		}
+	}
+
+	QSvUpdateToReliableMessages;
+
+	//The MSG_ALL stream is per-frame and shared,
+	//so it is folded into every active client's own reliable message and then
+	//dropped. Anything still sitting in a client message goes out below.
+	if (q_sv_reliable_datagram.len > 0)
+	{
+		for (i = 0; i < QSV_MAX_CLIENTS; i++)
+		{
+			if (q_sv_clients[i].active)
+				QMsgAppendIfRoom(&q_sv_client_msg[i],
+					&q_sv_reliable_datagram, QNET_MAX_MSG);
+		}
+
+		QMsgClear(&q_sv_reliable_datagram);
+	}
 
 	//Local (or solo) client - loopback. No shared TE/sound: already played
 	//locally. No PVS: a listen host must see every remote body.
 	if (!QNetBuildClientDatagram(client_ent, NULL, time, FALSE))
 		ok = FALSE;
-	else if (!QNetSendToClient(&q_net_datagram))
+	else
 	{
-		q_net_dropped++;
-		ok = FALSE;
+		//The host has no reliable channel to itself, so its MSG_ONE/MSG_ALL
+		//traffic rides the loopback datagram and is parsed by the same reader.
+		if (local_slot >= 0 && q_sv_client_msg[local_slot].len > 0)
+		{
+			QMsgAppendIfRoom(&q_net_datagram, &q_sv_client_msg[local_slot],
+				QNET_MAX_DATAGRAM);
+			QMsgClear(&q_sv_client_msg[local_slot]);
+		}
+
+		if (!QNetSendToClient(&q_net_datagram))
+		{
+			q_net_dropped++;
+			ok = FALSE;
+		}
 	}
 
 	//Each remote gets a datagram built for THEIR edict so they receive the host
@@ -834,6 +943,21 @@ Bool QNetServerFrame(I64 client_ent, F64 time)
 
 			if (!QNetDgrmSendUnreliable(i, &q_net_datagram))
 				ok = FALSE;
+
+			//Reliable half. An overflowed message cannot be truncated without
+			//desynchronising the reader, so the client is dropped instead.
+			if (q_sv_client_msg[i].overflowed)
+			{
+				QMsgClear(&q_sv_client_msg[i]);
+				q_sv_clients[i].drop_asap = TRUE;
+				goto qsf_next;
+			}
+
+			if (q_sv_client_msg[i].len > 0)
+			{
+				QNetDgrmSendReliable(i, &q_sv_client_msg[i]);
+				QMsgClear(&q_sv_client_msg[i]);
+			}
 
 qsf_next:
 		}
@@ -1583,7 +1707,12 @@ U0 QSvClientsClear()
 	for (i = 0; i < QSV_MAX_CLIENTS; i++)
 	{
 		q_sv_clients[i].edict     = 0;
-		q_sv_clients[i].spawned   = FALSE;
+		q_sv_clients[i].spawned    = FALSE;
+		q_sv_clients[i].drop_asap  = FALSE;
+		q_sv_clients[i].sent_ident = FALSE;
+		q_sv_clients[i].old_frags  = 0;
+		q_sv_clients[i].old_colors = 0;
+		q_sv_clients[i].old_name[0] = 0;
 		q_sv_clients[i].ip        = 0;
 		q_sv_clients[i].active    = FALSE;
 		q_sv_clients[i].local     = FALSE;
@@ -1605,6 +1734,8 @@ U0 QSvClientsClear()
 	}
 
 	q_sv_client_count = 0;
+
+	QSvClearWriteDests;
 }
 
 I64 QSvFindClient(U32 ip)
@@ -1660,7 +1791,12 @@ I64 QSvAddClient(U32 ip, Bool local, I64 edict, F64 now)
 		q_sv_clients[i].active    = TRUE;
 		q_sv_clients[i].local     = local;
 		q_sv_clients[i].seen_move = FALSE;
-		q_sv_clients[i].spawned   = ToBool(local);
+		q_sv_clients[i].spawned    = ToBool(local);
+		q_sv_clients[i].drop_asap  = FALSE;
+		q_sv_clients[i].sent_ident = FALSE;
+		q_sv_clients[i].old_frags  = 0;
+		q_sv_clients[i].old_colors = 0;
+		q_sv_clients[i].old_name[0] = 0;
 		//Local listen client skips UDP signon -- immediate play.
 		if (local)
 			q_sv_clients[i].signon = 4;
@@ -1849,8 +1985,10 @@ U0 QSvDropClient(I64 slot)
 		QNetSockClear(sock);
 
 	q_sv_clients[slot].active  = FALSE;
-	q_sv_clients[slot].spawned = FALSE;
-	q_sv_clients[slot].edict   = 0;
+	q_sv_clients[slot].spawned    = FALSE;
+	q_sv_clients[slot].drop_asap  = FALSE;
+	q_sv_clients[slot].sent_ident = FALSE;
+	q_sv_clients[slot].edict     = 0;
 	q_sv_client_count--;
 }
 
@@ -1868,6 +2006,15 @@ U0 QSvCheckTimeouts(F64 now)
 	{
 		if (!q_sv_clients[i].active || q_sv_clients[i].local)
 			goto qsv_to_next;
+
+		//SV_SendClientMessages flags a client whose reliable message could not
+		//be delivered; the kick happens here so the send loop stays reentrant.
+		if (q_sv_clients[i].drop_asap)
+		{
+			QLog("net: client reliable message overflowed\n");
+			QSvDropClient(i);
+			goto qsv_to_next;
+		}
 
 		if (q_sv_clients[i].seen_move)
 			limit = QSV_TIMEOUT;
@@ -2244,10 +2391,14 @@ U0 QSvSendClientSignon(I64 slot, I64 stage)
 
 	if (stage == 2)
 	{
-		//Host_PreSpawn_f: baselines, lightstyles, signonnum 2.
-		//GAP: svc_spawnstatic not written yet (makestatic lives client-local).
+		//Host_PreSpawn_f: baselines, lightstyles, sv.signon, signonnum 2.
 		QNetWriteBaselines(&q_net_send, FALSE);
 		QNetWriteLightstyles(&q_net_send);
+
+		//sv.signon holds the svc_spawnstatic run built by makestatic during
+		//map load, plus anything QuakeC wrote to MSG_INIT. It is replayed to
+		//each client here and never cleared: a later joiner needs it too.
+		QMsgAppendIfRoom(&q_net_send, &q_sv_signon, QNET_MAX_MSG);
 		QMsgWriteByte(&q_net_send, QSVC_SIGNONNUM);
 		QMsgWriteByte(&q_net_send, 2);
 		q_sv_clients[slot].signon = 2;
