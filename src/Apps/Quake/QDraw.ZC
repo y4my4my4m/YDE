@@ -229,6 +229,11 @@ I64	q_light_fast	= 0;
 I64	q_light_slow	= 0;
 I64	q_light_clamped	= 0;
 
+//R_PushDlights bookkeeping. The frame counter is what makes a face's marks
+//self-expiring: a face carrying last frame's number has no lights on it now.
+I64 q_dlight_frame	= 0;
+I64 q_ambient_light	= 0;		//r_refdef.ambientlight
+
 F64 q_light_time = 0.0;		//time the current frame is being drawn at
 F64 q_light_last = 0.0;		//previous frame's time, for the dynamic-light decay
 
@@ -238,6 +243,8 @@ U0 QLightInit()
 
 	q_dlight_any  = FALSE;
 	q_dlight_count = 0;
+	q_dlight_frame = 0;
+	q_ambient_light = 0;
 	q_light_last  = 0.0;
 	q_light_time  = 0.0;
 
@@ -306,6 +313,82 @@ ql_next:
 	}
 }
 
+U0 QMarkLights(CQMap *map, CQDlight *light, I64 bit, I64 node_index)
+{//R_MarkLights. Walk the BSP and flag every face the light's sphere can reach,
+ //descending only the side(s) it actually straddles.
+	CQNode	*node;
+	CQPlane	*plane;
+	CQFace	*f;
+	F64		 dist;
+	I64		 i;
+
+	if (node_index < 0 || node_index >= map->num_nodes)
+		return;
+
+	node = &map->nodes[node_index];
+
+	if (node->plane_num < 0 || node->plane_num >= map->num_planes)
+		return;
+
+	plane = &map->planes[node->plane_num];
+	dist  = QVecDot(light->origin, plane->normal) - plane->dist;
+
+	//Entirely on one side: only that child can be lit.
+	if (dist > light->radius)
+	{
+		QMarkLights(map, light, bit, node->children[0]);
+		return;
+	}
+	if (dist < -light->radius)
+	{
+		QMarkLights(map, light, bit, node->children[1]);
+		return;
+	}
+
+	for (i = 0; i < node->num_faces; i++)
+	{
+		if (node->first_face + i < 0 ||
+			node->first_face + i >= map->num_faces)
+			goto qml_next;
+
+		f = &map->faces[node->first_face + i];
+
+		//First light to reach this face this frame resets the mask.
+		if (f->dlight_frame != q_dlight_frame)
+		{
+			f->dlight_bits  = 0;
+			f->dlight_frame = q_dlight_frame;
+		}
+
+		f->dlight_bits |= bit;
+
+qml_next:
+	}
+
+	QMarkLights(map, light, bit, node->children[0]);
+	QMarkLights(map, light, bit, node->children[1]);
+}
+
+U0 QPushDlights(CQMap *map, F64 time)
+{//R_PushDlights, once per frame before anything is drawn.
+	I64 i;
+
+	q_dlight_frame++;
+
+	if (!map || !map->nodes || map->num_nodes < 1)
+		return;
+
+	for (i = 0; i < q_dlight_count && i < QMAX_DLIGHTS; i++)
+	{
+		if (q_dlight[i].die <= time || q_dlight[i].radius <= 0.0)
+			goto qpd_next;
+
+		QMarkLights(map, &q_dlight[i], 1 << i, 0);
+
+qpd_next:
+	}
+}
+
 U0 QLightAddDynamic(CQMap *map, CQFace *f, I64 lm_w, I64 lm_h, F64 time)
 {//Fold every dynamic light touching this face into the accumulator.
  //R_AddDynamicLights.
@@ -339,6 +422,11 @@ U0 QLightAddDynamic(CQMap *map, CQFace *f, I64 lm_w, I64 lm_h, F64 time)
 
 	for (lnum = 0; lnum < q_dlight_count; lnum++)
 	{
+		//R_MarkLights already decided which lights reach this face; anything
+		//not in the mask cannot touch it and is skipped without a trace.
+		if (!(f->dlight_bits & (1 << lnum)))
+			goto qad_next;
+
 		d = &q_dlight[lnum];
 
 		if (d->die <= time || d->radius <= 0.0)
@@ -422,6 +510,11 @@ U8 *QLightFaceMap(CQMap *map, CQFace *f, I64 lm_w, I64 lm_h, F64 time)
 	if (f->light_offset < 0 || !map->lightdata)
 		return NULL;
 
+	if (q_ambient_light < 0)
+		q_ambient_light = 0;
+	if (q_ambient_light > 255)
+		q_ambient_light = 255;
+
 	base = map->lightdata + f->light_offset;
 
 	//How many styles this face actually uses. 255 terminates the list, and any
@@ -437,11 +530,14 @@ U8 *QLightFaceMap(CQMap *map, CQFace *f, I64 lm_w, I64 lm_h, F64 time)
 	if (size <= 0 || size > QLIGHT_SCRATCH)
 		return base;
 
-	dyn = q_dlight_any;
+	//Marked by R_MarkLights this frame, rather than "some light exists".
+	dyn = ToBool(q_dlight_any && f->dlight_frame == q_dlight_frame &&
+			f->dlight_bits != 0);
 
 	//One steady style and no dynamic light means the whole recombine is a
 	//no-op, so hand back the map's own data.
-	if (!dyn && count == 1 &&
+	//Ambient has to be added to every luxel, so it rules out the fast path.
+	if (!dyn && !q_ambient_light && count == 1 &&
 		q_lightstyle_value[f->styles[0]] == QLIGHT_UNITY)
 	{
 		q_light_fast++;
@@ -459,7 +555,10 @@ U8 *QLightFaceMap(CQMap *map, CQFace *f, I64 lm_w, I64 lm_h, F64 time)
 	//anything is rounded or clamped.
 	for (i = 0; i < size; i++)
 	{
-		acc = 0;
+		//R_BuildLightMap clears to the ambient level before adding any
+		//lightmap, so an unlit corner still reads at r_ambient rather than
+		//black. Expressed in the accumulator's units.
+		acc = q_ambient_light * QLIGHT_UNITY;
 
 		for (j = 0; j < count; j++)
 		{
@@ -720,10 +819,337 @@ I64 QDrawClipNear(CQPolyVert *in, I64 count, CQPolyVert *out)
 	return n;
 }
 
+F64 QLightBilinear(U8 *lightmap, I64 lm_w, I64 lm_h, F64 ls, F64 lt)
+{//One lightmap sample with the four neighbours blended.
+ //
+ //Quake's software renderer interpolates lighting across each surface block
+ //(the lightleftstep/lightstep machinery in R_DrawSurfaceBlock8). Taking the
+ //nearest luxel instead makes every 16-texel cell a flat slab of one value
+ //with a hard edge against its neighbours - which reads as one stair tread
+ //being lit while the one beside it is black.
+	I64 lx0, ly0, lx1, ly1;
+	F64 fs, ft;
+	F64 top, bot;
+
+	if (ls < 0.0)	ls = 0.0;
+	if (lt < 0.0)	lt = 0.0;
+
+	lx0 = ToI64(Floor(ls));
+	ly0 = ToI64(Floor(lt));
+	fs  = ls - ToF64(lx0);
+	ft  = lt - ToF64(ly0);
+
+	lx1 = lx0 + 1;
+	ly1 = ly0 + 1;
+
+	lx0 = ClampI64(lx0, 0, lm_w - 1);
+	lx1 = ClampI64(lx1, 0, lm_w - 1);
+	ly0 = ClampI64(ly0, 0, lm_h - 1);
+	ly1 = ClampI64(ly1, 0, lm_h - 1);
+
+	top = ToF64(lightmap[ly0 * lm_w + lx0]) * (1.0 - fs) +
+		  ToF64(lightmap[ly0 * lm_w + lx1]) * fs;
+	bot = ToF64(lightmap[ly1 * lm_w + lx0]) * (1.0 - fs) +
+		  ToF64(lightmap[ly1 * lm_w + lx1]) * fs;
+
+	return top * (1.0 - ft) + bot * ft;
+}
+
+//--- surface cache ----------------------------------------------------------
+//
+// D_CacheSurface. Quake does NOT light a wall pixel by pixel every frame: it
+// builds the surface's texture with its lighting already folded in, once, at
+// the mip it is being drawn at, and then the span loop is a plain texture
+// fetch. A surface that has not moved and whose lighting has not changed is
+// simply reused next frame.
+//
+// The cache is keyed on the mip AND on a lighting key, so an animated style or
+// a dynamic light rebuilds the surface while a static wall never does.
+
+#define QSURF_SLOTS			512
+#define QSURF_BUDGET		6291456		//6MB of lit surfaces
+
+class CQSurfCache
+{
+	U8	*pixels;
+	I64	 bytes;			//allocated size, which may exceed w*h after a rebuild
+	I64	 w;
+	I64	 h;
+	I64	 mip;
+	I64	 face;			//face index owning this slot, -1 when free
+	I64	 frame;			//last frame it was used, for eviction
+	I64	 light_key;		//lighting state it was built from
+};
+
+CQSurfCache	 q_surf[QSURF_SLOTS];
+I64			*q_face_surf	= NULL;		//face index -> slot, -1 for none
+I64			 q_face_surf_n	= 0;
+CQMap		*q_surf_map		= NULL;
+I64			 q_surf_bytes	= 0;
+I64			 q_surf_frame	= 0;
+I64			 q_surf_builds	= 0;
+I64			 q_surf_hits	= 0;
+
+U0 QSurfCacheFlush()
+{//Drop everything. Called on map change and whenever the palette changes.
+	I64 i;
+
+	for (i = 0; i < QSURF_SLOTS; i++)
+	{
+		if (q_surf[i].pixels)
+			Free(q_surf[i].pixels);
+
+		q_surf[i].pixels    = NULL;
+		q_surf[i].bytes     = 0;
+		q_surf[i].face      = -1;
+		q_surf[i].frame     = -1;
+		q_surf[i].mip       = -1;
+		q_surf[i].light_key = -1;
+	}
+
+	if (q_face_surf)
+	{
+		for (i = 0; i < q_face_surf_n; i++)
+			q_face_surf[i] = -1;
+	}
+
+	q_surf_bytes = 0;
+}
+
+U0 QSurfCacheSetMap(CQMap *map)
+{//One slot table per map. Face indices are only meaningful within a map, so
+ //the mapping has to be thrown away with it.
+	if (map == q_surf_map)
+		return;
+
+	QSurfCacheFlush;
+
+	if (q_face_surf)
+	{
+		Free(q_face_surf);
+		q_face_surf   = NULL;
+		q_face_surf_n = 0;
+	}
+
+	q_surf_map = map;
+
+	if (map && map->num_faces > 0)
+	{
+		q_face_surf_n = map->num_faces;
+		q_face_surf   = MAlloc(q_face_surf_n * sizeof(I64));
+		MemSet(q_face_surf, 0xFF, q_face_surf_n * sizeof(I64));
+	}
+}
+
+I64 QSurfCacheEvict()
+{//The least recently used slot, freed and handed back.
+	I64 best = -1;
+	I64 best_frame = I64_MAX;
+	I64 i;
+
+	for (i = 0; i < QSURF_SLOTS; i++)
+	{
+		if (q_surf[i].face < 0)
+			return i;
+
+		if (q_surf[i].frame < best_frame)
+		{
+			best_frame = q_surf[i].frame;
+			best       = i;
+		}
+	}
+
+	if (best < 0)
+		return -1;
+
+	//Never evict something already used this frame - it is about to be drawn.
+	if (q_surf[best].frame == q_surf_frame)
+		return -1;
+
+	if (q_face_surf && q_surf[best].face < q_face_surf_n)
+		q_face_surf[q_surf[best].face] = -1;
+
+	q_surf[best].face = -1;
+
+	return best;
+}
+
+I64 QSurfLightKey(CQFace *f)
+{//What the cached lighting was built from. Any change here means rebuild.
+	I64 key = 0;
+	I64 j;
+
+	for (j = 0; j < 4; j++)
+	{
+		if (f->styles[j] == 255)
+			break;
+		if (f->styles[j] < QMAX_LIGHTSTYLES)
+			key = key * 31 + q_lightstyle_value[f->styles[j]];
+	}
+
+	key = key * 31 + q_ambient_light;
+
+	//A face under a dynamic light is rebuilt every frame it is marked, and once
+	//more on the frame the light leaves it.
+	if (f->dlight_frame == q_dlight_frame && f->dlight_bits)
+		key = key * 31 + q_dlight_frame + 1;
+
+	return key;
+}
+
+U8 *QSurfCacheGet(CQMap *map, CQFace *f, I64 face_index, CQTexture *tex,
+	I64 mip, U8 *lightmap, I64 lm_w, I64 lm_h, I64 *_cw, I64 *_ch)
+{//R_DrawSurface: the face's texture with its lighting already applied, at the
+ //mip it is about to be drawn at. NULL means "not cached, light it per pixel".
+	CQSurfCache	*sc;
+	U8			*texels;
+	U8			*out;
+	I64			 slot;
+	I64			 cw, ch;
+	I64			 tw, th;
+	I64			 need;
+	I64			 key;
+	I64			 u, v;
+	I64			 tx, ty;
+	I64			 s0, t0;
+	I64			 mins_s_i, mins_t_i;
+	I64			 texel;
+	I64			 light;
+	I64			 shade;
+	F64			 lightv;
+
+	if (!q_face_surf || face_index < 0 || face_index >= q_face_surf_n)
+		return NULL;
+
+	texels = tex->texels[mip];
+	tw     = tex->width >> mip;
+	th     = tex->height >> mip;
+
+	if (!texels || tw <= 0 || th <= 0)
+		return NULL;
+
+	cw = (f->extent_s >> mip) + 1;
+	ch = (f->extent_t >> mip) + 1;
+
+	if (cw <= 0 || ch <= 0)
+		return NULL;
+
+	need = cw * ch;
+	if (need > QSURF_BUDGET / 4)
+		return NULL;			//absurdly large surface, not worth caching
+
+	key  = QSurfLightKey(f);
+	slot = q_face_surf[face_index];
+
+	if (slot >= 0 && slot < QSURF_SLOTS)
+	{
+		sc = &q_surf[slot];
+
+		if (sc->face == face_index && sc->mip == mip &&
+			sc->light_key == key && sc->pixels)
+		{
+			sc->frame = q_surf_frame;
+			*_cw = sc->w;
+			*_ch = sc->h;
+			q_surf_hits++;
+			return sc->pixels;
+		}
+	}
+	else
+	{
+		slot = QSurfCacheEvict;
+		if (slot < 0)
+			return NULL;
+	}
+
+	sc = &q_surf[slot];
+
+	//Grow only. A surface bounces between mips as the player walks, and
+	//reallocating both ways would churn the heap for no gain.
+	if (sc->bytes < need)
+	{
+		while (q_surf_bytes + need - sc->bytes > QSURF_BUDGET)
+		{
+			I64 freed = QSurfCacheEvict;
+			if (freed < 0)
+				break;
+			if (freed == slot)
+				break;
+			if (q_surf[freed].pixels)
+			{
+				q_surf_bytes -= q_surf[freed].bytes;
+				Free(q_surf[freed].pixels);
+				q_surf[freed].pixels = NULL;
+				q_surf[freed].bytes  = 0;
+			}
+		}
+
+		if (sc->pixels)
+		{
+			q_surf_bytes -= sc->bytes;
+			Free(sc->pixels);
+		}
+
+		sc->pixels = MAlloc(need);
+		sc->bytes  = need;
+		q_surf_bytes += need;
+	}
+
+	out      = sc->pixels;
+	mins_s_i = ToI64(f->mins_s);
+	mins_t_i = ToI64(f->mins_t);
+
+	for (v = 0; v < ch; v++)
+	{
+		t0 = v << mip;
+		ty = ((mins_t_i + t0) >> mip) & (th - 1);
+
+		for (u = 0; u < cw; u++)
+		{
+			s0 = u << mip;
+			tx = ((mins_s_i + s0) >> mip) & (tw - 1);
+
+			texel = texels[ty * tw + tx];
+
+			if (lightmap && lm_w > 0 && lm_h > 0)
+			{
+				lightv = QLightBilinear(lightmap, lm_w, lm_h,
+							ToF64(s0) / 16.0, ToF64(t0) / 16.0);
+				light  = ClampI64(ToI64(lightv), 0, 255);
+			}
+			else
+				light = 255;
+
+			shade = ClampI64((255 - light) >> 2, 0, QPAL_SHADES - 1);
+
+			if (texel >= QPAL_FULLBRIGHT)
+				out[v * cw + u] = texel;
+			else
+				out[v * cw + u] = qpal_colormap[shade * QPAL_COLORS + texel];
+		}
+	}
+
+	sc->w         = cw;
+	sc->h         = ch;
+	sc->mip       = mip;
+	sc->face      = face_index;
+	sc->frame     = q_surf_frame;
+	sc->light_key = key;
+
+	q_face_surf[face_index] = slot;
+	q_surf_builds++;
+
+	*_cw = cw;
+	*_ch = ch;
+
+	return out;
+}
+
 U0 QDrawSpan(CQCanvas *c, I64 y, I64 x1, I64 x2,
 	F64 iz1, F64 soz1, F64 toz1, F64 iz2, F64 soz2, F64 toz2,
 	CQTexture *tex, U8 *lightmap, I64 lm_w, I64 lm_h,
-	F64 mins_s, F64 mins_t, I64 flat_light, I64 mip)
+	F64 mins_s, F64 mins_t, I64 flat_light, I64 mip,
+	U8 *surf = NULL, I64 sw = 0, I64 sh = 0)
 {//Fill one horizontal run. HOT LOOP: this is the function to subdivide and
  //then rewrite in assembly. Everything else runs a few thousand times a
  //frame; this runs a few hundred thousand.
@@ -740,8 +1166,6 @@ U0 QDrawSpan(CQCanvas *c, I64 y, I64 x1, I64 x2,
 	F64	 z;
 	F64	 s;
 	F64	 t;
-	F64	 ls;
-	F64	 lt;
 	F64	 ws;
 	F64	 wt;
 	Bool	 turb;
@@ -750,13 +1174,16 @@ U0 QDrawSpan(CQCanvas *c, I64 y, I64 x1, I64 x2,
 	I64	 th;
 	I64	 tx;
 	I64	 ty;
-	I64	 lx;
-	I64	 ly;
+	F64	 lightv;
+	F64	 dlight;
+	F64	 light_e;
 	I64	 light;
 	I64	 shade;
 	I64	 texel;
 	I64	 xe;
 	I64	 n;
+	I64	 mins_s_i;
+	I64	 mins_t_i;
 	F64	 iz_e;
 	F64	 soz_e;
 	F64	 toz_e;
@@ -804,12 +1231,27 @@ U0 QDrawSpan(CQCanvas *c, I64 y, I64 x1, I64 x2,
 	while (mip > 0 && !tex->texels[mip])
 		mip--;
 
-	texels = tex->texels[mip];
-	tw     = tex->width >> mip;
-	th     = tex->height >> mip;
+	//A cached surface already holds the texture with its lighting folded in and
+	//is addressed in SURFACE space, so it needs neither the wrap nor the
+	//colormap below - that is the whole point of building it.
+	if (surf && sw > 0 && sh > 0)
+	{
+		texels = surf;
+		tw     = sw;
+		th     = sh;
+	}
+	else
+	{
+		texels = tex->texels[mip];
+		tw     = tex->width >> mip;
+		th     = tex->height >> mip;
+	}
 
 	if (tw <= 0 || th <= 0 || !texels)
 		return;
+
+	mins_s_i = ToI64(mins_s);
+	mins_t_i = ToI64(mins_t);
 
 	clamp_tex = tex->clamp;
 
@@ -871,6 +1313,23 @@ U0 QDrawSpan(CQCanvas *c, I64 y, I64 x1, I64 x2,
 		ds = (s_e - s) / ToF64(n);
 		dt = (t_e - t) / ToF64(n);
 
+		//Light is interpolated across the block exactly like s and t: sampled
+		//at both ends and stepped between, which is one bilinear fetch per
+		//block rather than per pixel.
+		if (lightmap && lm_w > 0 && lm_h > 0)
+		{
+			lightv  = QLightBilinear(lightmap, lm_w, lm_h,
+						(s - mins_s) / 16.0, (t - mins_t) / 16.0);
+			light_e = QLightBilinear(lightmap, lm_w, lm_h,
+						(s_e - mins_s) / 16.0, (t_e - mins_t) / 16.0);
+			dlight  = (light_e - lightv) / ToF64(n);
+		}
+		else
+		{
+			lightv = ToF64(flat_light);
+			dlight = 0.0;
+		}
+
 		while (x < xe)
 		{
 			//Depth test first: a rejected pixel costs only the adds below.
@@ -883,7 +1342,13 @@ U0 QDrawSpan(CQCanvas *c, I64 y, I64 x1, I64 x2,
 			//s and t stay in level-0 texel space and are shifted down to the
 			//chosen mip here, so the lightmap lookup below - which needs the
 			//unshifted values - is unaffected.
-			if (turb)
+			if (surf)
+			{
+				//Surface space: one cache texel per drawn texel at this mip.
+				tx = ClampI64((ToI64(Floor(s)) - mins_s_i) >> mip, 0, tw - 1);
+				ty = ClampI64((ToI64(Floor(t)) - mins_t_i) >> mip, 0, th - 1);
+			}
+			else if (turb)
 			{
 				//Cross-coupled sine warp. Each axis is displaced by a table
 				//lookup indexed with the OTHER axis, which is what swirls it.
@@ -901,7 +1366,11 @@ U0 QDrawSpan(CQCanvas *c, I64 y, I64 x1, I64 x2,
 				ty = ToI64(Floor(t)) >> mip;
 			}
 
-			if (clamp_tex)
+			if (surf)
+			{
+				//Already clamped above.
+			}
+			else if (clamp_tex)
 			{
 				//Model skin: arbitrary size, never tiles.
 				tx = ClampI64(tx, 0, tw - 1);
@@ -917,33 +1386,29 @@ U0 QDrawSpan(CQCanvas *c, I64 y, I64 x1, I64 x2,
 
 			texel = texels[ty * tw + tx];
 
-			if (lightmap && lm_w > 0 && lm_h > 0)
+			if (surf)
+				row[x] = texel;			//lit when the surface was built
+			else
 			{
-				//One luxel per 16 texels, nearest sample.
-				ls = (s - mins_s) / 16.0;
-				lt = (t - mins_t) / 16.0;
-				lx = ClampI64(ToI64(Floor(ls)), 0, lm_w - 1);
-				ly = ClampI64(ToI64(Floor(lt)), 0, lm_h - 1);
-				light = lightmap[ly * lm_w + lx];
+				light = ClampI64(ToI64(lightv), 0, 255);
+
+				//Colormap row 0 is brightest, row 63 is darkest.
+				shade = (255 - light) >> 2;
+				shade = ClampI64(shade, 0, QPAL_SHADES - 1);
+
+				if (texel >= QPAL_FULLBRIGHT)
+					row[x] = texel;		//fullbrights ignore lighting
+				else
+					row[x] = qpal_colormap[shade * QPAL_COLORS + texel];
 			}
-			else
-				light = flat_light;
-
-			//Colormap row 0 is brightest, row 63 is darkest.
-			shade = (255 - light) >> 2;
-			shade = ClampI64(shade, 0, QPAL_SHADES - 1);
-
-			if (texel >= QPAL_FULLBRIGHT)
-				row[x] = texel;			//fullbrights ignore lighting
-			else
-				row[x] = qpal_colormap[shade * QPAL_COLORS + texel];
 
 			zrow[x] = iz;
 			}
 
-			s  += ds;
-			t  += dt;
-			iz += d_iz;
+			s      += ds;
+			t      += dt;
+			lightv += dlight;
+			iz     += d_iz;
 			x++;
 		}
 
@@ -961,7 +1426,8 @@ U0 QDrawSpan(CQCanvas *c, I64 y, I64 x1, I64 x2,
 
 U0 QDrawPolygon(CQCanvas *c, CQScreenVert *v, I64 count,
 	CQTexture *tex, U8 *lightmap, I64 lm_w, I64 lm_h,
-	F64 mins_s, F64 mins_t, I64 flat_light, I64 mip)
+	F64 mins_s, F64 mins_t, I64 flat_light, I64 mip,
+	U8 *surf = NULL, I64 sw = 0, I64 sh = 0)
 {//Scanline fill of a convex polygon. For each row every edge is intersected
  //and the extreme hits become the span. O(edges) per row, but after clipping
  //there are rarely more than eight edges, and it sidesteps the bookkeeping
@@ -1062,7 +1528,8 @@ U0 QDrawPolygon(CQCanvas *c, CQScreenVert *v, I64 count,
 		{
 			QDrawSpan(c, y, ToI64(Ceil(xl)), ToI64(Ceil(xr)),
 				izl, sozl, tozl, izr, sozr, tozr,
-				tex, lightmap, lm_w, lm_h, mins_s, mins_t, flat_light, mip);
+				tex, lightmap, lm_w, lm_h, mins_s, mins_t, flat_light, mip,
+				surf, sw, sh);
 		}
 	}
 }
@@ -1371,6 +1838,9 @@ U0 QDrawFace(CQCanvas *c, CQMap *map, I64 face_index, F64 *offset = NULL)
 	CQScreenVert scr[QMAX_POLY_VERTS];
 	CQVertex	*wv;
 	U8			*lightmap = NULL;
+	U8			*surf = NULL;
+	I64			 sw = 0;
+	I64			 sh = 0;
 	F64			 rel[3];
 	F64			 inv_z;
 	I64			 n = 0;
@@ -1480,10 +1950,17 @@ U0 QDrawFace(CQCanvas *c, CQMap *map, I64 face_index, F64 *offset = NULL)
 		else
 			mip = 3;
 
+		//D_CacheSurface. A turbulent surface warps its coordinates every frame
+		//and a sky is drawn by direction, so neither can be cached; everything
+		//else is built once and reused until its mip or lighting changes.
+		if (!tex->is_turb && !tex->clamp)
+			surf = QSurfCacheGet(map, f, face_index, tex, mip,
+					lightmap, lm_w, lm_h, &sw, &sh);
+
 		//Unlit faces (anything the compiler left without a lightmap) render
 		//fullbright, matching how they look in the original.
 		QDrawPolygon(c, scr, count, tex, lightmap, lm_w, lm_h,
-			f->mins_s, f->mins_t, 255, mip);
+			f->mins_s, f->mins_t, 255, mip, surf, sw, sh);
 	}
 
 	c->faces_drawn++;
