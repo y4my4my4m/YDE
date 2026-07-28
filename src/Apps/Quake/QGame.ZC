@@ -139,6 +139,37 @@ Bool QGameSetField(I64 ent, U8 *key, U8 *value)
 #define QSPAWNFLAG_NOT_HARD			1024
 #define QSPAWNFLAG_NOT_DEATHMATCH	2048
 
+//coop resolved for this level. NOT zeroed by the loader, QGameApplyModeCvars
+//is the init and every reader goes through it first
+Bool q_coop_active = FALSE;
+
+U0 QGameApplyModeCvars()
+{//resolve the game mode, then publish it to the VM
+ //
+ //coop and deathmatch are mutually exclusive - Host_InitLocal forces
+ //deathmatch off whenever coop is set. every later test (entity inhibit,
+ //SelectSpawnPoint, respawn) reads the resolved pair, so it is settled once
+ //here and never re-derived
+ //
+ //SV_SpawnServer publishes these as progs GLOBALS, not cvars - CheatCommand
+ //(impulse 9) returns early on deathmatch || coop, and SelectSpawnPoint reads
+ //coop to pick info_player_coop. left at 0 the QuakeC side plays single player
+	q_coop_active = FALSE;
+
+	if (QCvarGet("coop") != 0.0)
+	{
+		q_coop_active = TRUE;
+
+		if (QCvarGet("deathmatch") != 0.0)
+			QCvarSet("deathmatch", 0.0);
+	}
+
+	if (q_ofs_coop >= 0)
+		QPrSetF(q_ofs_coop, QCvarGet("coop"));
+	if (q_ofs_deathmatch >= 0)
+		QPrSetF(q_ofs_deathmatch, QCvarGet("deathmatch"));
+}
+
 Bool QGameInhibitEntity(I64 ent)
 {//ED_LoadFromFile - does this entity belong in the game being started
 	I64 flags;
@@ -150,7 +181,14 @@ Bool QGameInhibitEntity(I64 ent)
 
 	flags = ToI64(QPrFieldF(ent, q_fld_spawnflags));
 
-	if (QCvarGet("deathmatch") != 0.0)
+	//coop takes the SKILL path, not the deathmatch one - deathmatch is forced
+	//to 0 above, so monsters spawn exactly as in single player. the coop test
+	//is belt and braces in case a cvar was written behind our back
+	//
+	//deathmatch-only entities carry 1792 (NOT_EASY|NOT_MEDIUM|NOT_HARD) and so
+	//stay inhibited by whichever skill line matches - that is how the original
+	//keeps DM pads out of a coop game
+	if (!q_coop_active && QCvarGet("deathmatch") != 0.0)
 		return ToBool(flags & QSPAWNFLAG_NOT_DEATHMATCH);
 
 	//current_skill is the clamped integer, not the raw cvar - skill 3 uses
@@ -1047,6 +1085,61 @@ U0 QGameRunThinks()
 	}
 }
 
+//set when a coop game swallowed a "restart" - the remote pass in QSvRunClients
+//picks it up and respawns the other bodies. NOT zeroed by the loader
+Bool q_coop_respawn_pending = FALSE;
+
+Bool QGameCoopRespawn(I64 ent)
+{//respawn(), coop branch of client.qc:
+ //    CopyToBodyQue (self); setspawnparms (self); PutClientInServer ();
+ //
+ //back into the RUNNING level - no map reload, so nobody else loses progress
+	I64 fn;
+	I64 slot;
+	I64 ofs;
+	I64 i;
+
+	if (ent <= 0 || ent >= q_pr_num_edicts || q_pr_edict_free[ent])
+		return FALSE;
+
+	//leave a corpse where they fell, as the original does
+	fn = QPrFindFunction("CopyToBodyQue");
+	if (fn > 0)
+	{
+		QPrSetI(q_ofs_self, QPrEdictValue(ent));
+		QPrSetI(q_ofs_other, 0);
+		QPrExecute(fn);
+		q_pr_error = FALSE;
+	}
+
+	//setspawnparms: the kit this client had at LEVEL START, not at death.
+	//clients are edicts 1..maxclients, so the slot is the edict minus one
+	slot = ent - 1;
+	if (slot >= 0 && slot < QSV_MAX_CLIENTS && q_client_parms_set[slot])
+	{
+		for (i = 0; i < QGAME_MAX_PARMS; i++)
+		{
+			ofs = q_ofs_parms[i];
+			if (ofs >= 0)
+				QPrSetF(ofs,
+					q_client_parms[slot * QPR_MAX_PARM_GLOBALS + i]);
+		}
+	}
+
+	fn = QPrFindFunction("PutClientInServer");
+	if (fn <= 0)
+		return FALSE;
+
+	QPrSetI(q_ofs_self, QPrEdictValue(ent));
+	QPrSetI(q_ofs_other, 0);
+	QPrExecute(fn);
+	q_pr_error = FALSE;
+
+	QGameLinkEdict(ent);
+
+	return TRUE;
+}
+
 U0 QGameFrame(F64 dt)
 {//advance game time, run one round of thinking
 	I64 fn;
@@ -1059,10 +1152,7 @@ U0 QGameFrame(F64 dt)
 	//SV_SpawnServer publishes the game mode globals. they must be explicitly
 	//zero in single player - CheatCommand (impulse 9) returns early on
 	//deathmatch || coop
-	if (q_ofs_deathmatch >= 0)
-		QPrSetF(q_ofs_deathmatch, QCvarGet("deathmatch"));
-	if (q_ofs_coop >= 0)
-		QPrSetF(q_ofs_coop, QCvarGet("coop"));
+	QGameApplyModeCvars;
 
 	//skill sits outside pr_global_struct, at global offset 349, and progs
 	//never writes it - the engine publishes it by name via ED_FindGlobal.
@@ -1092,6 +1182,26 @@ U0 QGameFrame(F64 dt)
 
 	QGameRunPhysics(dt);
 	QGameRunThinks;
+
+	//COOP MUST NOT RELOAD THE LEVEL ON A DEATH. stock client.qc already avoids
+	//it - respawn() only reaches localcmd("restart\n") on the single player
+	//branch - but a mod that got here anyway would throw away every other
+	//player's progress, so the request is swallowed and serviced in place
+	//
+	//the local body is done here, right before the shell adopts .origin off the
+	//edict. remotes are cached in the server slots, so QSvRunClients redoes
+	//them where it can also fix the cache
+	if (q_coop_active && q_restart_pending)
+	{
+		q_restart_pending = FALSE;
+		QLog("QGame: coop - respawning in place, not restarting\n");
+
+		if (q_player_edict > 0 &&
+			QPrFieldF(q_player_edict, q_fld_health) <= 0.0)
+			QGameCoopRespawn(q_player_edict);
+
+		q_coop_respawn_pending = TRUE;
+	}
 }
 
 U0 QGameSaveParms()
@@ -1100,6 +1210,8 @@ U0 QGameSaveParms()
 	I64	fn;
 	I64	ofs;
 	I64	i;
+	I64	slot;
+	I64	ent;
 	F64	value;
 
 	q_have_saved_parms = FALSE;
@@ -1108,13 +1220,48 @@ U0 QGameSaveParms()
 		return;
 
 	fn = QPrFindFunction("SetChangeParms");
-	if (fn > 0)
+
+	//SV_SaveSpawnparms runs SetChangeParms for EVERY client and stores the
+	//result on that client - in coop each player carries their own kit across
+	//the level change, so one shared copy would hand everyone the host's
+	//loadout. clients are edicts 1..maxclients
+	for (slot = 0; slot < QSV_MAX_CLIENTS; slot++)
 	{
-		QPrSetI(q_ofs_self, QPrEdictValue(q_player_edict));
-		QPrExecute(fn);
-		q_pr_error = FALSE;
+		ent = slot + 1;
+
+		if (ent >= q_pr_num_edicts || q_pr_edict_free[ent])
+			goto qsp_next;
+		if (!(ToI64(QPrFieldF(ent, q_fld_flags)) & QFL_CLIENT))
+			goto qsp_next;
+
+		if (fn > 0)
+		{
+			QPrSetI(q_ofs_self, QPrEdictValue(ent));
+			QPrExecute(fn);
+			q_pr_error = FALSE;
+		}
+
+		for (i = 0; i < QGAME_MAX_PARMS; i++)
+		{
+			ofs = q_ofs_parms[i];
+			if (ofs < 0)
+				goto qsp_next_parm;
+
+			//via a temp - this compiler computes the slot address before
+			//evaluating the call and can lose the store
+			value = QPrGetF(ofs);
+			q_client_parms[slot * QPR_MAX_PARM_GLOBALS + i] = value;
+
+qsp_next_parm:
+		}
+
+		q_client_parms_set[slot] = TRUE;
+
+qsp_next:
 	}
 
+	//the local player's set is also the one restored into the freshly loaded
+	//bytecode, so worldspawn and the first ClientConnect see something sane
 	for (i = 0; i < QGAME_MAX_PARMS; i++)
 	{
 		q_saved_parms[i] = 0.0;
@@ -1122,25 +1269,19 @@ U0 QGameSaveParms()
 
 		if (ofs >= 0)
 		{
-			//via a temp - this compiler computes the slot address before
-			//evaluating the call and can lose the store
-			value = QPrGetF(ofs);
+			value = q_client_parms[i];
 			q_saved_parms[i] = value;
 		}
 	}
 
-	//serverflags tracks which episode runes are collected
+	//serverflags tracks which episode runes are collected. it is a progs
+	//GLOBAL, not a client field - episode progression is SHARED in coop, so it
+	//is read once here and never stamped per player
 	if (q_ofs_serverflags >= 0)
 	{
 		value = QPrGetF(q_ofs_serverflags);
 		q_saved_serverflags = value;
 	}
-
-	//SV_SaveSpawnparms also stashes it on the client, which is what
-	//setspawnparms hands back later
-	for (i = 0; i < QGAME_MAX_PARMS; i++)
-		q_client_parms[i] = q_saved_parms[i];
-	q_client_parms_set[0] = TRUE;
 
 	q_have_saved_parms = TRUE;
 }
@@ -1216,12 +1357,23 @@ Bool QGameInit(CQMap *map, Bool spawn_entities = TRUE)
 	q_game_thinks  = 0;
 	q_game_spawned = 0;
 
+	//globals aren't zeroed
+	q_coop_active          = FALSE;
+	q_coop_respawn_pending = FALSE;
+
 	if (!QPrLoad("progs.dat", QGAME_MAX_EDICTS))
 		return FALSE;
 
 	QPrCacheOffsets;
 	QBiInit;
 	q_bi_map = map;
+
+	//BEFORE ANY SPAWN RUNS. QGameInhibitEntity reads the resolved pair for
+	//every map entity, and PutClientInServer -> SelectSpawnPoint reads the
+	//coop global to pick info_player_coop over info_player_start. published
+	//only per-frame it would be 0 for the whole spawn pass, and coop players
+	//would all pile onto the single player start
+	QGameApplyModeCvars;
 
 	//before any spawn runs - slot 1 = world, 2..N = its submodels
 	QBiPrecacheWorld(map, q_map_name);
@@ -1428,6 +1580,13 @@ Bool QClientSpawnAt(I64 ent, F64 *origin, F64 *angles, U8 *player_name)
 
 	if (ent <= 0)
 		return FALSE;
+
+	//SelectSpawnPoint reads the coop and deathmatch GLOBALS, not the cvars:
+	//coop -> "info_player_coop" (falling back to info_player_start when the
+	//map has none), deathmatch -> the info_player_deathmatch ring. resolve
+	//them again here so a mode change between levels cannot spawn a late
+	//joiner by the previous game's rules
+	QGameApplyModeCvars;
 
 	if (!player_name || !player_name[0])
 		netname = "player";

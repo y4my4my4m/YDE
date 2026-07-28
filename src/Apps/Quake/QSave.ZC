@@ -15,8 +15,17 @@
 // load runs the map and bytecode up but NOT the spawn functions, then
 // overwrites the world
 
-#define QSAVE_MAGIC		0x56535A51	//"QZSV" little-endian
-#define QSAVE_VERSION	1
+// version 2 appends a spawn parm block for every client slot. it is a TRAILER,
+// past everything version 1 wrote, because CQSaveHeader's size is baked into
+// every v1 file on disk - growing the class would shift the whole body and
+// misread them. a v1 file simply has no trailer, and loads as one client
+#define QSAVE_MAGIC			0x56535A51	//"QZSV" little-endian
+#define QSAVE_VERSION		2
+#define QSAVE_VERSION_MIN	1
+
+//I64 slot count, I64 parms per slot, then per slot an I64 set flag and its
+//parms - counts are in the trailer, not the frozen header
+#define QSAVE_PARM_BYTES	(16 + QSV_MAX_CLIENTS * (8 + QPR_MAX_PARM_GLOBALS * 8))
 
 class CQSaveHeader
 {
@@ -45,6 +54,57 @@ U8 *QSaveAppend(U8 *dst, U8 *src, I64 bytes)
 {//append and return the new write point
 	MemCopy(dst, src, bytes);
 	return dst + bytes;
+}
+
+U0 QSaveSpawnParms()
+{//SV_SaveSpawnparms: run SetChangeParms once per ACTIVE client with self set
+ //to that client's body, and keep what it leaves in parm1..parm16
+ //
+ //the QuakeC side is untouched - this is the same call the changelevel path
+ //makes, only over every slot instead of the local player alone. without it a
+ //coop save carries one inventory and the other players respawn empty
+	I64	fn;
+	I64	ofs;
+	I64	ent;
+	I64	i;
+	I64	j;
+	F64	value;
+
+	fn = QPrFindFunction("SetChangeParms");
+	if (fn <= 0)
+		return;
+
+	for (i = 0; i < QSV_MAX_CLIENTS; i++)
+	{
+		if (!q_sv_clients[i].active)
+			goto qsp_next;
+
+		ent = q_sv_clients[i].edict;
+		if (ent < 1 || ent >= q_pr_num_edicts || q_pr_edict_free[ent])
+			goto qsp_next;
+
+		QPrSetI(q_ofs_self, QPrEdictValue(ent));
+		QPrExecute(fn);
+		q_pr_error = FALSE;
+
+		for (j = 0; j < QPR_MAX_PARM_GLOBALS; j++)
+		{
+			ofs = q_ofs_parms[j];
+			if (ofs < 0)
+				goto qsp_next_parm;
+
+			//via a temp - this compiler computes the slot address before
+			//evaluating the call and can lose the store
+			value = QPrGetF(ofs);
+			q_client_parms[i * QPR_MAX_PARM_GLOBALS + j] = value;
+
+qsp_next_parm:
+		}
+
+		q_client_parms_set[i] = TRUE;
+
+qsp_next:
+	}
 }
 
 Bool QSaveWrite(U8 *path, U8 *mapname, F64 game_time, F64 *origin,
@@ -80,6 +140,17 @@ Bool QSaveWrite(U8 *path, U8 *mapname, F64 game_time, F64 *origin,
 		"QSave: can't save in intermission\n";
 		return FALSE;
 	}
+
+	//Host_Savegame_f: deathmatch is out, there is nothing coherent to restore
+	//when the level is a scoreboard. coop is fine and keeps every inventory
+	if (QCvarGet("deathmatch") != 0.0)
+	{
+		"QSave: can't save a deathmatch game\n";
+		return FALSE;
+	}
+
+	//refresh every active client's parms first, they are written below
+	QSaveSpawnParms;
 
 	MemSet(&hdr, 0, sizeof(CQSaveHeader));
 
@@ -119,7 +190,8 @@ Bool QSaveWrite(U8 *path, U8 *mapname, F64 game_time, F64 *origin,
 		+ q_pr_num_edicts			//one free flag per edict
 		+ q_pr_strings_size
 		+ QMAX_LIGHTSTYLES * QLIGHTSTYLE_LEN
-		+ (q_precache_model_count + q_precache_sound_count) * 8;
+		+ (q_precache_model_count + q_precache_sound_count) * 8
+		+ QSAVE_PARM_BYTES;
 
 	if (total < 1)
 	{
@@ -171,6 +243,28 @@ Bool QSaveWrite(U8 *path, U8 *mapname, F64 game_time, F64 *origin,
 			ofs = q_precache_sound[i] - q_pr_strings;
 		MemCopy(p, &ofs, 8);
 		p += 8;
+	}
+
+	//--- version 2 trailer: per client spawn parms ---
+	ofs = QSV_MAX_CLIENTS;
+	MemCopy(p, &ofs, 8);
+	p += 8;
+
+	ofs = QPR_MAX_PARM_GLOBALS;
+	MemCopy(p, &ofs, 8);
+	p += 8;
+
+	for (i = 0; i < QSV_MAX_CLIENTS; i++)
+	{
+		ofs = 0;
+		if (q_client_parms_set[i])
+			ofs = 1;
+		MemCopy(p, &ofs, 8);
+		p += 8;
+
+		MemCopy(p, &q_client_parms[i * QPR_MAX_PARM_GLOBALS],
+			QPR_MAX_PARM_GLOBALS * 8);
+		p += QPR_MAX_PARM_GLOBALS * 8;
 	}
 
 	if (FileWrite(path, buf, total) < 1)
@@ -228,10 +322,14 @@ Bool QSaveReadHeader(U8 *path, U8 *_mapname)
 
 	MemCopy(&q_save_hdr, q_save_buf, sizeof(CQSaveHeader));
 
+	//a version 1 file is still perfectly readable, it just stops after the
+	//precache lists. reject only what is not ours or is from the future
 	if (q_save_hdr.magic != QSAVE_MAGIC ||
-		q_save_hdr.version != QSAVE_VERSION)
+		q_save_hdr.version < QSAVE_VERSION_MIN ||
+		q_save_hdr.version > QSAVE_VERSION)
 	{
-		"QSave: %s is not a version %d save\n", path, QSAVE_VERSION;
+		"QSave: %s is not a version %d..%d save\n", path,
+			QSAVE_VERSION_MIN, QSAVE_VERSION;
 		QSaveDiscard;
 		return FALSE;
 	}
@@ -249,6 +347,11 @@ Bool QSaveRestore(F64 *_game_time, F64 *origin, F64 *velocity, F64 *angles,
 	I64				 ofs;
 	I64				 i;
 	I64				 j;
+	I64				 slots;
+	I64				 nparm;
+	I64				 flag;
+	I64				 remaining;
+	F64				 value;
 
 	if (!q_save_buf)
 		return FALSE;
@@ -324,6 +427,57 @@ Bool QSaveRestore(F64 *_game_time, F64 *origin, F64 *velocity, F64 *angles,
 		q_saved_parms[j] = hdr->saved_parms[j];
 	q_saved_serverflags = hdr->saved_serverflags;
 	q_have_saved_parms  = TRUE;
+
+	//--- per client spawn parms ---
+	//
+	//seed every slot from the header first. that is all a version 1 file has,
+	//and it is exactly the old single client behaviour - slot 0 holds the
+	//player's kit and nobody else is set
+	for (i = 0; i < QSV_MAX_CLIENTS; i++)
+		q_client_parms_set[i] = FALSE;
+
+	for (j = 0; j < QPR_MAX_PARM_GLOBALS; j++)
+		q_client_parms[j] = hdr->saved_parms[j];
+	q_client_parms_set[0] = TRUE;
+
+	remaining = q_save_size - (p - q_save_buf);
+
+	if (hdr->version >= 2 && remaining >= 16)
+	{
+		//counts live here, not in the header - the header is frozen at its
+		//version 1 size and a wider QSV_MAX_CLIENTS must still read old files
+		MemCopy(&slots, p, 8);
+		p += 8;
+		MemCopy(&nparm, p, 8);
+		p += 8;
+		remaining -= 16;
+
+		if (slots >= 0 && nparm >= 0 &&
+			remaining >= slots * (8 + nparm * 8))
+		{
+			for (i = 0; i < slots; i++)
+			{
+				MemCopy(&flag, p, 8);
+				p += 8;
+
+				//read every parm the file has, keep the ones this build has
+				//room for - a save from a bigger progs must not walk off
+				for (j = 0; j < nparm; j++)
+				{
+					MemCopy(&value, p, 8);
+					p += 8;
+
+					if (i < QSV_MAX_CLIENTS && j < QPR_MAX_PARM_GLOBALS)
+						q_client_parms[i * QPR_MAX_PARM_GLOBALS + j] = value;
+				}
+
+				if (i < QSV_MAX_CLIENTS)
+					q_client_parms_set[i] = ToBool(flag);
+			}
+		}
+		else
+			"QSave: parm block is malformed, keeping one client\n";
+	}
 
 	for (j = 0; j < 3; j++)
 	{
