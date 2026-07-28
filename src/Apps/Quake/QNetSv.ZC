@@ -158,6 +158,10 @@ class CQSvClient
 };
 
 CQSvClient	q_sv_clients[QSV_MAX_CLIENTS];
+
+//One-shot: a client slot holding an edict that is not its reserved one.
+Bool	q_sv_edict_warned = FALSE;
+U8		q_sv_edict_line[96];
 I64			q_sv_client_count = 0;
 
 U0 QNetClientClear()
@@ -298,7 +302,15 @@ U0 QNetWriteBaselines(CQMsg *m, Bool update_local=TRUE)
 
 	for (i = 1; i < q_pr_num_edicts && i < QNET_MAX_ENTS; i++)
 	{
-		if (q_pr_edict_free[i] || !QNetEntityVisible(i))
+		if (q_pr_edict_free[i])
+			goto qnb_next;
+
+		//SV_CreateBaseline: "create baselines for all player slots, and any
+		//other edict that has a visible model". The client-slot exemption is
+		//not optional - baselines are captured before anyone is put in the
+		//server, so every client edict is still an empty reserved shell here
+		//and the visibility test would drop all of them.
+		if (i > QSV_MAX_CLIENTS && !QNetEntityVisible(i))
 			goto qnb_next;
 
 		b = &q_net_baseline[i];
@@ -1054,6 +1066,47 @@ U0 QNetParseClientdata(CQMsg *m)
 	q_cl.weapon       = QMsgReadByte(m);
 }
 
+U0 QNetParseStatic(CQMsg *m)
+{//svc_spawnstatic. Read in full even when the slot table is exhausted or the
+ //model is unknown, or the bytes are left in the stream.
+	CQStaticEnt	*se;
+	I64			 idx;
+	I64			 frame;
+	I64			 j;
+	F64			 org[3];
+	F64			 ang[3];
+
+	idx   = QMsgReadByte(m);
+	frame = QMsgReadByte(m);
+	QMsgReadByte(m);		//colormap
+	QMsgReadByte(m);		//skin
+
+	for (j = 0; j < 3; j++)
+	{
+		org[j] = QMsgReadCoord(m);
+		ang[j] = QMsgReadAngle(m);
+	}
+
+	if (m->badread || q_static_count >= QBI_MAX_STATIC)
+		return;
+
+	se = &q_static_ent[q_static_count];
+	se->mdl = NULL;
+	if (idx > 0 && idx < q_precache_model_count)
+		se->mdl = q_precache_mdl[idx];
+
+	if (!se->mdl)
+		return;
+
+	for (j = 0; j < 3; j++)
+	{
+		se->origin[j] = org[j];
+		se->angles[j] = ang[j];
+	}
+	se->frame = frame;
+	q_static_count++;
+}
+
 U0 QNetParseBaseline(CQMsg *m)
 {
 	CQEntState	*b;
@@ -1206,6 +1259,22 @@ Bool QNetClientParse(CQMsg *m)
 
 			case QSVC_SPAWNBASELINE:
 				QNetParseBaseline(m);
+				break;
+
+			//Static entities have no edict on the client and are never
+			//updated. Both of these arrive in the signon block, so failing to
+			//consume them desynchronises the whole rest of the stream - which
+			//is what would happen against a stock Quake host.
+			case QSVC_SPAWNSTATIC:
+				QNetParseStatic(m);
+				break;
+
+			case QSVC_SPAWNSTATICSOUND:
+				for (i = 0; i < 3; i++)
+					QMsgReadCoord(m);
+				QMsgReadByte(m);		//sound number
+				QMsgReadByte(m);		//volume
+				QMsgReadByte(m);		//attenuation
 				break;
 
 			case QSVC_SERVERINFO:
@@ -2391,13 +2460,15 @@ U0 QSvSendClientSignon(I64 slot, I64 stage)
 
 	if (stage == 2)
 	{
-		//Host_PreSpawn_f: baselines, lightstyles, sv.signon, signonnum 2.
-		QNetWriteBaselines(&q_net_send, FALSE);
+		//Host_PreSpawn_f: sv.signon (which carries the baselines), lightstyles,
+		//signonnum 2.
 		QNetWriteLightstyles(&q_net_send);
 
-		//sv.signon holds the svc_spawnstatic run built by makestatic during
-		//map load, plus anything QuakeC wrote to MSG_INIT. It is replayed to
-		//each client here and never cleared: a later joiner needs it too.
+		//sv.signon: the baselines, the svc_spawnstatic run built by makestatic
+		//and anything QuakeC wrote to MSG_INIT, all captured ONCE at map load.
+		//Replayed verbatim to every client and never rebuilt - re-capturing it
+		//per join would move the delta reference under the clients already
+		//playing, and every one of their entity updates measures from it.
 		QMsgAppendIfRoom(&q_net_send, &q_sv_signon, QNET_MAX_MSG);
 		QMsgWriteByte(&q_net_send, QSVC_SIGNONNUM);
 		QMsgWriteByte(&q_net_send, 2);
@@ -2970,6 +3041,26 @@ U0 QSvRunClients(F64 dt, F64 now)
 		if (ent <= 0)
 			goto qsr_next;
 
+		//Client i owns edict i+1 for the whole level - QGameInit reserved it.
+		//Writing this client's origin through any other edict number stamps
+		//its position onto somebody else's body, which is exactly what a
+		//remote joining did to the host. Self-heal and say so once.
+		if (ent != i + 1)
+		{
+			if (!q_sv_edict_warned)
+			{
+				q_sv_edict_warned = TRUE;
+				StrPrint(q_sv_edict_line,
+					"net: SLOT %d HELD EDICT %d, EXPECTED %d\n",
+					i, ent, i + 1);
+				QLog(q_sv_edict_line);
+				QLogFlush;
+			}
+
+			ent = i + 1;
+			q_sv_clients[i].edict = ent;
+		}
+
 		//PutClientInServer should have done this; force it so the body is
 		//always drawable through the ordinary entity path.
 		QSvEnsureClientModel(ent);
@@ -3050,7 +3141,6 @@ U0 QSvRunClients(F64 dt, F64 now)
 			QVecNormalize(wish_move);
 
 		QSvCallPlayerFunc(ent, "PlayerPreThink");
-
 		//PreThink may jump / teleport - adopt before hull walk.
 		for (j = 0; j < 3; j++)
 		{
@@ -3087,7 +3177,7 @@ U0 QSvRunClients(F64 dt, F64 now)
 			QMOVETYPE_WALK);
 		if (walking && q_map)
 			QPlayerMove(q_map, org, vel, wish_move, wishspeed, FALSE, dt,
-				&on_ground, water_level, waterjump, ang);
+				&on_ground, water_level, waterjump, ang, ent);
 
 		q_sv_clients[i].on_ground = on_ground;
 		flags = ToI64(QPrFieldF(ent, q_fld_flags));
@@ -3104,15 +3194,11 @@ U0 QSvRunClients(F64 dt, F64 now)
 			QPrSetFieldF(ent, q_fld_velocity + j, vel[j]);
 		}
 		QGameLinkEdict(ent);
-
 		//Items/doors/teleporters after the move so pickups see new origin.
 		QGameTouchTriggersFor(ent);
-
 		QSvCallPlayerFunc(ent, "PlayerPostThink");
-
 		//Frame chains (player_shot1 -> player_run) live on .think/.nextthink.
 		QSvRunEntityThink(ent);
-
 		//PostThink may have teleported / knocked; adopt what QuakeC decided.
 		for (j = 0; j < 3; j++)
 		{
