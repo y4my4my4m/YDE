@@ -877,6 +877,7 @@ U0 QRenderFrame()
 	F64		 fov_y;
 	F64		 vm_org[3];
 	F64		 view_angles[3];
+	F64		 saved_idle;
 	CQMdl	*vm_mdl;
 	F64		 vm_depth;
 	F64		 snd_fwd[3];
@@ -921,10 +922,25 @@ U0 QRenderFrame()
 	q_view[2] += 1.0 / 32.0;
 
 	QVecCopy(q_angles, view_angles);
-	view_angles[2] = QViewRoll(q_angles, q_velocity);
 
-	//Weapon recoil and damage kicks, on the render copy only.
-	QViewApplyKick(view_angles);
+	//V_CalcIntermissionRefdef: the parked camera gets V_AddIdle with
+	//v_idlescale forced to 1 - a slow breathing sway - and none of the
+	//gameplay view motion: no velocity roll, no kicks, no bob.
+	if (q_intermission)
+	{
+		saved_idle   = q_idle_scale;
+		q_idle_scale = 1.0;
+		view_angles[2] = 0.0;
+		QViewAddIdle(view_angles);
+		q_idle_scale = saved_idle;
+	}
+	else
+	{
+		view_angles[2] = QViewRoll(q_angles, q_velocity);
+
+		//Weapon recoil and damage kicks, on the render copy only.
+		QViewApplyKick(view_angles);
+	}
 
 	//The dead view lies on its side. V_CalcRefdef sets roll to 80 and returns
 	//early once health reaches zero, which is what makes death read as
@@ -939,7 +955,7 @@ U0 QRenderFrame()
 
 	//The listener's own body is always full volume and centred, so the mixer needs
 	//which entity that is.
-	if (q_udp_ready && !q_udp_server)
+	if (QClientMode)
 		q_snd_viewent = q_cl_viewent;
 	else
 		q_snd_viewent = q_player_edict;
@@ -974,7 +990,7 @@ U0 QRenderFrame()
 
 	//S_UpdateAmbientSounds: the compiled per-leaf wind and water. Passed the
 	//leaf and the cvars because QSound.ZC compiles before both.
-	if (q_map)
+	if (QMapValid(q_map, "QSndLeafAmbients"))
 		QSndLeafAmbients(q_map, QVisLeafForPoint(q_map, q_view),
 			QCvarGet("ambient_level"), QCvarGet("ambient_fade"), tS);
 
@@ -986,6 +1002,18 @@ U0 QRenderFrame()
 	//the projection centres on.
 	QDrawSetViewRect(q_canvas, QCvarGet("viewsize"), 24);
 	QDrawSetView(q_canvas, q_view, view_angles, q_fov);
+
+	//NO WORLD, NO WORLD RENDER. There are two windows where these are absent:
+	//between a changelevel releasing the old map and the new one arriving, and
+	//after a changelevel that failed outright. A demo reaches both, because its
+	//svc_serverinfo changes the level from inside the stream - so the frame
+	//loop keeps running while the map it draws is gone.
+	if (!QMapValid(q_map, "QRenderFrame") || !q_vis)
+	{
+		QSbarDraw(q_canvas);
+		return;
+	}
+
 	QVisBuildList(q_vis, q_view, forward, right, up, q_fov, fov_y);
 	QDrawWorld(q_canvas, q_map, q_vis);
 
@@ -999,7 +1027,7 @@ U0 QRenderFrame()
 			//QSvSpawnRemote) is always visible. GUEST has no copy of the host
 			//player in its edict table - force the wire path, and never skip
 			//edict 1 (both ends use it for "the player").
-			if (q_udp_ready && !q_udp_server)
+			if (QClientMode)
 			{
 				//svc_setview names this client's body on the host. Fall back to 0 (draw
 				//everyone) only if the host forgot to send it.
@@ -1051,7 +1079,7 @@ U0 QRenderFrame()
 
 		//Thin client: weaponmodel on the wire is a precache index, not a
 		//QuakeC string. Prefer that so the viewgun tracks the host.
-		if (q_udp_ready && !q_udp_server && q_cl.weaponmodel > 0 &&
+		if (QClientMode && q_cl.weaponmodel > 0 &&
 			q_cl.weaponmodel < q_precache_model_count)
 		{
 			vm_mdl   = q_precache_mdl[q_cl.weaponmodel];
@@ -1230,9 +1258,24 @@ Bool QLoadMap(U8 *mapname)
 	//functions run, so it has to be empty before the world comes up.
 	QSvClearSignon;
 
+	//Playback is driven entirely by the recorded server stream, which carries
+	//its own baselines, entity updates and view state. Bringing up QuakeC here
+	//would spawn a second, live world - complete with a player at the map's
+	//start point - and the two would fight over every edict. That is exactly
+	//what "playdemo just drops me into the level" looks like.
+	if (q_demo_playing)
+	{
+		//Any world left over from a previous map still holds edicts and
+		//precache slots that the demo's own numbering would collide with.
+		QGameShutdown;
+
+		QNetStatesClear;
+		QNetClientClear;
+	}
+
 	//Bring up the QuakeC world. If the bytecode is unavailable the game falls
 	//back to the static entity list, which still renders but never thinks.
-	if (QGameInit(q_map))
+	else if (QGameInit(q_map))
 	{
 		StrPrint(line, "QuakeC: %d spawn functions ran, %d edicts live\n",
 			q_game_spawned, q_pr_num_edicts);
@@ -1491,6 +1534,46 @@ Bool QChangeLevel(U8 *mapname)
 	return TRUE;
 }
 
+U0 QClientPrecacheRebuild()
+{//CL_ParseServerInfo's precache resolution, deferred to just after the map
+ //load it depends on. The serverinfo lists are replayed into the builtin
+ //tables IN WIRE ORDER, so every modelindex and sound number in the stream
+ //lands on the same entry it referred to on the server.
+	U8	*name;
+	I64	 j;
+
+	QBiFreePrecache;
+
+	//Slot 0 is "no model"; entry 1, the world, is the map itself and is
+	//already loaded - resolving it through the external-BSP cache would load
+	//the whole map a second time.
+	q_precache_model[0]    = NULL;
+	q_precache_mdl[0]      = NULL;
+	q_precache_model_count = 1;
+
+	for (j = 0; j < q_cl_model_count; j++)
+	{
+		name = q_cl_model_names + j * QCL_PRECACHE_NAME;
+		if (j == 0)
+		{
+			QStrCopy(q_world_model_name, name, 96);
+			q_precache_model[1] = q_world_model_name;
+			q_precache_mdl[1]   = NULL;
+			q_precache_model_count = 2;
+		}
+		else
+			QBiPrecacheModel(name);
+	}
+
+	for (j = 0; j < q_cl_sound_count; j++)
+		q_precache_sound[j] = q_cl_sound_names + j * QCL_PRECACHE_NAME;
+	q_precache_sound_count = q_cl_sound_count;
+
+	StrPrint(q_join_line, "client: %d models, %d sounds precached\n",
+		q_precache_model_count, q_precache_sound_count);
+	QLog(q_join_line);
+}
+
 U0 QInputDrain()
 {//Consume queued keyboard messages.
  //
@@ -1727,23 +1810,96 @@ U0 QGameLoop()
 			QNetClientFrame;
 		}
 
+		//A demo is a server stream and has to be pumped whatever the UI is
+		//doing, which is why Host_Frame calls CL_ReadFromServer
+		//unconditionally. The console and menu states below both jump to the
+		//end of the frame, and the in-game tick that used to carry this call
+		//is skipped during playback - so without a pump here the stream is
+		//never read at all.
+		if (q_demo_playing)
+		{
+			//The map FIRST. svc_serverinfo names the level and everything
+			//after it - baselines, entity updates - describes that world, so
+			//reading further before the load would fill the client tables and
+			//then have the changelevel clear them.
+			if (q_change_pending)
+			{
+				q_change_pending = FALSE;
+				if (QChangeLevel(q_change_map))
+					QClientPrecacheRebuild;
+				else
+				{
+					QLog("demo: level failed to load, stopping\n");
+					q_demo_loop = FALSE;
+					QDemoStop;
+				}
+			}
+
+			QNetClientFrame;
+
+			//The camera tracks the view entity HERE, not only in the play
+			//tick: with the menu open the tick is skipped, and the world
+			//would render dimmed behind the menu from whatever the view
+			//globals last held.
+			if (q_demo_playing)
+			{
+				if (q_cl_viewent > 0 && q_cl_viewent < QNET_MAX_ENTS)
+					QVecCopy(q_net_cl[q_cl_viewent].origin, q_origin);
+				QVecCopy(q_demo_angles, q_angles);
+			}
+
+			//Playback that ends - cleanly or not - leaves a map on screen with
+			//no QuakeC behind it and no stream feeding it, which is not a state
+			//anything can be done from. The menu is where the attract loop came
+			//from, so it is where a finished demo goes back to.
+			if (!q_demo_playing && !q_game_active)
+			{
+				//A changelevel the stream requested and did not live to see
+				//must die with it. Left set, the generic service at the bottom
+				//of the frame loads the map as a REAL game and spawns the
+				//player into what was meant to be an attract loop.
+				q_change_pending = FALSE;
+
+				q_menu_ingame = FALSE;
+				q_menu_page   = QPAGE_MAIN;
+				q_state       = QST_MENU;
+			}
+		}
+
 		//The server named a level: load it, then continue stock signon
 		//(prespawn -> spawn -> begin). Do NOT enter play until signon 4.
 		if (q_net_join_pending)
 		{
 			q_net_join_pending = FALSE;
 
-			//QGameLoop has no scratch line buffer of its own - `line` belongs
-			//to Quake() - so the message is built in the join buffer's own
-			//scratch rather than borrowing a name that is not in scope here.
-			StrPrint(q_join_line, "net: joining, server level %s\n",
-				q_net_join_map);
-			QLog(q_join_line);
+			//A level named by a stream that has since died must die with it.
+			//Acting on it here is how a failed attract demo turned into a
+			//REAL game: the pending map fell through to the ordinary
+			//changelevel service, which spawns a live player.
+			if (q_demo_playing || (q_udp_ready && !q_udp_server))
+			{
+				//QGameLoop has no scratch line buffer of its own - `line` belongs
+				//to Quake() - so the message is built in the join buffer's own
+				//scratch rather than borrowing a name that is not in scope here.
+				if (q_demo_playing)
+					StrPrint(q_join_line, "demo: %s, level %s\n",
+						q_demo_name, q_net_join_map);
+				else
+					StrPrint(q_join_line, "net: joining, server level %s\n",
+						q_net_join_map);
+				QLog(q_join_line);
 
-			QStrCopy(q_change_map, q_net_join_map, 64);
-			q_change_pending = TRUE;
-			q_menu_ingame    = TRUE;
-			q_state          = QST_PLAYING;
+				//Same landing for both: the recorded stream and a live server
+				//each name the level in svc_serverinfo. One difference - a demo
+				//rolling to its next level must not close a menu the player is
+				//browsing. M_Draw keeps the menu over the attract loop; only a
+				//LIVE join forces the view to the world.
+				QStrCopy(q_change_map, q_net_join_map, 64);
+				q_change_pending = TRUE;
+				q_menu_ingame    = TRUE;
+				if (!q_demo_playing || q_state != QST_MENU)
+					q_state = QST_PLAYING;
+			}
 		}
 
 		//--- tilde drops the console, as in the original ---
@@ -1917,6 +2073,12 @@ U0 QGameLoop()
 				{
 					if (start_game)
 					{
+						//cls.demonum = -1: choosing anything cancels the
+						//attract loop, and the demo must stop before the
+						//world it was driving is replaced.
+						QDemoStop;
+						q_demo_loop = FALSE;
+
 						q_menu_ingame = TRUE;
 						q_state       = QST_PLAYING;
 					}
@@ -1997,6 +2159,16 @@ U0 QGameLoop()
 			dy       = 0;
 			wheel_dz = 0;
 			attack   = FALSE;
+		}
+
+		//During an intermission the view belongs to the info_intermission
+		//spot the server parked it at - V_CalcIntermissionRefdef reads the
+		//entity's angles every frame, so the mouse has no say until play
+		//resumes.
+		if (q_intermission)
+		{
+			dx = 0;
+			dy = 0;
 		}
 
 		//m_pitch carries the INVERT setting in its sign, as the original does.
@@ -2221,7 +2393,24 @@ U0 QGameLoop()
 				QCheckStuck(q_map, q_origin);
 
 
-			if (q_game_active)
+			//DEMO PLAYBACK OWNS THE FRAME.
+			//
+			//A demo is a recorded server stream, so there is no local player to
+			//simulate: no input, no move, no think. Vanilla has no client-side
+			//prediction either - V_CalcRefdef puts the view on
+			//cl_entities[cl.viewentity] - and the angles are the three floats
+			//recorded beside every demo message. Running the normal tick as well
+			//left the local player walking around under the demo's camera.
+			if (q_demo_playing)
+			{
+				if (q_cl_viewent > 0 && q_cl_viewent < QNET_MAX_ENTS)
+					QVecCopy(q_net_cl[q_cl_viewent].origin, q_origin);
+
+				QVecCopy(q_demo_angles, q_angles);
+				QVecSet(q_velocity, 0.0, 0.0, 0.0);
+				q_on_ground = TRUE;
+			}
+			else if (q_game_active)
 			{
 				//--- upstream: the client's move goes over the wire ------------
 				//
@@ -2314,7 +2503,9 @@ U0 QGameLoop()
 					}
 				}
 
-				if (!(q_udp_ready && !q_udp_server))
+				//The local world does not run while a demo plays - the stream
+				//already contains everything that happened.
+				if (!QClientMode)
 					QGameFrame(QSERVER_STEP);
 
 				//Adopt whatever the physics pass did to the body - a corpse
@@ -2443,7 +2634,9 @@ U0 QGameLoop()
 			goto ql_next_frame;
 		}
 
-		if (q_change_pending)
+		//Never during playback: the demo pump owns its own changelevels, and
+		//this copy would service one without the client precache rebuild.
+		if (q_change_pending && !q_demo_playing)
 		{
 			q_change_pending = FALSE;
 			QChangeLevel(q_change_map);
@@ -2505,6 +2698,7 @@ U0 Quake(U8 *mapname = QDEFAULT_MAP)
 	CQVisState	*vis			= NULL;
 	CQMap		*map			= NULL;
 	Bool		 raw_was_on		= FALSE;
+	Bool		 demo_boot		= FALSE;
 	Bool		 final_active	= FALSE;
 	I64			 final_edicts	= 0;
 	I64			 final_thinks	= 0;
@@ -2551,6 +2745,7 @@ U0 Quake(U8 *mapname = QDEFAULT_MAP)
 	QBiBspCacheInit;
 	QSurfCacheInit;
 	QMusicReset;
+	QPlayerStateInit;
 	QDemoInit;
 	QConHistoryInit;
 	QLightInit;
@@ -2640,11 +2835,28 @@ U0 Quake(U8 *mapname = QDEFAULT_MAP)
 	QSbarInit;
 	QMenuInit;
 
-	if (!QLoadMap(mapname))
+	//A stock boot loads NO playable map. quake.rc's startdemos supplies the
+	//world - each demo names its own level in svc_serverinfo - and the menu
+	//needs none at all. Loading one here spun up QuakeC and put a live player
+	//in it, which is why the game opened already being played. The direct load
+	//remains only as the fallback for a boot with the attract loop disabled or
+	//no demos to run.
+	demo_boot = FALSE;
+	if (QCvarGet("demoloop") != 0.0)
+		demo_boot = QDemoNextInLoop;
+
+	if (demo_boot)
+		QLog("demo: attract loop started\n");
+	else if (!QLoadMap(mapname))
 	{
 		"Quake: could not load %s\n", mapname;
 		return;
 	}
+
+	//Explicit, not initialisers: a global's declaration initialiser is not
+	//honoured, so both are whatever the loader left in memory until set.
+	q_state       = QST_MENU;
+	q_menu_ingame = FALSE;
 
 	q_canvas = QDrawNew(q_res_w[q_opt_res], q_res_h[q_opt_res]);
 	q_ready  = FALSE;

@@ -72,6 +72,18 @@ U8				q_net_cmd_line[128];
 //shell acts on it, since it owns map loading.
 Bool	q_net_join_pending = FALSE;
 U8		q_net_join_map[64];
+
+//CL_ParseServerInfo keeps both precache lists - every wire modelindex and
+//sound number is an index into them, so a client that throws the names away
+//has no way to draw an entity or start a sound. Persistent copies, because
+//the map load they resolve against happens frames later.
+#define QCL_MAX_PRECACHE	192
+#define QCL_PRECACHE_NAME	64
+U8	q_cl_model_names[QCL_MAX_PRECACHE * QCL_PRECACHE_NAME];
+U8	q_cl_sound_names[QCL_MAX_PRECACHE * QCL_PRECACHE_NAME];
+I64	q_cl_model_count = 0;
+I64	q_cl_sound_count = 0;
+U8		q_net_level_name[64];	//svc_serverinfo's display name
 I64		q_cl_signon = 0;		//0..4, mirrors cls.signon
 Bool	q_net_need_prespawn = FALSE;	//signon 1: send after map load
 Bool	q_net_need_spawn = FALSE;	//signon 2: send "spawn"
@@ -1137,14 +1149,16 @@ U0 QNetParseParticle(CQMsg *m)
 }
 
 U0 QNetParseBaseline(CQMsg *m)
-{
-	CQEntState	*b;
+{//svc_spawnbaseline. The payload is consumed UNCONDITIONALLY - the original
+ //has no range check here at all, and entity 0, the world, gets a baseline
+ //like everything else. Returning early on num 0 left its fourteen payload
+ //bytes in the stream to be read as opcodes, which is where every demo died.
+	CQEntState	 scratch;
+	CQEntState	*b = &scratch;
 	I64			 num = QMsgReadShort(m);
 
-	if (num < 1 || num >= QNET_MAX_ENTS)
-		return;
-
-	b = &q_net_baseline[num];
+	if (num >= 1 && num < QNET_MAX_ENTS)
+		b = &q_net_baseline[num];
 
 	b->modelindex = QMsgReadByte(m);
 	b->frame      = QMsgReadByte(m);
@@ -1160,7 +1174,7 @@ U0 QNetParseBaseline(CQMsg *m)
 	b->step       = FALSE;
 	b->active     = FALSE;
 
-	if (num >= q_net_num_ents)
+	if (num >= 1 && num < QNET_MAX_ENTS && num >= q_net_num_ents)
 		q_net_num_ents = num + 1;
 }
 
@@ -1209,8 +1223,9 @@ U0 QNetParseTempEntity(CQMsg *m)
 
 	type = QMsgReadByte(m);
 
+	//TE_BEAM is the grappling-hook beam: same wire shape as lightning.
 	if (type == QTE_LIGHTNING1 || type == QTE_LIGHTNING2 ||
-		type == QTE_LIGHTNING3)
+		type == QTE_LIGHTNING3 || type == QTE_BEAM)
 	{
 		QMsgReadShort(m);		//owning entity - placement uses coords
 		for (i = 0; i < 3; i++)
@@ -1223,6 +1238,15 @@ U0 QNetParseTempEntity(CQMsg *m)
 
 	for (i = 0; i < 3; i++)
 		org[i] = QMsgReadCoord(m);
+
+	//TE_EXPLOSION2 carries a palette range after the position. Unread, those
+	//two bytes become the next opcode - the same class of desync the world
+	//baseline caused.
+	if (type == QTE_EXPLOSION2)
+	{
+		QMsgReadByte(m);		//colorStart
+		QMsgReadByte(m);		//colorLength
+	}
 
 	QBiTempEntity(type, org);
 }
@@ -1257,6 +1281,17 @@ Bool QNetClientParse(CQMsg *m)
 		//delta mask". Without it the reader cannot frame the stream at all.
 		if (cmd & 128)
 		{
+			//CL_ParseUpdate: "first update is the final signon stage". No
+			//svc_signonnum 4 ever crosses the wire - a recorded demo carries
+			//only 1..3 - so this promotion is the ONLY way playback reaches
+			//signon 4. Without it the demo clock throttle never engages and
+			//the whole recording is consumed in a single frame.
+			if (q_cl_signon == 3)
+			{
+				q_cl_signon = 4;
+				QLog("net: signon 4 (first entity update)\n");
+			}
+
 			if (!QNetReadEntityUpdate(m, cmd & 127))
 				return FALSE;
 
@@ -1306,6 +1341,7 @@ Bool QNetClientParse(CQMsg *m)
 				QMsgReadString(m, line, 128);
 				QStrCopy(q_center_text, line, 256);
 				q_center_until = tS + QCENTER_TIME;
+				q_center_start = tS;
 				break;
 
 			case QSVC_PARTICLE:
@@ -1335,6 +1371,11 @@ Bool QNetClientParse(CQMsg *m)
 				q_intermission = TRUE;
 				q_finale       = TRUE;
 				QStrCopy(q_finale_text, line, 256);
+
+				//svc_finale is a centerprint with a plaque on top.
+				QStrCopy(q_center_text, line, 256);
+				q_center_until = tS + QCENTER_TIME;
+				q_center_start = tS;
 				break;
 
 			case QSVC_VERSION:
@@ -1365,27 +1406,70 @@ Bool QNetClientParse(CQMsg *m)
 				i = QMsgReadByte(m);		//gametype
 				if (i == 1)
 					QCvarSet("deathmatch", 1.0);
-				QMsgReadString(m, q_net_join_map, 64);
+				//The LEVEL NAME - display text, not a path.
+				QMsgReadString(m, q_net_level_name, 64);
 
 				//Model precache list: strings until "" (index 1..n on wire).
+				//Entry 1 IS the map: cl.worldmodel = cl.model_precache[1].
+				//The whole list is kept, not just the map - every modelindex
+				//in the stream refers into it by position.
+				q_net_join_map[0] = 0;
+				q_cl_model_count  = 0;
+				i = 1;
 				while (TRUE)
 				{
 					QMsgReadString(m, line, 128);
 					if (m->badread || !line[0])
 						break;
+
+					if (i == 1)
+						QStrCopy(q_net_join_map, line, 64);
+					if (q_cl_model_count < QCL_MAX_PRECACHE)
+					{
+						QStrCopy(q_cl_model_names +
+							q_cl_model_count * QCL_PRECACHE_NAME,
+							line, QCL_PRECACHE_NAME);
+						q_cl_model_count++;
+					}
+					i++;
 				}
-				//Sound precache list: strings until "".
+				//Sound precache list, kept for the same reason.
+				q_cl_sound_count = 0;
 				while (TRUE)
 				{
 					QMsgReadString(m, line, 128);
 					if (m->badread || !line[0])
 						break;
+
+					if (q_cl_sound_count < QCL_MAX_PRECACHE)
+					{
+						QStrCopy(q_cl_sound_names +
+							q_cl_sound_count * QCL_PRECACHE_NAME,
+							line, QCL_PRECACHE_NAME);
+						q_cl_sound_count++;
+					}
 				}
 
 				q_cl_signon = 0;
 				q_net_need_prespawn = FALSE;
 				q_net_need_spawn = FALSE;
 				q_net_need_begin = FALSE;
+
+				//CL_PlayDemo_f runs CL_Disconnect, which zeroes cls.signon
+				//before the new stream begins. Ours can arrive with signon
+				//still 4 from whatever played before, and that stale value
+				//spent the clock-seed latch a frame early: the seed then
+				//never re-armed for the REAL signon, the throttle compared
+				//real time against a stale message time, and the whole
+				//recording drained in one frame. serverinfo IS the stream
+				//boundary, so everything per-stream re-arms here.
+				if (q_demo_playing)
+				{
+					q_demo_timed  = FALSE;
+					q_demo_clock  = 0.0;
+					q_demo_last_t = 0.0;
+				}
+				q_net_msgtime = 0.0;
 
 				//The shell loads it; this is only the parse.
 				if (q_net_join_map[0])
@@ -2277,13 +2361,22 @@ U0 QNetWriteServerInfo(CQMsg *m, I64 slot)
 	QMsgWriteByte(m, QSV_MAX_CLIENTS);
 	QMsgWriteByte(m, 1);				//gametype: deathmatch
 
-	//Prefer maps/e1m1.bsp form (matches precache[1] / Ironwail Mod_ForName).
-	mapname = q_map_name;
-	if ((!mapname || !mapname[0]) && q_precache_model_count > 1 &&
-		q_precache_model[1])
-		mapname = q_precache_model[1];
+	//THIS SLOT IS THE LEVEL NAME, not the map file. SV_SendServerinfo sends
+	//    sprintf (message, pr_strings + sv.edicts->v.message);
+	//which is worldspawn's .message - "the Necropolis" and the like. The map
+	//itself is precache model 1, which is where the client picks it up:
+	//    cl.worldmodel = cl.model_precache[1];
+	//Sending the filename here works only between two engines that share the
+	//mistake; a real client tries to load a level called "the Necropolis".
+	mapname = NULL;
+	if (q_fld_message >= 0)
+		mapname = QPrStr(QPrFieldI(0, q_fld_message));
+
 	if (!mapname || !mapname[0])
-		mapname = "maps/start.bsp";
+		mapname = q_map_name;
+	if (!mapname || !mapname[0])
+		mapname = "";
+
 	QMsgWriteString(m, mapname);
 
 	//Models index 1..n then empty terminator (WinQuake SV_SendServerinfo).
@@ -3443,6 +3536,8 @@ Bool QNetClientFrame()
 	Bool	 ok  = TRUE;
 	I64		 n;
 	I64		 ret;
+	I64		 guard = 0;
+	U8		 dline[128];
 	U32		 from_ip;
 
 	//A demo is the same stream from a file. CL_ReadDemoMessage holds off once
@@ -3450,13 +3545,38 @@ Bool QNetClientFrame()
 	//or the whole recording would be parsed in one frame.
 	if (q_demo_playing)
 	{
+		//Advance the playback clock in REAL time. Comparing the message time
+		//against itself - which is what using q_cl.time here did - always
+		//compares equal, so exactly one message was read per rendered frame
+		//and the demo ran at the render rate.
+		if (q_demo_last_t > 0.0)
+			q_demo_clock += tS - q_demo_last_t;
+
+		q_demo_last_t = tS;
+
 		while (TRUE)
 		{
-			if (q_cl_signon >= 4 && q_cl.time <= q_net_msgtime)
+			//Seeded once the stream is live, so the clock starts where the
+			//recording does rather than at zero.
+			if (q_cl_signon >= 4 && !q_demo_timed)
+			{
+				q_demo_clock = q_net_msgtime;
+				q_demo_timed = TRUE;
+			}
+
+			if (q_cl_signon >= 4 && q_demo_clock <= q_net_msgtime)
 				break;
 
 			if (!QDemoReadMessage(in))
 			{
+				//How far the read got separates a finished demo from one that
+				//was misframed and ran off the end early.
+				StrPrint(dline,
+					"demo: %s ended at %d/%d, signon %d, %d messages\n",
+					q_demo_name, q_demo_pos, q_demo_size, q_cl_signon, guard);
+				QLog(dline);
+				QLogFlush;
+
 				//End of file: step the attract cycle, or simply stop.
 				if (q_demo_loop)
 				{
@@ -3470,9 +3590,54 @@ Bool QNetClientFrame()
 			}
 
 			q_net_parsed++;
+
+			//A desync is fatal to a demo. The stream is a byte sequence with
+			//no resync point, so once framing is lost every later read is
+			//garbage - the original calls Host_Error. Carrying on here read
+			//the whole recording as noise in a single frame, hit end of file
+			//and rolled straight into the next demo, which is what the endless
+			//burst of map loads was.
 			if (!QNetClientParse(in))
-				ok = FALSE;
+			{
+				QLog("demo: parse failed, stopping playback\n");
+				QLogFlush;
+				q_demo_loop = FALSE;
+				QDemoStop;
+				return FALSE;
+			}
+
+			//CL_ParseServerInfo loads the world before another byte is read -
+			//everything after svc_serverinfo describes the NEW map. The load
+			//is the shell's job on the next frame, so reading on would parse
+			//baselines into tables the changelevel is about to clear. AFTER
+			//the parse of the message that carried it, so nothing is lost.
+			if (q_net_join_pending)
+				break;
+
+			//Nothing in a signon is anywhere near this long. The clock only
+			//starts throttling at signon 4, so a recording that never gets
+			//there would otherwise be consumed entirely by this one loop.
+			guard++;
+			if (guard > 1024)
+			{
+				StrPrint(dline,
+					"demo: %d messages without reaching signon 4 (at %d), "
+					"stopping\n", guard, q_cl_signon);
+				QLog(dline);
+				QLogFlush;
+				q_demo_loop = FALSE;
+				QDemoStop;
+				return FALSE;
+			}
 		}
+
+		//A demo is one-way - CL_SignonReply returns immediately on
+		//demoplayback - so the signon flags its stream raised are dropped
+		//here rather than answered. Left set, they fire stringcmds at the
+		//next LIVE connection the moment one exists.
+		q_net_need_prespawn = FALSE;
+		q_net_need_spawn    = FALSE;
+		q_net_need_begin    = FALSE;
 
 		return ok;
 	}
