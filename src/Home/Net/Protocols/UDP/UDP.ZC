@@ -89,6 +89,8 @@ CUDPSocket *UDPSocket(U16 domain=AF_UNSPEC)
 
 	udp_socket->receive_queue = CAlloc(sizeof(CUDPMessageQueue));
 	QueueInit(udp_socket->receive_queue); // acts as head. add messages to but don't remove head.
+	udp_socket->receive_queue_depth = 0;
+	udp_socket->receive_lock        = 0;
 
 	return udp_socket;
 
@@ -233,17 +235,17 @@ I64 UDPSocketClose(CUDPSocket *udp_socket)
 	SocketClose(udp_socket->socket); // TODO: testing on closing a socket while another task is using it
 	// after low-level socket close, even if protocol level socket fails close, it is now disabled (state is close request)
 
-	node = UDPTreeNodeFind(udp_socket->bound_to, head);
+	/*	An unbound socket is an ordinary case - a bind that failed, or a second
+		close - NOT a reason to halt the machine. This used to call Debug() and
+		drop the whole system into the debugger, which is what a failed DHCP
+		attempt on a link with no server did. Unlink if we can, free either way. */
+	node  = UDPTreeNodeFind(udp_socket->bound_to, head);
+	queue = NULL;
 
 	if (node)
 		queue = UDPTreeNodeQueueSocketFind(udp_socket, node);
-	else
-	{
-		Debug("TODO: Didn't find node at socket during UDPSocketClose!\n");
-		return -1;
-	}
 
-	if (queue)
+	if (node && queue)
 	{
 		UDPTreeNodeQueueSocketSinglePop(udp_socket, node);
 
@@ -267,31 +269,35 @@ I64 UDPSocketClose(CUDPSocket *udp_socket)
 
 			Free(node);
 		}
+	}
+	else
+		NetErr("UDP SOCKET CLOSE: socket was not bound; freeing anyway.");
 
-		Free(udp_socket->socket);
+	//Teardown always runs, or a failed bind leaks the socket and its queue.
+	Free(udp_socket->socket);
 
+	if (udp_socket->receive_queue)
+	{
 		message = udp_socket->receive_queue->next;
 		while (message != udp_socket->receive_queue)
 		{
-			NetWarn("UDP SOCKET CLOSE: Freeing message @ 0x%X", message);
-			Free(message->data);
 			QueueRemove(message);
+			Free(message->data);
 			Free(message);
 			message = udp_socket->receive_queue->next;
 		}
 
-		NetWarn("UDP SOCKET CLOSE: Freeing message queue & socket.");
 		Free(udp_socket->receive_queue);
-		Free(udp_socket);
-		Free(queue);
 	}
-	else
-	{
-		Debug("TODO: Didn't find queue at socket during UDPSocketClose!\n");
-		return -1;
-	}
-	
 
+	udp_socket->receive_queue_depth = 0;
+
+	Free(udp_socket);
+
+	if (queue)
+		Free(queue);
+	else
+		return -1;
 
 	return 0;
 }
@@ -337,9 +343,20 @@ I64 UDPSocketReceiveFrom(CUDPSocket *udp_socket, U8 *buffer, I64 len, CSocketAdd
 		Yield;
 	}
 
-	NetLog("UDP SOCKET RECEIVE FROM: Saw message in receive queue.");
+	PUSHFD
+	CLI
+	while (LBts(&udp_socket->receive_lock, 0))
+		PAUSE
 
 	message = message->next;
+
+	//Raced with another reader and lost - nothing left to take.
+	if (message == udp_socket->receive_queue)
+	{
+		LBtr(&udp_socket->receive_lock, 0);
+		POPFD
+		return -1;
+	}
 
 	if (address_out)
 	{
@@ -362,22 +379,27 @@ I64 UDPSocketReceiveFrom(CUDPSocket *udp_socket, U8 *buffer, I64 len, CSocketAdd
 
 	if (len >= message->data_length - message->received_length)
 	{
-		NetLog("UDP SOCKET RECEIVE FROM: Requested length longer than data. Truncating.");
 		len = message->data_length - message->received_length;
 		MemCopy(buffer, message->data + message->received_length, len);
 
-		NetWarn("UDP SOCKET RECEIVE FROM: Freeing message and removing from queue.");
-		// all data pulled, release message
 		QueueRemove(message);
+		if (udp_socket->receive_queue_depth > 0)
+			udp_socket->receive_queue_depth--;
+
+		LBtr(&udp_socket->receive_lock, 0);
+		POPFD
+
 		Free(message->data);
 		Free(message);
+
+		return len;
 	}
-	else
-	{
-		NetLog("UDP SOCKET RECEIVE FROM: Requsted length shorter than data at message.");
-		MemCopy(buffer, message->data + message->received_length, len);
-		message->received_length += len;
-	}
+
+	MemCopy(buffer, message->data + message->received_length, len);
+	message->received_length += len;
+
+	LBtr(&udp_socket->receive_lock, 0);
+	POPFD
 
 	return len;
 }
@@ -454,14 +476,11 @@ I64 UDPHandler(CIPV4Packet *packet)
 	CUDPTreeQueue		*queue;
 	CUDPMessageQueue	*messages_head;
 	CUDPMessageQueue	*message;
+	CUDPMessageQueue	*stale;
 	CUDPSocket			*udp_socket;
 	CSocketAddressIPV4	*ipv4_addr;
 
-	NetLog("UDP HANDLER: Beginning handling UDP Packet.");
-
 	I64 error = UDPPacketParse(&source_port, &destination_port, &data, &length, packet);
-
-//	NetDebug("UDP HANDLER: Packet parsed, port to search in bound tree: 0x%0X (L.E...?)", destination_port);
 
 	if (error < 0)
 	{
@@ -469,46 +488,41 @@ I64 UDPHandler(CIPV4Packet *packet)
 		return error;
 	}
 
-	if (head)
+	/* Quiet drops when nothing is bound - host Quake keeps blasting after
+	   guest reboot; logging each orphan datagram was the GP flood. */
+	if (!head)
+		return -1;
+
+	node = UDPTreeNodeFind(destination_port, head);
+	if (!node)
+		return -1;
+
+	queue = UDPTreeNodeQueueIPV4Find(packet->source_ip_address, node); // TODO: make sure bit order is correct here!!
+	if (!queue)
 	{
-		node = UDPTreeNodeFind(destination_port, head);
-		if (node)
-		{
-			queue = UDPTreeNodeQueueIPV4Find(packet->source_ip_address, node); // TODO: make sure bit order is correct here!!
-			if (queue)
-			{
-				udp_socket = queue->socket;
-				NetLog("UDP HANDLER: Port and Address are in bound tree.");
-			}
-			else
-			{
-				NetWarn("UDP HANDLER: Found node for port, but address is not in node queue.");
-				NetWarn("             UDP packet dest ip: 0x%0X.", packet->destination_ip_address);
-				return -1;
-			}
-		}
-		else
-		{
-			NetWarn("UDP HANDLER: Node for Port is not in tree.");
-			return -1;
-		}
-	}
-	else
-	{
-		NetWarn("UDP HANDLER: Socket tree is currently empty.");
+		// The lookup already falls back to INADDR_ANY binds, so reaching here
+		// means nothing wants this datagram. Silent: see the !head case.
 		return -1;
 	}
-	// at this point, udp_socket is set, otherwise has already returned -1.
 
-
-	NetLog("UDP HANDLER: Putting data payload into message queue.");
+	udp_socket = queue->socket;
 
 	messages_head = udp_socket->receive_queue;
 
+	/*	Built COMPLETE before it is linked. Linking first left a message on the
+		queue whose data pointer was still null, and recvfrom - which runs in a
+		task while this runs in the NetHandler interrupt - could reach it. */
 	message = CAlloc(sizeof(CUDPMessageQueue));
-	QueueInsertRev(message, messages_head);
+	if (!message)
+		return -1;
 
 	message->data = CAlloc(length);
+	if (!message->data)
+	{
+		Free(message);
+		return -1;
+	}
+
 	MemCopy(message->data, data, length);
 	message->data_length = length;
 
@@ -517,9 +531,32 @@ I64 UDPHandler(CIPV4Packet *packet)
 	ipv4_addr->family			= AF_INET;
 	ipv4_addr->port				= EndianU16(source_port);
 	ipv4_addr->address.address	= EndianU32(packet->source_ip_address);
-	NetLog("UDP HANDLER: Copying packet source IP (BE) to FROM_ADDRESS of UDP Socket: %08X ", ipv4_addr->address.address);
 
-	NetLog("UDP HANDLER: Data payload succesfully placed in message queue.");
+	PUSHFD
+	CLI
+	while (LBts(&udp_socket->receive_lock, 0))
+		PAUSE
+
+	/*	Depth cap: a peer keeps sending while this side is busy loading a map
+		and not draining, and an unbounded queue eats the heap. Drop the oldest
+		so the newest state survives. */
+	while (udp_socket->receive_queue_depth >= UDP_RECV_QUEUE_MAX &&
+		messages_head->next != messages_head)
+	{
+		stale = messages_head->next;
+
+		QueueRemove(stale);
+		udp_socket->receive_queue_depth--;
+
+		Free(stale->data);
+		Free(stale);
+	}
+
+	QueueInsertRev(message, messages_head);
+	udp_socket->receive_queue_depth++;
+
+	LBtr(&udp_socket->receive_lock, 0);
+	POPFD
 
 	return error;
 }

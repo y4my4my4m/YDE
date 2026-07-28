@@ -1,28 +1,21 @@
-// QSound.ZC - WAV loading and sound effects.
+// QSound.ZC - WAV loading and sound effects
 //
-// The AC97 driver already provides a 4-stream software mixer and a
-// fire-and-forget one-shot queue (AudioSFXPlay), so nothing here mixes audio.
-// This layer only has to turn a PAK'd WAV into the 48kHz stereo frames that
-// mixer expects, and decide how loud it should be.
+// the AC97 driver mixes, so nothing here does. this layer only turns a PAK'd
+// WAV into frames the mixer takes, and decides how loud
 //
-// Format reality of the shareware data: 188 of the 190 sounds are 8-BIT mono
-// at 11025Hz, the other two are 16-bit at 22050Hz. Handling only 16-bit (as
-// the browser's WAV path does) would play almost nothing, so 8-bit unsigned
-// is the important case, not the edge case.
+// 188 of the 190 shareware sounds are 8-bit unsigned mono at 11025Hz, the
+// other two 16-bit at 22050Hz - 8-bit is the common case, not the edge case
 //
-// Decoding everything up front would cost about 47MB, so sounds are decoded on
-// first use and kept in a bounded cache. Gameplay reuses a small working set,
-// so this stays far below the budget in practice.
+// decoding everything up front costs ~47MB, so decode on first use into a
+// bounded cache
 
 #define QSND_MAX_CACHE		256
-//Storing at native rate cut the footprint by roughly 4x, and the whole
-//shareware sound set now fits comfortably. Still bounded, and exceeding it is
-//reported rather than silently failing every later load.
+//native rate storage, ~4x smaller than resampling on load
 #define QSND_CACHE_BUDGET	16777216	//16MB of decoded audio
-#define QSND_RATE			48000		//the mixer's fixed output rate
+#define QSND_RATE			48000		//mixer output rate
 #define QSND_CLIP_DIST		1000.0		//attenuation reaches silence here
 
-//Diagnostics for the "nothing is audible" case.
+//diagnostics for the "nothing is audible" case
 #define QSND_MAX_REPORTS	64
 I64 q_snd_reports	= 0;
 I64 q_snd_silent	= 0;
@@ -31,26 +24,212 @@ U8  q_snd_line[160];
 class CQSound
 {
 	U8	 name[64];
-	U32	*frames;		//stereo L16 | R16 << 16, at the file's OWN rate
+	U32	*frames;		//stereo L16 | R16 << 16, at the file's own rate
 	I64	 count;
-	I64	 rate;			//samples per second of the stored data
+	I64	 rate;			//rate of the stored data, not the mixer's
 };
 
 CQSound	 q_snd_cache[QSND_MAX_CACHE];
 I64		 q_snd_count	= 0;
 I64		 q_snd_bytes	= 0;
 Bool	 q_snd_enabled	= TRUE;
+
+//quake's own volume 0..1, the AC97 master is the system's and applies on top
+F64		 q_snd_master	= 0.8;
 I64		 q_snd_played	= 0;
 I64		 q_snd_dropped	= 0;
 
-//Volume scaling needs a copy, since the cached frames are shared and the
-//mixer consumes whatever it is handed. Grown on demand, reused every play.
-
-//Where the player is listening from, refreshed each frame by the app.
+//refreshed each frame by the app
 F64		 q_snd_listener[3];
+F64		 q_snd_right[3];		//listener_right, for stereo separation
+
+
+
+//--- channels ---------------------------------------------------------------
+//
+// SND_PickChannel. eight dynamic channels; a sound from an entity replaces
+// whatever that entity already has on the same channel, so repeat fire is one
+// weapon instead of a stack of overlapping copies
+
+#define QSND_DYNAMIC_CHANNELS	8
+
+class CQSndChan
+{
+	I64	entnum;
+	I64	entchannel;
+	I64	voice;			//mixer handle, -1 when free
+	F64	origin[3];
+	F64	master_vol;		//0..1 before distance and pan
+	F64	dist_mult;		//attenuation / QSND_CLIP_DIST
+	Bool fixed;			//fixed point, not an entity to follow
+};
+
+CQSndChan	q_snd_chan[QSND_DYNAMIC_CHANNELS];
+I64			q_snd_viewent = 0;
+
+U0 QSndChannelsClear()
+{
+	I64 i;
+
+	for (i = 0; i < QSND_DYNAMIC_CHANNELS; i++)
+	{
+		q_snd_chan[i].entnum     = 0;
+		q_snd_chan[i].entchannel = 0;
+		q_snd_chan[i].voice      = -1;
+		q_snd_chan[i].master_vol = 0.0;
+		q_snd_chan[i].dist_mult  = 0.0;
+		q_snd_chan[i].fixed      = TRUE;
+		QVecSet(q_snd_chan[i].origin, 0.0, 0.0, 0.0);
+	}
+}
+
+U0 QSndSpatialize(CQSndChan *ch, I64 *_l, I64 *_r)
+{//SND_Spatialize: distance attenuation plus pan from dot with listener_right
+	F64 dir[3];
+	F64 dist;
+	F64 dot;
+	F64 lscale;
+	F64 rscale;
+	F64 vol;
+
+	vol = ch->master_vol * q_snd_master;
+
+	//view entity is always full volume and centred, own weapon must not pan
+	if (ch->entnum == q_snd_viewent && q_snd_viewent != 0)
+	{
+		*_l = ToI64(vol * ToF64(AUDIO_VOL_UNITY));
+		*_r = *_l;
+		return;
+	}
+
+	QVecSub(ch->origin, q_snd_listener, dir);
+	dist = QVecLength(dir);
+
+	if (dist > 0.0001)
+	{
+		dir[0] /= dist;
+		dir[1] /= dist;
+		dir[2] /= dist;
+	}
+
+	dist = dist * ch->dist_mult;
+	dot  = QVecDot(q_snd_right, dir);
+
+	rscale = 1.0 + dot;
+	lscale = 1.0 - dot;
+
+	*_l = ToI64(vol * (1.0 - dist) * lscale * ToF64(AUDIO_VOL_UNITY));
+	*_r = ToI64(vol * (1.0 - dist) * rscale * ToF64(AUDIO_VOL_UNITY));
+
+	if (*_l < 0)	*_l = 0;
+	if (*_r < 0)	*_r = 0;
+}
+
+I64 QSndPickChannel(I64 entnum, I64 entchannel)
+{//the channel this sound takes, stealing one if need be
+	I64 i;
+	I64 first_to_die = -1;
+
+	for (i = 0; i < QSND_DYNAMIC_CHANNELS; i++)
+	{
+		//channel 0 is CHAN_AUTO, never overrides
+		if (entchannel != 0 && q_snd_chan[i].entnum == entnum &&
+			(q_snd_chan[i].entchannel == entchannel || entchannel == -1))
+		{
+			first_to_die = i;
+			break;
+		}
+
+		//free slots first
+		if (!AudioSFXPlaying(q_snd_chan[i].voice))
+		{
+			first_to_die = i;
+			break;
+		}
+
+		//never steal the player's own channel for someone else
+		if (q_snd_chan[i].entnum == q_snd_viewent && entnum != q_snd_viewent)
+			goto qsp_next;
+
+		if (first_to_die < 0)
+			first_to_die = i;
+
+qsp_next:
+	}
+
+	if (first_to_die < 0)
+		return -1;
+
+	if (AudioSFXPlaying(q_snd_chan[first_to_die].voice))
+		AudioSFXStop(q_snd_chan[first_to_die].voice);
+
+	q_snd_chan[first_to_die].voice = -1;
+
+	return first_to_die;
+}
+
+U0 QSndUpdate()
+{//S_Update: re-aim every live channel, a long sound must track the listener
+	CQSndChan *ch;
+	I64 i;
+	I64 l;
+	I64 r;
+
+	for (i = 0; i < QSND_DYNAMIC_CHANNELS; i++)
+	{
+		ch = &q_snd_chan[i];
+
+		if (!AudioSFXPlaying(ch->voice))
+		{
+			ch->voice = -1;
+			goto qsu_next;
+		}
+
+		QSndSpatialize(ch, &l, &r);
+		AudioSFXVoiceVolSet(ch->voice, l, r);
+
+qsu_next:
+	}
+}
+
+//--- leaf ambients ----------------------------------------------------------
+//
+// S_UpdateAmbientSounds. not ambientsound() entities - every BSP leaf carries
+// four compiled-in ambient levels, one permanent channel per type, faded to
+// the level of the leaf the listener stands in rather than cut
+
+#define QNUM_AMBIENTS		4
+#define QAMBIENT_WATER		0
+#define QAMBIENT_SKY		1
+
+U8	*q_ambient_sfx[QNUM_AMBIENTS];
+F64	 q_ambient_vol[QNUM_AMBIENTS];
+I64	 q_ambient_voice[QNUM_AMBIENTS];
+F64	 q_ambient_ends[QNUM_AMBIENTS];
+F64	 q_ambient_last = 0.0;		//previous call's time, for the fade delta
+
+U0 QSndLeafAmbientInit()
+{
+	I64 i;
+
+	//slime and lava have leaf entries but no sound in the original
+	q_ambient_sfx[QAMBIENT_WATER] = "ambience/water1.wav";
+	q_ambient_sfx[QAMBIENT_SKY]   = "ambience/wind2.wav";
+	q_ambient_sfx[2]              = NULL;
+	q_ambient_sfx[3]              = NULL;
+
+	for (i = 0; i < QNUM_AMBIENTS; i++)
+	{
+		q_ambient_vol[i]   = 0.0;
+		q_ambient_voice[i] = -1;
+		q_ambient_ends[i]  = 0.0;
+	}
+
+	q_ambient_last = 0.0;
+}
 
 U0 QSndInit()
-{//Globals are not zeroed by the JIT, and this table gets walked and freed.
+{//globals aren't zeroed, and this table gets walked and freed
 	I64 i;
 
 	for (i = 0; i < QSND_MAX_CACHE; i++)
@@ -66,15 +245,18 @@ U0 QSndInit()
 	q_snd_dropped       = 0;
 
 	QVecSet(q_snd_listener, 0.0, 0.0, 0.0);
+	QVecSet(q_snd_right, 0.0, 1.0, 0.0);
+	QSndChannelsClear;
+	QSndLeafAmbientInit;
+
 }
 
 U0 QSndFree()
 {
 	I64 i;
 
-	//CRITICAL ORDER: voices reference the cached PCM directly, so every voice
-	//must be silenced before any of it is released. AudioSFXStopAll also waits
-	//out any mix pass already in flight.
+	//ORDER: voices point straight at the cached PCM, silence them all before
+	//releasing any of it. AudioSFXStopAll waits out a mix pass in flight
 	AudioSFXStopAll;
 
 	for (i = 0; i < QSND_MAX_CACHE; i++)
@@ -93,18 +275,12 @@ U0 QSndFree()
 }
 
 I64 QSndDecodeWav(U8 *raw, I64 size, U32 **_frames, I64 *_rate)
-{//RIFF/WAVE -> stereo frames AT THE FILE'S OWN RATE. Returns the frame count,
- //0 on failure. Walks the chunk list rather than assuming a 44-byte header,
- //because some files carry extra chunks before the data.
+{//RIFF/WAVE -> stereo frames at the file's own rate, returns frame count or 0.
+ //walks the chunk list, some files carry extra chunks before the data
  //
- //Deliberately does NOT resample. Quake's effects are 11025Hz 8-bit mono, and
- //converting them to 48kHz stereo on load inflates them about SEVENTEEN times -
- //one source byte becomes 4.35 frames of 4 bytes. That exhausted the decoded
- //audio budget after a handful of files, and every sound loaded afterwards
- //failed outright: ambience (precached first) played while every monster,
- //weapon and door sound silently did not.
- //
- //The mixer resamples per voice instead, which is where a real engine does it.
+ //does NOT resample: 11025Hz 8-bit mono -> 48kHz stereo is ~17x inflation and
+ //blows the cache budget after a handful of files. the mixer resamples per
+ //voice, which is where it belongs
 	U8	*p;
 	U8	*end;
 	U8	*data     = NULL;
@@ -133,7 +309,7 @@ I64 QSndDecodeWav(U8 *raw, I64 size, U32 **_frames, I64 *_rate)
 	{
 		chunk = QRdU32(p + 4);
 
-		//A truncated final chunk is clamped rather than trusted.
+		//clamp a truncated final chunk
 		if (chunk < 0 || p + 8 + chunk > end)
 			chunk = end - (p + 8);
 
@@ -149,7 +325,7 @@ I64 QSndDecodeWav(U8 *raw, I64 size, U32 **_frames, I64 *_rate)
 			dsize = chunk;
 		}
 
-		//Chunks are word aligned, so an odd size carries a pad byte.
+		//word aligned, odd size carries a pad byte
 		p += 8 + chunk + (chunk & 1);
 	}
 
@@ -175,7 +351,7 @@ I64 QSndDecodeWav(U8 *raw, I64 size, U32 **_frames, I64 *_rate)
 
 		if (bits == 8)
 		{
-			//8-bit WAV is UNSIGNED with 128 as silence.
+			//8-bit WAV is unsigned, 128 is silence
 			l = (data[src * channels] - 128) << 8;
 			if (channels > 1)
 				r = (data[src * channels + 1] - 128) << 8;
@@ -203,7 +379,7 @@ I64 QSndDecodeWav(U8 *raw, I64 size, U32 **_frames, I64 *_rate)
 }
 
 CQSound *QSndLoad(U8 *name)
-{//Fetch from cache, decoding on first use.
+{//cache fetch, decoding on first use
 	CQSound	*s;
 	U8		*raw;
 	U8		 path[128];
@@ -217,8 +393,7 @@ CQSound *QSndLoad(U8 *name)
 	{
 		if (!StrICompare(q_snd_cache[i].name, name))
 		{
-			//A cached miss is remembered too, so a missing file is not
-			//re-read from the archive on every single play.
+			//misses are cached too, don't re-read the pak every play
 			if (!q_snd_cache[i].frames)
 				return NULL;
 			return &q_snd_cache[i];
@@ -227,8 +402,7 @@ CQSound *QSndLoad(U8 *name)
 
 	if (q_snd_count >= QSND_MAX_CACHE || q_snd_bytes >= QSND_CACHE_BUDGET)
 	{
-		//Say so. This used to return NULL indistinguishably from a missing
-		//file, so a full cache looked exactly like a decode failure.
+		//say so, a full cache looks exactly like a missing file
 		if (q_snd_reports < QSND_MAX_REPORTS)
 		{
 			q_snd_reports++;
@@ -240,7 +414,7 @@ CQSound *QSndLoad(U8 *name)
 		return NULL;
 	}
 
-	//QuakeC passes names relative to the sound directory.
+	//QuakeC names are relative to sound/
 	StrPrint(path, "sound/%s", name);
 
 	raw = QPakData(path, &size);
@@ -266,29 +440,101 @@ CQSound *QSndLoad(U8 *name)
 	return NULL;
 }
 
+U0 QSndLeafAmbients(CQMap *map, I64 leaf_num, F64 level, F64 fade, F64 now)
+{//one channel per ambient type, level from the listener's leaf, approached at
+ //ambient_fade per second. leaf and cvars are passed in - this file compiles
+ //before both the cvar table and the BSP walker
+	CQSound	*snd;
+	I64		 i;
+	I64		 vol;
+	F64		 want;
+	F64		 dt;
+
+	if (!q_snd_enabled || !map)
+		return;
+
+	//fade runs in real time, a level load stall must not slam to target
+	dt = now - q_ambient_last;
+	q_ambient_last = now;
+
+	if (dt < 0.0 || dt > 0.25)
+		dt = 0.0;
+
+	for (i = 0; i < QNUM_AMBIENTS; i++)
+	{
+		if (!q_ambient_sfx[i])
+			goto qla_next;
+
+		want = 0.0;
+
+		if (level > 0.0 && leaf_num > 0 && leaf_num < map->num_leafs)
+			want = level * ToF64(map->leafs[leaf_num].ambient[i]);
+
+		//below 8 is inaudible, cut it or a faint leaf leaves a permanent hum
+		if (want < 8.0)
+			want = 0.0;
+
+		//approach, don't jump - a doorway must not switch the wind on and off
+		if (q_ambient_vol[i] < want)
+		{
+			q_ambient_vol[i] += dt * fade;
+			if (q_ambient_vol[i] > want)
+				q_ambient_vol[i] = want;
+		}
+		else if (q_ambient_vol[i] > want)
+		{
+			q_ambient_vol[i] -= dt * fade;
+			if (q_ambient_vol[i] < want)
+				q_ambient_vol[i] = want;
+		}
+
+		vol = ToI64(q_ambient_vol[i] / 255.0 * q_snd_master *
+				ToF64(AUDIO_VOL_UNITY));
+
+		if (vol <= 0)
+		{
+			if (q_ambient_voice[i] >= 0)
+			{
+				AudioSFXStop(q_ambient_voice[i]);
+				q_ambient_voice[i] = -1;
+			}
+			goto qla_next;
+		}
+
+		//already running, just re-aim. non-positional so both ears match, and
+		//the loop is never restarted so there is no seam
+		if (q_ambient_voice[i] >= 0 && AudioSFXPlaying(q_ambient_voice[i]))
+		{
+			AudioSFXVoiceVolSet(q_ambient_voice[i], vol, vol);
+			goto qla_next;
+		}
+
+		snd = QSndLoad(q_ambient_sfx[i]);
+		if (!snd || !snd->frames || snd->count < 1)
+			goto qla_next;
+
+		//S_UpdateAmbientSounds channels are permanent - one short sample held
+		//indefinitely, not replayed. restarting clicks and resets phase
+		q_ambient_voice[i] = AudioSFXPlayRef(snd->frames, snd->count,
+								snd->rate, vol, vol, TRUE);
+
+qla_next:
+	}
+}
+
 //--- music -----------------------------------------------------------------
 //
-// Quake's music is CD AUDIO - redbook tracks on the physical disc, not data in
-// the PAK. Confirmed rather than assumed: neither PAK0 nor PAK1 contains a
-// single music or track entry. So there is nothing to extract, and playing it
-// "from the pak anyway" is not possible.
-//
-// What every modern source port does instead is read the ripped tracks from a
-// music directory beside the PAKs, which is what this does:
+// the music is redbook CD audio, nothing in PAK0 or PAK1 to extract. ripped
+// tracks are read from a music dir beside the PAKs, as source ports do:
 //
 //     ::/Apps/Quake/id1/music/track02.wav ... track11.wav
 //
-// Track numbering starts at 2 because track 1 on the CD is the data track.
-// A map asks for its track through worldspawn's `sounds` field, which the
-// server sends as svc_cdtrack - exactly the path the original uses to tell the
-// client which track to spin up.
+// numbering starts at 2, track 1 on the disc is the data track. worldspawn's
+// sounds field picks it, sent to the client as svc_cdtrack
 //
-// WAV only for now. A pure-ZealC MP3 decoder does exist in Apps/ZealAmp, but it
-// is not part of the system image, so depending on it here would make Quake
-// fail to compile unless ZealAmp had been loaded first - the same constraint
-// the net stack has. Whole-file decoding also makes size matter: a three minute
-// 44.1kHz stereo track is over 30MB decoded, so 22050Hz mono is the sensible
-// thing to supply.
+// WAV only. the ZealC MP3 decoder in Apps/ZealAmp isn't in the system image,
+// so depending on it would break the build - same constraint as the net stack.
+// whole-file decode, so supply 22050Hz mono: 44.1kHz stereo is 30MB+ a track
 
 #define QMUSIC_MAX_BYTES	(48 * 1024 * 1024)
 
@@ -297,12 +543,25 @@ I64		 q_music_count	= 0;
 I64		 q_music_rate	= QSND_RATE;
 I64		 q_music_track	= 0;
 Bool	 q_music_playing = FALSE;
+I64		 q_music_voice	= -1;		//track's voice, -1 when silent
 F64		 q_music_ends	= 0.0;
 F64		 q_music_volume	= 0.7;
 U8		 q_music_status[64];
 
 U0 QMusicFree()
-{
+{//ORDER MATTERS. the mixer task reads voice->frames every millisecond, so stop
+ //the voice BEFORE freeing what it points at. freeing first corrupts the heap
+ //silently instead of faulting, and only bites much later
+	if (q_music_voice >= 0)
+	{
+		AudioSFXStop(q_music_voice);
+		q_music_voice = -1;
+
+		//a mix pass may still hold a pointer it already read, same wait
+		//AudioSFXStopAll uses
+		Sleep(4);
+	}
+
 	if (q_music_frames)
 		Free(q_music_frames);
 
@@ -313,7 +572,7 @@ U0 QMusicFree()
 }
 
 Bool QMusicLoad(I64 track)
-{//Read and decode one track. FALSE if there is no file for it.
+{//read and decode one track, FALSE if there is no file for it
 	U8	 path[96];
 	U8	*raw;
 	I64	 size  = 0;
@@ -352,18 +611,29 @@ Bool QMusicLoad(I64 track)
 	return TRUE;
 }
 
+U0 QMusicReset()
+{//globals aren't zeroed. a junk handle is rejected, but junk q_music_playing
+ //makes QMusicUpdate retrigger a voice that never started, stacking copies
+	q_music_voice   = -1;
+	q_music_playing = FALSE;
+	q_music_ends    = 0.0;
+}
+
 U0 QMusicStart(F64 now)
-{//Hand the buffer to a voice and note when it will run out.
+{//hand the buffer to a voice and note when it runs out
 	if (!q_music_frames || q_music_count < 1 || !q_snd_enabled)
 		return;
 
-	AudioSFXPlayRef(q_music_frames, q_music_count, q_music_rate,
-		ToI64(q_music_volume * ToF64(AUDIO_VOL_UNITY)),
-		ToI64(q_music_volume * ToF64(AUDIO_VOL_UNITY)));
+	//stop the previous copy first, or every retrigger stacks another until the
+	//whole voice pool is music
+	if (q_music_voice >= 0)
+		AudioSFXStop(q_music_voice);
 
-	//The mixer has no loop flag, so the end is predicted from the length and
-	//the track is retriggered when it passes. Close enough for music, and it
-	//keeps the change out of the shared audio driver.
+	q_music_voice = AudioSFXPlayRef(q_music_frames, q_music_count, q_music_rate,
+		ToI64(q_music_volume * q_snd_master * ToF64(AUDIO_VOL_UNITY)),
+		ToI64(q_music_volume * q_snd_master * ToF64(AUDIO_VOL_UNITY)));
+
+	//backstop only, a predicted end drifts - the live voice is the real test
 	q_music_ends    = now + ToF64(q_music_count) / ToF64(q_music_rate);
 	q_music_playing = TRUE;
 }
@@ -376,8 +646,7 @@ Bool QMusicPlay(I64 track, F64 now)
 		return FALSE;
 	}
 
-	//Already spinning this one - a level reload should not restart the music,
-	//which is what the original's CDAudio_Play does with the same check.
+	//CDAudio_Play has the same check, a level reload must not restart music
 	if (q_music_playing && q_music_track == track)
 		return TRUE;
 
@@ -390,30 +659,36 @@ Bool QMusicPlay(I64 track, F64 now)
 }
 
 U0 QMusicUpdate(F64 now)
-{//Retrigger at the end of the track.
+{//retrigger once the mixer says it finished - predicting from length runs
+ //early and stacks copies, or late and leaves a gap
 	if (!q_music_playing || !q_music_frames)
 		return;
 
-	if (now >= q_music_ends)
-		QMusicStart(now);
+	if (q_music_voice >= 0 && AudioSFXPlaying(q_music_voice))
+		return;
+
+	QMusicStart(now);
 }
 
-U0 QSndPlayAt(U8 *name, F64 *origin, F64 volume, F64 attenuation)
-{//Play one sound, attenuated by distance from the listener.
-	CQSound	*s;
-	F64		 d[3];
-	F64		 dist;
-	F64		 gain;
-	I64		 stream;
+U0 QSndPlayAt(U8 *name, F64 *origin, F64 volume, F64 attenuation,
+	I64 entnum = 0, I64 entchannel = 0)
+{//S_StartSound. entnum/entchannel pick the channel and what it replaces, 0/0
+ //is CHAN_AUTO from the world and overrides nothing
+	CQSound		*s;
+	CQSndChan	*ch;
+	I64			 chan;
+	I64			 vol_l;
+	I64			 vol_r;
+	F64			 gain;
+	I64			 stream;
 
 	if (!q_snd_enabled || !name || !name[0])
 		return;
 
 	s = QSndLoad(name);
 
-	//Log the first handful of requests with what became of them. "no monster
-	//sounds" has three very different causes - never requested, failed to load,
-	//or attenuated to silence - and they need opposite fixes.
+	//"no monster sounds" is three different faults - never requested, load
+	//failure, or attenuated to silence. log the first few to tell them apart
 	if (q_snd_reports < QSND_MAX_REPORTS)
 	{
 		q_snd_reports++;
@@ -433,45 +708,52 @@ U0 QSndPlayAt(U8 *name, F64 *origin, F64 volume, F64 attenuation)
 	if (gain > 1.0)
 		gain = 1.0;
 
-	//A positioned sound fades with distance; attenuation 0 means it plays at
-	//full volume everywhere, which is how QuakeC does music and pickups.
-	if (origin && attenuation > 0.0)
+	chan = QSndPickChannel(entnum, entchannel);
+	if (chan < 0)
 	{
-		QVecSub(origin, q_snd_listener, d);
-		dist = QVecLength(d);
-		gain = gain * (1.0 - dist * attenuation / QSND_CLIP_DIST);
-	}
-
-	if (gain <= 0.0)
-	{
-		//Attenuated into silence. Counted, because a monster that is audible in
-		//the original but silent here shows up as nothing else.
-		q_snd_silent++;
+		q_snd_dropped++;
 		return;
 	}
-	if (gain > 1.0)
-		gain = 1.0;
 
-	//Played by REFERENCE straight out of the cache, with the volume handed to
-	//the mixer instead of baked into a copy.
-	//
-	//This used to scale every sample into a scratch buffer and hand that over,
-	//which meant one full copy of the PCM per play AND a single shared scratch
-	//buffer - so only one sound could be in flight through it. The cache never
-	//evicts, so the frames stay valid for the life of the map; QSndFree stops
-	//all voices before releasing them.
-	stream = AudioSFXPlayRef(s->frames, s->count, s->rate,
-		ToI64(gain * ToF64(AUDIO_VOL_UNITY)),
-		ToI64(gain * ToF64(AUDIO_VOL_UNITY)));
+	ch = &q_snd_chan[chan];
+	ch->entnum     = entnum;
+	ch->entchannel = entchannel;
+	ch->master_vol = gain;
 
-	//A busy moment drops the sound rather than queueing it. Counted so the cost
-	//is visible instead of mysterious.
+	//attenuation 0 gives dist_mult 0 and never fades, as pickups want
+	ch->dist_mult = attenuation / QSND_CLIP_DIST;
+
+	if (origin)
+		QVecCopy(origin, ch->origin);
+	else
+	{
+		QVecCopy(q_snd_listener, ch->origin);
+		ch->dist_mult = 0.0;
+	}
+
+	QSndSpatialize(ch, &vol_l, &vol_r);
+
+	//S_StartSound bails rather than burn a channel on the inaudible
+	if (vol_l <= 0 && vol_r <= 0)
+	{
+		q_snd_silent++;
+		ch->voice = -1;
+		return;
+	}
+
+	//played by reference out of the cache with volume handed to the mixer,
+	//not baked into a scratch copy - that costs a full PCM copy per play and
+	//lets only one sound through the shared buffer. the cache never evicts,
+	//and QSndFree stops every voice before releasing frames
+	stream = AudioSFXPlayRef(s->frames, s->count, s->rate, vol_l, vol_r);
+	ch->voice = stream;
+
+	//dropped, not queued, when every voice is busy
 	if (stream < 0)
 	{
 		q_snd_dropped++;
 
-		//Name the losers: a dropped sound is indistinguishable from one that
-		//was never requested unless it says so.
+		//a drop looks like a sound never requested unless it says so
 		if (q_snd_reports < QSND_MAX_REPORTS)
 		{
 			q_snd_reports++;
@@ -485,21 +767,15 @@ U0 QSndPlayAt(U8 *name, F64 *origin, F64 volume, F64 attenuation)
 
 //--- looping ambient sounds ------------------------------------------------
 //
-// ambientsound() places a permanent looping source: wind, water, torches. The
-// mixer here has only four streams and no loop flag, so a source cannot simply
-// be started and left running.
+// ambientsound() places a permanent looping source - wind, water, torches. no
+// loop flag in the mixer, so sources are remembered and the loudest few are
+// re-triggered as their previous instance runs out
 //
-// Instead every source is remembered, and each frame the loudest few are
-// re-triggered as their previous instance runs out. Deliberately capped well
-// below the stream count so gunfire is never starved by ambience.
+// capped well under the voice count so gunfire is never starved by ambience
 
 #define QSND_MAX_AMBIENT	64
-//Ambient voices.
-//
-//This was cut to 1 as a workaround when the mixer had only four buffered
-//streams and a two-second ambience loop held one for its whole length. With a
-//proper voice bank in the driver that constraint is gone, so ambience can run
-//at a useful count again.
+//was 1 back when the mixer had four buffered streams and one ambience loop
+//held a stream for its whole length. the voice bank lifted that
 #define QSND_AMBIENT_VOICES	3
 
 class CQAmbient
@@ -508,7 +784,7 @@ class CQAmbient
 	U8	 name[64];
 	F64	 volume;
 	F64	 attenuation;
-	F64	 next_time;		//when this source may be re-triggered
+	F64	 next_time;		//earliest re-trigger
 	F64	 duration;
 };
 
@@ -521,7 +797,7 @@ U0 QSndAmbientClear()
 }
 
 U0 QSndAmbientAdd(F64 *origin, U8 *name, F64 volume, F64 attenuation)
-{//Register a looping source. Called once per ambient entity at map load.
+{//one call per ambient entity at map load
 	CQAmbient	*a;
 	CQSound		*snd;
 
@@ -541,8 +817,7 @@ U0 QSndAmbientAdd(F64 *origin, U8 *name, F64 volume, F64 attenuation)
 	a->next_time   = 0.0;
 	a->duration    = ToF64(snd->count) / ToF64(snd->rate);
 
-	//A source shorter than this would re-trigger every few frames and eat the
-	//whole mixer, so treat it as at least a reasonable loop length.
+	//a shorter source re-triggers every few frames and eats the mixer
 	if (a->duration < 0.25)
 		a->duration = 0.25;
 
@@ -550,7 +825,7 @@ U0 QSndAmbientAdd(F64 *origin, U8 *name, F64 volume, F64 attenuation)
 }
 
 U0 QSndAmbientUpdate(F64 time)
-{//Keep the nearest ambient sources playing.
+{//keep the nearest ambient sources playing
 	CQAmbient	*a;
 	F64			 d[3];
 	F64			 dist;
@@ -569,7 +844,7 @@ U0 QSndAmbientUpdate(F64 time)
 		best      = -1;
 		best_gain = 0.0;
 
-		//Pick the loudest source that is due to be re-triggered.
+		//loudest source that is due
 		for (i = 0; i < q_ambient_count; i++)
 		{
 			a = &q_ambient[i];
@@ -602,11 +877,52 @@ qa_next:
 		used[best]   = TRUE;
 		a->next_time = time + a->duration;
 
-		QSndPlayAt(a->name, a->origin, a->volume, a->attenuation);
+		//each source is its own entnum on a fixed channel, so a re-trigger
+		//replaces its own previous instance instead of stacking
+		QSndPlayAt(a->name, a->origin, a->volume, a->attenuation,
+			-(best + 1), 1);
 	}
 }
 
-U0 QSndListener(F64 *origin)
-{
+U0 QSndListener(F64 *origin, F64 *right = NULL)
+{//S_Update's listener. without listener_right every sound sits dead centre
 	QVecCopy(origin, q_snd_listener);
+
+	if (right)
+		QVecCopy(right, q_snd_right);
+}
+
+U0 QSndStop(I64 entnum, I64 entchannel)
+{//S_StopSound: silence that entity's dynamic channel. svc_stopsound cuts a
+ //long sample short - a lift motor, a charging shambler - and ignoring it
+ //leaves the sound running to its natural end
+	I64 i;
+
+	for (i = 0; i < QSND_DYNAMIC_CHANNELS; i++)
+	{
+		if (q_snd_chan[i].entnum == entnum &&
+			q_snd_chan[i].entchannel == entchannel)
+		{
+			if (q_snd_chan[i].voice >= 0)
+				AudioSFXStop(q_snd_chan[i].voice);
+
+			q_snd_chan[i].voice      = -1;
+			q_snd_chan[i].entnum     = 0;
+			q_snd_chan[i].entchannel = 0;
+			q_snd_chan[i].master_vol = 0.0;
+			return;
+		}
+	}
+}
+
+U0 QMusicApplyVolume()
+{//re-aim the running track at bgmvolume. one voice, so this is a level change
+ //not a restart - the slider must not skip back to the top of the track
+	I64 vol;
+
+	if (q_music_voice < 0 || !AudioSFXPlaying(q_music_voice))
+		return;
+
+	vol = ToI64(q_music_volume * q_snd_master * ToF64(AUDIO_VOL_UNITY));
+	AudioSFXVoiceVolSet(q_music_voice, vol, vol);
 }

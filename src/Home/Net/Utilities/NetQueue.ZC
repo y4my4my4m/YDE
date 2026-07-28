@@ -22,10 +22,24 @@ class CNetQueueEntry:CQueue
 
 CQueue *net_queue; // no QueueRemove the Head! only Entries!
 
+/*	Depth cap: a flood must not CAlloc the heap to death from the NIC IRQ.
+
+	net_queue is mutated from TWO interrupt contexts - the NIC IRQ pushes and
+	NetHandler pulls - so the list and the counter need a lock. Without one the
+	counter loses updates and drifts; once it drifts up to NETQUEUE_MAX it never
+	comes back down and every frame is dropped from then on. */
+#define NETQUEUE_MAX	64
+I64 net_queue_depth = 0;
+I64 net_queue_drops = 0;
+I64 net_queue_lock  = 0;
+
 U0 NetQueueInit()
 {
 	net_queue = CAlloc(sizeof(CQueue));
 	QueueInit(net_queue);
+	net_queue_depth = 0;
+	net_queue_drops = 0;
+	net_queue_lock  = 0;
 }
 
 CNetQueueEntry *NetQueuePull()
@@ -34,17 +48,25 @@ CNetQueueEntry *NetQueuePull()
 
 	CNetQueueEntry *entry;
 
+	PUSHFD
+	CLI
+	while (LBts(&net_queue_lock, 0))
+		PAUSE
+
 	if (net_queue->next != net_queue)
 	{
 		entry = net_queue->next;
-
-		NetLog("NETQUEUE PULL: Removing entry from queue.");
 		QueueRemove(entry);
+		if (net_queue_depth > 0)
+			net_queue_depth--;
 	}
 	else // Queue is empty if head->next is head itself.
 	{
 		entry = NULL;
 	}
+
+	LBtr(&net_queue_lock, 0);
+	POPFD
 
 	return entry;
 }
@@ -55,16 +77,41 @@ U0 NetQueuePush(U8 *data, I64 length)
 	after the last entry of net_queue to keep new
 	items in the back of the Queue, old in front. */ 
 
-	CNetQueueEntry *entry = CAlloc(sizeof(CNetQueueEntry));
+	CNetQueueEntry *entry;
+
+	/*	frame[] is fixed size and the caller is a NIC IRQ passing a length taken
+		from the receive ring, so an impossible length must not reach MemCopy. */
+	if (length < 1 || length > ETHERNET_FRAME_SIZE)
+		return;
+
+	entry = CAlloc(sizeof(CNetQueueEntry));
+	if (!entry)
+		return;
 
 	entry->packet_length = length;
-
 	MemCopy(entry->frame, data, length);
 
-	QueueInsert(entry, net_queue->last);
+	PUSHFD
+	CLI
+	while (LBts(&net_queue_lock, 0))
+		PAUSE
 
-	// Generate Net Handler interrupt.
-	NetLog("NETQUEUE PUSH COPY: Generating NetHandler interrupt.");
+	if (net_queue_depth >= NETQUEUE_MAX)
+	{
+		net_queue_drops++;
+		LBtr(&net_queue_lock, 0);
+		POPFD
+
+		Free(entry);
+		return;
+	}
+
+	QueueInsert(entry, net_queue->last);
+	net_queue_depth++;
+
+	LBtr(&net_queue_lock, 0);
+	POPFD
+
 	MPInt(I_NETHANDLER, INT_DEST_CPU);
 }
 

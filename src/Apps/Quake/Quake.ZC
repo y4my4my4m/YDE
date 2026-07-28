@@ -1,55 +1,40 @@
-// Quake.ZC - application shell: window, input, frame loop.
+// Quake.ZC - app shell: window, input, frame loop.
 //
-// Rendering happens on this task and the blit happens in the draw_it callback
-// on the window manager task. That callback must never block (it drives the
-// whole compositor), so it only ever copies pixels.
+// rendering runs on this task; the blit runs in the draw_it callback on the
+// window manager task, which must never block - it copies pixels and nothing
+// else.
 
-//cl_forwardspeed and cl_forwardspeed * cl_movespeedkey, the original's own
-//defaults. The run figure exceeds sv_maxspeed (320) on purpose: the move code
-//clamps it, which is what makes diagonal movement no faster than straight.
+//cl_forwardspeed and * cl_movespeedkey, the original's defaults. run exceeds
+//sv_maxspeed (320) on purpose - the move code clamps it, so diagonals are no
+//faster than straight.
 #define QMOVE_SPEED		200.0	//world units per second
 #define QMOVE_FAST		400.0
 #define QPITCH_LIMIT	89.0
-//New Game starts in start.bsp, not the first level. That is how the original
-//works: skill is chosen by walking into one of three corridors and the episode
-//by entering a slipgate, so the difficulty and episode selection are part of
-//the world rather than a menu page.
+//new game starts in start.bsp - skill and episode are chosen by walking into
+//the world, not from a menu page.
 #define QDEFAULT_MAP	"maps/start.bsp"
 
-//Entities are not in the PVS, so they are range-limited instead. 2000 units
-//covers a large room without submitting the whole level's triangles.
+//entities are not in the PVS, so range-limit instead. 2000 covers a large
+//room without submitting the whole level.
 #define QENT_DRAW_DIST	2000.0
 #define QENT_LIGHT		170		//flat shade until models sample the lightmap
 
 #define QVIEW_HEIGHT	22.0	//eye height above the player origin
 
-//Server tick.
-//
-//The game clock is driven by the OS jiffy counter (JIFFY_FREQ, 1000Hz), NOT by
-//how fast we happen to render. Rendering speed must not change how the world
-//behaves: the original runs one server frame per accepted host frame at a
-//capped rate, and 72Hz reproduces the cadence its physics and QuakeC timings
-//were tuned against.
-//
-//Jiffies rather than tS because it is the kernel's own monotonic tick - one
-//integer increment per millisecond, immune to any frame pacing.
+//server tick: off the jiffy counter, not the render rate. QuakeC timings and
+//the physics were tuned against 72Hz.
 #define QSERVER_HZ			72.0
 #define QSERVER_STEP		(1.0 / QSERVER_HZ)
 #define QSERVER_MAX_CATCHUP	4
 
-//View-model placement: world-space offsets from the eye, in Quake units.
-//
-//The view model sits AT the eye, not out in front of it. Its own vertices
-//already place the weapon correctly relative to the viewpoint - the original
-//copies the view origin straight into the model entity and adds nothing but
-//bob. Pushing it forward instead makes it shrink away into the distance and
-//read as a world prop lying on the floor.
+//view model sits AT the eye - its verts already carry the offset. V_CalcRefdef
+//copies the view origin in and adds only bob.
 #define QVM_FORWARD		0.0
 #define QVM_RIGHT		0.0
 #define QVM_UP			0.0
 #define QVM_LIGHT		200		//weapons read brighter than world entities
 
-CQMap		*q_map		= NULL;
+//q_map declared in QBSP.ZC (needed by QNetSv before this file).
 CQVisState	*q_vis		= NULL;
 CQCanvas	*q_canvas	= NULL;
 
@@ -73,26 +58,32 @@ Bool q_ready		= FALSE;
 F64	 q_fps			= 0.0;
 I64	 q_frame_count	= 0;
 
+Bool q_loading = FALSE;		//SCR_BeginLoadingPlaque / scr_drawloading
+
 U0 QDrawIt(CTask *task, CDC *dc)
-{//Runs on the window manager task: copy only, no work.
- //Every pointer this touches is cleared before the owning task frees it, so
- //the guard below is what keeps teardown from pulling memory out from under
- //an in-flight blit.
-	if (!q_ready || !q_canvas || !q_vis)
+{//window manager task: copy only. every pointer is cleared before the owner
+ //frees it, so these guards are what keep teardown out of an in-flight blit.
+	//a map load blocks the game task but not this one, and q_vis stays NULL
+	//throughout - without this the old level sits frozen on screen.
+	if (q_loading && q_ready && q_canvas)
+	{
+		QDrawBlitFit(q_canvas, dc, q_blit_x, q_blit_y, q_blit_w, q_blit_h);
+		return;
+	}
+
+	if (!q_ready || !q_canvas)
 		return;
 
 	QDrawBlitFit(q_canvas, dc, q_blit_x, q_blit_y, q_blit_w, q_blit_h);
 
 
-	//Health, armor and ammo are deliberately NOT printed here any more. The
-	//real status bar draws them inside the canvas from the game's own art, at
-	//the game's own resolution, through the game's own palette.
+	//no HUD text here - Sbar draws it into the canvas, from the game's own art
+	//and through the game's own palette.
 }
 
 U0 QRenderEntities()
-{//Brush entities first (they are part of the architecture), then the alias
- //models. Everything is depth tested, so order is a performance detail rather
- //than a correctness one.
+{//brush models first, then alias. everything is depth tested, so order is a
+ //speed detail, not a correctness one.
 	CQEntity *e;
 	F64		  dist[3];
 	I64		  i;
@@ -131,10 +122,8 @@ U0 QRenderEntities()
 
 //--- stuck detector --------------------------------------------------------
 //
-// "I get stuck and nothing is in the log" needs its own signal. Wanting to move
-// and not moving is measurable: if the player is asking for motion and the
-// origin has not changed across several server steps, something is refusing the
-// move, and the interesting part is WHAT.
+// Wanting to move and not moving is measurable: input applied, origin unchanged
+// across several server steps means something is refusing the move.
 #define QSTUCK_STEPS	12		//consecutive refused steps before reporting
 #define QSTUCK_REPORTS	4
 
@@ -180,18 +169,14 @@ U0 QStuckCheck(F64 *wishdir, F64 wishspeed)
 	if (q_stuck_steps != QSTUCK_STEPS || q_stuck_said >= QSTUCK_REPORTS)
 		return;
 
-	//Walking straight into a wall legitimately does not move the player, so a
-	//refused move is only interesting when the sweep is CLEAR. Reporting the
-	//blocked case as well made the detector fire constantly against ordinary
-	//geometry and buried the cases that matter.
+	//only interesting when the sweep is CLEAR - walking into a wall legitimately
+	//does not move the player.
 	QVecMA(q_origin, 4.0, wishdir, probe);
 	QTracePlayer(q_map, q_origin, probe, &tr);
 
 	if (tr.fraction < 1.0)
 	{
-		//Something really is in the way - a wall, a door, a button. Standing
-		//against it and not moving is correct, not stuck, so this is not worth
-		//a line either way. Only a REFUSED move with a clear sweep is a bug.
+		//something really is in the way - not stuck, correct.
 		q_stuck_steps = 0;
 		return;
 	}
@@ -220,10 +205,8 @@ U0 QStuckCheck(F64 *wishdir, F64 wishspeed)
 		QLog(q_stuck_line);
 	}
 
-	//Knowing the position is clear is not enough - the question is what stops
-	//the SWEEP. Repeat the move the player is asking for and report the trace
-	//that refuses it: how far it got, the plane it hit, and which entity owns
-	//that plane (-1 being the world).
+	//a clear position is not the question - what stops the SWEEP is. repeat the
+	//move and report the trace that refuses it (ent -1 is the world).
 	QVecMA(q_origin, 4.0, wishdir, probe);
 	QTracePlayer(q_map, q_origin, probe, &tr);
 
@@ -240,10 +223,8 @@ U0 QStuckCheck(F64 *wishdir, F64 wishspeed)
 			ToI64(QPrFieldF(tr.ent, q_fld_solid)));
 		QLog(q_stuck_line);
 
-		//The blocker's OWN geometry, so a phantom collision is provable rather
-		//than inferred. If the player is nowhere near these bounds then the
-		//trace is being run against the wrong submodel, and the brush number it
-		//resolved to is printed for exactly that comparison.
+		//the blocker's own bounds: if the player is nowhere near them the trace
+		//ran against the wrong submodel, so the brush number is printed too.
 		StrPrint(q_stuck_line,
 			"stuck:   bmodel=%d org %.0f %.0f %.0f  mins %.0f %.0f %.0f  maxs %.0f %.0f %.0f\n",
 			QClipBrushModel(ToI64(QPrFieldF(tr.ent, q_fld_modelindex))),
@@ -264,34 +245,24 @@ U0 QStuckCheck(F64 *wishdir, F64 wishspeed)
 
 //--- cshifts ----------------------------------------------------------------
 //
-// V_UpdatePalette blends FOUR independent colour shifts into the palette, not
-// one. Only the liquid one was wired up here, so taking damage, picking
-// something up and holding a powerup all looked identical - nothing happened.
+// V_UpdatePalette blends four shifts, each a destination colour plus a percent,
+// applied in sequence so a hit while underwater reads as both.
 //
-//   CONTENTS - what the eye is submerged in (already handled by QLiquidView)
-//   DAMAGE   - red, driven by how much was just taken, decaying at 150/sec
-//   BONUS    - the pale yellow item-pickup flash, decaying at 100/sec
-//   POWERUP  - held item: quad blue, invulnerability red, suit green
-//
-// Each is a destination colour plus a percentage, and they are applied in
-// sequence so a hit while underwater reads as both.
+//   CONTENTS - eye submersion (QLiquidView)
+//   DAMAGE   - red, scaled by damage taken, decays at 150/sec
+//   BONUS    - pickup flash, decays at 100/sec
+//   POWERUP  - quad blue, invulnerability yellow, suit green
 #define QCS_DAMAGE_RATE		150.0
 #define QCS_BONUS_RATE		100.0
 
-//Powerup bits from the original's defs.qc.
+//powerup bits from defs.qc. 4096 is IT_AXE, always held - do not use it for a
+//powerup test.
 //
-//These were wrong, and wrong in the worst possible way: 4096 is IT_AXE, which
-//the player ALWAYS has, so the invulnerability tint was applied on every single
-//frame and the screen simply stayed red once anything tinted it.
-//
-//    IT_AXE             4096
-//    IT_SUPERHEALTH    16384
-//    IT_KEY1          131072
-//    IT_KEY2          262144
-//    IT_INVISIBILITY  524288
-//    IT_INVULNERABILITY 1048576
-//    IT_SUIT          2097152
-//    IT_QUAD          4194304
+//    IT_AXE             4096      IT_INVISIBILITY   524288
+//    IT_SUPERHEALTH    16384      IT_INVULNERABILITY 1048576
+//    IT_KEY1          131072      IT_SUIT          2097152
+//    IT_KEY2          262144      IT_QUAD          4194304
+#define QIT_INVISIBILITY	524288
 #define QIT_INVULNERABILITY	1048576
 #define QIT_SUIT			2097152
 #define QIT_QUAD			4194304
@@ -332,12 +303,9 @@ U0 QCShiftUpdate(F64 dt)
 }
 
 U0 QCShiftBlend(I64 *_r, I64 *_g, I64 *_b, I64 *_a)
-{//Fold the damage, bonus and powerup shifts on top of whatever the liquid
- //shift already produced, and hand back a single tint.
- //
- //Blended in place rather than summed: each shift moves the running colour a
- //percentage of the way towards its own, which is what V_UpdatePalette does
- //when it accumulates them one after another.
+{//fold damage, bonus and powerup over the liquid shift into one tint.
+ //blended in place, not summed: each shift moves the running colour a
+ //percentage of the way toward its own.
 	F64 r = ToF64(*_r);
 	F64 g = ToF64(*_g);
 	F64 b = ToF64(*_b);
@@ -345,17 +313,17 @@ U0 QCShiftBlend(I64 *_r, I64 *_g, I64 *_b, I64 *_a)
 	I64 items = 0;
 	F64 pct;
 
-	if (q_player_active && q_player_edict > 0 && q_fld_items >= 0)
+	//V_CalcPowerupCshift reads cl.items, off svc_clientdata - a demo or a remote
+	//client has no server edict to read.
+	if (QClientMode)
+		items = q_cl.items;
+	else if (q_player_active && q_player_edict > 0 && q_fld_items >= 0)
 		items = ToI64(QPrFieldF(q_player_edict, q_fld_items));
 
-	//Powerups first, so a hit taken while quadded still reads red on top.
+	//powerups first, so a hit taken while quadded still reads red on top.
+	//one shift only - V_CalcPowerupCshift is an if/else chain, in this order.
 	pct = 0.0;
-	if (items & QIT_INVULNERABILITY)
-	{
-		r = r + (255.0 - r) * 0.30;  g = g * 0.70;  b = b * 0.70;
-		pct = 30.0;
-	}
-	else if (items & QIT_QUAD)
+	if (items & QIT_QUAD)
 	{
 		b = b + (255.0 - b) * 0.30;  r = r * 0.70;  g = g * 0.70;
 		pct = 30.0;
@@ -364,6 +332,19 @@ U0 QCShiftBlend(I64 *_r, I64 *_g, I64 *_b, I64 *_a)
 	{
 		g = g + (255.0 - g) * 0.20;  r = r * 0.80;  b = b * 0.80;
 		pct = 20.0;
+	}
+	else if (items & QIT_INVISIBILITY)
+	{
+		//100 percent: the ring washes the whole screen to flat grey.
+		r = 100.0;  g = 100.0;  b = 100.0;
+		pct = 100.0;
+	}
+	else if (items & QIT_INVULNERABILITY)
+	{
+		r = r + (255.0 - r) * 0.30;
+		g = g + (255.0 - g) * 0.30;
+		b = b * 0.70;
+		pct = 30.0;
 	}
 
 	if (pct > a)
@@ -404,19 +385,16 @@ U0 QCShiftBlend(I64 *_r, I64 *_g, I64 *_b, I64 *_a)
 
 //--- weapon punch and damage kick ------------------------------------------
 //
-// Two separate effects, both VIEW-ONLY and applied to a copy of the angles:
+// Two view-only effects, applied to a copy of the angles:
 //
-//   punchangle - QuakeC sets .punchangle when a weapon fires (the shotgun uses
-//                -2 pitch), giving the recoil snap.
-//   damage kick - V_ParseDamage turns a hit into a roll and pitch kick whose
-//                direction depends on where the damage came from, so being shot
-//                from the left throws the view differently than from the front.
+//   punchangle  - QuakeC sets .punchangle on fire (shotgun uses -2 pitch)
+//   damage kick - V_ParseDamage turns a hit into roll and pitch, directed by
+//                 where the damage came from
 //
-// The original's own cvar defaults for the kick.
+// Cvar defaults below are the original's.
 #define QKICK_ROLL		0.6
 #define QKICK_PITCH		0.6
 #define QKICK_TIME		0.5
-#define QPUNCH_DECAY	0.5		//seconds for a weapon punch to wash out
 
 F64 q_dmg_roll		= 0.0;
 F64 q_dmg_pitch		= 0.0;
@@ -428,6 +406,16 @@ I64 q_con_return_state = QST_PLAYING;	//state the console was opened from
 //Entities whose reconstructed client state disagreed with the server's world on
 //the last tick. Should be 0; anything else is an encode or decode fault.
 I64 q_net_mismatch = 0;
+
+//When the last connection request went out, so it can be repeated.
+F64 q_join_last_try = 0.0;
+U8  q_join_line[96];
+F64 q_heap_check_last = 0.0;
+U8  q_heap_check_line[48];
+
+F64 q_tick_log_last = 0.0;
+I64 q_tick_log_n    = 0;
+U8  q_tick_line[160];
 
 U0 QViewKickInit()
 {
@@ -445,12 +433,10 @@ U0 QViewKickUpdate(F64 dt)
 	F64 rgt[3];
 	F64 upv[3];
 	F64 dir[3];
-	F64 take;
 	F64 count;
 	F64 side;
 	F64 len;
 	I64 inflictor;
-	I64 items;
 	I64 j;
 
 	if (!q_player_active || q_player_edict <= 0)
@@ -461,46 +447,46 @@ U0 QViewKickUpdate(F64 dt)
 
 	//--- weapon punch ---
 	//
-	//The field is read rather than tracked, and decayed here rather than in
-	//QuakeC. Taking the larger magnitude means a fresh shot always registers
-	//even if the previous punch has not finished washing out.
+	//Read straight off the edict - the field IS the current kick. Recovery
+	//happens in DropPunchAngle each client think.
 	if (q_fld_punchangle >= 0)
 	{
 		for (j = 0; j < 3; j++)
-		{
-			take = QPrFieldF(q_player_edict, q_fld_punchangle + j);
-
-			if (take < 0.0)
-			{
-				if (take < q_punch[j])
-					q_punch[j] = take;
-			}
-			else if (take > 0.0)
-			{
-				if (take > q_punch[j])
-					q_punch[j] = take;
-			}
-		}
-	}
-
-	for (j = 0; j < 3; j++)
-	{
-		if (q_punch[j] > 0.0)
-		{
-			q_punch[j] -= dt / QPUNCH_DECAY * 4.0;
-			if (q_punch[j] < 0.0)
-				q_punch[j] = 0.0;
-		}
-		else if (q_punch[j] < 0.0)
-		{
-			q_punch[j] += dt / QPUNCH_DECAY * 4.0;
-			if (q_punch[j] > 0.0)
-				q_punch[j] = 0.0;
-		}
+			q_punch[j] = QPrFieldF(q_player_edict, q_fld_punchangle + j);
 	}
 
 	//--- damage kick ---
-	if (q_fld_dmg_take >= 0 && q_fld_dmg_save >= 0)
+	//
+	//Thin client: QuakeC never writes local dmg_take. svc_damage parks the hit
+	//in q_net_damage_* (V_ParseDamage's inputs) - honour that here.
+	if (q_net_damage_pending)
+	{
+		count = ToF64(q_net_damage_take) + ToF64(q_net_damage_save);
+		if (count < 10.0)
+			count = 10.0;
+		if (count > 255.0)
+			count = 255.0;
+
+		QCShiftDamage(count);
+
+		QVecSub(q_net_damage_from, q_origin, dir);
+		len = QVecLength(dir);
+		if (len > 0.0)
+		{
+			QVecScale(dir, 1.0 / len, dir);
+			QAngleVectors(q_angles, fwd, rgt, upv);
+			side        = QVecDot(dir, rgt);
+			q_dmg_roll  = count * side * QKICK_ROLL;
+			side        = QVecDot(dir, fwd);
+			q_dmg_pitch = count * side * QKICK_PITCH;
+			q_dmg_time  = QKICK_TIME;
+		}
+
+		q_net_damage_pending = FALSE;
+		q_net_damage_take    = 0;
+		q_net_damage_save    = 0;
+	}
+	else if (q_fld_dmg_take >= 0 && q_fld_dmg_save >= 0)
 	{
 		count = QPrFieldF(q_player_edict, q_fld_dmg_take) +
 				QPrFieldF(q_player_edict, q_fld_dmg_save);
@@ -511,17 +497,11 @@ U0 QViewKickUpdate(F64 dt)
 			if (count < 10.0)
 				count = 10.0;
 
-			//Upper bound comes from the PROTOCOL, not from a clamp in the view
-			//code. V_ParseDamage reads armour and blood as two BYTES and forms
-			//count = blood*0.5 + armor*0.5, so it can never exceed 255 however
-			//much damage was actually dealt. Reading the fields directly, as
-			//this does, has no such ceiling - a large hit would throw the camera
-			//much further than the original ever could.
+			//V_ParseDamage reads armour and blood as bytes - cap at 255.
 			if (count > 255.0)
 				count = 255.0;
 
-			//Same event drives the red screen flash. V_ParseDamage does the
-			//kick and the cshift together from this one message.
+			//V_ParseDamage does the kick and the cshift from the one message.
 			QCShiftDamage(count);
 
 			inflictor = 0;
@@ -557,16 +537,22 @@ U0 QViewKickUpdate(F64 dt)
 
 		q_dmg_last = count;
 
-		//SV_WriteClientdataToMessage CLEARS these after sending them, so they
-		//describe one frame's damage and nothing more. Left standing they
-		//describe the last hit forever, which makes an identical second hit
-		//register as no change at all and produce no flash or kick.
+		//SV_WriteClientdataToMessage clears these after sending: left standing,
+		//an identical second hit reads as no change and gives no flash or kick.
 		if (count > 0.0)
 		{
 			QPrSetFieldF(q_player_edict, q_fld_dmg_take, 0.0);
 			QPrSetFieldF(q_player_edict, q_fld_dmg_save, 0.0);
 			q_dmg_last = 0.0;
 		}
+	}
+
+	//Thin client: punchangle arrives in clientdata, not on the local edict.
+	//The host has already decayed it, so this is the value to use as-is.
+	if (q_udp_ready && !q_udp_server)
+	{
+		for (j = 0; j < 3; j++)
+			q_punch[j] = q_cl.punchangle[j];
 	}
 
 	if (q_dmg_time > 0.0)
@@ -576,25 +562,14 @@ U0 QViewKickUpdate(F64 dt)
 			q_dmg_time = 0.0;
 	}
 
-	//Pickup flash. QuakeC signals this with a stuffcmd of "bf" in the original,
-	//which needs a command layer to receive; watching .items GAIN a bit is the
-	//same event from this side and needs nothing extra.
-	//The bonus flash used to be INFERRED from the items bitmask changing. That
-	//was a guess, and it was wrong in both directions: it missed pickups that
-	//set no new bit (health, ammo you already had) and it could never fire while
-	//a powerup was running out, since fading changes no bits at all. QuakeC says
-	//when to flash by stuffing "bf", and that is now honoured directly.
+	//Pickup flash is driven by QuakeC stuffing "bf", not by watching .items:
+	//health and already-held ammo set no bit, and a fading powerup clears one.
 
 	QCShiftUpdate(dt);
 }
 
-//Idle drift. V_AddIdle: three independent sine waves that make the view
-//breathe when standing still.
-//
-//v_idlescale is 0 in stock Quake, so this is OFF by default and porting it
-//faithfully means porting a no-op. The cvar values are the original's, and the
-//scale is exposed so it can be turned on - but leaving it at 0 is what matches
-//the game, and that is why it stays there.
+//V_AddIdle: three sines that make the view breathe when standing still.
+//v_idlescale is 0 in stock Quake, so this is off by default.
 #define QIDLE_ROLL_CYCLE	0.5
 #define QIDLE_PITCH_CYCLE	1.0
 #define QIDLE_YAW_CYCLE		2.0
@@ -634,9 +609,8 @@ U0 QViewApplyKick(F64 *angles)
 
 //--- view bob and roll -----------------------------------------------------
 //
-// Both are cosmetic and VIEW-ONLY. They are applied to a copy of the angles
-// used for rendering, never to q_angles itself: that feeds .v_angle, and
-// leaning it would make the player's aim lean with the camera.
+// View-only: applied to the render copy of the angles, never to q_angles, which
+// feeds .v_angle and would lean the player's aim with the camera.
 
 #define QBOB_AMOUNT		0.02	//bob per unit of horizontal speed
 #define QBOB_CYCLE		0.6		//seconds for a full step cycle
@@ -649,23 +623,13 @@ F64 q_bob_value	= 0.0;	//last computed bob, held while airborne
 F64 q_bob_prev	= 0.0;	//real time of the previous update
 
 U0 QViewBobUpdate()
-{//Recompute the head bob. Called ONCE per frame. V_CalcBob.
+{//V_CalcBob. called ONCE per frame: it is read twice, for the eye and for the
+ //weapon, and advancing the clock in the reader doubles the cycle rate.
  //
- //Three things here are easy to get subtly wrong, and all three were:
- //
- //  1. Airborne HOLDS the previous value rather than returning zero. The
- //     original does `if (onground == -1) return bob;`. Snapping to zero puts a
- //     visible jolt in the view on every jump and every step off a ledge.
- //
- //  2. The cycle runs on ACCUMULATED walking time, not wall-clock time. The
- //     original increments bobtime only after the airborne early-out, so the
- //     cycle pauses in mid-air and resumes where it left off. Driving it from
- //     absolute time instead makes the phase jump on landing, so footfalls
- //     land at the wrong point of the step.
- //
- //  3. It must be computed once per frame. This is read twice - once for the
- //     eye and once for the weapon - and advancing the clock inside the reader
- //     stepped the cycle at double rate.
+ //airborne HOLDS the last value (original: if (onground == -1) return bob;) -
+ //zeroing puts a jolt in the view on every jump. the cycle runs on accumulated
+ //walking time, not wall-clock, so the phase resumes where it left off on
+ //landing rather than jumping.
 	F64 cycle;
 	F64 bob;
 	F64 speed;
@@ -718,15 +682,9 @@ F64 q_view_oldz	= 0.0;	//eye height being caught up to after a step
 F64 q_step_prev	= 0.0;
 
 F64 QViewStepOffset()
-{//Smooth the view over stair steps. V_CalcRefdef.
- //
- //Walking up stairs teleports the origin up a whole step - as much as 18 units
- //at once - and putting the camera straight there makes every step a jolt. The
- //eye instead chases the new height at 80 units/sec, never lagging more than
- //12 behind, so a staircase reads as a climb rather than a series of hops.
- //
- //Only upward moves are smoothed. Falling must be immediate, or the ground
- //would appear to come up to meet the player.
+{//V_CalcRefdef stair smoothing: the eye chases the new height at 80 units/sec,
+ //never lagging more than 12 behind. up only - falling must be immediate, or
+ //the ground appears to come up to meet the player.
 	F64 dt = tS - q_step_prev;
 
 	q_step_prev = tS;
@@ -779,12 +737,9 @@ F64 QViewRoll(F64 *angles, F64 *velocity)
 
 
 U0 QLiquidView()
-{//Screen wash and view warp for whatever the eye is submerged in, plus the
- //one-shot sounds for crossing the surface.
- //
- //The tint values are the originals': lava burns orange, slime is a dark
- //green, water a murky brown. They are folded into the palette rather than
- //blended per pixel, because 8bpp indices cannot be averaged.
+{//screen wash, view warp and the surface-crossing sounds.
+ //tints are the original's, folded into the palette rather than blended per
+ //pixel - 8bpp indices cannot be averaged.
 	I64 r = 0;
 	I64 g = 0;
 	I64 b = 0;
@@ -813,14 +768,12 @@ U0 QLiquidView()
 
 	q_warp_time = tS;
 
-	//Damage, pickup and powerup shifts go on top of the liquid one, so a single
-	//tint carries all four.
+	//all four shifts collapse into one tint.
 	QCShiftBlend(&r, &g, &b, &a);
 
 	QPalSetTint(r, g, b, a);
 
-	//Surface crossings. Compared against the previous frame so each transition
-	//fires exactly once rather than every frame while submerged.
+	//edged against last frame, or the sound fires every frame while submerged.
 	if (q_water_level > 0 && q_water_last == 0)
 	{
 		if (q_water_type == QCONTENTS_LAVA)
@@ -842,10 +795,22 @@ U0 QRenderFrame()
 	F64		 right[3];
 	F64		 up[3];
 	F64		 fov_y;
-	F64		 vm_org[3];
 	F64		 view_angles[3];
+	F64		 saved_idle;
+	F64		 chase_f[3];
+	F64		 chase_r[3];
+	F64		 chase_u[3];
+	F64		 chase_want[3];
+	F64		 chase_zero[3];
+	CQTrace	 chase_tr;
 	CQMdl	*vm_mdl;
 	F64		 vm_depth;
+	F64		 snd_fwd[3];
+	F64		 snd_right[3];
+	I64		 skip_ent;
+	I64		 vm_frame;
+	I64		 i;
+	Bool	 vm_show;
 
 	QAngleVectors(q_angles, forward, right, up);
 	fov_y = QDrawFovY(q_fov, q_canvas->width, q_canvas->height);
@@ -853,88 +818,188 @@ U0 QRenderFrame()
 	//Drives the two sky layers' scroll.
 	q_sky_time = tS;
 
-	//The eye rides above the player origin, plus the walk bob.
-	//
-	//Bob is proportional to horizontal speed and rides a cycle, so it grows
-	//with running and stops when standing still. Roll leans the view into a
-	//strafe. Both are VIEW-only: they must not touch q_angles, because that
-	//feeds v_angle and would make the player's shots lean too.
-	//
-	//Updated exactly ONCE per frame, here, because it is read twice below -
-	//for the eye and again for the weapon.
+	//bob and roll are VIEW-only - q_angles feeds v_angle and would lean the
+	//player's aim with the camera. updated once here, read twice below: for the
+	//eye and again for the weapon.
 	QViewBobUpdate;
 
 	QVecCopy(q_origin, q_view);
 
-	//The step offset is negative while catching up, so it pulls the eye DOWN
-	//towards where it was. The weapon needs no separate handling: it is drawn
-	//in camera space, so it already follows the eye.
-	//Eye height comes from QuakeC's .view_ofs, not a constant - it drops on
-	//death and shifts in liquid. QVIEW_HEIGHT is only the fallback for when no
-	//player entity exists yet.
+	//the step offset is negative while catching up, pulling the eye DOWN. eye
+	//height is QuakeC's .view_ofs, not a constant - it drops on death and shifts
+	//in liquid. QVIEW_HEIGHT is only the fallback with no player entity.
 	if (q_game_active)
 		q_view[2] += QPlayerViewHeight + QViewBob + QViewStepOffset;
 	else
 		q_view[2] += QVIEW_HEIGHT + QViewBob + QViewStepOffset;
 
-	//Nudge the eye off any exact plane. The original does this because a water
-	//surface can vanish when the viewpoint sits precisely on its node line.
+	//nudge off any exact plane - a water surface vanishes with the eye sitting
+	//precisely on its node line.
 	q_view[0] += 1.0 / 32.0;
 	q_view[1] += 1.0 / 32.0;
 	q_view[2] += 1.0 / 32.0;
 
+	//Chase_Update. pull the eye back along the view axis and trace to it so the
+	//camera stops at the wall instead of ending up outside the level. not at
+	//intermission, where the view belongs to the info_intermission spot, and
+	//not in a demo, whose camera is the recorded one
+	if (QCvarGet("chase_active") != 0.0 && !q_intermission && !q_demo_playing &&
+		QMapValid(q_map, "QChaseUpdate"))
+	{
+		QVecSet(chase_zero, 0.0, 0.0, 0.0);
+		QAngleVectors(q_angles, chase_f, chase_r, chase_u);
+
+		for (i = 0; i < 3; i++)
+			chase_want[i] = q_view[i]
+				- chase_f[i] * QCvarGet("chase_back")
+				+ chase_r[i] * QCvarGet("chase_right")
+				+ chase_u[i] * QCvarGet("chase_up");
+
+		//point trace - the camera has no size of its own
+		QTraceEntity(q_map, q_view, chase_want, chase_zero, chase_zero,
+			q_player_edict, TRUE, &chase_tr);
+
+		for (i = 0; i < 3; i++)
+			q_view[i] = chase_tr.end_pos[i];
+
+		//back off the surface it stopped on, or the near plane clips into it
+		if (chase_tr.fraction < 1.0)
+		{
+			for (i = 0; i < 3; i++)
+				q_view[i] += chase_tr.plane_normal[i] * 4.0;
+		}
+	}
+
 	QVecCopy(q_angles, view_angles);
-	view_angles[2] = QViewRoll(q_angles, q_velocity);
 
-	//Weapon recoil and damage kicks, on the render copy only.
-	QViewApplyKick(view_angles);
+	//V_CalcIntermissionRefdef: idle sway at scale 1, and none of the gameplay
+	//view motion - no roll, no kicks, no bob.
+	if (q_intermission)
+	{
+		saved_idle   = q_idle_scale;
+		q_idle_scale = 1.0;
+		view_angles[2] = 0.0;
+		QViewAddIdle(view_angles);
+		q_idle_scale = saved_idle;
+	}
+	else
+	{
+		view_angles[2] = QViewRoll(q_angles, q_velocity);
 
-	//The dead view lies on its side. V_CalcRefdef sets roll to 80 and returns
-	//early once health reaches zero, which is what makes death read as
-	//collapsing rather than just freezing in place.
+		//Weapon recoil and damage kicks, on the render copy only.
+		QViewApplyKick(view_angles);
+	}
+
+	//V_CalcRefdef sets roll to 80 and returns early once health hits zero, which
+	//is what makes death read as collapsing rather than freezing.
 	if (q_game_active && QPlayerDead)
 		view_angles[2] = 80.0;
 
-	//Sounds attenuate from wherever the player is listening.
-	QSndListener(q_view);
+	//listener panning runs off the view right vector.
+	QAngleVectors(view_angles, snd_fwd, snd_right, NULL);
+	QSndListener(q_view, snd_right);
 
-	//Light styles step at 10Hz off the game clock, and ambient sources are
-	//re-triggered as their previous instance runs out.
+	//the listener's own body is full volume and centred, so the mixer needs to
+	//know which entity that is.
+	if (QClientMode)
+		q_snd_viewent = q_cl_viewent;
+	else
+		q_snd_viewent = q_player_edict;
+
+	//S_Update: re-aim everything still playing.
+	QSndUpdate;
+
+	//light styles step at 10Hz off the game clock; ambients retrigger as their
+	//previous instance runs out.
 	QLightAnimate(q_game_time);
 	QTurbFrame(tS);
 
-	//Entity lights are refreshed BEFORE the frame's light bookkeeping, so a
-	//muzzle flash added this frame is live for this frame's drawing.
+	//before QLightFrame, so a muzzle flash added this frame is live this frame.
 	if (q_game_active)
 		QGameEntityLights(tS);
 
 	QLightFrame(tS);
+
+	//R_PushDlights: mark which faces each light reaches once, before anything is
+	//drawn - per face at draw time lit whatever happened to be tested.
+	q_ambient_light = ToI64(QCvarGet("r_ambient"));
+	QPushDlights(q_map, tS);
+
+	//one surface-cache generation per frame - entries touched this frame must
+	//not be evicted out from under the drawing below.
+	QSurfCacheSetMap(q_map);
+	q_surf_frame++;
+
 	QSndAmbientUpdate(q_game_time);
+
+	//S_UpdateAmbientSounds: per-leaf wind and water. passed the leaf and the
+	//cvars because QSound.ZC compiles before both.
+	if (QMapValid(q_map, "QSndLeafAmbients"))
+		QSndLeafAmbients(q_map, QVisLeafForPoint(q_map, q_view),
+			QCvarGet("ambient_level"), QCvarGet("ambient_fade"), tS);
 
 	//Liquid wash, view warp and surface sounds.
 	QLiquidView;
 
 	QDrawClear(q_canvas, 0);
+	//SCR_CalcRefdef before the projection, so the view rect it picks is what
+	//the projection centres on.
+	//sb_lines, not a fixed 24 - below viewsize 110 the inventory row is on
+	//screen too and the view has to clear both
+	QDrawSetViewRect(q_canvas, QCvarGet("viewsize"), QSbarLines);
 	QDrawSetView(q_canvas, q_view, view_angles, q_fov);
+
+	//NO WORLD, NO WORLD RENDER. a changelevel from inside a demo stream leaves
+	//the frame loop running while the map it draws is gone - either mid-load or
+	//after a load that failed outright.
+	if (!QMapValid(q_map, "QRenderFrame") || !q_vis)
+	{
+		QSbarDraw(q_canvas);
+		return;
+	}
+
 	QVisBuildList(q_vis, q_view, forward, right, up, q_fov, fov_y);
 	QDrawWorld(q_canvas, q_map, q_vis);
 
 	if (q_draw_entities)
 	{
-		//With the VM running, entities come from the QuakeC world. The static
-		//list is only used when the bytecode failed to load.
-		if (q_game_active)
+		//VM live: entities come from the QuakeC world. playback: the stream IS
+		//the entity list. the map's own entity lump is neither - it still holds
+		//triggers, and InitTrigger clears modelindex, so a real client is never
+		//told about one.
+		if (q_game_active || QClientMode)
 		{
-			//Two paths to the same picture: the server's edicts, or the
-			//client's reconstruction of them from the wire. cl_netdraw 1
-			//switches over, which is how a remote client will eventually have
-			//to draw - it has no edicts to read.
-			if (QCvarGet("cl_netdraw") != 0.0)
+			//host draws from edicts, so the remote body QSvSpawnRemote made is
+			//visible. guest has no copy of the host player in its edict table,
+			//so it must take the wire path.
+			if (QClientMode)
+			{
+				//svc_setview names this client's body; 0 draws everyone.
+				skip_ent = q_cl_viewent;
+				//No distance cull on the wire path for MP - DM spawns on e1m1
+				//are often >2000 apart, and that alone hid both players.
+				QNetDrawEntities(q_canvas, q_map, q_view, 10000.0,
+					skip_ent);
+			}
+			else if (QCvarGet("cl_netdraw") != 0.0)
 				QNetDrawEntities(q_canvas, q_map, q_view, QENT_DRAW_DIST,
 					q_player_edict);
+			else if (q_udp_ready && q_udp_server)
+			{
+				//host MP: remote bodies are ordinary edicts with player.mdl, so the
+				//normal path draws them - the wire path would draw a second body in
+				//the same place.
+				QGameDrawEntities(q_canvas, q_map, q_view, 10000.0);
+			}
 			else
 				QGameDrawEntities(q_canvas, q_map, q_view, QENT_DRAW_DIST);
 			QGameDrawStatics(q_canvas, q_map);
+			//CL_UpdateTEnts re-anchors our own bolt before drawing.
+			if (q_udp_ready && !q_udp_server || q_demo_playing)
+				QBiBeamsFollow(q_cl_viewent);
+			else
+				QBiBeamsFollow(q_player_edict);
+
 			QBiDrawBeams(q_canvas, tS);
 		}
 		else
@@ -944,56 +1009,87 @@ U0 QRenderFrame()
 	//Particles are depth tested, so they sit correctly among the geometry.
 	QPartDraw(q_canvas, tS);
 
-	//The weapon goes last, on top of everything. QuakeC owns which model and
-	//which frame, so switching weapons and firing animate for free.
-	if (q_player_active && !QPlayerDead)
+	//weapon last, over everything. QuakeC owns the model and the frame.
+	//
+	//hidden at intermission: execute_changelevel zeroes the player's modelindex
+	//and parks the camera, so the view is a spectator shot.
+	//
+	//client side, dead is cl.stats[STAT_HEALTH] - QPlayerDead would read an
+	//edict that does not exist and hide the gun for a whole demo.
+	if (QClientMode)
+		vm_show = ToBool(q_cl.health > 0 && !q_intermission);
+	else
+		vm_show = ToBool(q_player_active && !QPlayerDead && !q_intermission);
+
+	if (vm_show)
 	{
-		vm_mdl = QBiFindModel(QPlayerWeaponModel);
+		vm_mdl = NULL;
+		vm_frame = QPlayerWeaponFrame;
+
+		//Thin client: weaponmodel on the wire is a precache index, not a
+		//QuakeC string. Prefer that so the viewgun tracks the host.
+		if (QClientMode && q_cl.weaponmodel > 0 &&
+			q_cl.weaponmodel < q_precache_model_count)
+		{
+			vm_mdl   = q_precache_mdl[q_cl.weaponmodel];
+			vm_frame = q_cl.weaponframe;
+		}
+
+		if (!vm_mdl)
+			vm_mdl = QBiFindModel(QPlayerWeaponModel);
+
 		if (vm_mdl)
 		{
-			//SCREEN-LOCKED, not placed in the world.
+			//SCREEN-LOCKED, not placed in the world: drawn straight in camera
+			//space, so the camera and model rotations cancel by construction -
+			//no angles, and no sign convention to get wrong.
 			//
-			//The original copies the view angles onto the view model entity, so
-			//the model turns by exactly the amount the camera turns and the two
-			//rotations cancel: the weapon appears welded to the screen and never
-			//swings as you aim. Mapping the model straight into camera space
-			//makes that cancellation exact by construction - no angles, and no
-			//sign convention to get wrong.
-			//
-			//BOB IS FORWARD, NOT VERTICAL. V_CalcRefdef gives the eye
-			//`viewheight + bob` and the gun `viewheight + bob` as well, so the
-			//two rise and fall TOGETHER and the gun has no vertical motion
-			//relative to the screen at all. Its only relative movement is
+			//BOB IS FORWARD, NOT VERTICAL. V_CalcRefdef gives eye and gun the
+			//same viewheight + bob, so they rise TOGETHER. the only relative
+			//motion is
 			//
 			//    view->origin[i] += forward[i] * bob * 0.4;
 			//
-			//a slight push toward and away from the eye. Adding bob to the
-			//camera's UP axis instead - which is what this did - invents a
-			//vertical bob the original does not have.
-			//1.0 leaves the weapon in the world's depth range, which is what
-			//the software renderer does and why it sinks into walls. 1/0.3 is
-			//GLQuake's depth-range compression, chosen in the options menu.
+			//depth 1.0 is the software renderer's world range, which is why the
+			//gun sinks into walls. 1/0.3 is GLQuake's compression, an option.
 			if (q_opt_gunclip)
 				vm_depth = 1.0 / 0.3;
 			else
 				vm_depth = 1.0;
 
-			QMdlDrawView(q_canvas, vm_mdl, QPlayerWeaponFrame,
+			QMdlDrawView(q_canvas, vm_mdl, vm_frame,
 				QVM_FORWARD + QViewBob * 0.4, QVM_RIGHT, QVM_UP,
 				1.0, QVM_LIGHT, vm_depth);
 		}
 	}
 
-	//Trigger messages, then the intermission overlay on top of them.
-	QSbarCenterPrint(q_canvas);
-	QSbarIntermission(q_canvas, q_game_time);
+	//over the world, under the overlays - hidden when the view is not the
+	//player's own.
+	if (!q_intermission)
+		QSbarCrosshair(q_canvas);
 
-	//The status bar goes over everything, including the weapon.
-	QSbarDraw(q_canvas);
+	//SCR_UpdateScreen's split: intermission 1 is the stat sheet ALONE, and only
+	//the finale (2) pairs its plaque with the centerprint.
+	if (!q_intermission || q_finale)
+		QSbarCenterPrint(q_canvas);
 
-	//Console last of all, dropped over the top of the finished frame. With it
-	//closed, the recent lines still show briefly at the top left - which is how
-	//pickup messages reach the player.
+	//The stat sheet reads cl.completed_time, frozen when the level ended.
+	QSbarIntermission(q_canvas, q_completed_time);
+
+	//sbar over everything, including the weapon. at intermission the overlay
+	//replaces it entirely.
+	if (!q_intermission)
+	{
+		QSbarTileClear(q_canvas);
+		QSbarDraw(q_canvas);
+	}
+
+	//TAB deathmatch scoreboard (SCR_DrawScoreboard / Sbar_DeathmatchOverlay).
+	if (q_scoreboard_show)
+		QSbarDrawScoreboard(q_canvas);
+
+	//console last, over the finished frame. closed, the notify lines still carry
+	//pickup messages and the messagemode prompt.
 	if (q_state == QST_CONSOLE)
 		QConDraw(q_canvas);
 	else
@@ -1001,9 +1097,8 @@ U0 QRenderFrame()
 }
 
 U0 QCenterView(CTask *task)
-{//Fit the canvas to the window, preserving aspect ratio and centring the
- //result. Every render resolution therefore fills the same area of screen -
- //raising it adds detail rather than shrinking the picture.
+{//aspect-preserving fit, centred: raising the render resolution adds detail
+ //rather than shrinking the picture.
 	I64 w = task->pix_width;
 	I64 h = task->pix_height;
 	I64 cw;
@@ -1033,11 +1128,9 @@ U0 QCenterView(CTask *task)
 }
 
 U0 QApplyVideo()
-{//Rebuild the render target at the selected resolution and resize the window.
- //
- //The canvas is read by the compositor through draw_it, so it cannot simply be
- //freed and replaced: the same drain-before-free ordering that teardown needs
- //applies here too, or a resolution change frees memory mid-blit.
+{//rebuild the render target and resize the window. the compositor reads the
+ //canvas through draw_it, so the same drain-before-free that teardown needs
+ //applies here, or a resolution change frees memory mid-blit.
 	CQCanvas *old;
 	I64		  w = q_res_w[q_opt_res];
 	I64		  h = q_res_h[q_opt_res];
@@ -1052,8 +1145,7 @@ U0 QApplyVideo()
 
 	q_canvas = QDrawNew(w, h);
 
-	//Fullscreen fills the display; windowed sizes the window to the render
-	//target so it lands close to 1:1 with a little room for the border.
+	//windowed sizes to the render target, landing close to 1:1.
 	if (q_opt_fullscreen)
 		WinMax;
 	else
@@ -1091,48 +1183,68 @@ Bool QLoadMap(U8 *mapname)
 
 	QStrCopy(q_map_name, mapname, 96);
 
+	//Trail memory is keyed by edict number, which the next map reuses for
+	//entirely different entities.
+	QPartTrailReset;
+
 	q_vis = QVisNew(q_map);
 
-	//Order matters: models resolve against the parsed list, and the spawn
-	//point is found in it too. These must not be folded into one print, since
-	//argument evaluation order would not guarantee the sequence.
+	//order matters - models resolve against the parsed list. not folded into one
+	//print: argument evaluation order would not guarantee the sequence.
 	ent_count = QEntParse(q_map);
 	mdl_count = QEntLoadModels;
+
+	QHeapCheck("after QBSPLoad");
 
 	StrPrint(line, "map %s: %d entities, %d static models\n",
 		mapname, ent_count, mdl_count);
 	QLog(line);
 
+	//makestatic and ambientsound write into sv.signon while the map's spawn
+	//functions run, so it has to be empty before the world comes up.
+	QSvClearSignon;
+
+	//the stream carries its own baselines, updates and view state. bringing up
+	//QuakeC here spawns a second live world, player and all, and the two fight
+	//over every edict.
+	if (q_demo_playing)
+	{
+		//a leftover world holds edicts and precache slots the demo's own
+		//numbering collides with.
+		QGameShutdown;
+
+		QNetStatesClear;
+		QNetClientClear;
+	}
+
 	//Bring up the QuakeC world. If the bytecode is unavailable the game falls
 	//back to the static entity list, which still renders but never thinks.
-	if (QGameInit(q_map))
+	else if (QGameInit(q_map))
 	{
 		StrPrint(line, "QuakeC: %d spawn functions ran, %d edicts live\n",
 			q_game_spawned, q_pr_num_edicts);
 		QLog(line);
 
-		//Baselines are part of the SIGNON, not the per-frame datagram: they are
-		//sent once, after the world has spawned and before any update, because
-		//every later delta is measured from them. Sending them late would leave
-		//the client differencing against zeroes.
+		//baselines are SIGNON, not datagram: sent once after the spawn and before
+		//any update, because every later delta is measured from them.
 		QNetStatesClear;
 		QNetClientClear;
 
-		//The person at the keyboard is client 0, holding the edict QuakeC has
-		//already outfitted. Registering them in the same table the remote
-		//clients use is what keeps "how many players are here" a single
-		//question with a single answer.
+		//the local player is client 0, in the same slot table as the remotes.
 		QSvClientsClear;
 		QSvAddClient(0, TRUE, q_player_edict, q_game_time);
 
 		QMsgClear(&q_net_send);
 
-		//Identity goes in the same signon buffer as the baselines, BEFORE it is
-		//handed over - writing after the send left the name and colours sitting
-		//in a buffer nobody read, and the client kept its defaults.
-		QNetWriteIdentity(&q_net_send, q_player_edict, q_setup_name,
+		//identity into the signon buffer BEFORE the send, or the name and colours
+		//sit in a buffer nobody reads.
+		QNetWriteIdentity(&q_net_send, 0, q_setup_name,
 			q_setup_top, q_setup_bottom);
-		QNetWriteBaselines(&q_net_send);
+
+		//SV_CreateBaseline: once into sv.signon after the spawn, so every joiner
+		//replays the same bytes and deltas from the same reference.
+		QNetWriteBaselines(&q_sv_signon);
+		QMsgAppendIfRoom(&q_net_send, &q_sv_signon, QNET_MAX_MSG);
 
 		QNetSendToClient(&q_net_send);
 		QNetClientFrame;
@@ -1148,8 +1260,20 @@ Bool QLoadMap(U8 *mapname)
 	//q_origin is replaced by whatever the game logic decided.
 	if (q_game_active)
 	{
-		if (QPlayerSpawn(q_origin, q_angles))
+		if (QPlayerSpawn(q_origin, q_angles, q_setup_name))
 		{
+			//slot state first - QSvApplyClientColors resolves .colormap through
+			//the slot table, so the slot must already own the edict.
+			if (q_sv_clients[0].active && q_sv_clients[0].local)
+			{
+				q_sv_clients[0].top    = q_setup_top & 15;
+				q_sv_clients[0].bottom = q_setup_bottom & 15;
+				QStrCopy(q_sv_clients[0].name, q_setup_name, 32);
+			}
+
+			//Shirt/trousers from the setup page - remotes see these via colormap.
+			QSvApplyClientColors(q_player_edict, q_setup_top, q_setup_bottom);
+
 			StrPrint(line, "player: edict %d, health %3.0f\n",
 				q_player_edict, QPlayerHealth);
 			QLog(line);
@@ -1168,9 +1292,8 @@ Bool QLoadMap(U8 *mapname)
 
 	if (!QEntFindPlayerStart(q_map, q_origin, q_angles))
 	{
-		//No spawn point: fall back to the centre of the world bounds.
-		//The centre of the world bounds is very likely inside geometry, so
-		//start in noclip rather than trapping the player in a wall.
+		//no spawn point: centre of the world bounds, which is very likely inside
+		//geometry - noclip rather than trapped in a wall.
 		"Quake: no info_player_start, using model bounds (noclip on)\n";
 		q_noclip = TRUE;
 		q_origin[0] = (q_map->models[0].mins[0] + q_map->models[0].maxs[0]) * 0.5;
@@ -1179,8 +1302,7 @@ Bool QLoadMap(U8 *mapname)
 		QVecSet(q_angles, 0.0, 0.0, 0.0);
 	}
 
-	//Seed the unstick fallback. Globals are not zeroed here, so leaving this
-	//uninitialised would let the first stuck frame warp the player to garbage.
+	//seed the unstick fallback - globals aren't zeroed.
 	QVecCopy(q_origin, q_old_origin);
 
 	return TRUE;
@@ -1195,11 +1317,9 @@ Bool QSaveGame()
 }
 
 Bool QLoadGame()
-{//Bring up the map named in the save, then pour the saved world into it.
- //
- //The spawn functions are deliberately NOT run: they would build a fresh world
- //that the restore has to overwrite anyway, and their side effects would linger
- //on top of the restored state.
+{//load the save's map, then pour the saved world into it. spawn functions are
+ //deliberately NOT run - the restore overwrites them anyway, and their side
+ //effects would linger on top of the restored state.
 	U8 mapname[96];
 	U8 line[160];
 
@@ -1228,6 +1348,8 @@ Bool QLoadGame()
 		return FALSE;
 	}
 
+	QSvClearSignon;
+
 	if (!QGameInit(q_map, FALSE))
 	{
 		QLog("load: progs.dat failed to come up\n");
@@ -1242,13 +1364,13 @@ Bool QLoadGame()
 		return FALSE;
 	}
 
-	//A restored world is a NEW world as far as the protocol is concerned, so it
-	//gets fresh baselines. Reusing the previous map's would delta every entity
-	//against a reference that no longer describes it.
+	//a restored world is a NEW world to the protocol - fresh baselines, or every
+	//entity deltas against a reference that no longer describes it.
 	QNetStatesClear;
 	QNetClientClear;
 	QMsgClear(&q_net_send);
-	QNetWriteBaselines(&q_net_send);
+	QNetWriteBaselines(&q_sv_signon);
+	QMsgAppendIfRoom(&q_net_send, &q_sv_signon, QNET_MAX_MSG);
 	QNetSendToClient(&q_net_send);
 	QNetClientFrame;
 
@@ -1257,11 +1379,141 @@ Bool QLoadGame()
 	q_world_warned = FALSE;
 	QBiIntermissionClear;
 
+	//engine diagnostics to the LOG - Con_Printf feeds the notify lines, and that
+	//space belongs to the game's own messages, not to where the player spawned.
 	StrPrint(line, "load: %s at %.0f %.0f %.0f\n", mapname,
 		q_origin[0], q_origin[1], q_origin[2]);
 	QLog(line);
-	QConPrint(line);
 	QLogFlush;
+
+	return TRUE;
+}
+
+Bool QPakMountOne(U8 *dir, I64 index)
+{//mount dir/pakN, trying BOTH cases. id1 ships PAK0.PAK, but a mission pack
+ //dropped in by hand is usually pak0.pak and FileFind will not find the other
+	U8 pakname[64];
+
+	StrPrint(pakname, "::/Apps/Quake/%s/PAK%d.PAK", dir, index);
+	if (FileFind(pakname))
+		return QPakMount(pakname);
+
+	StrPrint(pakname, "::/Apps/Quake/%s/pak%d.pak", dir, index);
+	if (FileFind(pakname))
+		return QPakMount(pakname);
+
+	return FALSE;
+}
+
+U0 QPakMountGame()
+{//COM_AddGameDirectory: id1 first, then the mod on top. QPakFind searches
+ //newest first, so a mod shadows by name - progs.dat included
+	I64	i;
+
+	if (!QPakMountOne("id1", 0))
+		return;
+
+	i = 1;
+	while (i < QPAK_MAX_PAKS && QPakMountOne("id1", i))
+		i++;
+
+	if (!q_game_dir[0])
+		return;
+
+	if (!QPakMountOne(q_game_dir, 0))
+	{
+		QLog("gamedir: no pak0 in that directory\n");
+		return;
+	}
+
+	i = 1;
+	while (i < QPAK_MAX_PAKS && QPakMountOne(q_game_dir, i))
+		i++;
+}
+
+Bool QGameDirSwitch(U8 *dir)
+{//"game <dir>" with no restart
+ //
+ //EVERY lookup hands back a pointer INTO the archive - qpal_colormap is a
+ //pointer into gfx/colormap.lmp, and the wad art is the same - so nothing may
+ //still hold one when the paks go. drop the world, every cache, and the
+ //compositor, then remount and reload the art that lives in them
+	U8	line[96];
+
+	if (!dir)
+		return FALSE;
+
+	//the wm reads menu art straight out of the archives
+	q_ready = FALSE;
+	Sleep(60);
+
+	QDemoStop;
+	q_demo_loop = FALSE;
+
+	//frees the precache, the external bsp and sprite caches, and the vm
+	QGameShutdown;
+	QEntFree;
+
+	QSurfCacheFlush;
+	QSurfCacheSetMap(NULL);
+
+	if (q_vis)
+	{
+		QVisFree(q_vis);
+		q_vis = NULL;
+	}
+	if (q_map)
+	{
+		QBSPFree(q_map);
+		q_map = NULL;
+	}
+
+	//the mixer borrows sample buffers on its own task, so it has to be quiet
+	//before the memory behind them goes
+	QMusicFree;
+	QSndFree;
+
+	QMdlCacheFree;
+	QMdlPreviewFree;
+
+	QPakUnmountAll;
+
+	QStrCopy(q_game_dir, dir, 32);
+	QPakMountGame;
+
+	//gfx/pop.lmp is COM_CheckRegistered's test and lives in the paks that just
+	//changed, so it is re-run rather than carried over
+	QCvarSet("registered", ToF64(QPakFind("gfx/pop.lmp") != NULL));
+
+	if (!QPalLoad)
+	{
+		QLog("gamedir: palette missing, cannot continue\n");
+		return FALSE;
+	}
+
+	QWadInit;
+	QSbarInit;
+	QMenuInit;
+
+	QNetStatesClear;
+	QNetClientClear;
+	QBiFreePrecache;
+
+	q_menu_ingame = FALSE;
+	q_menu_page   = QPAGE_MAIN;
+	q_state       = QST_MENU;
+	q_map_name[0] = 0;
+
+	q_ready = TRUE;
+
+	//no ternary in ZealC
+	if (dir[0])
+		StrPrint(line, "gamedir: now %s\n", dir);
+	else
+		StrPrint(line, "gamedir: now id1\n");
+	QLog(line);
+	QConPrint(line);
+	QCfgSave;
 
 	return TRUE;
 }
@@ -1289,6 +1541,17 @@ Bool QChangeLevel(U8 *mapname)
 		q_map = NULL;
 	}
 
+	//SCR_BeginLoadingPlaque: paint the plaque ONCE, before anything is freed,
+	//and leave it up for the whole load.
+	if (q_canvas)
+	{
+		QDrawClear(q_canvas, 0);
+		if (q_pic_conback.pixels)
+			QPicDrawFill(q_canvas, &q_pic_conback);
+		QSbarLoadingPlaque(q_canvas);
+		q_loading = TRUE;
+	}
+
 	//QuakeC passes a bare map name; the archive stores full paths.
 	if (!StrNICompare(mapname, "maps/", 5))
 		QStrCopy(path, mapname, 96);
@@ -1297,62 +1560,133 @@ Bool QChangeLevel(U8 *mapname)
 
 	if (!QLoadMap(path))
 	{
+		q_loading = FALSE;
 		StrPrint(line, "changelevel: %s failed to load\n", path);
 		QLog(line);
 		return FALSE;
 	}
 
-	//Carried-over motion state would otherwise persist into the new level:
-	//stale velocity keeps shoving the player, and a stale water level makes
-	//the move code swim on dry land - which reads as being frozen in place.
+	q_loading = FALSE;
+
+	//stale velocity keeps shoving the player, and a stale water level swims the
+	//move code on dry land.
 	QVecSet(q_velocity, 0.0, 0.0, 0.0);
 	q_water_level  = 0;
 	q_water_type   = 0;
 	q_on_ground    = FALSE;
 	q_world_warned = FALSE;
 
+	//NO SECOND SPAWN - QLoadMap already ran SetNewParms, ClientConnect and
+	//PutClientInServer for this level. colours still need reapplying: the slot
+	//table was rebuilt.
 	if (q_game_active)
-		QPlayerSpawn(q_origin, q_angles);
+	{
+		QSvApplyClientColors(q_player_edict, q_setup_top, q_setup_bottom);
+		if (q_sv_clients[0].active && q_sv_clients[0].local)
+		{
+			q_sv_clients[0].top    = q_setup_top & 15;
+			q_sv_clients[0].bottom = q_setup_bottom & 15;
+			QStrCopy(q_sv_clients[0].name, q_setup_name, 32);
+		}
+	}
 
 	//The previous map's origin is meaningless here, and the unstick fallback
-	//would otherwise drag the player back to it.
+	//drags the player back to it otherwise.
 	QVecCopy(q_origin, q_old_origin);
 
 	StrPrint(line, "changelevel: spawned at %.0f %.0f %.0f\n",
 		q_origin[0], q_origin[1], q_origin[2]);
 	QLog(line);
 
+	//log only - the original prints nothing to the player on a level change.
 	StrPrint(line, "changelevel -> %s\n", path);
 	QLog(line);
-	QConPrint(line);
 	QLogFlush;
 
 	return TRUE;
 }
 
+U0 QClientPrecacheRebuild()
+{//CL_ParseServerInfo precache resolution, deferred until after the map load it
+ //depends on. replayed IN WIRE ORDER, so every modelindex and sound number
+ //lands on the entry it meant on the server.
+	U8	*name;
+	I64	 j;
+
+	QBiFreePrecache;
+
+	//slot 0 is no model; slot 1 is the map, already loaded - resolving it through
+	//the external-BSP cache would load the whole map twice.
+	q_precache_model[0]    = NULL;
+	q_precache_mdl[0]      = NULL;
+	q_precache_model_count = 1;
+
+	for (j = 0; j < q_cl_model_count; j++)
+	{
+		name = q_cl_model_names + j * QCL_PRECACHE_NAME;
+		if (j == 0)
+		{
+			QStrCopy(q_world_model_name, name, 96);
+			q_precache_model[1] = q_world_model_name;
+			q_precache_mdl[1]   = NULL;
+			q_precache_model_count = 2;
+		}
+		else
+			QBiPrecacheModel(name);
+	}
+
+	for (j = 0; j < q_cl_sound_count; j++)
+		q_precache_sound[j] = q_cl_sound_names + j * QCL_PRECACHE_NAME;
+	q_precache_sound_count = q_cl_sound_count;
+
+	StrPrint(q_join_line, "client: %d models, %d sounds precached\n",
+		q_precache_model_count, q_precache_sound_count);
+	QLog(q_join_line);
+}
+
 U0 QInputDrain()
-{//Consume queued keyboard messages.
+{//consume queued key messages.
  //
- //Quake reads the keyboard as RAW STATE through kbd.down_bitmap - the menu, the
- //console and the game all do - and never calls MessageGet. But the window
- //still receives a MESSAGE_KEY_DOWN/UP pair for every keystroke, and nothing
- //takes them off the queue, so an entire session's worth of WASD, jump and
- //weapon keys sits there.
+ //input is read as raw state through kbd.down_bitmap, so MessageGet is never
+ //called and a session's worth of KEY_DOWN/UP pairs piles up. on return the
+ //terminal drains that backlog AS TYPED INPUT and the shell hands the garbage
+ //to the compiler - that is the fault inside ExeCmdLine.
  //
- //When the app returns, the terminal drains that backlog AS TYPED INPUT. The
- //shell then hands whatever it reassembles to the compiler: a mangled line like
- //"ww`map e1m1" is the visible form, and a pointer built from that garbage
- //faulting inside ExeCmdLine is the crash. It happens with no typing at all,
- //because the game's own keys are the input.
- //
- //Bounded rather than unbounded: a frame should never hold many, and a runaway
- //loop here would hang the game rather than crash it later.
+ //bounded: a frame should never hold many, and a runaway loop here would hang
+ //the game rather than crash it later.
 	I64 ch;
 	I64 sc;
 	I64 guard = 0;
 
 	while (guard < 64 && KeyScan(&ch, &sc))
 		guard++;
+}
+
+U0 QInputDrainAll()
+{//the same drain for EXIT, where it has to finish the job.
+ //
+ //the frame loop's cap of 64 clears a rounding error against a session's
+ //backlog. drain until the queue reports empty, with a ceiling far above any
+ //real backlog so a broken queue cannot spin forever, and repeat because
+ //messages can still be posted between passes.
+	I64 ch;
+	I64 sc;
+	I64 guard;
+	I64 pass;
+
+	for (pass = 0; pass < 4; pass++)
+	{
+		guard = 0;
+		while (guard < 65536 && KeyScan(&ch, &sc))
+			guard++;
+
+		//Nothing left on this pass means nothing is still arriving.
+		if (!guard)
+			break;
+
+		//Let anything mid-post land before the next sweep.
+		Sleep(10);
+	}
 }
 
 U0 QGameLoop()
@@ -1362,16 +1696,18 @@ U0 QGameLoop()
 	F64  up[3];
 	F64  move[3];
 	F64  speed;
+	F64  net_fwd;
+	F64  net_side;
 	F64  now;
 	F64  last;
 	F64  dt;
 	F64  fps_time;
-	I64  sc_w		= Char2ScanCode('w');
-	I64  sc_a		= Char2ScanCode('a');
-	I64  sc_s		= Char2ScanCode('s');
-	I64  sc_d		= Char2ScanCode('d');
-	I64  sc_jump	= Char2ScanCode(' ');	//no SC_SPACE define exists
+
 	I64  sc_tilde	= Char2ScanCode('`');
+	I64  sc_minus	= Char2ScanCode('-');
+	I64  sc_equals	= Char2ScanCode('=');
+	I64  sc_y		= Char2ScanCode('y');
+	I64  sc_u		= Char2ScanCode('u');
 	I64  dx;
 	I64  dy;
 	I64  fps_frames   = 0;
@@ -1387,6 +1723,7 @@ U0 QGameLoop()
 	Bool tilde_held   = FALSE;
 	I64  wheel_dz     = 0;
 	Bool save_held    = FALSE;
+	Bool size_held    = FALSE;
 	Bool load_held    = FALSE;
 	Bool q_load_request = FALSE;
 	F64  srv_accum    = 0.0;
@@ -1406,9 +1743,8 @@ U0 QGameLoop()
 		if (dt > 0.1)
 			dt = 0.1;
 
-		//Video changes are serviced FIRST, before any state branch can jump
-		//past them: the menu path ends in a goto to the bottom of the loop,
-		//and the menu is exactly where they are requested.
+		//FIRST, before any state branch gotos past them - the menu path is
+		//exactly where they are requested.
 		if (q_res_dirty)
 			QApplyVideo;
 
@@ -1416,10 +1752,39 @@ U0 QGameLoop()
 		//the whole session's keystrokes as a command line on exit.
 		QInputDrain;
 
-		//--- F2 saves, F3 loads ---
+		//--- F2 saves, F3 loads: one slot, so bound straight to the keys ---
+		//--- viewsize: default.cfg binds "-" to sizedown and "=" to sizeup ---
 		//
-		//The original reaches these through menu pages; there is only one slot
-		//here, so they are bound directly to the keys its menu uses.
+		//SCR_SizeUp_f / SCR_SizeDown_f step by 10, clamped to 30..120. at 110
+		//the inventory row goes, at 120 the whole status bar does.
+		//
+		//only while the keyboard belongs to the GAME - typing an underscore in
+		//the console must not resize the screen.
+		if (q_state == QST_CONSOLE || q_msg_mode || q_state == QST_MENU)
+			size_held = TRUE;		//swallow the edge, act on nothing
+		else if (Bt(kbd.down_bitmap, sc_minus))
+		{
+			if (!size_held)
+			{
+				size_held = TRUE;
+				QCvarSet("viewsize", QCvarGet("viewsize") - 10.0);
+				if (QCvarGet("viewsize") < 30.0)
+					QCvarSet("viewsize", 30.0);
+			}
+		}
+		else if (Bt(kbd.down_bitmap, sc_equals))
+		{
+			if (!size_held)
+			{
+				size_held = TRUE;
+				QCvarSet("viewsize", QCvarGet("viewsize") + 10.0);
+				if (QCvarGet("viewsize") > 120.0)
+					QCvarSet("viewsize", 120.0);
+			}
+		}
+		else
+			size_held = FALSE;
+
 		if (Bt(kbd.down_bitmap, SC_F2))
 		{
 			if (!save_held)
@@ -1445,11 +1810,124 @@ U0 QGameLoop()
 		else
 			load_held = FALSE;
 
+		//The Single Player menu page cannot call these itself: QMenu.ZC
+		//compiles before both, and loading tears the world down mid-frame.
+		if (q_menu_save_req)
+		{
+			q_menu_save_req = FALSE;
+			if (q_game_active)
+				QSaveGame;
+		}
+
+		if (q_menu_load_req)
+		{
+			q_menu_load_req = FALSE;
+			q_load_request  = TRUE;
+		}
+
 		if (q_load_request)
 		{
 			q_load_request = FALSE;
 			QLoadGame;
 			goto ql_next_frame;
+		}
+
+		//--- joining: the network runs OUTSIDE the in-game tick ---
+		//
+		//an unjoined client sits in the menu, where the tick never runs. the
+		//request repeats because a datagram can simply be lost.
+		//
+		//keep poking the host while the map loads, or last_msg goes stale and
+		//the host's timeout kills the body mid-join.
+		if (q_udp_ready && !q_udp_server &&
+			(!q_menu_ingame || q_change_pending || !q_game_active))
+		{
+			if (tS - q_join_last_try > 1.0)
+			{
+				q_join_last_try = tS;
+
+				if (!QNetUdpPeerResolved)
+					QNetUdpArpProbe;
+
+				QNetClientSendConnect(q_setup_name, q_setup_top, q_setup_bottom);
+			}
+
+			QNetClientFrame;
+		}
+
+		//Host_Frame calls CL_ReadFromServer unconditionally: the console and
+		//menu states skip the frame tail, so pump here.
+		if (q_demo_playing)
+		{
+			//map FIRST: everything after svc_serverinfo describes that world,
+			//and the changelevel would clear tables filled before it.
+			if (q_change_pending)
+			{
+				q_change_pending = FALSE;
+				if (QChangeLevel(q_change_map))
+					QClientPrecacheRebuild;
+				else
+				{
+					QLog("demo: level failed to load, stopping\n");
+					q_demo_loop = FALSE;
+					QDemoStop;
+				}
+			}
+
+			QNetClientFrame;
+
+			//track the view entity here too - the tick is skipped with the
+			//menu open, and the world still renders behind it.
+			if (q_demo_playing)
+			{
+				if (q_cl_viewent > 0 && q_cl_viewent < QNET_MAX_ENTS)
+					QVecCopy(q_net_cl[q_cl_viewent].origin, q_origin);
+				QVecCopy(q_demo_angles, q_angles);
+			}
+
+			//a finished demo leaves a map with no QuakeC and no stream behind
+			//it - go back to the menu the attract loop came from.
+			if (!q_demo_playing && !q_game_active)
+			{
+				//a changelevel the dead stream asked for must die with it, or
+				//the frame tail loads it as a REAL game.
+				q_change_pending = FALSE;
+
+				q_menu_ingame = FALSE;
+				q_menu_page   = QPAGE_MAIN;
+				q_state       = QST_MENU;
+			}
+		}
+
+		//The server named a level: load it, then continue stock signon
+		//(prespawn -> spawn -> begin). Do NOT enter play until signon 4.
+		if (q_net_join_pending)
+		{
+			q_net_join_pending = FALSE;
+
+			//same again: a level named by a dead stream must not fall through
+			//to the ordinary changelevel service, which spawns a live player.
+			if (q_demo_playing || (q_udp_ready && !q_udp_server))
+			{
+				//QGameLoop has no scratch line buffer of its own, so build the
+				//message in the join buffer's scratch.
+				if (q_demo_playing)
+					StrPrint(q_join_line, "demo: %s, level %s\n",
+						q_demo_name, q_net_join_map);
+				else
+					StrPrint(q_join_line, "net: joining, server level %s\n",
+						q_net_join_map);
+				QLog(q_join_line);
+
+				//stream and live server both name the level in svc_serverinfo.
+				//M_Draw keeps the menu over the attract loop, so only a LIVE
+				//join forces the view to the world.
+				QStrCopy(q_change_map, q_net_join_map, 64);
+				q_change_pending = TRUE;
+				q_menu_ingame    = TRUE;
+				if (!q_demo_playing || q_state != QST_MENU)
+					q_state = QST_PLAYING;
+			}
 		}
 
 		//--- tilde drops the console, as in the original ---
@@ -1459,11 +1937,8 @@ U0 QGameLoop()
 			{
 				tilde_held = TRUE;
 
-				//Con_ToggleConsole_f opens the console from ANY key_dest, the
-				//menu included - the earlier version only opened it from
-				//QST_PLAYING, which is why it did nothing at the main menu.
-				//Closing it goes back to the game when connected, and to the
-				//main menu when not, rather than always to the game.
+				//Con_ToggleConsole_f opens from ANY key_dest, menu included.
+				//closing goes back to the game when connected, else the menu.
 				if (q_state == QST_CONSOLE)
 				{
 					if (q_menu_ingame)
@@ -1487,6 +1962,20 @@ U0 QGameLoop()
 		else
 			tilde_held = FALSE;
 
+		//--- messagemode (Y) / messagemode2 (U); TAB scoreboard ---
+		q_scoreboard_show = FALSE;
+		if (q_state == QST_PLAYING && !q_msg_mode)
+		{
+			//QConKeyEdge so the opening press is not typed into the chat.
+			if (QConKeyEdge(sc_y))
+				QMsgModeBegin(FALSE);
+			else if (QConKeyEdge(sc_u))
+				QMsgModeBegin(TRUE);
+
+			if (Bt(kbd.down_bitmap, SC_TAB))
+				q_scoreboard_show = TRUE;
+		}
+
 		//--- ESC toggles the menu; quitting is a menu choice ---
 		if (Bt(kbd.down_bitmap, SC_ESC))
 		{
@@ -1494,16 +1983,27 @@ U0 QGameLoop()
 			{
 				esc_held = TRUE;
 
-				if (q_state == QST_PLAYING)
+				//arriving at a menu page sets m_entersound, which M_Draw plays
+				//as misc/menu2.wav - backing out is not silent.
+				if (q_msg_mode)
+					QMsgModeCancel;
+				else if (q_state == QST_PLAYING)
+				{
 					q_state = QST_MENU;
+					QMenuSound(QMSND_ENTER);
+				}
 				else if (q_state == QST_CONSOLE)
 				{
 					//Key_Console passes ESC straight to M_ToggleMenu_f.
 					q_state     = QST_MENU;
 					q_menu_page = QPAGE_MAIN;
+					QMenuSound(QMSND_ENTER);
 				}
 				else if (q_menu_page != QPAGE_MAIN)
+				{
 					q_menu_page = QPAGE_MAIN;	//back out of a submenu first
+					QMenuSound(QMSND_ENTER);
+				}
 				else if (q_menu_ingame)
 					q_state = QST_PLAYING;
 			}
@@ -1546,23 +2046,16 @@ U0 QGameLoop()
 			if (q_con_want_quit)
 				break;
 
-			QPartUpdate(dt, tS);
-			QCenterView(Fs);
-			QRenderFrame;
-			q_ready = TRUE;
-
-			LBts(&Fs->task_flags, TASKf_IDLE);
-			Yield;
-			LBtr(&Fs->task_flags, TASKf_IDLE);
-			goto ql_next_frame;
+			//NO early-out: jumping to the next frame skips the server tick,
+			//which stops the WORLD and every remote client with it -
+			//QSvRunClients and QNetServerFrame both live in that tick. the
+			//local player is held still by the input gate below instead.
 		}
 
 		//--- console opened from the MENU: no world to render behind it ---
 		//
-		//The console normally draws at the end of QRenderFrame, which needs a
-		//map. Opened from the title screen there is none, so the menu artwork
-		//stands in as the backdrop - which is also what the original shows when
-		//the console is down outside a game.
+		//QRenderFrame draws the console at its tail and needs a map. from the
+		//title screen there is none, so the menu art stands in as the backdrop.
 		if (q_state == QST_CONSOLE && !q_menu_ingame)
 		{
 			QMenuDraw(q_canvas);
@@ -1589,14 +2082,22 @@ U0 QGameLoop()
 			//The name editor polls the keyboard itself, so it runs before the
 			//scancode dispatch and swallows the frame when it is active.
 			QSetupInput;
+			QLanInput;
 
 			//Edge trigger, or a held arrow runs the whole list.
-			if (menu_sc && menu_sc != last_menu_sc && !q_setup_editing)
+			if (menu_sc && menu_sc != last_menu_sc && !q_setup_editing &&
+				!q_lan_editing)
 			{
 				if (QMenuKey(menu_sc, &start_game))
 				{
 					if (start_game)
 					{
+						//cls.demonum = -1: any choice cancels the attract
+						//loop, and the demo stops before the world it was
+						//driving is replaced.
+						QDemoStop;
+						q_demo_loop = FALSE;
+
 						q_menu_ingame = TRUE;
 						q_state       = QST_PLAYING;
 					}
@@ -1604,15 +2105,20 @@ U0 QGameLoop()
 			}
 			last_menu_sc = menu_sc;
 
-			//Multiplayer -> New Game. The cvar is already set; the map has to be
-			//restarted so the QuakeC world respawns with deathmatch active -
-			//items behave differently from the moment they spawn, so flipping it
-			//on a running level would leave the existing ones wrong.
+			//multiplayer new game: the map must restart so items spawn with
+			//deathmatch already active - flipping it on a live level leaves the
+			//existing ones wrong.
 			if (q_mp_start_dm)
 			{
-				//The map switch itself is already queued by the menu; this only
-				//has to leave the menu so the change is serviced by the frame
-				//loop the way a changelevel from QuakeC would be.
+				//cls.demonum = -1. the attract loop owns the world until
+				//something else claims it, and it must be dropped BEFORE the
+				//map switch or the demo pump keeps serving its own changelevels
+				//over the top of the new game.
+				QDemoStop;
+				q_demo_loop = FALSE;
+
+				//the menu already queued the map switch - this only has to leave
+				//the menu so the frame loop services it.
 				q_mp_start_dm = FALSE;
 				q_menu_ingame = TRUE;
 				q_state       = QST_PLAYING;
@@ -1621,10 +2127,8 @@ U0 QGameLoop()
 			if (q_quit_request)
 				break;
 
-			//With a game running, render the frozen world first so the menu
-			//has something to dim. QMenuBackdrop applies the fade dither over
-			//it; without this pass there is nothing underneath and the fade
-			//would darken last frame's leftovers or plain black.
+			//render the frozen world first, so QMenuBackdrop has something to
+			//dither over.
 			if (q_menu_ingame && q_map && q_vis)
 				QRenderFrame;
 
@@ -1639,36 +2143,55 @@ U0 QGameLoop()
 		}
 
 		//--- mouse: read deltas AND the wheel before the reset clears them ---
+		//
+		//drained even while typing, or they pile up and lurch the view the
+		//moment the console closes.
 		dx = mouse_hard.raw_data.x;
 		dy = mouse_hard.raw_data.y;
 
-		//The WHEEL comes from raw_data.z, which accumulates and is cleared by
-		//the reset below - so it is already a per-frame delta. It used to be
-		//read from mouse.pos.z, which raw mode never updates: that value never
-		//changed, so the wheel produced no impulse at all.
+		//wheel is raw_data.z, already a per-frame delta. mouse.pos.z is not
+		//usable - raw mode never updates it.
 		wheel_dz = mouse_hard.raw_data.z;
 
 		//FIRE is the latch OR the level, and it needs both.
 		//
-		//raw_bttns is accumulated with |= and cleared every frame, so it only
-		//reads set on a frame where the mouse actually sent a packet - and a
-		//PS/2 mouse sends nothing while a button is held still. On its own,
-		//holding fire only registered while the mouse was also moving, which is
-		//why automatic weapons fired only when aiming around.
+		//raw_bttns only reads set on a frame where the mouse sent a packet, and
+		//a PS/2 mouse sends nothing while a button is held still - on its own,
+		//holding fire registers only while also moving.
 		//
-		//bttns is the LEVEL, which answers "is it down now". The kernel only
-		//maintains it in raw mode with the Mouse.ZC change that accompanies
-		//this, so on a kernel built before that it stays FALSE forever - reading
-		//it alone meant no shooting at all. Taking either source keeps a stale
-		//kernel working exactly as it did while a rebuilt one holds fire
-		//properly, and neither can produce a false positive: the level is
-		//cleared on entry below.
+		//bttns is the LEVEL, but the kernel only maintains it in raw mode with
+		//the accompanying Mouse.ZC change - FALSE forever on an older build.
+		//either source, and neither can false-positive: the level is cleared on
+		//entry below.
 		attack = ToBool(mouse_hard.raw_bttns[0] || mouse_hard.bttns[0]);
 
 		MouseRawReset;
 
+		//Typing owns the keyboard and mouse: the player holds still, but the
+		//server keeps running for everyone else.
+		if (q_state != QST_PLAYING || q_msg_mode)
+		{
+			dx       = 0;
+			dy       = 0;
+			wheel_dz = 0;
+			attack   = FALSE;
+		}
+
+		//V_CalcIntermissionRefdef reads the parked entity's angles every frame,
+		//so the mouse has no say until play resumes.
+		if (q_intermission)
+		{
+			dx = 0;
+			dy = 0;
+		}
+
+		//m_pitch carries invert in its sign, as the original does; magnitude is
+		//the sensitivity slider's job.
 		q_angles[1] -= ToF64(dx) * q_opt_sensitivity;
-		q_angles[0] += ToF64(dy) * q_opt_sensitivity;
+		if (QCvarGet("m_pitch") < 0.0)
+			q_angles[0] -= ToF64(dy) * q_opt_sensitivity;
+		else
+			q_angles[0] += ToF64(dy) * q_opt_sensitivity;
 
 		if (q_angles[0] > QPITCH_LIMIT)
 			q_angles[0] = QPITCH_LIMIT;
@@ -1677,12 +2200,9 @@ U0 QGameLoop()
 
 		q_angles[1] = QAngleNorm(q_angles[1]);
 
-		//Number keys request a weapon switch. EDGE TRIGGERED, because an impulse
-		//is a one-shot event, not a state: the original's +impulse binding fires
-		//once on the key going down and CL_SendMove zeroes in_impulse straight
-		//after transmitting it. Sampling the held state instead re-sent the same
-		//impulse every tick, which is harmless for a direct weapon select but
-		//makes the cycle impulses unusable.
+		//weapon select. EDGE TRIGGERED - an impulse is a one-shot, not a state:
+		//CL_SendMove zeroes in_impulse straight after transmitting it, and
+		//resending makes the cycle impulses unusable.
 		impulse      = 0;
 		impulse_down = 0;
 
@@ -1698,63 +2218,78 @@ U0 QGameLoop()
 
 		impulse_last = impulse_down;
 
-		//Wheel cycles weapons. The original has no wheel binding - it predates
-		//the convention - but it exposes the two impulses such a binding would
-		//use, so this drives the game's own commands rather than inventing a
-		//path: 10 is next weapon, 12 is previous.
+		//wheel cycles weapons through the game's own impulses: 10 next, 12
+		//previous. the original predates the convention and binds no wheel.
 		if (wheel_dz > 0)
 			impulse = 10;
 		else if (wheel_dz < 0)
 			impulse = 12;
 
-		//A console `impulse N` is delivered here rather than written to the edict,
-		//so it goes through the same one-tick path a key press does.
-		if (q_con_impulse_want)
-		{
-			impulse            = q_con_impulse_want;
-			q_con_impulse_want = 0;
-		}
+
 
 		//--- movement wish direction ---
 		QAngleVectors(q_angles, forward, right, up);
 		QVecSet(move, 0.0, 0.0, 0.0);
+		//Stock clc_move shorts are view-relative (forwardmove/sidemove/upmove).
+		net_fwd  = 0.0;
+		net_side = 0.0;
 
-		//A DEAD player has no input. SV_ClientThink bails out on both of these
-		//before reading the move at all:
+		//messagemode and the console both own the keyboard - no walk while
+		//typing. The world still ticks; only this player's input is dropped.
+		if (q_msg_mode || q_state == QST_CONSOLE)
+		{
+			if (q_msg_mode)
+				QMsgModeInput;
+			impulse = 0;
+			attack  = FALSE;
+		}
+		//a dead player has no input. SV_ClientThink bails before the move:
 		//    if (movetype == MOVETYPE_NONE) return;
 		//    if (health <= 0) return;
-		//Without it the corpse keeps walking around under player control while
-		//health counts further and further below zero.
-		if (q_game_active && QPlayerFrozen)
+		else if (q_game_active && QPlayerFrozen)
 		{
-			//MOVEMENT only. The buttons must still reach QuakeC: once dead,
-			//PlayerDeathThink waits for every button to be RELEASED and then for
-			//one to be pressed again before it will respawn. Swallowing the
-			//attack button here would leave the player permanently dead.
-			//
-			//SV_ClientThink works the same way round - it returns before reading
-			//the move, but the buttons were already delivered.
+			//MOVEMENT only - PlayerDeathThink waits on a button release then a
+			//press to respawn, so swallowing attack here means dead forever.
+			//SV_ClientThink returns before the move, but after the buttons.
 			impulse = 0;
 		}
 		else
 		{
-			if (Bt(kbd.down_bitmap, sc_w))
+			if (Bt(kbd.down_bitmap, q_bind_key[QBIND_FORWARD]))
+			{
 				QVecAdd(move, forward, move);
-			if (Bt(kbd.down_bitmap, sc_s))
+				net_fwd += 1.0;
+			}
+			if (Bt(kbd.down_bitmap, q_bind_key[QBIND_BACK]))
+			{
 				QVecSub(move, forward, move);
-			if (Bt(kbd.down_bitmap, sc_d))
+				net_fwd -= 1.0;
+			}
+			if (Bt(kbd.down_bitmap, q_bind_key[QBIND_RIGHT]))
+			{
 				QVecAdd(move, right, move);
-			if (Bt(kbd.down_bitmap, sc_a))
+				net_side += 1.0;
+			}
+			if (Bt(kbd.down_bitmap, q_bind_key[QBIND_LEFT]))
+			{
 				QVecSub(move, right, move);
+				net_side -= 1.0;
+			}
 		}
 
-		//Run by default, shift to walk. The original ships the opposite way
-		//round, but its own default config raises cl_forwardspeed to the run
-		//figure, so always-running IS how the game is played.
-		if (Bt(kbd.down_bitmap, SC_SHIFT))
+		//cl_forwardspeed IS the always-run setting - no separate flag. shift is
+		//the speed key and swaps whichever way it is set.
+		speed = QCvarGet("cl_forwardspeed");
+		if (speed < QMOVE_SPEED)
 			speed = QMOVE_SPEED;
-		else
-			speed = QMOVE_FAST;
+
+		if (Bt(kbd.down_bitmap, SC_SHIFT))
+		{
+			if (speed >= QMOVE_FAST)
+				speed = QMOVE_SPEED;
+			else
+				speed = QMOVE_FAST;
+		}
 
 		if (q_noclip)
 		{
@@ -1771,9 +2306,8 @@ U0 QGameLoop()
 			q_water_level = QWaterLevelGet(q_map, q_origin, &q_water_type);
 			QPlayerWater(q_water_level, q_water_type);
 
-			//Out of water the wish direction is flattened so looking up does
-			//not drive the player into the floor. Swimming keeps the vertical
-			//component, which is how looking up makes you rise.
+			//flatten the wish out of water, or looking up drives into the floor.
+			//swimming keeps z, which is the lift.
 			if (q_water_level < 2)
 				move[2] = 0.0;
 
@@ -1781,93 +2315,162 @@ U0 QGameLoop()
 				QVecNormalize(move);
 		}
 
+		//a console impulse lands AFTER the suppression above: Host_Impulse_f
+		//queues it whatever key_dest is, and typing the command necessarily
+		//leaves the console open on that frame.
+		if (q_con_impulse_want)
+		{
+			impulse            = q_con_impulse_want;
+			q_con_impulse_want = 0;
+		}
+
+		//console heapcheck 1 only - the sweep walks every live allocation.
+		if (q_heap_check_on && tS - q_heap_check_last > 1.0)
+		{
+			q_heap_check_last = tS;
+			StrPrint(q_heap_check_line, "in game f%d", q_frame_count);
+			QHeapCheck(q_heap_check_line);
+		}
+
 		//--- server frames at a FIXED rate ---
 		//
-		//The original caps its host loop and runs exactly ONE server frame per
-		//accepted frame, so PreThink, the move and PostThink all advance at a
-		//bounded, consistent rate. Driving them at render rate instead (190Hz
-		//here) over-runs everything by nearly 3x: jumps integrate differently,
-		//and anything QuakeC does per-call happens far too often.
+		//the server steps at a fixed interval, rendering runs free. driving
+		//PreThink, the move and PostThink at render rate over-runs everything by
+		//nearly 3x. catch-up is capped, or a stall fires a burst at once.
 		//
-		//So the server steps at a fixed interval and rendering runs free. The
-		//catch-up is capped, or a stall would fire a burst of frames at once.
+		//the log below runs from the FRAME loop, not the tick, so it still
+		//reports when the tick itself is being gated.
+		if (q_net_active && q_udp_server && tS - q_tick_log_last > 1.0)
+		{
+			q_tick_log_last = tS;
+
+			if (q_tick_log_n < 120)
+			{
+				q_tick_log_n++;
+
+				StrPrint(q_tick_line,
+					"tick: state %d act %d self %d rem %d org(%.0f %.0f) "
+					"mv(%.0f %.0f) sig %d\n",
+					q_state, QSvFlagI(q_game_active), q_player_edict,
+					q_sv_clients[1].edict,
+					q_sv_clients[1].origin[0], q_sv_clients[1].origin[1],
+					q_sv_clients[1].cmd[0], q_sv_clients[1].cmd[1],
+					q_sv_clients[1].signon);
+				QLog(q_tick_line);
+				QLogFlush;
+			}
+		}
+
 		srv_accum += dt;
 		srv_steps  = 0;
 
 		while (srv_accum >= QSERVER_STEP && srv_steps < QSERVER_MAX_CATCHUP)
 		{
-			//Before anything else, make sure the player is not embedded in
-			//solid. A teleport or a door can leave them there, and the slide
-			//move alone can never recover from it.
-			//Tell the collision code which edict is doing the moving, so the
-			//player's own box is not treated as an obstacle by their own move.
+			//a teleport or a door can leave the player embedded, and the slide
+			//move alone never recovers from it. QCheckStuck traces before
+			//QPlayerMove has set the pass entity, so set one here.
 			q_move_pass = q_player_edict;
 
 			if (!q_noclip && q_map)
 				QCheckStuck(q_map, q_origin);
 
 
-			if (q_game_active)
+			//DEMO PLAYBACK OWNS THE FRAME: no input, no move, no think.
+			//vanilla has no prediction either - V_CalcRefdef puts the view on
+			//cl_entities[cl.viewentity], and the angles are the three floats
+			//recorded beside every demo message.
+			if (q_demo_playing)
+			{
+				if (q_cl_viewent > 0 && q_cl_viewent < QNET_MAX_ENTS)
+					QVecCopy(q_net_cl[q_cl_viewent].origin, q_origin);
+
+				QVecCopy(q_demo_angles, q_angles);
+				QVecSet(q_velocity, 0.0, 0.0, 0.0);
+				q_on_ground = TRUE;
+			}
+			else if (q_game_active)
 			{
 				//--- upstream: the client's move goes over the wire ------------
 				//
-				//CL_SendMove then SV_ReadClientMove. The view angles, the two
-				//buttons and the impulse now reach the edict by being SERIALISED
-				//and read back, not by being written across - so the input path
-				//is a real client/server boundary too, and a second player would
-				//arrive down exactly this route.
+				//CL_SendMove then SV_ReadClientMove: angles, buttons and impulse
+				//reach the edict SERIALISED, so the input path is a real
+				//client/server boundary and a second player arrives this way.
 				//
-				//The move vector itself is sent and read back for the ping and
-				//for symmetry, but the engine still applies its own copy: the
-				//server-side move would have to reconstruct the wish direction
-				//from angles the way SV_ClientThink does, and that swap belongs
-				//with the renderer flip rather than here.
+				//the move vector round-trips for symmetry, but the engine still
+				//applies its own copy - reconstructing the wish server-side the
+				//way SV_ClientThink does goes with the renderer flip, not here.
 				if (q_net_active)
 				{
-					QNetClientSendMove(q_angles,
-						move[0] * speed, move[1] * speed, move[2] * speed,
-						attack, ToBool(Bt(kbd.down_bitmap, sc_jump)),
-						impulse, q_game_time);
+					//Stock: CL_SendMove only after SIGNONS (4). Listen host
+					//never walks UDP signon -- q_cl_signon stays 0.
+					if (!q_udp_ready || q_udp_server || q_cl_signon >= 4)
+					{
+						QNetClientSendMove(q_angles,
+							net_fwd * speed, net_side * speed, 0.0,
+							attack, ToBool(Bt(kbd.down_bitmap, q_bind_key[QBIND_JUMP])),
+							impulse, q_game_time);
+					}
 
 					QNetServerReadClient(q_player_edict, q_game_time);
 				}
 
-				QPlayerPreThink(q_origin, q_velocity, q_angles, q_on_ground,
-					attack, ToBool(Bt(kbd.down_bitmap, sc_jump)), impulse);
+				//SV_ClientThink opens with this, so the kick from the last
+				//shot has recovered a little before the frame is built.
+				QDropPunchAngle(q_player_edict, QSERVER_STEP);
 
-				//CONSUMED, because this loop can run several catch-up ticks for
-				//one rendered frame. The original carries an impulse in a single
-				//move message, so exactly one server frame ever sees it; leaving
-				//it set here would hand the same key press to ImpulseCommands
-				//two or three times and cycle straight past the weapon asked for.
+				QPlayerPreThink(q_origin, q_velocity, q_angles, q_on_ground,
+					attack, ToBool(Bt(kbd.down_bitmap, q_bind_key[QBIND_JUMP])), impulse);
+
+				//consumed: catch-up runs several ticks per rendered frame, and
+				//the original's impulse rides one move message only - left set,
+				//ImpulseCommands cycles straight past the weapon asked for.
 				impulse = 0;
 
-				//QuakeC owns jumping while the VM is live: PlayerJump has
-				//already set the vertical velocity during pre-think.
-				//Only a MOVETYPE_WALK player is moved from here. Once dead the
-				//movetype becomes TOSS and the entity physics pass owns the
-				//corpse, which is how SV_Physics_Client splits it. Left running,
-				//WALK physics on a corpse re-fires the touch of whatever it
-				//rests on every frame - looping that entity's sound.
+				//QuakeC owns jumping - PlayerJump set the vertical velocity in
+				//pre-think. WALK players only: SV_Physics_Client hands a TOSS
+				//corpse to the entity pass, and WALK physics on one re-fires the
+				//touch of whatever it rests on every frame.
 				if (!q_noclip && QPlayerWalking)
 					QPlayerMove(q_map, q_origin, q_velocity, move, speed,
 						FALSE, QSERVER_STEP, &q_on_ground, q_water_level,
-						QPlayerWaterJump(q_velocity, q_game_time), q_angles);
+						QPlayerWaterJump(q_velocity, q_game_time), q_angles,
+						q_player_edict);
 
-				//Publish what the player is standing on. QuakeC and the pusher
-				//code both read .groundentity, and a platform only carries
-				//riders it can identify.
+				//publish .groundentity - a platform only carries riders it can
+				//identify.
 				if (q_player_edict > 0 && q_fld_groundentity >= 0)
 					QPrSetFieldI(q_player_edict, q_fld_groundentity,
 						QPrEdictValue(q_ground_entity));
 
-				QGameFrame(QSERVER_STEP);
+				//THIN CLIENT: a guest must NOT run the world think pass on top
+				//of parsing the host's entity storm. its world comes off the
+				//wire via QNetClientFrame + cl_netdraw; local motion is still
+				//predicted below.
+				//
+				//PUBLISH THE POST-MOVE POSITION BEFORE THE PUSHERS RUN.
+				//PreThink wrote the pre-move origin, so a pusher tests the
+				//player a tick behind and a plat can never move them out of its
+				//way - it stays blocked and plat_crush fires every frame. in the
+				//original sv_player->v.origin IS the position.
+				if (q_game_active && q_player_edict > 0)
+				{
+					for (i = 0; i < 3; i++)
+					{
+						QPrSetFieldF(q_player_edict, q_fld_origin + i,
+							q_origin[i]);
+						QPrSetFieldF(q_player_edict, q_fld_velocity + i,
+							q_velocity[i]);
+					}
+				}
 
-				//A corpse is moved by the entity physics pass, which writes the
-				//EDICT. The engine has to adopt that before anything publishes
-				//its own copy again, or the touch pass writes the stale origin
-				//straight back over the fall.
-				if (q_game_active && !QPlayerWalking)
+				//The local world does not run while a demo plays - the stream
+				//already contains everything that happened.
+				if (!QClientMode)
+					QGameFrame(QSERVER_STEP);
+
+				//adopt what the physics pass did to the body. published just
+				//above, so any difference here is exactly what the pusher did.
+				if (q_game_active && q_player_edict > 0)
 				{
 					for (i = 0; i < 3; i++)
 					{
@@ -1879,8 +2482,11 @@ U0 QGameLoop()
 				}
 
 				QPlayerTouchTriggers(q_origin, q_velocity);
-				QPlayerPostThink(q_origin, q_velocity, q_angles);
-				QViewKickUpdate(QSERVER_STEP);
+				QPlayerPostThink(q_origin, q_velocity, q_angles,
+					q_on_ground, q_water_level, q_water_type);
+				//Local player frame chains - same as remotes in QSvRunClients.
+				if (q_player_edict > 0)
+					QSvRunEntityThink(q_player_edict);
 				QStuckCheck(move, speed);
 
 				//Anything QuakeC printed this tick goes to the console, and
@@ -1900,35 +2506,52 @@ U0 QGameLoop()
 
 				//--- the client/server boundary --------------------------------
 				//
-				//The world is now settled for this tick, which is exactly where
-				//SV_SendClientDatagram runs. The server serialises it and the
-				//local client rebuilds its copy from the bytes.
+				//the world is settled for this tick, which is where
+				//SV_SendClientDatagram runs: the server serialises and the local
+				//client rebuilds its copy from the bytes.
 				//
-				//The RENDERER still reads the world directly. Flipping it over to
-				//the client's tables is the last step and a separate one: this
-				//pass has to be proved to reconstruct the world correctly first,
-				//which is what QNetVerify measures - and it can only measure it
-				//while a known-good reference is still there to compare against.
+				//NOTE: the renderer still reads the world directly. QNetVerify
+				//can only measure the reconstruction while that known-good
+				//reference is still there to compare against.
 				if (q_net_active && q_player_edict > 0)
 				{
-					//Remote clients are simulated AFTER their moves have been
-					//read and BEFORE the datagram goes out, so what each of
-					//them is told already includes everyone's movement this
-					//tick rather than lagging it by one.
-					QSvRunClients(QSERVER_STEP, q_game_time);
+					if (q_udp_ready && q_udp_server)
+						QSvRunClients(QSERVER_STEP, q_game_time);
 
-					QNetServerFrame(q_player_edict, q_vis, q_game_time);
+					//Host builds the datagram; guest only drains the wire.
+					if (q_udp_server || !q_udp_ready)
+						QNetServerFrame(q_player_edict, q_game_time);
+
 					QNetClientFrame;
-					q_net_mismatch        = QNetVerify(q_player_edict);
-					q_net_mismatch_report = q_net_mismatch;
+
+					//Guest: HUD / death / viewweapon follow host clientdata.
+					QNetSyncLocalFromClient;
+
+					//svc_print / Host_Say may have arrived this tick - show now.
+					QConDrainProgs;
+
+					if (q_udp_server || !q_udp_ready)
+					{
+						q_net_mismatch        = QNetVerify(q_player_edict);
+						q_net_mismatch_report = q_net_mismatch;
+					}
 				}
+
+				//AFTER the wire: guest hit kick reads q_net_damage_pending from
+				//svc_damage parsed above. Host still gets dmg_* from the edict.
+				QViewKickUpdate(QSERVER_STEP);
+
+				//Keep the OS responsive under catch-up bursts.
+				if (q_udp_ready && !q_udp_server)
+					Yield;
 			}
 			else if (!q_noclip)
 			{
 				//No bytecode loaded, so the engine owns jumping.
 				QPlayerMove(q_map, q_origin, q_velocity, move, speed,
-					ToBool(Bt(kbd.down_bitmap, sc_jump)), QSERVER_STEP,
-					&q_on_ground, q_water_level, FALSE, q_angles);
+					ToBool(Bt(kbd.down_bitmap, q_bind_key[QBIND_JUMP])), QSERVER_STEP,
+					&q_on_ground, q_water_level, FALSE, q_angles,
+					q_player_edict);
 			}
 
 			srv_accum -= QSERVER_STEP;
@@ -1955,10 +2578,9 @@ U0 QGameLoop()
 			fps_time   = now;
 		}
 
-		//A level change is requested from inside a think, so it is serviced
-		//here, between frames, once nothing is executing.
-		//A death restart reloads the SAME map with no carried inventory. Handled
-		//before the level change so the two cannot both fire in one frame.
+		//a level change is requested from inside a think, so it is serviced
+		//here, between frames. a death restart reloads the SAME map with no
+		//carried inventory, and goes first so the two cannot both fire.
 		if (q_restart_pending)
 		{
 			q_restart_pending = FALSE;
@@ -1967,10 +2589,33 @@ U0 QGameLoop()
 			goto ql_next_frame;
 		}
 
-		if (q_change_pending)
+		//"game <dir>" arrives from the console, which compiles before this
+		//file and cannot call in directly. serviced between frames like a
+		//changelevel, and BEFORE it, because it invalidates every archive the
+		//map would load from
+		if (q_gamedir_pending)
+		{
+			q_gamedir_pending = FALSE;
+			q_change_pending  = FALSE;
+			QGameDirSwitch(q_gamedir_next);
+			goto ql_next_frame;
+		}
+
+		//Never during playback: the demo pump owns its own changelevels, and
+		//this copy would service one without the client precache rebuild.
+		if (q_change_pending && !q_demo_playing)
 		{
 			q_change_pending = FALSE;
 			QChangeLevel(q_change_map);
+
+			//Guest: after map load, reply to signonnum 1 with "prespawn".
+			if (q_udp_ready && !q_udp_server && q_net_need_prespawn)
+			{
+				q_net_need_prespawn = FALSE;
+				QLog("net: cl -> prespawn (map loaded)\n");
+				QLogFlush;
+				QNetClientSendStringCmd("prespawn");
+			}
 		}
 
 		LBts(&Fs->task_flags, TASKf_IDLE);
@@ -1982,22 +2627,14 @@ ql_next_frame:
 }
 
 U0 QDocCursorPark()
-{//Put the terminal's document cursor back at the END of the document.
+{//park the terminal's document cursor at the END.
  //
- //Quake calls DocClear on startup and then prints a great deal - the load
- //report, the exit summary - into the terminal's own document. That leaves the
- //cursor wherever the last write or the last mouse click put it, which for a
- //DolDoc terminal is a real editing position, not a prompt.
+ //the cursor is left wherever the last write or click put it, which in DolDoc
+ //is a real editing position, not a prompt. anything typed after is inserted
+ //INTO existing text, and the shell hands the merged line to the compiler -
+ //a fault inside ExeCmdLine, after Quake has fully exited.
  //
- //Anything the user types afterwards is then inserted INTO existing document
- //text rather than appended at the prompt, so a typed command comes out merged
- //with whatever was on that line: "map e1m1" becomes something like
- //"ww`map e1m1". The shell hands that to the compiler, which either reports an
- //undefined identifier or dereferences a pointer built from the mangled text
- //and faults inside ExeCmdLine - a crash that looks like it belongs to Quake
- //but happens after Quake has fully exited.
- //
- //Parking the cursor at the tail is the same idiom the doc utilities use.
+ //same idiom the doc utilities use.
 	CDoc *doc;
 	Bool  unlock;
 
@@ -2020,6 +2657,7 @@ U0 Quake(U8 *mapname = QDEFAULT_MAP)
 	CQVisState	*vis			= NULL;
 	CQMap		*map			= NULL;
 	Bool		 raw_was_on		= FALSE;
+	Bool		 demo_boot		= FALSE;
 	Bool		 final_active	= FALSE;
 	I64			 final_edicts	= 0;
 	I64			 final_thinks	= 0;
@@ -2036,19 +2674,43 @@ U0 Quake(U8 *mapname = QDEFAULT_MAP)
 
 	QLogReset;
 
+	//before a single allocation of ours: corruption here did not come from
+	//here.
+	QHeapCheck("entry");
+
 	QPakInit;
 	QSndInit;
 	QPartInit;
 	QClipInit;
+	//ZealC does not honour a declaration initialiser on a global, and every
+	//pointer below is handed to Free() at teardown - one never assigned is
+	//freed as garbage, faulting inside the allocator.
+	q_music_frames     = NULL;
+	q_music_count      = 0;
+	q_music_rate       = QSND_RATE;
+	q_music_track      = 0;
+	q_save_buf         = NULL;
+	q_mdl_preview      = NULL;
+	q_mdl_preview_skin = NULL;
+	q_vis              = NULL;
+	q_map              = NULL;
+	q_entities         = NULL;
+	q_num_entities     = 0;
+
 	QMdlCacheInit;
+	QBiBspCacheInit;
+	QSurfCacheInit;
+	QMusicReset;
+	QPlayerStateInit;
+	QClientParmsInit;
+	QDemoInit;
+	QConHistoryInit;
 	QLightInit;
 	QTurbInit;
 	QNetInit;
 	QNetUdpInit;
 	QNetStatesClear;
-
-	//Preferences before the render target is built: the saved resolution and
-	//fullscreen flag decide how it is created.
+	QNetClockInit;
 	QSetupDefaults;
 	QCfgLoad;
 	QViewKickInit;
@@ -2059,32 +2721,31 @@ U0 Quake(U8 *mapname = QDEFAULT_MAP)
 	//again on every map load and would throw away "registered" and "skill".
 	QCvarInit;
 
-	//Mount PAK0, PAK1, PAK2... until one is missing, the way
-	//COM_AddGameDirectory walks pak%i. Mounting only PAK0 left the registered
-	//game's 85 extra files - episodes 2 through 4, their models and sounds, and
-	//gfx/pop.lmp - unreachable. PAK0 is byte-identical between the shareware
-	//and registered releases, so PAK0 alone can never tell the two apart.
-	if (!QPakMount("::/Apps/Quake/id1/PAK0.PAK"))
+	//Applied AFTER the cvars exist: QCfgLoad ran before this and only parked
+	//the value, because defining it there would have been shadowed here.
+	QCvarSet("crosshair", ToF64(q_opt_crosshair));
+
+	//COM_AddGameDirectory walks pak%i until one is missing. PAK0 is
+	//byte-identical between shareware and registered, so it alone can never
+	//tell the two apart - episodes 2-4 and gfx/pop.lmp live in the later paks.
+	//shared with the live gamedir switch, which remounts the same way
+	if (!FileFind("::/Apps/Quake/id1/PAK0.PAK") &&
+		!FileFind("::/Apps/Quake/id1/pak0.pak"))
 	{
 		"Quake: PAK0.PAK not found. See ::/Apps/Quake/README.md\n";
 		return;
 	}
 
-	i = 1;
-	while (i < QPAK_MAX_PAKS)
+	QPakMountGame;
+
+	if (q_game_dir[0])
 	{
-		StrPrint(pakname, "::/Apps/Quake/id1/PAK%d.PAK", i);
-		if (!FileFind(pakname))
-			break;
-		if (!QPakMount(pakname))
-			break;
-		i++;
+		StrPrint(pakname, "Quake: gamedir %s\n", q_game_dir);
+		"%s", pakname;
 	}
 
-	//COM_CheckRegistered: the presence of gfx/pop.lmp IS the registration test.
-	//trigger_onlyregistered_touch reads cvar("registered"), so without this the
-	//full game still prints the shareware "you'll never know what awaits you"
-	//message at every episode gate.
+	//COM_CheckRegistered: gfx/pop.lmp IS the test.
+	//trigger_onlyregistered_touch reads cvar("registered").
 	if (QPakFind("gfx/pop.lmp"))
 	{
 		QCvarSet("registered", 1.0);
@@ -2099,20 +2760,36 @@ U0 Quake(U8 *mapname = QDEFAULT_MAP)
 		return;
 	}
 
-	//Interface art: gfx.wad (status bar, digits, icons, font) plus the
-	//standalone gfx/*.lmp menu pictures.
+	//interface art: gfx.wad plus the standalone gfx/*.lmp menu pictures.
 	QWadInit;
 	QSbarInit;
 	QMenuInit;
 
-	if (!QLoadMap(mapname))
+	//a stock boot loads NO playable map: quake.rc's startdemos supplies the
+	//world, each demo naming its own level in svc_serverinfo. the direct load
+	//is only the fallback for a boot with no attract loop.
+	demo_boot = FALSE;
+	if (QCvarGet("demoloop") != 0.0)
+		demo_boot = QDemoNextInLoop;
+
+	if (demo_boot)
+		QLog("demo: attract loop started\n");
+	else if (!QLoadMap(mapname))
 	{
 		"Quake: could not load %s\n", mapname;
 		return;
 	}
 
+	//explicit, not initialisers - a global's declaration initialiser is not
+	//honoured.
+	q_state       = QST_MENU;
+	q_menu_ingame = FALSE;
+
 	q_canvas = QDrawNew(q_res_w[q_opt_res], q_res_h[q_opt_res]);
 	q_ready  = FALSE;
+
+	//checkpoints: the first of these that reports corruption brackets it.
+	QHeapCheck("startup");
 
 	MenuPush(
 		"File {"
@@ -2133,23 +2810,20 @@ U0 Quake(U8 *mapname = QDEFAULT_MAP)
 
 		QCenterView(Fs);
 
-		//Raw mode gives relative deltas and stops clicks reaching the window
-		//manager. It must be turned back off on every exit path.
+		//raw mode gives relative deltas and keeps clicks off the window manager.
+		//must be turned back off on every exit path.
 		raw_was_on = MouseRaw(TRUE);
 		MouseRawReset;
 
 		Fs->draw_it = &QDrawIt;
 
-		//The wheel needs no baseline now: raw_data.z is a delta that the frame
-		//loop's own MouseRawReset clears, not an absolute position. Anything
-		//accumulated before the loop starts is discarded here so entering the
-		//game cannot arrive as one large scroll.
+		//raw_data.z is a delta the frame loop's MouseRawReset clears, not a
+		//position - discard what accumulated before the loop, or entering the
+		//game arrives as one large scroll.
 		MouseRawReset;
 
-		//The button LEVELS are cleared too. MouseRawReset does not touch them -
-		//they are not raw state - so a click that landed just before raw mode
-		//was entered would otherwise read as fire held down from the first
-		//frame, and the weapon would fire on its own.
+		//MouseRawReset does not touch the button levels, and a click landing
+		//just before raw mode reads as fire held on the first frame.
 		mouse_hard.bttns[0] = FALSE;
 		mouse_hard.bttns[1] = FALSE;
 		mouse_hard.bttns[2] = FALSE;
@@ -2160,16 +2834,13 @@ U0 Quake(U8 *mapname = QDEFAULT_MAP)
 		PutExcept;
 
 	//--- teardown ---
-	//QDrawIt runs on the window manager task and the blit is long, so the
-	//compositor is very often executing inside it. Detaching the callback is
-	//NOT enough on its own: an already-entered QDrawIt keeps running. So stop
-	//it drawing, detach, let the in-flight call drain, and only then free.
+	//detaching draw_it is NOT enough - an already-entered QDrawIt keeps
+	//running. stop it drawing, detach, let the in-flight call drain, then free.
 	q_ready     = FALSE;
 	Fs->draw_it = NULL;
 	Sleep(100);
 
-	//Clear each global before releasing it, so even a late QDrawIt sees NULL
-	//rather than a dangling pointer.
+	//clear each global before releasing it, so a late QDrawIt sees NULL.
 	canvas   = q_canvas;
 	q_canvas = NULL;
 	vis      = q_vis;
@@ -2183,9 +2854,8 @@ U0 Quake(U8 *mapname = QDEFAULT_MAP)
 	SettingsPop;
 	MenuPop;
 
-	//Capture the VM stats before shutdown clears them. Startup messages are
-	//wiped by DocClear when the window opens, so this summary printed after
-	//the game exits is the only way to actually read them.
+	//capture the VM stats before shutdown clears them. DocClear wiped the
+	//startup messages, so this summary is the only readable one.
 	final_active  = q_game_active;
 	final_edicts  = q_pr_num_edicts;
 	final_thinks  = q_game_thinks;
@@ -2198,15 +2868,14 @@ U0 Quake(U8 *mapname = QDEFAULT_MAP)
 	final_move_fail = q_move_fail;
 	final_errors    = q_pr_errors;
 
-	//Teardown is breadcrumbed and flushed after every step. This has crashed
-	//twice and been mis-diagnosed twice, so the log is written as we go: the
-	//LAST line in QUAKELOG.TXT names the step that was running when it died,
-	//which turns an opaque fault into a one-line answer.
+	//breadcrumbed and flushed after every step, so the last line in QUAKELOG.TXT
+	//names the step that was running if it faults.
+	QHeapCheck("teardown");
+
 	QLog("teardown: begin\n");
 	QLogFlush;
 
-	//The QuakeC world holds precached models and points at the map, so it is
-	//torn down before the map itself.
+	//the QuakeC world points at the map, so it goes first.
 	QGameShutdown;
 	QLog("teardown: QGameShutdown ok\n");
 	QLogFlush;
@@ -2216,17 +2885,23 @@ U0 Quake(U8 *mapname = QDEFAULT_MAP)
 	QLog("teardown: QSndFree ok\n");
 	QLogFlush;
 
-	//The socket outlives the app if it is not closed - it is registered with the
-	//net stack, not with this task.
+	//the socket is registered with the net stack, not this task - it outlives
+	//the app if it is not closed.
 	QNetUdpClose;
 	QMdlPreviewFree;
 	QLog("teardown: net/preview ok\n");
 	QLogFlush;
 
-	//Entities hold alias models that borrow nothing from the map, but they are
-	//released first so nothing outlives the map it was spawned from.
+	//released before the map, so nothing outlives what it was spawned from.
 	QEntFree;
 	QLog("teardown: QEntFree ok\n");
+	QLogFlush;
+
+	//up to 512 lit-surface blocks plus a slot table sized to the map's face
+	//count, both allocated during rendering - a menu-only session has neither.
+	QSurfCacheFlush;
+	QSurfCacheSetMap(NULL);
+	QLog("teardown: QSurfCacheFlush ok\n");
 	QLogFlush;
 
 	QDrawFree(canvas);
@@ -2240,7 +2915,7 @@ U0 Quake(U8 *mapname = QDEFAULT_MAP)
 	QBSPFree(map);
 	QLog("teardown: QBSPFree ok\n");
 
-	//Last, because the precache and the static entity list both point into it.
+	//last: the precache and the static entity list both point into it.
 	QMdlCacheFree;
 	QLog("teardown: QMdlCacheFree ok\n");
 	QLogFlush;
@@ -2257,8 +2932,8 @@ U0 Quake(U8 *mapname = QDEFAULT_MAP)
 			final_thinks, final_time);
 		QLog(line);
 
-		//Only four mixer streams exist, so drops are expected in a firefight.
-		//A zero played count means the audio path never worked at all.
+		//only four mixer streams, so drops are expected in a firefight. a zero
+		//played count means the audio path never worked at all.
 		StrPrint(line, "sound: %d played, %d dropped (4 streams)\n",
 			final_snd, final_drop);
 		QLog(line);
@@ -2266,25 +2941,50 @@ U0 Quake(U8 *mapname = QDEFAULT_MAP)
 
 
 
-		//Total VM errors, including the ones the console suppressed. A large
-		//number here with a healthy think count means errors are being
-		//survived; a large number with a low think count means they are not.
+		//includes the ones the console suppressed - large with a healthy think
+		//count means they are being survived.
 		StrPrint(line, "QuakeC errors: %d\n", final_errors);
 		QLog(line);
 
-		//Spawning but never thinking is a different fault from failing to
-		//spawn at all, so it is called out rather than left to be inferred.
+		//spawning but never thinking is a different fault from not spawning.
 		if (final_thinks == 0)
 			QLog("QuakeC: WARNING - nothing ever thought. Check nextthink.\n");
 	}
 	else
 		QLog("QuakeC: did not load - entities were static\n");
 
+	//written LAST, so this line missing with everything above it present means
+	//the fault is after all of our own cleanup.
+	QHeapCheck("returning");
+
+	QLog("teardown: returning\n");
 	QLogFlush;
+
 	"\nLog written to ::/Apps/Quake/QUAKELOG.TXT\n";
 
-	//LAST. Anything queued during teardown must not reach the shell either, and
-	//the cursor is parked only once nothing further will write to the document.
-	QInputDrain;
+	//anything queued during teardown must not reach the shell either, and the
+	//cursor is parked only once nothing further writes to the document.
+	QInputDrainAll;
 	QDocCursorPark;
+
+	//THIS IS WHY EXITING FAULTED IN ExeCmdLine.
+	//
+	//the shell's lexer holds cur_entry into the terminal document and rebuilds
+	//the task title from it every iteration:
+	//
+	//    doc_e = cc->lex_include_stack->cur_entry;
+	//    while (doc_e != doc && ptr2 < ptr3)
+	//        switch (doc_e->type_u8) ...
+	//
+	//DocClear in the setup above freed every entry, so that walk reads freed
+	//memory and faults nowhere near this code.
+	//
+	//it only runs while title_src is TTS_CUR_LEX, and ExeCmdLine restores the
+	//previous value when its own loop finishes.
+	Fs->title_src = TTS_LOCKED_CONST;
+
+	//settle before handing the task back: the wm, the mixer and the block cache
+	//run on their own tasks and may still hold work referring to this one.
+	Sleep(200);
+
 }
