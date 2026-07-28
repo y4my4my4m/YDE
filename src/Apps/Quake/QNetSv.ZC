@@ -1184,6 +1184,8 @@ U0 QNetParseSound(CQMsg *m)
 	I64		volume;
 	F64		attenuation;
 	I64		sound_num;
+	I64		ent_num;
+	I64		chan_num;
 	I64		i;
 	F64		pos[3];
 	U8		*name;
@@ -1198,7 +1200,12 @@ U0 QNetParseSound(CQMsg *m)
 	if (field_mask & QSND_ATTENUATION)
 		attenuation = ToF64(QMsgReadByte(m)) / 64.0;
 
-	QMsgReadShort(m);			//(ent<<3)|channel - mixer ignores
+	//(entity << 3) | channel. Both halves matter: the channel decides what
+	//this sound REPLACES on that entity, and svc_stopsound later addresses it
+	//by exactly this pair.
+	i = QMsgReadShort(m);
+	ent_num   = i >> 3;
+	chan_num  = i & 7;
 	sound_num = QMsgReadByte(m);
 
 	for (i = 0; i < 3; i++)
@@ -1211,7 +1218,8 @@ U0 QNetParseSound(CQMsg *m)
 	if (!name || !name[0])
 		return;
 
-	QSndPlayAt(name, pos, ToF64(volume) / 255.0, attenuation);
+	QSndPlayAt(name, pos, ToF64(volume) / 255.0, attenuation,
+		ent_num, chan_num);
 }
 
 U0 QNetParseTempEntity(CQMsg *m)
@@ -1313,8 +1321,11 @@ Bool QNetClientParse(CQMsg *m)
 			case QSVC_TIME:
 				//svc_time comes before the updates it describes, so stamping
 				//from here is what lets those updates carry the right time.
-				q_cl.time     = QMsgReadFloat(m);
-				q_net_msgtime = q_cl.time;
+				//The previous stamp is kept: the pair brackets the interval
+				//the entity interpolation runs across.
+				q_net_msgtime_prev = q_net_msgtime;
+				q_cl.time          = QMsgReadFloat(m);
+				q_net_msgtime      = q_cl.time;
 				break;
 
 			case QSVC_CLIENTDATA:
@@ -1349,7 +1360,9 @@ Bool QNetClientParse(CQMsg *m)
 				break;
 
 			case QSVC_STOPSOUND:
-				QMsgReadShort(m);
+				//The same (entity << 3) | channel packing svc_sound uses.
+				i = QMsgReadShort(m);
+				QSndStop(i >> 3, i & 7);
 				break;
 
 			case QSVC_SETPAUSE:
@@ -3397,6 +3410,50 @@ qsr_next:
 
 //--- drawing from the client's own tables -----------------------------------
 
+F64 QNetLerpFrac()
+{//CL_LerpPoint: how far between the last two updates the client clock sits.
+ //
+ //Returns 1 - snap to the newest state - whenever interpolating is wrong:
+ //with a local server running there is no network latency to smooth over and
+ //the entities are already simulated at frame rate, which is why the original
+ //tests sv.active here and single player never lerps at all.
+	F64 f;
+	F64 frac;
+	F64 now;
+
+	if (!QClientMode || QCvarGet("cl_nolerp") != 0.0)
+		return 1.0;
+
+	f = q_net_msgtime - q_net_msgtime_prev;
+	if (f <= 0.0)
+		return 1.0;
+
+	//A dropped packet leaves a gap far longer than a server frame. Smearing
+	//motion across it would show entities gliding in slow motion, so the
+	//window is clamped and the rest is taken as a jump.
+	if (f > 0.1)
+	{
+		q_net_msgtime_prev = q_net_msgtime - 0.1;
+		f = 0.1;
+	}
+
+	//The demo clock is the client clock during playback; a live client keeps
+	//its own, advanced in real time by the frame loop.
+	if (q_demo_playing)
+		now = q_demo_clock;
+	else
+		now = q_cl_clock;
+
+	frac = (now - q_net_msgtime_prev) / f;
+
+	if (frac < 0.0)
+		frac = 0.0;
+	else if (frac > 1.0)
+		frac = 1.0;
+
+	return frac;
+}
+
 U0 QNetDrawEntities(CQCanvas *c, CQMap *map, F64 *view_origin, F64 max_dist,
 	I64 client_ent)
 {//QGameDrawEntities' job, from the client's reconstruction rather than the
@@ -3412,7 +3469,15 @@ U0 QNetDrawEntities(CQCanvas *c, CQMap *map, F64 *view_origin, F64 max_dist,
 	I64			 top;
 	I64			 bottom;
 	F64			 eyaw;
+	F64			 eang[3];
+	F64			 delta[3];
+	F64			 frac;
+	F64			 f;
+	F64			 dang;
+	I64			 k;
 	U8			*name;
+
+	frac = QNetLerpFrac;
 
 	for (i = 1; i < q_net_num_ents && i < QNET_MAX_ENTS; i++)
 	{
@@ -3438,7 +3503,38 @@ U0 QNetDrawEntities(CQCanvas *c, CQMap *map, F64 *view_origin, F64 max_dist,
 		if (e->modelindex <= 0 || e->modelindex >= q_precache_model_count)
 			goto qnd_next;
 
+		//CL_RelinkEntities: draw between the last two updates, not at the
+		//newest one. A delta over 100 units on any axis is a teleport rather
+		//than movement, and sliding an entity across the level to meet it is
+		//exactly what the original refuses to do here.
 		QVecCopy(e->origin, eorg);
+		QVecCopy(e->angles, eang);
+
+		if (!e->forcelink && frac < 1.0)
+		{
+			f = frac;
+			for (k = 0; k < 3; k++)
+			{
+				delta[k] = e->origin[k] - e->prev_origin[k];
+				if (delta[k] > 100.0 || delta[k] < -100.0)
+					f = 1.0;
+			}
+
+			for (k = 0; k < 3; k++)
+			{
+				eorg[k] = e->prev_origin[k] + f * delta[k];
+
+				//Angles take the SHORT way round, or an entity crossing due
+				//north spins a full turn on the spot.
+				dang = e->angles[k] - e->prev_angles[k];
+				if (dang > 180.0)
+					dang -= 360.0;
+				else if (dang < -180.0)
+					dang += 360.0;
+				eang[k] = e->prev_angles[k] + f * dang;
+			}
+		}
+
 		name = q_precache_model[e->modelindex];
 
 		//Brush models, and as on the server path they are not distance-culled:
@@ -3500,7 +3596,7 @@ U0 QNetDrawEntities(CQCanvas *c, CQMap *map, F64 *view_origin, F64 max_dist,
 			frame = 0;
 
 		//Binary objects spin locally, off the client clock - see the edict path.
-		eyaw = e->angles[1];
+		eyaw = eang[1];
 		if (mdl->flags & QMDLF_ROTATE)
 			eyaw = QAngleNorm(100.0 * q_cl.time);
 
@@ -3678,6 +3774,23 @@ Bool QNetClientFrame()
 		q_net_need_begin    = FALSE;
 
 		return ok;
+	}
+
+	//A live client's clock runs in REAL time between updates - that is the
+	//whole basis of the interpolation, which asks how far along the interval
+	//between the last two snapshots this frame falls. Snapping it to the
+	//newest message time, as the demo path does, would make every fraction
+	//come out at 1 and there would be nothing to interpolate.
+	if (q_udp_ready && !q_udp_server)
+	{
+		if (q_cl_clock_last > 0.0)
+			q_cl_clock += tS - q_cl_clock_last;
+		q_cl_clock_last = tS;
+
+		//A clock that has drifted outside the bracket entirely is resynced,
+		//as CL_LerpPoint does when the fraction lands out of range.
+		if (q_cl_clock > q_net_msgtime || q_cl_clock < q_net_msgtime_prev)
+			q_cl_clock = q_net_msgtime;
 	}
 
 	while (QNetGetMessage(in))
