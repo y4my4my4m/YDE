@@ -430,7 +430,6 @@ U0 QCShiftBlend(I64 *_r, I64 *_g, I64 *_b, I64 *_a)
 #define QKICK_ROLL		0.6
 #define QKICK_PITCH		0.6
 #define QKICK_TIME		0.5
-#define QPUNCH_DECAY	0.5		//seconds for a weapon punch to wash out
 
 F64 q_dmg_roll		= 0.0;
 F64 q_dmg_pitch		= 0.0;
@@ -446,6 +445,8 @@ I64 q_net_mismatch = 0;
 //When the last connection request went out, so it can be repeated.
 F64 q_join_last_try = 0.0;
 U8  q_join_line[96];
+F64 q_heap_check_last = 0.0;
+U8  q_heap_check_line[48];
 
 F64 q_tick_log_last = 0.0;
 I64 q_tick_log_n    = 0;
@@ -483,42 +484,14 @@ U0 QViewKickUpdate(F64 dt)
 
 	//--- weapon punch ---
 	//
-	//The field is read rather than tracked, and decayed here rather than in
-	//QuakeC. Taking the larger magnitude means a fresh shot always registers
-	//even if the previous punch has not finished washing out.
+	//Read straight off the edict, with no local decay or latching: the field
+	//IS the current kick. DropPunchAngle shortens it every client think, which
+	//is where the recovery happens, so a fresh shot simply overwrites it and
+	//every weapon kicks the same way.
 	if (q_fld_punchangle >= 0)
 	{
 		for (j = 0; j < 3; j++)
-		{
-			take = QPrFieldF(q_player_edict, q_fld_punchangle + j);
-
-			if (take < 0.0)
-			{
-				if (take < q_punch[j])
-					q_punch[j] = take;
-			}
-			else if (take > 0.0)
-			{
-				if (take > q_punch[j])
-					q_punch[j] = take;
-			}
-		}
-	}
-
-	for (j = 0; j < 3; j++)
-	{
-		if (q_punch[j] > 0.0)
-		{
-			q_punch[j] -= dt / QPUNCH_DECAY * 4.0;
-			if (q_punch[j] < 0.0)
-				q_punch[j] = 0.0;
-		}
-		else if (q_punch[j] < 0.0)
-		{
-			q_punch[j] += dt / QPUNCH_DECAY * 4.0;
-			if (q_punch[j] > 0.0)
-				q_punch[j] = 0.0;
-		}
+			q_punch[j] = QPrFieldF(q_player_edict, q_fld_punchangle + j);
 	}
 
 	//--- damage kick ---
@@ -622,22 +595,11 @@ U0 QViewKickUpdate(F64 dt)
 	}
 
 	//Thin client: punchangle arrives in clientdata, not on the local edict.
+	//The host has already decayed it, so this is the value to use as-is.
 	if (q_udp_ready && !q_udp_server)
 	{
 		for (j = 0; j < 3; j++)
-		{
-			take = q_cl.punchangle[j];
-			if (take < 0.0)
-			{
-				if (take < q_punch[j])
-					q_punch[j] = take;
-			}
-			else if (take > 0.0)
-			{
-				if (take > q_punch[j])
-					q_punch[j] = take;
-			}
-		}
+			q_punch[j] = q_cl.punchangle[j];
 	}
 
 	if (q_dmg_time > 0.0)
@@ -1061,6 +1023,12 @@ U0 QRenderFrame()
 			else
 				QGameDrawEntities(q_canvas, q_map, q_view, QENT_DRAW_DIST);
 			QGameDrawStatics(q_canvas, q_map);
+			//CL_UpdateTEnts re-anchors our own bolt before drawing.
+			if (q_udp_ready && !q_udp_server)
+				QBiBeamsFollow(q_cl_viewent);
+			else
+				QBiBeamsFollow(q_player_edict);
+
 			QBiDrawBeams(q_canvas, tS);
 		}
 		else
@@ -1072,7 +1040,11 @@ U0 QRenderFrame()
 
 	//The weapon goes last, on top of everything. QuakeC owns which model and
 	//which frame, so switching weapons and firing animate for free.
-	if (q_player_active && !QPlayerDead)
+	//
+	//Hidden at intermission: execute_changelevel zeroes the player's
+	//modelindex and parks the camera at an info_intermission, so the view is a
+	//spectator shot of the level rather than a first-person one.
+	if (q_player_active && !QPlayerDead && !q_intermission)
 	{
 		vm_mdl = NULL;
 		vm_frame = QPlayerWeaponFrame;
@@ -1129,8 +1101,12 @@ U0 QRenderFrame()
 	QSbarIntermission(q_canvas, q_game_time);
 
 	//The status bar goes over everything, including the weapon.
-	QSbarTileClear(q_canvas);
-	QSbarDraw(q_canvas);
+	//The status bar goes too - the overlay replaces it entirely.
+	if (!q_intermission)
+	{
+		QSbarTileClear(q_canvas);
+		QSbarDraw(q_canvas);
+	}
 
 	//TAB deathmatch scoreboard (SCR_DrawScoreboard / Sbar_DeathmatchOverlay).
 	if (q_scoreboard_show)
@@ -1243,6 +1219,8 @@ Bool QLoadMap(U8 *mapname)
 	//argument evaluation order would not guarantee the sequence.
 	ent_count = QEntParse(q_map);
 	mdl_count = QEntLoadModels;
+
+	QHeapCheck("after QBSPLoad");
 
 	StrPrint(line, "map %s: %d entities, %d static models\n",
 		mapname, ent_count, mdl_count);
@@ -1536,6 +1514,38 @@ U0 QInputDrain()
 
 	while (guard < 64 && KeyScan(&ch, &sc))
 		guard++;
+}
+
+U0 QInputDrainAll()
+{//The same drain, but for EXIT, where it has to finish the job.
+ //
+ //QInputDrain is capped at 64 per call because it runs inside the frame loop
+ //and a runaway there would hang the game. That cap is exactly wrong on the
+ //way out: a session leaves thousands of queued key messages, one drain of 64
+ //clears a rounding error's worth, and the shell reassembles the rest as a
+ //command line - which is the fault inside ExeCmdLine.
+ //
+ //Drained until the queue actually reports empty, with a ceiling far above any
+ //real backlog so a broken queue still cannot spin forever. Repeated a few
+ //times because messages can still be posted between passes.
+	I64 ch;
+	I64 sc;
+	I64 guard;
+	I64 pass;
+
+	for (pass = 0; pass < 4; pass++)
+	{
+		guard = 0;
+		while (guard < 65536 && KeyScan(&ch, &sc))
+			guard++;
+
+		//Nothing left on this pass means nothing is still arriving.
+		if (!guard)
+			break;
+
+		//Let anything mid-post land before the next sweep.
+		Sleep(10);
+	}
 }
 
 U0 QGameLoop()
@@ -2147,6 +2157,16 @@ U0 QGameLoop()
 			q_con_impulse_want = 0;
 		}
 
+		//Only while hunting: `heapcheck 1` in the console. The sweep walks
+		//every live allocation, which is far too much to do per second during
+		//normal play.
+		if (q_heap_check_on && tS - q_heap_check_last > 1.0)
+		{
+			q_heap_check_last = tS;
+			StrPrint(q_heap_check_line, "in game f%d", q_frame_count);
+			QHeapCheck(q_heap_check_line);
+		}
+
 		//--- server frames at a FIXED rate ---
 		//
 		//The original caps its host loop and runs exactly ONE server frame per
@@ -2230,6 +2250,10 @@ U0 QGameLoop()
 
 					QNetServerReadClient(q_player_edict, q_game_time);
 				}
+
+				//SV_ClientThink opens with this, so the kick from the last
+				//shot has recovered a little before the frame is built.
+				QDropPunchAngle(q_player_edict, QSERVER_STEP);
 
 				QPlayerPreThink(q_origin, q_velocity, q_angles, q_on_ground,
 					attack, ToBool(Bt(kbd.down_bitmap, sc_jump)), impulse);
@@ -2497,10 +2521,32 @@ U0 Quake(U8 *mapname = QDEFAULT_MAP)
 
 	QLogReset;
 
+	//The FIRST thing done, before a single allocation of ours. If this already
+	//reports corruption then it did not come from here, and the check itself
+	//or the caller's state is what needs looking at.
+	QHeapCheck("entry");
+
 	QPakInit;
 	QSndInit;
 	QPartInit;
 	QClipInit;
+	//Every pointer below is handed to Free() during teardown, and ZealC does
+	//not honour a declaration initialiser on a global. One that is never
+	//assigned before then - the music buffer when no track played, the save
+	//buffer when nothing was loaded - is freed as garbage, which faults inside
+	//the allocator with no reference to this code anywhere in the trace.
+	q_music_frames     = NULL;
+	q_music_count      = 0;
+	q_music_rate       = QSND_RATE;
+	q_music_track      = 0;
+	q_save_buf         = NULL;
+	q_mdl_preview      = NULL;
+	q_mdl_preview_skin = NULL;
+	q_vis              = NULL;
+	q_map              = NULL;
+	q_entities         = NULL;
+	q_num_entities     = 0;
+
 	QMdlCacheInit;
 	QBiBspCacheInit;
 	QSurfCacheInit;
@@ -2603,6 +2649,10 @@ U0 Quake(U8 *mapname = QDEFAULT_MAP)
 	q_canvas = QDrawNew(q_res_w[q_opt_res], q_res_h[q_opt_res]);
 	q_ready  = FALSE;
 
+	//Checkpoints. The heap is intact at startup by definition, so the first of
+	//these that reports corruption brackets where it happened.
+	QHeapCheck("startup");
+
 	MenuPush(
 		"File {"
 		"  Exit(,CH_ESC);"
@@ -2688,6 +2738,8 @@ U0 Quake(U8 *mapname = QDEFAULT_MAP)
 
 	//Teardown is breadcrumbed and flushed after every step, so the last line in
 	//QUAKELOG.TXT names the step that was running if it faults.
+	QHeapCheck("teardown");
+
 	QLog("teardown: begin\n");
 	QLogFlush;
 
@@ -2713,6 +2765,15 @@ U0 Quake(U8 *mapname = QDEFAULT_MAP)
 	//released first so nothing outlives the map it was spawned from.
 	QEntFree;
 	QLog("teardown: QEntFree ok\n");
+	QLogFlush;
+
+	//The surface cache holds up to 512 lit-surface blocks and a slot table
+	//sized to the map's face count. Both are allocated during rendering, so a
+	//session that never left the menu has none of it - and neither had any of
+	//it ever been released.
+	QSurfCacheFlush;
+	QSurfCacheSetMap(NULL);
+	QLog("teardown: QSurfCacheFlush ok\n");
 	QLogFlush;
 
 	QDrawFree(canvas);
@@ -2766,11 +2827,46 @@ U0 Quake(U8 *mapname = QDEFAULT_MAP)
 	else
 		QLog("QuakeC: did not load - entities were static\n");
 
+	//Written LAST so the file distinguishes "died during teardown" from "died
+	//on the way out of the function". Everything above this line completing and
+	//this line missing means the fault is after all of our own cleanup.
+	QHeapCheck("returning");
+
+	QLog("teardown: returning\n");
 	QLogFlush;
+
 	"\nLog written to ::/Apps/Quake/QUAKELOG.TXT\n";
 
-	//LAST. Anything queued during teardown must not reach the shell either, and
-	//the cursor is parked only once nothing further will write to the document.
-	QInputDrain;
+	//Anything queued during teardown must not reach the shell either, and the
+	//cursor is parked only once nothing further will write to the document.
+	QInputDrainAll;
 	QDocCursorPark;
+
+	//THIS IS WHY EXITING FAULTED IN ExeCmdLine.
+	//
+	//The shell is part way through ExeCmdLine executing the line that started
+	//this program, and its lexer holds cur_entry pointing at an entry in the
+	//terminal document. Each iteration it rebuilds the task title by walking
+	//from that entry:
+	//
+	//    doc_e = cc->lex_include_stack->cur_entry;
+	//    while (doc_e != doc && ptr2 < ptr3)
+	//        switch (doc_e->type_u8) ...
+	//
+	//DocClear in the setup above removes every entry in that document, so the
+	//pointer the shell is holding refers to memory that has been handed back.
+	//The walk then reads a freed entry, and the fault address is whatever
+	//happened to be reused - deterministic, and nowhere near this code.
+	//
+	//The walk only runs while title_src is TTS_CUR_LEX. Locking the title
+	//skips it entirely, and ExeCmdLine restores the previous value when its
+	//own loop finishes, so the scope is exactly the remaining iterations.
+	Fs->title_src = TTS_LOCKED_CONST;
+
+	//Settle before handing the task back. The window manager, the mixer and
+	//the block cache all run on their own tasks and may still hold work that
+	//refers to this one - the compositor in particular is detached above but
+	//an already-entered callback finishes on its own schedule.
+	Sleep(200);
+
 }
