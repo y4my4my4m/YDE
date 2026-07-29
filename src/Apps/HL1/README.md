@@ -15,6 +15,12 @@ Valve's SDK (`valvesoftware/halflife`) is open, but it is the *game* — `dlls/`
 
 ## Status
 
+**Half-Life levels load, render and are walkable.** Confirmed in the VM on
+`c1a0`: BSP30 geometry, WAD3 textures with per-texture palettes, RGB lightmaps,
+the truecolor span rasteriser, and world collision. `HLTest;` renders a frame
+off-screen and reports the numbers if you want to check a build without
+starting the game.
+
 Working, inherited from the Quake port and re-pointed at HL formats:
 
 - **BSP v30** loader — `HLBSP.ZC`. Geometry lumps are byte-identical to BSP29;
@@ -56,9 +62,10 @@ entity origin.
 
 Not done yet, in the order they are being done:
 
-1. The rest of the brush entities: `func_tracktrain` orientation, rotating
-   brushes, plats, momentary doors, breakables, and the damage system they
-   need. Plus blocked/crush handling on pushers.
+1. The rest of the brush entities. `func_plat` and `func_tracktrain` are in;
+   rotating brushes need `HLDrawBrushModel` to take angles first, and nothing
+   rotates until it does. Then momentary doors, breakables, and the damage
+   system they need, plus blocked/crush handling on pushers.
 2. SPR v2 sprites (per-sprite palette, render modes).
 3. Weapons, gamerules, HUD.
 4. Monster AI: schedules, tasks, `scripted_sequence`, sentences.
