@@ -41,6 +41,14 @@ Working, inherited from the Quake port and re-pointed at HL formats:
   auto-hop, and a full duck state machine that swaps to hull 3. Duck is bound
   to `c` by default.
 
+- **Native entity system** — `HLEntity.ZC`. No QuakeC: HL's game logic is
+  native, so the engine calls classes directly. Classname spawn dispatch,
+  method-ID virtual dispatch, `SUB_UseTargets` with delay and killtarget,
+  `SUB_CalcMove`, master/multisource gating, pusher movement that carries the
+  player. Working classes: `func_door`, `func_button`, `func_train` +
+  `path_corner`, the `trigger_*` family, `multi_manager`, `multisource`,
+  switchable lights, `func_wall`. `+use` is bound to `e`.
+
 Studio gaps, in the order they will bite: sequence groups (`<name>NN.mdl`),
 chrome skins, attachments, four-way blends, and per-vertex lighting from the
 model normals — everything is currently flat-lit from `HLLightPoint` at the
@@ -48,12 +56,16 @@ entity origin.
 
 Not done yet, in the order they are being done:
 
-1. Native entity system. `HLProgs.ZC`/`HLBuiltin.ZC` are the QuakeC VM and are
-   dead weight here — HL's game logic is native code, which is the SDK.
+1. The rest of the brush entities: `func_tracktrain` orientation, rotating
+   brushes, plats, momentary doors, breakables, and the damage system they
+   need. Plus blocked/crush handling on pushers.
 2. SPR v2 sprites (per-sprite palette, render modes).
 3. Weapons, gamerules, HUD.
 4. Monster AI: schedules, tasks, `scripted_sequence`, sentences.
 5. Protocol 48 netcode. **Last** — single player runs in-process without it.
+
+`HLProgs.ZC`/`HLBuiltin.ZC` are the QuakeC VM carried over by the fork. They
+are dead weight now and will be deleted once nothing calls them.
 
 Movement pieces still missing all need entities first: ladders, HL water
 movement, fall damage, per-surface friction, conveyors.
@@ -69,33 +81,36 @@ and much of `models/` and `sound/`. Every lookup is loose-first, pak-second,
 gamedir before `valve`, and case is folded both ways on the way, so a Steam
 install (lowercase) and an old disc (uppercase) both resolve.
 
-`pak0.pak` is **not required**. It is ~350 MB and nothing in the renderer path
-needs it. The current minimum is:
+Whether `valve/pak0.pak` exists at all depends on the release: the 1998 discs
+shipped one, later builds unpacked it. **Either is fine and neither is
+required** — nothing in the engine path needs a pak's contents, and the boot
+check accepts "no pak, but a map exists".
+
+Simplest thing, if the disk image has room: copy the whole `valve/` directory.
+The stock `ZealOS.qcow2` is 1 GiB and will not fit one, so either grow it or
+copy a subset. The minimum that gets a map on screen:
 
 | File | Size | Why |
 |---|---|---|
 | `valve/halflife.wad` | ~70 MB | world textures |
-| `valve/maps/c0a0.bsp` | ~2 MB | any map; `c0a0` is the default |
-| `valve/liquids.wad` | ~3 MB | only if the map's `wad` key names it |
-| `valve/models/*.mdl` | ~1 MB ea | optional; whatever the map's monsters use |
+| `valve/maps/*.bsp` | ~3 MB ea | whatever you want to look at |
+| `valve/models/*.mdl` | ~1 MB ea | plus the matching `*T.mdl` |
+| `valve/gfx/palette.lmp` | 768 B | 2D art colours; optional |
 
-For models, `scientist.mdl` plus `scientistT.mdl` is the useful pair to start
-with — it exercises the external-texture path, which most player and NPC
-models use. `HLTest;` loads exactly that.
+To find which wads a map wants, from the host:
 
-Watch the disk. The stock `ZealOS.qcow2` is 1 GiB virtual with ~460 MiB free —
-a full `valve/` will not fit without growing it.
+    strings valve/maps/c1a1.bsp | grep -i '\.wad'
 
-Two Quake-era files `valve/` does not have, both handled without it:
+Two Quake-era files `valve/` does not have, both handled without them:
 
 - `gfx/colormap.lmp` — generated from the palette at startup.
-- `gfx/palette.lmp` — lives inside `pak0.pak`. Without it a generic colour
-  cube stands in. This affects 2D art only; the world is drawn through the
-  per-texture palettes in the wads.
+- `gfx/palette.lmp` — present loose in some installs, inside the pak in
+  others. Without it a generic colour cube stands in. This affects 2D art
+  only; the world is drawn through the per-texture palettes in the wads.
 
 `gfx.wad` is WAD3 here and stores `CONCHARS` as a font lump rather than
-Quake's raw 128x128 atlas, so console text falls back to the kernel font
-(`sys_font_std`). Text always works, gfx.wad or not.
+Quake's raw 128x128 atlas, so console text falls back to the kernel font,
+read through `text.font`. Text always works, gfx.wad or not.
 
 Mission packs go in their own directory next to `valve` — `gearbox` for
 Opposing Force, `bshift` for Blue Shift — and are selected with `game <dir>`

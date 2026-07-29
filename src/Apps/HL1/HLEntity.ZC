@@ -1,0 +1,1667 @@
+// HLEntity.ZC - native entity behaviour, replacing the QuakeC VM
+//
+// Half-Life has no bytecode. Its game logic is a native DLL, which is what
+// the SDK IS - so there is nothing to interpret and the engine calls the
+// classes directly. HLProgs.ZC and HLBuiltin.ZC are dead weight here and are
+// only still compiled because the fork carried them across.
+//
+// Two things the SDK does with C++ that this does with integers:
+//
+//   LINK_ENTITY_TO_CLASS   a classname -> spawn dispatch, HLEntSpawnOne
+//   virtual Think/Use/...  a method ID dispatched through a switch
+//
+// method IDs rather than function pointers because ZealC is single-pass: the
+// dispatcher can then sit after every implementation it calls, and an entity
+// can schedule a method that is defined later in the file.
+//
+// SUB_UseTargets, SUB_CalcMove and CBaseToggle are the load-bearing pieces -
+// nearly every brush entity in HL1 is a toggle that moves between two points
+// and fires its target on arrival.
+
+//--- method ids -------------------------------------------------------------
+//
+// grouped by owning class. 0 is "no method" and every scheduling field rests
+// there, so a zeroed entity does nothing rather than something arbitrary
+
+#define HLM_NONE				0
+
+#define HLM_REMOVE			1	//free the slot on the next think
+#define HLM_FIRE_TARGETS		2	//delayed SUB_UseTargets
+#define HLM_MOVE_DONE		3	//arrival, dispatches move_done
+
+#define HLM_DOOR_GO_UP		10
+#define HLM_DOOR_GO_DOWN		11
+#define HLM_DOOR_HIT_TOP		12
+#define HLM_DOOR_HIT_BOTTOM	13
+#define HLM_DOOR_USE			14
+#define HLM_DOOR_TOUCH		15
+#define HLM_DOOR_BLOCKED		16
+
+#define HLM_BUTTON_USE		20
+#define HLM_BUTTON_TOUCH		21
+#define HLM_BUTTON_GO_UP		22
+#define HLM_BUTTON_GO_DOWN	23
+#define HLM_BUTTON_HIT_TOP	24
+#define HLM_BUTTON_HIT_BOTTOM 25
+#define HLM_BUTTON_RETURN	26
+
+#define HLM_TRAIN_NEXT		30
+#define HLM_TRAIN_USE		31
+#define HLM_TRAIN_WAIT		32
+#define HLM_TRAIN_START		33
+
+#define HLM_TRIGGER_TOUCH	40
+#define HLM_TRIGGER_USE		41
+#define HLM_TRIGGER_ENABLE	42
+#define HLM_MULTI_MANAGER_USE 43
+#define HLM_MULTI_MANAGER_TICK 44
+#define HLM_RELAY_USE		45
+#define HLM_AUTO_THINK		46
+
+#define HLM_LIGHT_USE		50
+#define HLM_WALL_USE			51
+
+//how long a "toggle" trigger stays untouchable after firing
+#define HLENT_TRIGGER_DEBOUNCE	0.2
+
+//SUB_CalcMove refuses to divide by a zero traveltime
+#define HLENT_MIN_MOVE_TIME	0.0001
+
+//multi_manager fires up to this many targets, each at its own offset
+#define HLENT_MM_MAX			16
+
+class CHLMultiManager
+{//parsed out of the entity's own key/values: every key that is not a known
+ //field is a targetname, and its value is the delay
+	I64	ent;					//owning entity index
+	U8	name[HLENT_MM_MAX * 64];
+	F64	delay[HLENT_MM_MAX];
+	I64	count;
+	I64	fired;					//how many have gone off this cycle
+	F64	started;
+};
+
+CHLMultiManager	hl_mm[32];
+I64				hl_mm_count = 0;
+
+//game clock the entity system runs on. separate from hl_light_time, which is
+//a render clock and keeps ticking through a pause
+F64	hl_ent_time     = 0.0;
+I64	hl_ent_thinks   = 0;
+I64	hl_ent_spawned  = 0;
+
+//the player, as an entity the movers can push and triggers can fire on.
+//index -1 until a map is up
+I64	hl_ent_player   = -1;
+
+//--- helpers ----------------------------------------------------------------
+
+Bool HLEntValid(I64 i)
+{
+	if (i < 0 || i >= hl_num_entities || !hl_entities)
+		return FALSE;
+
+	return hl_entities[i].in_use;
+}
+
+CHLEntity *HLEntGet(I64 i)
+{
+	if (!HLEntValid(i))
+		return NULL;
+
+	return &hl_entities[i];
+}
+
+I64 HLEntFindByTargetname(U8 *name, I64 start)
+{//next entity whose targetname matches, -1 when the chain ends
+	I64 i;
+
+	if (!name || !name[0])
+		return -1;
+
+	for (i = start; i < hl_num_entities; i++)
+	{
+		if (!hl_entities[i].in_use)
+			goto qefb_next;
+
+		if (!StrICompare(hl_entities[i].targetname, name))
+			return i;
+
+qefb_next:
+	}
+
+	return -1;
+}
+
+U0 HLEntSetAbsBox(CHLEntity *e)
+{//SV_LinkEdict's bounds, rebuilt after anything moves
+	I64 i;
+
+	for (i = 0; i < 3; i++)
+	{
+		e->absmin[i] = e->origin[i] + e->mins[i] - 1.0;
+		e->absmax[i] = e->origin[i] + e->maxs[i] + 1.0;
+		e->size[i]   = e->maxs[i] - e->mins[i];
+	}
+}
+
+U0 HLEntSetBrushSize(CHLMap *map, CHLEntity *e)
+{//a brush entity's box comes from its BSP submodel, not from key/values
+	CHLModel *bm;
+
+	if (e->brush_model < 1 || !map || e->brush_model >= map->num_models)
+		return;
+
+	bm = &map->models[e->brush_model];
+
+	HLVecCopy(bm->mins, e->mins);
+	HLVecCopy(bm->maxs, e->maxs);
+
+	HLEntSetAbsBox(e);
+}
+
+U0 HLEntSetMoveDir(CHLEntity *e)
+{//SetMovedir - the "angle" key doubles as a movement axis for brush movers.
+ //-1 is straight up and -2 straight down, which is why a door pointing at
+ //yaw 359 behaves and one at yaw -1 flies upward
+	F64 yaw = e->angles[1];
+
+	if (yaw == -1.0)
+	{
+		HLVecSet(e->move_dir, 0.0, 0.0, 1.0);
+		e->angles[1] = 0.0;
+		return;
+	}
+
+	if (yaw == -2.0)
+	{
+		HLVecSet(e->move_dir, 0.0, 0.0, -1.0);
+		e->angles[1] = 0.0;
+		return;
+	}
+
+	HLVecSet(e->move_dir, Cos(yaw * HLDEG2RAD), Sin(yaw * HLDEG2RAD), 0.0);
+	e->angles[1] = 0.0;
+}
+
+F64 HLEntAbsF(F64 v)
+{
+	if (v < 0.0)
+		return -v;
+
+	return v;
+}
+
+//--- scheduling -------------------------------------------------------------
+
+U0 HLEntSetThink(CHLEntity *e, I64 method, F64 at)
+{//absolute time, matching pev->nextthink. 0 disarms
+	e->think_fn   = method;
+	e->next_think = at;
+}
+
+U0 HLEntCalcMove(CHLEntity *e, F64 *dest, F64 speed, I64 done_method)
+{//SUB_CalcMove - set a constant velocity that arrives exactly on a think
+ //
+ //the arrival is SCHEDULED, not detected: floating point would never land on
+ //the destination exactly, and a "close enough" test drifts over a level's
+ //worth of door cycles
+	F64 delta[3];
+	F64 length;
+	F64 travel;
+
+	HLVecCopy(dest, e->finaldest);
+	e->move_done = done_method;
+
+	if (speed <= 0.0)
+		speed = 100.0;
+
+	HLVecSub(dest, e->origin, delta);
+	length = HLVecLength(delta);
+
+	if (length < 0.0001)
+	{
+		//already there - still take the think, so the caller's arrival
+		//handler runs exactly once either way
+		HLVecSet(e->velocity, 0.0, 0.0, 0.0);
+		HLEntSetThink(e, HLM_MOVE_DONE, hl_ent_time + HLENT_MIN_MOVE_TIME);
+		return;
+	}
+
+	travel = length / speed;
+	if (travel < HLENT_MIN_MOVE_TIME)
+		travel = HLENT_MIN_MOVE_TIME;
+
+	e->velocity[0] = delta[0] / travel;
+	e->velocity[1] = delta[1] / travel;
+	e->velocity[2] = delta[2] / travel;
+
+	HLEntSetThink(e, HLM_MOVE_DONE, hl_ent_time + travel);
+}
+
+//--- master / multisource ---------------------------------------------------
+
+Bool HLEntMasterAllows(CHLEntity *e)
+{//UTIL_IsMasterTriggered. a locked door names a multisource; until every
+ //input to that source is on, the door refuses to be used
+	I64 m;
+
+	if (!e->master[0])
+		return TRUE;
+
+	m = HLEntFindByTargetname(e->master, 0);
+	if (m < 0)
+		return TRUE;
+
+	//multisource state is kept in toggle_state: AT_TOP means satisfied
+	return ToBool(hl_entities[m].toggle_state == HLTS_AT_TOP);
+}
+
+//--- the call queue ---------------------------------------------------------
+//
+// HLEntCallMethod is defined at the bottom, after every implementation it
+// dispatches - that is the point of integer methods under a single-pass
+// compiler. Code ABOVE it therefore cannot call it, and a forward declaration
+// is not an option: see the note at the top of HLPhys.ZC, routing a call
+// through one miscompiles here.
+//
+// So anything that needs to invoke a method from above queues it, and the
+// frame driver drains the queue. This also bounds what an accidental target
+// loop can do - two multi_managers naming each other would otherwise recurse
+// until the stack ran out.
+
+#define HLENT_CALLQ_MAX		256
+#define HLENT_CALLQ_BUDGET	4096	//dispatches allowed per drain
+
+class CHLEntCall
+{
+	I64	ent;
+	I64	method;
+	I64	activator;
+	I64	use_type;
+	F64	value;
+};
+
+CHLEntCall	hl_ent_callq[HLENT_CALLQ_MAX];
+I64			hl_ent_callq_head = 0;
+I64			hl_ent_callq_tail = 0;
+I64			hl_ent_callq_lost = 0;
+
+U0 HLEntQueueCall(I64 ent, I64 method, I64 activator, I64 use_type, F64 value)
+{
+	I64 next = (hl_ent_callq_tail + 1) % HLENT_CALLQ_MAX;
+
+	if (method == HLM_NONE)
+		return;
+
+	if (next == hl_ent_callq_head)
+	{
+		//full - drop it rather than overwrite an unread entry, and say so
+		//once so a runaway chain is visible instead of silently truncated
+		if (hl_ent_callq_lost < 4)
+			"HLEnt: call queue full, dropping method %d\n", method;
+
+		hl_ent_callq_lost++;
+		return;
+	}
+
+	hl_ent_callq[hl_ent_callq_tail].ent       = ent;
+	hl_ent_callq[hl_ent_callq_tail].method    = method;
+	hl_ent_callq[hl_ent_callq_tail].activator = activator;
+	hl_ent_callq[hl_ent_callq_tail].use_type  = use_type;
+	hl_ent_callq[hl_ent_callq_tail].value     = value;
+
+	hl_ent_callq_tail = next;
+}
+
+U0 HLEntFireTargets(I64 self, I64 activator, I64 use_type, F64 value)
+{//SUB_UseTargets - fire everything sharing this entity's target name, and
+ //remove everything sharing its killtarget
+	CHLEntity	*e = HLEntGet(self);
+	I64			 t;
+
+	if (!e)
+		return;
+
+	if (e->killtarget[0])
+	{
+		t = HLEntFindByTargetname(e->killtarget, 0);
+
+		while (t >= 0)
+		{
+			hl_entities[t].in_use     = FALSE;
+			hl_entities[t].solid      = HLSOLID_NOT;
+			hl_entities[t].think_fn   = HLM_NONE;
+			hl_entities[t].next_think = 0.0;
+
+			t = HLEntFindByTargetname(e->killtarget, t + 1);
+		}
+	}
+
+	if (!e->target[0])
+		return;
+
+	t = HLEntFindByTargetname(e->target, 0);
+
+	while (t >= 0)
+	{
+		//an entity must not fire itself - multi_manager chains do it by
+		//accident and the recursion never ends
+		if (t != self && hl_entities[t].use_fn)
+		{
+			hl_entities[t].activator = activator;
+			HLEntQueueCall(t, hl_entities[t].use_fn, activator, use_type,
+				value);
+		}
+
+		t = HLEntFindByTargetname(e->target, t + 1);
+	}
+}
+
+U0 HLEntUseTargets(I64 self, I64 activator, I64 use_type = HLUSE_TOGGLE,
+	F64 value = 0.0)
+{//the delay key defers the whole thing. HL puts a DelayedUse entity in the
+ //world for this; here the delay rides on the firing entity's own think,
+ //which is equivalent as long as nothing re-fires inside the window
+	CHLEntity *e = HLEntGet(self);
+
+	if (!e)
+		return;
+
+	if (e->delay > 0.0)
+	{
+		e->activator = activator;
+		HLEntSetThink(e, HLM_FIRE_TARGETS, hl_ent_time + e->delay);
+		return;
+	}
+
+	HLEntFireTargets(self, activator, use_type, value);
+}
+
+//--- doors ------------------------------------------------------------------
+//
+// func_door. SF_DOOR_START_OPEN swaps the two positions at spawn rather than
+// running the mover, so everything below still thinks it opens "up"
+
+#define HLSF_DOOR_START_OPEN		1
+#define HLSF_DOOR_PASSABLE		8
+#define HLSF_DOOR_TOGGLE			32
+#define HLSF_DOOR_USE_ONLY		256
+#define HLSF_DOOR_TOUCH_OPENS	0		//the default when USE_ONLY is clear
+
+U0 HLDoorGoUp(I64 self, I64 activator)
+{
+	CHLEntity *e = HLEntGet(self);
+
+	if (!e)
+		return;
+
+	//already moving or open - a second use during the interval is dropped,
+	//which is what stops a door stuttering under a held button
+	if (e->toggle_state == HLTS_GOING_UP || e->toggle_state == HLTS_AT_TOP)
+		return;
+
+	e->toggle_state = HLTS_GOING_UP;
+	e->activator    = activator;
+
+	HLEntCalcMove(e, e->position2, e->speed, HLM_DOOR_HIT_TOP);
+}
+
+U0 HLDoorGoDown(I64 self)
+{
+	CHLEntity *e = HLEntGet(self);
+
+	if (!e)
+		return;
+
+	e->toggle_state = HLTS_GOING_DOWN;
+
+	HLEntCalcMove(e, e->position1, e->speed, HLM_DOOR_HIT_BOTTOM);
+}
+
+U0 HLDoorHitTop(I64 self)
+{
+	CHLEntity *e = HLEntGet(self);
+
+	if (!e)
+		return;
+
+	HLVecSet(e->velocity, 0.0, 0.0, 0.0);
+	e->toggle_state = HLTS_AT_TOP;
+
+	//SF_DOOR_TOGGLE and a negative wait both mean "stay open"
+	if (e->spawnflags & HLSF_DOOR_TOGGLE)
+		goto qdht_fire;
+
+	if (e->wait < 0.0)
+		goto qdht_fire;
+
+	HLEntSetThink(e, HLM_DOOR_GO_DOWN, hl_ent_time + e->wait);
+
+qdht_fire:
+	//the door's own target fires on OPEN, not on close
+	HLEntUseTargets(self, e->activator, HLUSE_TOGGLE, 0.0);
+}
+
+U0 HLDoorHitBottom(I64 self)
+{
+	CHLEntity *e = HLEntGet(self);
+
+	if (!e)
+		return;
+
+	HLVecSet(e->velocity, 0.0, 0.0, 0.0);
+	e->toggle_state = HLTS_AT_BOTTOM;
+}
+
+U0 HLDoorUse(I64 self, I64 activator)
+{
+	CHLEntity *e = HLEntGet(self);
+
+	if (!e)
+		return;
+
+	if (!HLEntMasterAllows(e))
+		return;
+
+	if (e->toggle_state == HLTS_AT_TOP || e->toggle_state == HLTS_GOING_UP)
+	{
+		//only a TOGGLE door closes on a second use; a normal one is already
+		//on its wait timer and ignores this
+		if (e->spawnflags & HLSF_DOOR_TOGGLE)
+			HLDoorGoDown(self);
+
+		return;
+	}
+
+	HLDoorGoUp(self, activator);
+}
+
+//--- buttons ----------------------------------------------------------------
+
+#define HLSF_BUTTON_DONT_MOVE	1
+#define HLSF_BUTTON_TOGGLE		32
+#define HLSF_BUTTON_TOUCH_ONLY	256
+
+U0 HLButtonHitTop(I64 self)
+{
+	CHLEntity *e = HLEntGet(self);
+
+	if (!e)
+		return;
+
+	HLVecSet(e->velocity, 0.0, 0.0, 0.0);
+	e->toggle_state = HLTS_AT_TOP;
+
+	HLEntUseTargets(self, e->activator, HLUSE_TOGGLE, 0.0);
+
+	//a button with a negative wait latches down permanently, which is how
+	//most one-shot switches in HL1 are built
+	if (e->wait < 0.0)
+		return;
+
+	if (e->spawnflags & HLSF_BUTTON_TOGGLE)
+		return;
+
+	HLEntSetThink(e, HLM_BUTTON_RETURN, hl_ent_time + e->wait);
+}
+
+U0 HLButtonHitBottom(I64 self)
+{
+	CHLEntity *e = HLEntGet(self);
+
+	if (!e)
+		return;
+
+	HLVecSet(e->velocity, 0.0, 0.0, 0.0);
+	e->toggle_state = HLTS_AT_BOTTOM;
+}
+
+U0 HLButtonGoUp(I64 self, I64 activator)
+{
+	CHLEntity *e = HLEntGet(self);
+
+	if (!e)
+		return;
+
+	e->activator    = activator;
+	e->toggle_state = HLTS_GOING_UP;
+
+	//SF_BUTTON_DONT_MOVE is how a "button" becomes a pure trigger surface
+	if (e->spawnflags & HLSF_BUTTON_DONT_MOVE)
+	{
+		HLButtonHitTop(self);
+		return;
+	}
+
+	HLEntCalcMove(e, e->position2, e->speed, HLM_BUTTON_HIT_TOP);
+}
+
+U0 HLButtonGoDown(I64 self)
+{
+	CHLEntity *e = HLEntGet(self);
+
+	if (!e)
+		return;
+
+	e->toggle_state = HLTS_GOING_DOWN;
+
+	if (e->spawnflags & HLSF_BUTTON_DONT_MOVE)
+	{
+		HLButtonHitBottom(self);
+		return;
+	}
+
+	HLEntCalcMove(e, e->position1, e->speed, HLM_BUTTON_HIT_BOTTOM);
+}
+
+U0 HLButtonUse(I64 self, I64 activator)
+{
+	CHLEntity *e = HLEntGet(self);
+
+	if (!e)
+		return;
+
+	if (!HLEntMasterAllows(e))
+		return;
+
+	if (e->toggle_state == HLTS_GOING_UP || e->toggle_state == HLTS_GOING_DOWN)
+		return;
+
+	if (e->toggle_state == HLTS_AT_TOP)
+	{
+		if (e->spawnflags & HLSF_BUTTON_TOGGLE)
+			HLButtonGoDown(self);
+
+		return;
+	}
+
+	HLButtonGoUp(self, activator);
+}
+
+//--- trains -----------------------------------------------------------------
+//
+// func_train walks a chain of path_corner entities. c0a0's tram is a
+// func_tracktrain on path_track, which is the same idea with orientation -
+// not implemented yet, but the corner walk below is the half that carries
+
+#define HLSF_TRAIN_WAIT_RETRIGGER	1
+#define HLSF_TRAIN_START_ON			4
+
+U0 HLTrainNext(I64 self)
+{//the train has arrived at its current corner: fire that corner's target,
+ //then head for the next one
+	CHLEntity	*e = HLEntGet(self);
+	CHLEntity	*corner;
+	F64			 dest[3];
+	I64			 next;
+
+	if (!e)
+		return;
+
+	HLVecSet(e->velocity, 0.0, 0.0, 0.0);
+
+	next = HLEntFindByTargetname(e->target, 0);
+
+	if (next < 0)
+	{
+		//broken path - stop rather than spin looking for it every frame
+		HLEntSetThink(e, HLM_NONE, 0.0);
+		return;
+	}
+
+	corner = &hl_entities[next];
+
+	//a corner may fire something as the train passes
+	if (corner->target[0])
+		HLEntUseTargets(next, self, HLUSE_TOGGLE, 0.0);
+
+	//the corner's own target names the corner AFTER it
+	HLStrCopy(e->target, corner->target, 64);
+
+	//a corner's speed overrides the train's for the leg leaving it
+	if (corner->speed > 0.0)
+		e->speed = corner->speed;
+
+	//the train's ORIGIN is its brush centre, so it parks with its centre on
+	//the corner, not its corner
+	dest[0] = corner->origin[0] - (e->mins[0] + e->maxs[0]) * 0.5;
+	dest[1] = corner->origin[1] - (e->mins[1] + e->maxs[1]) * 0.5;
+	dest[2] = corner->origin[2] - (e->mins[2] + e->maxs[2]) * 0.5;
+
+	if (corner->wait > 0.0)
+	{
+		//pause at this corner before leaving
+		HLEntCalcMove(e, dest, e->speed, HLM_TRAIN_WAIT);
+		return;
+	}
+
+	HLEntCalcMove(e, dest, e->speed, HLM_TRAIN_NEXT);
+}
+
+U0 HLTrainWait(I64 self)
+{//parked at a corner with a wait - resume after it
+	CHLEntity *e = HLEntGet(self);
+
+	if (!e)
+		return;
+
+	HLVecSet(e->velocity, 0.0, 0.0, 0.0);
+
+	HLEntSetThink(e, HLM_TRAIN_NEXT, hl_ent_time + 1.0);
+}
+
+U0 HLTrainUse(I64 self)
+{//a stopped train starts, a moving one stops
+	CHLEntity *e = HLEntGet(self);
+
+	if (!e)
+		return;
+
+	if (e->think_fn != HLM_NONE)
+	{
+		HLEntSetThink(e, HLM_NONE, 0.0);
+		HLVecSet(e->velocity, 0.0, 0.0, 0.0);
+		return;
+	}
+
+	HLTrainNext(self);
+}
+
+//--- triggers ---------------------------------------------------------------
+
+#define HLSF_TRIGGER_MONSTERS	1
+#define HLSF_TRIGGER_NO_CLIENTS	2
+
+Bool HLTriggerCanFire(CHLEntity *e)
+{
+	if (!HLEntMasterAllows(e))
+		return FALSE;
+
+	//pain_finished doubles as the debounce clock here - a brush trigger is
+	//touched every frame the player stands in it
+	if (e->pain_finished > hl_ent_time)
+		return FALSE;
+
+	return TRUE;
+}
+
+U0 HLTriggerTouch(I64 self, I64 other)
+{
+	CHLEntity *e = HLEntGet(self);
+
+	if (!e)
+		return;
+
+	if (!HLTriggerCanFire(e))
+		return;
+
+	e->pain_finished = hl_ent_time + HLENT_TRIGGER_DEBOUNCE;
+
+	HLEntUseTargets(self, other, HLUSE_TOGGLE, 0.0);
+
+	//trigger_once removes itself. wait < 0 means the same for a multiple
+	if (e->wait < 0.0)
+	{
+		e->in_use = FALSE;
+		e->solid  = HLSOLID_NOT;
+		return;
+	}
+
+	if (e->wait > 0.0)
+		e->pain_finished = hl_ent_time + e->wait;
+}
+
+U0 HLTriggerUse(I64 self, I64 activator)
+{//trigger_relay and anything else fired rather than touched
+	CHLEntity *e = HLEntGet(self);
+
+	if (!e)
+		return;
+
+	if (!HLEntMasterAllows(e))
+		return;
+
+	HLEntUseTargets(self, activator, HLUSE_TOGGLE, 0.0);
+}
+
+//--- multi_manager ----------------------------------------------------------
+//
+// fires N named targets, each at its own offset, off ONE use. the offsets are
+// stored as key/values whose keys are the target names, which is why the
+// generic key parser cannot pick them up and they are re-scanned here
+
+I64 HLMMFind(I64 ent)
+{
+	I64 i;
+
+	for (i = 0; i < hl_mm_count; i++)
+	{
+		if (hl_mm[i].ent == ent)
+			return i;
+	}
+
+	return -1;
+}
+
+U0 HLMMUse(I64 self, I64 activator)
+{
+	CHLEntity	*e = HLEntGet(self);
+	I64			 m;
+
+	if (!e)
+		return;
+
+	m = HLMMFind(self);
+	if (m < 0)
+		return;
+
+	//re-triggering mid-cycle restarts it, matching CMultiManager::Use with
+	//no SF_MULTIMAN_THREAD
+	hl_mm[m].fired   = 0;
+	hl_mm[m].started = hl_ent_time;
+	e->activator     = activator;
+
+	HLEntSetThink(e, HLM_MULTI_MANAGER_TICK, hl_ent_time);
+}
+
+U0 HLMMTick(I64 self)
+{//walk the schedule, firing everything whose offset has come due
+	CHLEntity	*e = HLEntGet(self);
+	I64			 m;
+	I64			 t;
+	F64			 elapsed;
+	F64			 soonest = -1.0;
+	I64			 i;
+
+	if (!e)
+		return;
+
+	m = HLMMFind(self);
+	if (m < 0)
+		return;
+
+	elapsed = hl_ent_time - hl_mm[m].started;
+
+	for (i = 0; i < hl_mm[m].count; i++)
+	{
+		if (hl_mm[m].fired & (1 << i))
+			goto qmmt_next;
+
+		if (hl_mm[m].delay[i] > elapsed)
+		{
+			//track the next one due so the think can be scheduled exactly
+			if (soonest < 0.0 || hl_mm[m].delay[i] < soonest)
+				soonest = hl_mm[m].delay[i];
+
+			goto qmmt_next;
+		}
+
+		hl_mm[m].fired |= 1 << i;
+
+		t = HLEntFindByTargetname(&hl_mm[m].name[i * 64], 0);
+
+		while (t >= 0)
+		{
+			if (t != self && hl_entities[t].use_fn)
+			{
+				hl_entities[t].activator = e->activator;
+				HLEntQueueCall(t, hl_entities[t].use_fn, e->activator,
+					HLUSE_TOGGLE, 0.0);
+			}
+
+			t = HLEntFindByTargetname(&hl_mm[m].name[i * 64], t + 1);
+		}
+
+qmmt_next:
+	}
+
+	if (soonest < 0.0)
+	{
+		HLEntSetThink(e, HLM_NONE, 0.0);
+		return;
+	}
+
+	HLEntSetThink(e, HLM_MULTI_MANAGER_TICK,
+		hl_mm[m].started + soonest);
+}
+
+//--- lights -----------------------------------------------------------------
+
+U0 HLLightUse(I64 self, I64 use_type)
+{//a switchable light toggles its style between "on" and "off" patterns
+	CHLEntity *e = HLEntGet(self);
+	Bool	   on;
+
+	if (!e || e->style < 32)
+		return;
+
+	on = ToBool(e->toggle_state == HLTS_AT_TOP);
+
+	if (use_type == HLUSE_ON)
+		on = TRUE;
+	else if (use_type == HLUSE_OFF)
+		on = FALSE;
+	else
+		on = !on;
+
+	if (on)
+	{
+		HLLightStyleSet(e->style, "m");
+		e->toggle_state = HLTS_AT_TOP;
+	}
+	else
+	{
+		HLLightStyleSet(e->style, "a");
+		e->toggle_state = HLTS_AT_BOTTOM;
+	}
+}
+
+//--- the dispatcher ---------------------------------------------------------
+//
+// what a virtual call would be. defined last so every implementation above is
+// already visible, which is the whole reason methods are integers
+
+U0 HLEntCallMethod(I64 self, I64 method, I64 activator = -1,
+	I64 use_type = HLUSE_TOGGLE, F64 value = 0.0)
+{
+	CHLEntity *e = HLEntGet(self);
+
+	if (!e || method == HLM_NONE)
+		return;
+
+	switch (method)
+	{
+		case HLM_REMOVE:
+			e->in_use = FALSE;
+			e->solid  = HLSOLID_NOT;
+			break;
+
+		case HLM_FIRE_TARGETS:
+			HLEntSetThink(e, HLM_NONE, 0.0);
+			HLEntFireTargets(self, e->activator, use_type, value);
+			break;
+
+		case HLM_MOVE_DONE:
+			//arrival: stop, snap to the exact destination, then hand over to
+			//whatever asked for the move
+			HLVecCopy(e->finaldest, e->origin);
+			HLVecSet(e->velocity, 0.0, 0.0, 0.0);
+			HLEntSetAbsBox(e);
+			HLEntSetThink(e, HLM_NONE, 0.0);
+			HLEntCallMethod(self, e->move_done, activator, use_type, value);
+			break;
+
+		case HLM_DOOR_GO_UP:		HLDoorGoUp(self, activator);	break;
+		case HLM_DOOR_GO_DOWN:		HLDoorGoDown(self);				break;
+		case HLM_DOOR_HIT_TOP:		HLDoorHitTop(self);				break;
+		case HLM_DOOR_HIT_BOTTOM:	HLDoorHitBottom(self);			break;
+		case HLM_DOOR_USE:			HLDoorUse(self, activator);		break;
+		case HLM_DOOR_TOUCH:
+			//a touch-opened door ignores the touch when USE_ONLY is set
+			if (!(e->spawnflags & HLSF_DOOR_USE_ONLY))
+				HLDoorUse(self, activator);
+			break;
+
+		case HLM_BUTTON_USE:		HLButtonUse(self, activator);	break;
+		case HLM_BUTTON_TOUCH:
+			if (e->spawnflags & HLSF_BUTTON_TOUCH_ONLY)
+				HLButtonUse(self, activator);
+			break;
+		case HLM_BUTTON_GO_UP:		HLButtonGoUp(self, activator);	break;
+		case HLM_BUTTON_GO_DOWN:	HLButtonGoDown(self);			break;
+		case HLM_BUTTON_HIT_TOP:	HLButtonHitTop(self);			break;
+		case HLM_BUTTON_HIT_BOTTOM:	HLButtonHitBottom(self);		break;
+		case HLM_BUTTON_RETURN:		HLButtonGoDown(self);			break;
+
+		case HLM_TRAIN_NEXT:		HLTrainNext(self);				break;
+		case HLM_TRAIN_WAIT:		HLTrainWait(self);				break;
+		case HLM_TRAIN_USE:			HLTrainUse(self);				break;
+		case HLM_TRAIN_START:		HLTrainNext(self);				break;
+
+		case HLM_TRIGGER_TOUCH:		HLTriggerTouch(self, activator); break;
+		case HLM_TRIGGER_USE:		HLTriggerUse(self, activator);	break;
+		case HLM_RELAY_USE:			HLTriggerUse(self, activator);	break;
+
+		case HLM_AUTO_THINK:
+			//trigger_auto fires once at level start and is then gone
+			HLEntSetThink(e, HLM_NONE, 0.0);
+			HLEntUseTargets(self, hl_ent_player, HLUSE_TOGGLE, 0.0);
+			e->in_use = FALSE;
+			break;
+
+		case HLM_MULTI_MANAGER_USE:	HLMMUse(self, activator);		break;
+		case HLM_MULTI_MANAGER_TICK: HLMMTick(self);				break;
+
+		case HLM_LIGHT_USE:			HLLightUse(self, use_type);		break;
+
+		case HLM_WALL_USE:
+			//func_wall toggles its texture frame, which is how the SDK does
+			//"switch the screen to the other image"
+			e->frame = 1 - e->frame;
+			break;
+
+		default:
+			break;
+	}
+}
+
+//--- spawning ---------------------------------------------------------------
+//
+// LINK_ENTITY_TO_CLASS. a comparison chain rather than a table for the same
+// reason HLEntModelForClass is one - see the note there.
+//
+// what a spawn function does is set the physics type, the collision box, the
+// method IDs, and (for a mover) the two positions it travels between
+
+U0 HLEntSpawnToggleBrush(CHLMap *map, CHLEntity *e)
+{//shared front half of every brush mover
+	HLEntSetMoveDir(e);
+	HLEntSetBrushSize(map, e);
+
+	e->movetype = HLMOVETYPE_PUSH;
+	e->solid    = HLSOLID_BSP;
+
+	if (e->speed <= 0.0)
+		e->speed = 100.0;
+}
+
+U0 HLEntSpawnDoor(CHLMap *map, CHLEntity *e)
+{//func_door / func_water. position1 is where it was built, position2 is
+ //that plus the travel along move_dir
+	F64 travel;
+
+	HLEntSpawnToggleBrush(map, e);
+
+	HLVecCopy(e->origin, e->position1);
+
+	//the door slides its own size along the movement axis, less "lip" - so a
+	//lip of 8 leaves 8 units of the door showing when open
+	travel = HLEntAbsF(e->move_dir[0] * e->size[0]) +
+			 HLEntAbsF(e->move_dir[1] * e->size[1]) +
+			 HLEntAbsF(e->move_dir[2] * e->size[2]) - e->lip;
+
+	HLVecMA(e->position1, travel, e->move_dir, e->position2);
+
+	//START_OPEN swaps the endpoints instead of moving the brush, so every
+	//later "go up" still means "go to position2"
+	if (e->spawnflags & HLSF_DOOR_START_OPEN)
+	{
+		HLVecCopy(e->position2, e->origin);
+		HLVecCopy(e->position1, e->position2);
+		HLVecCopy(e->origin, e->position1);
+	}
+
+	e->toggle_state = HLTS_AT_BOTTOM;
+	e->use_fn       = HLM_DOOR_USE;
+	e->touch_fn     = HLM_DOOR_TOUCH;
+	e->blocked_fn   = HLM_DOOR_BLOCKED;
+
+	if (e->wait == 0.0)
+		e->wait = 3.0;
+
+	HLEntSetAbsBox(e);
+}
+
+U0 HLEntSpawnButton(CHLMap *map, CHLEntity *e)
+{
+	F64 travel;
+
+	HLEntSpawnToggleBrush(map, e);
+
+	if (e->speed <= 0.0)
+		e->speed = 40.0;
+
+	HLVecCopy(e->origin, e->position1);
+
+	travel = HLEntAbsF(e->move_dir[0] * e->size[0]) +
+			 HLEntAbsF(e->move_dir[1] * e->size[1]) +
+			 HLEntAbsF(e->move_dir[2] * e->size[2]) - e->lip;
+
+	HLVecMA(e->position1, travel, e->move_dir, e->position2);
+
+	e->toggle_state = HLTS_AT_BOTTOM;
+	e->use_fn       = HLM_BUTTON_USE;
+	e->touch_fn     = HLM_BUTTON_TOUCH;
+
+	if (e->wait == 0.0)
+		e->wait = 1.0;
+
+	HLEntSetAbsBox(e);
+}
+
+U0 HLEntSpawnTrain(CHLMap *map, CHLEntity *e)
+{
+	HLEntSetBrushSize(map, e);
+
+	e->movetype = HLMOVETYPE_PUSH;
+	e->solid    = HLSOLID_BSP;
+	e->use_fn   = HLM_TRAIN_USE;
+
+	if (e->speed <= 0.0)
+		e->speed = 100.0;
+
+	//a train has to reach its first corner before it can start walking the
+	//chain, and the chain is only readable once every corner has spawned -
+	//so the start is deferred by one think
+	if (e->spawnflags & HLSF_TRAIN_START_ON)
+		HLEntSetThink(e, HLM_TRAIN_START, hl_ent_time + 0.1);
+
+	HLEntSetAbsBox(e);
+}
+
+U0 HLEntSpawnTrigger(CHLMap *map, CHLEntity *e, Bool once)
+{//brush triggers are invisible and non-solid but still tested for overlap
+	HLEntSetBrushSize(map, e);
+
+	e->movetype = HLMOVETYPE_NONE;
+	e->solid    = HLSOLID_TRIGGER;
+	e->touch_fn = HLM_TRIGGER_TOUCH;
+	e->use_fn   = HLM_TRIGGER_USE;
+
+	if (once)
+		e->wait = -1.0;
+	else if (e->wait == 0.0)
+		e->wait = 0.2;
+
+	HLEntSetAbsBox(e);
+}
+
+I64 HLEntSpawnOne(CHLMap *map, I64 i)
+{//returns 1 if the classname was recognised
+	CHLEntity *e = &hl_entities[i];
+
+	if (e->spawned)
+		return 0;
+
+	e->spawned = TRUE;
+
+	//--- doors ---
+	if (!StrCompare(e->classname, "func_door") ||
+		!StrCompare(e->classname, "func_water"))
+	{
+		HLEntSpawnDoor(map, e);
+		return 1;
+	}
+
+	//--- buttons ---
+	if (!StrCompare(e->classname, "func_button") ||
+		!StrCompare(e->classname, "func_rot_button"))
+	{
+		HLEntSpawnButton(map, e);
+		return 1;
+	}
+
+	//--- trains ---
+	if (!StrCompare(e->classname, "func_train") ||
+		!StrCompare(e->classname, "func_tracktrain"))
+	{
+		//tracktrain steers along path_track and banks into corners; walked
+		//as a plain corner chain here, so it follows the route without the
+		//orientation
+		HLEntSpawnTrain(map, e);
+		return 1;
+	}
+
+	if (!StrCompare(e->classname, "path_corner") ||
+		!StrCompare(e->classname, "path_track"))
+	{
+		//pure data - a named point with a target and an optional wait
+		e->movetype = HLMOVETYPE_NONE;
+		e->solid    = HLSOLID_NOT;
+		return 1;
+	}
+
+	//--- triggers ---
+	if (!StrCompare(e->classname, "trigger_once"))
+	{
+		HLEntSpawnTrigger(map, e, TRUE);
+		return 1;
+	}
+
+	if (!StrCompare(e->classname, "trigger_multiple") ||
+		!StrCompare(e->classname, "trigger_hurt") ||
+		!StrCompare(e->classname, "trigger_push") ||
+		!StrCompare(e->classname, "trigger_teleport"))
+	{
+		//hurt, push and teleport share the touch plumbing; only their touch
+		//EFFECT is missing, and firing their target is still correct
+		HLEntSpawnTrigger(map, e, FALSE);
+		return 1;
+	}
+
+	if (!StrCompare(e->classname, "trigger_relay") ||
+		!StrCompare(e->classname, "trigger_changelevel"))
+	{
+		e->movetype = HLMOVETYPE_NONE;
+		e->solid    = HLSOLID_NOT;
+		e->use_fn   = HLM_RELAY_USE;
+		return 1;
+	}
+
+	if (!StrCompare(e->classname, "trigger_auto"))
+	{
+		//fires once shortly after level start. the delay lets everything
+		//else finish spawning first
+		e->movetype = HLMOVETYPE_NONE;
+		e->solid    = HLSOLID_NOT;
+
+		if (e->delay <= 0.0)
+			e->delay = 0.2;
+
+		HLEntSetThink(e, HLM_AUTO_THINK, hl_ent_time + e->delay);
+		return 1;
+	}
+
+	if (!StrCompare(e->classname, "multi_manager"))
+	{
+		e->movetype = HLMOVETYPE_NONE;
+		e->solid    = HLSOLID_NOT;
+		e->use_fn   = HLM_MULTI_MANAGER_USE;
+		return 1;
+	}
+
+	if (!StrCompare(e->classname, "multisource"))
+	{
+		//every input must be on before it satisfies a master check. with no
+		//damage or logic yet it starts satisfied, which unlocks rather than
+		//locks - the failure mode that lets a map be walked
+		e->movetype     = HLMOVETYPE_NONE;
+		e->solid        = HLSOLID_NOT;
+		e->toggle_state = HLTS_AT_TOP;
+		e->use_fn       = HLM_TRIGGER_USE;
+		return 1;
+	}
+
+	//--- static brushwork ---
+	if (!StrCompare(e->classname, "func_wall") ||
+		!StrCompare(e->classname, "func_breakable") ||
+		!StrCompare(e->classname, "func_pushable") ||
+		!StrCompare(e->classname, "func_wall_toggle"))
+	{
+		HLEntSetBrushSize(map, e);
+		e->movetype = HLMOVETYPE_PUSH;
+		e->solid    = HLSOLID_BSP;
+		e->use_fn   = HLM_WALL_USE;
+		return 1;
+	}
+
+	if (!StrCompare(e->classname, "func_illusionary") ||
+		!StrCompare(e->classname, "func_ladder"))
+	{
+		//drawn but not solid. func_ladder is climbable in HL and is not
+		//climbable here yet - see the movement notes
+		HLEntSetBrushSize(map, e);
+		e->movetype = HLMOVETYPE_NONE;
+		e->solid    = HLSOLID_NOT;
+		return 1;
+	}
+
+	//--- lights ---
+	if (!StrCompare(e->classname, "light") ||
+		!StrCompare(e->classname, "light_spot") ||
+		!StrCompare(e->classname, "light_environment"))
+	{
+		e->movetype = HLMOVETYPE_NONE;
+		e->solid    = HLSOLID_NOT;
+
+		//only a light with a style is switchable; the rest were baked into
+		//the lightmap by qrad and have nothing left to do at runtime
+		if (e->style >= 32)
+		{
+			e->use_fn = HLM_LIGHT_USE;
+
+			//SF_LIGHT_START_OFF
+			if (e->spawnflags & 1)
+			{
+				HLLightStyleSet(e->style, "a");
+				e->toggle_state = HLTS_AT_BOTTOM;
+			}
+			else
+			{
+				HLLightStyleSet(e->style, "m");
+				e->toggle_state = HLTS_AT_TOP;
+			}
+		}
+
+		return 1;
+	}
+
+	//worldspawn and the player starts carry no behaviour
+	if (!StrCompare(e->classname, "worldspawn") ||
+		!StrCompare(e->classname, "info_player_start") ||
+		!StrCompare(e->classname, "info_player_deathmatch") ||
+		!StrCompare(e->classname, "info_landmark") ||
+		!StrCompare(e->classname, "info_node"))
+		return 1;
+
+	return 0;
+}
+
+U0 HLEntParseMultiManagers(CHLMap *map)
+{//a multi_manager's targets ARE its key names, with the delay as the value,
+ //so the generic parser cannot pick them up - it has no list to check them
+ //against. re-scan the lump for those blocks only
+	U8	*p;
+	U8	*end;
+	U8	 key[64];
+	U8	 val[64];
+	U8	 name[64];
+	I64	 k;
+	I64	 slot;
+	I64	 ent;
+	I64	 n;
+
+	hl_mm_count = 0;
+
+	if (!map->entities || map->entities_size <= 0)
+		return;
+
+	p   = map->entities;
+	end = map->entities + map->entities_size;
+
+	while (p < end && hl_mm_count < 32)
+	{
+		if (*p != '{')
+		{
+			p++;
+			goto qpmm_next_char;
+		}
+
+		p++;
+		slot          = hl_mm_count;
+		hl_mm[slot].count = 0;
+		name[0]       = 0;
+
+		while (p < end && *p != '}')
+		{
+			//key
+			while (p < end && *p != '"' && *p != '}')
+				p++;
+			if (p >= end || *p == '}')
+				break;
+
+			p++;
+			k = 0;
+			while (p < end && *p != '"' && k < 63)
+			{
+				key[k] = *p;
+				k++;
+				p++;
+			}
+			key[k] = 0;
+			if (p < end)
+				p++;
+
+			//value
+			while (p < end && *p != '"' && *p != '}')
+				p++;
+			if (p >= end || *p == '}')
+				break;
+
+			p++;
+			k = 0;
+			while (p < end && *p != '"' && k < 63)
+			{
+				val[k] = *p;
+				k++;
+				p++;
+			}
+			val[k] = 0;
+			if (p < end)
+				p++;
+
+			if (!StrCompare(key, "classname"))
+			{
+				HLStrCopy(name, val, 64);
+				goto qpmm_next_key;
+			}
+
+			//everything that is not one of the handful of real fields is a
+			//target name
+			if (!StrCompare(key, "targetname") ||
+				!StrCompare(key, "origin") ||
+				!StrCompare(key, "angle") ||
+				!StrCompare(key, "angles") ||
+				!StrCompare(key, "spawnflags") ||
+				!StrCompare(key, "wait") ||
+				!StrCompare(key, "model"))
+				goto qpmm_next_key;
+
+			if (hl_mm[slot].count < HLENT_MM_MAX)
+			{
+				n = hl_mm[slot].count;
+				HLStrCopy(&hl_mm[slot].name[n * 64], key, 64);
+				hl_mm[slot].delay[n] = HLAtoF(val);
+				hl_mm[slot].count    = n + 1;
+			}
+
+qpmm_next_key:
+		}
+
+		if (!StrCompare(name, "multi_manager") && hl_mm[slot].count > 0)
+		{
+			//bind it to the entity that parsed out of the same block. the
+			//blocks are walked in the same order both times, but a skipped
+			//classname-less block would desync the count, so match by name
+			ent = -1;
+
+			for (n = 0; n < hl_num_entities; n++)
+			{
+				if (StrCompare(hl_entities[n].classname, "multi_manager"))
+					goto qpmm_next_ent;
+
+				//already claimed by an earlier block with the same name
+				if (HLMMFind(n) >= 0)
+					goto qpmm_next_ent;
+
+				ent = n;
+				break;
+
+qpmm_next_ent:
+			}
+
+			if (ent >= 0)
+			{
+				hl_mm[slot].ent     = ent;
+				hl_mm[slot].fired   = 0;
+				hl_mm[slot].started = 0.0;
+				hl_mm_count++;
+			}
+		}
+
+qpmm_next_char:
+		if (p < end)
+			p++;
+	}
+}
+
+I64 HLEntSpawnAll(CHLMap *map)
+{//ED_LoadFromFile's second half: run every class function
+	I64 i;
+	I64 known = 0;
+
+	hl_ent_time       = 0.0;
+	hl_ent_thinks     = 0;
+	hl_ent_callq_head = 0;
+	hl_ent_callq_tail = 0;
+	hl_ent_callq_lost = 0;
+
+	HLEntParseMultiManagers(map);
+
+	for (i = 0; i < hl_num_entities; i++)
+	{
+		if (!hl_entities[i].in_use)
+			goto qesa_next;
+
+		if (HLEntSpawnOne(map, i))
+			known++;
+		else
+		{
+			//not one of ours. leave it unspawned so the report can count it
+			//and a later pass can pick it up once the class exists
+			hl_entities[i].spawned = FALSE;
+		}
+
+qesa_next:
+	}
+
+	hl_ent_spawned = known;
+
+	return known;
+}
+
+//--- the frame --------------------------------------------------------------
+
+U0 HLEntDrainCalls()
+{//dispatch everything queued, including anything queued BY the dispatch, up
+ //to a budget. a target loop hits the budget instead of the stack
+	I64 budget = HLENT_CALLQ_BUDGET;
+	I64 ent;
+	I64 method;
+	I64 activator;
+	I64 use_type;
+	F64 value;
+
+	while (hl_ent_callq_head != hl_ent_callq_tail && budget > 0)
+	{
+		ent       = hl_ent_callq[hl_ent_callq_head].ent;
+		method    = hl_ent_callq[hl_ent_callq_head].method;
+		activator = hl_ent_callq[hl_ent_callq_head].activator;
+		use_type  = hl_ent_callq[hl_ent_callq_head].use_type;
+		value     = hl_ent_callq[hl_ent_callq_head].value;
+
+		hl_ent_callq_head = (hl_ent_callq_head + 1) % HLENT_CALLQ_MAX;
+
+		HLEntCallMethod(ent, method, activator, use_type, value);
+
+		budget--;
+	}
+
+	if (!budget)
+	{
+		//a chain that will not settle. drop the rest, or it comes back next
+		//frame and every frame after
+		hl_ent_callq_head = hl_ent_callq_tail;
+		"HLEnt: call budget exhausted, target loop?\n";
+	}
+}
+
+Bool HLEntBoxOverlap(CHLEntity *e, F64 *mins, F64 *maxs)
+{//world space AABB test against an entity's linked bounds
+	if (maxs[0] < e->absmin[0] || mins[0] > e->absmax[0])
+		return FALSE;
+	if (maxs[1] < e->absmin[1] || mins[1] > e->absmax[1])
+		return FALSE;
+	if (maxs[2] < e->absmin[2] || mins[2] > e->absmax[2])
+		return FALSE;
+
+	return TRUE;
+}
+
+U0 HLEntPushPlayer(CHLEntity *e, F64 *move, F64 *player_org)
+{//SV_PushMove's rider handling, reduced to the one entity that can ride
+ //
+ //a player standing ON a mover, or caught INSIDE its swept volume, is carried
+ //by the same delta. anything more (blocking, crushing) needs the damage
+ //system and is not here yet
+	F64 pmins[3];
+	F64 pmaxs[3];
+	I64 i;
+
+	for (i = 0; i < 3; i++)
+	{
+		//the player's feet get a little slack downward so standing on a
+		//platform counts as riding it rather than as not touching
+		pmins[i] = player_org[i] + hl_player_mins[i];
+		pmaxs[i] = player_org[i] + hl_player_maxs[i];
+	}
+
+	pmins[2] -= 2.0;
+
+	if (!HLEntBoxOverlap(e, pmins, pmaxs))
+		return;
+
+	for (i = 0; i < 3; i++)
+		player_org[i] += move[i];
+}
+
+U0 HLEntFrame(CHLMap *map, F64 dt, F64 *player_org)
+{//one server tick of the entity world
+ //
+ //player_org is passed in rather than read from a global because the shell
+ //owns it and compiles after this file
+	CHLEntity	*e;
+	F64			 move[3];
+	I64			 i;
+
+	if (!hl_entities || !map)
+		return;
+
+	hl_ent_time += dt;
+
+	//--- movers ---
+	for (i = 0; i < hl_num_entities; i++)
+	{
+		e = &hl_entities[i];
+
+		if (!e->in_use || e->movetype != HLMOVETYPE_PUSH)
+			goto qef_next_move;
+
+		if (HLIsZeroF(e->velocity[0]) && HLIsZeroF(e->velocity[1]) &&
+			HLIsZeroF(e->velocity[2]))
+			goto qef_next_move;
+
+		move[0] = e->velocity[0] * dt;
+		move[1] = e->velocity[1] * dt;
+		move[2] = e->velocity[2] * dt;
+
+		e->origin[0] += move[0];
+		e->origin[1] += move[1];
+		e->origin[2] += move[2];
+
+		HLEntSetAbsBox(e);
+
+		if (player_org && hl_ent_player >= 0)
+			HLEntPushPlayer(e, move, player_org);
+
+qef_next_move:
+	}
+
+	//--- thinks ---
+	for (i = 0; i < hl_num_entities; i++)
+	{
+		e = &hl_entities[i];
+
+		if (!e->in_use || !e->think_fn)
+			goto qef_next_think;
+
+		if (e->next_think <= 0.0 || e->next_think > hl_ent_time)
+			goto qef_next_think;
+
+		//the method may re-arm the think; clearing first means it has to say
+		//so explicitly rather than inherit last time's schedule
+		hl_ent_thinks++;
+
+		HLEntCallMethod(i, e->think_fn, e->activator, HLUSE_TOGGLE, 0.0);
+
+qef_next_think:
+	}
+
+	HLEntDrainCalls();
+}
+
+U0 HLEntTouchPlayer(F64 *player_org)
+{//test the player against every trigger and touchable mover
+	CHLEntity	*e;
+	F64			 pmins[3];
+	F64			 pmaxs[3];
+	I64			 i;
+
+	if (!hl_entities || !player_org)
+		return;
+
+	for (i = 0; i < 3; i++)
+	{
+		pmins[i] = player_org[i] + hl_player_mins[i];
+		pmaxs[i] = player_org[i] + hl_player_maxs[i];
+	}
+
+	for (i = 0; i < hl_num_entities; i++)
+	{
+		e = &hl_entities[i];
+
+		if (!e->in_use || !e->touch_fn)
+			goto qetp_next;
+
+		if (e->solid != HLSOLID_TRIGGER && e->touch_fn != HLM_DOOR_TOUCH &&
+			e->touch_fn != HLM_BUTTON_TOUCH)
+			goto qetp_next;
+
+		if (!HLEntBoxOverlap(e, pmins, pmaxs))
+			goto qetp_next;
+
+		HLEntQueueCall(i, e->touch_fn, hl_ent_player, HLUSE_TOGGLE, 0.0);
+
+qetp_next:
+	}
+
+	HLEntDrainCalls();
+}
+
+I64 HLEntUseInFront(F64 *player_org, F64 *forward)
+{//the +use key: fire the nearest usable entity the player is looking at.
+ //HL traces 64 units; the box test here is coarser but needs no trace
+	CHLEntity	*e;
+	F64			 probe[3];
+	F64			 pmins[3];
+	F64			 pmaxs[3];
+	I64			 i;
+	I64			 fired = 0;
+
+	if (!hl_entities || !player_org || !forward)
+		return 0;
+
+	HLVecMA(player_org, 48.0, forward, probe);
+
+	for (i = 0; i < 3; i++)
+	{
+		pmins[i] = probe[i] - 16.0;
+		pmaxs[i] = probe[i] + 16.0;
+	}
+
+	for (i = 0; i < hl_num_entities; i++)
+	{
+		e = &hl_entities[i];
+
+		if (!e->in_use || !e->use_fn)
+			goto qeuf_next;
+
+		//only things the player is meant to operate by hand
+		if (e->use_fn != HLM_DOOR_USE && e->use_fn != HLM_BUTTON_USE &&
+			e->use_fn != HLM_TRAIN_USE)
+			goto qeuf_next;
+
+		if (!HLEntBoxOverlap(e, pmins, pmaxs))
+			goto qeuf_next;
+
+		HLEntQueueCall(i, e->use_fn, hl_ent_player, HLUSE_TOGGLE, 0.0);
+		fired++;
+		break;
+
+qeuf_next:
+	}
+
+	HLEntDrainCalls();
+
+	return fired;
+}
+
+U0 HLEntReport()
+{//load time sanity dump
+	I64 i;
+	I64 movers   = 0;
+	I64 triggers = 0;
+	I64 unknown  = 0;
+
+	for (i = 0; i < hl_num_entities; i++)
+	{
+		if (!hl_entities[i].in_use)
+			goto qer_next;
+
+		if (!hl_entities[i].spawned)
+			unknown++;
+		else if (hl_entities[i].movetype == HLMOVETYPE_PUSH)
+			movers++;
+		else if (hl_entities[i].solid == HLSOLID_TRIGGER)
+			triggers++;
+
+qer_next:
+	}
+
+	"HLEnt: %d entities, %d movers, %d triggers, %d multi_managers\n",
+		hl_num_entities, movers, triggers, hl_mm_count;
+
+	if (unknown)
+		"HLEnt: %d classnames not recognised (inert)\n", unknown;
+}
