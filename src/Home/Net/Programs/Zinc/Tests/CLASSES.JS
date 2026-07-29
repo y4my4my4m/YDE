@@ -1,26 +1,50 @@
-// class extends / super. Currently the superclass is parsed and discarded.
-class Animal {
-	constructor(name) { this.name = name; }
-	speak() { return this.name + " makes a noise"; }
-	kind() { return "animal"; }
-}
-class Dog extends Animal {
-	constructor(name) { super(name); this.legs = 4; }
-	speak() { return super.speak() + " (a bark)"; }
-}
-var d = new Dog("Rex");
-console.log(d.name);
-console.log(d.legs);
-console.log(d.speak());
-console.log(d.kind());          // inherited, not overridden
-console.log(d instanceof Dog);
-console.log(d instanceof Animal);
+// class inheritance: extends, super(), super.method(), instanceof
 
-// three levels deep
-class Puppy extends Dog {
-	speak() { return "small: " + super.speak(); }
+class Animal {
+	constructor(name) {
+		this.name = name;
+	}
+	speak() {
+		return this.name + " makes a noise";
+	}
+	kind() {
+		return "animal";
+	}
 }
-var p = new Puppy("Bit");
+
+class Dog extends Animal {
+	constructor(name, breed) {
+		super(name);
+		this.breed = breed;
+	}
+	speak() {
+		return super.speak() + " (woof)";
+	}
+	kind() {
+		return "dog:" + super.kind();
+	}
+}
+
+class Puppy extends Dog {
+	constructor(name) {
+		super(name, "lab");
+		this.small = true;
+	}
+	speak() {
+		return super.speak() + " (yip)";
+	}
+}
+
+var a = new Animal("generic");
+var d = new Dog("rex", "shepherd");
+var p = new Puppy("bitsy");
+
+console.log(a.speak());
+console.log(d.name + "/" + d.breed);
+console.log(d.speak());
+console.log(d.kind());
+console.log(p.name + "/" + p.breed);
 console.log(p.speak());
-console.log(p.legs);
-console.log(p.kind());
+console.log(p instanceof Puppy);
+console.log(p instanceof Dog);
+console.log(p instanceof Animal);

@@ -1,32 +1,72 @@
-// get/set in object literals and classes. Framework internals lean on these
-// heavily, and Babel/TS output emits them constantly.
+// object-literal accessors, get and set on the same name
 var o = {
-	_v: 1,
-	get v() { return this._v * 10; },
-	set v(x) { this._v = x + 1; }
+	first: "Ada",
+	last: "Lovelace",
+	get full() { return this.first + " " + this.last; },
+	set full(v) {
+		var parts = v.split(" ");
+		this.first = parts[0];
+		this.last = parts[1];
+	}
 };
-console.log(o.v);
-o.v = 5;
-console.log(o._v);
-console.log(o.v);
+console.log(o.full);
+o.full = "Grace Hopper";
+console.log(o.first);
+console.log(o.last);
+console.log(o.full);
 
-// accessor on a class, reached through the prototype chain
-class Temp {
-	constructor(c) { this._c = c; }
-	get f() { return this._c * 9 / 5 + 32; }
-	set f(x) { this._c = (x - 32) * 5 / 9; }
+// getter only
+var g = { get answer() { return 42; } };
+console.log(g.answer);
+
+// setter only: reading yields undefined
+var s = { _v: 0, set val(x) { this._v = x * 2; } };
+s.val = 4;
+console.log(s._v);
+console.log(s.val);
+
+// a getter runs on every read
+var counter = { n: 0, get next() { this.n = this.n + 1; return this.n; } };
+console.log(counter.next);
+console.log(counter.next);
+console.log(counter.n);
+
+// accessors defined on a class prototype fire on instances
+class Rect {
+	constructor(w, h) {
+		this.w = w;
+		this.h = h;
+	}
+	get area() { return this.w * this.h; }
+	set area(a) { this.h = a / this.w; }
+	describe() { return this.w + "x" + this.h; }
 }
-var t = new Temp(100);
-console.log(t.f);
-t.f = 32;
-console.log(t._c);
+var r = new Rect(3, 4);
+console.log(r.area);
+r.area = 30;
+console.log(r.h);
+console.log(r.describe());
+var r2 = new Rect(2, 5);
+console.log(r2.area);
+console.log(r.area);
 
-// a getter defined on a plain prototype object
-function P() {}
-P.prototype = { get tag() { return "from-proto"; } };
-console.log(new P().tag);
+// a getter can read plain methods off the same prototype
+class Temp {
+	constructor(c) { this.c = c; }
+	get f() { return this.c * 9 / 5 + 32; }
+	set f(v) { this.c = (v - 32) * 5 / 9; }
+}
+var tp = new Temp(100);
+console.log(tp.f);
+tp.f = 32;
+console.log(tp.c);
 
-// a plain data property must still behave normally
-var d = { a: 1 };
-d.a = 2;
-console.log(d.a);
+// "get" and "set" are still ordinary property names
+var m = { get: 1, set: 2, getThing: function () { return "t"; } };
+console.log(m.get + m.set);
+console.log(m.getThing());
+
+// literal accessors are own enumerable properties
+console.log(Object.keys(g).join(","));
+// class accessors live on the prototype, not the instance
+console.log(Object.keys(r).join(","));

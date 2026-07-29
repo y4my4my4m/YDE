@@ -58,6 +58,7 @@
 #define JSO_XHR			6
 #define JSO_PROMISE		7
 #define JSO_CLASSLIST	8
+#define JSO_PROXY		9	// new Proxy(t, h); slots _ptarget / _phandler
 
 /* native function ids */
 #define JSN_ALERT			1
@@ -403,6 +404,7 @@
 #define JN_DO		39	// do a while (b)
 #define JN_SWITCH	40	// a = discriminant, b = JN_CASE chain
 #define JN_CASE		41	// a = test expr (NULL = default), b = stmt chain
+#define JN_SUPER	42	// bare `super`; resolves via the enclosing class env
 
 /* control flow states */
 #define JF_NORMAL	0
@@ -417,10 +419,14 @@ class CJsAllocHdr
 };
 
 class CJsProp
-{
+{ // getter/setter are CJsVal* too, but CJsVal is declared below us, so every
+  // value slot here has to be a U64 and get cast at the use site.
 	CJsProp *next;
 	U8		*name;
-	U64		 val;	// CJsVal*
+	U64		 val;		// CJsVal*
+	U64		 getter;	// CJsVal* accessor `get name()`, 0 = none
+	U64		 setter;	// CJsVal* accessor `set name(v)`, 0 = none
+	Bool	 is_acc;	// TRUE: val is unused, read/write go through getter/setter
 };
 
 class CJsVal
@@ -705,10 +711,102 @@ U0 JsPropSet(CJsInterp *ji, CJsVal *obj, U8 *name, CJsVal *val)
 	p->name = JsStrDup(ji, name);
 	p->val	= val(U64);
 	p->next = NULL;
+	p->getter = 0;
+	p->setter = 0;
+	p->is_acc = FALSE;
 	if (tail)
 		tail->next = p;
 	else
 		obj->props = p;
+}
+
+/* ---- accessors (get x() / set x(v)) ----
+   These sit on the JS-VISIBLE path only. JsPropGet/JsPropSet above stay raw:
+   promises, XHR and the DOM keep their internal slots (_state, _onres,
+   _ptarget, ...) with no chance of a user getter firing under them. An
+   accessor prop carries val = 0, so a raw JsPropGet on one reads as "absent",
+   which is exactly what the internal callers want. */
+
+CJsProp *JsAccessorFind(CJsVal *obj, U8 *name)
+{ // the accessor record for `name`, own-first then up the prototype chain.
+  // A plain data property SHADOWS an inherited accessor, so the first record
+  // wins whatever its kind: matching a data prop returns NULL, not "keep looking".
+	CJsProp *p;
+	I64		 depth = 0;
+
+	while (obj && depth < 8)
+	{
+		p = obj->props;
+		while (p)
+		{
+			if (!StrCompare(p->name, name))
+			{
+				if (p->is_acc)
+					return p;
+				return NULL;
+			}
+			p = p->next;
+		}
+		obj = obj->proto;
+		depth++;
+	}
+
+	return NULL;
+}
+
+U0 JsAccessorDefine(CJsInterp *ji, CJsVal *obj, U8 *name, CJsVal *getter,
+					CJsVal *setter)
+{ // define-or-merge: `get x()` then `set x(v)` must land in ONE property, so
+  // the second call fills the empty half instead of replacing the record.
+  // New props go on the END of the list (Object.keys/for-in insertion order).
+	CJsProp *p = obj->props, *tail = NULL;
+
+	while (p)
+	{
+		if (!StrCompare(p->name, name))
+			break;
+		tail = p;
+		p = p->next;
+	}
+	if (!p)
+	{
+		p = JsAlloc(ji, sizeof(CJsProp))(CJsProp *);
+		p->name = JsStrDup(ji, name);
+		p->next = NULL;
+		p->getter = 0;
+		p->setter = 0;
+		if (tail)
+			tail->next = p;
+		else
+			obj->props = p;
+	}
+	else if (!p->is_acc)
+	{ // a data prop being redefined as an accessor drops its old value
+		p->getter = 0;
+		p->setter = 0;
+	}
+	p->val	  = 0;
+	p->is_acc = TRUE;
+	if (getter)
+		p->getter = getter(U64);
+	if (setter)
+		p->setter = setter(U64);
+}
+
+CJsVal *JsPropValue(CJsInterp *ji, CJsVal *obj, CJsProp *p)
+{ // value of an ALREADY-FOUND own prop while enumerating (Object.values,
+  // Object.entries, spread, JSON.stringify): fires the getter for accessors.
+	CJsVal *gargs[1];
+
+	gargs[0] = JsUndefV(ji);
+	if (p->is_acc)
+	{
+		if (p->getter)
+			return JsCall(ji, p->getter(CJsVal *), obj, gargs, 0);
+		return JsUndefV(ji);
+	}
+
+	return p->val(CJsVal *);
 }
 
 /* ---- coercions ---- */
@@ -913,6 +1011,7 @@ CJsNode *JsParseClass(CJsInterp *ji)
   // BOTH statement and expression positions (minified code uses class exprs).
 	CJsNode *node = JsNode(ji, JN_CLASS), *item, *mtail = NULL;
 	CJsTok	*t;
+	I64		 acc; // member accessor kind: 0 none, 1 get, 2 set
 
 	t = JsTok(ji);
 	if (t->type == JT_IDENT && StrCompare(t->str, "extends"))
@@ -921,7 +1020,7 @@ CJsNode *JsParseClass(CJsInterp *ji)
 		ji->pos++;
 	}
 	if (JsEatKw(ji, "extends"))
-		node->c = JsParseAssign(ji); // parsed, superclass ignored (no real super)
+		node->c = JsParseAssign(ji); // superclass expr; JN_CLASS links prototypes
 	if (!JsEatPunct(ji, '{'))
 		return node;
 	while (!JsIsPunct(ji, '}') && JsTok(ji)->type != JT_EOF && !ji->has_err)
@@ -930,8 +1029,10 @@ CJsNode *JsParseClass(CJsInterp *ji)
 		{ /* stray semicolons between members */ }
 		else
 		{
-			// skip modifier keywords (static/async/get/set) when another member
-			// token follows, else the modifier IS the member name.
+			// eat modifier keywords (static/async/get/set) when another member
+			// token follows, else the modifier IS the member name. get/set also
+			// mark the member as an accessor for the prototype object.
+			acc = 0;
 			while (JsTok(ji)->type == JT_IDENT &&
 				   (!StrCompare(JsTok(ji)->str, "static") ||
 					!StrCompare(JsTok(ji)->str, "async") ||
@@ -942,7 +1043,13 @@ CJsNode *JsParseClass(CJsInterp *ji)
 					(ji->toks[ji->pos + 1].type == JT_PUNCT &&
 					 (ji->toks[ji->pos + 1].punct == '[' ||
 					  ji->toks[ji->pos + 1].punct == '*'))))
+			{
+				if (!StrCompare(JsTok(ji)->str, "get"))
+					acc = 1;
+				else if (!StrCompare(JsTok(ji)->str, "set"))
+					acc = 2;
 				ji->pos++;
+			}
 			JsEatPunct(ji, '*'); // generator method
 			item = JsNode(ji, JN_PROP);
 			if (JsEatPunct(ji, '['))
@@ -1045,9 +1152,10 @@ U0 JsTokDesc(CJsInterp *ji, I64 idx, U8 *out)
 CJsNode *JsParsePrimary(CJsInterp *ji)
 {
 	CJsTok	*t = JsTok(ji);
-	CJsNode *node, *item, *tail;
+	CJsNode *node, *item, *tail, *supcall;
 	U8		 numkey[24], embuf[96], emtk[16];
 	I64		 emk, open_pos;
+	I64		 acc; // object-literal accessor kind: 0 none, 1 get, 2 set
 
 	if (t->type == JT_NUM)
 	{
@@ -1114,21 +1222,26 @@ CJsNode *JsParsePrimary(CJsInterp *ji)
 			return JsNode(ji, JN_NULLLIT);
 		if (JsEatKw(ji, "undefined"))
 			return JsNode(ji, JN_UNDEFLIT);
+		if (JsIsKw(ji, "super"))
+		{ // MUST live inside the JT_IDENT arm: `super` lexes as a plain ident,
+		  // so the generic fallthrough below would swallow it first. JN_SUPER
+		  // is resolved at eval time against the class env (%superctor /
+		  // %superproto) that JN_CLASS wraps its methods in.
+			ji->pos++;
+			node = JsNode(ji, JN_SUPER);
+			if (JsEatPunct(ji, '('))
+			{ // super(args): built here, not by the postfix loop, so JN_CALL
+			  // can see a JN_SUPER callee and pass the current `this` through.
+				supcall = JsNode(ji, JN_CALL);
+				supcall->a = node;
+				supcall->b = JsParseArgs(ji); // eats ')'
+				return supcall;
+			}
+			return node; // super.m / super.m(...) : postfix builds the JN_MEMBER
+		}
 		ji->pos++;
 		node = JsNode(ji, JN_IDENT);
 		node->str = t->str;
-		return node;
-	}
-	if (JsIsKw(ji, "super"))
-	{ // super(...) constructor call -> no-op; super.x / super.m() -> this.x/m()
-		ji->pos++;
-		if (JsEatPunct(ji, '('))
-		{
-			JsParseArgs(ji); // parse + discard args, eats ')'
-			return JsNode(ji, JN_UNDEFLIT);
-		}
-		node = JsNode(ji, JN_IDENT);
-		node->str = "this";
 		return node;
 	}
 	if (JsIsKw(ji, "this"))
@@ -1229,8 +1342,10 @@ CJsNode *JsParsePrimary(CJsInterp *ji)
 			{
 				if (JsIsPunct(ji, '}'))
 					break; // tolerate a trailing comma: {a: 1,}
-				// skip method modifiers get/set/async + generator '*' (only when a
-				// key follows - else get/set/async is itself the property name)
+				// eat method modifiers get/set/async + generator '*' (only when a
+				// key follows - else get/set/async is itself the property name).
+				// get/set additionally mark the member as an ACCESSOR (acc).
+				acc = 0;
 				while (JsTok(ji)->type == JT_IDENT &&
 					   (!StrCompare(JsTok(ji)->str, "get") ||
 						!StrCompare(JsTok(ji)->str, "set") ||
@@ -1240,7 +1355,13 @@ CJsNode *JsParsePrimary(CJsInterp *ji)
 						(ji->toks[ji->pos + 1].type == JT_PUNCT &&
 						 (ji->toks[ji->pos + 1].punct == '[' ||
 						  ji->toks[ji->pos + 1].punct == '*'))))
+				{
+					if (!StrCompare(JsTok(ji)->str, "get"))
+						acc = 1;
+					else if (!StrCompare(JsTok(ji)->str, "set"))
+						acc = 2;
 					ji->pos++;
+				}
 				JsEatPunct(ji, '*'); // generator method shorthand
 				if (JsEatPunct(ji, JP_SPREAD))
 				{ // {...src}: props shallow-merged at eval
@@ -1291,6 +1412,11 @@ CJsNode *JsParsePrimary(CJsInterp *ji)
 						item->a->str = item->str;
 					}
 				}
+				// op 1/2 = get/set accessor. Only a member that actually parsed
+				// as `name(params){body}` qualifies; `get: 1` stays a data prop.
+				if (acc && item->type == JN_PROP && item->a &&
+					item->a->type == JN_FUNC)
+					item->op = acc;
 				if (tail)
 					tail->next = item;
 				else
@@ -2547,11 +2673,43 @@ U0 JsCookieSet(CJsInterp *ji, U8 *s)
 
 CJsVal *JsMemberGet(CJsInterp *ji, CJsVal *obj, U8 *name)
 {
-	CJsVal *v;
+	CJsVal *v, *trap, *tgt;
+	CJsProp *acc;
+	CJsVal *targs[2];
 	CZNode *node, *snode, *scur;
 	U8	   *attr;
 	U8		buf[1024]; // stack frames stay small: this recurses via JsEval
 	I64		len;
+
+	// Proxy and accessors hook in HERE, the JS-visible path, never in
+	// JsPropGet: the engine's own internal slots must never fire user code.
+	if (obj->type == JV_OBJ && obj->native_id == JSO_PROXY)
+	{
+		tgt = JsPropGet(obj, "_ptarget")(CJsVal *);
+		v	= JsPropGet(obj, "_phandler")(CJsVal *);
+		if (v)
+			trap = JsPropGet(v, "get")(CJsVal *);
+		else
+			trap = NULL;
+		if (!tgt)
+			return JsUndefV(ji);
+		if (trap && (trap->type == JV_FUNC || trap->type == JV_NATIVE))
+		{ // handler.get(target, key) - the TARGET is passed, not the proxy,
+		  // so a trap doing t[k] cannot recurse back into itself
+			targs[0] = tgt;
+			targs[1] = JsStrV(ji, name);
+			return JsCall(ji, trap, v, targs, 2);
+		}
+		return JsMemberGet(ji, tgt, name); // no trap: forward
+	}
+	if (obj->type == JV_OBJ || obj->type == JV_ARR)
+	{
+		acc = JsAccessorFind(obj, name);
+		if (acc && acc->getter)
+			return JsCall(ji, acc->getter(CJsVal *), obj, NULL, 0);
+		if (acc)
+			return JsUndefV(ji); // setter-only property reads as undefined
+	}
 
 	switch (obj->type)
 	{
@@ -2958,11 +3116,45 @@ CJsVal *JsMemberGet(CJsInterp *ji, CJsVal *obj, U8 *name)
 U0 JsMemberSet(CJsInterp *ji, CJsVal *obj, U8 *name, CJsVal *val)
 {
 	CZNode *node;
+	CJsVal *trap, *hnd, *tgt;
+	CJsProp *acc;
+	CJsVal *targs[3];
 	U8	   *s;
 	U8		kebab[64], style_buf[512];
 
 	if (obj->type != JV_OBJ)
 		return;
+
+	if (obj->native_id == JSO_PROXY)
+	{
+		tgt = JsPropGet(obj, "_ptarget")(CJsVal *);
+		hnd = JsPropGet(obj, "_phandler")(CJsVal *);
+		trap = NULL;
+		if (hnd)
+			trap = JsPropGet(hnd, "set")(CJsVal *);
+		if (!tgt)
+			return;
+		if (trap && (trap->type == JV_FUNC || trap->type == JV_NATIVE))
+		{ // handler.set(target, key, value)
+			targs[0] = tgt;
+			targs[1] = JsStrV(ji, name);
+			targs[2] = val;
+			JsCall(ji, trap, hnd, targs, 3);
+			return;
+		}
+		JsMemberSet(ji, tgt, name, val); // no trap: forward
+		return;
+	}
+	acc = JsAccessorFind(obj, name);
+	if (acc)
+	{ // a setter-less accessor silently swallows the write, as in JS
+		if (acc->setter)
+		{
+			targs[0] = val;
+			JsCall(ji, acc->setter(CJsVal *), obj, targs, 1);
+		}
+		return;
+	}
 
 	switch (obj->native_id)
 	{
@@ -3307,6 +3499,34 @@ Bool JsArrMethod(U8 *nm)
 		   !StrCompare(nm, "fill");
 }
 
+CJsNode *JsSynthSuperCtor(CJsInterp *ji)
+{ // AST for the implicit constructor of a derived class with none of its own:
+  //   constructor(...%a) { super(...%a); }
+  // Built at eval time (there is no source text for it) and given the class
+  // env as its closure, so JN_CALL/JN_SUPER finds %superctor the usual way.
+	CJsNode *fnode, *param, *body, *stmt, *call, *arg, *id;
+
+	fnode = JsNode(ji, JN_FUNC);
+	param = JsNode(ji, JN_IDENT);
+	body  = JsNode(ji, JN_BLOCK);
+	stmt  = JsNode(ji, JN_EXPR);
+	call  = JsNode(ji, JN_CALL);
+	arg	  = JsNode(ji, JN_SPREAD);
+	id	  = JsNode(ji, JN_IDENT);
+	param->str = "%a";
+	param->op  = 1; // rest parameter: JsCall packs the args into an array
+	id->str	   = "%a";
+	arg->a	   = id;
+	call->a	   = JsNode(ji, JN_SUPER);
+	call->b	   = arg;
+	stmt->a	   = call;
+	body->a	   = stmt;
+	fnode->a   = param;
+	fnode->b   = body;
+
+	return fnode;
+}
+
 CJsVal *JsConstruct(CJsInterp *ji, CJsVal *fn, CJsVal **args, I64 argc, U8 *name)
 { // new-expression: fresh object, prototype link, constructor call with this
 	CJsVal *obj, *pr, *r;
@@ -3335,13 +3555,116 @@ CJsVal *JsConstruct(CJsInterp *ji, CJsVal *fn, CJsVal **args, I64 argc, U8 *name
 	return obj;
 }
 
+/* ---- iterator protocol ----
+   Symbol.iterator evaluates to the plain string "@@iterator" (see JsMemberGet,
+   JV_NATIVE / JSN_SYMBOL), so a computed key [Symbol.iterator] lands as an
+   ordinary property of that name and the whole protocol is reachable with the
+   normal property machinery: no new value type, no new prop flags. */
+
+#define JS_MAX_ITER		100000	// per-loop cap: a lying iterator cannot wedge ring-0
+
+Bool JsIterCallable(CJsVal *v)
+{ // JsIsCallable says the same thing but is defined further down this file, and
+  // ZealC compiles in one pass
+	return v && (v->type == JV_FUNC || v->type == JV_NATIVE);
+}
+
+CJsVal *JsIterOpen(CJsInterp *ji, CJsVal *v)
+{ // returns the iterator object from v[@@iterator](), or NULL when v is not a
+  // protocol iterable (callers then fall back to their own handling)
+	CJsVal *fn, *it;
+
+	if (!v || ji->has_err)
+		return NULL;
+	if (v->type != JV_OBJ && v->type != JV_FUNC && v->type != JV_NATIVE)
+		return NULL;
+	fn = JsMemberGet(ji, v, "@@iterator");
+	if (!JsIterCallable(fn))
+		return NULL;
+	it = JsCall(ji, fn, v, NULL, 0);
+	if (!it || ji->has_err)
+		return NULL;
+	if (it->type != JV_OBJ && it->type != JV_FUNC && it->type != JV_NATIVE)
+		return NULL;
+	return it;
+}
+
+Bool JsIterStep(CJsInterp *ji, CJsVal *it, CJsVal **out)
+{ // one it.next(): TRUE (and *out set) while the iterator is still producing
+	CJsVal *nx, *res, *dn;
+
+	*out = NULL;
+	if (!it || ji->has_err)
+		return FALSE;
+	ji->steps++; // share the script-wide step budget
+	if (ji->steps > JS_MAX_STEPS)
+	{
+		JsErr(ji, "script ran too long");
+		return FALSE;
+	}
+	nx = JsMemberGet(ji, it, "next");
+	if (!JsIterCallable(nx))
+		return FALSE;
+	res = JsCall(ji, nx, it, NULL, 0);
+	if (!res || ji->has_err)
+		return FALSE;
+	if (res->type != JV_OBJ && res->type != JV_FUNC && res->type != JV_NATIVE)
+		return FALSE; // spec would throw; we stop the loop instead
+	dn = JsMemberGet(ji, res, "done");
+	if (dn && JsToBool(dn))
+		return FALSE;
+	*out = JsMemberGet(ji, res, "value");
+	if (!*out)
+		*out = JsUndefV(ji);
+	return TRUE;
+}
+
+Bool JsSpreadInto(CJsInterp *ji, CJsVal *src, CJsVal *dst)
+{ // append every element of src to the JV_ARR dst. FALSE when src is not
+  // spreadable at all, so the caller can push it as a lone value.
+	CJsVal *it, *el;
+	I64		i;
+	U8		one[2];
+
+	if (!src || !dst)
+		return FALSE;
+	if (src->type == JV_ARR)
+	{
+		for (i = 0; i < src->count; i++)
+			JsArrPush(ji, dst, src->items[i]);
+		return TRUE;
+	}
+	if (src->type == JV_STR)
+	{
+		for (i = 0; src->str[i]; i++)
+		{
+			one[0] = src->str[i];
+			one[1] = 0;
+			JsArrPush(ji, dst, JsStrV(ji, one));
+		}
+		return TRUE;
+	}
+	it = JsIterOpen(ji, src);
+	if (!it)
+		return FALSE;
+	i = 0;
+	while (i < JS_MAX_ITER && !ji->has_err)
+	{
+		if (!JsIterStep(ji, it, &el))
+			break;
+		JsArrPush(ji, dst, el);
+		i++;
+	}
+	return TRUE;
+}
+
 CJsVal *JsEval(CJsInterp *ji, CJsNode *node)
 {
-	CJsVal	*v, *obj, *fn, *cur, *sv, *fproto;
+	CJsVal	*v, *obj, *fn, *cur, *sv, *fproto, *iarr;
 	CJsEnv	*saved_env, *loop_env;
 	Bool	 per_iter;
 	CJsVal	*argv[JS_MAX_ARGS];
-	CJsNode *child, *item;
+	CJsNode *child, *item, *stmp;
 	CJsProp *prp;
 	I64		 i, argc, op, k;
 	U8		 one[2], nmbuf[80];
@@ -3369,6 +3692,14 @@ CJsVal *JsEval(CJsInterp *ji, CJsNode *node)
 			return JsUndefV(ji);
 		case JN_IDENT:
 			v = JsEnvGet(ji, node->str);
+			if (v)
+				return v;
+			return JsUndefV(ji);
+		case JN_SUPER:
+			// Bare `super` outside a call: a plain `super.x` READ. Yields the
+			// superclass prototype so JN_MEMBER reads through it. (A call goes
+			// through JN_CALL instead, which also rebinds `this`.)
+			v = JsEnvGet(ji, "%superproto");
 			if (v)
 				return v;
 			return JsUndefV(ji);
@@ -3400,14 +3731,9 @@ CJsVal *JsEval(CJsInterp *ji, CJsNode *node)
 			while (child)
 			{
 				if (child->type == JN_SPREAD)
-				{ // [...a, b]
+				{ // [...a, b]: array, string, or any @@iterator iterable
 					sv = JsEval(ji, child->a);
-					if (sv && sv->type == JV_ARR)
-					{
-						for (k = 0; k < sv->count; k++)
-							JsArrPush(ji, v, sv->items[k]);
-					}
-					else if (sv)
+					if (sv && !JsSpreadInto(ji, sv, v))
 						JsArrPush(ji, v, sv);
 				}
 				else
@@ -3616,7 +3942,16 @@ CJsVal *JsEval(CJsInterp *ji, CJsNode *node)
 								argv[argc++] = sv->items[k];
 						}
 						else if (sv)
-							argv[argc++] = sv;
+						{ // string / @@iterator iterable: drain it, then splat
+							iarr = JsArrV(ji);
+							if (JsSpreadInto(ji, sv, iarr))
+							{
+								for (k = 0; k < iarr->count && argc < JS_MAX_ARGS; k++)
+									argv[argc++] = iarr->items[k];
+							}
+							else
+								argv[argc++] = sv;
+						}
 					}
 					else
 					{ // local first - see the arg-eval note in the call path below
@@ -3627,7 +3962,24 @@ CJsVal *JsEval(CJsInterp *ji, CJsNode *node)
 				}
 				return JsConstruct(ji, fn, argv, argc, JsCtorName(node->a->a));
 			}
-			if (node->a && node->a->type == JN_MEMBER)
+			if (node->a && node->a->type == JN_SUPER)
+			{ // super(args): the PARENT constructor run against the SAME `this`,
+			  // so its field writes land on the object `new` already made.
+				fn	= JsEnvGet(ji, "%superctor");
+				obj = JsEnvGet(ji, "this");
+			}
+			else if (node->a && node->a->type == JN_MEMBER && node->a->a &&
+					 node->a->a->type == JN_SUPER)
+			{ // super.m(args): m comes off the superclass prototype (skipping
+			  // this class's override, which is the whole point), but `this`
+			  // stays the instance.
+				sv	= JsEnvGet(ji, "%superproto");
+				obj = JsEnvGet(ji, "this");
+				fn	= NULL;
+				if (sv)
+					fn = JsPropGet(sv, node->a->str); // walks up from there
+			}
+			else if (node->a && node->a->type == JN_MEMBER)
 			{
 				obj = JsEval(ji, node->a->a);
 				fn	= JsMemberGet(ji, obj, node->a->str);
@@ -3650,7 +4002,16 @@ CJsVal *JsEval(CJsInterp *ji, CJsNode *node)
 							argv[argc++] = sv->items[k];
 					}
 					else if (sv)
-						argv[argc++] = sv;
+					{ // string / @@iterator iterable: drain it, then splat
+						iarr = JsArrV(ji);
+						if (JsSpreadInto(ji, sv, iarr))
+						{
+							for (k = 0; k < iarr->count && argc < JS_MAX_ARGS; k++)
+								argv[argc++] = iarr->items[k];
+						}
+						else
+							argv[argc++] = sv;
+					}
 				}
 				else
 				{ // eval into a local FIRST: `argv[argc++] = JsEval(...)` computes
@@ -3985,12 +4346,67 @@ CJsVal *JsEval(CJsInterp *ji, CJsNode *node)
 					prp = prp->next;
 				}
 			}
+			else if (!node->op)
+			{ // for-of over anything else: the iterator protocol. cur holds the
+			  // iterator object returned by v[@@iterator](); k bounds the loop so
+			  // an iterator that never reports done cannot spin forever.
+				cur = JsIterOpen(ji, v);
+				if (cur)
+				{
+					k = 0;
+					while (k < JS_MAX_ITER && !ji->has_err &&
+						   ji->flow == JF_NORMAL)
+					{
+						if (!JsIterStep(ji, cur, &sv))
+							k = JS_MAX_ITER; // done (or broken): leave the loop
+						else
+						{
+							JsEnvDeclare(ji, ji->env, node->str, sv);
+							JsEval(ji, node->d);
+							if (ji->flow == JF_CONTINUE)
+								ji->flow = JF_NORMAL;
+							k++;
+						}
+					}
+				}
+			}
 			if (ji->flow == JF_BREAK)
 				ji->flow = JF_NORMAL;
 			return NULL;
 		case JN_CLASS:
 			obj = JsValNew(ji, JV_OBJ); // the prototype object
 			v = NULL;					// the constructor
+			sv = NULL;					// the superclass constructor
+			saved_env = ji->env;
+			if (node->c)
+			{ // class X extends E: E is an ARBITRARY expression, evaluated once
+			  // here (before the members, which may close over it).
+				sv = JsEval(ji, node->c);
+				if (sv && (sv->type == JV_FUNC || sv->type == JV_NATIVE))
+				{ // the whole of inheritance: the subclass prototype's proto is
+				  // the superclass prototype, so JsPropGet's existing chain walk
+				  // finds inherited methods and JP_INSTOF sees the ancestor.
+					fproto = JsPropGet(sv, "prototype");
+					if (fproto && fproto->type == JV_OBJ)
+						obj->proto = fproto;
+				}
+				else
+					sv = NULL; // extends <non-constructor>: soft, plain class
+			}
+			if (sv)
+			{ // a per-class env holding the super bindings. Methods are JN_FUNCs
+			  // evaluated below with ji->env = this env, so each captures it as
+			  // its closure parent: a method of Dog sees Dog's %superctor even
+			  // when it is running on a Puppy instance. That lexical capture is
+			  // what makes three levels work - a dynamic "proto of this" lookup
+			  // would loop forever on Puppy.speak -> Dog.speak.
+				loop_env = JsAlloc(ji, sizeof(CJsEnv))(CJsEnv *);
+				loop_env->parent = saved_env;
+				ji->env = loop_env;
+				JsEnvDeclare(ji, loop_env, "%superctor", sv);
+				if (obj->proto)
+					JsEnvDeclare(ji, loop_env, "%superproto", obj->proto);
+			}
 			child = node->a;
 			while (child)
 			{
@@ -4001,9 +4417,20 @@ CJsVal *JsEval(CJsInterp *ji, CJsNode *node)
 					JsPropSet(ji, obj, child->str, fn);
 				child = child->next;
 			}
+			if (!v && sv)
+			{ // derived class with no constructor of its own: synthesise
+			  // constructor(...a){ super(...a); } so the parent still runs.
+				v = JsValNew(ji, JV_FUNC);
+				stmp = JsSynthSuperCtor(ji);
+				v->func = stmp(U64);
+				v->fenv = ji->env(U64); // the class env, for %superctor
+			}
+			ji->env = saved_env;
 			if (!v)
 				v = JsNativeV(ji, JSN_EVT_NOOP); // default empty constructor
 			JsPropSet(ji, v, "prototype", obj);
+			if (sv)
+				v->proto = sv; // static members inherit too (Dog.fromName etc)
 			if (node->str)
 				JsEnvDeclare(ji, ji->env, node->str, v);
 			return v;
