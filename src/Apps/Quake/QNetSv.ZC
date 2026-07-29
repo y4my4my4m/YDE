@@ -111,6 +111,7 @@ I64				q_net_parsed  = 0;	//messages the client consumed
 #define QSV_TIMEOUT			10.0	//silence AFTER first clc_move
 #define QSV_CONNECT_GRACE	90.0	//map load: connect done, moves not yet
 
+I64		q_cl_gametype	= 0;	//cl.gametype: 0 coop or single player, 1 deathmatch
 I64		q_cl_maxclients = QSV_MAX_CLIENTS;
 
 //cl.scores. filled by svc_updatename/frags/colors; host also refreshes from
@@ -175,6 +176,7 @@ U0 QNetClientClear()
 		q_cl.view_angles[i] = 0.0;
 	}
 
+	q_cl_gametype       = 0;
 	q_cl.items          = 0;
 	q_cl.on_ground      = FALSE;
 	q_cl.in_water       = FALSE;
@@ -1384,24 +1386,30 @@ Bool QNetClientParse(CQMsg *m)
 				i = QMsgReadByte(m);		//maxclients
 				if (i > 0 && i <= QSV_MAX_CLIENTS)
 					q_cl_maxclients = i;
-				i = QMsgReadByte(m);		//gametype
-				if (i == 1)
+				//cl.gametype is a CLIENT field. the original stores it and
+				//reads it for scoreboard decisions - it never writes the
+				//server's deathmatch or coop cvars, which are the server's
+				//own state.
+				//
+				//this port runs the local client through the protocol too, so
+				//the host parses its OWN serverinfo. writing the cvars here
+				//round-tripped the game mode through the wire and back, and a
+				//changelevel landed that write before the next map spawned its
+				//entities - monsters appeared in a deathmatch because the
+				//progs deathmatch global had just been cleared by our own echo
+				q_cl_gametype = QMsgReadByte(m);
+
+				//a GUEST has no server of its own and needs the rules to
+				//display them. never on the host, whose cvars are the truth
+				if (q_udp_ready && !q_udp_server)
 				{
-					//GAME_DEATHMATCH
-					QCvarSet("deathmatch", 1.0);
-					QCvarSet("coop", 0.0);
-				}
-				else
-				{
-					//GAME_COOP. the host owns the rules; a guest that kept
-					//deathmatch 1 from a previous session would draw the
-					//deathmatch scoreboard over a coop game
-					//
-					//NOTE: coop is NOT forced to 1 here. the original only
-					//stores cl.gametype, and GAME_COOP is also what a plain
-					//single player server sends - setting the cvar would make
-					//every guest think it is in coop
-					QCvarSet("deathmatch", 0.0);
+					if (q_cl_gametype == 1)
+					{
+						QCvarSet("deathmatch", 1.0);
+						QCvarSet("coop", 0.0);
+					}
+					else
+						QCvarSet("deathmatch", 0.0);
 				}
 				//the level NAME - display text, not a path
 				QMsgReadString(m, q_net_level_name, 64);
@@ -1924,6 +1932,11 @@ I64 QSvFlagI(Bool b)
 	return 0;
 }
 
+//set while a changelevel is in flight. clients live in svs, which SURVIVES
+//SV_SpawnServer - only sv, the per level state, is reset. that is the whole
+//reason a connected player follows the server to the next map
+Bool q_sv_keep_clients = FALSE;
+
 U0 QSvClientsClear()
 {//globals aren't zeroed
 	I64 i;
@@ -1931,6 +1944,19 @@ U0 QSvClientsClear()
 
 	for (i = 0; i < QSV_MAX_CLIENTS; i++)
 	{
+		//a remote survives a changelevel. its edict and signon are per level
+		//and get rebuilt, the connection itself is not
+		if (q_sv_keep_clients && q_sv_clients[i].active &&
+			!q_sv_clients[i].local)
+		{
+			q_sv_clients[i].edict      = 0;
+			q_sv_clients[i].spawned    = FALSE;
+			q_sv_clients[i].signon     = 0;
+			q_sv_clients[i].sent_ident = FALSE;
+			q_sv_clients[i].seen_move  = FALSE;
+			goto qscc_next;
+		}
+
 		q_sv_clients[i].edict     = 0;
 		q_sv_clients[i].spawned    = FALSE;
 		q_sv_clients[i].drop_asap  = FALSE;
@@ -1956,9 +1982,17 @@ U0 QSvClientsClear()
 			q_sv_clients[i].origin[j]   = 0.0;
 			q_sv_clients[i].velocity[j] = 0.0;
 		}
+
+qscc_next:
 	}
 
+	//survivors still count - the local client is re-added by the caller
 	q_sv_client_count = 0;
+	for (i = 0; i < QSV_MAX_CLIENTS; i++)
+	{
+		if (q_sv_clients[i].active)
+			q_sv_client_count++;
+	}
 
 	QSvClearWriteDests;
 }
@@ -3299,7 +3333,21 @@ U0 QSvRunClients(F64 dt, F64 now)
 			q_sv_clients[i].impulse = 0;
 		}
 
-		QVecCopy(q_sv_clients[i].origin, org);
+		//THE EDICT WINS IF SOMETHING ELSE MOVED IT.
+		//
+		//the cache and the edict agree at the end of every tick - the read
+		//back after PostThink sees to that. so a difference here can only have
+		//come from outside this function, and the thing that moves a client
+		//edict from outside is SV_PushMove carrying a rider.
+		//
+		//QGameFrame runs the pushers BEFORE this, so stamping the cache
+		//unconditionally threw the platform's lift away every tick: the guest
+		//never rose, the plat climbed into them, and the overlap test handed
+		//them to blocked, which for a plat is the crush. the host never saw it
+		//because its move reads the edict directly
+		for (j = 0; j < 3; j++)
+			org[j] = QPrFieldF(ent, q_fld_origin + j);
+
 		QVecCopy(q_sv_clients[i].velocity, vel);
 		on_ground = q_sv_clients[i].on_ground;
 
@@ -3316,6 +3364,21 @@ U0 QSvRunClients(F64 dt, F64 now)
 		{
 			QPrSetFieldF(ent, q_fld_origin + j, org[j]);
 			QPrSetFieldF(ent, q_fld_velocity + j, vel[j]);
+		}
+
+		//groundentity, from the origin just stamped. the client reports only
+		//a yes/no for on_ground, so the WHAT has to be derived here - and
+		//SV_PushMove needs it: a rider is carried only when FL_ONGROUND is set
+		//and groundentity is the pusher itself. left at 0 a guest riding a
+		//platform read as an obstruction and the plat crushed them, while the
+		//host rode it fine because its own move sets this field locally
+		if (q_fld_groundentity >= 0)
+		{
+			if (on_ground)
+				QPrSetFieldI(ent, q_fld_groundentity,
+					QPrEdictValue(QGameGroundEntUnder(ent)));
+			else
+				QPrSetFieldI(ent, q_fld_groundentity, QPrEdictValue(0));
 		}
 		QGameLinkEdict(ent);
 
