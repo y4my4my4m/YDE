@@ -5,7 +5,23 @@
 // CTL CCREQ/CCREP lives here; server slot alloc is in QNetSv.
 
 //here so this file sits between QNetUdp and QNetSv in Run.ZC
-#define QSV_MAX_CLIENTS		4
+//compile-time ceiling, sizes the slot tables. the original allows 16
+#define QSV_MAX_CLIENTS		16
+
+//svs.maxclients - how many this SERVER actually accepts. single player is 1,
+//and it is what decides how many edicts get reserved, so it must not be the
+//ceiling: reserving 16 in a solo game shifts every world entity by fifteen
+I64 q_sv_maxclients = 1;
+
+U0 QSvMaxClientsSet(I64 n)
+{//globals aren't zeroed, and this is the init as well as the setter
+	if (n < 1)
+		n = 1;
+	if (n > QSV_MAX_CLIENTS)
+		n = QSV_MAX_CLIENTS;
+
+	q_sv_maxclients = n;
+}
 
 //guest->host has its own sock, server slots are 0..QSV_MAX_CLIENTS-1
 #define QNET_CLIENT_SLOT	(-1)
@@ -182,6 +198,109 @@ Bool QNetClientCtlConnect(U32 ip)
 	QMsgWriteString(m, "QUAKE");
 	QMsgWriteByte(m, QNET_CTL_VERSION);
 	return QNetDgrmSendCtl(ip, m, QNET_PORT_DEFAULT);
+}
+
+//--- host cache (NET_Slist_f / hostcache) -----------------------------------
+//
+//the control channel carries no transaction id, so a CCREP_SERVER_INFO cannot
+//be tied to the CCREQ that caused it. the only pairing available is temporal -
+//a reply counts if it lands on our bound port inside the window a broadcast
+//query opened. outside that window an unsolicited CCREP is dropped, or a stray
+//one from a scan long since finished would sit in the list forever
+
+#define QNET_SLIST_MAX		16
+#define QNET_SLIST_WINDOW	2.0		//seconds a query stays open
+
+class CQHostCache
+{
+	U32		ip;
+	I64		port;
+	U8		addr[32];	//as the server reported it, the dedupe key
+	U8		name[32];
+	U8		map[32];
+	I64		players;
+	I64		max_players;
+};
+
+CQHostCache	q_slist[QNET_SLIST_MAX];
+I64		q_slist_count    = 0;
+F64		q_slist_deadline = 0.0;		//tS past which a reply is unsolicited
+Bool	q_slist_asked    = FALSE;	//a query went out at least once
+
+U0 QSlistInit()
+{//globals aren't zeroed, and a junk count indexes past the table
+	I64 i;
+
+	q_slist_count    = 0;
+	q_slist_deadline = 0.0;
+	q_slist_asked    = FALSE;
+
+	for (i = 0; i < QNET_SLIST_MAX; i++)
+	{
+		q_slist[i].ip          = 0;
+		q_slist[i].port        = QNET_PORT_DEFAULT;
+		q_slist[i].addr[0]     = 0;
+		q_slist[i].name[0]     = 0;
+		q_slist[i].map[0]      = 0;
+		q_slist[i].players     = 0;
+		q_slist[i].max_players = 0;
+	}
+}
+
+I64 QSlistFind(U8 *addr)
+{//the reported address is the identity, not the source ip - one server, one row
+	I64 i;
+
+	if (!addr || !addr[0])
+		return -1;
+
+	for (i = 0; i < q_slist_count; i++)
+	{
+		if (!StrICompare(q_slist[i].addr, addr))
+			return i;
+	}
+
+	return -1;
+}
+
+Bool QNetSlistBroadcast()
+{//Datagram_SearchForHosts - CCREQ_SERVER_INFO to the subnet, returns at once
+ //
+ //frames CTL by hand instead of going through QNetDgrmSendCtl: that one
+ //resolves the destination mac first, and the broadcast address has none
+	CQMsg	*m = &q_net_cmd;
+	U8		 pkt[QNET_MAX_DATAGRAM + 4];
+	I64		 total;
+
+	if (!q_udp_ready)
+		return FALSE;
+
+	QMsgClear(m);
+	QMsgWriteByte(m, QCCREQ_SERVER_INFO);
+	QMsgWriteString(m, "QUAKE");
+	QMsgWriteByte(m, QNET_CTL_VERSION);
+
+	if (m->overflowed || m->len < 1)
+		return FALSE;
+
+	total = 4 + m->len;
+	QNetWriteBigLong(pkt, total | QNETFLAG_CTL);
+	MemCopy(pkt + 4, m->data, m->len);
+
+	//replies arrive over the next second through the ordinary recv path, so
+	//the window has to be open before the send, not after it
+	q_slist_deadline = tS + QNET_SLIST_WINDOW;
+	q_slist_asked    = TRUE;
+
+	return QNetUdpSendRawBroadcast(pkt, total, QNET_PORT_DEFAULT);
+}
+
+Bool QNetSlistSearching()
+{//true while replies are still expected, so an empty table reads as pending
+	if (!q_slist_asked)
+		return FALSE;
+
+	return ToBool(tS < q_slist_deadline);
 }
 
 Bool QNetDgrmIsCtl(U8 *data, I64 len)
@@ -404,6 +523,14 @@ I64 QNetDgrmHandleCtl(U8 *data, I64 len, U32 from_ip)
 	I64		 port;
 	U8		 reason[64];
 	U8		 line[96];
+	//CCREP_SERVER_INFO fields, sized to the host cache row they land in
+	U8		 addr[32];
+	U8		 hname[32];
+	U8		 level[32];
+	I64		 players;
+	I64		 maxp;
+	I64		 ver;
+	I64		 idx;
 
 	if (!data || len < 5 || !QNetDgrmIsCtl(data, len))
 		return 0;
@@ -454,7 +581,60 @@ I64 QNetDgrmHandleCtl(U8 *data, I64 len, U32 from_ip)
 		return 0;
 	}
 
-	//FIXME: CCREP_SERVER_INFO ignored, no slist yet
+	if (cmd == QCCREP_SERVER_INFO)
+	{
+		//no transaction id on this channel - the open query window is the
+		//whole of the match. drop anything arriving outside it
+		if (!QNetSlistSearching)
+			return 0;
+
+		QMsgReadString(m, addr, 32);
+		QMsgReadString(m, hname, 32);
+		QMsgReadString(m, level, 32);
+		players = QMsgReadByte(m);
+		maxp    = QMsgReadByte(m);
+		ver     = QMsgReadByte(m);
+		if (m->badread)
+			return 0;
+
+		if (ver != QNET_CTL_VERSION)
+			return 0;
+
+		//the address it ANSWERED FROM wins over the one it advertises. a host
+		//with no local ip set reports 0.0.0.0 and the string is not empty, so
+		//trusting it produced an entry that listed fine and joined nowhere.
+		//from_ip is the address that actually reached us
+		if (from_ip)
+			StrPrint(addr, "%d.%d.%d.%d:%d",
+				from_ip & 255, (from_ip >> 8) & 255,
+				(from_ip >> 16) & 255, (from_ip >> 24) & 255,
+				QNET_PORT_DEFAULT);
+		else if (!addr[0])
+			return 0;
+
+		//a broadcast reaches every server once per query and the query repeats,
+		//so refreshing in place is the common path, appending the rare one
+		idx = QSlistFind(addr);
+		if (idx < 0)
+		{
+			if (q_slist_count >= QNET_SLIST_MAX)
+				return 0;
+			idx = q_slist_count;
+			q_slist_count++;
+			QStrCopy(q_slist[idx].addr, addr, 32);
+		}
+
+		q_slist[idx].ip   = from_ip;
+		q_slist[idx].port = q_udp_from_port;
+		if (q_slist[idx].port < 1)
+			q_slist[idx].port = QNET_PORT_DEFAULT;
+		QStrCopy(q_slist[idx].name, hname, 32);
+		QStrCopy(q_slist[idx].map, level, 32);
+		q_slist[idx].players     = players;
+		q_slist[idx].max_players = maxp;
+		return 0;
+	}
+
 	return 0;
 }
 
