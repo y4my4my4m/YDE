@@ -1,0 +1,646 @@
+/*	Zinc JS shell: a REPL and a file-driven test runner for the JS engine.
+
+	Until now the only way to exercise Zinc's JS was to boot the VM, load a
+	page, and read the Network Log. That makes every engine change expensive to
+	verify, so most of them were not. This is the same trick Ladybird plays with
+	Utilities/js.cpp: give the engine a front end that is not the browser, and
+	engine work becomes testable on its own.
+
+	  JsShell;                  interactive REPL
+	  JsTestRun("::/Home/Net/Programs/Zinc/Tests");   run the suite
+
+	A test is a pair of files: FOO.JS is the script, FOO.OUT is the exact
+	console.log output it must produce. Expected files are generated on the host
+	with `node FOO.JS > FOO.OUT`, so the suite is a differential test against a
+	real engine rather than a record of what Zinc happens to do today.
+
+	Needs: JS.ZC (JsRunEx, JsLogEmit, the JSLOG_* sinks) and HTML.ZC.
+	No literal dollar signs allowed in this file. */
+
+#define JSSH_SRC_MAX	65536	// one REPL entry, or one test script
+#define JSSH_FMT_MAX	4096	// rendered value
+#define JSSH_CAP_MAX	65536	// captured console.log output per test
+#define JSSH_MAX_DEPTH	3		// nesting shown before eliding to [Object]
+#define JSSH_MAX_ITEMS	32		// array elements shown
+#define JSSH_MAX_PROPS	24		// object properties shown
+#define JSSH_SETTLE_MS	400		// wall time a test gets for timers/promises
+#define JSSH_LINE_MAX	512		// one line of test output, for diff reporting
+
+I64 js_test_pass = 0;	// globals are NOT zeroed by the JIT: initialize always
+I64 js_test_fail = 0;
+
+/* ---- string helpers ---- */
+
+U0 JsShellCat(U8 *out, I64 max, U8 *s)
+{ // bounded append onto a NUL-terminated buffer. MemCopy, not CatPrint: an
+  // exact-fit CatPrint is what corrupted the allocator heap once already.
+	I64 have, want;
+
+	if (!out || !s)
+		return;
+	have = StrLen(out);
+	want = StrLen(s);
+	if (have + want + 1 >= max)
+	{
+		want = max - have - 2;
+		if (want <= 0)
+			return;
+		MemCopy(out + have, s, want);
+		out[have + want] = 0;
+		return;
+	}
+	MemCopy(out + have, s, want + 1);
+}
+
+U0 JsShellStripCR(U8 *s)
+{
+	U8 *d = s;
+
+	while (*s)
+	{
+		if (*s != '\r')
+		{
+			*d = *s;
+			d++;
+		}
+		s++;
+	}
+	*d = 0;
+}
+
+U0 JsShellTrimTail(U8 *s)
+{ // trailing blank lines must not decide a test
+	I64 n = StrLen(s);
+
+	while (n > 0 && (s[n - 1] == '\n' || s[n - 1] == ' ' || s[n - 1] == '\t'))
+	{
+		s[n - 1] = 0;
+		n--;
+	}
+}
+
+U0 JsShellQuote(U8 *out, I64 max, U8 *s)
+{ // "a\nb" rather than a raw two-line paste
+	U8	esc[8];
+	I64	have;
+
+	JsShellCat(out, max, "\"");
+	while (*s)
+	{
+		have = StrLen(out);
+		if (have + 4 >= max)
+			break;
+		switch (*s)
+		{
+			case '\n':
+				esc[0] = '\\'; esc[1] = 'n'; esc[2] = 0;
+				break;
+			case '\t':
+				esc[0] = '\\'; esc[1] = 't'; esc[2] = 0;
+				break;
+			case '"':
+				esc[0] = '\\'; esc[1] = '"'; esc[2] = 0;
+				break;
+			case '\\':
+				esc[0] = '\\'; esc[1] = '\\'; esc[2] = 0;
+				break;
+			default:
+				esc[0] = *s; esc[1] = 0;
+				break;
+		}
+		JsShellCat(out, max, esc);
+		s++;
+	}
+	JsShellCat(out, max, "\"");
+}
+
+/* ---- value rendering ----
+   JsToStr is the language's ToString: it joins arrays with bare commas and
+   flattens every plain object to [object Object], so ["a,b"] and ["a","b"]
+   print identically. Useless when the point is to inspect a value, hence a
+   separate REPL renderer (Ladybird splits these the same way, Print.cpp vs
+   Value::to_string). Recursion here is a DIRECT self-call on purpose: routing
+   it through a forward-declared helper miscompiles (see the JSRegex group bug). */
+
+U0 JsShellFmt(CJsInterp *ji, CJsVal *v, U8 *out, I64 max, I64 depth)
+{
+	CJsProp *p;
+	I64		 i, n;
+
+	if (!v)
+	{
+		JsShellCat(out, max, "<none>");
+		return;
+	}
+
+	switch (v->type)
+	{
+		case JV_STR:
+			JsShellQuote(out, max, v->str);
+			return;
+		case JV_FUNC:
+			JsShellCat(out, max, "[Function]");
+			return;
+		case JV_NATIVE:
+			JsShellCat(out, max, "[Native]");
+			return;
+		case JV_ARR:
+			if (depth >= JSSH_MAX_DEPTH)
+			{
+				JsShellCat(out, max, "[Array]");
+				return;
+			}
+			JsShellCat(out, max, "[");
+			n = v->count;
+			if (n > JSSH_MAX_ITEMS)
+				n = JSSH_MAX_ITEMS;
+			for (i = 0; i < n; i++)
+			{
+				if (i)
+					JsShellCat(out, max, ", ");
+				JsShellFmt(ji, v->items[i], out, max, depth + 1);
+			}
+			if (v->count > n)
+				JsShellCat(out, max, ", ...");
+			JsShellCat(out, max, "]");
+			return;
+		case JV_OBJ:
+			if (v->native_id != JSO_PLAIN)
+			{ // document / element / XHR / promise: no useful literal form
+				JsShellCat(out, max, "[host object]");
+				return;
+			}
+			if (depth >= JSSH_MAX_DEPTH)
+			{
+				JsShellCat(out, max, "[Object]");
+				return;
+			}
+			JsShellCat(out, max, "{");
+			p = v->props;
+			i = 0;
+			while (p && i < JSSH_MAX_PROPS)
+			{
+				if (i)
+					JsShellCat(out, max, ",");
+				JsShellCat(out, max, " ");
+				JsShellCat(out, max, p->name);
+				JsShellCat(out, max, ": ");
+				JsShellFmt(ji, p->val(CJsVal *), out, max, depth + 1);
+				p = p->next;
+				i++;
+			}
+			if (p)
+				JsShellCat(out, max, ", ...");
+			JsShellCat(out, max, " }");
+			return;
+	}
+
+	JsShellCat(out, max, JsToStr(ji, v)); // undefined, null, bool, number
+}
+
+/* ---- interpreter lifecycle ---- */
+
+CZNode *js_shell_dom = NULL;	// owned by the live shell interpreter
+
+CJsInterp *JsShellNewInterp()
+{ // a blank document, so the DOM natives have something valid to walk
+	if (js_shell_dom)
+	{
+		ZNodeFree(js_shell_dom);
+		js_shell_dom = NULL;
+	}
+	js_shell_dom = ZHtmlParse("<html><head><title>jsshell</title></head><body></body></html>");
+
+	return JsInterpNew(js_shell_dom, "zinc:shell");
+}
+
+Bool JsShellPending(CJsInterp *ji)
+{
+	CJsTimer *t;
+
+	if (!ji)
+		return FALSE;
+	if (ji->micro_head)
+		return TRUE;
+	t = ji->timers;
+	while (t)
+	{
+		if (t->active)
+			return TRUE;
+		t = t->next;
+	}
+
+	return FALSE;
+}
+
+U0 JsShellSettle(CJsInterp *ji, I64 max_ms)
+{ // give setTimeout and promise reactions a bounded slice of real time.
+  // A setInterval will simply burn the whole budget; that is intended.
+	I64 waited = 0;
+
+	JsEventLoopPump(ji);
+	while (waited < max_ms && JsShellPending(ji))
+	{
+		Sleep(5);
+		waited += 5;
+		JsEventLoopPump(ji);
+	}
+}
+
+/* ---- test runner ---- */
+
+U8 *JsShellReadFile(U8 *path)
+{ // FileRead pads to the cluster; do not trust it to terminate
+	U8	*raw, *buf;
+	I64	 sz = 0;
+
+	raw = FileRead(path, &sz);
+	if (!raw)
+		return NULL;
+	buf = CAlloc(sz + 1);
+	MemCopy(buf, raw, sz);
+	Free(raw);
+	JsShellStripCR(buf);
+
+	return buf;
+}
+
+U8 *JsShellReExt(U8 *js_path, U8 *ext)
+{ // FOO.JS -> FOO.<ext>
+	U8 *base = MStrPrint("%s", js_path), *dot = NULL, *s = base, *res;
+
+	while (*s)
+	{
+		if (*s == '.')
+			dot = s;
+		s++;
+	}
+	if (dot)
+		*dot = 0;
+	res = MStrPrint("%s.%s", base, ext);
+	Free(base);
+
+	return res;
+}
+
+U0 JsShellEsc(U8 *dst, I64 max, U8 *s)
+{ // copy with dollars doubled: anything printed here goes through DolDoc, and
+  // a lone dollar from test output would eat the rest of the line
+	I64 n = 0;
+
+	while (*s && n < max - 3)
+	{
+		if (*s == 0x24)
+		{
+			dst[n] = 0x24;
+			n++;
+		}
+		dst[n] = *s;
+		n++;
+		s++;
+	}
+	dst[n] = 0;
+}
+
+U8 *JsShellLineCopy(U8 *s, U8 *out, I64 max)
+{ // copy the line at s into out; return the next line's start, NULL if that
+  // was the last one
+	I64 n = 0;
+
+	while (*s && *s != '\n')
+	{
+		if (n < max - 1)
+		{
+			out[n] = *s;
+			n++;
+		}
+		s++;
+	}
+	out[n] = 0;
+	if (*s == '\n')
+		return s + 1;
+
+	return NULL;
+}
+
+I64 JsShellFirstDiff(U8 *got, U8 *want, U8 *gl, U8 *wl, I64 max)
+{ // 1-based line where got and want first differ, 0 if identical. Printing the
+  // whole of both blocks scrolls a real failure off the top of the screen.
+	U8	*g = got, *w = want;
+	I64	 ln = 1;
+
+	while (g || w)
+	{
+		gl[0] = 0;
+		wl[0] = 0;
+		if (g)
+			g = JsShellLineCopy(g, gl, max);
+		if (w)
+			w = JsShellLineCopy(w, wl, max);
+		if (StrCompare(gl, wl))
+			return ln;
+		ln++;
+	}
+
+	return 0;
+}
+
+Bool JsTestFile(U8 *js_path, Bool verbose)
+{ // returns TRUE if the script's console output matched its .OUT file
+	CJsInterp	*ji;
+	U8			*src, *want, *out_path, *got, *got_path;
+	U8			*gl, *wl, *esc;
+	I64			 n;
+	Bool		 ok = FALSE;
+
+	src = JsShellReadFile(js_path);
+	if (!src)
+	{
+		"  SKIP %s (unreadable)\n", js_path;
+		return FALSE;
+	}
+	out_path = JsShellReExt(js_path, "OUT");
+	want = JsShellReadFile(out_path);
+	if (!want)
+	{
+		"  SKIP %s (no %s)\n", js_path, out_path;
+		Free(src);
+		Free(out_path);
+		return FALSE;
+	}
+
+	got = CAlloc(JSSH_CAP_MAX);
+	got[0] = 0;
+	js_log_cap		= got;
+	js_log_cap_max	= JSSH_CAP_MAX;
+	js_log_mode		= JSLOG_CAPTURE;
+
+	ji = JsShellNewInterp();
+	JsRun(ji, src);
+	JsShellSettle(ji, JSSH_SETTLE_MS);
+	JsInterpFree(ji);	// before the DOM: the interpreter holds CZNode pointers
+	if (js_shell_dom)
+	{
+		ZNodeFree(js_shell_dom);
+		js_shell_dom = NULL;
+	}
+
+	js_log_mode	= JSLOG_NETLOG;
+	js_log_cap	= NULL;
+
+	JsShellTrimTail(got);
+	JsShellTrimTail(want);
+	if (!StrCompare(got, want))
+	{
+		ok = TRUE;
+		js_test_pass++;
+		if (verbose)
+			"  ok   %s\n", js_path;
+	}
+	else
+	{
+		js_test_fail++;
+		gl	= CAlloc(JSSH_LINE_MAX);
+		wl	= CAlloc(JSSH_LINE_MAX);
+		esc = CAlloc(JSSH_LINE_MAX * 2 + 4);
+		n = JsShellFirstDiff(got, want, gl, wl, JSSH_LINE_MAX);
+		"  FAIL %s (line %d)\n", js_path, n;
+		JsShellEsc(esc, JSSH_LINE_MAX * 2 + 4, wl);
+		"    want: %s\n", esc;
+		JsShellEsc(esc, JSSH_LINE_MAX * 2 + 4, gl);
+		"    got : %s\n", esc;
+		Free(gl);
+		Free(wl);
+		Free(esc);
+		// full output next to the test, so it can be synced back and diffed
+		// against node on the host rather than squinted at on a VM terminal
+		got_path = JsShellReExt(js_path, "GOT");
+		FileWrite(got_path, got, StrLen(got));
+		Free(got_path);
+	}
+
+	Free(got);
+	Free(want);
+	Free(out_path);
+	Free(src);
+
+	return ok;
+}
+
+U0 JsTestRun(U8 *dir = "::/Home/Net/Programs/Zinc/Tests", Bool verbose = TRUE)
+{
+	CDirEntry	*de, *de1;
+	U8			*mask;
+
+	js_test_pass = 0;
+	js_test_fail = 0;
+
+	mask = MStrPrint("%s/*.JS", dir);
+	de = de1 = FilesFind(mask);
+	Free(mask);
+	if (!de1)
+	{
+		"No tests found in %s\n", dir;
+		return;
+	}
+
+	"Zinc JS tests in %s\n", dir;
+	while (de)
+	{
+		JsTestFile(de->full_name, verbose);
+		de = de->next;
+	}
+	DirEntryDel(de1);
+
+	"\n%d passed, %d failed.\n", js_test_pass, js_test_fail;
+}
+
+/* ---- REPL ---- */
+
+I64 JsShellDepth(U8 *s, I64 depth)
+{ // bracket balance across lines, so a pasted function body is not run early.
+  // String bodies and line comments are skipped; regex literals are not
+  // tracked, so a bracket inside one still counts (rare enough in a REPL).
+	U8	 q = 0;
+	Bool esc = FALSE;
+
+	while (*s)
+	{
+		if (q)
+		{
+			if (esc)
+				esc = FALSE;
+			else if (*s == '\\')
+				esc = TRUE;
+			else if (*s == q)
+				q = 0;
+		}
+		else if (*s == '"' || *s == '\'' || *s == '`')
+			q = *s;
+		else if (*s == '/' && s[1] == '/')
+			return depth; // rest of the line is a comment
+		else if (*s == '{' || *s == '(' || *s == '[')
+			depth++;
+		else if (*s == '}' || *s == ')' || *s == ']')
+			depth--;
+		s++;
+	}
+
+	return depth;
+}
+
+U0 JsShellHelp()
+{
+	"\n";
+	"  .help          this text\n";
+	"  .exit          leave the shell\n";
+	"  .abort         discard a half-typed multi-line entry\n";
+	"  .clear         throw away the interpreter and start a fresh one\n";
+	"  .load <path>   read a file and run it\n";
+	"  .pump          run the event loop until timers and promises settle\n";
+	"  .test [dir]    run the .JS/.OUT suite\n";
+	"                 (default ::/Home/Net/Programs/Zinc/Tests)\n";
+	"\n";
+	"  _              the value of the previous entry\n";
+	"  An unclosed brace, paren or bracket continues onto the next line.\n";
+	"\n";
+}
+
+U0 JsShell()
+{
+	CJsInterp	*ji;
+	CJsVal		*last = NULL;
+	U8			*line, *src, *fmt, *arg, *fbuf;
+	I64			 depth = 0, prev_mode;
+	Bool		 done = FALSE, run_it;
+
+	src = CAlloc(JSSH_SRC_MAX);
+	fmt = CAlloc(JSSH_FMT_MAX);
+	src[0] = 0;
+
+	prev_mode	= js_log_mode;
+	js_log_mode	= JSLOG_TERM;	// console.log lands here, not in the Network Log
+	ji = JsShellNewInterp();
+
+	"\nZinc JS shell. .help for commands, .exit to leave.\n\n";
+
+	while (!done)
+	{
+		if (depth > 0)
+			line = StrGet("...   ");
+		else
+			line = StrGet("js> ");
+		if (!line)
+			break;
+
+		run_it = FALSE;
+
+		if (!StrCompare(line, ".abort"))
+		{ // checked before the depth test: without it an unbalanced brace
+		  // leaves the shell with no way back to the top-level prompt
+			src[0] = 0;
+			depth = 0;
+			"(entry discarded)\n";
+		}
+		else if (depth == 0 && *line == '.')
+		{ // shell command, not JS
+			arg = line;
+			while (*arg && *arg != ' ')
+				arg++;
+			while (*arg == ' ')
+				arg++;
+
+			if (!StrCompare(line, ".exit") || !StrCompare(line, ".quit"))
+				done = TRUE;
+			else if (!StrCompare(line, ".help"))
+				JsShellHelp;
+			else if (!StrCompare(line, ".clear"))
+			{
+				JsInterpFree(ji);
+				ji = JsShellNewInterp();
+				last = NULL;
+				"(fresh interpreter)\n";
+			}
+			else if (!StrCompare(line, ".pump"))
+			{
+				JsShellSettle(ji, JSSH_SETTLE_MS);
+				"(settled)\n";
+			}
+			else if (!MemCompare(line, ".load ", 6))
+			{ // copy into src rather than swapping the pointer: src has to stay
+			  // a JSSH_SRC_MAX buffer for the next line's CatPrint
+				fbuf = JsShellReadFile(arg);
+				if (!fbuf)
+					"Cannot read %s\n", arg;
+				else
+				{
+					if (StrLen(fbuf) + 1 < JSSH_SRC_MAX)
+					{
+						MemCopy(src, fbuf, StrLen(fbuf) + 1);
+						run_it = TRUE;
+					}
+					else
+						"%s is too big for the shell buffer.\n", arg;
+					Free(fbuf);
+				}
+			}
+			else if (!MemCompare(line, ".test", 5))
+			{
+				js_log_mode = JSLOG_NETLOG; // JsTestFile drives the sink itself
+				if (*arg)
+					JsTestRun(arg);
+				else
+					JsTestRun;
+				js_log_mode = JSLOG_TERM;
+			}
+			else
+				"Unknown command. .help for the list.\n";
+		}
+		else
+		{
+			if (StrLen(src) + StrLen(line) + 2 < JSSH_SRC_MAX)
+			{
+				CatPrint(src, "%s\n", line);
+				depth = JsShellDepth(line, depth);
+				if (depth <= 0)
+				{
+					depth = 0;
+					run_it = TRUE;
+				}
+			}
+			else
+			{
+				"Entry too long, discarded.\n";
+				src[0] = 0;
+				depth = 0;
+			}
+		}
+		Free(line);
+
+		if (run_it)
+		{
+			JsRunEx(ji, src, &last);
+			JsShellSettle(ji, 50); // let a 0ms timer or a resolved promise run
+			if (last)
+			{
+				fmt[0] = 0;
+				JsShellFmt(ji, last, fmt, JSSH_FMT_MAX, 0);
+				// the terminal is a DolDoc: dollars must be doubled
+				"%s\n", JsEscDollars(ji, fmt);
+				JsEnvDeclare(ji, ji->genv, "_", last);
+			}
+			src[0] = 0;
+		}
+	}
+
+	JsInterpFree(ji);
+	if (js_shell_dom)
+	{
+		ZNodeFree(js_shell_dom);
+		js_shell_dom = NULL;
+	}
+	js_log_mode = prev_mode;
+	Free(src);
+	Free(fmt);
+	"\n";
+}
