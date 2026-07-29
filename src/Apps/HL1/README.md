@@ -47,6 +47,9 @@ Working, inherited from the Quake port and re-pointed at HL formats:
   auto-hop, and a full duck state machine that swaps to hull 3. Duck is bound
   to `c` by default.
 
+- **Sound** — door and button sound tables (HL stores these as integers the
+  game code resolves, not as paths), `ambient_generic` loops, and the
+  `movesnd`/`stopsnd`/`sounds`/`volume` keys.
 - **Native entity system** — `HLEntity.ZC`. No QuakeC: HL's game logic is
   native, so the engine calls classes directly. Classname spawn dispatch,
   method-ID virtual dispatch, `SUB_UseTargets` with delay and killtarget,
@@ -67,6 +70,8 @@ Not done yet, in the order they are being done:
    rotates until it does. Then momentary doors, breakables, and the damage
    system they need, plus blocked/crush handling on pushers.
 2. SPR v2 sprites (per-sprite palette, render modes).
+   Console and HUD text needs HL's `qfont_t` decoded out of `gfx.wad` -
+   until then text falls back to the kernel 8x8 font and looks chunky.
 3. Weapons, gamerules, HUD.
 4. Monster AI: schedules, tasks, `scripted_sequence`, sentences.
 5. Protocol 48 netcode. **Last** — single player runs in-process without it.

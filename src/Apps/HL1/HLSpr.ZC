@@ -17,6 +17,18 @@
 #define HLSPR_MAX_FRAMES	64
 #define HLSPR_TRANSPARENT	255
 
+//SPR version. quake shipped 1; every Half-Life sprite is 2, and the only
+//structural difference is a palette wedged between the header and the frames
+#define HLSPR_VERSION_Q		1
+#define HLSPR_VERSION_HL		2
+
+//texFormat, the word version 2 added. it decides how a texel reaches the
+//screen, which for the HUD is the difference between readable and a solid box
+#define HLSPR_NORMAL			0	//index 255 is the cutout
+#define HLSPR_ADDITIVE		1	//added to what is behind it
+#define HLSPR_INDEXALPHA		2	//index IS the alpha, palette[255] the colour
+#define HLSPR_ALPHATEST		3	//index 255 cut, the rest opaque
+
 class CHLSprFrame
 {
 	I64	 origin_x;		//texel offset from centre
@@ -30,13 +42,40 @@ class CHLSpr
 {
 	U8			 name[64];
 	U8			*raw;			//owned
+	I64			 version;
 	I64			 type;
+	I64			 tex_format;	//HLSPR_*, v2 only
 	I64			 max_width;
 	I64			 max_height;
 	I64			 num_frames;
 	F64			 interval;		//seconds per frame, grouped sprites
+	U8			*palette;		//v2 carries its own; NULL means the global one
 	CHLSprFrame	 frames[HLSPR_MAX_FRAMES];
 };
+
+U32 HLSprColor(CHLSpr *sp, I64 texel)
+{//one texel to 0x00RRGGBB through whichever palette applies
+	texel &= 255;
+
+	if (!sp->palette)
+		return HLPalColor(texel);
+
+	return (sp->palette[texel * 3] << 16) |
+		   (sp->palette[texel * 3 + 1] << 8) |
+			sp->palette[texel * 3 + 2];
+}
+
+Bool HLSprTexelVisible(CHLSpr *sp, I64 texel)
+{//whether a texel draws at all
+ //
+ //INDEXALPHA sprites are monochrome masks - the index is coverage, so 0 is
+ //fully transparent and anything above it shows. every other format cuts on
+ //the last palette entry
+	if (sp->tex_format == HLSPR_INDEXALPHA)
+		return ToBool(texel != 0);
+
+	return ToBool(texel != HLSPR_TRANSPARENT);
+}
 
 CHLSpr *HLSprLoad(U8 *name)
 {//load one sprite from the paks
@@ -68,11 +107,39 @@ CHLSpr *HLSprLoad(U8 *name)
 	sp->raw = d;
 	HLStrCopy(sp->name, name, 64);
 
-	sp->type       = HLRdI32(d + 8);
-	sp->max_width  = HLRdI32(d + 16);
-	sp->max_height = HLRdI32(d + 20);
-	sp->num_frames = HLRdI32(d + 24);
-	sp->interval   = 0.1;
+	sp->version = HLRdI32(d + 4);
+
+	if (sp->version != HLSPR_VERSION_Q && sp->version != HLSPR_VERSION_HL)
+	{
+		"HLSpr: %s is version %d, expected 1 or 2\n", name, sp->version;
+		Free(d);
+		Free(sp);
+		return NULL;
+	}
+
+	//version 2 inserts texFormat after type, shifting everything after it by
+	//four bytes - read the wrong layout and the frame offsets land in texels
+	if (sp->version == HLSPR_VERSION_HL)
+	{
+		sp->type       = HLRdI32(d + 8);
+		sp->tex_format = HLRdI32(d + 12);
+		sp->max_width  = HLRdI32(d + 20);
+		sp->max_height = HLRdI32(d + 24);
+		sp->num_frames = HLRdI32(d + 28);
+		p              = 40;
+	}
+	else
+	{
+		sp->type       = HLRdI32(d + 8);
+		sp->tex_format = HLSPR_NORMAL;
+		sp->max_width  = HLRdI32(d + 16);
+		sp->max_height = HLRdI32(d + 20);
+		sp->num_frames = HLRdI32(d + 24);
+		p              = 36;
+	}
+
+	sp->interval = 0.1;
+	sp->palette  = NULL;
 
 	if (sp->num_frames < 1 || sp->num_frames > HLSPR_MAX_FRAMES)
 	{
@@ -81,7 +148,27 @@ CHLSpr *HLSprLoad(U8 *name)
 		return NULL;
 	}
 
-	p = 36;
+	//v2: u16 colour count then count*3 RGB, before the first frame
+	if (sp->version == HLSPR_VERSION_HL)
+	{
+		I64 colors;
+
+		if (p + 2 > size)
+		{
+			Free(d);
+			Free(sp);
+			return NULL;
+		}
+
+		colors = HLRdU16(d + p);
+		p += 2;
+
+		if (colors > 0 && p + colors * 3 <= size)
+		{
+			sp->palette = d + p;
+			p += colors * 3;
+		}
+	}
 
 	for (i = 0; i < sp->num_frames; i++)
 	{
@@ -164,6 +251,7 @@ U0 HLSprDraw(CHLCanvas *c, CHLSpr *sp, I64 frame, F64 *origin, I64 light)
 	I64			 tx, ty;
 	I64			 texel;
 	I64			 shade;
+	U32			 c32;
 
 	if (!sp || frame < 0 || frame >= sp->num_frames)
 		return;
@@ -228,14 +316,28 @@ U0 HLSprDraw(CHLCanvas *c, CHLSpr *sp, I64 frame, F64 *origin, I64 light)
 
 			texel = fr->pixels[ty * fr->width + tx];
 
-			//255 is the cutout
-			if (texel == HLSPR_TRANSPARENT)
+			if (!HLSprTexelVisible(sp, texel))
 				goto qsd_next;
 
-			//SPR v1 still shares gfx/palette.lmp, so the quake colormap is
-			//still the right shading table here. HL's SPR v2 carries its own
-			//palette and will not come through this path
-			if (texel >= HLPAL_FULLBRIGHT)
+			if (sp->palette)
+			{
+				//v2 carries its own colours, so the global colormap is the
+				//wrong shading table entirely. shade the RGB directly
+				//
+				//INDEXALPHA is a mask: the index is coverage and palette[255]
+				//is the one colour it is drawn in
+				if (sp->tex_format == HLSPR_INDEXALPHA)
+					c32 = HLSprColor(sp, 255);
+				else
+					c32 = HLSprColor(sp, texel);
+
+				//fully parenthesised against ZealC precedence - the shifts
+				//must happen after the scale, not inside it
+				row[x] = ((((c32 >> 16) & 255) * light / 255) << 16) |
+						 ((((c32 >> 8) & 255) * light / 255) << 8) |
+						  (((c32 & 255) * light) / 255);
+			}
+			else if (texel >= HLPAL_FULLBRIGHT)
 				row[x] = HLPalColor(texel);
 			else
 				row[x] = HLPalColor(
