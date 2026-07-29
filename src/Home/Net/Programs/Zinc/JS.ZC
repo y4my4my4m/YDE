@@ -305,6 +305,17 @@
 #define JSN_EL_DISPATCH		295	// element.dispatchEvent(evt) -> fires listeners
 #define JSN_PROMISE_SREJECT	296	// Promise.reject(v) - the static, not the
 									// executor's reject fn (that is 72)
+#define JSN_PROMISE_SALL	297	// Promise.all(arr)
+#define JSN_PROMISE_SRACE	298	// Promise.race(arr)
+#define JSN_PROMISE_SALLSET	299	// Promise.allSettled(arr)
+#define JSN_PROMISE_SANY	300	// Promise.any(arr)
+// Per-element reactions for the four combinators above. Native code has no
+// closures, so the shared counter cannot be captured: it rides on the reaction
+// value itself as _cst, with _ci holding that element's slot index.
+#define JSN_PROMISE_ALLSTEP	301	// all: record value, resolve at zero
+#define JSN_PROMISE_ASOK	302	// allSettled: record {status:"fulfilled"}
+#define JSN_PROMISE_ASERR	303	// allSettled: record {status:"rejected"}
+#define JSN_PROMISE_ANYERR	304	// any: record reason, AggregateError at zero
 
 /* token types */
 #define JT_EOF		0
@@ -2621,6 +2632,14 @@ CJsVal *JsMemberGet(CJsInterp *ji, CJsVal *obj, U8 *name)
 				return JsNativeV(ji, JSN_PROMISE_SRESOLVE);
 			if (obj->native_id == JSN_PROMISE_CTOR && !StrCompare(name, "reject"))
 				return JsNativeV(ji, JSN_PROMISE_SREJECT);
+			if (obj->native_id == JSN_PROMISE_CTOR && !StrCompare(name, "all"))
+				return JsNativeV(ji, JSN_PROMISE_SALL);
+			if (obj->native_id == JSN_PROMISE_CTOR && !StrCompare(name, "race"))
+				return JsNativeV(ji, JSN_PROMISE_SRACE);
+			if (obj->native_id == JSN_PROMISE_CTOR && !StrCompare(name, "allSettled"))
+				return JsNativeV(ji, JSN_PROMISE_SALLSET);
+			if (obj->native_id == JSN_PROMISE_CTOR && !StrCompare(name, "any"))
+				return JsNativeV(ji, JSN_PROMISE_SANY);
 			v = JsPropGet(obj, name); // bound-fn slots (_t/_this) live here
 			if (v)
 				return v;
@@ -4232,6 +4251,178 @@ U0 JsPromiseReact(CJsInterp *ji, CJsVal *pr, CJsVal *cb, Bool on_rej,
 		else
 			JsMicroPass(ji, derived, val, on_rej);
 	}
+}
+
+/* ---- Promise combinators: all / race / allSettled / any ---- */
+
+CJsVal *JsPromiseCoerce(CJsInterp *ji, CJsVal *v)
+{ // Promise.resolve(v) for a combinator input: promises pass through, anything
+  // else is wrapped already-resolved so the element still reports on a
+  // microtask tick instead of inline.
+	CJsVal *pr;
+
+	if (v && v->type == JV_OBJ && v->native_id == JSO_PROMISE)
+		return v;
+	pr = JsPromiseNew(ji);
+	JsPromiseSettle(ji, pr, v, FALSE);
+
+	return pr;
+}
+
+CJsVal *JsCombAggErr(CJsInterp *ji, CJsVal *errors)
+{ // what Promise.any rejects with once every input has rejected. Shaped like
+  // the Error objects JSN_ERROR_CTOR builds, plus the errors array.
+	CJsVal *e = JsValNew(ji, JV_OBJ);
+
+	JsPropSet(ji, e, "name", JsStrV(ji, "AggregateError"));
+	JsPropSet(ji, e, "message", JsStrV(ji, "All promises were rejected"));
+	JsPropSet(ji, e, "stack", JsStrV(ji, ""));
+	JsPropSet(ji, e, "errors", errors);
+
+	return e;
+}
+
+CJsVal *JsCombStateNew(CJsInterp *ji, CJsVal *result, I64 n)
+{ // shared slot array + outstanding counter for one combinator call. Slots are
+  // pre-filled to full length because elements land out of order.
+	CJsVal *st = JsValNew(ji, JV_OBJ);
+	CJsVal *slots = JsArrV(ji);
+	I64		i;
+
+	for (i = 0; i < n; i++)
+		JsArrPush(ji, slots, JsUndefV(ji));
+	JsPropSet(ji, st, "_p", result);
+	JsPropSet(ji, st, "_slots", slots);
+	JsPropSet(ji, st, "_left", JsNumV(ji, n));
+
+	return st;
+}
+
+U0 JsCombStep(CJsInterp *ji, I64 id, CJsVal *self, CJsVal *val)
+{ // one element of a combinator settled. The shared state and this element's
+  // index are read back off the reaction value, since there are no closures.
+	CJsVal *st, *slots, *result, *lv, *rec;
+	I64		idx, left;
+
+	if (!self)
+		return;
+	st = JsPropGet(self, "_cst");
+	lv = JsPropGet(self, "_ci");
+	if (!st || !lv)
+		return;
+	idx = ToI64(JsToNum(lv));
+	slots = JsPropGet(st, "_slots");
+	result = JsPropGet(st, "_p");
+	if (!slots || !result || slots->type != JV_ARR)
+		return;
+	if (idx < 0 || idx >= slots->count)
+		return;
+	if (id == JSN_PROMISE_ASOK || id == JSN_PROMISE_ASERR)
+	{ // allSettled reports an outcome record per input rather than a bare value
+		rec = JsValNew(ji, JV_OBJ);
+		if (id == JSN_PROMISE_ASOK)
+		{
+			JsPropSet(ji, rec, "status", JsStrV(ji, "fulfilled"));
+			JsPropSet(ji, rec, "value", val);
+		}
+		else
+		{
+			JsPropSet(ji, rec, "status", JsStrV(ji, "rejected"));
+			JsPropSet(ji, rec, "reason", val);
+		}
+	}
+	else
+		rec = val;
+	slots->items[idx] = rec;
+	lv = JsPropGet(st, "_left");
+	left = 0;
+	if (lv)
+		left = ToI64(JsToNum(lv));
+	left--;
+	JsPropSet(ji, st, "_left", JsNumV(ji, left));
+	if (left > 0)
+		return;
+	if (id == JSN_PROMISE_ANYERR)
+	{ // nothing fulfilled, so the collected reasons are the rejection
+		JsPromiseSettle(ji, result, JsCombAggErr(ji, slots), TRUE);
+		return;
+	}
+	JsPromiseSettle(ji, result, slots, FALSE);
+}
+
+U0 JsCombWatch(CJsInterp *ji, CJsVal *el, I64 step_id, CJsVal *st, I64 idx,
+			   Bool on_rej)
+{ // register one per-element reaction carrying its slot index
+	CJsVal *cb = JsNativeV(ji, step_id);
+
+	JsPropSet(ji, cb, "_cst", st);
+	JsPropSet(ji, cb, "_ci", JsNumV(ji, idx));
+	JsPromiseReact(ji, el, cb, on_rej, NULL);
+}
+
+U0 JsCombSettleWith(CJsInterp *ji, CJsVal *el, CJsVal *result, Bool on_rej)
+{ // first-past-the-post: settle result directly off this element. The executor
+  // resolve/reject natives already do exactly that, and JsPromiseSettle drops
+  // every later settlement, so race/any need nothing of their own here.
+	CJsVal *cb;
+
+	if (on_rej)
+		cb = JsNativeV(ji, JSN_PROMISE_REJECT);
+	else
+		cb = JsNativeV(ji, JSN_PROMISE_RESOLVE);
+	cb->proto = result;
+	JsPromiseReact(ji, el, cb, on_rej, NULL);
+}
+
+CJsVal *JsPromiseComb(CJsInterp *ji, I64 id, CJsVal **args, I64 argc)
+{ // Promise.all / race / allSettled / any. Only real arrays are accepted as
+  // input; the engine has no iterator protocol to walk anything else.
+	CJsVal *result, *arr, *st, *el;
+	I64		i, n;
+
+	result = JsPromiseNew(ji);
+	arr = JsArgOr(ji, args, argc, 0);
+	n = 0;
+	if (arr && arr->type == JV_ARR)
+		n = arr->count;
+	if (!n)
+	{ // Promise.race([]) is required to stay pending forever, so it is the one
+	  // case that falls through with an untouched promise
+		if (id == JSN_PROMISE_SALL || id == JSN_PROMISE_SALLSET)
+			JsPromiseSettle(ji, result, JsArrV(ji), FALSE);
+		else if (id == JSN_PROMISE_SANY)
+			JsPromiseSettle(ji, result, JsCombAggErr(ji, JsArrV(ji)), TRUE);
+		return result;
+	}
+	st = NULL;
+	if (id != JSN_PROMISE_SRACE)
+		st = JsCombStateNew(ji, result, n);
+	for (i = 0; i < n; i++)
+	{
+		el = JsPromiseCoerce(ji, arr->items[i]);
+		if (id == JSN_PROMISE_SRACE)
+		{ // whichever settles first wins, fulfilled or rejected
+			JsCombSettleWith(ji, el, result, FALSE);
+			JsCombSettleWith(ji, el, result, TRUE);
+		}
+		else if (id == JSN_PROMISE_SALL)
+		{ // collect values in input order, but reject on the first failure
+			JsCombWatch(ji, el, JSN_PROMISE_ALLSTEP, st, i, FALSE);
+			JsCombSettleWith(ji, el, result, TRUE);
+		}
+		else if (id == JSN_PROMISE_SALLSET)
+		{ // never rejects: both outcomes just fill a slot
+			JsCombWatch(ji, el, JSN_PROMISE_ASOK, st, i, FALSE);
+			JsCombWatch(ji, el, JSN_PROMISE_ASERR, st, i, TRUE);
+		}
+		else
+		{ // any: first fulfilment wins, reasons accumulate for AggregateError
+			JsCombSettleWith(ji, el, result, FALSE);
+			JsCombWatch(ji, el, JSN_PROMISE_ANYERR, st, i, TRUE);
+		}
+	}
+
+	return result;
 }
 
 CJsVal *JsFetch(CJsInterp *ji, CJsVal **args, I64 argc)
