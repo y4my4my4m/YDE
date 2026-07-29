@@ -59,6 +59,7 @@
 #define JSO_PROMISE		7
 #define JSO_CLASSLIST	8
 #define JSO_PROXY		9	// new Proxy(t, h); slots _ptarget / _phandler
+#define JSO_DATASET	10	// el.dataset: camelCase <-> data-* attributes
 
 /* native function ids */
 #define JSN_ALERT			1
@@ -317,6 +318,8 @@
 #define JSN_PROMISE_ASOK	302	// allSettled: record {status:"fulfilled"}
 #define JSN_PROMISE_ASERR	303	// allSettled: record {status:"rejected"}
 #define JSN_PROMISE_ANYERR	304	// any: record reason, AggregateError at zero
+#define JSN_EVT_STOPPROP	305	// evt.stopPropagation(): halts the bubble walk
+#define JSN_DOC_CREATE_FRAG	306	// document.createDocumentFragment()
 
 /* token types */
 #define JT_EOF		0
@@ -1073,6 +1076,8 @@ CJsNode *JsParseClass(CJsInterp *ji)
 				else
 					item->str = t->str;
 			}
+			if (acc)
+				item->op = acc; // get/set member: JN_CLASS builds an accessor
 			if (JsIsPunct(ji, '('))
 				item->a = JsParseFunc(ji, FALSE); // method (params){body}
 			else
@@ -2679,6 +2684,7 @@ CJsVal *JsMemberGet(CJsInterp *ji, CJsVal *obj, U8 *name)
 	CZNode *node, *snode, *scur;
 	U8	   *attr;
 	U8		buf[1024]; // stack frames stay small: this recurses via JsEval
+	U8		dkebab[64], dkey[80];
 	I64		len;
 
 	// Proxy and accessors hook in HERE, the JS-visible path, never in
@@ -2822,6 +2828,15 @@ CJsVal *JsMemberGet(CJsInterp *ji, CJsVal *obj, U8 *name)
 
 	switch (obj->native_id)
 	{
+		case JSO_DATASET:
+			// mirror of the setter: data-user-id reads back as dataset.userId
+			node = obj->node;
+			JsCamelToKebab(name, dkebab, 60);
+			StrPrint(dkey, "data-%s", dkebab);
+			attr = ZNodeAttr(node, dkey);
+			if (attr)
+				return JsStrV(ji, attr);
+			return JsUndefV(ji);
 		case JSO_DOCUMENT:
 			if (!StrCompare(name, "title"))
 			{
@@ -2859,6 +2874,8 @@ CJsVal *JsMemberGet(CJsInterp *ji, CJsVal *obj, U8 *name)
 				return JsNativeV(ji, JSN_DOC_CREATE_EVENT);
 			if (!StrCompare(name, "createTextNode"))
 				return JsNativeV(ji, JSN_DOC_CREATE_TX);
+			if (!StrCompare(name, "createDocumentFragment"))
+				return JsNativeV(ji, JSN_DOC_CREATE_FRAG);
 			if (!StrCompare(name, "querySelector"))
 				return JsNativeV(ji, JSN_QSEL);
 			if (!StrCompare(name, "querySelectorAll"))
@@ -3064,6 +3081,25 @@ CJsVal *JsMemberGet(CJsInterp *ji, CJsVal *obj, U8 *name)
 				}
 				return v;
 			}
+			if (!StrCompare(name, "childNodes"))
+			{ // unlike `children`, TEXT nodes count
+				v = JsArrV(ji);
+				node = node->first_child;
+				while (node)
+				{
+					JsArrPush(ji, v, JsElemV(ji, node));
+					node = node->next;
+				}
+				return v;
+			}
+			if (!StrCompare(name, "dataset"))
+			{ // a view onto the element's data-* attributes, same trick as
+			  // .style: a JSO_ flavour whose member get/set rewrites the name
+				v = JsValNew(ji, JV_OBJ);
+				v->native_id = JSO_DATASET;
+				v->node = node;
+				return v;
+			}
 			attr = ZNodeAttr(node, name);
 			if (attr)
 				return JsStrV(ji, attr);
@@ -3219,6 +3255,16 @@ U0 JsMemberSet(CJsInterp *ji, CJsVal *obj, U8 *name, CJsVal *val)
 				ZNodeAttrSet(node, name, JsToStr(ji, val));
 				ji->dom_dirty = TRUE;
 			}
+			return;
+		case JSO_DATASET:
+			// dataset.userId -> the data-user-id attribute
+			node = obj->node;
+			JsCamelToKebab(name, kebab, 60);
+			StrPrint(style_buf, "data-%s", kebab);
+			// writing a key that does not exist yet CREATES it: do NOT gate
+			// this on ZNodeAttr the way a read would
+			ZNodeAttrSet(node, style_buf, JsToStr(ji, val));
+			ji->dom_dirty = TRUE;
 			return;
 		case JSO_STYLE:
 			node = obj->node;
@@ -3763,6 +3809,14 @@ CJsVal *JsEval(CJsInterp *ji, CJsNode *node)
 					// computed key {[expr]: val}
 					JsPropSet(ji, v, JsToStr(ji, JsEval(ji, child->b)),
 							  JsEval(ji, child->a));
+				else if (child->op == 1)
+					// get x(): the parser marked it, build a real accessor so a
+					// read CALLS it instead of handing back the function
+					JsAccessorDefine(ji, v, child->str, JsEval(ji, child->a),
+									 NULL);
+				else if (child->op == 2)
+					JsAccessorDefine(ji, v, child->str, NULL,
+									 JsEval(ji, child->a));
 				else
 					JsPropSet(ji, v, child->str, JsEval(ji, child->a));
 				child = child->next;
@@ -4411,11 +4465,25 @@ CJsVal *JsEval(CJsInterp *ji, CJsNode *node)
 			while (child)
 			{
 				fn = JsEval(ji, child->a); // JN_FUNC: closure value
+				if (child->op == 1)
+				{ // get x() on the prototype: fires for every instance through
+				  // JsAccessorFind's chain walk
+					JsAccessorDefine(ji, obj, child->str, fn, NULL);
+					child = child->next;
+					goto js_class_next;
+				}
+				if (child->op == 2)
+				{
+					JsAccessorDefine(ji, obj, child->str, NULL, fn);
+					child = child->next;
+					goto js_class_next;
+				}
 				if (!StrCompare(child->str, "constructor"))
 					v = fn;
 				else
 					JsPropSet(ji, obj, child->str, fn);
 				child = child->next;
+js_class_next:;
 			}
 			if (!v && sv)
 			{ // derived class with no constructor of its own: synthesise
@@ -5139,8 +5207,24 @@ U0 JsStyleIngest(CJsInterp *ji, CZNode *node)
 
 U0 JsNodeAppend(CJsInterp *ji, CZNode *p, CZNode *c)
 {
+	CZNode *kid, *nxt;
+
 	if (!p || !c || p == c)
 		return;
+	if (!StrCompare(c->tag, "#fragment"))
+	{ // a DocumentFragment inserts its CHILDREN and is left empty; that is the
+	  // whole reason frameworks batch through one
+		kid = c->first_child;
+		while (kid)
+		{
+			nxt = kid->next;
+			JsNodeAppend(ji, p, kid);
+			kid = nxt;
+		}
+		c->first_child = NULL;
+		c->last_child = NULL;
+		return;
+	}
 	JsNodeDetach(c);
 	c->parent = p;
 	c->next = NULL;
@@ -5152,6 +5236,101 @@ U0 JsNodeAppend(CJsInterp *ji, CZNode *p, CZNode *c)
 	zh_dom_gen++;
 	ji->dom_dirty = TRUE;
 	JsStyleIngest(ji, c); // CSS-in-JS: appending a filled <style> applies it
+}
+
+CZNode *JsNodeClone(CJsInterp *ji, CZNode *src, Bool deep, I64 depth)
+{ // A REAL copy. cloneNode used to hand back the very node it was called on, so
+  // the standard <template> + cloneNode pattern mutated the template itself and
+  // the deep flag did nothing. Recurses directly (never through a forward
+  // declaration - that has miscompiled here). Returns NULL if the node budget
+  // is exhausted, which the caller reports as null.
+	CZNode *n, *kid, *ckid;
+	CZAttr *a;
+
+	if (!src || depth > 64)
+		return NULL;
+	n = ZNodeNew(src->type, NULL);
+	if (!n)
+		return NULL;
+	StrCopy(n->tag, src->tag);
+	if (src->text)
+		n->text = StrNew(src->text);
+	if (src->value)
+		n->value = StrNew(src->value);
+	n->checked = src->checked;
+	a = src->attrs;
+	while (a)
+	{
+		ZNodeAttrSet(n, a->name, a->val);
+		a = a->next;
+	}
+	if (!deep)
+		return n; // shallow: attributes and text of THIS node only
+
+	kid = src->first_child;
+	while (kid)
+	{
+		ckid = JsNodeClone(ji, kid, TRUE, depth + 1);
+		if (ckid)
+			JsNodeAppend(ji, n, ckid);
+		kid = kid->next;
+	}
+
+	return n;
+}
+
+U0 JsNodeInsertBefore(CJsInterp *ji, CZNode *p, CZNode *c, CZNode *ref)
+{ // real insertBefore. This used to just append, so any framework that patches
+  // a list by ORDER (which is most of them) rendered its children reversed or
+  // shuffled. Children are a singly-linked next-chain, so splicing means
+  // finding ref's predecessor.
+	CZNode *prev, *kid, *nxt;
+
+	if (!p || !c || p == c)
+		return;
+	if (!ref || ref->parent != p)
+	{ // absent or foreign reference node: the spec says append
+		JsNodeAppend(ji, p, c);
+		return;
+	}
+	if (!StrCompare(c->tag, "#fragment"))
+	{ // fragment: splice its children in, in order, ahead of ref
+		kid = c->first_child;
+		while (kid)
+		{
+			nxt = kid->next;
+			JsNodeInsertBefore(ji, p, kid, ref);
+			kid = nxt;
+		}
+		c->first_child = NULL;
+		c->last_child = NULL;
+		return;
+	}
+	JsNodeDetach(c); // may itself be in this chain; unlink before searching
+	c->parent = p;
+	if (p->first_child == ref)
+	{
+		c->next = ref;
+		p->first_child = c;
+	}
+	else
+	{
+		prev = p->first_child;
+		while (prev && prev->next != ref)
+			prev = prev->next;
+		if (!prev)
+		{ // ref vanished from the chain mid-flight: degrade to append
+			JsNodeAppend(ji, p, c);
+			return;
+		}
+		c->next = ref;
+		prev->next = c;
+	}
+	if (!p->last_child)
+		p->last_child = c;
+	zh_dom_gen++;
+	ji->dom_dirty = TRUE;
+	JsStyleIngest(ji, c);
 }
 
 U0 JsQSelSplit(U8 *sel, U8 *tag, U8 *cls, U8 *id)
@@ -5314,14 +5493,19 @@ U0 JsClassListMod(CJsInterp *ji, CZNode *node, U8 *tok, I64 mode)
    forward-declared above. */
 
 CJsVal *JsEventObj(CJsInterp *ji, CZNode *node, U8 *type)
-{ // the minimal Event passed to a handler
+{ // the Event handed to a handler. `target` stays the node the event started
+  // on for the whole walk; `currentTarget` is rewritten at each ancestor, which
+  // is the pair event delegation reads.
 	CJsVal *e = JsValNew(ji, JV_OBJ);
 
 	JsPropSet(ji, e, "type", JsStrV(ji, type));
 	if (node)
+	{
 		JsPropSet(ji, e, "target", JsElemV(ji, node));
+		JsPropSet(ji, e, "currentTarget", JsElemV(ji, node));
+	}
 	JsPropSet(ji, e, "preventDefault",  JsNativeV(ji, JSN_EVT_NOOP));
-	JsPropSet(ji, e, "stopPropagation", JsNativeV(ji, JSN_EVT_NOOP));
+	JsPropSet(ji, e, "stopPropagation", JsNativeV(ji, JSN_EVT_STOPPROP));
 	return e;
 }
 
@@ -5509,25 +5693,38 @@ U0 JsXhrSend(CJsInterp *ji, CJsVal *xhr, CJsVal *body_val)
 		JsXhrFire(ji, xhr);
 }
 
-Bool JsDispatchEvent(CJsInterp *ji, CZNode *node, U8 *type)
-{ // fire every active handler bound to (node, type). Returns TRUE if any ran.
+Bool JsDispatchEvent(CJsInterp *ji, CZNode *node, U8 *type, Bool bubbles=TRUE)
+{ // Fire handlers for `type` on the target, then on each ancestor, until the
+  // root or a stopPropagation(). Used to match l->node == node exactly, so
+  // nothing bubbled - which silently broke event DELEGATION, the pattern React
+  // and most routers are built on (one listener high up, e.target identifies
+  // the real source). Returns TRUE if any handler ran.
 	CJsListener *l;
-	CJsVal		*evt, *a1;
+	CJsVal		*evt, *a1, *stopped;
+	CZNode		*cur = node;
+	I64			 depth = 0;
 	Bool		 ran = FALSE;
 
 	if (!ji || !node || !type)
 		return FALSE;
 
 	evt = JsEventObj(ji, node, type);
+	while (cur && depth < 64)
+	{
+	// one Event object for the whole walk (as in the DOM); only the
+	// currentTarget slot is rewritten per level
+	JsPropSet(ji, evt, "currentTarget", JsElemV(ji, cur));
 	l = ji->listeners;
 	while (l)
 	{
-		if (l->active && l->node == node && !StrCompare(l->type, type))
+		if (l->active && l->node == cur && !StrCompare(l->type, type))
 		{
 			ji->has_err = FALSE;
 			ji->steps = 0; ji->depth = 0; ji->flow = JF_NORMAL; ji->env = ji->genv;
 			a1 = evt;
-			JsCall(ji, l->fn, JsElemV(ji, node), &a1, 1);
+			// `this` inside a handler is the node the handler is ON
+			// (currentTarget), not the node the event started from
+			JsCall(ji, l->fn, JsElemV(ji, cur), &a1, 1);
 			ran = TRUE;
 			if (ji->has_err)
 			{
@@ -5536,6 +5733,14 @@ Bool JsDispatchEvent(CJsInterp *ji, CZNode *node, U8 *type)
 			}
 		}
 		l = l->next;
+	}
+	stopped = JsPropGet(evt, "_stopped");
+	if (stopped && JsToBool(stopped))
+		break;
+	if (!bubbles)
+		break;
+	cur = cur->parent;
+	depth++;
 	}
 	if (ran)
 	{
