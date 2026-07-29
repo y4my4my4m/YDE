@@ -1,12 +1,11 @@
-//YKD native AC'97 audio driver + software mixer.
-//Ported from ZealAmp/erythros (Alec Murphy / y4my4m), adapted to the ZealOS
-//kernel PCI API. Pure ZealC - no ELF, no FFI. Polling driven (no IRQs).
+//AC'97 audio driver + software mixer. Polling driven, no IRQs.
+//Ported from ZealAmp/erythros (Alec Murphy / y4my4m) onto the ZealOS PCI API.
 //
-//QEMU needs: -device AC97,audiodev=<your audiodev>
-//If no AC'97 device is found, everything no-ops safely (ac97.present=FALSE).
+//QEMU needs: -device AC97,audiodev=<audiodev>
+//No device found -> ac97.present=FALSE and every entry point no-ops.
 //
-//Output path: streams are CFifoI64s of U32 frames (L16|R16<<16, 48kHz).
-//AC97MixTask mixes all live streams into the hardware Buffer Descriptor List.
+//Streams are CFifoI64s of U32 frames (L16|R16<<16, 48kHz). AC97MixTask mixes
+//all live streams into the hardware Buffer Descriptor List.
 
 #define AC97_INT_IOC			(1 << 3)
 
@@ -15,27 +14,25 @@
 #define AC97_PCM_BUF_SIZE		2048
 #define AC97_PCM_OUT			1
 
-//Native Audio Mixer registers (U16)
+//--- native audio mixer registers (U16) ---
 #define AC97_RESET				0x00
 #define AC97_MASTER_VOL			0x02
 #define AC97_PCM_VOL			0x18
 
-//Native Audio Bus Master registers
+//--- native audio bus master registers ---
 #define AC97_PCM_OUTPUT_REG_BOX	0x10
 #define AC97_GLOBAL_CTL			0x2C
 
-//NABM register box registers
+//--- NABM register box ---
 #define AC97_BUFFER_DSC_ADDR	0x00
 #define AC97_CURRENT_INDEX		0x04 //Buffer the hardware is playing RIGHT NOW.
 #define AC97_LAST_VALID_ENTRY	0x05
 #define AC97_TRANSFER_STS		0x06
 #define AC97_BUFFER_CNT			0x0B
 
-//How many buffers to keep queued ahead of the play cursor. Each buffer is
-//AC97_BDL_BUF_SIZE/4 = 511 frames, about 10.6ms at 48kHz, so 4 buffers is
-//roughly 42ms of latency. The mixer task polls every 1ms, so it has ample
-//time to top the queue back up; going much lower risks underrun crackle,
-//going higher is audible lag on game sound effects.
+//buffers queued ahead of the play cursor. AC97_BDL_BUF_SIZE/4 = 511 frames =
+//10.6ms at 48kHz, so 4 is ~42ms of latency. Mixer task polls at 1ms; lower
+//risks underrun crackle, higher is audible lag on sfx.
 #define AC97_TARGET_LEAD		4
 
 class CAC97PCIInfo
@@ -73,23 +70,17 @@ class CAudioStream
 	CFifoI64 *data;
 };
 
-//SFX voices.
+//--- sfx voices ---
+//AC'97 has exactly ONE PCM-Out DMA engine, so all voice mixing is software
+//and the voice count is a free choice: same single DMA buffer, more sources.
 //
-//AC'97 hardware has exactly ONE PCM-Out DMA engine - there are no hardware
-//voices to enable - so every AC'97 driver mixes in software, and the voice count
-//is purely a software choice. This costs nothing on real hardware because it
-//changes no hardware interaction at all: the same single DMA buffer is filled,
-//just from more sources.
-//
-//A voice REFERENCES the caller's PCM rather than copying it into a FIFO, which
-//is what makes many of them affordable: a FIFO stream is 2MB (one I64 slot per
-//4-byte frame), while a voice is a few dozen bytes. The streams stay for
-//continuous feeds - ZealAmp, Tracker, the browser's <audio> - which genuinely
-//need buffering; one-shot effects do not.
+//A voice REFERENCES the caller's PCM instead of copying it into a FIFO: a
+//FIFO stream costs 2MB (one I64 slot per 4-byte frame), a voice a few dozen
+//bytes. Streams stay for continuous feeds that need buffering.
 //
 //CONTRACT: the frames passed in must stay valid until playback finishes or
 //AudioSFXStopAll is called. The caller owns that memory.
-//The mixer's own output rate, used to work out each voice's resample step.
+//mixer output rate; sets each voice's resample step
 #define QSND_MIX_RATE			48000
 #define AUDIO_MAX_SFX_VOICES	24
 #define AUDIO_VOL_UNITY			256
@@ -105,16 +96,14 @@ class CAudioVoice
 	I64	 serial;	//bumped on every allocation; see AudioSFXStop
 	Bool active;
 
-	//A looping voice never finishes on its own: at the end of the buffer the
-	//position wraps instead of clearing `active`. Used for sustained sources
-	//- wind, water, machinery - which are one short sample played forever
-	//rather than a sound that has a natural end.
+	//a looping voice never finishes on its own: at the end of the buffer the
+	//position wraps instead of clearing 'active'
 	Bool loop;
 };
 
-//A handle is slot + serial. The slot alone is not enough: by the time a caller
-//asks to stop a voice it may already have finished and been handed to someone
-//else, and stopping that one instead is a bug you hear rather than see.
+//handle = slot + serial. THE SERIAL MUST BE CHECKED TOO: by the time a caller
+//stops a voice the slot may already have been reused, and stopping the new
+//owner instead is a bug you hear rather than see.
 #define AUDIO_VOICE_SHIFT	8
 
 class CAudio
@@ -148,19 +137,15 @@ U0 AudioInit()
 public I64 AudioSFXPlayRef(U32 *frames, I64 count, I64 rate = QSND_MIX_RATE,
 	I64 vol_l = AUDIO_VOL_UNITY, I64 vol_r = AUDIO_VOL_UNITY,
 	Bool loop = FALSE)
-{//Play a buffer WITHOUT copying it, resampling from `rate` to the mixer's
- //output rate. Returns the voice, or -1 if all are busy. The buffer must
- //outlive playback - see the contract above.
+{//Play frames WITHOUT copying, resampling rate -> mixer rate. Returns a
+ //handle, or -1 if all voices are busy. The buffer must outlive playback.
  //
- //`loop` makes the voice repeat until it is stopped explicitly. It defaults
- //off, so every existing caller keeps the one-shot behaviour it was written
- //against; a looping voice also never frees itself, so whoever starts one owns
- //stopping it.
+ //loop repeats until stopped explicitly; a looping voice never frees itself,
+ //so whoever starts one owns stopping it.
  //
- //Taking a rate here is what lets callers keep their audio at its native rate.
- //Game effects are 11025Hz; pre-converting them to the 48kHz output rate costs
- //over four times the memory for no gain in quality, since the conversion is
- //the same nearest-sample step either way.
+ //Taking a rate lets callers keep audio at its native rate: game sfx are
+ //11025Hz, and pre-converting to 48kHz costs 4x the memory for no quality
+ //gain - it is the same nearest-sample step either way.
 	I64 i;
 	I64 slot = -1;
 
@@ -175,8 +160,8 @@ public I64 AudioSFXPlayRef(U32 *frames, I64 count, I64 rate = QSND_MIX_RATE,
 	if (vol_r < 0)					vol_r = 0;
 	if (vol_r > AUDIO_VOL_UNITY)	vol_r = AUDIO_VOL_UNITY;
 
-	//Task-only contention (the mixer is a task, not an interrupt), so a plain
-	//spin with Yield is safe here.
+	//task-only contention (the mixer is a task, not an interrupt), so a plain
+	//spin with Yield is safe
 	while (LBts(&audio.voice_lock, 0))
 		Yield;
 
@@ -200,8 +185,8 @@ public I64 AudioSFXPlayRef(U32 *frames, I64 count, I64 rate = QSND_MIX_RATE,
 		audio.voice[slot].loop    = loop;
 		audio.voice[slot].serial++;
 
-		//Set LAST: the mixer reads this flag to decide whether the rest of the
-		//slot is meaningful.
+		//set LAST: the mixer reads this flag to decide whether the rest of the
+		//slot is meaningful
 		audio.voice[slot].active = TRUE;
 
 		slot |= audio.voice[slot].serial << AUDIO_VOICE_SHIFT;
@@ -237,8 +222,7 @@ public Bool AudioSFXPlaying(I64 handle)
 }
 
 public U0 AudioSFXStop(I64 handle)
-{//Stop one voice. Used to take a channel away from a sound that is being
- //replaced, which is what Quake does when an entity retriggers the same one.
+{//Stop one voice, e.g. stealing the channel of a sound being retriggered.
 	I64 slot;
 
 	while (LBts(&audio.voice_lock, 0))
@@ -247,8 +231,8 @@ public U0 AudioSFXStop(I64 handle)
 	slot = AudioSFXSlotOf(handle);
 	if (slot >= 0)
 	{
-		//Cleared before `active` so a looping voice cannot be re-armed by the
-		//mixer between the two writes.
+		//loop cleared before active, else the mixer re-arms the looping voice
+		//between the two writes
 		audio.voice[slot].loop   = FALSE;
 		audio.voice[slot].active = FALSE;
 		audio.voice[slot].frames = NULL;
@@ -258,8 +242,8 @@ public U0 AudioSFXStop(I64 handle)
 }
 
 public U0 AudioSFXVoiceVolSet(I64 handle, I64 vol_l, I64 vol_r)
-{//Re-aim a voice that is already playing. The listener moves while a sound is
- //still running, and a fixed pan set at trigger time drifts audibly wrong.
+{//Re-aim a playing voice; a pan fixed at trigger time drifts audibly wrong
+ //as the listener moves.
 	I64 slot;
 
 	if (vol_l < 0)					vol_l = 0;
@@ -289,8 +273,8 @@ public U0 AudioSFXStopAll()
 
 	for (i = 0; i < AUDIO_MAX_SFX_VOICES; i++)
 	{
-		//loop first, or a repeating voice re-arms itself in the mixer between
-		//this write and the next one and survives the shutdown.
+		//loop first, else a repeating voice re-arms in the mixer between these
+		//two writes and survives the shutdown
 		audio.voice[i].loop   = FALSE;
 		audio.voice[i].active = FALSE;
 		audio.voice[i].frames = NULL;
@@ -298,9 +282,8 @@ public U0 AudioSFXStopAll()
 
 	LBtr(&audio.voice_lock, 0);
 
-	//The mixer may be part way through a buffer holding a pointer it already
-	//read. It runs every millisecond, so this is comfortably long enough for
-	//any in-flight pass to finish before the caller frees the samples.
+	//the mixer may still hold a frames pointer it already read; it runs every
+	//1ms, so this outlasts any in-flight pass before the caller frees the PCM
 	Sleep(4);
 }
 
@@ -343,10 +326,10 @@ public I64 AudioSFXPlay(U32 *frames, I64 count)
 	return stream;
 }
 
-//Incremental streaming feed (browser <audio>): open a stream, push frames one at
-//a time (respecting fifo space so a long song does not need a giant buffer),
-//stop when done. AudioStreamPush returns FALSE when the fifo is full - the
-//caller sleeps and retries. Complements AudioSFXPlay (which queues all at once).
+//--- incremental streaming feed ---
+//open, push frames one at a time, stop. AudioStreamPush returns FALSE when
+//the fifo is full - the caller sleeps and retries. AudioSFXPlay instead
+//queues a whole buffer at once.
 public I64 AudioStreamOpen()
 {//Grab a free output stream, cleared + ready to be fed. -1 if none free.
 	I64 stream = AudioAvailableOutputStreamGet;
@@ -415,13 +398,9 @@ public U0 AC97MasterVolumeSet(I64 pct)
 
 U0 AC97OutputMix(U32 *buf, I64 length)
 {//Sum every live source into one hardware buffer.
- //
- //Two kinds of source, mixed differently on purpose:
- //  streams - buffered continuous feeds, averaged the way they always were so
- //            existing players sound exactly as before
- //  voices  - one-shot effects, SUMMED and then clamped, because averaging
- //            would make every effect quieter as more of them played, which is
- //            wrong for game audio: a second gunshot must not halve the first
+ //  streams - averaged, so a continuous feed keeps constant loudness
+ //  voices  - SUMMED then clamped; averaging would make every effect quieter
+ //            as more played, and a second gunshot must not halve the first
 	CAudioVoice *vp;
 	I64 i, j, acc_l, acc_r, acc_streams;
 	I64 sample;
@@ -456,13 +435,11 @@ U0 AC97OutputMix(U32 *buf, I64 length)
 
 			if (vp->active && vp->frames && (vp->pos_fp >> 16) < vp->count)
 			{
-				//Nearest source sample. These are 11kHz effects played out of a
-				//48kHz path, and the original resamples no better.
+				//nearest source sample; 11kHz sfx in a 48kHz path, and the
+				//original resamples no better
 				vsamp = vp->frames[vp->pos_fp >> 16];
 
-				//Parenthesised deliberately: shift and multiply precedence
-				//differs from C here, so mixed arithmetic gets explicit
-				//grouping rather than relying on it.
+				//PARENTHESISE: ZealC shift/multiply precedence differs from C
 				acc_l += (vsamp.i16[0] * vp->vol_l) / AUDIO_VOL_UNITY;
 				acc_r += (vsamp.i16[1] * vp->vol_r) / AUDIO_VOL_UNITY;
 
@@ -471,12 +448,11 @@ U0 AC97OutputMix(U32 *buf, I64 length)
 				{
 					if (vp->loop)
 					{
-						//Subtract the buffer length rather than resetting to
-						//zero: that carries the fractional phase across the
-						//join, so the wrap does not quantise to a sample
-						//boundary and click once per repeat. A while, not an
-						//if, because one output step can span a very short
-						//buffer more than once.
+						//subtract the length, do not zero: this carries the
+						//fractional phase across the join, else the wrap
+						//quantises to a sample boundary and clicks once per
+						//repeat. while, not if: one output step can span a
+						//very short buffer more than once.
 						while ((vp->pos_fp >> 16) >= vp->count)
 							vp->pos_fp -= vp->count << 16;
 					}
@@ -486,8 +462,7 @@ U0 AC97OutputMix(U32 *buf, I64 length)
 			}
 		}
 
-		//Clamp rather than wrap. Wrapping an overloaded sum inverts the
-		//waveform and is heard as a loud crack.
+		//clamp, do not wrap: a wrapped sum inverts the waveform and cracks
 		if (acc_l >  32767)	acc_l =  32767;
 		if (acc_l < -32768)	acc_l = -32768;
 		if (acc_r >  32767)	acc_r =  32767;
@@ -500,17 +475,10 @@ U0 AC97OutputMix(U32 *buf, I64 length)
 
 
 U0 AC97BufferFill()
-{//Keep a small, BOUNDED number of buffers queued ahead of the play cursor.
- //
- //This used to fill exactly one buffer per call without ever looking at where
- //the hardware actually was. Whenever the card drained faster than the mixer
- //task refilled, the last-valid index slipped further and further ahead of the
- //play position, and the queue grew until it approached the whole 32-entry
- //ring - about 340ms of audio waiting to be heard. That is what made sound
- //effects arrive noticeably after the action that caused them.
- //
- //Reading the current index closes the loop: fill only until the lead reaches
- //the target, so latency stays fixed instead of drifting upward.
+{//Keep a BOUNDED number of buffers queued ahead of the play cursor. MUST
+ //read the current index: filling blind lets lvi drift ahead until the queue
+ //approaches the whole 32-entry ring, ~340ms of latency, whenever the card
+ //drains faster than the mixer task refills.
 	I64  civ  = InU8(ac97.nabm + AC97_PCM_OUTPUT_REG_BOX + AC97_CURRENT_INDEX);
 	I64  lvi  = InU8(ac97.nabm + AC97_PCM_OUTPUT_REG_BOX + AC97_LAST_VALID_ENTRY);
 	I64  lead;
@@ -520,15 +488,15 @@ U0 AC97BufferFill()
 	civ &= AC97_MAX_BDLS - 1;
 	lvi &= AC97_MAX_BDLS - 1;
 
-	//Distance from the play cursor to the last valid buffer, around the ring.
+	//distance from play cursor to last valid buffer, around the ring
 	lead = (lvi - civ) & (AC97_MAX_BDLS - 1);
 
-	//The guard bounds the work per call: without it a stalled or misreported
-	//index could spin here filling the entire ring.
+	//guard bounds work per call: a stalled or misreported index would
+	//otherwise spin here filling the entire ring
 	while (lead < AC97_TARGET_LEAD && guard < AC97_MAX_BDLS)
 	{
-		//Same fill-then-advance order the working driver used: mix into the
-		//entry the hardware reports as last-valid, then move the register on.
+		//fill then advance: mix into the entry reported last-valid, only
+		//then move the register on
 		buf = ac97.bdl->entries[lvi].addr;
 		AC97OutputMix(buf, AC97_BDL_BUF_SIZE);
 
