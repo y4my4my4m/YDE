@@ -1,0 +1,1443 @@
+// HLStudio.ZC - studio models, "IDST" version 10
+//
+// Nothing about this resembles the alias models in HLMDL.ZC. Those morph a
+// fixed vertex set between whole-model snapshots. A studio model is skeletal:
+//
+//   bones        a hierarchy, each with a rest pose and a per-channel scale
+//   sequences    named animations, each a set of RLE compressed channels
+//   bodyparts    -> submodels -> meshes, a mesh being tristrips over one skin
+//   textures     8bpp, each with its OWN 256 colour palette, like a miptex
+//
+// so drawing is: evaluate six channels per bone at the current frame, build a
+// quaternion and a position, concatenate down the hierarchy, transform every
+// vertex by its one bone, then rasterise.
+//
+// on-disk layout is fixed size records at header offsets. as everywhere else
+// in this tree, nothing is overlaid - the on-disk floats are binary32 and
+// ZealC is F64-only, so every field is pulled out by hand.
+//
+// not implemented yet, in rough order of how much they are missed:
+//   sequence groups (<name>NN.mdl), chrome skins, attachments, hitboxes,
+//   events, 4-way blends, per-vertex lighting from the normals
+
+#define HLST_MAGIC			0x54534449	//"IDST" little-endian
+#define HLST_MAGIC_SEQ		0x51534449	//"IDSQ", a sequence group file
+#define HLST_VERSION		10
+
+#define HLST_MAX_BONES		128
+#define HLST_MAX_VERTS		2048
+#define HLST_MAX_TEXTURES	64
+#define HLST_MAX_BODYPARTS	32
+#define HLST_MAX_SUBMODELS	32
+#define HLST_MAX_MESHES		48
+#define HLST_MAX_SEQS		256
+#define HLST_MAX_CONTROLLERS 8		//4 generic + mouth, with headroom
+
+//record sizes, so a malformed count can be bounds checked before it is used
+#define HLST_HDR_SIZE		244
+#define HLST_BONE_SIZE		112
+#define HLST_BONECTL_SIZE	24
+#define HLST_SEQ_SIZE		176
+#define HLST_TEX_SIZE		80
+#define HLST_BODYPART_SIZE	76
+#define HLST_MODEL_SIZE		112
+#define HLST_MESH_SIZE		20
+#define HLST_ANIM_SIZE		12		//six u16 channel offsets
+
+//mstudiotexture_t flags
+#define HLST_NF_FLATSHADE	0x0001
+#define HLST_NF_CHROME		0x0002
+#define HLST_NF_FULLBRIGHT	0x0004
+#define HLST_NF_NOMIPS		0x0008
+#define HLST_NF_ALPHA		0x0010
+#define HLST_NF_ADDITIVE	0x0020
+#define HLST_NF_MASKED		0x0040
+
+class CHLStBone
+{
+	U8	name[32];
+	I64	parent;			//-1 for the root
+	I64	flags;
+	I64	controller[6];	//-1, or an index into the bone controller table
+	F64	value[6];		//rest pose: xyz position then xyz rotation
+	F64	scale[6];		//what one unit of compressed channel data is worth
+};
+
+class CHLStBoneCtl
+{
+	I64	bone;
+	I64	type;			//which channel, plus HLST_RLOOP
+	F64	start;
+	F64	end;
+	I64	rest;
+	I64	index;			//0-3 generic, 4 is the mouth
+};
+
+class CHLStSeq
+{
+	U8	label[32];
+	F64	fps;
+	I64	flags;			//bit 0 is looping
+	I64	activity;
+	I64	num_frames;
+	I64	motion_type;
+	I64	motion_bone;
+	F64	linear_movement[3];
+	I64	num_blends;
+	I64	anim_index;		//to mstudioanim_t[num_blends][num_bones]
+	I64	seq_group;
+	I64	next_seq;
+};
+
+class CHLStTexture
+{
+	U8			name[64];
+	I64			flags;
+	CHLTexture	tex;	//what the rasterizer takes, palette and all
+};
+
+class CHLStMesh
+{
+	I64	num_tris;
+	I64	tri_index;		//to the tristrip/trifan command stream
+	I64	skin_ref;		//index into one row of the skin family table
+};
+
+class CHLStSubModel
+{
+	U8			name[64];
+	I64			num_verts;
+	I64			vert_info_index;	//byte per vertex: which bone owns it
+	I64			vert_index;			//vec3 per vertex, in ITS BONE's space
+	I64			num_meshes;
+	CHLStMesh	meshes[HLST_MAX_MESHES];
+};
+
+class CHLStBodyPart
+{
+	U8				name[64];
+	I64				num_models;
+	I64				base;			//divisor for decoding .body
+	CHLStSubModel	models[HLST_MAX_SUBMODELS];
+};
+
+class CHLStudio
+{
+	U8				*raw;			//owned, every index below points into it
+	I64				 raw_size;
+
+	U8				 name[64];
+	I64				 flags;
+
+	F64				 eye_position[3];
+	F64				 mins[3];
+	F64				 maxs[3];
+
+	I64				 num_bones;
+	CHLStBone		*bones;
+
+	I64				 num_controllers;
+	CHLStBoneCtl	*controllers;
+
+	I64				 num_seqs;
+	CHLStSeq		*seqs;
+
+	I64				 num_textures;
+	CHLStTexture	*textures;
+
+	//skin families: num_skin_families rows of num_skin_ref shorts, each a
+	//texture index. a mesh names a COLUMN, the entity picks the row
+	I64				 num_skin_ref;
+	I64				 num_skin_families;
+	I64				 skin_index;
+	Bool			 skin_in_tex_raw;	//which buffer skin_index addresses
+
+	I64				 num_bodyparts;
+	CHLStBodyPart	*bodyparts;
+
+	//textures may live in <name>T.mdl. that buffer is owned separately
+	//because it is loaded and freed as a unit with this one
+	U8				*tex_raw;
+	I64				 tex_raw_size;
+};
+
+//--- quaternion and matrix helpers -----------------------------------------
+//
+// a bone transform is 3x4 row-major, twelve F64: rows of (rotation, offset).
+// flat, not [3][4] - index arithmetic is explicit everywhere it is used
+
+U0 HLStAngleQuaternion(F64 *angles, F64 *q)
+{//AngleQuaternion. angles are RADIANS in x,y,z order, not the degrees the
+ //entity system uses
+	F64 sr, sp, sy, cr, cp, cy;
+	F64 a;
+
+	a = angles[2] * 0.5;
+	sy = Sin(a);
+	cy = Cos(a);
+
+	a = angles[1] * 0.5;
+	sp = Sin(a);
+	cp = Cos(a);
+
+	a = angles[0] * 0.5;
+	sr = Sin(a);
+	cr = Cos(a);
+
+	q[0] = sr * cp * cy - cr * sp * sy;
+	q[1] = cr * sp * cy + sr * cp * sy;
+	q[2] = cr * cp * sy - sr * sp * cy;
+	q[3] = cr * cp * cy + sr * sp * sy;
+}
+
+U0 HLStQuaternionSlerp(F64 *p, F64 *q, F64 t, F64 *out)
+{//QuaternionSlerp, including the sign fix - without it a blend across the
+ //antipode spins the bone the long way round
+	F64	 a = 0.0;
+	F64	 b = 0.0;
+	F64	 cosom;
+	F64	 sinom;
+	F64	 omega;
+	F64	 sclp;
+	F64	 sclq;
+	F64	 qt[4];
+	I64	 i;
+
+	for (i = 0; i < 4; i++)
+	{
+		a += (p[i] - q[i]) * (p[i] - q[i]);
+		b += (p[i] + q[i]) * (p[i] + q[i]);
+	}
+
+	//the two quaternions are further apart than their negations, so flip
+	if (a > b)
+	{
+		for (i = 0; i < 4; i++)
+			qt[i] = -q[i];
+	}
+	else
+	{
+		for (i = 0; i < 4; i++)
+			qt[i] = q[i];
+	}
+
+	cosom = p[0] * qt[0] + p[1] * qt[1] + p[2] * qt[2] + p[3] * qt[3];
+
+	if (cosom > -0.999999 && cosom < 0.999999)
+	{
+		sinom = Sqrt(1.0 - cosom * cosom);
+
+		//ZealOS spells atan2 Arg(x, y) - the argument of a complex number,
+		//so the operands are the other way round from the C name
+		omega = Arg(cosom, sinom);
+		sclp  = Sin((1.0 - t) * omega) / sinom;
+		sclq  = Sin(t * omega) / sinom;
+	}
+	else
+	{
+		//nearly identical, or exactly opposed - lerp and let the normalise
+		//below sort it out rather than divide by a vanishing sine
+		sclp = 1.0 - t;
+		sclq = t;
+	}
+
+	for (i = 0; i < 4; i++)
+		out[i] = sclp * p[i] + sclq * qt[i];
+}
+
+U0 HLStQuaternionMatrix(F64 *q, F64 *m)
+{//QuaternionMatrix. the offset column is left alone, the caller fills it
+	m[0] = 1.0 - 2.0 * q[1] * q[1] - 2.0 * q[2] * q[2];
+	m[4] = 2.0 * q[0] * q[1] + 2.0 * q[3] * q[2];
+	m[8] = 2.0 * q[0] * q[2] - 2.0 * q[3] * q[1];
+
+	m[1] = 2.0 * q[0] * q[1] - 2.0 * q[3] * q[2];
+	m[5] = 1.0 - 2.0 * q[0] * q[0] - 2.0 * q[2] * q[2];
+	m[9] = 2.0 * q[1] * q[2] + 2.0 * q[3] * q[0];
+
+	m[2]  = 2.0 * q[0] * q[2] + 2.0 * q[3] * q[1];
+	m[6]  = 2.0 * q[1] * q[2] - 2.0 * q[3] * q[0];
+	m[10] = 1.0 - 2.0 * q[0] * q[0] - 2.0 * q[1] * q[1];
+}
+
+U0 HLStConcatTransforms(F64 *a, F64 *b, F64 *out)
+{//ConcatTransforms - out = a * b, both 3x4 with an implied (0 0 0 1) row
+	I64 r;
+
+	for (r = 0; r < 3; r++)
+	{
+		out[r * 4]     = a[r * 4] * b[0] + a[r * 4 + 1] * b[4] +
+						 a[r * 4 + 2] * b[8];
+		out[r * 4 + 1] = a[r * 4] * b[1] + a[r * 4 + 1] * b[5] +
+						 a[r * 4 + 2] * b[9];
+		out[r * 4 + 2] = a[r * 4] * b[2] + a[r * 4 + 1] * b[6] +
+						 a[r * 4 + 2] * b[10];
+		out[r * 4 + 3] = a[r * 4] * b[3] + a[r * 4 + 1] * b[7] +
+						 a[r * 4 + 2] * b[11] + a[r * 4 + 3];
+	}
+}
+
+U0 HLStVectorTransform(F64 *in, F64 *m, F64 *out)
+{//rotate and translate
+	out[0] = in[0] * m[0] + in[1] * m[1] + in[2] * m[2]  + m[3];
+	out[1] = in[0] * m[4] + in[1] * m[5] + in[2] * m[6]  + m[7];
+	out[2] = in[0] * m[8] + in[1] * m[9] + in[2] * m[10] + m[11];
+}
+
+U0 HLStAngleMatrix(F64 *angles, F64 *origin, F64 *m)
+{//AngleMatrix - degrees, (pitch, yaw, roll), then the origin in the offset
+ //column. matches the entity convention, not the quaternion one above
+	F64 sr, sp, sy, cr, cp, cy;
+	F64 a;
+
+	a = angles[1] * HLDEG2RAD;
+	sy = Sin(a);
+	cy = Cos(a);
+
+	a = angles[0] * HLDEG2RAD;
+	sp = Sin(a);
+	cp = Cos(a);
+
+	a = angles[2] * HLDEG2RAD;
+	sr = Sin(a);
+	cr = Cos(a);
+
+	m[0] = cp * cy;
+	m[4] = cp * sy;
+	m[8] = -sp;
+
+	m[1] = sr * sp * cy - cr * sy;
+	m[5] = sr * sp * sy + cr * cy;
+	m[9] = sr * cp;
+
+	m[2]  = cr * sp * cy + sr * sy;
+	m[6]  = cr * sp * sy - sr * cy;
+	m[10] = cr * cp;
+
+	m[3]  = origin[0];
+	m[7]  = origin[1];
+	m[11] = origin[2];
+}
+
+//--- loading ----------------------------------------------------------------
+
+U0 HLStudioFree(CHLStudio *m)
+{
+	if (!m)
+		return;
+
+	if (m->bones)		Free(m->bones);
+	if (m->controllers)	Free(m->controllers);
+	if (m->seqs)		Free(m->seqs);
+	if (m->textures)	Free(m->textures);
+	if (m->bodyparts)	Free(m->bodyparts);
+	if (m->tex_raw)		Free(m->tex_raw);
+	if (m->raw)			Free(m->raw);
+
+	Free(m);
+}
+
+Bool HLStudioLoadTextures(CHLStudio *m, U8 *d, I64 size, I64 count, I64 index)
+{//mstudiotexture_t is 80 bytes: name[64], flags, w, h, offset to the image.
+ //the image is w*h 8bpp followed by 768 bytes of palette, exactly like a
+ //miptex body - which is why the rasterizer needs no special case for it
+	CHLStTexture	*t;
+	U8				*rec;
+	I64				 w;
+	I64				 h;
+	I64				 ofs;
+	I64				 i;
+	I64				 j;
+
+	if (count <= 0)
+		return TRUE;
+
+	if (count > HLST_MAX_TEXTURES)
+	{
+		"HLStudio: %s has %d textures, clamping\n", m->name, count;
+		count = HLST_MAX_TEXTURES;
+	}
+
+	if (index < 0 || index + count * HLST_TEX_SIZE > size)
+	{
+		"HLStudio: %s texture table is out of range\n", m->name;
+		return FALSE;
+	}
+
+	//may already hold the embedded (empty) table from the main file
+	if (m->textures)
+		Free(m->textures);
+
+	m->textures     = CAlloc(count * sizeof(CHLStTexture));
+	m->num_textures = count;
+
+	for (i = 0; i < count; i++)
+	{
+		t   = &m->textures[i];
+		rec = d + index + i * HLST_TEX_SIZE;
+
+		HLRdName(rec, t->name, 64);
+		t->flags = HLRdI32(rec + 64);
+		w        = HLRdI32(rec + 68);
+		h        = HLRdI32(rec + 72);
+		ofs      = HLRdI32(rec + 76);
+
+		HLRdName(t->name, t->tex.name, 16);
+
+		t->tex.width   = w;
+		t->tex.height  = h;
+		t->tex.clamp   = TRUE;		//skins never tile
+		t->tex.is_sky  = FALSE;
+		t->tex.is_turb = FALSE;
+
+		//a studio skin has no name conventions - the flags word carries the
+		//render intent that a world texture spells out in its name
+		t->tex.is_masked = ToBool(t->flags & HLST_NF_MASKED);
+		t->tex.is_light  = ToBool(t->flags & HLST_NF_FULLBRIGHT);
+		t->tex.is_scroll = FALSE;
+
+		t->tex.anim_total = 0;
+		t->tex.anim_next  = i;
+		t->tex.alt_anims  = -1;
+
+		for (j = 0; j < 4; j++)
+			t->tex.texels[j] = NULL;
+
+		t->tex.palette = NULL;
+
+		if (w <= 0 || h <= 0 || ofs < 0 || ofs + w * h + 768 > size)
+		{
+			"HLStudio: %s skin '%s' is out of range\n", m->name, t->name;
+			goto qslt_next;
+		}
+
+		//studiomdl writes no mip chain, so only level 0 exists. HLDrawSpan
+		//walks down to a level that is present, so this is enough
+		t->tex.texels[0] = d + ofs;
+		t->tex.palette   = d + ofs + w * h;
+
+qslt_next:
+	}
+
+	return TRUE;
+}
+
+Bool HLStudioLoadBodyParts(CHLStudio *m, U8 *d, I64 size, I64 count, I64 index)
+{//bodypart -> submodel -> mesh. a submodel is one alternative for that part,
+ //picked by the entity's .body field
+	CHLStBodyPart	*bp;
+	CHLStSubModel	*sm;
+	CHLStMesh		*me;
+	U8				*rec;
+	U8				*mrec;
+	U8				*erec;
+	I64				 model_index;
+	I64				 mesh_index;
+	I64				 nm;
+	I64				 nme;
+	I64				 i;
+	I64				 j;
+	I64				 k;
+
+	if (count <= 0)
+	{
+		"HLStudio: %s has no bodyparts\n", m->name;
+		return FALSE;
+	}
+
+	if (count > HLST_MAX_BODYPARTS)
+		count = HLST_MAX_BODYPARTS;
+
+	if (index < 0 || index + count * HLST_BODYPART_SIZE > size)
+	{
+		"HLStudio: %s bodypart table is out of range\n", m->name;
+		return FALSE;
+	}
+
+	m->bodyparts     = CAlloc(count * sizeof(CHLStBodyPart));
+	m->num_bodyparts = count;
+
+	for (i = 0; i < count; i++)
+	{
+		bp  = &m->bodyparts[i];
+		rec = d + index + i * HLST_BODYPART_SIZE;
+
+		HLRdName(rec, bp->name, 64);
+		nm          = HLRdI32(rec + 64);
+		bp->base    = HLRdI32(rec + 68);
+		model_index = HLRdI32(rec + 72);
+
+		if (nm > HLST_MAX_SUBMODELS)
+			nm = HLST_MAX_SUBMODELS;
+
+		if (nm <= 0 || model_index < 0 ||
+			model_index + nm * HLST_MODEL_SIZE > size)
+		{
+			bp->num_models = 0;
+			goto qsbp_next;
+		}
+
+		bp->num_models = nm;
+
+		for (j = 0; j < nm; j++)
+		{
+			sm   = &bp->models[j];
+			mrec = d + model_index + j * HLST_MODEL_SIZE;
+
+			HLRdName(mrec, sm->name, 64);
+			sm->num_verts       = HLRdI32(mrec + 80);
+			sm->vert_info_index = HLRdI32(mrec + 84);
+			sm->vert_index      = HLRdI32(mrec + 88);
+			nme                 = HLRdI32(mrec + 72);
+			mesh_index          = HLRdI32(mrec + 76);
+
+			sm->num_meshes = 0;
+
+			//vertices are vec3 binary32, the info table one byte per vertex
+			if (sm->num_verts < 0 || sm->num_verts > HLST_MAX_VERTS ||
+				sm->vert_index < 0 ||
+				sm->vert_index + sm->num_verts * 12 > size ||
+				sm->vert_info_index < 0 ||
+				sm->vert_info_index + sm->num_verts > size)
+			{
+				sm->num_verts = 0;
+				goto qsbp_next_model;
+			}
+
+			if (nme > HLST_MAX_MESHES)
+				nme = HLST_MAX_MESHES;
+
+			if (nme <= 0 || mesh_index < 0 ||
+				mesh_index + nme * HLST_MESH_SIZE > size)
+				goto qsbp_next_model;
+
+			sm->num_meshes = nme;
+
+			for (k = 0; k < nme; k++)
+			{
+				me   = &sm->meshes[k];
+				erec = d + mesh_index + k * HLST_MESH_SIZE;
+
+				me->num_tris = HLRdI32(erec);
+				me->tri_index = HLRdI32(erec + 4);
+				me->skin_ref = HLRdI32(erec + 8);
+
+				if (me->tri_index < 0 || me->tri_index >= size)
+					me->num_tris = 0;
+			}
+
+qsbp_next_model:
+		}
+
+qsbp_next:
+	}
+
+	return TRUE;
+}
+
+CHLStudio *HLStudioLoad(U8 *name)
+{//one .mdl. the textures may be in a sibling <name>T.mdl, which is the usual
+ //arrangement for anything a player model can reskin
+	CHLStudio	*m;
+	CHLStBone	*b;
+	CHLStBoneCtl *bc;
+	CHLStSeq	*sq;
+	U8			*d;
+	U8			*rec;
+	U8			 tex_name[96];
+	I64			 size = 0;
+	I64			 tsize = 0;
+	I64			 count;
+	I64			 index;
+	I64			 i;
+	I64			 j;
+	I64			 n;
+
+	d = HLFileLoad(name, &size);
+	if (!d)
+	{
+		"HLStudio: %s not found\n", name;
+		return NULL;
+	}
+
+	if (size < HLST_HDR_SIZE || HLRdU32(d) != HLST_MAGIC ||
+		HLRdI32(d + 4) != HLST_VERSION)
+	{
+		"HLStudio: %s is not an IDST version 10 model\n", name;
+		Free(d);
+		return NULL;
+	}
+
+	m           = CAlloc(sizeof(CHLStudio));
+	m->raw      = d;
+	m->raw_size = size;
+
+	HLRdName(d + 8, m->name, 64);
+
+	HLRdVec(d + 76, m->eye_position);
+	HLRdVec(d + 88, m->mins);
+	HLRdVec(d + 100, m->maxs);
+
+	m->flags = HLRdI32(d + 136);
+
+	//--- bones ---
+	count = HLRdI32(d + 140);
+	index = HLRdI32(d + 144);
+
+	if (count <= 0 || count > HLST_MAX_BONES || index < 0 ||
+		index + count * HLST_BONE_SIZE > size)
+	{
+		"HLStudio: %s bone table is out of range (%d bones)\n", name, count;
+		HLStudioFree(m);
+		return NULL;
+	}
+
+	m->num_bones = count;
+	m->bones     = CAlloc(count * sizeof(CHLStBone));
+
+	for (i = 0; i < count; i++)
+	{
+		b   = &m->bones[i];
+		rec = d + index + i * HLST_BONE_SIZE;
+
+		HLRdName(rec, b->name, 32);
+		b->parent = HLRdI32(rec + 32);
+		b->flags  = HLRdI32(rec + 36);
+
+		for (j = 0; j < 6; j++)
+		{
+			b->controller[j] = HLRdI32(rec + 40 + j * 4);
+			b->value[j]      = HLRdF32(rec + 64 + j * 4);
+			b->scale[j]      = HLRdF32(rec + 88 + j * 4);
+		}
+
+		//a forward or self reference would make the hierarchy walk read a
+		//transform that has not been built yet
+		if (b->parent >= i)
+			b->parent = -1;
+	}
+
+	//--- bone controllers ---
+	count = HLRdI32(d + 148);
+	index = HLRdI32(d + 152);
+
+	if (count > 0 && count <= HLST_MAX_CONTROLLERS && index >= 0 &&
+		index + count * HLST_BONECTL_SIZE <= size)
+	{
+		m->num_controllers = count;
+		m->controllers     = CAlloc(count * sizeof(CHLStBoneCtl));
+
+		for (i = 0; i < count; i++)
+		{
+			bc  = &m->controllers[i];
+			rec = d + index + i * HLST_BONECTL_SIZE;
+
+			bc->bone  = HLRdI32(rec);
+			bc->type  = HLRdI32(rec + 4);
+			bc->start = HLRdF32(rec + 8);
+			bc->end   = HLRdF32(rec + 12);
+			bc->rest  = HLRdI32(rec + 16);
+			bc->index = HLRdI32(rec + 20);
+		}
+	}
+
+	//--- sequences ---
+	count = HLRdI32(d + 164);
+	index = HLRdI32(d + 168);
+
+	if (count > HLST_MAX_SEQS)
+		count = HLST_MAX_SEQS;
+
+	if (count > 0 && index >= 0 && index + count * HLST_SEQ_SIZE <= size)
+	{
+		m->num_seqs = count;
+		m->seqs     = CAlloc(count * sizeof(CHLStSeq));
+
+		for (i = 0; i < count; i++)
+		{
+			sq  = &m->seqs[i];
+			rec = d + index + i * HLST_SEQ_SIZE;
+
+			HLRdName(rec, sq->label, 32);
+			sq->fps         = HLRdF32(rec + 32);
+			sq->flags       = HLRdI32(rec + 36);
+			sq->activity    = HLRdI32(rec + 40);
+			sq->num_frames  = HLRdI32(rec + 56);
+			sq->motion_type = HLRdI32(rec + 68);
+			sq->motion_bone = HLRdI32(rec + 72);
+			HLRdVec(rec + 76, sq->linear_movement);
+			sq->num_blends  = HLRdI32(rec + 120);
+			sq->anim_index  = HLRdI32(rec + 124);
+			sq->seq_group   = HLRdI32(rec + 156);
+			sq->next_seq    = HLRdI32(rec + 172);
+
+			if (sq->fps <= 0.0)
+				sq->fps = 1.0;
+			if (sq->num_frames < 1)
+				sq->num_frames = 1;
+			if (sq->num_blends < 1)
+				sq->num_blends = 1;
+		}
+	}
+	else
+		"HLStudio: %s has no usable sequences\n", name;
+
+	//--- skin families ---
+	m->num_skin_ref      = HLRdI32(d + 192);
+	m->num_skin_families = HLRdI32(d + 196);
+	m->skin_index        = HLRdI32(d + 200);
+
+	m->skin_in_tex_raw = FALSE;
+
+	if (m->num_skin_ref < 0 || m->num_skin_families < 1 ||
+		m->skin_index < 0 ||
+		m->skin_index + m->num_skin_ref * m->num_skin_families * 2 > size)
+	{
+		m->num_skin_ref      = 0;
+		m->num_skin_families = 0;
+	}
+
+	//--- textures, here or in the T file ---
+	count = HLRdI32(d + 180);
+	index = HLRdI32(d + 184);
+
+	if (count > 0)
+	{
+		if (!HLStudioLoadTextures(m, d, size, count, index))
+		{
+			HLStudioFree(m);
+			return NULL;
+		}
+	}
+	else
+	{
+		//"models/scientist.mdl" -> "models/scientistT.mdl". the T file is a
+		//complete studio header whose only populated table is the textures
+		n = StrLen(name);
+
+		if (n > 4 && n < 90 && !StrICompare(name + n - 4, ".mdl"))
+		{
+			MemCopy(tex_name, name, n - 4);
+			tex_name[n - 4] = 'T';
+			MemCopy(tex_name + n - 3, ".mdl", 5);
+
+			m->tex_raw = HLFileLoad(tex_name, &tsize);
+
+			if (m->tex_raw && tsize >= HLST_HDR_SIZE &&
+				HLRdU32(m->tex_raw) == HLST_MAGIC)
+			{
+				m->tex_raw_size = tsize;
+
+				HLStudioLoadTextures(m, m->tex_raw, tsize,
+					HLRdI32(m->tex_raw + 180), HLRdI32(m->tex_raw + 184));
+
+				//the skin table travels with the textures, so it indexes the
+				//T file. only take it if the main file had none - otherwise
+				//skin_index would be read out of the wrong buffer
+				if (!m->num_skin_families)
+				{
+					m->num_skin_ref      = HLRdI32(m->tex_raw + 192);
+					m->num_skin_families = HLRdI32(m->tex_raw + 196);
+					m->skin_index        = HLRdI32(m->tex_raw + 200);
+					m->skin_in_tex_raw   = TRUE;
+
+					if (m->num_skin_ref < 0 || m->num_skin_families < 1 ||
+						m->skin_index < 0 ||
+						m->skin_index + m->num_skin_ref *
+							m->num_skin_families * 2 > tsize)
+					{
+						m->num_skin_ref      = 0;
+						m->num_skin_families = 0;
+						m->skin_in_tex_raw   = FALSE;
+					}
+				}
+			}
+			else
+			{
+				"HLStudio: %s has no textures and no %s\n", name, tex_name;
+
+				if (m->tex_raw)
+				{
+					Free(m->tex_raw);
+					m->tex_raw = NULL;
+				}
+			}
+		}
+	}
+
+	//--- bodyparts ---
+	if (!HLStudioLoadBodyParts(m, d, size, HLRdI32(d + 204), HLRdI32(d + 208)))
+	{
+		HLStudioFree(m);
+		return NULL;
+	}
+
+	return m;
+}
+
+//--- animation --------------------------------------------------------------
+//
+// each channel is run length encoded as a stream of mstudioanimvalue_t, a
+// two byte union read either as (valid, total) or as a signed value:
+//
+//   valid  how many literal values follow this header
+//   total  how many FRAMES this run covers - a still channel is one header
+//          with valid 1, total 100 and a single value
+//
+// so seeking to a frame walks headers subtracting total, then indexes the
+// literals, clamping to the last one when the run is longer than it is wide
+
+I64 HLStAnimValue(U8 *base, I64 ofs, I64 frame, I64 avail, I64 *_next)
+{//one channel at one frame, plus the value at frame+1 for interpolation.
+ //returns the value at frame; _next gets the following one
+	I64 p = ofs;
+	I64 valid;
+	I64 total;
+	I64 k = frame;
+	I64 v;
+
+	*_next = 0;
+
+	//walk whole runs off the front
+	while (TRUE)
+	{
+		if (p + 2 > avail)
+			return 0;
+
+		valid = base[p];
+		total = base[p + 1];
+
+		//a zero-length run would never advance and the walk would not end
+		if (total < 1)
+			return 0;
+
+		if (total > k)
+			break;
+
+		k -= total;
+		p += (valid + 1) * 2;
+	}
+
+	if (p + (valid + 1) * 2 > avail)
+		return 0;
+
+	if (valid > k)
+	{
+		v = HLRdI16(base + p + (k + 1) * 2);
+
+		if (valid > k + 1)
+			*_next = HLRdI16(base + p + (k + 2) * 2);
+		else if (total > k + 1)
+			*_next = v;			//held for the rest of this run
+		else if (p + (valid + 2) * 2 + 2 <= avail)
+			*_next = HLRdI16(base + p + (valid + 2) * 2);
+		else
+			*_next = v;
+	}
+	else
+	{
+		//past the literals - the run holds the last value for its remainder
+		v = HLRdI16(base + p + valid * 2);
+
+		if (total > k + 1)
+			*_next = v;
+		else if (p + (valid + 2) * 2 + 2 <= avail)
+			*_next = HLRdI16(base + p + (valid + 2) * 2);
+		else
+			*_next = v;
+	}
+
+	return v;
+}
+
+U0 HLStCalcBoneQuaternion(CHLStudio *m, CHLStBone *b, I64 anim_rec,
+	I64 frame, F64 s, F64 *adj, F64 *q)
+{//six channels per bone, the last three being rotation. builds the two
+ //bracketing eulers and slerps between them
+	F64	 angle1[3];
+	F64	 angle2[3];
+	F64	 q1[4];
+	F64	 q2[4];
+	I64	 ofs;
+	I64	 v;
+	I64	 vnext;
+	I64	 ctl;
+	I64	 j;
+	Bool same = TRUE;
+
+	for (j = 0; j < 3; j++)
+	{
+		//offsets are RELATIVE to the mstudioanim_t record, not the file
+		ofs = HLRdU16(m->raw + anim_rec + (j + 3) * 2);
+
+		if (!ofs)
+		{
+			angle1[j] = b->value[j + 3];
+			angle2[j] = b->value[j + 3];
+		}
+		else
+		{
+			v = HLStAnimValue(m->raw, anim_rec + ofs, frame,
+					m->raw_size, &vnext);
+
+			angle1[j] = b->value[j + 3] + ToF64(v) * b->scale[j + 3];
+			angle2[j] = b->value[j + 3] + ToF64(vnext) * b->scale[j + 3];
+		}
+
+		ctl = b->controller[j + 3];
+		if (ctl >= 0 && ctl < HLST_MAX_CONTROLLERS)
+		{
+			angle1[j] += adj[ctl];
+			angle2[j] += adj[ctl];
+		}
+
+		if (angle1[j] != angle2[j])
+			same = FALSE;
+	}
+
+	if (same)
+		HLStAngleQuaternion(angle1, q);
+	else
+	{
+		HLStAngleQuaternion(angle1, q1);
+		HLStAngleQuaternion(angle2, q2);
+		HLStQuaternionSlerp(q1, q2, s, q);
+	}
+}
+
+U0 HLStCalcBonePosition(CHLStudio *m, CHLStBone *b, I64 anim_rec,
+	I64 frame, F64 s, F64 *adj, F64 *pos)
+{//the first three channels, linearly interpolated - positions do not need
+ //the great-circle treatment rotations do
+	I64	 ofs;
+	I64	 v;
+	I64	 vnext;
+	I64	 ctl;
+	I64	 j;
+
+	for (j = 0; j < 3; j++)
+	{
+		pos[j] = b->value[j];
+
+		ofs = HLRdU16(m->raw + anim_rec + j * 2);
+
+		if (ofs)
+		{
+			v = HLStAnimValue(m->raw, anim_rec + ofs, frame,
+					m->raw_size, &vnext);
+
+			pos[j] += (ToF64(v) * (1.0 - s) + ToF64(vnext) * s) * b->scale[j];
+		}
+
+		ctl = b->controller[j];
+		if (ctl >= 0 && ctl < HLST_MAX_CONTROLLERS)
+			pos[j] += adj[ctl];
+	}
+}
+
+//scratch for one model's pose. a global, not a local: HLST_MAX_BONES * 12
+//F64 is 12KB and ZealC task stacks are not generous
+F64 hl_st_bone_tf[HLST_MAX_BONES * 12];
+F64 hl_st_q[HLST_MAX_BONES * 4];
+F64 hl_st_pos[HLST_MAX_BONES * 3];
+
+//the second blend's pose, slerped against the first
+F64 hl_st_q2[HLST_MAX_BONES * 4];
+F64 hl_st_pos2[HLST_MAX_BONES * 3];
+
+F64 hl_st_xform[HLST_MAX_VERTS * 3];
+
+U0 HLStCalcRotations(CHLStudio *m, CHLStSeq *sq, I64 blend, I64 frame, F64 s,
+	F64 *adj, F64 *out_q, F64 *out_pos)
+{//one blend's worth of pose: every bone evaluated at (frame, s)
+	CHLStBone	*b;
+	I64			 anim_base;
+	I64			 anim_rec;
+	I64			 i;
+
+	//mstudioanim_t[num_blends][num_bones], twelve bytes each
+	anim_base = sq->anim_index + blend * m->num_bones * HLST_ANIM_SIZE;
+
+	for (i = 0; i < m->num_bones; i++)
+	{
+		b        = &m->bones[i];
+		anim_rec = anim_base + i * HLST_ANIM_SIZE;
+
+		if (anim_rec < 0 || anim_rec + HLST_ANIM_SIZE > m->raw_size)
+		{
+			//no animation data - fall back to the bone's rest pose
+			HLStAngleQuaternion(&b->value[3], &out_q[i * 4]);
+			out_pos[i * 3]     = b->value[0];
+			out_pos[i * 3 + 1] = b->value[1];
+			out_pos[i * 3 + 2] = b->value[2];
+			goto qscr_next;
+		}
+
+		HLStCalcBoneQuaternion(m, b, anim_rec, frame, s, adj, &out_q[i * 4]);
+		HLStCalcBonePosition(m, b, anim_rec, frame, s, adj, &out_pos[i * 3]);
+
+qscr_next:
+	}
+}
+
+U0 HLStSetupBones(CHLStudio *m, I64 seq, F64 cycle, F64 blend, F64 *adj,
+	F64 *root)
+{//evaluate the sequence and concatenate the hierarchy into hl_st_bone_tf
+ //
+ //cycle is 0..1 through the sequence, blend is 0..1 between the first two
+ //blend poses. root is the entity's world 3x4
+	CHLStSeq	*sq;
+	CHLStBone	*b;
+	F64			 bone_matrix[12];
+	F64			 frame_f;
+	F64			 s;
+	I64			 frame;
+	I64			 i;
+	I64			 j;
+
+	if (seq < 0 || seq >= m->num_seqs)
+		seq = 0;
+
+	if (!m->num_seqs)
+	{
+		//no sequences at all - stand every bone at its rest pose so the
+		//model is at least visible and obviously unanimated
+		for (i = 0; i < m->num_bones; i++)
+		{
+			b = &m->bones[i];
+			HLStAngleQuaternion(&b->value[3], &hl_st_q[i * 4]);
+			for (j = 0; j < 3; j++)
+				hl_st_pos[i * 3 + j] = b->value[j];
+		}
+	}
+	else
+	{
+		sq = &m->seqs[seq];
+
+		//sequence groups past 0 live in <name>NN.mdl, which is not loaded
+		//yet. their anim_index would address the wrong file entirely
+		if (sq->seq_group)
+		{
+			for (i = 0; i < m->num_bones; i++)
+			{
+				b = &m->bones[i];
+				HLStAngleQuaternion(&b->value[3], &hl_st_q[i * 4]);
+				for (j = 0; j < 3; j++)
+					hl_st_pos[i * 3 + j] = b->value[j];
+			}
+
+			goto qssb_build;
+		}
+
+		if (cycle < 0.0)	cycle = 0.0;
+		if (cycle > 1.0)	cycle = 1.0;
+
+		//the last frame duplicates the first in a looping sequence, so the
+		//playable span is one shorter
+		frame_f = cycle * ToF64(sq->num_frames - 1);
+		frame   = ToI64(Floor(frame_f));
+		s       = frame_f - ToF64(frame);
+
+		if (frame < 0)
+			frame = 0;
+		if (frame > sq->num_frames - 1)
+			frame = sq->num_frames - 1;
+
+		HLStCalcRotations(m, sq, 0, frame, s, adj, hl_st_q, hl_st_pos);
+
+		//two-way blends cover aim pitch and the walk/run pairs. four-way
+		//exists in the format and nothing in HL1 proper uses it
+		if (sq->num_blends > 1 && blend > 0.0)
+		{
+			HLStCalcRotations(m, sq, 1, frame, s, adj, hl_st_q2, hl_st_pos2);
+
+			for (i = 0; i < m->num_bones; i++)
+			{
+				HLStQuaternionSlerp(&hl_st_q[i * 4], &hl_st_q2[i * 4],
+					blend, &hl_st_q[i * 4]);
+
+				for (j = 0; j < 3; j++)
+					hl_st_pos[i * 3 + j] +=
+						(hl_st_pos2[i * 3 + j] - hl_st_pos[i * 3 + j]) * blend;
+			}
+		}
+	}
+
+qssb_build:
+	for (i = 0; i < m->num_bones; i++)
+	{
+		HLStQuaternionMatrix(&hl_st_q[i * 4], bone_matrix);
+
+		bone_matrix[3]  = hl_st_pos[i * 3];
+		bone_matrix[7]  = hl_st_pos[i * 3 + 1];
+		bone_matrix[11] = hl_st_pos[i * 3 + 2];
+
+		if (m->bones[i].parent < 0)
+			HLStConcatTransforms(root, bone_matrix, &hl_st_bone_tf[i * 12]);
+		else
+			HLStConcatTransforms(&hl_st_bone_tf[m->bones[i].parent * 12],
+				bone_matrix, &hl_st_bone_tf[i * 12]);
+	}
+}
+
+//--- drawing ----------------------------------------------------------------
+
+CHLTexture *HLStudioSkin(CHLStudio *m, I64 skin_ref, I64 skin_family)
+{//a mesh names a column of the skin table, the entity picks the row
+	I64 idx = skin_ref;
+
+	if (!m->num_textures)
+		return NULL;
+
+	if (m->num_skin_families > 0 && m->num_skin_ref > 0 &&
+		skin_ref >= 0 && skin_ref < m->num_skin_ref)
+	{
+		U8 *table = m->raw;
+		I64 rows  = m->num_skin_families;
+
+		if (m->skin_in_tex_raw)
+			table = m->tex_raw;
+
+		if (skin_family < 0 || skin_family >= rows)
+			skin_family = 0;
+
+		idx = HLRdU16(table + m->skin_index +
+				(skin_family * m->num_skin_ref + skin_ref) * 2);
+	}
+
+	if (idx < 0 || idx >= m->num_textures)
+		return NULL;
+
+	if (!m->textures[idx].tex.texels[0] || !m->textures[idx].tex.palette)
+		return NULL;
+
+	return &m->textures[idx].tex;
+}
+
+I64 HLStudioDrawMesh(CHLCanvas *c, CHLStudio *m, CHLStSubModel *sm,
+	CHLStMesh *me, CHLTexture *tex, I64 light)
+{//walk the tristrip/trifan command stream and rasterise
+ //
+ //stream is: i16 count, then |count| runs of four i16 (vert, norm, s, t).
+ //positive count is a STRIP, negative a FAN, zero ends the mesh.
+ //
+ //s and t are already in TEXELS, which is what the rasterizer wants, so they
+ //go straight through with no scaling
+	CHLPolyVert		 poly[3];
+	CHLPolyVert		 clipped[HLMAX_POLY_VERTS];
+	CHLScreenVert	 scr[HLMAX_POLY_VERTS];
+	F64				 rel[3];
+	F64				 world[3];
+	F64				 wx[3];		//the sliding three vertex window
+	F64				 wy[3];
+	F64				 wz[3];
+	F64				 ws[3];
+	F64				 wt[3];
+	F64				 inv_z;
+	I64				 p;
+	I64				 cmd;
+	I64				 run;
+	I64				 i;
+	I64				 j;
+	I64				 vi;
+	I64				 held;
+	I64				 n;
+	I64				 emitted = 0;
+	Bool			 fan;
+
+	if (!tex || tex->width <= 0 || tex->height <= 0)
+		return 0;
+
+	p = me->tri_index;
+
+	while (TRUE)
+	{
+		if (p + 2 > m->raw_size)
+			break;
+
+		cmd = HLRdI16(m->raw + p);
+		p += 2;
+
+		if (!cmd)
+			break;
+
+		fan = ToBool(cmd < 0);
+		run = cmd;
+		if (fan)
+			run = -cmd;
+
+		if (run < 3 || p + run * 8 > m->raw_size)
+			break;
+
+		held = 0;
+
+		for (i = 0; i < run; i++)
+		{
+			vi = HLRdU16(m->raw + p + i * 8);
+
+			if (vi < 0 || vi >= sm->num_verts)
+				vi = 0;
+
+			if (held >= 3)
+			{
+				//a FAN pins vertex 0 and rolls the other two; a STRIP rolls
+				//all three. either way the new vertex lands in slot 2
+				if (!fan)
+				{
+					wx[0] = wx[1];	wy[0] = wy[1];	wz[0] = wz[1];
+					ws[0] = ws[1];	wt[0] = wt[1];
+				}
+
+				wx[1] = wx[2];	wy[1] = wy[2];	wz[1] = wz[2];
+				ws[1] = ws[2];	wt[1] = wt[2];
+
+				held = 2;
+			}
+
+			wx[held] = hl_st_xform[vi * 3];
+			wy[held] = hl_st_xform[vi * 3 + 1];
+			wz[held] = hl_st_xform[vi * 3 + 2];
+
+			ws[held] = ToF64(HLRdI16(m->raw + p + i * 8 + 4));
+			wt[held] = ToF64(HLRdI16(m->raw + p + i * 8 + 6));
+
+			held++;
+
+			if (held < 3)
+				goto qsdm_next_vert;
+
+			for (j = 0; j < 3; j++)
+			{
+				world[0] = wx[j];
+				world[1] = wy[j];
+				world[2] = wz[j];
+
+				HLVecSub(world, c->origin, rel);
+
+				poly[j].cam[0] = HLVecDot(rel, c->right);
+				poly[j].cam[1] = HLVecDot(rel, c->up);
+				poly[j].cam[2] = HLVecDot(rel, c->forward);
+				poly[j].s      = ws[j];
+				poly[j].t      = wt[j];
+			}
+
+			n = HLDrawClipNear(poly, 3, clipped);
+
+			if (n < 3)
+				goto qsdm_next_vert;
+
+			for (j = 0; j < n; j++)
+			{
+				inv_z = 1.0 / clipped[j].cam[2];
+
+				scr[j].x = c->center_x +
+					clipped[j].cam[0] * c->x_scale * inv_z;
+				scr[j].y = c->center_y -
+					clipped[j].cam[1] * c->y_scale * inv_z;
+
+				scr[j].inv_z    = inv_z;
+				scr[j].s_over_z = clipped[j].s * inv_z;
+				scr[j].t_over_z = clipped[j].t * inv_z;
+			}
+
+			//a strip alternates winding, but the scanline fill takes the
+			//extremes per row and does not care which way round they came
+			HLDrawPolygon(c, scr, n, tex, NULL, 0, 0, 0.0, 0.0, light, 0);
+			emitted++;
+
+qsdm_next_vert:
+		}
+
+		p += run * 8;
+	}
+
+	return emitted;
+}
+
+U0 HLStudioDraw(CHLCanvas *c, CHLStudio *m, F64 *origin, F64 *angles,
+	I64 seq, F64 cycle, F64 blend, I64 body, I64 skin, I64 light,
+	F64 *controllers = NULL)
+{//one studio model at a world position
+ //
+ //body packs one submodel choice per bodypart into a single integer, base
+ //being that part's place value
+	CHLStBodyPart	*bp;
+	CHLStSubModel	*sm;
+	F64				 root[12];
+	F64				 ang[3];
+	F64				 adj[HLST_MAX_CONTROLLERS];
+	F64				 v[3];
+	U8				*vert_bone;
+	I64				 pick;
+	I64				 base;
+	I64				 bone;
+	I64				 i;
+	I64				 j;
+
+	if (!m || !m->num_bones)
+		return;
+
+	for (i = 0; i < HLST_MAX_CONTROLLERS; i++)
+	{
+		if (controllers)
+			adj[i] = controllers[i];
+		else
+			adj[i] = 0.0;
+	}
+
+	//StudioSetUpTransform inverts pitch: studio models are authored nose-up
+	//where the entity system counts pitch nose-down
+	ang[0] = -angles[0];
+	ang[1] = angles[1];
+	ang[2] = angles[2];
+
+	HLStAngleMatrix(ang, origin, root);
+
+	HLStSetupBones(m, seq, cycle, blend, adj, root);
+
+	for (i = 0; i < m->num_bodyparts; i++)
+	{
+		bp = &m->bodyparts[i];
+
+		if (bp->num_models < 1)
+			goto qsd_next_part;
+
+		//base is the place value for this part inside .body. a zero would
+		//divide by zero, and it is the model that is wrong, not the entity
+		base = bp->base;
+		if (base < 1)
+			base = 1;
+
+		pick = (body / base) % bp->num_models;
+		if (pick < 0 || pick >= bp->num_models)
+			pick = 0;
+
+		sm = &bp->models[pick];
+
+		if (sm->num_verts < 1 || sm->num_meshes < 1)
+			goto qsd_next_part;
+
+		//every vertex is authored in the space of the ONE bone that owns it
+		vert_bone = m->raw + sm->vert_info_index;
+
+		for (j = 0; j < sm->num_verts; j++)
+		{
+			bone = vert_bone[j];
+
+			if (bone < 0 || bone >= m->num_bones)
+				bone = 0;
+
+			HLRdVec(m->raw + sm->vert_index + j * 12, v);
+			HLStVectorTransform(v, &hl_st_bone_tf[bone * 12],
+				&hl_st_xform[j * 3]);
+		}
+
+		for (j = 0; j < sm->num_meshes; j++)
+		{
+			HLStudioDrawMesh(c, m, sm, &sm->meshes[j],
+				HLStudioSkin(m, sm->meshes[j].skin_ref, skin), light);
+		}
+
+qsd_next_part:
+	}
+}
+
+//--- shared cache -----------------------------------------------------------
+//
+// a studio model is immutable once loaded - the pose lives in the globals
+// above and belongs to whichever draw is running, not to the model
+
+#define HLST_CACHE_MAX	128
+#define HLST_NAME_MAX	80
+
+U8			hl_st_cache_name[HLST_CACHE_MAX * HLST_NAME_MAX];
+CHLStudio	*hl_st_cache_mdl[HLST_CACHE_MAX];
+I64			hl_st_cache_count = 0;
+
+U0 HLStudioCacheInit()
+{//globals aren't zeroed, and a stale pointer here is freed at shutdown
+	I64 i;
+
+	for (i = 0; i < HLST_CACHE_MAX; i++)
+	{
+		hl_st_cache_mdl[i] = NULL;
+		hl_st_cache_name[i * HLST_NAME_MAX] = 0;
+	}
+
+	hl_st_cache_count = 0;
+}
+
+U0 HLStudioCacheFree()
+{
+	I64 i;
+
+	for (i = 0; i < HLST_CACHE_MAX; i++)
+	{
+		if (hl_st_cache_mdl[i])
+			HLStudioFree(hl_st_cache_mdl[i]);
+
+		hl_st_cache_mdl[i] = NULL;
+		hl_st_cache_name[i * HLST_NAME_MAX] = 0;
+	}
+
+	hl_st_cache_count = 0;
+}
+
+CHLStudio *HLStudioCacheGet(U8 *name)
+{//the cache OWNS what it hands out - callers must not free it
+	CHLStudio	*m;
+	I64			 i;
+
+	for (i = 0; i < hl_st_cache_count; i++)
+	{
+		if (!StrICompare(&hl_st_cache_name[i * HLST_NAME_MAX], name))
+			return hl_st_cache_mdl[i];
+	}
+
+	if (hl_st_cache_count >= HLST_CACHE_MAX)
+	{
+		"HLStudio: cache full, %s not loaded\n", name;
+		return NULL;
+	}
+
+	m = HLStudioLoad(name);
+	if (!m)
+		return NULL;
+
+	HLRdName(name, &hl_st_cache_name[hl_st_cache_count * HLST_NAME_MAX],
+		HLST_NAME_MAX);
+	hl_st_cache_mdl[hl_st_cache_count] = m;
+	hl_st_cache_count++;
+
+	return m;
+}
+
+U0 HLStudioReport(CHLStudio *m)
+{//load time sanity dump
+	I64 i;
+
+	if (!m)
+	{
+		"HLStudio: no model\n";
+		return;
+	}
+
+	"  name         %s\n", m->name;
+	"  bones        %6d\n", m->num_bones;
+	"  controllers  %6d\n", m->num_controllers;
+	"  sequences    %6d\n", m->num_seqs;
+	if (m->tex_raw)
+		"  textures     %6d (external T file)\n", m->num_textures;
+	else
+		"  textures     %6d\n", m->num_textures;
+	"  skins        %6d ref x %d families\n",
+		m->num_skin_ref, m->num_skin_families;
+	"  bodyparts    %6d\n", m->num_bodyparts;
+
+	for (i = 0; i < m->num_seqs && i < 8; i++)
+	{
+		"    seq %2d %-20s %3d frames @ %g fps, %d blend(s)\n",
+			i, m->seqs[i].label, m->seqs[i].num_frames,
+			m->seqs[i].fps, m->seqs[i].num_blends;
+	}
+}

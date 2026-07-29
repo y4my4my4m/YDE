@@ -26,6 +26,48 @@ class CHLPak
 CHLPak	*hl_paks[HLPAK_MAX_PAKS];
 I64		 hl_pak_count = 0;
 
+//--- loose files -----------------------------------------------------------
+//
+// quake shipped everything inside PAK0. a retail Half-Life install does not:
+// maps/*.bsp, the .wad files and much of models/ and sound/ sit loose in the
+// game directory, and pak0.pak is only part of the content.
+//
+// so every lookup is loose-first, pak-second, gamedir before valve. loose hits
+// are cached because the callers that use the borrowed-pointer form (palette,
+// gfx.wad, sound samples) hold them for the life of the mount
+
+#define HLFILE_CACHE_MAX	64
+
+class CHLFileCache
+{
+	U8	 name[80];
+	U8	*data;			//owned
+	I64	 size;
+};
+
+CHLFileCache	hl_file_cache[HLFILE_CACHE_MAX];
+I64				hl_file_count = 0;
+
+//HLPak compiles before the shell declares hl_game_dir, so the search root
+//lives here and the "game" command pushes it down
+U8				hl_pak_game_dir[32];
+
+U0 HLPakSetGameDir(U8 *dir)
+{
+	I64 i = 0;
+
+	if (dir)
+	{
+		while (i < 31 && dir[i])
+		{
+			hl_pak_game_dir[i] = dir[i];
+			i++;
+		}
+	}
+
+	hl_pak_game_dir[i] = 0;
+}
+
 U0 HLPakInit()
 {//globals aren't zeroed
 	I64 i;
@@ -33,6 +75,16 @@ U0 HLPakInit()
 	hl_pak_count = 0;
 	for (i = 0; i < HLPAK_MAX_PAKS; i++)
 		hl_paks[i] = NULL;
+
+	for (i = 0; i < HLFILE_CACHE_MAX; i++)
+	{
+		hl_file_cache[i].data    = NULL;
+		hl_file_cache[i].size    = 0;
+		hl_file_cache[i].name[0] = 0;
+	}
+
+	hl_file_count      = 0;
+	hl_pak_game_dir[0] = 0;
 }
 
 Bool HLPakMount(U8 *filename)
@@ -101,10 +153,27 @@ Bool HLPakMount(U8 *filename)
 	return TRUE;
 }
 
+U0 HLFileCacheClear()
+{
+	I64 i;
+
+	for (i = 0; i < HLFILE_CACHE_MAX; i++)
+	{
+		if (hl_file_cache[i].data)
+			Free(hl_file_cache[i].data);
+
+		hl_file_cache[i].data    = NULL;
+		hl_file_cache[i].size    = 0;
+		hl_file_cache[i].name[0] = 0;
+	}
+
+	hl_file_count = 0;
+}
+
 U0 HLPakUnmountAll()
-{//release every archive. the whole file stays resident and lookups hand back
- //interior pointers, so NOTHING may still hold one when this runs - flush every
- //cache first
+{//release every archive and every cached loose file. both stay resident and
+ //lookups hand back interior pointers, so NOTHING may still hold one when this
+ //runs - flush every cache first
 	CHLPak	*pak;
 	I64		 i;
 
@@ -127,6 +196,8 @@ qpu_next:
 	}
 
 	hl_pak_count = 0;
+
+	HLFileCacheClear;
 }
 
 CHLPakEntry *HLPakFind(U8 *name, CHLPak **_pak = NULL)
@@ -207,6 +278,156 @@ U8 *HLPakLoad(U8 *name, I64 *_size = NULL)
 		*_size = size;
 
 	return dst;
+}
+
+U0 HLFileCaseFold(U8 *in, U8 *out, Bool upper)
+{//ZealOS RedSea is case sensitive and installs are inconsistent about it -
+ //Steam ships lowercase, older discs uppercase. only the leaf and directory
+ //names are folded, the mount prefix is built separately
+	I64 i = 0;
+	I64 c;
+
+	while (in[i] && i < 79)
+	{
+		c = in[i];
+
+		if (upper)
+		{
+			if ('a' <= c <= 'z')
+				c -= 'a' - 'A';
+		}
+		else
+		{
+			if ('A' <= c <= 'Z')
+				c += 'a' - 'A';
+		}
+
+		out[i] = c;
+		i++;
+	}
+
+	out[i] = 0;
+}
+
+Bool HLFileResolve(U8 *name, U8 *out)
+{//first existing loose path for a game-relative name, e.g. "maps/c1a0.bsp"
+	U8	 folded[80];
+	I64	 dir;
+	I64	 variant;
+
+	//gamedir shadows valve, exactly like the pak search order
+	for (dir = 0; dir < 2; dir++)
+	{
+		if (!dir && !hl_pak_game_dir[0])
+			goto qfr_next_dir;
+
+		for (variant = 0; variant < 3; variant++)
+		{
+			if (!variant)
+				HLFileCaseFold(name, folded, FALSE);	//as shipped by Steam
+			else if (variant == 1)
+				HLFileCaseFold(name, folded, TRUE);		//older discs
+			else
+				HLRdName(name, folded, 80);				//exactly as asked
+
+			if (!dir)
+				StrPrint(out, "::/Apps/HL1/%s/%s", hl_pak_game_dir, folded);
+			else
+				StrPrint(out, "::/Apps/HL1/valve/%s", folded);
+
+			if (FileFind(out))
+				return TRUE;
+		}
+
+qfr_next_dir:
+	}
+
+	out[0] = 0;
+
+	return FALSE;
+}
+
+U8 *HLFileData(U8 *name, I64 *_size = NULL)
+{//borrowed pointer, valid until the next unmount. loose first, then the paks
+	U8	 path[160];
+	U8	*d;
+	I64	 size = 0;
+	I64	 i;
+
+	for (i = 0; i < hl_file_count; i++)
+	{
+		if (!StrICompare(hl_file_cache[i].name, name))
+		{
+			if (_size)
+				*_size = hl_file_cache[i].size;
+			return hl_file_cache[i].data;
+		}
+	}
+
+	if (HLFileResolve(name, path))
+	{
+		d = FileRead(path, &size);
+
+		if (d)
+		{
+			if (hl_file_count < HLFILE_CACHE_MAX)
+			{
+				HLRdName(name, hl_file_cache[hl_file_count].name, 80);
+				hl_file_cache[hl_file_count].data = d;
+				hl_file_cache[hl_file_count].size = size;
+				hl_file_count++;
+			}
+			else
+			{
+				//cache full - the buffer would leak, so refuse the loose copy
+				//and fall through to the pak rather than lose track of it
+				"HLPak: loose file cache full, ignoring %s\n", name;
+				Free(d);
+				goto qfd_pak;
+			}
+
+			if (_size)
+				*_size = size;
+
+			return d;
+		}
+	}
+
+qfd_pak:
+	return HLPakData(name, _size);
+}
+
+U8 *HLFileLoad(U8 *name, I64 *_size = NULL)
+{//owned copy, caller Frees
+	I64  size = 0;
+	U8  *src  = HLFileData(name, &size);
+	U8  *dst;
+
+	if (!src)
+	{
+		if (_size)
+			*_size = 0;
+		return NULL;
+	}
+
+	dst = MAlloc(size + 1);
+	MemCopy(dst, src, size);
+	dst[size] = 0;
+
+	if (_size)
+		*_size = size;
+
+	return dst;
+}
+
+Bool HLFileExists(U8 *name)
+{
+	U8 path[160];
+
+	if (HLFileResolve(name, path))
+		return TRUE;
+
+	return ToBool(HLPakFind(name) != NULL);
 }
 
 U0 HLPakList(U8 *prefix = NULL)

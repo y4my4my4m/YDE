@@ -29,44 +29,94 @@ Working, inherited from the Quake port and re-pointed at HL formats:
   damage/water tint moved out of the palette and into the blit, so they now
   cover the world too.
 - **Four clip hulls** — 32x32x72 standing, 64x64x64 large, 32x32x36 ducked.
+- **Studio models** (`IDST` v10) — `HLStudio.ZC`. Bones, RLE animation
+  channels, quaternion slerp, two-way blends, bodyparts/submodels/meshes,
+  tristrip and trifan decode, skin families, textures embedded or in a
+  sibling `<name>T.mdl`. Skinned software rasterisation through the same span
+  loop as the world.
+
+- **HL player movement** — the parts that define how HL feels: air
+  acceleration with the 30-unit target cap (airstrafing), half-gravity
+  leapfrog integration, jump at `sqrt(2*800*45)` with bunnyhop scaling and no
+  auto-hop, and a full duck state machine that swaps to hull 3. Duck is bound
+  to `c` by default.
+
+Studio gaps, in the order they will bite: sequence groups (`<name>NN.mdl`),
+chrome skins, attachments, four-way blends, and per-vertex lighting from the
+model normals — everything is currently flat-lit from `HLLightPoint` at the
+entity origin.
 
 Not done yet, in the order they are being done:
 
-1. Studio models (`IDST`, MDL v10) — bones, sequences, blends. The alias model
-   path still present is Quake's and will not load an HL model.
-2. `pm_shared` player movement.
-3. Native entity system. `HLProgs.ZC`/`HLBuiltin.ZC` are the QuakeC VM and are
+1. Native entity system. `HLProgs.ZC`/`HLBuiltin.ZC` are the QuakeC VM and are
    dead weight here — HL's game logic is native code, which is the SDK.
-4. SPR v2 sprites (per-sprite palette, render modes).
-5. Weapons, gamerules, HUD.
-6. Monster AI: schedules, tasks, `scripted_sequence`, sentences.
-7. Protocol 48 netcode. **Last** — single player runs in-process without it.
+2. SPR v2 sprites (per-sprite palette, render modes).
+3. Weapons, gamerules, HUD.
+4. Monster AI: schedules, tasks, `scripted_sequence`, sentences.
+5. Protocol 48 netcode. **Last** — single player runs in-process without it.
+
+Movement pieces still missing all need entities first: ladders, HL water
+movement, fall damage, per-surface friction, conveyors.
 
 ## Game data
 
-Not redistributable, and there is no shareware Half-Life. Copy your own
-install's `valve/` directory in:
+Not redistributable, and there is no shareware Half-Life. Files go under:
 
     src/Apps/HL1/valve/
 
-`pak0.pak` is required. The `.wad` files (`halflife.wad`, `liquids.wad`,
-`xeno.wad`, `decals.wad`, ...) are loose files beside it in a retail install
-and are looked for there first, then inside the paks.
+A retail install keeps most content **loose**, not in a pak — maps, the wads,
+and much of `models/` and `sound/`. Every lookup is loose-first, pak-second,
+gamedir before `valve`, and case is folded both ways on the way, so a Steam
+install (lowercase) and an old disc (uppercase) both resolve.
+
+`pak0.pak` is **not required**. It is ~350 MB and nothing in the renderer path
+needs it. The current minimum is:
+
+| File | Size | Why |
+|---|---|---|
+| `valve/halflife.wad` | ~70 MB | world textures |
+| `valve/maps/c0a0.bsp` | ~2 MB | any map; `c0a0` is the default |
+| `valve/liquids.wad` | ~3 MB | only if the map's `wad` key names it |
+| `valve/models/*.mdl` | ~1 MB ea | optional; whatever the map's monsters use |
+
+For models, `scientist.mdl` plus `scientistT.mdl` is the useful pair to start
+with — it exercises the external-texture path, which most player and NPC
+models use. `HLTest;` loads exactly that.
+
+Watch the disk. The stock `ZealOS.qcow2` is 1 GiB virtual with ~460 MiB free —
+a full `valve/` will not fit without growing it.
+
+Two Quake-era files `valve/` does not have, both handled without it:
+
+- `gfx/colormap.lmp` — generated from the palette at startup.
+- `gfx/palette.lmp` — lives inside `pak0.pak`. Without it a generic colour
+  cube stands in. This affects 2D art only; the world is drawn through the
+  per-texture palettes in the wads.
+
+`gfx.wad` is WAD3 here and stores `CONCHARS` as a font lump rather than
+Quake's raw 128x128 atlas, so console text falls back to the kernel font
+(`sys_font_std`). Text always works, gfx.wad or not.
 
 Mission packs go in their own directory next to `valve` — `gearbox` for
 Opposing Force, `bshift` for Blue Shift — and are selected with `game <dir>`
 at the console.
 
-`gfx/colormap.lmp` is a Quake file and `valve/` has no such lump. It is
-generated from `gfx/palette.lmp` at startup instead; only 2D art still uses it.
-
 ## Running
+
+**You can compile and run before copying any game data.** The build happens
+first; the data check is the last thing `HL1()` does, so an empty `valve/`
+still gets you a full compile pass. That is the fastest way to shake out
+compiler errors without moving 70 MB around.
 
     Cd("::/Apps/HL1");;ExeFile("Run");        // single player
     Cd("::/Apps/HL1");;ExeFile("RunNet");     // + UDP, inherited, not yet HL
 
 `RunNet.ZC` is a separate entry point rather than a runtime switch because the
 binding is compile-time — see its header.
+
+`HLTest;` at the prompt after quitting runs the data-layer self-check: format
+readers, palette, a map load, and a studio model load with its skin table
+resolved. That is the fastest way to find out which layer is unhappy.
 
 ## Build order
 
