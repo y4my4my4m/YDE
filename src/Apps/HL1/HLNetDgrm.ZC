@@ -1,0 +1,845 @@
+// HLNetDgrm.ZC - WinQuake net_dgrm framing over UDP.
+//
+// Loopback stays raw CHLMsg (HLNet.ZC). UDP peers get 8-byte BE headers
+// (DATA/UNREL/ACK) or 4-byte CTL. Reliable is stop-and-wait with EOM chunks.
+// CTL CCREQ/CCREP lives here; server slot alloc is in HLNetSv.
+
+//here so this file sits between HLNetUdp and HLNetSv in Run.ZC
+//compile-time ceiling, sizes the slot tables. the original allows 16
+#define HLSV_MAX_CLIENTS		16
+
+//svs.maxclients - how many this SERVER actually accepts. single player is 1,
+//and it is what decides how many edicts get reserved, so it must not be the
+//ceiling: reserving 16 in a solo game shifts every world entity by fifteen
+I64 hl_sv_maxclients = 1;
+
+U0 HLSvMaxClientsSet(I64 n)
+{//globals aren't zeroed, and this is the init as well as the setter
+	if (n < 1)
+		n = 1;
+	if (n > HLSV_MAX_CLIENTS)
+		n = HLSV_MAX_CLIENTS;
+
+	hl_sv_maxclients = n;
+}
+
+//guest->host has its own sock, server slots are 0..HLSV_MAX_CLIENTS-1
+#define HLNET_CLIENT_SLOT	(-1)
+#define HLNET_PENDING_DEPTH	4
+
+class CHLScore
+{
+	U8	name[16];
+	I64	frags;
+	I64	colors;		//shirt<<4 | pants, same as svc_updatecolors
+	Bool active;
+};
+
+CHLScore	hl_scores[HLSV_MAX_CLIENTS];
+
+//rest of WriteDest(); sv.datagram (unreliable broadcast) is in HLNet.ZC
+//  MSG_ONE  -> hl_sv_client_msg[slot], that client's reliable message
+//  MSG_ALL  -> hl_sv_reliable_datagram, reliable to everyone
+//  MSG_INIT -> hl_sv_signon, replayed to each client during signon
+CHLMsg	hl_sv_client_msg[HLSV_MAX_CLIENTS];
+CHLMsg	hl_sv_reliable_datagram;
+CHLMsg	hl_sv_signon;
+
+U0 HLSvClearWriteDests()
+{//globals aren't zeroed, reset every buffer at map start.
+ //sv.signon is NOT cleared here - filled during map load, must survive.
+	I64 i;
+
+	for (i = 0; i < HLSV_MAX_CLIENTS; i++)
+		HLMsgClear(&hl_sv_client_msg[i]);
+
+	HLMsgClear(&hl_sv_reliable_datagram);
+}
+
+U0 HLSvClearSignon()
+{//before the world spawns - makestatic and ambientsound fill sv.signon
+	HLMsgClear(&hl_sv_signon);
+}
+
+U0 HLSvColorsForColormap(I64 cmap, I64 *_top, I64 *_bottom)
+{//.colormap is a CLIENT NUMBER, colors come off the scoreboard
+	I64 colors = 0;
+
+	if (cmap >= 1 && cmap <= HLSV_MAX_CLIENTS)
+		colors = hl_scores[cmap - 1].colors;
+
+	if (_top)
+		*_top = (colors >> 4) & 15;
+	if (_bottom)
+		*_bottom = colors & 15;
+}
+
+class CHLNetSock
+{
+	U32		ip;
+	I64		port;		//peer port - Ironwail is ephemeral, Zeal peers 26000
+	Bool	active;
+	Bool	can_send;
+	U32		send_seq;
+	U32		recv_seq;
+	U32		unrel_send_seq;
+	U32		unrel_recv_seq;
+	U32		ack_seq;
+	I64		send_len;
+	U8		send_msg[HLNET_MAX_MSG];
+	F64		last_send_time;
+	I64		send_offset;
+	//multi-chunk reliable reassembly, WinQuake receiveMessage
+	I64		recv_len;
+	U8		recv_msg[HLNET_MAX_MSG];
+	I64		pending_count;
+	I64		pending_head;
+	I64		pending_tail;
+	I64		pending_len[HLNET_PENDING_DEPTH];
+	//flat - slot i at pending_msg + i * HLNET_MAX_MSG, no 2D class arrays
+	U8		pending_msg[HLNET_PENDING_DEPTH * HLNET_MAX_MSG];
+};
+
+Bool	hl_dgrm_pending_logged = FALSE;
+
+//log the first few rx datagrams - tells "nothing arrived" apart from
+//"arrived then dropped"
+#define HLNET_DGRM_RX_LOG	12
+I64		hl_dgrm_rx_logged = 0;
+U8		hl_dgrm_line[128];
+
+CHLNetSock	hl_net_socks[HLSV_MAX_CLIENTS];
+CHLNetSock	hl_net_client_sock;
+
+//guest CTL handshake state, cleared by HLNetDgrmInit and on new connect
+Bool	hl_ctl_accepted   = FALSE;
+U8		hl_ctl_name[32];
+I64		hl_ctl_top        = 0;
+I64		hl_ctl_bottom     = 0;
+
+U0 HLNetSockClear(CHLNetSock *s)
+{
+	if (!s)
+		return;
+
+	s->ip              = 0;
+	s->port            = HLNET_PORT_DEFAULT;
+	s->active          = FALSE;
+	s->can_send        = TRUE;
+	s->send_seq        = 0;
+	s->recv_seq        = 0;
+	s->unrel_send_seq  = 0;
+	s->unrel_recv_seq  = 0;
+	s->ack_seq         = 0;
+	s->send_len        = 0;
+	s->last_send_time  = 0.0;
+	s->send_offset     = 0;
+	s->recv_len        = 0;
+	s->pending_count   = 0;
+	s->pending_head    = 0;
+	s->pending_tail    = 0;
+	MemSet(s->send_msg, 0, HLNET_MAX_MSG);
+	MemSet(s->recv_msg, 0, HLNET_MAX_MSG);
+	MemSet(s->pending_len, 0, HLNET_PENDING_DEPTH * sizeof(I64));
+	MemSet(s->pending_msg, 0, HLNET_PENDING_DEPTH * HLNET_MAX_MSG);
+}
+
+U0 HLNetDgrmInit()
+{
+	I64 i;
+
+	hl_dgrm_rx_logged = 0;
+
+	for (i = 0; i < HLSV_MAX_CLIENTS; i++)
+		HLNetSockClear(&hl_net_socks[i]);
+
+	HLNetSockClear(&hl_net_client_sock);
+	hl_ctl_accepted   = FALSE;
+	hl_ctl_name[0]    = 0;
+	hl_ctl_top        = 0;
+	hl_ctl_bottom     = 0;
+}
+
+Bool HLNetDgrmSendCtl(U32 ip, CHLMsg *payload, I64 dest_port=0)
+{//prepend BE len|NETFLAG_CTL, payload stays little-endian MSG_* bytes
+	U8	 pkt[HLNET_MAX_DATAGRAM + 4];
+	I64	 total;
+	I64	 dport;
+
+	if (!ip || !payload || payload->overflowed || payload->len < 1)
+		return FALSE;
+
+	total = 4 + payload->len;
+	if (total > HLNET_MAX_DATAGRAM + 4)
+		return FALSE;
+
+	dport = dest_port;
+	if (dport < 1)
+		dport = hl_udp_from_port;
+	if (dport < 1)
+		dport = HLNET_PORT_DEFAULT;
+
+	HLNetWriteBigLong(pkt, total | HLNETFLAG_CTL);
+	MemCopy(pkt + 4, payload->data, payload->len);
+	if (!HLNetUdpEnsureArp(ip))
+		return FALSE;
+	return HLNetUdpSendRawTo(pkt, total, ip, dport);
+}
+
+Bool HLNetClientCtlConnect(U32 ip)
+{//CCREQ_CONNECT - 0x01, "QUAKE", HLNET_CTL_VERSION
+	CHLMsg *m = &hl_net_cmd;
+
+	if (!ip)
+		return FALSE;
+
+	HLMsgClear(m);
+	HLMsgWriteByte(m, HLCCREQ_CONNECT);
+	HLMsgWriteString(m, "QUAKE");
+	HLMsgWriteByte(m, HLNET_CTL_VERSION);
+	return HLNetDgrmSendCtl(ip, m, HLNET_PORT_DEFAULT);
+}
+
+//--- host cache (NET_Slist_f / hostcache) -----------------------------------
+//
+//the control channel carries no transaction id, so a CCREP_SERVER_INFO cannot
+//be tied to the CCREQ that caused it. the only pairing available is temporal -
+//a reply counts if it lands on our bound port inside the window a broadcast
+//query opened. outside that window an unsolicited CCREP is dropped, or a stray
+//one from a scan long since finished would sit in the list forever
+
+#define HLNET_SLIST_MAX		16
+#define HLNET_SLIST_WINDOW	2.0		//seconds a query stays open
+
+class CHLHostCache
+{
+	U32		ip;
+	I64		port;
+	U8		addr[32];	//as the server reported it, the dedupe key
+	U8		name[32];
+	U8		map[32];
+	I64		players;
+	I64		max_players;
+};
+
+CHLHostCache	hl_slist[HLNET_SLIST_MAX];
+I64		hl_slist_count    = 0;
+F64		hl_slist_deadline = 0.0;		//tS past which a reply is unsolicited
+Bool	hl_slist_asked    = FALSE;	//a query went out at least once
+
+U0 HLSlistInit()
+{//globals aren't zeroed, and a junk count indexes past the table
+	I64 i;
+
+	hl_slist_count    = 0;
+	hl_slist_deadline = 0.0;
+	hl_slist_asked    = FALSE;
+
+	for (i = 0; i < HLNET_SLIST_MAX; i++)
+	{
+		hl_slist[i].ip          = 0;
+		hl_slist[i].port        = HLNET_PORT_DEFAULT;
+		hl_slist[i].addr[0]     = 0;
+		hl_slist[i].name[0]     = 0;
+		hl_slist[i].map[0]      = 0;
+		hl_slist[i].players     = 0;
+		hl_slist[i].max_players = 0;
+	}
+}
+
+I64 HLSlistFind(U8 *addr)
+{//the reported address is the identity, not the source ip - one server, one row
+	I64 i;
+
+	if (!addr || !addr[0])
+		return -1;
+
+	for (i = 0; i < hl_slist_count; i++)
+	{
+		if (!StrICompare(hl_slist[i].addr, addr))
+			return i;
+	}
+
+	return -1;
+}
+
+Bool HLNetSlistBroadcast()
+{//Datagram_SearchForHosts - CCREQ_SERVER_INFO to the subnet, returns at once
+ //
+ //frames CTL by hand instead of going through HLNetDgrmSendCtl: that one
+ //resolves the destination mac first, and the broadcast address has none
+	CHLMsg	*m = &hl_net_cmd;
+	U8		 pkt[HLNET_MAX_DATAGRAM + 4];
+	I64		 total;
+
+	if (!hl_udp_ready)
+		return FALSE;
+
+	HLMsgClear(m);
+	HLMsgWriteByte(m, HLCCREQ_SERVER_INFO);
+	HLMsgWriteString(m, "QUAKE");
+	HLMsgWriteByte(m, HLNET_CTL_VERSION);
+
+	if (m->overflowed || m->len < 1)
+		return FALSE;
+
+	total = 4 + m->len;
+	HLNetWriteBigLong(pkt, total | HLNETFLAG_CTL);
+	MemCopy(pkt + 4, m->data, m->len);
+
+	//replies arrive over the next second through the ordinary recv path, so
+	//the window has to be open before the send, not after it
+	hl_slist_deadline = tS + HLNET_SLIST_WINDOW;
+	hl_slist_asked    = TRUE;
+
+	return HLNetUdpSendRawBroadcast(pkt, total, HLNET_PORT_DEFAULT);
+}
+
+Bool HLNetSlistSearching()
+{//true while replies are still expected, so an empty table reads as pending
+	if (!hl_slist_asked)
+		return FALSE;
+
+	return ToBool(tS < hl_slist_deadline);
+}
+
+Bool HLNetDgrmIsCtl(U8 *data, I64 len)
+{
+	U32 word;
+	U32 flags;
+	U32 hdr_len;
+
+	if (!data || len < 4)
+		return FALSE;
+
+	word    = HLNetReadBigLong(data);
+	flags   = word & ~HLNETFLAG_LENGTH_MASK;
+	hdr_len = word & HLNETFLAG_LENGTH_MASK;
+	if (hdr_len != len)
+		return FALSE;
+
+	return ToBool(flags & HLNETFLAG_CTL);
+}
+
+CHLNetSock *HLNetDgrmSock(I64 slot)
+{
+	if (slot == HLNET_CLIENT_SLOT)
+		return &hl_net_client_sock;
+
+	if (slot < 0 || slot >= HLSV_MAX_CLIENTS)
+		return NULL;
+
+	return &hl_net_socks[slot];
+}
+
+CHLNetSock *HLNetDgrmSockByIP(U32 ip)
+{
+	I64 i;
+
+	if (!ip)
+		return NULL;
+
+	if (hl_net_client_sock.active && hl_net_client_sock.ip == ip)
+		return &hl_net_client_sock;
+
+	for (i = 0; i < HLSV_MAX_CLIENTS; i++)
+	{
+		if (hl_net_socks[i].active && hl_net_socks[i].ip == ip)
+			return &hl_net_socks[i];
+	}
+
+	return NULL;
+}
+
+Bool HLNetDgrmSendChunk(CHLNetSock *s, Bool resend)
+{//send or resend one reliable fragment from send_msg[send_offset]
+	U8	 pkt[HLNET_MAX_DATAGRAM + HLNET_HEADERSIZE];
+	I64	 remain;
+	I64	 chunk;
+	I64	 packet_len;
+	U32	 flags;
+	U32	 seq;
+
+	if (!s || !s->ip || s->send_offset >= s->send_len)
+		return FALSE;
+
+	remain = s->send_len - s->send_offset;
+	if (remain > HLNET_MAX_DATAGRAM)
+		chunk = HLNET_MAX_DATAGRAM;
+	else
+		chunk = remain;
+
+	packet_len = HLNET_HEADERSIZE + chunk;
+	flags = HLNETFLAG_DATA;
+	if (chunk == remain)
+		flags |= HLNETFLAG_EOM;
+
+	if (resend)
+		seq = s->send_seq - 1;
+	else
+		seq = s->send_seq++;
+
+	HLNetWriteBigLong(pkt, packet_len | flags);
+	HLNetWriteBigLong(pkt + 4, seq);
+	MemCopy(pkt + HLNET_HEADERSIZE, s->send_msg + s->send_offset, chunk);
+
+	if (!HLNetUdpSendRawTo(pkt, packet_len, s->ip, s->port))
+		return FALSE;
+
+	s->last_send_time = tS;
+	return TRUE;
+}
+
+U0 HLNetDgrmFlushPending(CHLNetSock *s)
+{
+	I64 idx;
+
+	if (!s || !s->can_send || s->pending_count <= 0)
+		return;
+
+	idx = s->pending_tail;
+	MemCopy(s->send_msg, s->pending_msg + idx * HLNET_MAX_MSG, s->pending_len[idx]);
+	s->send_len    = s->pending_len[idx];
+	s->pending_tail = (s->pending_tail + 1) % HLNET_PENDING_DEPTH;
+	s->pending_count--;
+	s->send_offset = 0;
+	s->can_send    = FALSE;
+
+	if (!HLNetDgrmSendChunk(s, FALSE))
+		s->last_send_time = tS;
+}
+
+Bool HLNetDgrmPendingEnqueue(CHLNetSock *s, CHLMsg *m)
+{
+	I64 idx;
+
+	if (!s || !m || m->len < 1)
+		return FALSE;
+
+	if (s->pending_count >= HLNET_PENDING_DEPTH)
+	{
+		if (!hl_dgrm_pending_logged)
+		{
+			HLLog("net: pending reliable full, drop\n");
+			HLLogFlush;
+			hl_dgrm_pending_logged = TRUE;
+		}
+		return FALSE;
+	}
+
+	idx = s->pending_head;
+	MemCopy(s->pending_msg + idx * HLNET_MAX_MSG, m->data, m->len);
+	s->pending_len[idx] = m->len;
+	s->pending_head = (s->pending_head + 1) % HLNET_PENDING_DEPTH;
+	s->pending_count++;
+	return TRUE;
+}
+
+Bool HLNetDgrmSendUnreliable(I64 slot, CHLMsg *m)
+{
+	CHLNetSock	*s;
+	U8			 pkt[HLNET_MAX_DATAGRAM + HLNET_HEADERSIZE];
+	I64			 packet_len;
+
+	s = HLNetDgrmSock(slot);
+	if (!s || !s->active || !s->ip || !m || m->len < 1 || m->overflowed)
+		return FALSE;
+
+	if (m->len > HLNET_MAX_DATAGRAM)
+		return FALSE;
+
+	packet_len = HLNET_HEADERSIZE + m->len;
+	HLNetWriteBigLong(pkt, packet_len | HLNETFLAG_UNRELIABLE);
+	HLNetWriteBigLong(pkt + 4, s->unrel_send_seq++);
+	MemCopy(pkt + HLNET_HEADERSIZE, m->data, m->len);
+
+	return HLNetUdpSendRawTo(pkt, packet_len, s->ip, s->port);
+}
+
+Bool HLNetDgrmSendReliable(I64 slot, CHLMsg *m)
+{//buffer it, send the first chunk, block until ACK - stop-and-wait
+	CHLNetSock *s;
+
+	s = HLNetDgrmSock(slot);
+	if (!s || !s->active || !s->ip || !m || m->len < 1 || m->overflowed)
+		return FALSE;
+
+	if (m->len > HLNET_MAX_MSG)
+		return FALSE;
+
+	if (!s->can_send)
+		return HLNetDgrmPendingEnqueue(s, m);
+
+	MemCopy(s->send_msg, m->data, m->len);
+	s->send_len    = m->len;
+	s->send_offset = 0;
+	s->can_send    = FALSE;
+
+	if (!HLNetDgrmSendChunk(s, FALSE))
+	{
+		//keep the buffer, Tick resends once UDP/ARP is up
+		s->last_send_time = tS;
+		return FALSE;
+	}
+
+	return TRUE;
+}
+
+U0 HLNetDgrmTick(F64 now)
+{//resend the outstanding reliable chunk after 1s of silence
+	I64			 i;
+	CHLNetSock	*s;
+
+	for (i = 0; i < HLSV_MAX_CLIENTS; i++)
+	{
+		s = &hl_net_socks[i];
+		if (s->active && s->pending_count > 0 && s->can_send)
+			HLNetDgrmFlushPending(s);
+	}
+
+	s = &hl_net_client_sock;
+	if (s->active && s->pending_count > 0 && s->can_send)
+		HLNetDgrmFlushPending(s);
+
+	for (i = 0; i < HLSV_MAX_CLIENTS; i++)
+	{
+		s = &hl_net_socks[i];
+		if (s->active && !s->can_send && s->send_len > 0 &&
+			now - s->last_send_time > 1.0)
+			HLNetDgrmSendChunk(s, TRUE);
+	}
+
+	s = &hl_net_client_sock;
+	if (s->active && !s->can_send && s->send_len > 0 &&
+		now - s->last_send_time > 1.0)
+		HLNetDgrmSendChunk(s, TRUE);
+}
+
+I64 HLNetDgrmHandleCtl(U8 *data, I64 len, U32 from_ip)
+{//guest-side CTL replies, 0 = no game message delivered.
+ //server CCREQ is HLNetServerHandleCtl in HLNetSv.
+	CHLMsg	*m = &hl_net_cmd;	//scratch, hl_net_recv isn't declared yet
+	I64		 cmd;
+	I64		 port;
+	U8		 reason[64];
+	U8		 line[96];
+	//CCREP_SERVER_INFO fields, sized to the host cache row they land in
+	U8		 addr[32];
+	U8		 hname[32];
+	U8		 level[32];
+	I64		 players;
+	I64		 maxp;
+	I64		 ver;
+	I64		 idx;
+
+	if (!data || len < 5 || !HLNetDgrmIsCtl(data, len))
+		return 0;
+
+	//server path, leave it for HLNetServerHandleCtl
+	if (hl_udp_server)
+		return 0;
+
+	HLMsgClear(m);
+	MemCopy(m->data, data + 4, len - 4);
+	m->len  = len - 4;
+	m->read = 0;
+
+	cmd = HLMsgReadByte(m);
+	if (m->badread)
+		return 0;
+
+	if (cmd == HLCCREP_ACCEPT)
+	{
+		port = HLMsgReadLong(m);
+		if (m->badread)
+			return 0;
+
+		HLNetSockClear(&hl_net_client_sock);
+		hl_net_client_sock.ip       = from_ip;
+		hl_net_client_sock.port     = port;
+		if (hl_net_client_sock.port < 1)
+			hl_net_client_sock.port = HLNET_PORT_DEFAULT;
+		hl_net_client_sock.active   = TRUE;
+		hl_net_client_sock.can_send = TRUE;
+		hl_ctl_accepted = TRUE;
+
+		StrPrint(line, "net: CTL ACCEPT port %d from %d.%d.%d.%d\n",
+			port,
+			from_ip & 255, (from_ip >> 8) & 255,
+			(from_ip >> 16) & 255, (from_ip >> 24) & 255);
+		HLLog(line);
+		HLLogFlush;
+		return 4;	//guest ACCEPT, caller may send name/color
+	}
+
+	if (cmd == HLCCREP_REJECT)
+	{
+		HLMsgReadString(m, reason, 64);
+		StrPrint(line, "net: CTL REJECT %s\n", reason);
+		HLLog(line);
+		HLLogFlush;
+		return 0;
+	}
+
+	if (cmd == HLCCREP_SERVER_INFO)
+	{
+		//no transaction id on this channel - the open query window is the
+		//whole of the match. drop anything arriving outside it
+		if (!HLNetSlistSearching)
+			return 0;
+
+		HLMsgReadString(m, addr, 32);
+		HLMsgReadString(m, hname, 32);
+		HLMsgReadString(m, level, 32);
+		players = HLMsgReadByte(m);
+		maxp    = HLMsgReadByte(m);
+		ver     = HLMsgReadByte(m);
+		if (m->badread)
+			return 0;
+
+		if (ver != HLNET_CTL_VERSION)
+			return 0;
+
+		//the address it ANSWERED FROM wins over the one it advertises. a host
+		//with no local ip set reports 0.0.0.0 and the string is not empty, so
+		//trusting it produced an entry that listed fine and joined nowhere.
+		//from_ip is the address that actually reached us
+		if (from_ip)
+			StrPrint(addr, "%d.%d.%d.%d:%d",
+				from_ip & 255, (from_ip >> 8) & 255,
+				(from_ip >> 16) & 255, (from_ip >> 24) & 255,
+				HLNET_PORT_DEFAULT);
+		else if (!addr[0])
+			return 0;
+
+		//a broadcast reaches every server once per query and the query repeats,
+		//so refreshing in place is the common path, appending the rare one
+		idx = HLSlistFind(addr);
+		if (idx < 0)
+		{
+			if (hl_slist_count >= HLNET_SLIST_MAX)
+				return 0;
+			idx = hl_slist_count;
+			hl_slist_count++;
+			HLStrCopy(hl_slist[idx].addr, addr, 32);
+		}
+
+		hl_slist[idx].ip   = from_ip;
+		hl_slist[idx].port = hl_udp_from_port;
+		if (hl_slist[idx].port < 1)
+			hl_slist[idx].port = HLNET_PORT_DEFAULT;
+		HLStrCopy(hl_slist[idx].name, hname, 32);
+		HLStrCopy(hl_slist[idx].map, level, 32);
+		hl_slist[idx].players     = players;
+		hl_slist[idx].max_players = maxp;
+		return 0;
+	}
+
+	return 0;
+}
+
+Bool HLNetDgrmSendAck(CHLNetSock *s, U32 seq)
+{
+	U8 pkt[HLNET_HEADERSIZE];
+
+	if (!s || !s->ip)
+		return FALSE;
+
+	HLNetWriteBigLong(pkt, HLNET_HEADERSIZE | HLNETFLAG_ACK);
+	HLNetWriteBigLong(pkt + 4, seq);
+	return HLNetUdpSendRawTo(pkt, HLNET_HEADERSIZE, s->ip, s->port);
+}
+
+I64 HLNetDgrmProcess(CHLNetSock *s, U8 *buf, I64 len, CHLMsg *out)
+{//one framed game packet for an active sock, 0/1/2 as Recv
+	U32	 word;
+	U32	 flags;
+	U32	 hdr_len;
+	U32	 seq;
+	I64	 payload;
+	I64	 remain;
+	I64	 chunk;
+
+	if (!s || !buf || !out || len < 4)
+		return 0;
+
+	word    = HLNetReadBigLong(buf);
+	flags   = word & ~HLNETFLAG_LENGTH_MASK;
+	hdr_len = word & HLNETFLAG_LENGTH_MASK;
+
+	if (hdr_len != len)
+		return 0;
+
+	if (flags & HLNETFLAG_CTL)
+		return HLNetDgrmHandleCtl(buf, len, s->ip);
+
+	if (len < HLNET_HEADERSIZE)
+		return 0;
+
+	seq     = HLNetReadBigLong(buf + 4);
+	payload = len - HLNET_HEADERSIZE;
+
+	if (flags & HLNETFLAG_UNRELIABLE)
+	{
+		if (seq < s->unrel_recv_seq)
+			return 0;
+
+		s->unrel_recv_seq = seq + 1;
+		HLMsgClear(out);
+		if (payload > 0)
+		{
+			if (payload > HLNET_MAX_MSG)
+				return 0;
+			MemCopy(out->data, buf + HLNET_HEADERSIZE, payload);
+			out->len = payload;
+		}
+		return 2;
+	}
+
+	if (flags & HLNETFLAG_ACK)
+	{
+		if (seq != s->send_seq - 1)
+			return 0;
+
+		if (seq != s->ack_seq)
+			return 0;
+
+		s->ack_seq++;
+
+		remain = s->send_len - s->send_offset;
+		if (remain > HLNET_MAX_DATAGRAM)
+			chunk = HLNET_MAX_DATAGRAM;
+		else
+			chunk = remain;
+
+		s->send_offset += chunk;
+		if (s->send_offset < s->send_len)
+			HLNetDgrmSendChunk(s, FALSE);
+		else
+		{
+			s->send_len    = 0;
+			s->send_offset = 0;
+			s->can_send    = TRUE;
+			HLNetDgrmFlushPending(s);
+		}
+		return 0;
+	}
+
+	if (flags & HLNETFLAG_DATA)
+	{
+		HLNetDgrmSendAck(s, seq);
+
+		if (seq != s->recv_seq)
+			return 0;
+
+		s->recv_seq++;
+
+		if (payload > 0)
+		{
+			if (s->recv_len + payload > HLNET_MAX_MSG)
+			{
+				s->recv_len = 0;
+				return 0;
+			}
+			MemCopy(s->recv_msg + s->recv_len, buf + HLNET_HEADERSIZE, payload);
+			s->recv_len += payload;
+		}
+
+		if (flags & HLNETFLAG_EOM)
+		{
+			HLMsgClear(out);
+			if (s->recv_len > 0)
+			{
+				MemCopy(out->data, s->recv_msg, s->recv_len);
+				out->len = s->recv_len;
+			}
+			s->recv_len = 0;
+			return 1;
+		}
+		return 0;
+	}
+
+	return 0;
+}
+
+I64 HLNetDgrmRecv(CHLMsg *out, U32 *from_ip)
+{//0 none/ACK/drop, 1 reliable complete, 2 unreliable,
+ //3 server CTL (whole pkt left in out for HLNetServerHandleCtl), 4 guest ACCEPT
+	U8			 buf[HLNET_MAX_DATAGRAM + HLNET_HEADERSIZE];
+	I64			 got;
+	U32			 ip;
+	U32			 word;
+	U32			 flags;
+	U32			 hdr_len;
+	CHLNetSock	*s;
+	I64			 ret;
+
+	if (from_ip)
+		*from_ip = 0;
+
+	if (!out)
+		return 0;
+
+	if (!HLNetUdpRecvRaw(buf, HLNET_MAX_DATAGRAM + HLNET_HEADERSIZE, &got, &ip))
+		return 0;
+
+	if (from_ip)
+		*from_ip = ip;
+
+	//log before any drop path, otherwise "arrived then dropped" looks
+	//exactly like "never arrived"
+	if (hl_dgrm_rx_logged < HLNET_DGRM_RX_LOG)
+	{
+		hl_dgrm_rx_logged++;
+
+		StrPrint(hl_dgrm_line,
+			"net: rx %d bytes from %d.%d.%d.%d:%d hdr %02X%02X%02X%02X\n",
+			got,
+			ip & 255, (ip >> 8) & 255, (ip >> 16) & 255, (ip >> 24) & 255,
+			hl_udp_from_port,
+			buf[0], buf[1], buf[2], buf[3]);
+		HLLog(hl_dgrm_line);
+		HLLogFlush;
+	}
+
+	if (got < 4)
+		return 0;
+
+	word    = HLNetReadBigLong(buf);
+	flags   = word & ~HLNETFLAG_LENGTH_MASK;
+	hdr_len = word & HLNETFLAG_LENGTH_MASK;
+
+	if (hdr_len != got)
+	{
+		//SLIRP pads, so still try CTL if flagged and the payload fits
+		if (!(flags & HLNETFLAG_CTL) || hdr_len < 4 || hdr_len > got)
+			return 0;
+		got = hdr_len;
+	}
+
+	if (flags & HLNETFLAG_CTL)
+	{
+		//server CCREQ is in HLNetSv, hand the whole packet up
+		if (hl_udp_server)
+		{
+			HLMsgClear(out);
+			if (got > HLNET_MAX_MSG)
+				return 0;
+			MemCopy(out->data, buf, got);
+			out->len = got;
+			return 3;
+		}
+		return HLNetDgrmHandleCtl(buf, got, ip);
+	}
+
+	s = HLNetDgrmSockByIP(ip);
+	if (!s)
+		return 0;
+
+	//NAT and Ironwail source ports drift off 26000, track the peer
+	if (hl_udp_from_port >= 1)
+		s->port = hl_udp_from_port;
+
+	ret = HLNetDgrmProcess(s, buf, got, out);
+	return ret;
+}

@@ -1,0 +1,1513 @@
+// HLProgs.ZC - the QuakeC bytecode virtual machine
+//
+// progs.dat is a 60-byte header and six sections: statements, global defs,
+// field defs, functions, string blob, global pool
+//
+// the pool is 32-bit cells and stays that way. a vector is three consecutive
+// cells and QuakeC aliases them (.origin written, .origin_x read), so widening
+// to F64 would silently break every vector access - convert only for math
+//
+// entity fields are one contiguous block at a fixed stride, the bytecode
+// addresses them by byte offset from its start
+
+#define HLPR_VERSION		6
+
+//calling convention slots, three cells wide so a vector needs no special case
+#define HLPR_OFS_RETURN	1
+#define HLPR_OFS_PARM0	4
+#define HLPR_PARM_STRIDE	3
+#define HLPR_MAX_PARMS	8
+
+#define HLPR_MAX_STACK	64		//call frames
+#define HLPR_MAX_LOCALS	2048	//saved local cells across nested calls
+#define HLPR_MAX_RUNAWAY	500000	//statements before assuming an infinite loop
+#define HLPR_SOFT_RUNAWAY	50000	//statements before complaining, no abort
+#define HLPR_STRING_HEAP	65536	//room to append map strings after the blob
+
+//opcodes, in emit order
+#define OP_DONE			0
+#define OP_MUL_F		1
+#define OP_MUL_V		2
+#define OP_MUL_FV		3
+#define OP_MUL_VF		4
+#define OP_DIV_F		5
+#define OP_ADD_F		6
+#define OP_ADD_V		7
+#define OP_SUB_F		8
+#define OP_SUB_V		9
+#define OP_EQ_F			10
+#define OP_EQ_V			11
+#define OP_EQ_S			12
+#define OP_EQ_E			13
+#define OP_EQ_FNC		14
+#define OP_NE_F			15
+#define OP_NE_V			16
+#define OP_NE_S			17
+#define OP_NE_E			18
+#define OP_NE_FNC		19
+#define OP_LE			20
+#define OP_GE			21
+#define OP_LT			22
+#define OP_GT			23
+#define OP_LOAD_F		24
+#define OP_LOAD_V		25
+#define OP_LOAD_S		26
+#define OP_LOAD_ENT		27
+#define OP_LOAD_FLD		28
+#define OP_LOAD_FNC		29
+#define OP_ADDRESS		30
+#define OP_STORE_F		31
+#define OP_STORE_V		32
+#define OP_STORE_S		33
+#define OP_STORE_ENT	34
+#define OP_STORE_FLD	35
+#define OP_STORE_FNC	36
+#define OP_STOREP_F		37
+#define OP_STOREP_V		38
+#define OP_STOREP_S		39
+#define OP_STOREP_ENT	40
+#define OP_STOREP_FLD	41
+#define OP_STOREP_FNC	42
+#define OP_RETURN		43
+#define OP_NOT_F		44
+#define OP_NOT_V		45
+#define OP_NOT_S		46
+#define OP_NOT_ENT		47
+#define OP_NOT_FNC		48
+#define OP_IF			49
+#define OP_IFNOT		50
+#define OP_CALL0		51
+#define OP_CALL8		59
+#define OP_STATE		60
+#define OP_GOTO			61
+#define OP_AND			62
+#define OP_OR			63
+#define OP_BITAND		64
+#define OP_BITOR		65
+
+class CHLPrStatement
+{
+	I64	op;
+	I64	a;
+	I64	b;
+	I64	c;
+};
+
+class CHLPrDef
+{
+	I64	type;
+	I64	ofs;
+	I64	name;		//offset into the string blob
+};
+
+class CHLPrFunction
+{
+	I64	first_statement;	//negative is a builtin, index -n
+	I64	parm_start;
+	I64	locals;
+	I64	name;
+	I64	file;
+	I64	num_parms;
+	U8	parm_size[HLPR_MAX_PARMS];
+};
+
+class CHLPrStack
+{
+	I64	statement;
+	I64	function;
+};
+
+//--- loaded image ---
+U8				*hl_pr_raw			= NULL;
+I64				 hl_pr_raw_size		= 0;
+CHLPrStatement	*hl_pr_statements	= NULL;
+I64				 hl_pr_num_statements = 0;
+CHLPrDef			*hl_pr_globaldefs	= NULL;
+I64				 hl_pr_num_globaldefs = 0;
+CHLPrDef			*hl_pr_fielddefs		= NULL;
+I64				 hl_pr_num_fielddefs	= 0;
+CHLPrFunction	*hl_pr_functions		= NULL;
+I64				 hl_pr_num_functions	= 0;
+U8				*hl_pr_strings		= NULL;	//owned, blob plus a runtime heap
+I64				 hl_pr_strings_size	= 0;
+I64				 hl_pr_string_alloc	= 0;	//next free byte in the heap
+
+#define HLPR_TEMP_STR_LEN	32
+
+I64				 hl_pr_temp_str		= 0;	//reusable scratch for ftos/vtos
+U32				*hl_pr_globals		= NULL;	//raw 32-bit cells
+I64				 hl_pr_num_globals	= 0;
+I64				 hl_pr_entity_fields	= 0;
+
+//--- entities ---
+U8	*hl_pr_edicts		= NULL;		//contiguous field storage
+I64	 hl_pr_edict_stride	= 0;		//bytes per entity
+I64	 hl_pr_max_edicts	= 0;
+I64	 hl_pr_num_edicts	= 0;
+Bool *hl_pr_edict_free	= NULL;
+
+//--- execution state ---
+CHLPrStack	 hl_pr_stack[HLPR_MAX_STACK];
+I64			 hl_pr_depth			= 0;
+I64			 hl_pr_localstack[HLPR_MAX_LOCALS];
+I64			 hl_pr_localdepth	= 0;
+I64			 hl_pr_xfunction		= 0;
+I64			 hl_pr_xstatement	= 0;
+Bool		 hl_pr_trace			= FALSE;
+Bool		 hl_pr_error			= FALSE;
+
+//rate limited. these fire from inside the per-frame execution loop, and every
+//console line allocates a document entry - an error repeating each tick eats
+//the console heap and faults in the print path, far from the real cause
+#define HLPR_MAX_REPORTS	8
+I64	 hl_pr_errors	= 0;		//total, including suppressed
+I64	 hl_pr_reported	= 0;		//how many actually printed
+U8	 hl_pr_detail[128];			//scratch for a diagnostic string
+
+U0 HLPrReport2(U8 *msg, U8 *detail)
+{//one line, only while under the cap. logged too - console lines scroll away
+ //and the window is torn down on exit
+	U8 line[192];
+
+	hl_pr_errors++;
+
+	if (hl_pr_reported >= HLPR_MAX_REPORTS)
+		return;
+
+	hl_pr_reported++;
+
+	if (detail)
+		StrPrint(line, "HLProgs: %s (%s)\n", msg, detail);
+	else
+		StrPrint(line, "HLProgs: %s\n", msg);
+
+	HLLog(line);
+
+	if (hl_pr_reported == HLPR_MAX_REPORTS)
+		HLLog("HLProgs: further errors suppressed\n");
+}
+
+//builtins live in a later file, single-pass compiler can't forward reference
+U0 (*hl_pr_builtin_call)(I64 num) = NULL;
+
+//pr_argc. variadic builtins (bprint/sprint/dprint/centerprint) must use it -
+//the OFS_PARM slots are never cleared, so scanning for a zero prints leftovers
+I64 hl_pr_argc = 0;
+
+//hot symbols, resolved by name at load - the global struct layout is a
+//compiler detail that differs between QuakeC builds
+I64 hl_ofs_self		= -1;
+I64 hl_ofs_other		= -1;
+I64 hl_ofs_world		= -1;
+I64 hl_ofs_time		= -1;
+I64 hl_ofs_frametime	= -1;
+//intermission screen stats
+I64 hl_ofs_total_secrets		= -1;
+I64 hl_ofs_total_monsters	= -1;
+I64 hl_ofs_found_secrets		= -1;
+I64 hl_ofs_killed_monsters	= -1;
+I64 hl_ofs_v_forward	= -1;
+I64 hl_ofs_v_right	= -1;
+I64 hl_ofs_v_up		= -1;
+I64 hl_ofs_force_retouch	= -1;
+I64 hl_ofs_deathmatch	= -1;
+I64 hl_ofs_skill			= -1;
+I64 hl_ofs_teamplay		= -1;
+I64 hl_ofs_coop			= -1;
+I64 hl_ofs_msg_entity	= -1;
+
+I64 hl_fld_frame		= -1;
+I64 hl_fld_nextthink	= -1;
+I64 hl_fld_think		= -1;
+I64 hl_fld_origin	= -1;
+I64 hl_fld_angles	= -1;
+I64 hl_fld_velocity	= -1;
+I64 hl_fld_model		= -1;
+I64 hl_fld_modelindex = -1;
+I64 hl_fld_classname	= -1;
+I64 hl_fld_mins		= -1;
+I64 hl_fld_maxs		= -1;
+I64 hl_fld_size		= -1;
+I64 hl_fld_solid		= -1;
+I64 hl_fld_movetype	= -1;
+I64 hl_fld_flags		= -1;
+I64 hl_fld_health	= -1;
+I64 hl_fld_yaw_speed	= -1;
+I64 hl_fld_ideal_yaw	= -1;
+I64 hl_fld_enemy		= -1;
+I64 hl_fld_owner		= -1;
+I64 hl_fld_goalentity = -1;
+I64 hl_fld_takedamage = -1;
+I64 hl_fld_effects	= -1;
+I64 hl_fld_skin		= -1;
+I64 hl_fld_spawnflags	= -1;
+I64 hl_fld_colormap	= -1;
+I64 hl_fld_frags		= -1;	//deathmatch scoreboard
+I64 hl_fld_ltime		= -1;
+I64 hl_fld_touch		= -1;
+I64 hl_fld_use		= -1;
+I64 hl_fld_blocked	= -1;
+I64 hl_fld_chain		= -1;	//findradius list, T_RadiusDamage walks it
+
+//client fields, driven every frame
+I64 hl_fld_v_angle		= -1;
+I64 hl_fld_fixangle		= -1;
+I64 hl_fld_button0		= -1;
+I64 hl_fld_button1		= -1;
+I64 hl_fld_button2		= -1;
+I64 hl_fld_impulse		= -1;
+I64 hl_fld_view_ofs		= -1;
+I64 hl_fld_items			= -1;
+I64 hl_fld_weapon		= -1;
+I64 hl_fld_weaponmodel	= -1;
+I64 hl_fld_weaponframe	= -1;
+I64 hl_fld_currentammo	= -1;
+I64 hl_fld_max_health	= -1;
+I64 hl_fld_deadflag		= -1;
+I64 hl_fld_netname		= -1;
+I64 hl_fld_message		= -1;
+I64 hl_fld_team			= -1;
+I64 hl_fld_armorvalue	= -1;
+I64 hl_fld_waterlevel	= -1;
+I64 hl_fld_watertype		= -1;
+I64 hl_fld_avelocity		= -1;
+I64 hl_fld_gravity		= -1;
+I64 hl_fld_groundentity	= -1;
+
+//engine maintained. QuakeC reads absmin/absmax constantly (FireBullets aims
+//off absmin_z, findradius measures with them) and never writes them
+I64 hl_fld_absmin		= -1;
+I64 hl_fld_punchangle	= -1;
+I64 hl_fld_dmg_take		= -1;
+I64 hl_fld_dmg_save		= -1;
+I64 hl_fld_dmg_inflictor	= -1;
+I64 hl_fld_style		= -1;
+I64 hl_fld_sounds	= -1;
+I64 hl_fld_ammo_shells	= -1;
+I64 hl_fld_ammo_nails	= -1;
+I64 hl_fld_ammo_rockets	= -1;
+I64 hl_fld_ammo_cells	= -1;
+I64 hl_fld_absmax		= -1;
+I64 hl_fld_movedir		= -1;
+I64 hl_fld_teleport_time	= -1;
+I64 hl_fld_th_die		= -1;
+
+//the player's edict, reserved before map entities so it lands in the client
+//slot QuakeC expects. checkclient reads it
+//
+//file-scope initialisers are NOT honoured here, these hold junk until
+//HLPlayerStateInit runs, and HLPlayerHealth trusts the flag alone - the attract
+//loop draws a status bar before any map spawns
+I64  hl_player_edict;
+Bool hl_player_active;			//here, not HLPlayer.ZC, because HLNetSv is earlier
+
+U0 HLPlayerStateInit()
+{
+	hl_player_edict  = 0;
+	hl_player_active = FALSE;
+}
+
+//changelevel can't tear the world down from inside a think - that frees the
+//bytecode it is running in - so it records here and the app acts between
+//frames. declared early so the builtin layer needs no forward call
+U8	 hl_change_map[64];
+Bool hl_change_pending	= FALSE;
+
+//gamedir switch, deferred the same way for the same reason: the console lives
+//in HLMenu.ZC which compiles before the shell that owns the archives, and the
+//swap frees every pak while lookups are handing out interior pointers
+U8	 hl_gamedir_next[32];
+Bool hl_gamedir_pending	= FALSE;
+
+//parm1..parm16 offsets, resolved once at load rather than by building
+//"parm%d" in a loop on every level change
+#define HLPR_MAX_PARM_GLOBALS	16
+I64	 hl_ofs_parms[HLPR_MAX_PARM_GLOBALS];
+
+
+//SV_SaveSpawnparms writes every client's set at a level change, and
+//PF_setspawnparms reads one back into the parm globals - this is what keeps
+//carried inventory separate per player across a changelevel
+F64	 hl_client_parms[HLSV_MAX_CLIENTS * HLPR_MAX_PARM_GLOBALS];
+Bool hl_client_parms_set[HLSV_MAX_CLIENTS];
+
+U0 HLClientParmsInit()
+{//globals aren't zeroed
+	I64 i;
+
+	for (i = 0; i < HLSV_MAX_CLIENTS * HLPR_MAX_PARM_GLOBALS; i++)
+		hl_client_parms[i] = 0.0;
+
+	for (i = 0; i < HLSV_MAX_CLIENTS; i++)
+		hl_client_parms_set[i] = FALSE;
+}
+I64	 hl_ofs_serverflags	= -1;
+
+//--- cell access -----------------------------------------------------------
+// read widens a 32-bit cell to F64, write narrows it back
+
+F64 HLPrGetF(I64 ofs)
+{
+	U8 tmp[4];
+	U32 v;
+
+	if (ofs < 0 || ofs >= hl_pr_num_globals)
+		return 0.0;
+
+	v      = hl_pr_globals[ofs];
+	tmp[0] = v & 0xFF;
+	tmp[1] = (v >> 8) & 0xFF;
+	tmp[2] = (v >> 16) & 0xFF;
+	tmp[3] = (v >> 24) & 0xFF;
+
+	return HLRdF32(tmp);
+}
+
+U0 HLPrSetF(I64 ofs, F64 v)
+{
+	if (ofs < 0 || ofs >= hl_pr_num_globals)
+		return;
+
+	hl_pr_globals[ofs] = HLWrF32(v);
+}
+
+I64 HLPrGetI(I64 ofs)
+{//entity numbers, string offsets and function indices are ints, not floats
+	if (ofs < 0 || ofs >= hl_pr_num_globals)
+		return 0;
+
+	return hl_pr_globals[ofs];
+}
+
+U0 HLPrSetI(I64 ofs, I64 v)
+{
+	if (ofs < 0 || ofs >= hl_pr_num_globals)
+		return;
+
+	hl_pr_globals[ofs] = v & 0xFFFFFFFF;
+}
+
+U0 HLPrGetV(I64 ofs, F64 *out)
+{
+	out[0] = HLPrGetF(ofs);
+	out[1] = HLPrGetF(ofs + 1);
+	out[2] = HLPrGetF(ofs + 2);
+}
+
+U0 HLPrSetV(I64 ofs, F64 *v)
+{
+	HLPrSetF(ofs, v[0]);
+	HLPrSetF(ofs + 1, v[1]);
+	HLPrSetF(ofs + 2, v[2]);
+}
+
+U8 *HLPrStr(I64 ofs)
+{//string values are byte offsets into the blob
+	if (ofs < 0 || ofs >= hl_pr_strings_size)
+		return "";
+
+	return hl_pr_strings + ofs;
+}
+
+//--- entity access ---------------------------------------------------------
+// entity values are byte offsets into the edict block, so the world is offset
+// 0 and the bytecode's own pointer arithmetic works unchanged
+
+I64 HLPrEdictNum(I64 ent_value)
+{
+	if (hl_pr_edict_stride <= 0)
+		return 0;
+
+	return ent_value / hl_pr_edict_stride;
+}
+
+I64 HLPrEdictValue(I64 num)
+{
+	return num * hl_pr_edict_stride;
+}
+
+F64 HLPrFieldF(I64 ent_num, I64 field_ofs)
+{
+	U8 *p;
+
+	if (!hl_pr_edicts)
+		return 0;
+	if (ent_num < 0 || ent_num >= hl_pr_max_edicts)
+		return 0.0;
+	if (field_ofs < 0 || field_ofs >= hl_pr_entity_fields)
+		return 0.0;
+
+	p = hl_pr_edicts + ent_num * hl_pr_edict_stride + field_ofs * 4;
+
+	return HLRdF32(p);
+}
+
+U0 HLPrSetFieldF(I64 ent_num, I64 field_ofs, F64 v)
+{
+	U8	*p;
+	U32	 bits;
+
+	if (!hl_pr_edicts)
+		return;
+	if (ent_num < 0 || ent_num >= hl_pr_max_edicts)
+		return;
+	if (field_ofs < 0 || field_ofs >= hl_pr_entity_fields)
+		return;
+
+	p    = hl_pr_edicts + ent_num * hl_pr_edict_stride + field_ofs * 4;
+	bits = HLWrF32(v);
+
+	p[0] = bits & 0xFF;
+	p[1] = (bits >> 8) & 0xFF;
+	p[2] = (bits >> 16) & 0xFF;
+	p[3] = (bits >> 24) & 0xFF;
+}
+
+I64 HLPrFieldI(I64 ent_num, I64 field_ofs)
+{
+	U8 *p;
+
+	if (!hl_pr_edicts)
+		return 0;
+	if (ent_num < 0 || ent_num >= hl_pr_max_edicts)
+		return 0;
+	if (field_ofs < 0 || field_ofs >= hl_pr_entity_fields)
+		return 0;
+
+	p = hl_pr_edicts + ent_num * hl_pr_edict_stride + field_ofs * 4;
+
+	return HLRdU32(p);
+}
+
+U0 HLPrSetFieldI(I64 ent_num, I64 field_ofs, I64 v)
+{
+	U8 *p;
+
+	if (!hl_pr_edicts)
+		return;
+	if (ent_num < 0 || ent_num >= hl_pr_max_edicts)
+		return;
+	if (field_ofs < 0 || field_ofs >= hl_pr_entity_fields)
+		return;
+
+	p    = hl_pr_edicts + ent_num * hl_pr_edict_stride + field_ofs * 4;
+	p[0] = v & 0xFF;
+	p[1] = (v >> 8) & 0xFF;
+	p[2] = (v >> 16) & 0xFF;
+	p[3] = (v >> 24) & 0xFF;
+}
+
+//raw byte-offset access for the pointer opcodes
+F64 HLPrPtrGetF(I64 byte_ofs)
+{
+	if (byte_ofs < 0 || byte_ofs + 4 > hl_pr_max_edicts * hl_pr_edict_stride)
+		return 0.0;
+
+	return HLRdF32(hl_pr_edicts + byte_ofs);
+}
+
+U0 HLPrPtrSetI(I64 byte_ofs, I64 v)
+{
+	U8 *p;
+
+	if (!hl_pr_edicts)
+		return;
+	if (byte_ofs < 0 || byte_ofs + 4 > hl_pr_max_edicts * hl_pr_edict_stride)
+		return;
+
+	p    = hl_pr_edicts + byte_ofs;
+	p[0] = v & 0xFF;
+	p[1] = (v >> 8) & 0xFF;
+	p[2] = (v >> 16) & 0xFF;
+	p[3] = (v >> 24) & 0xFF;
+}
+
+I64 HLPrPtrGetI(I64 byte_ofs)
+{
+	if (!hl_pr_edicts)
+		return 0;
+	if (byte_ofs < 0 || byte_ofs + 4 > hl_pr_max_edicts * hl_pr_edict_stride)
+		return 0;
+
+	return HLRdU32(hl_pr_edicts + byte_ofs);
+}
+
+U0 HLPrPtrSetF(I64 byte_ofs, F64 v)
+{
+	HLPrPtrSetI(byte_ofs, HLWrF32(v));
+}
+
+//--- symbol lookup ---------------------------------------------------------
+// by name, never by hardcoded offset - the layout is a compiler detail
+
+I64 HLPrFindGlobal(U8 *name)
+{
+	I64 i;
+
+	for (i = 0; i < hl_pr_num_globaldefs; i++)
+	{
+		if (!StrCompare(HLPrStr(hl_pr_globaldefs[i].name), name))
+			return hl_pr_globaldefs[i].ofs;
+	}
+
+	return -1;
+}
+
+I64 HLPrFindField(U8 *name)
+{
+	I64 i;
+
+	for (i = 0; i < hl_pr_num_fielddefs; i++)
+	{
+		if (!StrCompare(HLPrStr(hl_pr_fielddefs[i].name), name))
+			return hl_pr_fielddefs[i].ofs;
+	}
+
+	return -1;
+}
+
+I64 HLPrFindFunction(U8 *name)
+{
+	I64 i;
+
+	for (i = 0; i < hl_pr_num_functions; i++)
+	{
+		if (!StrCompare(HLPrStr(hl_pr_functions[i].name), name))
+			return i;
+	}
+
+	return -1;
+}
+
+//--- loading ---------------------------------------------------------------
+
+U0 HLPrFree()
+{
+	if (hl_pr_statements)	Free(hl_pr_statements);
+	if (hl_pr_globaldefs)	Free(hl_pr_globaldefs);
+	if (hl_pr_fielddefs)		Free(hl_pr_fielddefs);
+	if (hl_pr_functions)		Free(hl_pr_functions);
+	if (hl_pr_globals)		Free(hl_pr_globals);
+	if (hl_pr_strings)		Free(hl_pr_strings);
+	if (hl_pr_edicts)		Free(hl_pr_edicts);
+	if (hl_pr_edict_free)	Free(hl_pr_edict_free);
+	if (hl_pr_raw)			Free(hl_pr_raw);
+
+	hl_pr_statements		= NULL;
+	hl_pr_globaldefs		= NULL;
+	hl_pr_fielddefs		= NULL;
+	hl_pr_functions		= NULL;
+	hl_pr_globals		= NULL;
+	hl_pr_strings		= NULL;
+	hl_pr_string_alloc	= 0;
+	hl_pr_temp_str		= 0;
+	hl_pr_edicts			= NULL;
+	hl_pr_edict_free		= NULL;
+	hl_pr_raw			= NULL;
+	hl_pr_num_edicts		= 0;
+
+	//the SIZES go too. every field accessor bounds-checks against these and
+	//then indexes off hl_pr_edicts - leaving them set after the block is freed
+	//means the guards pass and the write lands at NULL + offset
+	hl_pr_max_edicts		= 0;
+	hl_pr_entity_fields	= 0;
+	hl_pr_edict_stride	= 0;
+	hl_pr_strings_size	= 0;
+	hl_pr_num_globals	= 0;
+	hl_pr_num_functions	= 0;
+	hl_pr_num_statements	= 0;
+	hl_pr_depth			= 0;
+	hl_pr_localdepth		= 0;
+	hl_pr_error			= FALSE;
+}
+
+Bool HLPrLoad(U8 *name, I64 max_edicts)
+{
+	U8	*d;
+	U8	*rec;
+	I64	 size = 0;
+	I64	 ofs_statements;
+	I64	 ofs_globaldefs;
+	I64	 ofs_fielddefs;
+	I64	 ofs_functions;
+	I64	 ofs_strings;
+	I64	 ofs_globals;
+	I64	 i;
+	I64	 j;
+
+	HLPrFree;
+
+	d = HLPakLoad(name, &size);
+	if (!d)
+	{
+		"HLProgs: %s not found\n", name;
+		return FALSE;
+	}
+
+	if (size < 60 || HLRdI32(d) != HLPR_VERSION)
+	{
+		"HLProgs: %s is not a version %d image\n", name, HLPR_VERSION;
+		Free(d);
+		return FALSE;
+	}
+
+	hl_pr_raw      = d;
+	hl_pr_raw_size = size;
+
+	ofs_statements       = HLRdI32(d + 8);
+	hl_pr_num_statements  = HLRdI32(d + 12);
+	ofs_globaldefs       = HLRdI32(d + 16);
+	hl_pr_num_globaldefs  = HLRdI32(d + 20);
+	ofs_fielddefs        = HLRdI32(d + 24);
+	hl_pr_num_fielddefs   = HLRdI32(d + 28);
+	ofs_functions        = HLRdI32(d + 32);
+	hl_pr_num_functions   = HLRdI32(d + 36);
+	ofs_strings          = HLRdI32(d + 40);
+	hl_pr_strings_size    = HLRdI32(d + 44);
+	ofs_globals          = HLRdI32(d + 48);
+	hl_pr_num_globals     = HLRdI32(d + 52);
+	hl_pr_entity_fields   = HLRdI32(d + 56);
+
+	//--- statements: op, then three signed operands ---
+	hl_pr_statements = CAlloc(hl_pr_num_statements * sizeof(CHLPrStatement));
+	for (i = 0; i < hl_pr_num_statements; i++)
+	{
+		rec = d + ofs_statements + i * 8;
+		hl_pr_statements[i].op = HLRdU16(rec);
+
+		//signed, jumps are relative and go backwards for loops
+		hl_pr_statements[i].a = HLRdI16(rec + 2);
+		hl_pr_statements[i].b = HLRdI16(rec + 4);
+		hl_pr_statements[i].c = HLRdI16(rec + 6);
+	}
+
+	//--- defs ---
+	hl_pr_globaldefs = CAlloc(hl_pr_num_globaldefs * sizeof(CHLPrDef));
+	for (i = 0; i < hl_pr_num_globaldefs; i++)
+	{
+		rec = d + ofs_globaldefs + i * 8;
+		hl_pr_globaldefs[i].type = HLRdU16(rec);
+		hl_pr_globaldefs[i].ofs  = HLRdU16(rec + 2);
+		hl_pr_globaldefs[i].name = HLRdI32(rec + 4);
+	}
+
+	hl_pr_fielddefs = CAlloc(hl_pr_num_fielddefs * sizeof(CHLPrDef));
+	for (i = 0; i < hl_pr_num_fielddefs; i++)
+	{
+		rec = d + ofs_fielddefs + i * 8;
+		hl_pr_fielddefs[i].type = HLRdU16(rec);
+		hl_pr_fielddefs[i].ofs  = HLRdU16(rec + 2);
+		hl_pr_fielddefs[i].name = HLRdI32(rec + 4);
+	}
+
+	//--- functions ---
+	hl_pr_functions = CAlloc(hl_pr_num_functions * sizeof(CHLPrFunction));
+	for (i = 0; i < hl_pr_num_functions; i++)
+	{
+		rec = d + ofs_functions + i * 36;
+		hl_pr_functions[i].first_statement = HLRdI32(rec);
+		hl_pr_functions[i].parm_start      = HLRdI32(rec + 4);
+		hl_pr_functions[i].locals          = HLRdI32(rec + 8);
+		//rec + 12 is a profile counter, unused
+		hl_pr_functions[i].name            = HLRdI32(rec + 16);
+		hl_pr_functions[i].file            = HLRdI32(rec + 20);
+		hl_pr_functions[i].num_parms       = HLRdI32(rec + 24);
+		for (j = 0; j < HLPR_MAX_PARM_GLOBALS; j++)
+			hl_pr_functions[i].parm_size[j] = rec[28 + j];
+	}
+
+	//--- strings ---
+	//copied into a larger owned buffer so map entity values can be appended.
+	//string values are offsets into this space, anything handed to the VM
+	//must live here
+	hl_pr_strings_size = hl_pr_strings_size + HLPR_STRING_HEAP;
+	hl_pr_strings      = CAlloc(hl_pr_strings_size);
+	MemCopy(hl_pr_strings, d + ofs_strings, HLRdI32(d + 44));
+	hl_pr_string_alloc = HLRdI32(d + 44);
+
+	hl_pr_globals = CAlloc(hl_pr_num_globals * 4);
+	for (i = 0; i < hl_pr_num_globals; i++)
+		hl_pr_globals[i] = HLRdU32(d + ofs_globals + i * 4);
+
+	//--- entities ---
+	hl_pr_edict_stride = hl_pr_entity_fields * 4;
+	hl_pr_max_edicts   = max_edicts;
+	hl_pr_edicts       = CAlloc(hl_pr_max_edicts * hl_pr_edict_stride);
+	hl_pr_edict_free   = CAlloc(hl_pr_max_edicts * sizeof(Bool));
+	hl_pr_num_edicts   = 1;		//entity 0 is always the world
+
+	for (i = 0; i < hl_pr_max_edicts; i++)
+		hl_pr_edict_free[i] = TRUE;
+	hl_pr_edict_free[0] = FALSE;
+
+	return TRUE;
+}
+
+//--- execution -------------------------------------------------------------
+
+U0 HLPrChainDump()
+{//self plus the .enemy chain hanging off it
+ //
+ //door_fire and friends walk a circular .enemy list and stop on arriving back
+ //at the start. if the list isn't circular, or excludes the starting entity,
+ //the loop never ends - this says which, and whether links are stored at all
+	U8	line[192];
+	I64	self_ent;
+	I64	ent;
+	I64	i;
+
+	if (hl_ofs_self < 0 || hl_fld_enemy < 0)
+		return;
+
+	self_ent = HLPrEdictNum(HLPrGetI(hl_ofs_self));
+
+	StrPrint(line, "  self=%d (%s) owner=%d enemy=%d\n", self_ent,
+		HLPrStr(HLPrFieldI(self_ent, hl_fld_classname)),
+		HLPrEdictNum(HLPrFieldI(self_ent, hl_fld_owner)),
+		HLPrEdictNum(HLPrFieldI(self_ent, hl_fld_enemy)));
+	HLLog(line);
+
+	//closing back onto self within a few links is well formed, running to the
+	//cap is either long or cyclic somewhere that excludes self
+	ent = self_ent;
+	for (i = 0; i < 12; i++)
+	{
+		ent = HLPrEdictNum(HLPrFieldI(ent, hl_fld_enemy));
+
+		StrPrint(line, "    chain[%d] -> %d (%s)\n", i, ent,
+			HLPrStr(HLPrFieldI(ent, hl_fld_classname)));
+		HLLog(line);
+
+		if (ent == 0 || ent == self_ent)
+			return;
+	}
+
+	HLLog("    chain did not close within 12 links\n");
+}
+
+U0 HLPrStackDump()
+{//the QuakeC call chain, outermost first - the abort site alone rarely names
+ //the cause
+	U8	line[128];
+	I64 i;
+	I64 f;
+
+	for (i = 0; i < hl_pr_depth; i++)
+	{
+		f = hl_pr_stack[i].function;
+		if (f > 0 && f < hl_pr_num_functions)
+		{
+			StrPrint(line, "  stack[%d] %s\n", i,
+				HLPrStr(hl_pr_functions[f].name));
+			HLLog(line);
+		}
+	}
+
+	if (hl_pr_xfunction > 0 && hl_pr_xfunction < hl_pr_num_functions)
+	{
+		StrPrint(line, "  stack[%d] %s <- aborted here\n", hl_pr_depth,
+			HLPrStr(hl_pr_functions[hl_pr_xfunction].name));
+		HLLog(line);
+	}
+
+	HLPrChainDump;
+	HLLogFlush;
+}
+
+U0 HLPrEnterFunction(I64 fnum)
+{//push the caller, save the callee's locals, copy the arguments in
+	CHLPrFunction	*f = &hl_pr_functions[fnum];
+	I64				 i;
+	I64				 j;
+	I64				 o;
+	I64				 c;
+
+	if (hl_pr_depth >= HLPR_MAX_STACK)
+	{
+		HLPrReport2("call stack overflow", NULL);
+		hl_pr_error = TRUE;
+		return;
+	}
+
+	hl_pr_stack[hl_pr_depth].statement = hl_pr_xstatement;
+	hl_pr_stack[hl_pr_depth].function  = hl_pr_xfunction;
+	hl_pr_depth++;
+
+	//locals are statically allocated, recursion needs them saved and restored
+	c = f->locals;
+	if (hl_pr_localdepth + c > HLPR_MAX_LOCALS)
+	{
+		HLPrReport2("local stack overflow", NULL);
+		hl_pr_error = TRUE;
+		return;
+	}
+
+	for (i = 0; i < c; i++)
+	{
+		hl_pr_localstack[hl_pr_localdepth] = HLPrGetI(f->parm_start + i);
+		hl_pr_localdepth++;
+	}
+
+	//arguments arrive in the reserved parm cells
+	o = f->parm_start;
+	for (i = 0; i < f->num_parms; i++)
+	{
+		for (j = 0; j < f->parm_size[i]; j++)
+		{
+			HLPrSetI(o, HLPrGetI(HLPR_OFS_PARM0 + i * HLPR_PARM_STRIDE + j));
+			o++;
+		}
+	}
+
+	hl_pr_xfunction  = fnum;
+	hl_pr_xstatement = f->first_statement - 1;	//the loop pre-increments
+}
+
+U0 HLPrLeaveFunction()
+{
+	CHLPrFunction	*f;
+	I64				 i;
+	I64				 c;
+
+	if (hl_pr_depth <= 0)
+	{
+		HLPrReport2("call stack underflow", NULL);
+		hl_pr_error = TRUE;
+		return;
+	}
+
+	f = &hl_pr_functions[hl_pr_xfunction];
+	c = f->locals;
+
+	//reverse, the save loop pushed forwards
+	for (i = c - 1; i >= 0; i--)
+	{
+		hl_pr_localdepth--;
+		HLPrSetI(f->parm_start + i, hl_pr_localstack[hl_pr_localdepth]);
+	}
+
+	hl_pr_depth--;
+	hl_pr_xfunction  = hl_pr_stack[hl_pr_depth].function;
+	hl_pr_xstatement = hl_pr_stack[hl_pr_depth].statement;
+}
+
+U0 HLPrExecute(I64 fnum)
+{//PR_ExecuteProgram: run a QuakeC function to completion
+	CHLPrStatement	*st;
+	CHLPrFunction	*newf;
+	F64				 va[3];
+	F64				 vb[3];
+	F64				 vc[3];
+	F64				 fa;
+	F64				 fb;
+	I64				 exit_depth;
+	I64				 entry_local;
+	I64				 runaway = 0;
+	I64				 op;
+	I64				 i;
+	I64				 ptr;
+	I64				 ent;
+	I64				 fld;
+	I64				 newfnum;
+	I64				 caller;
+
+	if (fnum <= 0 || fnum >= hl_pr_num_functions)
+		return;
+
+	hl_pr_error  = FALSE;
+	exit_depth  = hl_pr_depth;
+	entry_local = hl_pr_localdepth;
+
+	//EnterFunction pushes the current function before switching, so frame 0
+	//would carry hl_pr_xfunction from the PREVIOUS execute and show a bogus
+	//outermost frame in every abort dump
+	hl_pr_xfunction = 0;
+
+	HLPrEnterFunction(fnum);
+
+	while (TRUE)
+	{
+		runaway++;
+		//a loop can wreck the frame without ever reaching the runaway cap,
+		//so complain once per execute well below it
+		if (runaway == HLPR_SOFT_RUNAWAY)
+		{
+			HLPrReport2("slow execute in",
+				HLPrStr(hl_pr_functions[hl_pr_xfunction].name));
+			HLPrStackDump;
+		}
+
+		if (runaway > HLPR_MAX_RUNAWAY)
+		{
+			HLPrReport2("runaway loop in",
+				HLPrStr(hl_pr_functions[hl_pr_xfunction].name));
+
+			//the innermost function is not the culprit - the loop that never
+			//exits lives further up the stack than wherever the counter tripped
+			HLPrStackDump;
+
+			hl_pr_error = TRUE;
+			goto qpr_abort;
+		}
+
+		if (hl_pr_error)
+			goto qpr_abort;
+
+		hl_pr_xstatement++;
+
+		if (hl_pr_xstatement < 0 || hl_pr_xstatement >= hl_pr_num_statements)
+		{
+			HLPrReport2("statement out of range",
+				HLPrStr(hl_pr_functions[hl_pr_xfunction].name));
+			hl_pr_error = TRUE;
+			goto qpr_abort;
+		}
+
+		st = &hl_pr_statements[hl_pr_xstatement];
+		op = st->op;
+
+		switch (op)
+		{
+			case OP_DONE:
+			case OP_RETURN:
+				//a bare DONE returns nothing, but the operand cells are always
+				//in range so copying them is harmless
+				HLPrSetI(HLPR_OFS_RETURN, HLPrGetI(st->a));
+				HLPrSetI(HLPR_OFS_RETURN + 1, HLPrGetI(st->a + 1));
+				HLPrSetI(HLPR_OFS_RETURN + 2, HLPrGetI(st->a + 2));
+
+				HLPrLeaveFunction;
+				if (hl_pr_depth == exit_depth)
+					return;
+				break;
+
+			//--- arithmetic ---
+			case OP_MUL_F:
+				HLPrSetF(st->c, HLPrGetF(st->a) * HLPrGetF(st->b));
+				break;
+			case OP_MUL_V:
+				HLPrGetV(st->a, va);
+				HLPrGetV(st->b, vb);
+				HLPrSetF(st->c, va[0] * vb[0] + va[1] * vb[1] + va[2] * vb[2]);
+				break;
+			case OP_MUL_FV:
+				fa = HLPrGetF(st->a);
+				HLPrGetV(st->b, vb);
+				HLVecScale(vb, fa, vc);
+				HLPrSetV(st->c, vc);
+				break;
+			case OP_MUL_VF:
+				HLPrGetV(st->a, va);
+				fb = HLPrGetF(st->b);
+				HLVecScale(va, fb, vc);
+				HLPrSetV(st->c, vc);
+				break;
+			case OP_DIV_F:
+				fb = HLPrGetF(st->b);
+				if (fb == 0.0)
+					HLPrSetF(st->c, 0.0);
+				else
+					HLPrSetF(st->c, HLPrGetF(st->a) / fb);
+				break;
+			case OP_ADD_F:
+				HLPrSetF(st->c, HLPrGetF(st->a) + HLPrGetF(st->b));
+				break;
+			case OP_ADD_V:
+				HLPrGetV(st->a, va);
+				HLPrGetV(st->b, vb);
+				HLVecAdd(va, vb, vc);
+				HLPrSetV(st->c, vc);
+				break;
+			case OP_SUB_F:
+				HLPrSetF(st->c, HLPrGetF(st->a) - HLPrGetF(st->b));
+				break;
+			case OP_SUB_V:
+				HLPrGetV(st->a, va);
+				HLPrGetV(st->b, vb);
+				HLVecSub(va, vb, vc);
+				HLPrSetV(st->c, vc);
+				break;
+
+			//--- comparison ---
+			case OP_EQ_F:
+				HLPrSetF(st->c, ToF64(HLPrGetF(st->a) == HLPrGetF(st->b)));
+				break;
+			case OP_EQ_V:
+				HLPrGetV(st->a, va);
+				HLPrGetV(st->b, vb);
+				HLPrSetF(st->c, ToF64(va[0] == vb[0] && va[1] == vb[1] &&
+					va[2] == vb[2]));
+				break;
+			case OP_EQ_S:
+				HLPrSetF(st->c, ToF64(!StrCompare(HLPrStr(HLPrGetI(st->a)),
+					HLPrStr(HLPrGetI(st->b)))));
+				break;
+			case OP_EQ_E:
+			case OP_EQ_FNC:
+				HLPrSetF(st->c, ToF64(HLPrGetI(st->a) == HLPrGetI(st->b)));
+				break;
+			case OP_NE_F:
+				HLPrSetF(st->c, ToF64(HLPrGetF(st->a) != HLPrGetF(st->b)));
+				break;
+			case OP_NE_V:
+				HLPrGetV(st->a, va);
+				HLPrGetV(st->b, vb);
+				HLPrSetF(st->c, ToF64(va[0] != vb[0] || va[1] != vb[1] ||
+					va[2] != vb[2]));
+				break;
+			case OP_NE_S:
+				HLPrSetF(st->c, ToF64(ToBool(StrCompare(HLPrStr(HLPrGetI(st->a)),
+					HLPrStr(HLPrGetI(st->b))))));
+				break;
+			case OP_NE_E:
+			case OP_NE_FNC:
+				HLPrSetF(st->c, ToF64(HLPrGetI(st->a) != HLPrGetI(st->b)));
+				break;
+			case OP_LE:
+				HLPrSetF(st->c, ToF64(HLPrGetF(st->a) <= HLPrGetF(st->b)));
+				break;
+			case OP_GE:
+				HLPrSetF(st->c, ToF64(HLPrGetF(st->a) >= HLPrGetF(st->b)));
+				break;
+			case OP_LT:
+				HLPrSetF(st->c, ToF64(HLPrGetF(st->a) < HLPrGetF(st->b)));
+				break;
+			case OP_GT:
+				HLPrSetF(st->c, ToF64(HLPrGetF(st->a) > HLPrGetF(st->b)));
+				break;
+
+			//--- field loads: a is the entity, b the field index ---
+			case OP_LOAD_F:
+			case OP_LOAD_S:
+			case OP_LOAD_ENT:
+			case OP_LOAD_FLD:
+			case OP_LOAD_FNC:
+				ent = HLPrEdictNum(HLPrGetI(st->a));
+				fld = HLPrGetI(st->b);
+				HLPrSetI(st->c, HLPrFieldI(ent, fld));
+				break;
+			case OP_LOAD_V:
+				ent = HLPrEdictNum(HLPrGetI(st->a));
+				fld = HLPrGetI(st->b);
+				HLPrSetI(st->c, HLPrFieldI(ent, fld));
+				HLPrSetI(st->c + 1, HLPrFieldI(ent, fld + 1));
+				HLPrSetI(st->c + 2, HLPrFieldI(ent, fld + 2));
+				break;
+
+			case OP_ADDRESS:
+				//yields a byte offset into the edict block
+				ent = HLPrEdictNum(HLPrGetI(st->a));
+				fld = HLPrGetI(st->b);
+				HLPrSetI(st->c, ent * hl_pr_edict_stride + fld * 4);
+				break;
+
+			//--- global stores ---
+			case OP_STORE_F:
+			case OP_STORE_S:
+			case OP_STORE_ENT:
+			case OP_STORE_FLD:
+			case OP_STORE_FNC:
+				HLPrSetI(st->b, HLPrGetI(st->a));
+				break;
+			case OP_STORE_V:
+				HLPrSetI(st->b, HLPrGetI(st->a));
+				HLPrSetI(st->b + 1, HLPrGetI(st->a + 1));
+				HLPrSetI(st->b + 2, HLPrGetI(st->a + 2));
+				break;
+
+			//--- pointer stores ---
+			case OP_STOREP_F:
+			case OP_STOREP_S:
+			case OP_STOREP_ENT:
+			case OP_STOREP_FLD:
+			case OP_STOREP_FNC:
+				ptr = HLPrGetI(st->b);
+				HLPrPtrSetI(ptr, HLPrGetI(st->a));
+				break;
+			case OP_STOREP_V:
+				ptr = HLPrGetI(st->b);
+				HLPrPtrSetI(ptr, HLPrGetI(st->a));
+				HLPrPtrSetI(ptr + 4, HLPrGetI(st->a + 1));
+				HLPrPtrSetI(ptr + 8, HLPrGetI(st->a + 2));
+				break;
+
+			//--- logic ---
+			case OP_NOT_F:
+				//explicit compare against 0.0. ZealC ! on an F64 does not
+				//behave like C, and this opcode carries half of QuakeC:
+				//  if (!self.yaw_speed) -> monsters that never turn
+				//  if (!targ.takedamage) -> the world becomes damageable
+				//  if (!self.speed) -> zero-speed doors, divide by zero in
+				//    SUB_CalcMove, a think at zero delay that locks the frame
+				if (HLPrGetF(st->a) == 0.0)
+					HLPrSetF(st->c, 1.0);
+				else
+					HLPrSetF(st->c, 0.0);
+				break;
+			case OP_NOT_V:
+				HLPrGetV(st->a, va);
+				if (va[0] == 0.0 && va[1] == 0.0 && va[2] == 0.0)
+					HLPrSetF(st->c, 1.0);
+				else
+					HLPrSetF(st->c, 0.0);
+				break;
+			case OP_NOT_S:
+				//same reasoning, no ! on values out of the pool
+				i = HLPrGetI(st->a);
+				if (!i)
+					HLPrSetF(st->c, 1.0);
+				else if (HLPrStr(i)[0] == 0)
+					HLPrSetF(st->c, 1.0);
+				else
+					HLPrSetF(st->c, 0.0);
+				break;
+			case OP_NOT_FNC:
+				//an integer test, matching how a function ref is stored
+				if (!HLPrGetI(st->a))
+					HLPrSetF(st->c, 1.0);
+				else
+					HLPrSetF(st->c, 0.0);
+				break;
+			case OP_NOT_ENT:
+				//only the world counts as no entity
+				if (HLPrEdictNum(HLPrGetI(st->a)) == 0)
+					HLPrSetF(st->c, 1.0);
+				else
+					HLPrSetF(st->c, 0.0);
+				break;
+			case OP_AND:
+				//ToBool takes an I64, an F64 arrives as raw bits
+				if (HLPrGetF(st->a) != 0.0 && HLPrGetF(st->b) != 0.0)
+					HLPrSetF(st->c, 1.0);
+				else
+					HLPrSetF(st->c, 0.0);
+				break;
+			case OP_OR:
+				if (HLPrGetF(st->a) != 0.0 || HLPrGetF(st->b) != 0.0)
+					HLPrSetF(st->c, 1.0);
+				else
+					HLPrSetF(st->c, 0.0);
+				break;
+			case OP_BITAND:
+				HLPrSetF(st->c, ToF64(ToI64(HLPrGetF(st->a)) &
+					ToI64(HLPrGetF(st->b))));
+				break;
+			case OP_BITOR:
+				HLPrSetF(st->c, ToF64(ToI64(HLPrGetF(st->a)) |
+					ToI64(HLPrGetF(st->b))));
+				break;
+
+			//--- flow. jumps are relative and the loop pre-increments ---
+			//branch tests read the operand as a raw int, as the original does:
+			//
+			//    case OP_IF:    if (a->_int) ...
+			//    case OP_IFNOT: if (!a->_int) ...
+			//
+			//conditions arrive as every type - floats from comparisons, but
+			//also entity, string and function refs stored as small ints. int
+			//and float tests agree on most bit patterns, not all: negative
+			//zero equals 0.0 while its _int is non-zero
+			case OP_IF:
+				if (HLPrGetI(st->a))
+					hl_pr_xstatement += st->b - 1;
+				break;
+			case OP_IFNOT:
+				if (!HLPrGetI(st->a))
+					hl_pr_xstatement += st->b - 1;
+				break;
+			case OP_GOTO:
+				hl_pr_xstatement += st->a - 1;
+				break;
+
+			case OP_STATE:
+				//animation step: frame a now, think b in 0.1s. drives every
+				//monster and door animation, so it has to be exact
+				ent = HLPrEdictNum(HLPrGetI(hl_ofs_self));
+				HLPrSetFieldF(ent, hl_fld_frame, HLPrGetF(st->a));
+				HLPrSetFieldF(ent, hl_fld_nextthink, HLPrGetF(hl_ofs_time) + 0.1);
+				HLPrSetFieldI(ent, hl_fld_think, HLPrGetI(st->b));
+				break;
+
+			default:
+				//--- calls: CALL0..CALL8 encode the argument count ---
+				if (OP_CALL0 <= op <= OP_CALL8)
+				{
+					newfnum = HLPrGetI(st->a);
+					if (newfnum <= 0 || newfnum >= hl_pr_num_functions)
+					{
+						//caller, callee, self classname, entnum and damage
+						//state. Killed on a null th_die says a death function
+						//is missing but not on what; entnum 0 with a real
+						//classname is the world, entnum 0 with junk is a
+						//corrupted self - opposite fixes. the caller separates
+						//a bad damage path from a bad T_Damage gate
+						ent = HLPrEdictNum(HLPrGetI(hl_ofs_self));
+
+						if (hl_pr_depth > 0)
+							caller = hl_pr_stack[hl_pr_depth - 1].function;
+						else
+							caller = 0;
+
+						StrPrint(hl_pr_detail, "%s<-%s self=%s #%d dmg=%d mt=%d",
+							HLPrStr(hl_pr_functions[hl_pr_xfunction].name),
+							HLPrStr(hl_pr_functions[caller].name),
+							HLPrStr(HLPrFieldI(ent, hl_fld_classname)),
+							ent,
+							ToI64(HLPrFieldF(ent, hl_fld_takedamage)),
+							ToI64(HLPrFieldF(ent, hl_fld_movetype)));
+
+						HLPrReport2("call to null function from", hl_pr_detail);
+						hl_pr_error = TRUE;
+						goto qpr_abort;
+					}
+
+					newf = &hl_pr_functions[newfnum];
+
+					if (newf->first_statement < 0)
+					{
+						//builtin, index is the negated first statement
+						hl_pr_argc = op - OP_CALL0;
+
+						if (hl_pr_builtin_call)
+							hl_pr_builtin_call(-newf->first_statement);
+					}
+					else
+						HLPrEnterFunction(newfnum);
+				}
+				else
+				{
+					HLPrReport2("unknown opcode in",
+						HLPrStr(hl_pr_functions[hl_pr_xfunction].name));
+					hl_pr_error = TRUE;
+					goto qpr_abort;
+				}
+				break;
+		}
+	}
+
+qpr_abort:
+	//an abort MUST put the stacks back. callers just clear the flag and carry
+	//on, so a leaked frame per error ratchets depth to the ceiling and every
+	//later think, touch and builtin fails - one bad function looks like the
+	//whole VM dying
+	hl_pr_depth      = exit_depth;
+	hl_pr_localdepth = entry_local;
+}
+
+I64 HLPrTempString(U8 *s)
+{//the one reusable scratch, as PF_ftos/PF_vtos use. NOT a fresh allocation -
+ //ftos runs in loops and would exhaust the string heap inside a level
+	I64 len;
+
+	if (!hl_pr_temp_str)
+	{
+		if (hl_pr_string_alloc + HLPR_TEMP_STR_LEN > hl_pr_strings_size)
+			return 0;
+
+		hl_pr_temp_str      = hl_pr_string_alloc;
+		hl_pr_string_alloc += HLPR_TEMP_STR_LEN;
+	}
+
+	if (!s)
+		s = "";
+
+	len = StrLen(s);
+	if (len > HLPR_TEMP_STR_LEN - 1)
+		len = HLPR_TEMP_STR_LEN - 1;
+
+	MemCopy(hl_pr_strings + hl_pr_temp_str, s, len);
+	hl_pr_strings[hl_pr_temp_str + len] = 0;
+
+	return hl_pr_temp_str;
+}
+
+I64 HLPrNewString(U8 *s)
+{//append a runtime string, returns its offset. map entity values are not in
+ //the compiled blob
+	I64 len = StrLen(s);
+	I64 ofs;
+
+	if (hl_pr_string_alloc + len + 1 > hl_pr_strings_size)
+	{
+		HLPrReport2("string heap full", NULL);
+		return 0;
+	}
+
+	ofs = hl_pr_string_alloc;
+	MemCopy(hl_pr_strings + ofs, s, len);
+	hl_pr_strings[ofs + len] = 0;
+	hl_pr_string_alloc += len + 1;
+
+	return ofs;
+}
+
+U0 HLPrCacheOffsets()
+{//resolve the hot symbols once. a miss stays -1 and every accessor range
+ //checks, so an unexpected QuakeC build degrades instead of faulting
+
+	hl_ofs_self		= HLPrFindGlobal("self");
+	hl_ofs_other		= HLPrFindGlobal("other");
+	hl_ofs_world		= HLPrFindGlobal("world");
+	hl_ofs_time		= HLPrFindGlobal("time");
+	hl_ofs_frametime	= HLPrFindGlobal("frametime");
+	hl_ofs_msg_entity = HLPrFindGlobal("msg_entity");
+	hl_ofs_total_secrets		= HLPrFindGlobal("total_secrets");
+	hl_ofs_total_monsters	= HLPrFindGlobal("total_monsters");
+	hl_ofs_found_secrets		= HLPrFindGlobal("found_secrets");
+	hl_ofs_killed_monsters	= HLPrFindGlobal("killed_monsters");
+	hl_ofs_v_forward	= HLPrFindGlobal("v_forward");
+	hl_ofs_v_right	= HLPrFindGlobal("v_right");
+	hl_ofs_v_up		= HLPrFindGlobal("v_up");
+
+	hl_fld_frame			= HLPrFindField("frame");
+	hl_fld_nextthink		= HLPrFindField("nextthink");
+	hl_fld_think			= HLPrFindField("think");
+	hl_fld_origin		= HLPrFindField("origin");
+	hl_fld_angles		= HLPrFindField("angles");
+	hl_fld_velocity		= HLPrFindField("velocity");
+	hl_fld_model			= HLPrFindField("model");
+	hl_fld_modelindex	= HLPrFindField("modelindex");
+	hl_fld_classname		= HLPrFindField("classname");
+	hl_fld_mins			= HLPrFindField("mins");
+	hl_fld_maxs			= HLPrFindField("maxs");
+	hl_fld_size			= HLPrFindField("size");
+	hl_fld_solid			= HLPrFindField("solid");
+	hl_fld_movetype		= HLPrFindField("movetype");
+	hl_fld_flags			= HLPrFindField("flags");
+	hl_fld_health		= HLPrFindField("health");
+	hl_fld_yaw_speed		= HLPrFindField("yaw_speed");
+	hl_fld_ideal_yaw		= HLPrFindField("ideal_yaw");
+	hl_fld_enemy			= HLPrFindField("enemy");
+	hl_fld_owner			= HLPrFindField("owner");
+	hl_fld_goalentity	= HLPrFindField("goalentity");
+	hl_fld_takedamage	= HLPrFindField("takedamage");
+	hl_fld_effects		= HLPrFindField("effects");
+	hl_fld_punchangle	= HLPrFindField("punchangle");
+	hl_fld_dmg_take		= HLPrFindField("dmg_take");
+	hl_fld_dmg_save		= HLPrFindField("dmg_save");
+	hl_fld_dmg_inflictor	= HLPrFindField("dmg_inflictor");
+	hl_fld_style			= HLPrFindField("style");
+	hl_fld_sounds		= HLPrFindField("sounds");
+	hl_fld_ammo_shells	= HLPrFindField("ammo_shells");
+	hl_fld_ammo_nails	= HLPrFindField("ammo_nails");
+	hl_fld_ammo_rockets	= HLPrFindField("ammo_rockets");
+	hl_fld_ammo_cells	= HLPrFindField("ammo_cells");
+	hl_fld_skin			= HLPrFindField("skin");
+	hl_fld_spawnflags	= HLPrFindField("spawnflags");
+	hl_fld_colormap		= HLPrFindField("colormap");
+	hl_fld_frags			= HLPrFindField("frags");
+	hl_fld_ltime			= HLPrFindField("ltime");
+	hl_fld_touch			= HLPrFindField("touch");
+	hl_fld_use			= HLPrFindField("use");
+	hl_fld_blocked		= HLPrFindField("blocked");
+	hl_fld_chain			= HLPrFindField("chain");
+
+	hl_fld_v_angle		= HLPrFindField("v_angle");
+	hl_fld_fixangle		= HLPrFindField("fixangle");
+	hl_fld_button0		= HLPrFindField("button0");
+	hl_fld_button1		= HLPrFindField("button1");
+	hl_fld_button2		= HLPrFindField("button2");
+	hl_fld_impulse		= HLPrFindField("impulse");
+	hl_fld_view_ofs		= HLPrFindField("view_ofs");
+	hl_fld_items			= HLPrFindField("items");
+	hl_fld_weapon		= HLPrFindField("weapon");
+	hl_fld_weaponmodel	= HLPrFindField("weaponmodel");
+	hl_fld_weaponframe	= HLPrFindField("weaponframe");
+	hl_fld_currentammo	= HLPrFindField("currentammo");
+	hl_fld_max_health	= HLPrFindField("max_health");
+	hl_fld_deadflag		= HLPrFindField("deadflag");
+	hl_fld_netname		= HLPrFindField("netname");
+	hl_fld_message		= HLPrFindField("message");
+	hl_fld_team			= HLPrFindField("team");
+	hl_fld_armorvalue	= HLPrFindField("armorvalue");
+	hl_fld_waterlevel	= HLPrFindField("waterlevel");
+	hl_fld_watertype		= HLPrFindField("watertype");
+	hl_fld_avelocity		= HLPrFindField("avelocity");
+	hl_fld_gravity		= HLPrFindField("gravity");
+	hl_fld_groundentity	= HLPrFindField("groundentity");
+	hl_fld_absmin		= HLPrFindField("absmin");
+	hl_fld_absmax		= HLPrFindField("absmax");
+	hl_fld_movedir		= HLPrFindField("movedir");
+	hl_fld_teleport_time	= HLPrFindField("teleport_time");
+	hl_fld_th_die		= HLPrFindField("th_die");
+	hl_fld_ltime			= HLPrFindField("ltime");
+
+	//spawn parms, by explicit name rather than a built string
+	hl_ofs_parms[0]  = HLPrFindGlobal("parm1");
+	hl_ofs_parms[1]  = HLPrFindGlobal("parm2");
+	hl_ofs_parms[2]  = HLPrFindGlobal("parm3");
+	hl_ofs_parms[3]  = HLPrFindGlobal("parm4");
+	hl_ofs_parms[4]  = HLPrFindGlobal("parm5");
+	hl_ofs_parms[5]  = HLPrFindGlobal("parm6");
+	hl_ofs_parms[6]  = HLPrFindGlobal("parm7");
+	hl_ofs_parms[7]  = HLPrFindGlobal("parm8");
+	hl_ofs_parms[8]  = HLPrFindGlobal("parm9");
+	hl_ofs_parms[9]  = HLPrFindGlobal("parm10");
+	hl_ofs_parms[10] = HLPrFindGlobal("parm11");
+	hl_ofs_parms[11] = HLPrFindGlobal("parm12");
+	hl_ofs_parms[12] = HLPrFindGlobal("parm13");
+	hl_ofs_parms[13] = HLPrFindGlobal("parm14");
+	hl_ofs_parms[14] = HLPrFindGlobal("parm15");
+	hl_ofs_parms[15] = HLPrFindGlobal("parm16");
+
+	hl_ofs_serverflags = HLPrFindGlobal("serverflags");
+	hl_ofs_force_retouch = HLPrFindGlobal("force_retouch");
+	hl_ofs_deathmatch	= HLPrFindGlobal("deathmatch");
+	hl_ofs_skill			= HLPrFindGlobal("skill");
+	hl_ofs_teamplay		= HLPrFindGlobal("teamplay");
+	hl_ofs_coop			= HLPrFindGlobal("coop");
+
+	//FIXME: e1m1 throws two "cross connected doors" objerrors, one per
+	//double-door pair - the shape of LinkDoors running twice per master door
+	//with the .enemy guard failing to stop it
+}
+
+I64 HLPrSpawnEdict()
+{//reuse a freed slot, otherwise extend the list
+	I64 i;
+
+	for (i = 1; i < hl_pr_num_edicts; i++)
+	{
+		if (hl_pr_edict_free[i])
+		{
+			hl_pr_edict_free[i] = FALSE;
+			MemSet(hl_pr_edicts + i * hl_pr_edict_stride, 0, hl_pr_edict_stride);
+			return i;
+		}
+	}
+
+	if (hl_pr_num_edicts >= hl_pr_max_edicts)
+	{
+		HLPrReport2("out of edicts", NULL);
+		return 0;
+	}
+
+	i = hl_pr_num_edicts;
+	hl_pr_num_edicts++;
+	hl_pr_edict_free[i] = FALSE;
+	MemSet(hl_pr_edicts + i * hl_pr_edict_stride, 0, hl_pr_edict_stride);
+
+	return i;
+}
+
+U0 HLPrFreeEdict(I64 num)
+{
+	if (num <= 0 || num >= hl_pr_max_edicts)
+		return;
+
+	MemSet(hl_pr_edicts + num * hl_pr_edict_stride, 0, hl_pr_edict_stride);
+	hl_pr_edict_free[num] = TRUE;
+}
+
+U0 HLPrReport()
+{
+	"  version      %d\n", HLPR_VERSION;
+	"  statements   %6d\n", hl_pr_num_statements;
+	"  globaldefs   %6d\n", hl_pr_num_globaldefs;
+	"  fielddefs    %6d\n", hl_pr_num_fielddefs;
+	"  functions    %6d\n", hl_pr_num_functions;
+	"  strings      %6d bytes\n", hl_pr_strings_size;
+	"  globals      %6d cells\n", hl_pr_num_globals;
+	"  entityfields %6d (stride %d bytes)\n", hl_pr_entity_fields,
+		hl_pr_edict_stride;
+}

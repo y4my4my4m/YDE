@@ -1,0 +1,928 @@
+// HLSound.ZC - WAV loading and sound effects
+//
+// the AC97 driver mixes, so nothing here does. this layer only turns a PAK'd
+// WAV into frames the mixer takes, and decides how loud
+//
+// 188 of the 190 shareware sounds are 8-bit unsigned mono at 11025Hz, the
+// other two 16-bit at 22050Hz - 8-bit is the common case, not the edge case
+//
+// decoding everything up front costs ~47MB, so decode on first use into a
+// bounded cache
+
+#define HLSND_MAX_CACHE		256
+//native rate storage, ~4x smaller than resampling on load
+#define HLSND_CACHE_BUDGET	16777216	//16MB of decoded audio
+#define HLSND_RATE			48000		//mixer output rate
+#define HLSND_CLIP_DIST		1000.0		//attenuation reaches silence here
+
+//diagnostics for the "nothing is audible" case
+#define HLSND_MAX_REPORTS	64
+I64 hl_snd_reports	= 0;
+I64 hl_snd_silent	= 0;
+U8  hl_snd_line[160];
+
+class CHLSound
+{
+	U8	 name[64];
+	U32	*frames;		//stereo L16 | R16 << 16, at the file's own rate
+	I64	 count;
+	I64	 rate;			//rate of the stored data, not the mixer's
+};
+
+CHLSound	 hl_snd_cache[HLSND_MAX_CACHE];
+I64		 hl_snd_count	= 0;
+I64		 hl_snd_bytes	= 0;
+Bool	 hl_snd_enabled	= TRUE;
+
+//quake's own volume 0..1, the AC97 master is the system's and applies on top
+F64		 hl_snd_master	= 0.8;
+I64		 hl_snd_played	= 0;
+I64		 hl_snd_dropped	= 0;
+
+//refreshed each frame by the app
+F64		 hl_snd_listener[3];
+F64		 hl_snd_right[3];		//listener_right, for stereo separation
+
+
+
+//--- channels ---------------------------------------------------------------
+//
+// SND_PickChannel. eight dynamic channels; a sound from an entity replaces
+// whatever that entity already has on the same channel, so repeat fire is one
+// weapon instead of a stack of overlapping copies
+
+#define HLSND_DYNAMIC_CHANNELS	8
+
+class CHLSndChan
+{
+	I64	entnum;
+	I64	entchannel;
+	I64	voice;			//mixer handle, -1 when free
+	F64	origin[3];
+	F64	master_vol;		//0..1 before distance and pan
+	F64	dist_mult;		//attenuation / HLSND_CLIP_DIST
+	Bool fixed;			//fixed point, not an entity to follow
+};
+
+CHLSndChan	hl_snd_chan[HLSND_DYNAMIC_CHANNELS];
+I64			hl_snd_viewent = 0;
+
+U0 HLSndChannelsClear()
+{
+	I64 i;
+
+	for (i = 0; i < HLSND_DYNAMIC_CHANNELS; i++)
+	{
+		hl_snd_chan[i].entnum     = 0;
+		hl_snd_chan[i].entchannel = 0;
+		hl_snd_chan[i].voice      = -1;
+		hl_snd_chan[i].master_vol = 0.0;
+		hl_snd_chan[i].dist_mult  = 0.0;
+		hl_snd_chan[i].fixed      = TRUE;
+		HLVecSet(hl_snd_chan[i].origin, 0.0, 0.0, 0.0);
+	}
+}
+
+U0 HLSndSpatialize(CHLSndChan *ch, I64 *_l, I64 *_r)
+{//SND_Spatialize: distance attenuation plus pan from dot with listener_right
+	F64 dir[3];
+	F64 dist;
+	F64 dot;
+	F64 lscale;
+	F64 rscale;
+	F64 vol;
+
+	vol = ch->master_vol * hl_snd_master;
+
+	//view entity is always full volume and centred, own weapon must not pan
+	if (ch->entnum == hl_snd_viewent && hl_snd_viewent != 0)
+	{
+		*_l = ToI64(vol * ToF64(AUDIO_VOL_UNITY));
+		*_r = *_l;
+		return;
+	}
+
+	HLVecSub(ch->origin, hl_snd_listener, dir);
+	dist = HLVecLength(dir);
+
+	if (dist > 0.0001)
+	{
+		dir[0] /= dist;
+		dir[1] /= dist;
+		dir[2] /= dist;
+	}
+
+	dist = dist * ch->dist_mult;
+	dot  = HLVecDot(hl_snd_right, dir);
+
+	rscale = 1.0 + dot;
+	lscale = 1.0 - dot;
+
+	*_l = ToI64(vol * (1.0 - dist) * lscale * ToF64(AUDIO_VOL_UNITY));
+	*_r = ToI64(vol * (1.0 - dist) * rscale * ToF64(AUDIO_VOL_UNITY));
+
+	if (*_l < 0)	*_l = 0;
+	if (*_r < 0)	*_r = 0;
+}
+
+I64 HLSndPickChannel(I64 entnum, I64 entchannel)
+{//the channel this sound takes, stealing one if need be
+	I64 i;
+	I64 first_to_die = -1;
+
+	for (i = 0; i < HLSND_DYNAMIC_CHANNELS; i++)
+	{
+		//channel 0 is CHAN_AUTO, never overrides
+		if (entchannel != 0 && hl_snd_chan[i].entnum == entnum &&
+			(hl_snd_chan[i].entchannel == entchannel || entchannel == -1))
+		{
+			first_to_die = i;
+			break;
+		}
+
+		//free slots first
+		if (!AudioSFXPlaying(hl_snd_chan[i].voice))
+		{
+			first_to_die = i;
+			break;
+		}
+
+		//never steal the player's own channel for someone else
+		if (hl_snd_chan[i].entnum == hl_snd_viewent && entnum != hl_snd_viewent)
+			goto qsp_next;
+
+		if (first_to_die < 0)
+			first_to_die = i;
+
+qsp_next:
+	}
+
+	if (first_to_die < 0)
+		return -1;
+
+	if (AudioSFXPlaying(hl_snd_chan[first_to_die].voice))
+		AudioSFXStop(hl_snd_chan[first_to_die].voice);
+
+	hl_snd_chan[first_to_die].voice = -1;
+
+	return first_to_die;
+}
+
+U0 HLSndUpdate()
+{//S_Update: re-aim every live channel, a long sound must track the listener
+	CHLSndChan *ch;
+	I64 i;
+	I64 l;
+	I64 r;
+
+	for (i = 0; i < HLSND_DYNAMIC_CHANNELS; i++)
+	{
+		ch = &hl_snd_chan[i];
+
+		if (!AudioSFXPlaying(ch->voice))
+		{
+			ch->voice = -1;
+			goto qsu_next;
+		}
+
+		HLSndSpatialize(ch, &l, &r);
+		AudioSFXVoiceVolSet(ch->voice, l, r);
+
+qsu_next:
+	}
+}
+
+//--- leaf ambients ----------------------------------------------------------
+//
+// S_UpdateAmbientSounds. not ambientsound() entities - every BSP leaf carries
+// four compiled-in ambient levels, one permanent channel per type, faded to
+// the level of the leaf the listener stands in rather than cut
+
+#define HLNUM_AMBIENTS		4
+#define HLAMBIENT_WATER		0
+#define HLAMBIENT_SKY		1
+
+U8	*hl_ambient_sfx[HLNUM_AMBIENTS];
+F64	 hl_ambient_vol[HLNUM_AMBIENTS];
+I64	 hl_ambient_voice[HLNUM_AMBIENTS];
+F64	 hl_ambient_ends[HLNUM_AMBIENTS];
+F64	 hl_ambient_last = 0.0;		//previous call's time, for the fade delta
+
+U0 HLSndLeafAmbientInit()
+{
+	I64 i;
+
+	//slime and lava have leaf entries but no sound in the original
+	hl_ambient_sfx[HLAMBIENT_WATER] = "ambience/water1.wav";
+	hl_ambient_sfx[HLAMBIENT_SKY]   = "ambience/wind2.wav";
+	hl_ambient_sfx[2]              = NULL;
+	hl_ambient_sfx[3]              = NULL;
+
+	for (i = 0; i < HLNUM_AMBIENTS; i++)
+	{
+		hl_ambient_vol[i]   = 0.0;
+		hl_ambient_voice[i] = -1;
+		hl_ambient_ends[i]  = 0.0;
+	}
+
+	hl_ambient_last = 0.0;
+}
+
+U0 HLSndInit()
+{//globals aren't zeroed, and this table gets walked and freed
+	I64 i;
+
+	for (i = 0; i < HLSND_MAX_CACHE; i++)
+	{
+		hl_snd_cache[i].name[0] = 0;
+		hl_snd_cache[i].frames  = NULL;
+		hl_snd_cache[i].count   = 0;
+	}
+
+	hl_snd_count         = 0;
+	hl_snd_bytes         = 0;
+	hl_snd_played        = 0;
+	hl_snd_dropped       = 0;
+
+	HLVecSet(hl_snd_listener, 0.0, 0.0, 0.0);
+	HLVecSet(hl_snd_right, 0.0, 1.0, 0.0);
+	HLSndChannelsClear;
+	HLSndLeafAmbientInit;
+
+}
+
+U0 HLSndFree()
+{
+	I64 i;
+
+	//ORDER: voices point straight at the cached PCM, silence them all before
+	//releasing any of it. AudioSFXStopAll waits out a mix pass in flight
+	AudioSFXStopAll;
+
+	for (i = 0; i < HLSND_MAX_CACHE; i++)
+	{
+		if (hl_snd_cache[i].frames)
+		{
+			Free(hl_snd_cache[i].frames);
+			hl_snd_cache[i].frames = NULL;
+		}
+		hl_snd_cache[i].name[0] = 0;
+		hl_snd_cache[i].count   = 0;
+	}
+
+	hl_snd_count        = 0;
+	hl_snd_bytes        = 0;
+}
+
+I64 HLSndDecodeWav(U8 *raw, I64 size, U32 **_frames, I64 *_rate)
+{//RIFF/WAVE -> stereo frames at the file's own rate, returns frame count or 0.
+ //walks the chunk list, some files carry extra chunks before the data
+ //
+ //does NOT resample: 11025Hz 8-bit mono -> 48kHz stereo is ~17x inflation and
+ //blows the cache budget after a handful of files. the mixer resamples per
+ //voice, which is where it belongs
+	U8	*p;
+	U8	*end;
+	U8	*data     = NULL;
+	I64	 chunk;
+	I64	 channels = 1;
+	I64	 rate     = 11025;
+	I64	 bits     = 8;
+	I64	 dsize    = 0;
+	I64	 in_count;
+	I64	 out_count;
+	I64	 i;
+	I64	 src;
+	I64	 l;
+	I64	 r;
+	U32	*out;
+
+	*_frames = NULL;
+
+	if (size < 44 || MemCompare(raw, "RIFF", 4) || MemCompare(raw + 8, "WAVE", 4))
+		return 0;
+
+	p   = raw + 12;
+	end = raw + size;
+
+	while (p + 8 <= end)
+	{
+		chunk = HLRdU32(p + 4);
+
+		//clamp a truncated final chunk
+		if (chunk < 0 || p + 8 + chunk > end)
+			chunk = end - (p + 8);
+
+		if (!MemCompare(p, "fmt ", 4) && chunk >= 16)
+		{
+			channels = HLRdU16(p + 10);
+			rate     = HLRdU32(p + 12);
+			bits     = HLRdU16(p + 22);
+		}
+		else if (!MemCompare(p, "data", 4))
+		{
+			data  = p + 8;
+			dsize = chunk;
+		}
+
+		//word aligned, odd size carries a pad byte
+		p += 8 + chunk + (chunk & 1);
+	}
+
+	if (!data || channels < 1 || rate < 1 || dsize < 1)
+		return 0;
+	if (bits != 8 && bits != 16)
+		return 0;
+
+	if (bits == 8)
+		in_count = dsize / channels;
+	else
+		in_count = dsize / (channels * 2);
+
+	if (in_count < 1)
+		return 0;
+
+	out_count = in_count;
+	out       = MAlloc(out_count * sizeof(U32));
+
+	for (i = 0; i < out_count; i++)
+	{
+		src = i;
+
+		if (bits == 8)
+		{
+			//8-bit WAV is unsigned, 128 is silence
+			l = (data[src * channels] - 128) << 8;
+			if (channels > 1)
+				r = (data[src * channels + 1] - 128) << 8;
+			else
+				r = l;
+		}
+		else
+		{
+			l = HLRdI16(data + src * channels * 2);
+			if (channels > 1)
+				r = HLRdI16(data + (src * channels + 1) * 2);
+			else
+				r = l;
+		}
+
+		out[i] = (l & 0xFFFF) | (r << 16);
+	}
+
+	*_frames = out;
+
+	if (_rate)
+		*_rate = rate;
+
+	return out_count;
+}
+
+CHLSound *HLSndLoad(U8 *name)
+{//cache fetch, decoding on first use
+	CHLSound	*s;
+	U8		*raw;
+	U8		 path[128];
+	I64		 size   = 0;
+	I64		 count;
+	I64		 rate;
+	U32		*frames = NULL;
+	I64		 i;
+
+	for (i = 0; i < hl_snd_count; i++)
+	{
+		if (!StrICompare(hl_snd_cache[i].name, name))
+		{
+			//misses are cached too, don't re-read the pak every play
+			if (!hl_snd_cache[i].frames)
+				return NULL;
+			return &hl_snd_cache[i];
+		}
+	}
+
+	if (hl_snd_count >= HLSND_MAX_CACHE || hl_snd_bytes >= HLSND_CACHE_BUDGET)
+	{
+		//say so, a full cache looks exactly like a missing file
+		if (hl_snd_reports < HLSND_MAX_REPORTS)
+		{
+			hl_snd_reports++;
+			StrPrint(hl_snd_line,
+				"snd: CACHE FULL (%d entries, %d bytes) - %s not loaded\n",
+				hl_snd_count, hl_snd_bytes, name);
+			HLLog(hl_snd_line);
+		}
+		return NULL;
+	}
+
+	//QuakeC names are relative to sound/
+	StrPrint(path, "sound/%s", name);
+
+	raw = HLPakData(path, &size);
+	rate = HLSND_RATE;
+	if (raw)
+		count = HLSndDecodeWav(raw, size, &frames, &rate);
+	else
+		count = 0;
+
+	s = &hl_snd_cache[hl_snd_count];
+	HLStrCopy(s->name, name, 64);
+	s->frames = frames;
+	s->count  = count;
+	s->rate   = rate;
+	hl_snd_count++;
+
+	if (frames)
+	{
+		hl_snd_bytes += count * sizeof(U32);
+		return s;
+	}
+
+	return NULL;
+}
+
+U0 HLSndLeafAmbients(CHLMap *map, I64 leaf_num, F64 level, F64 fade, F64 now)
+{//one channel per ambient type, level from the listener's leaf, approached at
+ //ambient_fade per second. leaf and cvars are passed in - this file compiles
+ //before both the cvar table and the BSP walker
+	CHLSound	*snd;
+	I64		 i;
+	I64		 vol;
+	F64		 want;
+	F64		 dt;
+
+	if (!hl_snd_enabled || !map)
+		return;
+
+	//fade runs in real time, a level load stall must not slam to target
+	dt = now - hl_ambient_last;
+	hl_ambient_last = now;
+
+	if (dt < 0.0 || dt > 0.25)
+		dt = 0.0;
+
+	for (i = 0; i < HLNUM_AMBIENTS; i++)
+	{
+		if (!hl_ambient_sfx[i])
+			goto qla_next;
+
+		want = 0.0;
+
+		if (level > 0.0 && leaf_num > 0 && leaf_num < map->num_leafs)
+			want = level * ToF64(map->leafs[leaf_num].ambient[i]);
+
+		//below 8 is inaudible, cut it or a faint leaf leaves a permanent hum
+		if (want < 8.0)
+			want = 0.0;
+
+		//approach, don't jump - a doorway must not switch the wind on and off
+		if (hl_ambient_vol[i] < want)
+		{
+			hl_ambient_vol[i] += dt * fade;
+			if (hl_ambient_vol[i] > want)
+				hl_ambient_vol[i] = want;
+		}
+		else if (hl_ambient_vol[i] > want)
+		{
+			hl_ambient_vol[i] -= dt * fade;
+			if (hl_ambient_vol[i] < want)
+				hl_ambient_vol[i] = want;
+		}
+
+		vol = ToI64(hl_ambient_vol[i] / 255.0 * hl_snd_master *
+				ToF64(AUDIO_VOL_UNITY));
+
+		if (vol <= 0)
+		{
+			if (hl_ambient_voice[i] >= 0)
+			{
+				AudioSFXStop(hl_ambient_voice[i]);
+				hl_ambient_voice[i] = -1;
+			}
+			goto qla_next;
+		}
+
+		//already running, just re-aim. non-positional so both ears match, and
+		//the loop is never restarted so there is no seam
+		if (hl_ambient_voice[i] >= 0 && AudioSFXPlaying(hl_ambient_voice[i]))
+		{
+			AudioSFXVoiceVolSet(hl_ambient_voice[i], vol, vol);
+			goto qla_next;
+		}
+
+		snd = HLSndLoad(hl_ambient_sfx[i]);
+		if (!snd || !snd->frames || snd->count < 1)
+			goto qla_next;
+
+		//S_UpdateAmbientSounds channels are permanent - one short sample held
+		//indefinitely, not replayed. restarting clicks and resets phase
+		hl_ambient_voice[i] = AudioSFXPlayRef(snd->frames, snd->count,
+								snd->rate, vol, vol, TRUE);
+
+qla_next:
+	}
+}
+
+//--- music -----------------------------------------------------------------
+//
+// the music is redbook CD audio, nothing in PAK0 or PAK1 to extract. ripped
+// tracks are read from a music dir beside the PAKs, as source ports do:
+//
+//     ::/Apps/HL1/valve/music/track02.wav ... track11.wav
+//
+// numbering starts at 2, track 1 on the disc is the data track. worldspawn's
+// sounds field picks it, sent to the client as svc_cdtrack
+//
+// WAV only. the ZealC MP3 decoder in Apps/ZealAmp isn't in the system image,
+// so depending on it would break the build - same constraint as the net stack.
+// whole-file decode, so supply 22050Hz mono: 44.1kHz stereo is 30MB+ a track
+
+#define HLMUSIC_MAX_BYTES	(48 * 1024 * 1024)
+
+U32		*hl_music_frames	= NULL;
+I64		 hl_music_count	= 0;
+I64		 hl_music_rate	= HLSND_RATE;
+I64		 hl_music_track	= 0;
+Bool	 hl_music_playing = FALSE;
+I64		 hl_music_voice	= -1;		//track's voice, -1 when silent
+F64		 hl_music_ends	= 0.0;
+F64		 hl_music_volume	= 0.7;
+U8		 hl_music_status[64];
+
+U0 HLMusicFree()
+{//ORDER MATTERS. the mixer task reads voice->frames every millisecond, so stop
+ //the voice BEFORE freeing what it points at. freeing first corrupts the heap
+ //silently instead of faulting, and only bites much later
+	if (hl_music_voice >= 0)
+	{
+		AudioSFXStop(hl_music_voice);
+		hl_music_voice = -1;
+
+		//a mix pass may still hold a pointer it already read, same wait
+		//AudioSFXStopAll uses
+		Sleep(4);
+	}
+
+	if (hl_music_frames)
+		Free(hl_music_frames);
+
+	hl_music_frames  = NULL;
+	hl_music_count   = 0;
+	hl_music_playing = FALSE;
+	hl_music_track   = 0;
+}
+
+Bool HLMusicLoad(I64 track)
+{//read and decode one track, FALSE if there is no file for it
+	U8	 path[96];
+	U8	*raw;
+	I64	 size  = 0;
+	I64	 rate  = HLSND_RATE;
+	U32	*frames = NULL;
+	I64	 count;
+
+	HLMusicFree;
+
+	StrPrint(path, "::/Apps/HL1/valve/music/track%02d.wav", track);
+
+	raw = FileRead(path, &size);
+	if (!raw)
+	{
+		StrPrint(hl_music_status, "no track%02d.wav", track);
+		return FALSE;
+	}
+
+	count = HLSndDecodeWav(raw, size, &frames, &rate);
+	Free(raw);
+
+	if (count < 1 || !frames)
+	{
+		StrPrint(hl_music_status, "track%02d.wav undecodable", track);
+		return FALSE;
+	}
+
+	hl_music_frames = frames;
+	hl_music_count  = count;
+	hl_music_rate   = rate;
+	hl_music_track  = track;
+
+	StrPrint(hl_music_status, "track%02d %dHz %ds", track, rate,
+		count / rate);
+
+	return TRUE;
+}
+
+U0 HLMusicReset()
+{//globals aren't zeroed. a junk handle is rejected, but junk hl_music_playing
+ //makes HLMusicUpdate retrigger a voice that never started, stacking copies
+	hl_music_voice   = -1;
+	hl_music_playing = FALSE;
+	hl_music_ends    = 0.0;
+}
+
+U0 HLMusicStart(F64 now)
+{//hand the buffer to a voice and note when it runs out
+	if (!hl_music_frames || hl_music_count < 1 || !hl_snd_enabled)
+		return;
+
+	//stop the previous copy first, or every retrigger stacks another until the
+	//whole voice pool is music
+	if (hl_music_voice >= 0)
+		AudioSFXStop(hl_music_voice);
+
+	hl_music_voice = AudioSFXPlayRef(hl_music_frames, hl_music_count, hl_music_rate,
+		ToI64(hl_music_volume * hl_snd_master * ToF64(AUDIO_VOL_UNITY)),
+		ToI64(hl_music_volume * hl_snd_master * ToF64(AUDIO_VOL_UNITY)));
+
+	//backstop only, a predicted end drifts - the live voice is the real test
+	hl_music_ends    = now + ToF64(hl_music_count) / ToF64(hl_music_rate);
+	hl_music_playing = TRUE;
+}
+
+Bool HLMusicPlay(I64 track, F64 now)
+{
+	if (track < 2)
+	{
+		HLMusicFree;
+		return FALSE;
+	}
+
+	//CDAudio_Play has the same check, a level reload must not restart music
+	if (hl_music_playing && hl_music_track == track)
+		return TRUE;
+
+	if (!HLMusicLoad(track))
+		return FALSE;
+
+	HLMusicStart(now);
+
+	return TRUE;
+}
+
+U0 HLMusicUpdate(F64 now)
+{//retrigger once the mixer says it finished - predicting from length runs
+ //early and stacks copies, or late and leaves a gap
+	if (!hl_music_playing || !hl_music_frames)
+		return;
+
+	if (hl_music_voice >= 0 && AudioSFXPlaying(hl_music_voice))
+		return;
+
+	HLMusicStart(now);
+}
+
+U0 HLSndPlayAt(U8 *name, F64 *origin, F64 volume, F64 attenuation,
+	I64 entnum = 0, I64 entchannel = 0)
+{//S_StartSound. entnum/entchannel pick the channel and what it replaces, 0/0
+ //is CHAN_AUTO from the world and overrides nothing
+	CHLSound		*s;
+	CHLSndChan	*ch;
+	I64			 chan;
+	I64			 vol_l;
+	I64			 vol_r;
+	F64			 gain;
+	I64			 stream;
+
+	if (!hl_snd_enabled || !name || !name[0])
+		return;
+
+	s = HLSndLoad(name);
+
+	//"no monster sounds" is three different faults - never requested, load
+	//failure, or attenuated to silence. log the first few to tell them apart
+	if (hl_snd_reports < HLSND_MAX_REPORTS)
+	{
+		hl_snd_reports++;
+
+		if (!s || !s->frames || s->count < 1)
+			StrPrint(hl_snd_line, "snd: %s FAILED TO LOAD\n", name);
+		else
+			StrPrint(hl_snd_line, "snd: %s ok (%d frames)\n", name, s->count);
+
+		HLLog(hl_snd_line);
+	}
+
+	if (!s || !s->frames || s->count < 1)
+		return;
+
+	gain = volume;
+	if (gain > 1.0)
+		gain = 1.0;
+
+	chan = HLSndPickChannel(entnum, entchannel);
+	if (chan < 0)
+	{
+		hl_snd_dropped++;
+		return;
+	}
+
+	ch = &hl_snd_chan[chan];
+	ch->entnum     = entnum;
+	ch->entchannel = entchannel;
+	ch->master_vol = gain;
+
+	//attenuation 0 gives dist_mult 0 and never fades, as pickups want
+	ch->dist_mult = attenuation / HLSND_CLIP_DIST;
+
+	if (origin)
+		HLVecCopy(origin, ch->origin);
+	else
+	{
+		HLVecCopy(hl_snd_listener, ch->origin);
+		ch->dist_mult = 0.0;
+	}
+
+	HLSndSpatialize(ch, &vol_l, &vol_r);
+
+	//S_StartSound bails rather than burn a channel on the inaudible
+	if (vol_l <= 0 && vol_r <= 0)
+	{
+		hl_snd_silent++;
+		ch->voice = -1;
+		return;
+	}
+
+	//played by reference out of the cache with volume handed to the mixer,
+	//not baked into a scratch copy - that costs a full PCM copy per play and
+	//lets only one sound through the shared buffer. the cache never evicts,
+	//and HLSndFree stops every voice before releasing frames
+	stream = AudioSFXPlayRef(s->frames, s->count, s->rate, vol_l, vol_r);
+	ch->voice = stream;
+
+	//dropped, not queued, when every voice is busy
+	if (stream < 0)
+	{
+		hl_snd_dropped++;
+
+		//a drop looks like a sound never requested unless it says so
+		if (hl_snd_reports < HLSND_MAX_REPORTS)
+		{
+			hl_snd_reports++;
+			StrPrint(hl_snd_line, "snd: %s DROPPED (no free voice)\n", name);
+			HLLog(hl_snd_line);
+		}
+	}
+	else
+		hl_snd_played++;
+}
+
+//--- looping ambient sounds ------------------------------------------------
+//
+// ambientsound() places a permanent looping source - wind, water, torches. no
+// loop flag in the mixer, so sources are remembered and the loudest few are
+// re-triggered as their previous instance runs out
+//
+// capped well under the voice count so gunfire is never starved by ambience
+
+#define HLSND_MAX_AMBIENT	64
+//was 1 back when the mixer had four buffered streams and one ambience loop
+//held a stream for its whole length. the voice bank lifted that
+#define HLSND_AMBIENT_VOICES	3
+
+class CHLAmbient
+{
+	F64	 origin[3];
+	U8	 name[64];
+	F64	 volume;
+	F64	 attenuation;
+	F64	 next_time;		//earliest re-trigger
+	F64	 duration;
+};
+
+CHLAmbient	hl_ambient[HLSND_MAX_AMBIENT];
+I64			hl_ambient_count = 0;
+
+U0 HLSndAmbientClear()
+{
+	hl_ambient_count = 0;
+}
+
+U0 HLSndAmbientAdd(F64 *origin, U8 *name, F64 volume, F64 attenuation)
+{//one call per ambient entity at map load
+	CHLAmbient	*a;
+	CHLSound		*snd;
+
+	if (hl_ambient_count >= HLSND_MAX_AMBIENT || !name || !name[0])
+		return;
+
+	snd = HLSndLoad(name);
+	if (!snd || snd->count < 1)
+		return;
+
+	a = &hl_ambient[hl_ambient_count];
+
+	HLVecCopy(origin, a->origin);
+	HLStrCopy(a->name, name, 64);
+	a->volume      = volume;
+	a->attenuation = attenuation;
+	a->next_time   = 0.0;
+	a->duration    = ToF64(snd->count) / ToF64(snd->rate);
+
+	//a shorter source re-triggers every few frames and eats the mixer
+	if (a->duration < 0.25)
+		a->duration = 0.25;
+
+	hl_ambient_count++;
+}
+
+U0 HLSndAmbientUpdate(F64 time)
+{//keep the nearest ambient sources playing
+	CHLAmbient	*a;
+	F64			 d[3];
+	F64			 dist;
+	F64			 gain;
+	F64			 best_gain;
+	I64			 best;
+	I64			 voices;
+	I64			 i;
+	Bool		 used[HLSND_MAX_AMBIENT];
+
+	for (i = 0; i < hl_ambient_count; i++)
+		used[i] = FALSE;
+
+	for (voices = 0; voices < HLSND_AMBIENT_VOICES; voices++)
+	{
+		best      = -1;
+		best_gain = 0.0;
+
+		//loudest source that is due
+		for (i = 0; i < hl_ambient_count; i++)
+		{
+			a = &hl_ambient[i];
+
+			if (used[i] || time < a->next_time)
+				goto qa_next;
+
+			gain = a->volume;
+
+			if (a->attenuation > 0.0)
+			{
+				HLVecSub(a->origin, hl_snd_listener, d);
+				dist = HLVecLength(d);
+				gain = gain * (1.0 - dist * a->attenuation / HLSND_CLIP_DIST);
+			}
+
+			if (gain > best_gain)
+			{
+				best_gain = gain;
+				best      = i;
+			}
+
+qa_next:
+		}
+
+		if (best < 0)
+			return;			//nothing audible is waiting
+
+		a = &hl_ambient[best];
+		used[best]   = TRUE;
+		a->next_time = time + a->duration;
+
+		//each source is its own entnum on a fixed channel, so a re-trigger
+		//replaces its own previous instance instead of stacking
+		HLSndPlayAt(a->name, a->origin, a->volume, a->attenuation,
+			-(best + 1), 1);
+	}
+}
+
+U0 HLSndListener(F64 *origin, F64 *right = NULL)
+{//S_Update's listener. without listener_right every sound sits dead centre
+	HLVecCopy(origin, hl_snd_listener);
+
+	if (right)
+		HLVecCopy(right, hl_snd_right);
+}
+
+U0 HLSndStop(I64 entnum, I64 entchannel)
+{//S_StopSound: silence that entity's dynamic channel. svc_stopsound cuts a
+ //long sample short - a lift motor, a charging shambler - and ignoring it
+ //leaves the sound running to its natural end
+	I64 i;
+
+	for (i = 0; i < HLSND_DYNAMIC_CHANNELS; i++)
+	{
+		if (hl_snd_chan[i].entnum == entnum &&
+			hl_snd_chan[i].entchannel == entchannel)
+		{
+			if (hl_snd_chan[i].voice >= 0)
+				AudioSFXStop(hl_snd_chan[i].voice);
+
+			hl_snd_chan[i].voice      = -1;
+			hl_snd_chan[i].entnum     = 0;
+			hl_snd_chan[i].entchannel = 0;
+			hl_snd_chan[i].master_vol = 0.0;
+			return;
+		}
+	}
+}
+
+U0 HLMusicApplyVolume()
+{//re-aim the running track at bgmvolume. one voice, so this is a level change
+ //not a restart - the slider must not skip back to the top of the track
+	I64 vol;
+
+	if (hl_music_voice < 0 || !AudioSFXPlaying(hl_music_voice))
+		return;
+
+	vol = ToI64(hl_music_volume * hl_snd_master * ToF64(AUDIO_VOL_UNITY));
+	AudioSFXVoiceVolSet(hl_music_voice, vol, vol);
+}

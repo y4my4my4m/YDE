@@ -1,0 +1,692 @@
+// HLNet.ZC - message buffers and the loopback link
+//
+// wire format, exact - demos and other HL1 clients depend on it:
+//   coord  16-bit signed, 1/8 unit    (MSG_WriteCoord: (int)(f*8))
+//   angle  8-bit, 256 units per turn  (MSG_WriteAngle: (int)(f*256/360) & 255)
+//   short  16-bit little endian
+//   long   32-bit little endian
+//
+// a coord spans +/-4096 units at eighth resolution, which is why the original
+// nudges the view by 1/32 to keep it off node planes
+
+#define HLNET_MAX_MSG		8192	//signon / reliable ceiling (MAX_MSGLEN)
+//unreliable datagrams MUST fit one Ethernet frame - no IP fragmentation here,
+//and RTL8139/QEMU drops a multi-kB UDP blob outright
+#define HLNET_MAX_DATAGRAM	1400
+#define HLNET_MAX_BACKLOG	4		//loopback messages held before dropping
+
+//WinQuake net.h NETFLAG_* and control opcodes, big-endian on the wire
+#define HLNETFLAG_LENGTH_MASK	0x0000FFFF
+#define HLNETFLAG_DATA		0x00010000
+#define HLNETFLAG_ACK		0x00020000
+#define HLNETFLAG_NAK		0x00040000
+#define HLNETFLAG_EOM		0x00080000
+#define HLNETFLAG_UNRELIABLE	0x00100000
+#define HLNETFLAG_CTL		0x80000000
+#define HLNET_HEADERSIZE		8
+#define HLNET_CTL_VERSION	3
+
+#define HLCCREQ_CONNECT		0x01
+#define HLCCREQ_SERVER_INFO	0x02
+#define HLCCREP_ACCEPT		0x81
+#define HLCCREP_REJECT		0x82
+#define HLCCREP_SERVER_INFO	0x83
+
+U32 HLNetBigLong(U32 v)
+{
+	return EndianU32(v);
+}
+
+U0 HLNetWriteBigLong(U8 *p, U32 v)
+{
+	U32 be = EndianU32(v);
+	MemCopy(p, &be, 4);
+}
+
+U32 HLNetReadBigLong(U8 *p)
+{
+	U32 be;
+	MemCopy(&be, p, 4);
+	return EndianU32(be);
+}
+
+//--- svc_: server to client -------------------------------------------------
+#define HLSVC_BAD			0
+#define HLSVC_NOP			1
+#define HLSVC_DISCONNECT		2
+#define HLSVC_UPDATESTAT		3
+#define HLSVC_VERSION		4
+#define HLSVC_SETVIEW		5
+#define HLSVC_SOUND			6
+#define HLSVC_TIME			7
+#define HLSVC_PRINT			8
+#define HLSVC_STUFFTEXT		9
+#define HLSVC_SETANGLE		10
+#define HLSVC_SERVERINFO		11
+#define HLSVC_LIGHTSTYLE		12
+#define HLSVC_UPDATENAME		13
+#define HLSVC_UPDATEFRAGS	14
+#define HLSVC_CLIENTDATA		15
+#define HLSVC_STOPSOUND		16
+#define HLSVC_UPDATECOLORS	17
+#define HLSVC_PARTICLE		18
+#define HLSVC_DAMAGE			19
+#define HLSVC_SPAWNSTATIC	20
+#define HLSVC_SPAWNBASELINE	22
+#define HLSVC_TEMPENTITY_	23
+#define HLSVC_SETPAUSE		24
+#define HLSVC_SIGNONNUM		25
+#define HLSVC_CENTERPRINT	26
+#define HLSVC_KILLEDMONSTER	27
+#define HLSVC_FOUNDSECRET	28
+#define HLSVC_SPAWNSTATICSOUND 29
+#define HLSVC_INTERMISSION_	30
+#define HLSVC_FINALE_		31
+#define HLSVC_CDTRACK		32
+#define HLSVC_SELLSCREEN		33
+#define HLSVC_CUTSCENE_		34
+
+//svc_sound field_mask bits (WinQuake protocol.h)
+#define HLSND_VOLUME			1		//(1<<0) - followed by volume byte
+#define HLSND_ATTENUATION	2		//(1<<1) - followed by atten*64 byte
+#define HLSND_DEFAULT_VOL	255
+#define HLSND_DEFAULT_ATTEN	1.0
+
+//--- clc_: client to server -------------------------------------------------
+#define HLCLC_BAD			0
+#define HLCLC_NOP			1
+#define HLCLC_DISCONNECT		2
+#define HLCLC_MOVE			3
+#define HLCLC_STRINGCMD		4
+
+class CHLMsg
+{
+	U8	 data[HLNET_MAX_MSG];
+	I64	 len;			//bytes written
+	I64	 read;			//read cursor
+	Bool overflowed;	//a write did not fit, the message is unusable
+	Bool badread;		//a read ran past the end
+};
+
+//sv.datagram - TE, sounds, particles. QuakeC Write* and sound() append here,
+//remotes get a copy in their packet. cleared each SV_SendClientMessages.
+//MUST sit after class CHLMsg
+CHLMsg	hl_sv_datagram;
+
+//--- writing ----------------------------------------------------------------
+
+U0 HLMsgClear(CHLMsg *m)
+{
+	m->len        = 0;
+	m->read       = 0;
+	m->overflowed = FALSE;
+	m->badread    = FALSE;
+}
+
+U0 HLMsgWriteByte(CHLMsg *m, I64 v)
+{//overflow is RECORDED, never silently truncated - a half-written message
+ //resyncs the reader mid-field and corrupts everything after it
+	if (m->len + 1 > HLNET_MAX_MSG)
+	{
+		m->overflowed = TRUE;
+		return;
+	}
+
+	m->data[m->len] = v & 0xFF;
+	m->len++;
+}
+
+U0 HLMsgWriteShort(CHLMsg *m, I64 v)
+{//little endian, as the wire is
+	HLMsgWriteByte(m, v & 0xFF);
+	HLMsgWriteByte(m, (v >> 8) & 0xFF);
+}
+
+U0 HLMsgWriteLong(CHLMsg *m, I64 v)
+{
+	HLMsgWriteByte(m, v & 0xFF);
+	HLMsgWriteByte(m, (v >> 8) & 0xFF);
+	HLMsgWriteByte(m, (v >> 16) & 0xFF);
+	HLMsgWriteByte(m, (v >> 24) & 0xFF);
+}
+
+U0 HLMsgWriteChar(CHLMsg *m, I64 v)
+{//MSG_WriteChar - same byte as MSG_WriteByte, the READER sign extends it
+	HLMsgWriteByte(m, v & 0xFF);
+}
+
+U0 HLMsgWriteFloat(CHLMsg *m, F64 f)
+{//MSG_WriteFloat - raw IEEE-754 binary32, only svc_time and svc_version
+ //need more range than a coord
+	HLMsgWriteLong(m, HLWrF32(f));
+}
+
+U0 HLMsgWriteCoord(CHLMsg *m, F64 f)
+{//MSG_WriteCoord - eighths of a unit in a signed short
+	HLMsgWriteShort(m, ToI64(f * 8.0));
+}
+
+U0 HLMsgWriteAngle(CHLMsg *m, F64 f)
+{//MSG_WriteAngle - a whole turn in 256 steps, coarse on purpose
+	HLMsgWriteByte(m, ToI64(f * 256.0 / 360.0) & 255);
+}
+
+U0 HLMsgWriteString(CHLMsg *m, U8 *s)
+{//NUL terminated, as the reader expects
+	I64 i = 0;
+
+	if (s)
+	{
+		while (s[i])
+		{
+			HLMsgWriteByte(m, s[i]);
+			i++;
+		}
+	}
+
+	HLMsgWriteByte(m, 0);
+}
+
+U0 HLMsgAppend(CHLMsg *dst, CHLMsg *src)
+{//copy src onto the end of dst, no-op if src is empty or either is bad
+	I64 i;
+
+	if (!dst || !src || src->len < 1 || dst->overflowed || src->overflowed)
+		return;
+
+	for (i = 0; i < src->len; i++)
+		HLMsgWriteByte(dst, src->data[i]);
+}
+
+U0 HLMsgAppendIfRoom(CHLMsg *dst, CHLMsg *src, I64 max_len)
+{//append only if the result still fits max_len, the MTU budget
+	if (!dst || !src || src->len < 1)
+		return;
+	if (dst->len + src->len > max_len)
+		return;
+	HLMsgAppend(dst, src);
+}
+
+//--- reading ----------------------------------------------------------------
+//
+// every read is bounds checked and sets badread - a truncated or corrupt
+// message must not walk off the buffer. the original sets msg_badread
+
+I64 HLMsgReadByte(CHLMsg *m)
+{
+	I64 v;
+
+	if (m->read + 1 > m->len)
+	{
+		m->badread = TRUE;
+		return -1;
+	}
+
+	v = m->data[m->read];
+	m->read++;
+
+	return v;
+}
+
+I64 HLMsgReadShort(CHLMsg *m)
+{//sign extended, coordinates are signed
+	I64 v;
+
+	if (m->read + 2 > m->len)
+	{
+		m->badread = TRUE;
+		return -1;
+	}
+
+	v = m->data[m->read] | (m->data[m->read + 1] << 8);
+	m->read += 2;
+
+	if (v & 0x8000)
+		v -= 0x10000;
+
+	return v;
+}
+
+I64 HLMsgReadLong(CHLMsg *m)
+{
+	I64 v;
+
+	if (m->read + 4 > m->len)
+	{
+		m->badread = TRUE;
+		return -1;
+	}
+
+	v = m->data[m->read] | (m->data[m->read + 1] << 8) |
+		(m->data[m->read + 2] << 16) | (m->data[m->read + 3] << 24);
+	m->read += 4;
+
+	//MSG_ReadLong returns a signed int - svc_updatestat and frag counts go
+	//negative
+	if (v & 0x80000000)
+		v -= 0x100000000;
+
+	return v;
+}
+
+I64 HLMsgReadChar(CHLMsg *m)
+{//MSG_ReadChar - one byte, sign extended
+	I64 v = HLMsgReadByte(m);
+
+	if (v < 0)
+		return -1;			//badread already recorded
+
+	if (v & 0x80)
+		v -= 0x100;
+
+	return v;
+}
+
+F64 HLMsgReadFloat(CHLMsg *m)
+{
+	U8 b[4];
+	I64 i;
+
+	for (i = 0; i < 4; i++)
+	{
+		b[i] = HLMsgReadByte(m) & 0xFF;
+		if (m->badread)
+			return 0.0;
+	}
+
+	return HLRdF32(b);
+}
+
+F64 HLMsgReadCoord(CHLMsg *m)
+{
+	return ToF64(HLMsgReadShort(m)) * 0.125;
+}
+
+F64 HLMsgReadAngle(CHLMsg *m)
+{//MSG_ReadAngle reads a CHAR, so this lands in -180..178.6, not 0..358.6.
+ //equivalent modulo a turn, kept signed to match the original byte for byte
+	return ToF64(HLMsgReadChar(m)) * 360.0 / 256.0;
+}
+
+U0 HLMsgReadString(CHLMsg *m, U8 *out, I64 max)
+{//always NUL terminates, never writes past max
+	I64 i = 0;
+	I64 c;
+
+	while (i < max - 1)
+	{
+		c = HLMsgReadByte(m);
+		if (c <= 0)
+			break;
+
+		out[i] = c;
+		i++;
+	}
+
+	out[i] = 0;
+}
+
+//--- loopback link ----------------------------------------------------------
+//
+// a queue of WHOLE messages. server writes its send buffer and calls
+// HLNetSendToClient, client drains with HLNetGetMessage. a UDP socket replaces
+// those two functions and nothing else
+
+class CHLNetLink
+{
+	CHLMsg	queue[HLNET_MAX_BACKLOG];
+	I64		head;			//next slot to write
+	I64		tail;			//next slot to read
+	I64		count;
+	I64		dropped;		//messages lost to a full queue
+};
+
+//TWO queues - the protocol is not one-way. entity updates go down hl_net_s2c,
+//client moves come back up hl_net_c2s
+CHLNetLink	hl_net_s2c;
+CHLNetLink	hl_net_c2s;
+CHLMsg		hl_net_send;		//server's scratch message being built
+CHLMsg		hl_net_cmd;		//client's scratch message being built
+Bool		hl_net_active = FALSE;
+
+U0 HLNetLinkClear(CHLNetLink *l)
+{
+	I64 i;
+
+	l->head    = 0;
+	l->tail    = 0;
+	l->count   = 0;
+	l->dropped = 0;
+
+	for (i = 0; i < HLNET_MAX_BACKLOG; i++)
+		HLMsgClear(&l->queue[i]);
+}
+
+U0 HLNetInit()
+{//globals aren't zeroed
+	HLNetLinkClear(&hl_net_s2c);
+	HLNetLinkClear(&hl_net_c2s);
+
+	HLMsgClear(&hl_net_send);
+	HLMsgClear(&hl_net_cmd);
+	HLMsgClear(&hl_sv_datagram);
+	hl_net_active = TRUE;
+}
+
+Bool HLNetLinkSend(CHLNetLink *l, CHLMsg *m)
+{//queue a finished message, FALSE if it was dropped
+	CHLMsg *slot;
+
+	if (!hl_net_active || m->overflowed || m->len < 1)
+		return FALSE;
+
+	if (l->count >= HLNET_MAX_BACKLOG)
+	{
+		//drop a WHOLE message, a partial one desyncs the reader
+		l->dropped++;
+		return FALSE;
+	}
+
+	slot = &l->queue[l->head];
+	HLMsgClear(slot);
+	MemCopy(slot->data, m->data, m->len);
+	slot->len = m->len;
+
+	l->head = (l->head + 1) % HLNET_MAX_BACKLOG;
+	l->count++;
+
+	return TRUE;
+}
+
+Bool HLNetLinkGet(CHLNetLink *l, CHLMsg *out)
+{//take the next queued message, if any
+	CHLMsg *slot;
+
+	if (!hl_net_active || l->count < 1)
+		return FALSE;
+
+	slot = &l->queue[l->tail];
+
+	HLMsgClear(out);
+	MemCopy(out->data, slot->data, slot->len);
+	out->len = slot->len;
+
+	l->tail = (l->tail + 1) % HLNET_MAX_BACKLOG;
+	l->count--;
+
+	return TRUE;
+}
+
+Bool HLNetSendToClient(CHLMsg *m)
+{//server -> client
+	return HLNetLinkSend(&hl_net_s2c, m);
+}
+
+Bool HLNetGetMessage(CHLMsg *out)
+{//client reads what the server sent
+	return HLNetLinkGet(&hl_net_s2c, out);
+}
+
+Bool HLNetSendToServer(CHLMsg *m)
+{//client -> server
+	return HLNetLinkSend(&hl_net_c2s, m);
+}
+
+Bool HLNetServerGetMessage(CHLMsg *out)
+{//server reads what the client sent
+	return HLNetLinkGet(&hl_net_c2s, out);
+}
+
+#define HLNET_MAX_ENTS	600
+
+//bits in an svc_update byte, U_MOREBITS chains a second
+#define HLU_MOREBITS		1
+#define HLU_ORIGIN1		2
+#define HLU_ORIGIN2		4
+#define HLU_ORIGIN3		8
+#define HLU_ANGLE2		16
+#define HLU_NOLERP		32
+#define HLU_FRAME		64
+#define HLU_SIGNAL		128
+#define HLU_ANGLE1		256
+#define HLU_ANGLE3		512
+#define HLU_MODEL		1024
+#define HLU_COLORMAP		2048
+#define HLU_SKIN			4096
+#define HLU_EFFECTS		8192
+#define HLU_LONGENTITY	16384
+
+class CHLEntState
+{
+	F64	 origin[3];
+	F64	 angles[3];
+	I64	 modelindex;
+	I64	 frame;
+	I64	 colormap;
+	I64	 skin;
+	I64	 effects;
+	Bool step;			//MOVETYPE_STEP, the client must not interpolate it
+	Bool active;		//the client has been told about this entity
+	F64	 msgtime;		//server time of the message that last described it
+
+	//CL_RelinkEntities lays a trail along last frame's segment, so the old
+	//position must survive the update that overwrites origin
+	F64	 trail_org[3];
+	Bool trail_valid;	//FALSE until the entity has been seen twice
+
+	//msg_origins[1] / msg_angles[1] - the PREVIOUS update. origin and angles
+	//above are msg_origins[0]; the drawn position lerps between the two
+	F64	 prev_origin[3];
+	F64	 prev_angles[3];
+	Bool forcelink;		//no previous update, snap instead of lerping
+};
+
+//cl.mtime[0] from svc_time. entity updates are stamped with it - anything not
+//in the LATEST message has left the PVS
+//hostname. a string, so it cannot live in the F64 cvar table - declared here
+//because HLNetSv answers CCREP_SERVER_INFO with it and compiles before the menu
+U8	hl_host_name[32];
+
+U0 HLHostNameInit()
+{//globals aren't zeroed
+	HLStrCopy(hl_host_name, "UNNAMED", 32);
+}
+
+F64 hl_net_msgtime = 0.0;
+
+//cl.mtime[1], the update before. the pair brackets the lerp interval
+F64 hl_net_msgtime_prev = 0.0;
+
+//cl.time for a client that is not also the server - advances in real time and
+//is pulled back into the [mtime1, mtime0] window by the lerp
+F64 hl_cl_clock = 0.0;
+F64 hl_cl_clock_last = 0.0;	//real time at the previous advance
+
+U0 HLNetClockInit()
+{//globals aren't zeroed, and a garbage clock pins the lerp out of range
+	hl_net_msgtime      = 0.0;
+	hl_net_msgtime_prev = 0.0;
+	hl_cl_clock         = 0.0;
+	hl_cl_clock_last    = 0.0;
+}
+
+//THREE tables - NQ deltas against the BASELINE, not the last packet sent.
+//svc_spawnbaseline gives every entity a starting state at signon and every
+//svc_update is measured from it. costs bandwidth against QuakeWorld's
+//delta-vs-last-sent, buys statelessness - a lost packet can't desync
+CHLEntState	hl_net_baseline[HLNET_MAX_ENTS];
+CHLEntState	hl_net_sent[HLNET_MAX_ENTS];
+CHLEntState	hl_net_cl[HLNET_MAX_ENTS];
+I64			hl_net_num_ents = 0;
+
+U0 HLNetStateClear(CHLEntState *e)
+{
+	HLVecSet(e->origin, 0.0, 0.0, 0.0);
+	HLVecSet(e->angles, 0.0, 0.0, 0.0);
+	e->modelindex = 0;
+	e->frame      = 0;
+	e->colormap   = 0;
+	e->skin       = 0;
+	e->effects    = 0;
+	e->step       = FALSE;
+	e->active     = FALSE;
+	e->msgtime    = 0.0;
+	HLVecSet(e->trail_org, 0.0, 0.0, 0.0);
+	e->trail_valid = FALSE;
+	HLVecSet(e->prev_origin, 0.0, 0.0, 0.0);
+	HLVecSet(e->prev_angles, 0.0, 0.0, 0.0);
+	e->forcelink = TRUE;
+}
+
+U0 HLNetStatesClear()
+{//globals aren't zeroed
+	I64 i;
+
+	for (i = 0; i < HLNET_MAX_ENTS; i++)
+	{
+		HLNetStateClear(&hl_net_baseline[i]);
+		HLNetStateClear(&hl_net_sent[i]);
+		HLNetStateClear(&hl_net_cl[i]);
+	}
+
+	hl_net_num_ents = 0;
+}
+
+Bool HLNetOriginDiffers(F64 a, F64 b)
+{//SV_WriteEntitiesToClient's own 0.1 tolerance - a coord round-tripped
+ //through the eighth-unit wire format never compares equal exactly
+	F64 miss = a - b;
+
+	return ToBool(miss < -0.1 || miss > 0.1);
+}
+
+U0 HLNetWriteEntityUpdate(CHLMsg *m, I64 num, CHLEntState *now,
+	CHLEntState *baseline)
+{//one delta-compressed entity update, in the original's field order
+ //the mask is built FIRST and written first - svc_update puts it ahead of the
+ //fields it describes and the reader has no other way to know what follows
+	I64 bits = 0;
+
+	if (HLNetOriginDiffers(now->origin[0], baseline->origin[0]))
+		bits |= HLU_ORIGIN1;
+	if (HLNetOriginDiffers(now->origin[1], baseline->origin[1]))
+		bits |= HLU_ORIGIN2;
+	if (HLNetOriginDiffers(now->origin[2], baseline->origin[2]))
+		bits |= HLU_ORIGIN3;
+
+	if (now->angles[0] != baseline->angles[0])	bits |= HLU_ANGLE1;
+	if (now->angles[1] != baseline->angles[1])	bits |= HLU_ANGLE2;
+	if (now->angles[2] != baseline->angles[2])	bits |= HLU_ANGLE3;
+
+	//U_NOLERP is a property of the entity, not a delta - a MOVETYPE_STEP mover
+	//teleports between fixed positions and lerping smears the step
+	if (now->step)
+		bits |= HLU_NOLERP;
+
+	if (now->frame      != baseline->frame)		bits |= HLU_FRAME;
+	if (now->modelindex != baseline->modelindex)	bits |= HLU_MODEL;
+	if (now->colormap   != baseline->colormap)	bits |= HLU_COLORMAP;
+	if (now->skin       != baseline->skin)		bits |= HLU_SKIN;
+	if (now->effects    != baseline->effects)	bits |= HLU_EFFECTS;
+
+	//NO early-out on an empty mask - the mask byte IS the "here and visible"
+	//signal, and suppressing it makes an unchanged entity look like one that
+	//left the PVS
+	if (num >= 256)
+		bits |= HLU_LONGENTITY;
+	if (bits >= 256)
+		bits |= HLU_MOREBITS;
+
+	//U_SIGNAL is the high bit of byte 0 and is ALWAYS set - it is how the
+	//client's loop tells an entity update from an svc_ opcode
+	HLMsgWriteByte(m, (bits | HLU_SIGNAL) & 255);
+
+	if (bits & HLU_MOREBITS)
+		HLMsgWriteByte(m, (bits >> 8) & 255);
+
+	if (bits & HLU_LONGENTITY)
+		HLMsgWriteShort(m, num);
+	else
+		HLMsgWriteByte(m, num);
+
+	if (bits & HLU_MODEL)	HLMsgWriteByte(m, now->modelindex);
+	if (bits & HLU_FRAME)	HLMsgWriteByte(m, now->frame);
+	if (bits & HLU_COLORMAP)	HLMsgWriteByte(m, now->colormap);
+	if (bits & HLU_SKIN)		HLMsgWriteByte(m, now->skin);
+	if (bits & HLU_EFFECTS)	HLMsgWriteByte(m, now->effects);
+
+	if (bits & HLU_ORIGIN1)	HLMsgWriteCoord(m, now->origin[0]);
+	if (bits & HLU_ANGLE1)	HLMsgWriteAngle(m, now->angles[0]);
+	if (bits & HLU_ORIGIN2)	HLMsgWriteCoord(m, now->origin[1]);
+	if (bits & HLU_ANGLE2)	HLMsgWriteAngle(m, now->angles[1]);
+	if (bits & HLU_ORIGIN3)	HLMsgWriteCoord(m, now->origin[2]);
+	if (bits & HLU_ANGLE3)	HLMsgWriteAngle(m, now->angles[2]);
+}
+
+Bool HLNetReadEntityUpdate(CHLMsg *m, I64 bits)
+{//CL_ParseUpdate - the low mask byte is already read, that is what identified
+ //this as an update
+	CHLEntState	*e;
+	I64			 num;
+
+	if (bits & HLU_MOREBITS)
+		bits |= HLMsgReadByte(m) << 8;
+
+	if (bits & HLU_LONGENTITY)
+		num = HLMsgReadShort(m);
+	else
+		num = HLMsgReadByte(m);
+
+	if (num < 0 || num >= HLNET_MAX_ENTS || m->badread)
+		return FALSE;
+
+	e = &hl_net_cl[num];
+
+	//a first sighting starts from the baseline, not from zero - CL_ParseUpdate
+	//copies ent->baseline in, else omitted fields read back as 0
+	if (!e->active)
+	{
+		MemCopy(e, &hl_net_baseline[num], sizeof(CHLEntState));
+		e->forcelink = TRUE;
+	}
+
+	//absent from the last message means it just reappeared - snap, don't
+	//slide in from wherever it was last seen
+	if (e->msgtime != hl_net_msgtime_prev)
+		e->forcelink = TRUE;
+
+	//msg_origins[0] becomes msg_origins[1], the bytes below overwrite [0]
+	HLVecCopy(e->origin, e->prev_origin);
+	HLVecCopy(e->angles, e->prev_angles);
+
+	e->step = ToBool((bits & HLU_NOLERP) != 0);
+
+	//anything NOT in the mask keeps its previous value - the client's copy is
+	//an accumulation of every update applied, not a snapshot
+	if (bits & HLU_MODEL)	e->modelindex = HLMsgReadByte(m);
+	if (bits & HLU_FRAME)	e->frame      = HLMsgReadByte(m);
+	if (bits & HLU_COLORMAP)	e->colormap   = HLMsgReadByte(m);
+	if (bits & HLU_SKIN)		e->skin       = HLMsgReadByte(m);
+	if (bits & HLU_EFFECTS)	e->effects    = HLMsgReadByte(m);
+
+	if (bits & HLU_ORIGIN1)	e->origin[0] = HLMsgReadCoord(m);
+	if (bits & HLU_ANGLE1)	e->angles[0] = HLMsgReadAngle(m);
+	if (bits & HLU_ORIGIN2)	e->origin[1] = HLMsgReadCoord(m);
+	if (bits & HLU_ANGLE2)	e->angles[1] = HLMsgReadAngle(m);
+	if (bits & HLU_ORIGIN3)	e->origin[2] = HLMsgReadCoord(m);
+	if (bits & HLU_ANGLE3)	e->angles[2] = HLMsgReadAngle(m);
+
+	if (e->forcelink)
+	{
+		HLVecCopy(e->origin, e->prev_origin);
+		HLVecCopy(e->angles, e->prev_angles);
+	}
+
+	e->active  = TRUE;
+	e->msgtime = hl_net_msgtime;
+
+	if (num >= hl_net_num_ents)
+		hl_net_num_ents = num + 1;
+
+	return ToBool(!m->badread);
+}

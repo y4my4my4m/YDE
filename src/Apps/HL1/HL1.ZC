@@ -1,0 +1,3133 @@
+// HL1.ZC - app shell: window, input, frame loop.
+//
+// rendering runs on this task; the blit runs in the draw_it callback on the
+// window manager task, which must never block - it copies pixels and nothing
+// else.
+
+//cl_forwardspeed and * cl_movespeedkey, the original's defaults. run exceeds
+//sv_maxspeed (320) on purpose - the move code clamps it, so diagonals are no
+//faster than straight.
+#define HLMOVE_SPEED		200.0	//world units per second
+#define HLMOVE_FAST		400.0
+#define HLPITCH_LIMIT	89.0
+//new game starts in start.bsp - skill and episode are chosen by walking into
+//the world, not from a menu page.
+#define HLDEFAULT_MAP	"maps/start.bsp"
+
+//entities are not in the PVS, so range-limit instead. 2000 covers a large
+//room without submitting the whole level.
+#define HLENT_DRAW_DIST	2000.0
+#define HLENT_LIGHT		170		//flat shade until models sample the lightmap
+
+#define HLVIEW_HEIGHT	22.0	//eye height above the player origin
+
+//server tick: off the jiffy counter, not the render rate. QuakeC timings and
+//the physics were tuned against 72Hz.
+#define HLSERVER_HZ			72.0
+#define HLSERVER_STEP		(1.0 / HLSERVER_HZ)
+#define HLSERVER_MAX_CATCHUP	4
+
+//view model sits AT the eye - its verts already carry the offset. V_CalcRefdef
+//copies the view origin in and adds only bob.
+#define HLVM_FORWARD		0.0
+#define HLVM_RIGHT		0.0
+#define HLVM_UP			0.0
+#define HLVM_LIGHT		200		//weapons read brighter than world entities
+
+//hl_map declared in HLBSP.ZC (needed by HLNetSv before this file).
+CHLVisState	*hl_vis		= NULL;
+CHLCanvas	*hl_canvas	= NULL;
+
+F64	 hl_origin[3];		//player origin, what physics moves
+F64	 hl_view[3];			//eye position, origin plus the view height
+F64	 hl_velocity[3];
+F64	 hl_angles[3];
+Bool hl_on_ground	= FALSE;
+Bool hl_noclip		= FALSE;
+I64	 hl_water_level	= 0;
+I64	 hl_water_type	= 0;
+I64	 hl_water_last	= 0;	//water level last frame, for surface crossings
+F64	 hl_fov			= 90.0;
+I64	 hl_blit_w		= 320;
+I64	 hl_blit_h		= 240;
+I64	 hl_blit_x		= 0;
+I64	 hl_blit_y		= 0;
+Bool hl_draw_entities = TRUE;
+I64	 hl_ent_drawn	= 0;
+Bool hl_ready		= FALSE;
+F64	 hl_fps			= 0.0;
+I64	 hl_frame_count	= 0;
+
+Bool hl_loading = FALSE;		//SCR_BeginLoadingPlaque / scr_drawloading
+
+U0 HLDrawIt(CTask *task, CDC *dc)
+{//window manager task: copy only. every pointer is cleared before the owner
+ //frees it, so these guards are what keep teardown out of an in-flight blit.
+	//a map load blocks the game task but not this one, and hl_vis stays NULL
+	//throughout - without this the old level sits frozen on screen.
+	if (hl_loading && hl_ready && hl_canvas)
+	{
+		HLDrawBlitFit(hl_canvas, dc, hl_blit_x, hl_blit_y, hl_blit_w, hl_blit_h);
+		return;
+	}
+
+	if (!hl_ready || !hl_canvas)
+		return;
+
+	HLDrawBlitFit(hl_canvas, dc, hl_blit_x, hl_blit_y, hl_blit_w, hl_blit_h);
+
+
+	//no HUD text here - Sbar draws it into the canvas, from the game's own art
+	//and through the game's own palette.
+}
+
+U0 HLRenderEntities()
+{//brush models first, then alias. everything is depth tested, so order is a
+ //speed detail, not a correctness one.
+	CHLEntity *e;
+	F64		  dist[3];
+	I64		  i;
+
+	hl_ent_drawn = 0;
+
+	//Model 0 is the world itself and is already drawn by the PVS path.
+	for (i = 0; i < hl_num_entities; i++)
+	{
+		e = &hl_entities[i];
+
+		if (e->brush_model > 0)
+		{
+			HLDrawBrushModel(hl_canvas, hl_map, e->brush_model, e->origin);
+			hl_ent_drawn++;
+		}
+	}
+
+	for (i = 0; i < hl_num_entities; i++)
+	{
+		e = &hl_entities[i];
+
+		if (e->mdl)
+		{
+			//Cheap distance reject before touching the triangles at all.
+			HLVecSub(e->origin, hl_origin, dist);
+			if (HLVecLength(dist) < HLENT_DRAW_DIST)
+			{
+				HLMdlDraw(hl_canvas, e->mdl, e->frame, e->origin,
+					e->angles[1], HLLightPoint(hl_map, e->origin));
+				hl_ent_drawn++;
+			}
+		}
+	}
+}
+
+//--- stuck detector --------------------------------------------------------
+//
+// Wanting to move and not moving is measurable: input applied, origin unchanged
+// across several server steps means something is refusing the move.
+#define HLSTUCK_STEPS	12		//consecutive refused steps before reporting
+#define HLSTUCK_REPORTS	4
+
+F64 hl_stuck_org[3];
+I64 hl_stuck_steps	= 0;
+I64 hl_stuck_said	= 0;
+U8  hl_stuck_line[192];
+
+U0 HLStuckInit()
+{
+	HLVecSet(hl_stuck_org, 0.0, 0.0, 0.0);
+	hl_stuck_steps = 0;
+	hl_stuck_said  = 0;
+}
+
+U0 HLStuckCheck(F64 *wishdir, F64 wishspeed)
+{//Called once per server step, after the move.
+	F64		d[3];
+	F64		probe[3];
+	CHLTrace	tr;
+	I64		blocker;
+
+	//Not trying to go anywhere, so standing still is correct.
+	if (wishspeed <= 0.0 ||
+		(wishdir[0] == 0.0 && wishdir[1] == 0.0 && wishdir[2] == 0.0))
+	{
+		hl_stuck_steps = 0;
+		HLVecCopy(hl_origin, hl_stuck_org);
+		return;
+	}
+
+	HLVecSub(hl_origin, hl_stuck_org, d);
+
+	if (HLVecLength(d) > 0.5)
+	{
+		hl_stuck_steps = 0;
+		HLVecCopy(hl_origin, hl_stuck_org);
+		return;
+	}
+
+	hl_stuck_steps++;
+
+	if (hl_stuck_steps != HLSTUCK_STEPS || hl_stuck_said >= HLSTUCK_REPORTS)
+		return;
+
+	//only interesting when the sweep is CLEAR - walking into a wall legitimately
+	//does not move the player.
+	HLVecMA(hl_origin, 4.0, wishdir, probe);
+	HLTracePlayer(hl_map, hl_origin, probe, &tr);
+
+	if (tr.fraction < 1.0)
+	{
+		//something really is in the way - not stuck, correct.
+		hl_stuck_steps = 0;
+		return;
+	}
+
+	hl_stuck_said++;
+
+	blocker = -1;
+	if (hl_game_active && hl_player_edict > 0)
+		blocker = HLTestEntityPosition(hl_map, hl_player_edict);
+
+	StrPrint(hl_stuck_line,
+		"stuck: at %.0f %.0f %.0f vel %.0f %.0f %.0f ground=%d water=%d\n",
+		hl_origin[0], hl_origin[1], hl_origin[2],
+		hl_velocity[0], hl_velocity[1], hl_velocity[2],
+		hl_on_ground, hl_water_level);
+	HLLog(hl_stuck_line);
+
+	if (blocker < 0)
+		HLLog("stuck: player position is CLEAR - the move is being refused\n");
+	else if (blocker == 0)
+		HLLog("stuck: player is embedded in the WORLD\n");
+	else
+	{
+		StrPrint(hl_stuck_line, "stuck: embedded in edict %d (%s)\n", blocker,
+			HLPrStr(HLPrFieldI(blocker, hl_fld_classname)));
+		HLLog(hl_stuck_line);
+	}
+
+	//a clear position is not the question - what stops the SWEEP is. repeat the
+	//move and report the trace that refuses it (ent -1 is the world).
+	HLVecMA(hl_origin, 4.0, wishdir, probe);
+	HLTracePlayer(hl_map, hl_origin, probe, &tr);
+
+	StrPrint(hl_stuck_line,
+		"stuck: probe frac=%.3f solid=%d/%d hit=%d ent=%d n=%.2f %.2f %.2f\n",
+		tr.fraction, tr.all_solid, tr.start_solid, tr.hit, tr.ent,
+		tr.plane_normal[0], tr.plane_normal[1], tr.plane_normal[2]);
+	HLLog(hl_stuck_line);
+
+	if (tr.ent > 0)
+	{
+		StrPrint(hl_stuck_line, "stuck: blocked by edict %d (%s) solid=%d\n",
+			tr.ent, HLPrStr(HLPrFieldI(tr.ent, hl_fld_classname)),
+			ToI64(HLPrFieldF(tr.ent, hl_fld_solid)));
+		HLLog(hl_stuck_line);
+
+		//the blocker's own bounds: if the player is nowhere near them the trace
+		//ran against the wrong submodel, so the brush number is printed too.
+		StrPrint(hl_stuck_line,
+			"stuck:   bmodel=%d org %.0f %.0f %.0f  mins %.0f %.0f %.0f  maxs %.0f %.0f %.0f\n",
+			HLClipBrushModel(ToI64(HLPrFieldF(tr.ent, hl_fld_modelindex))),
+			HLPrFieldF(tr.ent, hl_fld_origin + 0),
+			HLPrFieldF(tr.ent, hl_fld_origin + 1),
+			HLPrFieldF(tr.ent, hl_fld_origin + 2),
+			HLPrFieldF(tr.ent, hl_fld_mins + 0),
+			HLPrFieldF(tr.ent, hl_fld_mins + 1),
+			HLPrFieldF(tr.ent, hl_fld_mins + 2),
+			HLPrFieldF(tr.ent, hl_fld_maxs + 0),
+			HLPrFieldF(tr.ent, hl_fld_maxs + 1),
+			HLPrFieldF(tr.ent, hl_fld_maxs + 2));
+		HLLog(hl_stuck_line);
+	}
+
+	HLLogFlush;
+}
+
+//--- cshifts ----------------------------------------------------------------
+//
+// V_UpdatePalette blends four shifts, each a destination colour plus a percent,
+// applied in sequence so a hit while underwater reads as both.
+//
+//   CONTENTS - eye submersion (HLLiquidView)
+//   DAMAGE   - red, scaled by damage taken, decays at 150/sec
+//   BONUS    - pickup flash, decays at 100/sec
+//   POWERUP  - quad blue, invulnerability yellow, suit green
+#define HLCS_DAMAGE_RATE		150.0
+#define HLCS_BONUS_RATE		100.0
+
+//powerup bits from defs.qc. 4096 is IT_AXE, always held - do not use it for a
+//powerup test.
+//
+//    IT_AXE             4096      IT_INVISIBILITY   524288
+//    IT_SUPERHEALTH    16384      IT_INVULNERABILITY 1048576
+//    IT_KEY1          131072      IT_SUIT          2097152
+//    IT_KEY2          262144      IT_QUAD          4194304
+#define HLIT_INVISIBILITY	524288
+#define HLIT_INVULNERABILITY	1048576
+#define HLIT_SUIT			2097152
+#define HLIT_QUAD			4194304
+
+F64 hl_cs_dmg_pct	= 0.0;
+F64 hl_cs_bonus_pct	= 0.0;
+
+U0 HLCShiftInit()
+{
+	hl_cs_dmg_pct   = 0.0;
+	hl_cs_bonus_pct = 0.0;
+}
+
+U0 HLCShiftDamage(F64 count)
+{//V_ParseDamage: percent += 3*count, clamped to 150.
+	hl_cs_dmg_pct += 3.0 * count;
+
+	if (hl_cs_dmg_pct < 0.0)
+		hl_cs_dmg_pct = 0.0;
+	if (hl_cs_dmg_pct > 150.0)
+		hl_cs_dmg_pct = 150.0;
+}
+
+U0 HLCShiftBonus()
+{//V_BonusFlash: the pickup flash is a fixed colour at 50 percent.
+	hl_cs_bonus_pct = 50.0;
+}
+
+U0 HLCShiftUpdate(F64 dt)
+{//Decay both flashes. The original uses host_frametime for exactly this.
+	hl_cs_dmg_pct -= dt * HLCS_DAMAGE_RATE;
+	if (hl_cs_dmg_pct < 0.0)
+		hl_cs_dmg_pct = 0.0;
+
+	hl_cs_bonus_pct -= dt * HLCS_BONUS_RATE;
+	if (hl_cs_bonus_pct < 0.0)
+		hl_cs_bonus_pct = 0.0;
+}
+
+U0 HLCShiftAdd(F64 *_r, F64 *_g, F64 *_b, F64 *_a,
+	F64 dr, F64 dg, F64 db, F64 percent)
+{//one shift folded into the running blend, exactly as V_CalcBlend does it
+ //
+ //    a2 = percent/255      <- 255, NOT 100. the percents ARE 0..255
+ //    a  = a + a2*(1-a)
+ //    a2 = a2/a
+ //    r  = r*(1-a2) + destcolor*a2
+ //
+ //destcolor stays FULLY saturated and the alpha carries the strength. mixing
+ //the colour down by its own percent first and then applying the alpha again
+ //shifts twice, which washes the destination out - the biosuit ended up a dim
+ //grey-green instead of green
+	F64 a2;
+
+	if (percent <= 0.0)
+		return;
+
+	a2 = percent / 255.0;
+	if (a2 > 1.0)
+		a2 = 1.0;
+
+	*_a = *_a + a2 * (1.0 - *_a);
+	if (*_a <= 0.0)
+		return;
+
+	a2 = a2 / *_a;
+
+	*_r = *_r * (1.0 - a2) + dr * a2;
+	*_g = *_g * (1.0 - a2) + dg * a2;
+	*_b = *_b * (1.0 - a2) + db * a2;
+}
+
+U0 HLCShiftBlend(I64 *_r, I64 *_g, I64 *_b, I64 *_a)
+{//V_CalcBlend. contents, damage, bonus, powerup, in that order
+ //
+ //in: the CONTENTS shift, destcolor in _r.._b and its percent in _a
+ //out: the folded tint, alpha 0..255
+	F64 r = 0.0;
+	F64 g = 0.0;
+	F64 b = 0.0;
+	F64 a = 0.0;
+	I64 items = 0;
+
+	//V_CalcPowerupCshift reads cl.items, off svc_clientdata - a demo or a
+	//remote client has no server edict to read
+	if (HLClientMode)
+		items = hl_cl.items;
+	else if (hl_player_active && hl_player_edict > 0 && hl_fld_items >= 0)
+		items = ToI64(HLPrFieldF(hl_player_edict, hl_fld_items));
+
+	HLCShiftAdd(&r, &g, &b, &a,
+		ToF64(*_r), ToF64(*_g), ToF64(*_b), ToF64(*_a));
+
+	//V_ParseDamage caps its own percent at 150
+	HLCShiftAdd(&r, &g, &b, &a, 255.0, 0.0, 0.0, hl_cs_dmg_pct);
+
+	//the pickup flash
+	HLCShiftAdd(&r, &g, &b, &a, 215.0, 186.0, 69.0, hl_cs_bonus_pct);
+
+	//V_CalcPowerupCshift is an if/else chain - one shift only, this order
+	if (items & HLIT_QUAD)
+		HLCShiftAdd(&r, &g, &b, &a, 0.0, 0.0, 255.0, 30.0);
+	else if (items & HLIT_SUIT)
+		HLCShiftAdd(&r, &g, &b, &a, 0.0, 255.0, 0.0, 20.0);
+	else if (items & HLIT_INVISIBILITY)
+		HLCShiftAdd(&r, &g, &b, &a, 100.0, 100.0, 100.0, 100.0);
+	else if (items & HLIT_INVULNERABILITY)
+		HLCShiftAdd(&r, &g, &b, &a, 255.0, 255.0, 0.0, 30.0);
+
+	if (a > 1.0)
+		a = 1.0;
+	if (a < 0.0)
+		a = 0.0;
+
+	*_r = ClampI64(ToI64(r), 0, 255);
+	*_g = ClampI64(ToI64(g), 0, 255);
+	*_b = ClampI64(ToI64(b), 0, 255);
+	*_a = ClampI64(ToI64(a * 255.0), 0, 255);
+}
+
+//--- weapon punch and damage kick ------------------------------------------
+//
+// Two view-only effects, applied to a copy of the angles:
+//
+//   punchangle  - QuakeC sets .punchangle on fire (shotgun uses -2 pitch)
+//   damage kick - V_ParseDamage turns a hit into roll and pitch, directed by
+//                 where the damage came from
+//
+// Cvar defaults below are the original's.
+#define HLKICK_ROLL		0.6
+#define HLKICK_PITCH		0.6
+#define HLKICK_TIME		0.5
+
+F64 hl_dmg_roll		= 0.0;
+F64 hl_dmg_pitch		= 0.0;
+F64 hl_dmg_time		= 0.0;
+F64 hl_punch[3];
+F64 hl_dmg_last		= 0.0;	//dmg_take+dmg_save seen last frame
+I64 hl_con_return_state = HLST_PLAYING;	//state the console was opened from
+
+//Entities whose reconstructed client state disagreed with the server's world on
+//the last tick. Should be 0; anything else is an encode or decode fault.
+I64 hl_net_mismatch = 0;
+
+//When the last connection request went out, so it can be repeated.
+F64 hl_join_last_try = 0.0;
+U8  hl_join_line[96];
+F64 hl_heap_check_last = 0.0;
+U8  hl_heap_check_line[48];
+
+F64 hl_tick_log_last = 0.0;
+I64 hl_tick_log_n    = 0;
+U8  hl_tick_line[160];
+
+U0 HLViewKickInit()
+{
+	hl_dmg_roll  = 0.0;
+	hl_dmg_pitch = 0.0;
+	hl_dmg_time  = 0.0;
+	hl_dmg_last  = 0.0;
+	HLVecSet(hl_punch, 0.0, 0.0, 0.0);
+}
+
+U0 HLViewKickUpdate(F64 dt)
+{//Pick up a new punch or hit, and decay what is already running.
+	F64 from[3];
+	F64 fwd[3];
+	F64 rgt[3];
+	F64 upv[3];
+	F64 dir[3];
+	F64 count;
+	F64 side;
+	F64 len;
+	I64 inflictor;
+	I64 j;
+
+	if (!hl_player_active || hl_player_edict <= 0)
+	{
+		HLViewKickInit;
+		return;
+	}
+
+	//--- weapon punch ---
+	//
+	//Read straight off the edict - the field IS the current kick. Recovery
+	//happens in DropPunchAngle each client think.
+	if (hl_fld_punchangle >= 0)
+	{
+		for (j = 0; j < 3; j++)
+			hl_punch[j] = HLPrFieldF(hl_player_edict, hl_fld_punchangle + j);
+	}
+
+	//--- damage kick ---
+	//
+	//Thin client: QuakeC never writes local dmg_take. svc_damage parks the hit
+	//in hl_net_damage_* (V_ParseDamage's inputs) - honour that here.
+	if (hl_net_damage_pending)
+	{
+		count = ToF64(hl_net_damage_take) + ToF64(hl_net_damage_save);
+		if (count < 10.0)
+			count = 10.0;
+		if (count > 255.0)
+			count = 255.0;
+
+		HLCShiftDamage(count);
+
+		HLVecSub(hl_net_damage_from, hl_origin, dir);
+		len = HLVecLength(dir);
+		if (len > 0.0)
+		{
+			HLVecScale(dir, 1.0 / len, dir);
+			HLAngleVectors(hl_angles, fwd, rgt, upv);
+			side        = HLVecDot(dir, rgt);
+			hl_dmg_roll  = count * side * HLKICK_ROLL;
+			side        = HLVecDot(dir, fwd);
+			hl_dmg_pitch = count * side * HLKICK_PITCH;
+			hl_dmg_time  = HLKICK_TIME;
+		}
+
+		hl_net_damage_pending = FALSE;
+		hl_net_damage_take    = 0;
+		hl_net_damage_save    = 0;
+	}
+	else if (hl_fld_dmg_take >= 0 && hl_fld_dmg_save >= 0)
+	{
+		count = HLPrFieldF(hl_player_edict, hl_fld_dmg_take) +
+				HLPrFieldF(hl_player_edict, hl_fld_dmg_save);
+
+		//Only a CHANGE counts as a fresh hit; the fields persist between frames.
+		if (count > 0.0 && count != hl_dmg_last)
+		{
+			if (count < 10.0)
+				count = 10.0;
+
+			//V_ParseDamage reads armour and blood as bytes - cap at 255.
+			if (count > 255.0)
+				count = 255.0;
+
+			//V_ParseDamage does the kick and the cshift from the one message.
+			HLCShiftDamage(count);
+
+			inflictor = 0;
+			if (hl_fld_dmg_inflictor >= 0)
+				inflictor = HLPrEdictNum(
+					HLPrFieldI(hl_player_edict, hl_fld_dmg_inflictor));
+
+			if (inflictor > 0)
+			{
+				for (j = 0; j < 3; j++)
+					from[j] = HLPrFieldF(inflictor, hl_fld_origin + j);
+
+				HLVecSub(from, hl_origin, dir);
+				len = HLVecLength(dir);
+
+				if (len > 0.0)
+				{
+					HLVecScale(dir, 1.0 / len, dir);
+					HLAngleVectors(hl_angles, fwd, rgt, upv);
+
+					//Where the damage came from decides which way the view is
+					//thrown: sideways damage rolls it, frontal damage pitches.
+					side        = HLVecDot(dir, rgt);
+					hl_dmg_roll  = count * side * HLKICK_ROLL;
+
+					side        = HLVecDot(dir, fwd);
+					hl_dmg_pitch = count * side * HLKICK_PITCH;
+
+					hl_dmg_time  = HLKICK_TIME;
+				}
+			}
+		}
+
+		hl_dmg_last = count;
+
+		//SV_WriteClientdataToMessage clears these after sending: left standing,
+		//an identical second hit reads as no change and gives no flash or kick.
+		if (count > 0.0)
+		{
+			HLPrSetFieldF(hl_player_edict, hl_fld_dmg_take, 0.0);
+			HLPrSetFieldF(hl_player_edict, hl_fld_dmg_save, 0.0);
+			hl_dmg_last = 0.0;
+		}
+	}
+
+	//Thin client: punchangle arrives in clientdata, not on the local edict.
+	//The host has already decayed it, so this is the value to use as-is.
+	if (hl_udp_ready && !hl_udp_server)
+	{
+		for (j = 0; j < 3; j++)
+			hl_punch[j] = hl_cl.punchangle[j];
+	}
+
+	if (hl_dmg_time > 0.0)
+	{
+		hl_dmg_time -= dt;
+		if (hl_dmg_time < 0.0)
+			hl_dmg_time = 0.0;
+	}
+
+	//Pickup flash is driven by QuakeC stuffing "bf", not by watching .items:
+	//health and already-held ammo set no bit, and a fading powerup clears one.
+
+	HLCShiftUpdate(dt);
+}
+
+//V_AddIdle: three sines that make the view breathe when standing still.
+//v_idlescale is 0 in stock HL1, so this is off by default.
+#define HLIDLE_ROLL_CYCLE	0.5
+#define HLIDLE_PITCH_CYCLE	1.0
+#define HLIDLE_YAW_CYCLE		2.0
+#define HLIDLE_ROLL_LEVEL	0.1
+#define HLIDLE_PITCH_LEVEL	0.3
+#define HLIDLE_YAW_LEVEL		0.3
+
+F64 hl_idle_scale = 0.0;		//v_idlescale
+
+U0 HLViewAddIdle(F64 *angles)
+{
+	if (hl_idle_scale == 0.0)
+		return;
+
+	angles[2] += hl_idle_scale * Sin(tS * HLIDLE_ROLL_CYCLE) * HLIDLE_ROLL_LEVEL;
+	angles[0] += hl_idle_scale * Sin(tS * HLIDLE_PITCH_CYCLE) * HLIDLE_PITCH_LEVEL;
+	angles[1] += hl_idle_scale * Sin(tS * HLIDLE_YAW_CYCLE) * HLIDLE_YAW_LEVEL;
+}
+
+U0 HLViewApplyKick(F64 *angles)
+{//Fold every view-only angle effect into a copy of the angles.
+	F64 frac;
+
+	angles[0] += hl_punch[0];
+	angles[1] += hl_punch[1];
+	angles[2] += hl_punch[2];
+
+	if (hl_dmg_time > 0.0)
+	{
+		frac = hl_dmg_time / HLKICK_TIME;
+		angles[2] += frac * hl_dmg_roll;
+		angles[0] += frac * hl_dmg_pitch;
+	}
+
+	HLViewAddIdle(angles);
+}
+
+//--- view bob and roll -----------------------------------------------------
+//
+// View-only: applied to the render copy of the angles, never to hl_angles, which
+// feeds .v_angle and would lean the player's aim with the camera.
+
+#define HLBOB_AMOUNT		0.02	//bob per unit of horizontal speed
+#define HLBOB_CYCLE		0.6		//seconds for a full step cycle
+#define HLBOB_UP			0.5		//fraction of the cycle spent rising
+#define HLROLL_ANGLE		2.0		//degrees of lean at full strafe
+#define HLROLL_SPEED		200.0	//strafe speed at which the lean maxes out
+
+F64 hl_bob_time	= 0.0;	//accumulated walking time, NOT wall-clock time
+F64 hl_bob_value	= 0.0;	//last computed bob, held while airborne
+F64 hl_bob_prev	= 0.0;	//real time of the previous update
+
+U0 HLViewBobUpdate()
+{//V_CalcBob. called ONCE per frame: it is read twice, for the eye and for the
+ //weapon, and advancing the clock in the reader doubles the cycle rate.
+ //
+ //airborne HOLDS the last value (original: if (onground == -1) return bob;) -
+ //zeroing puts a jolt in the view on every jump. the cycle runs on accumulated
+ //walking time, not wall-clock, so the phase resumes where it left off on
+ //landing rather than jumping.
+	F64 cycle;
+	F64 bob;
+	F64 speed;
+	F64 dt;
+
+	dt         = tS - hl_bob_prev;
+	hl_bob_prev = tS;
+
+	//A level load must not dump a huge delta into the cycle.
+	if (dt < 0.0 || dt > 0.25)
+		dt = 0.0;
+
+	//Airborne means no footfalls: keep the last value.
+	if (!hl_on_ground)
+		return;
+
+	hl_bob_time += dt;
+
+	cycle = hl_bob_time - ToF64(ToI64(hl_bob_time / HLBOB_CYCLE)) * HLBOB_CYCLE;
+	cycle /= HLBOB_CYCLE;
+
+	//Rise and fall occupy different fractions of the cycle, which is what
+	//gives the footstep its uneven, weighted feel.
+	if (cycle < HLBOB_UP)
+		cycle = pi * cycle / HLBOB_UP;
+	else
+		cycle = pi + pi * (cycle - HLBOB_UP) / (1.0 - HLBOB_UP);
+
+	//Proportional to speed across the ground only - falling must not bob.
+	speed = Sqrt(hl_velocity[0] * hl_velocity[0] +
+				 hl_velocity[1] * hl_velocity[1]);
+
+	bob = speed * HLBOB_AMOUNT;
+	bob = bob * 0.3 + bob * 0.7 * Sin(cycle);
+
+	if (bob > 4.0)
+		bob = 4.0;
+	if (bob < -7.0)
+		bob = -7.0;
+
+	hl_bob_value = bob;
+}
+
+F64 HLViewBob()
+{//The bob for this frame. Read-only - HLViewBobUpdate owns the clock.
+	return hl_bob_value;
+}
+
+F64 hl_view_oldz	= 0.0;	//eye height being caught up to after a step
+F64 hl_step_prev	= 0.0;
+
+F64 HLViewStepOffset()
+{//V_CalcRefdef stair smoothing: the eye chases the new height at 80 units/sec,
+ //never lagging more than 12 behind. up only - falling must be immediate, or
+ //the ground appears to come up to meet the player.
+	F64 dt = tS - hl_step_prev;
+
+	hl_step_prev = tS;
+
+	if (dt < 0.0 || dt > 0.25)
+		dt = 0.0;
+
+	if (!hl_on_ground || hl_origin[2] - hl_view_oldz <= 0.0)
+	{
+		hl_view_oldz = hl_origin[2];
+		return 0.0;
+	}
+
+	hl_view_oldz += dt * 80.0;
+
+	if (hl_view_oldz > hl_origin[2])
+		hl_view_oldz = hl_origin[2];
+	if (hl_origin[2] - hl_view_oldz > 12.0)
+		hl_view_oldz = hl_origin[2] - 12.0;
+
+	return hl_view_oldz - hl_origin[2];
+}
+
+F64 HLViewRoll(F64 *angles, F64 *velocity)
+{//Lean into a strafe, proportional to sideways speed.
+	F64 fwd[3];
+	F64 rgt[3];
+	F64 upv[3];
+	F64 side;
+	F64 sign;
+
+	HLAngleVectors(angles, fwd, rgt, upv);
+	side = HLVecDot(velocity, rgt);
+
+	if (side < 0.0)
+	{
+		sign = -1.0;
+		side = -side;
+	}
+	else
+		sign = 1.0;
+
+	if (side < HLROLL_SPEED)
+		side = side * HLROLL_ANGLE / HLROLL_SPEED;
+	else
+		side = HLROLL_ANGLE;
+
+	return side * sign;
+}
+
+
+U0 HLLiquidView()
+{//screen wash, view warp and the surface-crossing sounds.
+ //tints are the original's, folded into the palette rather than blended per
+ //pixel - 8bpp indices cannot be averaged.
+	I64 r = 0;
+	I64 g = 0;
+	I64 b = 0;
+	I64 a = 0;
+
+	//Only a submerged EYE tints the view; wading to the waist does not.
+	if (hl_water_level >= 3)
+	{
+		switch (hl_water_type)
+		{
+			case HLCONTENTS_LAVA:
+				r = 255; g = 80;  b = 0;  a = 150;
+				break;
+			case HLCONTENTS_SLIME:
+				r = 0;   g = 25;  b = 5;  a = 150;
+				break;
+			default:
+				r = 130; g = 80;  b = 50; a = 128;
+				break;
+		}
+
+		hl_warp_amount = 4.0;
+	}
+	else
+		hl_warp_amount = 0.0;
+
+	hl_warp_time = tS;
+
+	//all four shifts collapse into one tint.
+	HLCShiftBlend(&r, &g, &b, &a);
+
+	HLPalSetTint(r, g, b, a);
+
+	//edged against last frame, or the sound fires every frame while submerged.
+	if (hl_water_level > 0 && hl_water_last == 0)
+	{
+		if (hl_water_type == HLCONTENTS_LAVA)
+			HLSndPlayAt("player/inlava.wav", hl_view, 1.0, 0.0);
+		else if (hl_water_type == HLCONTENTS_SLIME)
+			HLSndPlayAt("player/slimbrn2.wav", hl_view, 1.0, 0.0);
+		else
+			HLSndPlayAt("player/inh2o.wav", hl_view, 1.0, 0.0);
+	}
+	else if (hl_water_level == 0 && hl_water_last > 0)
+		HLSndPlayAt("misc/outwater.wav", hl_view, 1.0, 0.0);
+
+	hl_water_last = hl_water_level;
+}
+
+U0 HLRenderFrame()
+{//One full frame into the private canvas.
+	F64		 forward[3];
+	F64		 right[3];
+	F64		 up[3];
+	F64		 fov_y;
+	F64		 view_angles[3];
+	F64		 saved_idle;
+	F64		 chase_f[3];
+	F64		 chase_r[3];
+	F64		 chase_u[3];
+	F64		 chase_want[3];
+	F64		 chase_zero[3];
+	CHLTrace	 chase_tr;
+	CHLMdl	*vm_mdl;
+	F64		 vm_depth;
+	F64		 snd_fwd[3];
+	F64		 snd_right[3];
+	I64		 skip_ent;
+	I64		 vm_frame;
+	I64		 i;
+	Bool	 vm_show;
+
+	HLAngleVectors(hl_angles, forward, right, up);
+	fov_y = HLDrawFovY(hl_fov, hl_canvas->width, hl_canvas->height);
+
+	//Drives the two sky layers' scroll.
+	hl_sky_time = tS;
+
+	//bob and roll are VIEW-only - hl_angles feeds v_angle and would lean the
+	//player's aim with the camera. updated once here, read twice below: for the
+	//eye and again for the weapon.
+	HLViewBobUpdate;
+
+	HLVecCopy(hl_origin, hl_view);
+
+	//the step offset is negative while catching up, pulling the eye DOWN. eye
+	//height is QuakeC's .view_ofs, not a constant - it drops on death and shifts
+	//in liquid. HLVIEW_HEIGHT is only the fallback with no player entity.
+	if (hl_game_active)
+		hl_view[2] += HLPlayerViewHeight + HLViewBob + HLViewStepOffset;
+	else
+		hl_view[2] += HLVIEW_HEIGHT + HLViewBob + HLViewStepOffset;
+
+	//nudge off any exact plane - a water surface vanishes with the eye sitting
+	//precisely on its node line.
+	hl_view[0] += 1.0 / 32.0;
+	hl_view[1] += 1.0 / 32.0;
+	hl_view[2] += 1.0 / 32.0;
+
+	//Chase_Update. pull the eye back along the view axis and trace to it so the
+	//camera stops at the wall instead of ending up outside the level. not at
+	//intermission, where the view belongs to the info_intermission spot, and
+	//not in a demo, whose camera is the recorded one
+	if (HLCvarGet("chase_active") != 0.0 && !hl_intermission && !hl_demo_playing &&
+		HLMapValid(hl_map, "HLChaseUpdate"))
+	{
+		HLVecSet(chase_zero, 0.0, 0.0, 0.0);
+		HLAngleVectors(hl_angles, chase_f, chase_r, chase_u);
+
+		for (i = 0; i < 3; i++)
+			chase_want[i] = hl_view[i]
+				- chase_f[i] * HLCvarGet("chase_back")
+				+ chase_r[i] * HLCvarGet("chase_right")
+				+ chase_u[i] * HLCvarGet("chase_up");
+
+		//point trace - the camera has no size of its own
+		HLTraceEntity(hl_map, hl_view, chase_want, chase_zero, chase_zero,
+			hl_player_edict, TRUE, &chase_tr);
+
+		for (i = 0; i < 3; i++)
+			hl_view[i] = chase_tr.end_pos[i];
+
+		//back off the surface it stopped on, or the near plane clips into it
+		if (chase_tr.fraction < 1.0)
+		{
+			for (i = 0; i < 3; i++)
+				hl_view[i] += chase_tr.plane_normal[i] * 4.0;
+		}
+	}
+
+	HLVecCopy(hl_angles, view_angles);
+
+	//V_CalcIntermissionRefdef: idle sway at scale 1, and none of the gameplay
+	//view motion - no roll, no kicks, no bob.
+	if (hl_intermission)
+	{
+		saved_idle   = hl_idle_scale;
+		hl_idle_scale = 1.0;
+		view_angles[2] = 0.0;
+		HLViewAddIdle(view_angles);
+		hl_idle_scale = saved_idle;
+	}
+	else
+	{
+		view_angles[2] = HLViewRoll(hl_angles, hl_velocity);
+
+		//Weapon recoil and damage kicks, on the render copy only.
+		HLViewApplyKick(view_angles);
+	}
+
+	//V_CalcRefdef sets roll to 80 and returns early once health hits zero, which
+	//is what makes death read as collapsing rather than freezing.
+	if (hl_game_active && HLPlayerDead)
+		view_angles[2] = 80.0;
+
+	//listener panning runs off the view right vector.
+	HLAngleVectors(view_angles, snd_fwd, snd_right, NULL);
+	HLSndListener(hl_view, snd_right);
+
+	//the listener's own body is full volume and centred, so the mixer needs to
+	//know which entity that is.
+	if (HLClientMode)
+		hl_snd_viewent = hl_cl_viewent;
+	else
+		hl_snd_viewent = hl_player_edict;
+
+	//S_Update: re-aim everything still playing.
+	HLSndUpdate;
+
+	//light styles step at 10Hz off the game clock; ambients retrigger as their
+	//previous instance runs out.
+	HLLightAnimate(hl_game_time);
+	HLTurbFrame(tS);
+
+	//before HLLightFrame, so a muzzle flash added this frame is live this frame.
+	if (hl_game_active)
+		HLGameEntityLights(tS);
+
+	HLLightFrame(tS);
+
+	//R_PushDlights: mark which faces each light reaches once, before anything is
+	//drawn - per face at draw time lit whatever happened to be tested.
+	hl_ambient_light = ToI64(HLCvarGet("r_ambient"));
+	HLPushDlights(hl_map, tS);
+
+	//one surface-cache generation per frame - entries touched this frame must
+	//not be evicted out from under the drawing below.
+	HLSurfCacheSetMap(hl_map);
+	hl_surf_frame++;
+
+	HLSndAmbientUpdate(hl_game_time);
+
+	//S_UpdateAmbientSounds: per-leaf wind and water. passed the leaf and the
+	//cvars because HLSound.ZC compiles before both.
+	if (HLMapValid(hl_map, "HLSndLeafAmbients"))
+		HLSndLeafAmbients(hl_map, HLVisLeafForPoint(hl_map, hl_view),
+			HLCvarGet("ambient_level"), HLCvarGet("ambient_fade"), tS);
+
+	//Liquid wash, view warp and surface sounds.
+	HLLiquidView;
+
+	HLDrawClear(hl_canvas, 0);
+	//SCR_CalcRefdef before the projection, so the view rect it picks is what
+	//the projection centres on.
+	//sb_lines, not a fixed 24 - below viewsize 110 the inventory row is on
+	//screen too and the view has to clear both
+	HLDrawSetViewRect(hl_canvas, HLCvarGet("viewsize"), HLSbarLines);
+	HLDrawSetView(hl_canvas, hl_view, view_angles, hl_fov);
+
+	//NO WORLD, NO WORLD RENDER. a changelevel from inside a demo stream leaves
+	//the frame loop running while the map it draws is gone - either mid-load or
+	//after a load that failed outright.
+	if (!HLMapValid(hl_map, "HLRenderFrame") || !hl_vis)
+	{
+		HLSbarDraw(hl_canvas);
+		return;
+	}
+
+	HLVisBuildList(hl_vis, hl_view, forward, right, up, hl_fov, fov_y);
+	HLDrawWorld(hl_canvas, hl_map, hl_vis);
+
+	if (hl_draw_entities)
+	{
+		//VM live: entities come from the QuakeC world. playback: the stream IS
+		//the entity list. the map's own entity lump is neither - it still holds
+		//triggers, and InitTrigger clears modelindex, so a real client is never
+		//told about one.
+		if (hl_game_active || HLClientMode)
+		{
+			//host draws from edicts, so the remote body HLSvSpawnRemote made is
+			//visible. guest has no copy of the host player in its edict table,
+			//so it must take the wire path.
+			if (HLClientMode)
+			{
+				//svc_setview names this client's body; 0 draws everyone.
+				skip_ent = hl_cl_viewent;
+				//No distance cull on the wire path for MP - DM spawns on e1m1
+				//are often >2000 apart, and that alone hid both players.
+				HLNetDrawEntities(hl_canvas, hl_map, hl_view, 10000.0,
+					skip_ent);
+			}
+			else if (HLCvarGet("cl_netdraw") != 0.0)
+				HLNetDrawEntities(hl_canvas, hl_map, hl_view, HLENT_DRAW_DIST,
+					hl_player_edict);
+			else if (hl_udp_ready && hl_udp_server)
+			{
+				//host MP: remote bodies are ordinary edicts with player.mdl, so the
+				//normal path draws them - the wire path would draw a second body in
+				//the same place.
+				HLGameDrawEntities(hl_canvas, hl_map, hl_view, 10000.0);
+			}
+			else
+				HLGameDrawEntities(hl_canvas, hl_map, hl_view, HLENT_DRAW_DIST);
+			HLGameDrawStatics(hl_canvas, hl_map);
+			//CL_UpdateTEnts re-anchors our own bolt before drawing.
+			if (hl_udp_ready && !hl_udp_server || hl_demo_playing)
+				HLBiBeamsFollow(hl_cl_viewent);
+			else
+				HLBiBeamsFollow(hl_player_edict);
+
+			HLBiDrawBeams(hl_canvas, tS);
+		}
+		else
+			HLRenderEntities;
+	}
+
+	//Particles are depth tested, so they sit correctly among the geometry.
+	HLPartDraw(hl_canvas, tS);
+
+	//weapon last, over everything. QuakeC owns the model and the frame.
+	//
+	//hidden at intermission: execute_changelevel zeroes the player's modelindex
+	//and parks the camera, so the view is a spectator shot.
+	//
+	//client side, dead is cl.stats[STAT_HEALTH] - HLPlayerDead would read an
+	//edict that does not exist and hide the gun for a whole demo.
+	if (HLClientMode)
+		vm_show = ToBool(hl_cl.health > 0 && !hl_intermission);
+	else
+		vm_show = ToBool(hl_player_active && !HLPlayerDead && !hl_intermission);
+
+	if (vm_show)
+	{
+		vm_mdl = NULL;
+		vm_frame = HLPlayerWeaponFrame;
+
+		//Thin client: weaponmodel on the wire is a precache index, not a
+		//QuakeC string. Prefer that so the viewgun tracks the host.
+		if (HLClientMode && hl_cl.weaponmodel > 0 &&
+			hl_cl.weaponmodel < hl_precache_model_count)
+		{
+			vm_mdl   = hl_precache_mdl[hl_cl.weaponmodel];
+			vm_frame = hl_cl.weaponframe;
+		}
+
+		if (!vm_mdl)
+			vm_mdl = HLBiFindModel(HLPlayerWeaponModel);
+
+		if (vm_mdl)
+		{
+			//SCREEN-LOCKED, not placed in the world: drawn straight in camera
+			//space, so the camera and model rotations cancel by construction -
+			//no angles, and no sign convention to get wrong.
+			//
+			//BOB IS FORWARD, NOT VERTICAL. V_CalcRefdef gives eye and gun the
+			//same viewheight + bob, so they rise TOGETHER. the only relative
+			//motion is
+			//
+			//    view->origin[i] += forward[i] * bob * 0.4;
+			//
+			//depth 1.0 is the software renderer's world range, which is why the
+			//gun sinks into walls. 1/0.3 is GLQuake's compression, an option.
+			if (hl_opt_gunclip)
+				vm_depth = 1.0 / 0.3;
+			else
+				vm_depth = 1.0;
+
+			HLMdlDrawView(hl_canvas, vm_mdl, vm_frame,
+				HLVM_FORWARD + HLViewBob * 0.4, HLVM_RIGHT, HLVM_UP,
+				1.0, HLVM_LIGHT, vm_depth);
+		}
+	}
+
+	//over the world, under the overlays - hidden when the view is not the
+	//player's own.
+	if (!hl_intermission)
+		HLSbarCrosshair(hl_canvas);
+
+	//SCR_UpdateScreen's split: intermission 1 is the stat sheet ALONE, and only
+	//the finale (2) pairs its plaque with the centerprint.
+	if (!hl_intermission || hl_finale)
+		HLSbarCenterPrint(hl_canvas);
+
+	//Sbar_IntermissionOverlay: a deathmatch shows the RANKINGS at intermission,
+	//not a stat sheet - secrets and kills are single player accounting
+	if (hl_intermission && !hl_finale && HLCvarGet("deathmatch") != 0.0)
+	{
+		HLSbarDrawScoreboard(hl_canvas);
+	}
+	else
+	{
+		//the stat sheet reads cl.completed_time, frozen when the level ended
+		HLSbarIntermission(hl_canvas, hl_completed_time);
+	}
+
+	//sbar over everything, including the weapon. at intermission the overlay
+	//replaces it entirely.
+	if (!hl_intermission)
+	{
+		HLSbarTileClear(hl_canvas);
+		HLSbarDraw(hl_canvas);
+	}
+
+	//TAB deathmatch scoreboard (SCR_DrawScoreboard / Sbar_DeathmatchOverlay).
+	if (hl_scoreboard_show)
+		HLSbarDrawScoreboard(hl_canvas);
+
+	//console last, over the finished frame. closed, the notify lines still carry
+	//pickup messages and the messagemode prompt.
+	if (hl_state == HLST_CONSOLE)
+		HLConDraw(hl_canvas);
+	else
+		HLConDrawNotify(hl_canvas);
+}
+
+U0 HLCenterView(CTask *task)
+{//aspect-preserving fit, centred: raising the render resolution adds detail
+ //rather than shrinking the picture.
+	I64 w = task->pix_width;
+	I64 h = task->pix_height;
+	I64 cw;
+	I64 ch;
+
+	if (!hl_canvas)
+		return;
+
+	cw = hl_canvas->width;
+	ch = hl_canvas->height;
+
+	//Widest fit that still leaves the height inside the window.
+	hl_blit_w = w;
+	hl_blit_h = (w * ch) / cw;
+
+	if (hl_blit_h > h)
+	{
+		hl_blit_h = h;
+		hl_blit_w = (h * cw) / ch;
+	}
+
+	if (hl_blit_w < 1) hl_blit_w = 1;
+	if (hl_blit_h < 1) hl_blit_h = 1;
+
+	hl_blit_x = (w - hl_blit_w) / 2;
+	hl_blit_y = (h - hl_blit_h) / 2;
+}
+
+U0 HLApplyVideo()
+{//rebuild the render target and resize the window. the compositor reads the
+ //canvas through draw_it, so the same drain-before-free that teardown needs
+ //applies here, or a resolution change frees memory mid-blit.
+	CHLCanvas *old;
+	I64		  w = hl_res_w[hl_opt_res];
+	I64		  h = hl_res_h[hl_opt_res];
+
+	hl_ready     = FALSE;
+	Fs->draw_it = NULL;
+	Sleep(60);
+
+	old      = hl_canvas;
+	hl_canvas = NULL;
+	HLDrawFree(old);
+
+	hl_canvas = HLDrawNew(w, h);
+
+	//windowed sizes to the render target, landing close to 1:1.
+	if (hl_opt_fullscreen)
+		WinMax;
+	else
+	{
+		WinHorz(2, 2 + (w / FONT_WIDTH));
+		WinVert(2, 2 + (h / FONT_HEIGHT));
+	}
+
+	HLCenterView(Fs);
+
+	Fs->draw_it = &HLDrawIt;
+	hl_res_dirty = FALSE;
+}
+
+Bool HLLoadMap(U8 *mapname)
+{
+	I64 ent_count;
+	I64 mdl_count;
+	U8  line[256];
+
+	if (hl_vis)
+	{
+		HLVisFree(hl_vis);
+		hl_vis = NULL;
+	}
+	if (hl_map)
+	{
+		HLBSPFree(hl_map);
+		hl_map = NULL;
+	}
+
+	hl_map = HLBSPLoad(mapname);
+	if (!hl_map)
+		return FALSE;
+
+	HLStrCopy(hl_map_name, mapname, 96);
+
+	//Trail memory is keyed by edict number, which the next map reuses for
+	//entirely different entities.
+	HLPartTrailReset;
+
+	hl_vis = HLVisNew(hl_map);
+
+	//order matters - models resolve against the parsed list. not folded into one
+	//print: argument evaluation order would not guarantee the sequence.
+	ent_count = HLEntParse(hl_map);
+	mdl_count = HLEntLoadModels;
+
+	HLHeapCheck("after HLBSPLoad");
+
+	StrPrint(line, "map %s: %d entities, %d static models\n",
+		mapname, ent_count, mdl_count);
+	HLLog(line);
+
+	//makestatic and ambientsound write into sv.signon while the map's spawn
+	//functions run, so it has to be empty before the world comes up.
+	HLSvClearSignon;
+
+	//the stream carries its own baselines, updates and view state. bringing up
+	//QuakeC here spawns a second live world, player and all, and the two fight
+	//over every edict.
+	if (hl_demo_playing)
+	{
+		//a leftover world holds edicts and precache slots the demo's own
+		//numbering collides with.
+		HLGameShutdown;
+
+		HLNetStatesClear;
+		HLNetClientClear;
+	}
+
+	//Bring up the QuakeC world. If the bytecode is unavailable the game falls
+	//back to the static entity list, which still renders but never thinks.
+	else if (HLGameInit(hl_map))
+	{
+		StrPrint(line, "QuakeC: %d spawn functions ran, %d edicts live\n",
+			hl_game_spawned, hl_pr_num_edicts);
+		HLLog(line);
+
+		//baselines are SIGNON, not datagram: sent once after the spawn and before
+		//any update, because every later delta is measured from them.
+		HLNetStatesClear;
+		HLNetClientClear;
+
+		//the local player is client 0, in the same slot table as the remotes.
+		HLSvClientsClear;
+		HLSvAddClient(0, TRUE, hl_player_edict, hl_game_time);
+
+		HLMsgClear(&hl_net_send);
+
+		//identity into the signon buffer BEFORE the send, or the name and colours
+		//sit in a buffer nobody reads.
+		HLNetWriteIdentity(&hl_net_send, 0, hl_setup_name,
+			hl_setup_top, hl_setup_bottom);
+
+		//SV_CreateBaseline: once into sv.signon after the spawn, so every joiner
+		//replays the same bytes and deltas from the same reference.
+		HLNetWriteBaselines(&hl_sv_signon);
+		HLMsgAppendIfRoom(&hl_net_send, &hl_sv_signon, HLNET_MAX_MSG);
+
+		HLNetSendToClient(&hl_net_send);
+		HLNetClientFrame;
+
+		StrPrint(line, "net: %d baselines, %d bytes signon, name '%s'\n",
+			hl_net_num_ents, hl_net_send.len, hl_cl_name);
+		HLLog(line);
+	}
+	else
+		HLLog("QuakeC: FAILED to load - entities will be static\n");
+
+	//Hand the player to QuakeC. PutClientInServer chooses the spawn point, so
+	//hl_origin is replaced by whatever the game logic decided.
+	if (hl_game_active)
+	{
+		if (HLPlayerSpawn(hl_origin, hl_angles, hl_setup_name))
+		{
+			//slot state first - HLSvApplyClientColors resolves .colormap through
+			//the slot table, so the slot must already own the edict.
+			if (hl_sv_clients[0].active && hl_sv_clients[0].local)
+			{
+				hl_sv_clients[0].top    = hl_setup_top & 15;
+				hl_sv_clients[0].bottom = hl_setup_bottom & 15;
+				HLStrCopy(hl_sv_clients[0].name, hl_setup_name, 32);
+			}
+
+			//Shirt/trousers from the setup page - remotes see these via colormap.
+			HLSvApplyClientColors(hl_player_edict, hl_setup_top, hl_setup_bottom);
+
+			StrPrint(line, "player: edict %d, health %3.0f\n",
+				hl_player_edict, HLPlayerHealth);
+			HLLog(line);
+		}
+		else
+			HLLog("player: FAILED to spawn as a client\n");
+	}
+
+	//Flushed here, before the window opens, so the load report survives even
+	//if the game faults later.
+	HLLogFlush;
+	"HL1: %d entities, %d alias models\n", ent_count, mdl_count;
+
+	HLVecSet(hl_velocity, 0.0, 0.0, 0.0);
+	hl_on_ground = FALSE;
+
+	if (!HLEntFindPlayerStart(hl_map, hl_origin, hl_angles))
+	{
+		//no spawn point: centre of the world bounds, which is very likely inside
+		//geometry - noclip rather than trapped in a wall.
+		"HL1: no info_player_start, using model bounds (noclip on)\n";
+		hl_noclip = TRUE;
+		hl_origin[0] = (hl_map->models[0].mins[0] + hl_map->models[0].maxs[0]) * 0.5;
+		hl_origin[1] = (hl_map->models[0].mins[1] + hl_map->models[0].maxs[1]) * 0.5;
+		hl_origin[2] = (hl_map->models[0].mins[2] + hl_map->models[0].maxs[2]) * 0.5;
+		HLVecSet(hl_angles, 0.0, 0.0, 0.0);
+	}
+
+	//seed the unstick fallback - globals aren't zeroed.
+	HLVecCopy(hl_origin, hl_old_origin);
+
+	return TRUE;
+}
+
+#define HLSAVE_PATH	"HLSAVE1.SAV"
+
+Bool HLSaveGame()
+{//Quicksave. One slot: there is no save menu to pick others with.
+	return HLSaveWrite(HLSAVE_PATH, hl_map_name, hl_game_time, hl_origin,
+		hl_velocity, hl_angles, hl_on_ground, hl_water_level, hl_water_type);
+}
+
+Bool HLLoadGame()
+{//load the save's map, then pour the saved world into it. spawn functions are
+ //deliberately NOT run - the restore overwrites them anyway, and their side
+ //effects would linger on top of the restored state.
+	U8 mapname[96];
+	U8 line[160];
+
+	if (!HLSaveReadHeader(HLSAVE_PATH, mapname))
+		return FALSE;
+
+	HLGameShutdown;
+	HLEntFree;
+
+	if (hl_vis)
+	{
+		HLVisFree(hl_vis);
+		hl_vis = NULL;
+	}
+	if (hl_map)
+	{
+		HLBSPFree(hl_map);
+		hl_map = NULL;
+	}
+
+	if (!HLLoadMap(mapname))
+	{
+		StrPrint(line, "load: %s failed to load\n", mapname);
+		HLLog(line);
+		HLSaveDiscard;
+		return FALSE;
+	}
+
+	HLSvClearSignon;
+
+	if (!HLGameInit(hl_map, FALSE))
+	{
+		HLLog("load: progs.dat failed to come up\n");
+		HLSaveDiscard;
+		return FALSE;
+	}
+
+	if (!HLSaveRestore(&hl_game_time, hl_origin, hl_velocity, hl_angles,
+		&hl_on_ground, &hl_water_level, &hl_water_type))
+	{
+		HLLog("load: restore failed\n");
+		return FALSE;
+	}
+
+	//a restored world is a NEW world to the protocol - fresh baselines, or every
+	//entity deltas against a reference that no longer describes it.
+	HLNetStatesClear;
+	HLNetClientClear;
+	HLMsgClear(&hl_net_send);
+	HLNetWriteBaselines(&hl_sv_signon);
+	HLMsgAppendIfRoom(&hl_net_send, &hl_sv_signon, HLNET_MAX_MSG);
+	HLNetSendToClient(&hl_net_send);
+	HLNetClientFrame;
+
+	//Derived state that must agree with the restored origin.
+	HLVecCopy(hl_origin, hl_old_origin);
+	hl_world_warned = FALSE;
+	HLBiIntermissionClear;
+
+	//engine diagnostics to the LOG - Con_Printf feeds the notify lines, and that
+	//space belongs to the game's own messages, not to where the player spawned.
+	StrPrint(line, "load: %s at %.0f %.0f %.0f\n", mapname,
+		hl_origin[0], hl_origin[1], hl_origin[2]);
+	HLLog(line);
+	HLLogFlush;
+
+	return TRUE;
+}
+
+Bool HLPakMountOne(U8 *dir, I64 index)
+{//mount dir/pakN, trying BOTH cases. valve ships PAK0.PAK, but a mission pack
+ //dropped in by hand is usually pak0.pak and FileFind will not find the other
+	U8 pakname[64];
+
+	StrPrint(pakname, "::/Apps/HL1/%s/PAK%d.PAK", dir, index);
+	if (FileFind(pakname))
+		return HLPakMount(pakname);
+
+	StrPrint(pakname, "::/Apps/HL1/%s/pak%d.pak", dir, index);
+	if (FileFind(pakname))
+		return HLPakMount(pakname);
+
+	return FALSE;
+}
+
+U0 HLPakMountGame()
+{//COM_AddGameDirectory: valve first, then the mod on top. HLPakFind searches
+ //newest first, so a mod shadows by name - progs.dat included
+	I64	i;
+
+	if (!HLPakMountOne("valve", 0))
+		return;
+
+	i = 1;
+	while (i < HLPAK_MAX_PAKS && HLPakMountOne("valve", i))
+		i++;
+
+	if (!hl_game_dir[0])
+		return;
+
+	if (!HLPakMountOne(hl_game_dir, 0))
+	{
+		HLLog("gamedir: no pak0 in that directory\n");
+		return;
+	}
+
+	i = 1;
+	while (i < HLPAK_MAX_PAKS && HLPakMountOne(hl_game_dir, i))
+		i++;
+}
+
+Bool HLGameDirSwitch(U8 *dir)
+{//"game <dir>" with no restart
+ //
+ //EVERY lookup hands back a pointer INTO the archive - hl_pal_colormap is a
+ //pointer into gfx/colormap.lmp, and the wad art is the same - so nothing may
+ //still hold one when the paks go. drop the world, every cache, and the
+ //compositor, then remount and reload the art that lives in them
+	U8	line[96];
+
+	if (!dir)
+		return FALSE;
+
+	//the wm reads menu art straight out of the archives
+	hl_ready = FALSE;
+	Sleep(60);
+
+	HLDemoStop;
+	hl_demo_loop = FALSE;
+
+	//frees the precache, the external bsp and sprite caches, and the vm
+	HLGameShutdown;
+	HLEntFree;
+
+	HLSurfCacheFlush;
+	HLSurfCacheSetMap(NULL);
+
+	if (hl_vis)
+	{
+		HLVisFree(hl_vis);
+		hl_vis = NULL;
+	}
+	if (hl_map)
+	{
+		HLBSPFree(hl_map);
+		hl_map = NULL;
+	}
+
+	//the mixer borrows sample buffers on its own task, so it has to be quiet
+	//before the memory behind them goes
+	HLMusicFree;
+	HLSndFree;
+
+	HLMdlCacheFree;
+	HLMdlPreviewFree;
+
+	//the surface cache above held texel pointers into these, so they go after
+	//it and not before
+	HLWad3UnmountAll;
+	HLPakUnmountAll;
+
+	HLStrCopy(hl_game_dir, dir, 32);
+	HLWad3SetGameDir(hl_game_dir);
+	HLPakMountGame;
+
+	//no shareware Half-Life, so nothing to re-test on a gamedir switch
+	HLCvarSet("registered", 1.0);
+
+	if (!HLPalLoad)
+	{
+		HLLog("gamedir: palette missing, cannot continue\n");
+		return FALSE;
+	}
+
+	HLWadInit;
+	HLSbarInit;
+	HLMenuInit;
+
+	HLNetStatesClear;
+	HLNetClientClear;
+	HLBiFreePrecache;
+
+	hl_menu_ingame = FALSE;
+	hl_menu_page   = HLPAGE_MAIN;
+	hl_state       = HLST_MENU;
+	hl_map_name[0] = 0;
+
+	hl_ready = TRUE;
+
+	//no ternary in ZealC
+	if (dir[0])
+		StrPrint(line, "gamedir: now %s\n", dir);
+	else
+		StrPrint(line, "gamedir: now valve\n");
+	HLLog(line);
+	HLConPrint(line);
+	HLCfgSave;
+
+	return TRUE;
+}
+
+Bool HLChangeLevel(U8 *mapname)
+{//Tear the world down and bring up the next map, carrying the player's
+ //inventory across. Runs between frames, never inside a think.
+	U8  path[96];
+	U8  line[160];
+	I64 ci;
+
+	//svs survives SV_SpawnServer: connected players follow the server to the
+	//next map instead of being dropped
+	hl_sv_keep_clients = TRUE;
+
+	//Ask QuakeC to pack the inventory BEFORE anything is freed.
+	HLGameSaveParms;
+
+	HLGameShutdown;
+	HLEntFree;
+
+	if (hl_vis)
+	{
+		HLVisFree(hl_vis);
+		hl_vis = NULL;
+	}
+	if (hl_map)
+	{
+		HLBSPFree(hl_map);
+		hl_map = NULL;
+	}
+
+	//SCR_BeginLoadingPlaque: paint the plaque ONCE, before anything is freed,
+	//and leave it up for the whole load.
+	if (hl_canvas)
+	{
+		HLDrawClear(hl_canvas, 0);
+		if (hl_pic_conback.pixels)
+			HLPicDrawFill(hl_canvas, &hl_pic_conback);
+		HLSbarLoadingPlaque(hl_canvas);
+		hl_loading = TRUE;
+	}
+
+	//QuakeC passes a bare map name; the archive stores full paths.
+	if (!StrNICompare(mapname, "maps/", 5))
+		HLStrCopy(path, mapname, 96);
+	else
+		StrPrint(path, "maps/%s.bsp", mapname);
+
+	if (!HLLoadMap(path))
+	{
+		hl_sv_keep_clients = FALSE;
+		hl_loading = FALSE;
+		StrPrint(line, "changelevel: %s failed to load\n", path);
+		HLLog(line);
+		return FALSE;
+	}
+
+	hl_sv_keep_clients = FALSE;
+	hl_loading = FALSE;
+
+	//stale velocity keeps shoving the player, and a stale water level swims the
+	//move code on dry land.
+	HLVecSet(hl_velocity, 0.0, 0.0, 0.0);
+	hl_water_level  = 0;
+	hl_water_type   = 0;
+	hl_on_ground    = FALSE;
+	hl_world_warned = FALSE;
+
+	//NO SECOND SPAWN - HLLoadMap already ran SetNewParms, ClientConnect and
+	//PutClientInServer for this level. colours still need reapplying: the slot
+	//table was rebuilt.
+	if (hl_game_active)
+	{
+		HLSvApplyClientColors(hl_player_edict, hl_setup_top, hl_setup_bottom);
+		if (hl_sv_clients[0].active && hl_sv_clients[0].local)
+		{
+			hl_sv_clients[0].top    = hl_setup_top & 15;
+			hl_sv_clients[0].bottom = hl_setup_bottom & 15;
+			HLStrCopy(hl_sv_clients[0].name, hl_setup_name, 32);
+		}
+	}
+
+	//SV_SpawnServer's tail: every connected client is sent the new serverinfo
+	//and put back to signon 1, so it reloads and walks prespawn/spawn/begin
+	//again. without it a changelevel moved the host alone and left the guests
+	//standing in a world the server no longer has
+	if (hl_udp_ready && hl_udp_server)
+	{
+		for (ci = 0; ci < HLSV_MAX_CLIENTS; ci++)
+		{
+			if (!hl_sv_clients[ci].active || hl_sv_clients[ci].local)
+				goto qcl_next_client;
+
+			//the edict was reserved fresh by HLLoadMap, so the slot has to
+			//point at the new one before setview names it
+			hl_sv_clients[ci].edict   = ci + 1;
+			hl_sv_clients[ci].spawned = FALSE;
+			hl_sv_clients[ci].signon  = 0;
+
+			//identity and colours travel again - the scoreboard was rebuilt
+			hl_sv_clients[ci].sent_ident = FALSE;
+
+			HLNetSendServerInfo(ci);
+
+qcl_next_client:
+		}
+	}
+
+	//The previous map's origin is meaningless here, and the unstick fallback
+	//drags the player back to it otherwise.
+	HLVecCopy(hl_origin, hl_old_origin);
+
+	StrPrint(line, "changelevel: spawned at %.0f %.0f %.0f\n",
+		hl_origin[0], hl_origin[1], hl_origin[2]);
+	HLLog(line);
+
+	//log only - the original prints nothing to the player on a level change.
+	StrPrint(line, "changelevel -> %s\n", path);
+	HLLog(line);
+	HLLogFlush;
+
+	return TRUE;
+}
+
+U0 HLClientPrecacheRebuild()
+{//CL_ParseServerInfo precache resolution, deferred until after the map load it
+ //depends on. replayed IN WIRE ORDER, so every modelindex and sound number
+ //lands on the entry it meant on the server.
+	U8	*name;
+	I64	 j;
+
+	HLBiFreePrecache;
+
+	//slot 0 is no model; slot 1 is the map, already loaded - resolving it through
+	//the external-BSP cache would load the whole map twice.
+	hl_precache_model[0]    = NULL;
+	hl_precache_mdl[0]      = NULL;
+	hl_precache_model_count = 1;
+
+	for (j = 0; j < hl_cl_model_count; j++)
+	{
+		name = hl_cl_model_names + j * HLCL_PRECACHE_NAME;
+		if (j == 0)
+		{
+			HLStrCopy(hl_world_model_name, name, 96);
+			hl_precache_model[1] = hl_world_model_name;
+			hl_precache_mdl[1]   = NULL;
+			hl_precache_model_count = 2;
+		}
+		else
+			HLBiPrecacheModel(name);
+	}
+
+	for (j = 0; j < hl_cl_sound_count; j++)
+		hl_precache_sound[j] = hl_cl_sound_names + j * HLCL_PRECACHE_NAME;
+	hl_precache_sound_count = hl_cl_sound_count;
+
+	StrPrint(hl_join_line, "client: %d models, %d sounds precached\n",
+		hl_precache_model_count, hl_precache_sound_count);
+	HLLog(hl_join_line);
+}
+
+U0 HLInputDrain()
+{//consume queued key messages.
+ //
+ //input is read as raw state through kbd.down_bitmap, so MessageGet is never
+ //called and a session's worth of KEY_DOWN/UP pairs piles up. on return the
+ //terminal drains that backlog AS TYPED INPUT and the shell hands the garbage
+ //to the compiler - that is the fault inside ExeCmdLine.
+ //
+ //bounded: a frame should never hold many, and a runaway loop here would hang
+ //the game rather than crash it later.
+	I64 ch;
+	I64 sc;
+	I64 guard = 0;
+
+	while (guard < 64 && KeyScan(&ch, &sc))
+		guard++;
+}
+
+U0 HLInputDrainAll()
+{//the same drain for EXIT, where it has to finish the job.
+ //
+ //the frame loop's cap of 64 clears a rounding error against a session's
+ //backlog. drain until the queue reports empty, with a ceiling far above any
+ //real backlog so a broken queue cannot spin forever, and repeat because
+ //messages can still be posted between passes.
+	I64 ch;
+	I64 sc;
+	I64 guard;
+	I64 pass;
+
+	for (pass = 0; pass < 4; pass++)
+	{
+		guard = 0;
+		while (guard < 65536 && KeyScan(&ch, &sc))
+			guard++;
+
+		//Nothing left on this pass means nothing is still arriving.
+		if (!guard)
+			break;
+
+		//Let anything mid-post land before the next sweep.
+		Sleep(10);
+	}
+}
+
+//accumulator for the UI-frozen server tick. separate from the frame loop's
+//own, which does not advance while the menu is up
+F64 hl_host_ui_accum = 0.0;
+
+U0 HLSvHostTickInit()
+{//globals aren't zeroed
+	hl_host_ui_accum = 0.0;
+}
+
+U0 HLSvHostTick(F64 dt)
+{//Host_Frame runs Host_ServerFrame whenever sv.active. key_dest decides where
+ //INPUT goes and what gets drawn, never whether the world runs - so a host
+ //sitting in the menu or the console must keep serving its clients.
+ //
+ //no local input here on purpose: the player is not holding a movement key,
+ //they are navigating a menu, and CL_SendCmd builds an empty move in that
+ //state anyway
+	I64 steps = 0;
+	I64 k;
+	F64 nomove[3];
+
+	//sv.active is the ONLY condition. Host_Frame does not ask whether anyone
+	//is connected, and single player does not pause either - you can be killed
+	//while sitting in the menu. gating this on hl_udp_server also made it
+	//depend on a flag set at host time, so a menu opened before that stuck
+	if (!hl_game_active)
+		return;
+
+	//a demo is not a server. the stream owns the world and the demo pump
+	//already advances it
+	if (hl_demo_playing)
+		return;
+
+	hl_host_ui_accum += dt;
+
+	HLVecSet(nomove, 0.0, 0.0, 0.0);
+
+	while (hl_host_ui_accum >= HLSERVER_STEP && steps < HLSERVER_MAX_CATCHUP)
+	{
+		//THE LOCAL PLAYER IS A CLIENT EDICT AND STILL NEEDS ITS SERVER FRAME.
+		//SV_Physics runs SV_Physics_Client for every client, so vanilla drops
+		//you out of a jump and drowns you while the menu is up. HLGameFrame
+		//only covers the WORLD - the local move lives in the frame loop, which
+		//the menu skips, so the player hung in the air while game time and
+		//QuakeC carried on around them
+		if (hl_game_active && hl_player_edict > 0)
+		{
+			HLDropPunchAngle(hl_player_edict, HLSERVER_STEP);
+
+			//empty move: no direction, no jump, no attack, no impulse. this is
+			//the move CL_SendCmd builds when the menu owns the keyboard
+			HLPlayerPreThink(hl_origin, hl_velocity, hl_angles, hl_on_ground,
+				FALSE, FALSE, 0);
+
+			if (!hl_noclip && HLPlayerWalking)
+				HLPlayerMove(hl_map, hl_origin, hl_velocity, nomove, 0.0,
+					FALSE, HLSERVER_STEP, &hl_on_ground, hl_water_level,
+					HLPlayerWaterJump(hl_velocity, hl_game_time), hl_angles,
+					hl_player_edict);
+
+			for (k = 0; k < 3; k++)
+				HLPrSetFieldF(hl_player_edict, hl_fld_origin + k, hl_origin[k]);
+		}
+
+		HLGameFrame(HLSERVER_STEP);
+
+		if (hl_game_active && hl_player_edict > 0)
+		{
+			for (k = 0; k < 3; k++)
+				hl_origin[k] = HLPrFieldF(hl_player_edict, hl_fld_origin + k);
+
+			HLPlayerTouchTriggers(hl_origin, hl_velocity);
+			HLPlayerPostThink(hl_origin, hl_velocity, hl_angles,
+				hl_on_ground, hl_water_level, hl_water_type);
+			HLSvRunEntityThink(hl_player_edict);
+		}
+
+		//READ BEFORE RUNNING THEM. NET_Poll is unconditional in Host_Frame -
+		//it is not part of the client's own frame. this call is the only place
+		//a remote's clc_move is parsed, and the menu skipped it, so the host
+		//kept SENDING the world (guests saw everything moving) while every
+		//guest input was dropped on the floor and they could not move
+		HLNetServerReadClient(hl_player_edict, hl_game_time);
+
+		HLSvRunClients(HLSERVER_STEP, hl_game_time);
+		HLNetServerFrame(hl_player_edict, hl_game_time);
+
+		hl_host_ui_accum -= HLSERVER_STEP;
+		steps++;
+	}
+
+	//a long pause in the menu must not bank frames and then fast forward
+	if (hl_host_ui_accum > HLSERVER_STEP)
+		hl_host_ui_accum = 0.0;
+
+}
+
+U0 HLGameLoop()
+{
+	F64  forward[3];
+	F64  right[3];
+	F64  up[3];
+	F64  move[3];
+	F64  speed;
+	F64  net_fwd;
+	F64  net_side;
+	F64  now;
+	F64  last;
+	F64  dt;
+	F64  fps_time;
+
+	I64  sc_tilde	= Char2ScanCode('`');
+	I64  sc_minus	= Char2ScanCode('-');
+	I64  sc_equals	= Char2ScanCode('=');
+	I64  sc_y		= Char2ScanCode('y');
+	I64  sc_u		= Char2ScanCode('u');
+	I64  dx;
+	I64  dy;
+	I64  fps_frames   = 0;
+	I64  impulse      = 0;
+	I64  impulse_down = 0;	//number key held this frame, 0 = none
+	I64  impulse_last = 0;	//and the previous frame, for the edge
+	I64  i            = 0;
+	I64  menu_sc      = 0;
+	I64  last_menu_sc = 0;
+	Bool attack       = FALSE;
+	Bool esc_held     = FALSE;
+	Bool start_game   = FALSE;
+	Bool tilde_held   = FALSE;
+	I64  wheel_dz     = 0;
+	Bool save_held    = FALSE;
+	Bool size_held    = FALSE;
+	Bool load_held    = FALSE;
+	Bool hl_load_request = FALSE;
+	F64  srv_accum    = 0.0;
+	I64  srv_steps    = 0;
+
+	//Game time comes from the kernel tick, not from frame timing.
+	last     = ToF64(counts.jiffies) / ToF64(JIFFY_FREQ);
+	fps_time = last;
+
+	while (TRUE)
+	{
+		now  = ToF64(counts.jiffies) / ToF64(JIFFY_FREQ);
+		dt   = now - last;
+		last = now;
+
+		//A long stall (first frame, or a map load) must not launch the camera.
+		if (dt > 0.1)
+			dt = 0.1;
+
+		//FIRST, before any state branch gotos past them - the menu path is
+		//exactly where they are requested.
+		if (hl_res_dirty)
+			HLApplyVideo;
+
+		//Keep the message queue empty. Left to accumulate, the shell replays
+		//the whole session's keystrokes as a command line on exit.
+		HLInputDrain;
+
+		//--- F2 saves, F3 loads: one slot, so bound straight to the keys ---
+		//--- viewsize: default.cfg binds "-" to sizedown and "=" to sizeup ---
+		//
+		//SCR_SizeUp_f / SCR_SizeDown_f step by 10, clamped to 30..120. at 110
+		//the inventory row goes, at 120 the whole status bar does.
+		//
+		//only while the keyboard belongs to the GAME - typing an underscore in
+		//the console must not resize the screen.
+		if (hl_state == HLST_CONSOLE || hl_msg_mode || hl_state == HLST_MENU)
+			size_held = TRUE;		//swallow the edge, act on nothing
+		else if (Bt(kbd.down_bitmap, sc_minus))
+		{
+			if (!size_held)
+			{
+				size_held = TRUE;
+				HLCvarSet("viewsize", HLCvarGet("viewsize") - 10.0);
+				if (HLCvarGet("viewsize") < 30.0)
+					HLCvarSet("viewsize", 30.0);
+			}
+		}
+		else if (Bt(kbd.down_bitmap, sc_equals))
+		{
+			if (!size_held)
+			{
+				size_held = TRUE;
+				HLCvarSet("viewsize", HLCvarGet("viewsize") + 10.0);
+				if (HLCvarGet("viewsize") > 120.0)
+					HLCvarSet("viewsize", 120.0);
+			}
+		}
+		else
+			size_held = FALSE;
+
+		if (Bt(kbd.down_bitmap, SC_F2))
+		{
+			if (!save_held)
+			{
+				save_held = TRUE;
+				if (hl_game_active)
+					HLSaveGame;
+			}
+		}
+		else
+			save_held = FALSE;
+
+		if (Bt(kbd.down_bitmap, SC_F3))
+		{
+			if (!load_held)
+			{
+				load_held = TRUE;
+				//Deferred: reloading tears down the world, and this runs
+				//between frames rather than inside one.
+				hl_load_request = TRUE;
+			}
+		}
+		else
+			load_held = FALSE;
+
+		//The Single Player menu page cannot call these itself: HLMenu.ZC
+		//compiles before both, and loading tears the world down mid-frame.
+		if (hl_menu_save_req)
+		{
+			hl_menu_save_req = FALSE;
+			if (hl_game_active)
+				HLSaveGame;
+		}
+
+		if (hl_menu_load_req)
+		{
+			hl_menu_load_req = FALSE;
+			hl_load_request  = TRUE;
+		}
+
+		if (hl_load_request)
+		{
+			hl_load_request = FALSE;
+			HLLoadGame;
+			goto ql_next_frame;
+		}
+
+		//--- joining: the network runs OUTSIDE the in-game tick ---
+		//
+		//an unjoined client sits in the menu, where the tick never runs. the
+		//request repeats because a datagram can simply be lost.
+		//
+		//keep poking the host while the map loads, or last_msg goes stale and
+		//the host's timeout kills the body mid-join.
+		if (hl_udp_ready && !hl_udp_server &&
+			(!hl_menu_ingame || hl_change_pending || !hl_game_active))
+		{
+			if (tS - hl_join_last_try > 1.0)
+			{
+				hl_join_last_try = tS;
+
+				if (!HLNetUdpPeerResolved)
+					HLNetUdpArpProbe;
+
+				HLNetClientSendConnect(hl_setup_name, hl_setup_top, hl_setup_bottom);
+			}
+
+			HLNetClientFrame;
+		}
+
+		//Host_Frame calls CL_ReadFromServer unconditionally: the console and
+		//menu states skip the frame tail, so pump here.
+		if (hl_demo_playing)
+		{
+			//map FIRST: everything after svc_serverinfo describes that world,
+			//and the changelevel would clear tables filled before it.
+			if (hl_change_pending)
+			{
+				hl_change_pending = FALSE;
+				if (HLChangeLevel(hl_change_map))
+					HLClientPrecacheRebuild;
+				else
+				{
+					HLLog("demo: level failed to load, stopping\n");
+					hl_demo_loop = FALSE;
+					HLDemoStop;
+				}
+			}
+
+			HLNetClientFrame;
+
+			//track the view entity here too - the tick is skipped with the
+			//menu open, and the world still renders behind it.
+			if (hl_demo_playing)
+			{
+				if (hl_cl_viewent > 0 && hl_cl_viewent < HLNET_MAX_ENTS)
+					HLVecCopy(hl_net_cl[hl_cl_viewent].origin, hl_origin);
+				HLVecCopy(hl_demo_angles, hl_angles);
+			}
+
+			//a finished demo leaves a map with no QuakeC and no stream behind
+			//it - go back to the menu the attract loop came from.
+			if (!hl_demo_playing && !hl_game_active)
+			{
+				//a changelevel the dead stream asked for must die with it, or
+				//the frame tail loads it as a REAL game.
+				hl_change_pending = FALSE;
+
+				hl_menu_ingame = FALSE;
+				hl_menu_page   = HLPAGE_MAIN;
+				hl_state       = HLST_MENU;
+			}
+		}
+
+		//The server named a level: load it, then continue stock signon
+		//(prespawn -> spawn -> begin). Do NOT enter play until signon 4.
+		if (hl_net_join_pending)
+		{
+			hl_net_join_pending = FALSE;
+
+			//same again: a level named by a dead stream must not fall through
+			//to the ordinary changelevel service, which spawns a live player.
+			if (hl_demo_playing || (hl_udp_ready && !hl_udp_server))
+			{
+				//HLGameLoop has no scratch line buffer of its own, so build the
+				//message in the join buffer's scratch.
+				if (hl_demo_playing)
+					StrPrint(hl_join_line, "demo: %s, level %s\n",
+						hl_demo_name, hl_net_join_map);
+				else
+					StrPrint(hl_join_line, "net: joining, server level %s\n",
+						hl_net_join_map);
+				HLLog(hl_join_line);
+
+				//stream and live server both name the level in svc_serverinfo.
+				//M_Draw keeps the menu over the attract loop, so only a LIVE
+				//join forces the view to the world.
+				HLStrCopy(hl_change_map, hl_net_join_map, 64);
+				hl_change_pending = TRUE;
+				hl_menu_ingame    = TRUE;
+				if (!hl_demo_playing || hl_state != HLST_MENU)
+					hl_state = HLST_PLAYING;
+			}
+		}
+
+		//--- tilde drops the console, as in the original ---
+		if (Bt(kbd.down_bitmap, sc_tilde))
+		{
+			if (!tilde_held)
+			{
+				tilde_held = TRUE;
+
+				//Con_ToggleConsole_f opens from ANY key_dest, menu included.
+				//closing goes back to the game when connected, else the menu.
+				if (hl_state == HLST_CONSOLE)
+				{
+					if (hl_menu_ingame)
+						hl_state = HLST_PLAYING;
+					else
+					{
+						hl_state     = HLST_MENU;
+						hl_menu_page = HLPAGE_MAIN;
+					}
+				}
+				else
+				{
+					hl_state = HLST_CONSOLE;
+
+					//Clear edge state, or keys held as the console opens
+					//register as fresh presses.
+					HLConInputReset;
+				}
+			}
+		}
+		else
+			tilde_held = FALSE;
+
+		//--- messagemode (Y) / messagemode2 (U); TAB scoreboard ---
+		hl_scoreboard_show = FALSE;
+		if (hl_state == HLST_PLAYING && !hl_msg_mode)
+		{
+			//HLConKeyEdge so the opening press is not typed into the chat.
+			if (HLConKeyEdge(sc_y))
+				HLMsgModeBegin(FALSE);
+			else if (HLConKeyEdge(sc_u))
+				HLMsgModeBegin(TRUE);
+
+			if (Bt(kbd.down_bitmap, SC_TAB))
+				hl_scoreboard_show = TRUE;
+		}
+
+		//--- ESC toggles the menu; quitting is a menu choice ---
+		if (Bt(kbd.down_bitmap, SC_ESC))
+		{
+			if (!esc_held)
+			{
+				esc_held = TRUE;
+
+				//arriving at a menu page sets m_entersound, which M_Draw plays
+				//as misc/menu2.wav - backing out is not silent.
+				if (hl_msg_mode)
+					HLMsgModeCancel;
+				else if (hl_state == HLST_PLAYING)
+				{
+					hl_state = HLST_MENU;
+					HLMenuSound(HLMSND_ENTER);
+				}
+				else if (hl_state == HLST_CONSOLE)
+				{
+					//Key_Console passes ESC straight to M_ToggleMenu_f.
+					hl_state     = HLST_MENU;
+					hl_menu_page = HLPAGE_MAIN;
+					HLMenuSound(HLMSND_ENTER);
+				}
+				else if (hl_menu_page != HLPAGE_MAIN)
+				{
+					hl_menu_page = HLPAGE_MAIN;	//back out of a submenu first
+					HLMenuSound(HLMSND_ENTER);
+				}
+				else if (hl_menu_ingame)
+					hl_state = HLST_PLAYING;
+			}
+		}
+		else
+			esc_held = FALSE;
+
+		//--- console: typing owns the keyboard, world keeps running ---
+		if (hl_state == HLST_CONSOLE)
+		{
+			HLConInput;
+
+			if (hl_con_want_noclip)
+			{
+				hl_noclip = !hl_noclip;
+				HLVecSet(hl_velocity, 0.0, 0.0, 0.0);
+				hl_con_want_noclip = FALSE;
+			}
+
+			//Console requests that touch app-shell state, applied here because
+			//this file is compiled after the console.
+			if (hl_con_fov_want != 0.0)
+			{
+				hl_fov          = hl_con_fov_want;
+				hl_con_fov_want = 0.0;
+			}
+
+			if (hl_con_want_save)
+			{
+				hl_con_want_save = FALSE;
+				hl_con_save_ok   = HLSaveGame;
+			}
+
+			if (hl_con_want_load)
+			{
+				hl_con_want_load = FALSE;
+				hl_load_request  = TRUE;
+			}
+
+			if (hl_con_want_quit)
+				break;
+
+			//NO early-out: jumping to the next frame skips the server tick,
+			//which stops the WORLD and every remote client with it -
+			//HLSvRunClients and HLNetServerFrame both live in that tick. the
+			//local player is held still by the input gate below instead.
+		}
+
+		//--- console opened from the MENU: no world to render behind it ---
+		//
+		//HLRenderFrame draws the console at its tail and needs a map. from the
+		//title screen there is none, so the menu art stands in as the backdrop.
+		if (hl_state == HLST_CONSOLE && !hl_menu_ingame)
+		{
+			HLMenuDraw(hl_canvas);
+			HLConDraw(hl_canvas);
+			HLCenterView(Fs);
+			hl_ready = TRUE;
+
+			//the console owns the keyboard, not the server
+			HLSvHostTick(dt);
+
+			LBts(&Fs->task_flags, TASKf_IDLE);
+			Yield;
+			LBtr(&Fs->task_flags, TASKf_IDLE);
+			goto ql_next_frame;
+		}
+
+		//--- menu: no LOCAL simulation. the server still runs, see HLSvHostTick
+		if (hl_state == HLST_MENU)
+		{
+			menu_sc = 0;
+			if (Bt(kbd.down_bitmap, SC_CURSOR_UP))		menu_sc = SC_CURSOR_UP;
+			if (Bt(kbd.down_bitmap, SC_CURSOR_DOWN))	menu_sc = SC_CURSOR_DOWN;
+			if (Bt(kbd.down_bitmap, SC_CURSOR_LEFT))	menu_sc = SC_CURSOR_LEFT;
+			if (Bt(kbd.down_bitmap, SC_CURSOR_RIGHT))	menu_sc = SC_CURSOR_RIGHT;
+			if (Bt(kbd.down_bitmap, SC_ENTER))			menu_sc = SC_ENTER;
+
+			//The name editor polls the keyboard itself, so it runs before the
+			//scancode dispatch and swallows the frame when it is active.
+			HLSetupInput;
+			HLLanInput;
+
+			//Edge trigger, or a held arrow runs the whole list.
+			if (menu_sc && menu_sc != last_menu_sc && !hl_setup_editing &&
+				!hl_lan_editing)
+			{
+				if (HLMenuKey(menu_sc, &start_game))
+				{
+					if (start_game)
+					{
+						//cls.demonum = -1: any choice cancels the attract
+						//loop, and the demo stops before the world it was
+						//driving is replaced.
+						HLDemoStop;
+						hl_demo_loop = FALSE;
+
+						hl_menu_ingame = TRUE;
+						hl_state       = HLST_PLAYING;
+					}
+				}
+			}
+			last_menu_sc = menu_sc;
+
+			//multiplayer new game: the map must restart so items spawn with
+			//deathmatch already active - flipping it on a live level leaves the
+			//existing ones wrong.
+			if (hl_mp_start_dm)
+			{
+				//cls.demonum = -1. the attract loop owns the world until
+				//something else claims it, and it must be dropped BEFORE the
+				//map switch or the demo pump keeps serving its own changelevels
+				//over the top of the new game.
+				HLDemoStop;
+				hl_demo_loop = FALSE;
+
+				//the menu already queued the map switch - this only has to leave
+				//the menu so the frame loop services it.
+				hl_mp_start_dm = FALSE;
+				hl_menu_ingame = TRUE;
+				hl_state       = HLST_PLAYING;
+			}
+
+			if (hl_quit_request)
+				break;
+
+			//render the frozen world first, so HLMenuBackdrop has something to
+			//dither over.
+			if (hl_menu_ingame && hl_map && hl_vis)
+				HLRenderFrame;
+
+			HLMenuDraw(hl_canvas);
+			HLCenterView(Fs);
+			hl_ready = TRUE;
+
+			//a menu on the host must not freeze the guests
+			HLSvHostTick(dt);
+
+			LBts(&Fs->task_flags, TASKf_IDLE);
+			Yield;
+			LBtr(&Fs->task_flags, TASKf_IDLE);
+			goto ql_next_frame;
+		}
+
+		//--- mouse: read deltas AND the wheel before the reset clears them ---
+		//
+		//drained even while typing, or they pile up and lurch the view the
+		//moment the console closes.
+		dx = mouse_hard.raw_data.x;
+		dy = mouse_hard.raw_data.y;
+
+		//wheel is raw_data.z, already a per-frame delta. mouse.pos.z is not
+		//usable - raw mode never updates it.
+		wheel_dz = mouse_hard.raw_data.z;
+
+		//FIRE is the latch OR the level, and it needs both.
+		//
+		//raw_bttns only reads set on a frame where the mouse sent a packet, and
+		//a PS/2 mouse sends nothing while a button is held still - on its own,
+		//holding fire registers only while also moving.
+		//
+		//bttns is the LEVEL, but the kernel only maintains it in raw mode with
+		//the accompanying Mouse.ZC change - FALSE forever on an older build.
+		//either source, and neither can false-positive: the level is cleared on
+		//entry below.
+		attack = ToBool(mouse_hard.raw_bttns[0] || mouse_hard.bttns[0]);
+
+		MouseRawReset;
+
+		//Typing owns the keyboard and mouse: the player holds still, but the
+		//server keeps running for everyone else.
+		if (hl_state != HLST_PLAYING || hl_msg_mode)
+		{
+			dx       = 0;
+			dy       = 0;
+			wheel_dz = 0;
+			attack   = FALSE;
+		}
+
+		//V_CalcIntermissionRefdef reads the parked entity's angles every frame,
+		//so the mouse has no say until play resumes.
+		if (hl_intermission)
+		{
+			dx = 0;
+			dy = 0;
+		}
+
+		//m_pitch carries invert in its sign, as the original does; magnitude is
+		//the sensitivity slider's job.
+		hl_angles[1] -= ToF64(dx) * hl_opt_sensitivity;
+		if (HLCvarGet("m_pitch") < 0.0)
+			hl_angles[0] -= ToF64(dy) * hl_opt_sensitivity;
+		else
+			hl_angles[0] += ToF64(dy) * hl_opt_sensitivity;
+
+		if (hl_angles[0] > HLPITCH_LIMIT)
+			hl_angles[0] = HLPITCH_LIMIT;
+		if (hl_angles[0] < -HLPITCH_LIMIT)
+			hl_angles[0] = -HLPITCH_LIMIT;
+
+		hl_angles[1] = HLAngleNorm(hl_angles[1]);
+
+		//weapon select. EDGE TRIGGERED - an impulse is a one-shot, not a state:
+		//CL_SendMove zeroes in_impulse straight after transmitting it, and
+		//resending makes the cycle impulses unusable.
+		impulse      = 0;
+		impulse_down = 0;
+
+		for (i = 1; i <= 8; i++)
+		{
+			if (Bt(kbd.down_bitmap, Char2ScanCode('0' + i)))
+			{
+				impulse_down = i;
+				if (i != impulse_last)
+					impulse = i;
+			}
+		}
+
+		impulse_last = impulse_down;
+
+		//wheel cycles weapons through the game's own impulses: 10 next, 12
+		//previous. the original predates the convention and binds no wheel.
+		if (wheel_dz > 0)
+			impulse = 10;
+		else if (wheel_dz < 0)
+			impulse = 12;
+
+
+
+		//--- movement wish direction ---
+		HLAngleVectors(hl_angles, forward, right, up);
+		HLVecSet(move, 0.0, 0.0, 0.0);
+		//Stock clc_move shorts are view-relative (forwardmove/sidemove/upmove).
+		net_fwd  = 0.0;
+		net_side = 0.0;
+
+		//messagemode and the console both own the keyboard - no walk while
+		//typing. The world still ticks; only this player's input is dropped.
+		if (hl_msg_mode || hl_state == HLST_CONSOLE)
+		{
+			if (hl_msg_mode)
+				HLMsgModeInput;
+			impulse = 0;
+			attack  = FALSE;
+		}
+		//a dead player has no input. SV_ClientThink bails before the move:
+		//    if (movetype == MOVETYPE_NONE) return;
+		//    if (health <= 0) return;
+		else if (hl_game_active && HLPlayerFrozen)
+		{
+			//MOVEMENT only - PlayerDeathThink waits on a button release then a
+			//press to respawn, so swallowing attack here means dead forever.
+			//SV_ClientThink returns before the move, but after the buttons.
+			impulse = 0;
+		}
+		else
+		{
+			if (Bt(kbd.down_bitmap, hl_bind_key[HLBIND_FORWARD]))
+			{
+				HLVecAdd(move, forward, move);
+				net_fwd += 1.0;
+			}
+			if (Bt(kbd.down_bitmap, hl_bind_key[HLBIND_BACK]))
+			{
+				HLVecSub(move, forward, move);
+				net_fwd -= 1.0;
+			}
+			if (Bt(kbd.down_bitmap, hl_bind_key[HLBIND_RIGHT]))
+			{
+				HLVecAdd(move, right, move);
+				net_side += 1.0;
+			}
+			if (Bt(kbd.down_bitmap, hl_bind_key[HLBIND_LEFT]))
+			{
+				HLVecSub(move, right, move);
+				net_side -= 1.0;
+			}
+		}
+
+		//cl_forwardspeed IS the always-run setting - no separate flag. shift is
+		//the speed key and swaps whichever way it is set.
+		speed = HLCvarGet("cl_forwardspeed");
+		if (speed < HLMOVE_SPEED)
+			speed = HLMOVE_SPEED;
+
+		if (Bt(kbd.down_bitmap, SC_SHIFT))
+		{
+			if (speed >= HLMOVE_FAST)
+				speed = HLMOVE_SPEED;
+			else
+				speed = HLMOVE_FAST;
+		}
+
+		if (hl_noclip)
+		{
+			//Free flight, for getting unstuck and inspecting geometry.
+			HLVecSet(hl_velocity, 0.0, 0.0, 0.0);
+			if (HLVecLength(move) > 0.0)
+			{
+				HLVecNormalize(move);
+				HLVecMA(hl_origin, speed * dt, move, hl_origin);
+			}
+		}
+		else
+		{
+			hl_water_level = HLWaterLevelGet(hl_map, hl_origin, &hl_water_type);
+			HLPlayerWater(hl_water_level, hl_water_type);
+
+			//flatten the wish out of water, or looking up drives into the floor.
+			//swimming keeps z, which is the lift.
+			if (hl_water_level < 2)
+				move[2] = 0.0;
+
+			if (HLVecLength(move) > 0.0)
+				HLVecNormalize(move);
+		}
+
+		//a console impulse lands AFTER the suppression above: Host_Impulse_f
+		//queues it whatever key_dest is, and typing the command necessarily
+		//leaves the console open on that frame.
+		if (hl_con_impulse_want)
+		{
+			impulse            = hl_con_impulse_want;
+			hl_con_impulse_want = 0;
+		}
+
+		//console heapcheck 1 only - the sweep walks every live allocation.
+		if (hl_heap_check_on && tS - hl_heap_check_last > 1.0)
+		{
+			hl_heap_check_last = tS;
+			StrPrint(hl_heap_check_line, "in game f%d", hl_frame_count);
+			HLHeapCheck(hl_heap_check_line);
+		}
+
+		//--- server frames at a FIXED rate ---
+		//
+		//the server steps at a fixed interval, rendering runs free. driving
+		//PreThink, the move and PostThink at render rate over-runs everything by
+		//nearly 3x. catch-up is capped, or a stall fires a burst at once.
+		//
+		//the log below runs from the FRAME loop, not the tick, so it still
+		//reports when the tick itself is being gated.
+		if (hl_net_active && hl_udp_server && tS - hl_tick_log_last > 1.0)
+		{
+			hl_tick_log_last = tS;
+
+			if (hl_tick_log_n < 120)
+			{
+				hl_tick_log_n++;
+
+				StrPrint(hl_tick_line,
+					"tick: state %d act %d self %d rem %d org(%.0f %.0f) "
+					"mv(%.0f %.0f) sig %d\n",
+					hl_state, HLSvFlagI(hl_game_active), hl_player_edict,
+					hl_sv_clients[1].edict,
+					hl_sv_clients[1].origin[0], hl_sv_clients[1].origin[1],
+					hl_sv_clients[1].cmd[0], hl_sv_clients[1].cmd[1],
+					hl_sv_clients[1].signon);
+				HLLog(hl_tick_line);
+				HLLogFlush;
+			}
+		}
+
+		srv_accum += dt;
+		srv_steps  = 0;
+
+		while (srv_accum >= HLSERVER_STEP && srv_steps < HLSERVER_MAX_CATCHUP)
+		{
+			//a teleport or a door can leave the player embedded, and the slide
+			//move alone never recovers from it. HLCheckStuck traces before
+			//HLPlayerMove has set the pass entity, so set one here.
+			hl_move_pass = hl_player_edict;
+
+			if (!hl_noclip && hl_map)
+				HLCheckStuck(hl_map, hl_origin);
+
+
+			//DEMO PLAYBACK OWNS THE FRAME: no input, no move, no think.
+			//vanilla has no prediction either - V_CalcRefdef puts the view on
+			//cl_entities[cl.viewentity], and the angles are the three floats
+			//recorded beside every demo message.
+			if (hl_demo_playing)
+			{
+				if (hl_cl_viewent > 0 && hl_cl_viewent < HLNET_MAX_ENTS)
+					HLVecCopy(hl_net_cl[hl_cl_viewent].origin, hl_origin);
+
+				HLVecCopy(hl_demo_angles, hl_angles);
+				HLVecSet(hl_velocity, 0.0, 0.0, 0.0);
+				hl_on_ground = TRUE;
+			}
+			else if (hl_game_active)
+			{
+				//--- upstream: the client's move goes over the wire ------------
+				//
+				//CL_SendMove then SV_ReadClientMove: angles, buttons and impulse
+				//reach the edict SERIALISED, so the input path is a real
+				//client/server boundary and a second player arrives this way.
+				//
+				//the move vector round-trips for symmetry, but the engine still
+				//applies its own copy - reconstructing the wish server-side the
+				//way SV_ClientThink does goes with the renderer flip, not here.
+				if (hl_net_active)
+				{
+					//Stock: CL_SendMove only after SIGNONS (4). Listen host
+					//never walks UDP signon -- hl_cl_signon stays 0.
+					if (!hl_udp_ready || hl_udp_server || hl_cl_signon >= 4)
+					{
+						HLNetClientSendMove(hl_angles,
+							net_fwd * speed, net_side * speed, 0.0,
+							attack, ToBool(Bt(kbd.down_bitmap, hl_bind_key[HLBIND_JUMP])),
+							impulse, hl_game_time);
+					}
+
+					HLNetServerReadClient(hl_player_edict, hl_game_time);
+				}
+
+				//SV_ClientThink opens with this, so the kick from the last
+				//shot has recovered a little before the frame is built.
+				HLDropPunchAngle(hl_player_edict, HLSERVER_STEP);
+
+				HLPlayerPreThink(hl_origin, hl_velocity, hl_angles, hl_on_ground,
+					attack, ToBool(Bt(kbd.down_bitmap, hl_bind_key[HLBIND_JUMP])), impulse);
+
+				//consumed: catch-up runs several ticks per rendered frame, and
+				//the original's impulse rides one move message only - left set,
+				//ImpulseCommands cycles straight past the weapon asked for.
+				impulse = 0;
+
+				//QuakeC owns jumping - PlayerJump set the vertical velocity in
+				//pre-think. WALK players only: SV_Physics_Client hands a TOSS
+				//corpse to the entity pass, and WALK physics on one re-fires the
+				//touch of whatever it rests on every frame.
+				if (!hl_noclip && HLPlayerWalking)
+					HLPlayerMove(hl_map, hl_origin, hl_velocity, move, speed,
+						FALSE, HLSERVER_STEP, &hl_on_ground, hl_water_level,
+						HLPlayerWaterJump(hl_velocity, hl_game_time), hl_angles,
+						hl_player_edict);
+
+				//publish .groundentity - a platform only carries riders it can
+				//identify.
+				if (hl_player_edict > 0 && hl_fld_groundentity >= 0)
+					HLPrSetFieldI(hl_player_edict, hl_fld_groundentity,
+						HLPrEdictValue(hl_ground_entity));
+
+				//THIN CLIENT: a guest must NOT run the world think pass on top
+				//of parsing the host's entity storm. its world comes off the
+				//wire via HLNetClientFrame + cl_netdraw; local motion is still
+				//predicted below.
+				//
+				//PUBLISH THE POST-MOVE POSITION BEFORE THE PUSHERS RUN.
+				//PreThink wrote the pre-move origin, so a pusher tests the
+				//player a tick behind and a plat can never move them out of its
+				//way - it stays blocked and plat_crush fires every frame. in the
+				//original sv_player->v.origin IS the position.
+				if (hl_game_active && hl_player_edict > 0)
+				{
+					for (i = 0; i < 3; i++)
+					{
+						HLPrSetFieldF(hl_player_edict, hl_fld_origin + i,
+							hl_origin[i]);
+						HLPrSetFieldF(hl_player_edict, hl_fld_velocity + i,
+							hl_velocity[i]);
+					}
+				}
+
+				//The local world does not run while a demo plays - the stream
+				//already contains everything that happened.
+				if (!HLClientMode)
+					HLGameFrame(HLSERVER_STEP);
+
+				//adopt what the physics pass did to the body. published just
+				//above, so any difference here is exactly what the pusher did.
+				if (hl_game_active && hl_player_edict > 0)
+				{
+					for (i = 0; i < 3; i++)
+					{
+						hl_origin[i]   = HLPrFieldF(hl_player_edict,
+											hl_fld_origin + i);
+						hl_velocity[i] = HLPrFieldF(hl_player_edict,
+											hl_fld_velocity + i);
+					}
+				}
+
+				HLPlayerTouchTriggers(hl_origin, hl_velocity);
+				HLPlayerPostThink(hl_origin, hl_velocity, hl_angles,
+					hl_on_ground, hl_water_level, hl_water_type);
+				//Local player frame chains - same as remotes in HLSvRunClients.
+				if (hl_player_edict > 0)
+					HLSvRunEntityThink(hl_player_edict);
+				HLStuckCheck(move, speed);
+
+				//Anything QuakeC printed this tick goes to the console, and
+				//anything it stuffed at the client gets executed.
+				HLConDrainProgs;
+				HLConDrainStuff;
+
+				if (hl_con_want_bf)
+				{
+					hl_con_want_bf = FALSE;
+					HLCShiftBonus;
+				}
+
+				//Music has no loop flag in the mixer, so it is retriggered when
+				//the track runs out.
+				HLMusicUpdate(tS);
+
+				//--- the client/server boundary --------------------------------
+				//
+				//the world is settled for this tick, which is where
+				//SV_SendClientDatagram runs: the server serialises and the local
+				//client rebuilds its copy from the bytes.
+				//
+				//NOTE: the renderer still reads the world directly. HLNetVerify
+				//can only measure the reconstruction while that known-good
+				//reference is still there to compare against.
+				if (hl_net_active && hl_player_edict > 0)
+				{
+					if (hl_udp_ready && hl_udp_server)
+						HLSvRunClients(HLSERVER_STEP, hl_game_time);
+
+					//Host builds the datagram; guest only drains the wire.
+					if (hl_udp_server || !hl_udp_ready)
+						HLNetServerFrame(hl_player_edict, hl_game_time);
+
+					HLNetClientFrame;
+
+					//Guest: HUD / death / viewweapon follow host clientdata.
+					HLNetSyncLocalFromClient;
+
+					//svc_print / Host_Say may have arrived this tick - show now.
+					HLConDrainProgs;
+
+					if (hl_udp_server || !hl_udp_ready)
+					{
+						hl_net_mismatch        = HLNetVerify(hl_player_edict);
+						hl_net_mismatch_report = hl_net_mismatch;
+					}
+				}
+
+				//AFTER the wire: guest hit kick reads hl_net_damage_pending from
+				//svc_damage parsed above. Host still gets dmg_* from the edict.
+				HLViewKickUpdate(HLSERVER_STEP);
+
+				//Keep the OS responsive under catch-up bursts.
+				if (hl_udp_ready && !hl_udp_server)
+					Yield;
+			}
+			else if (!hl_noclip)
+			{
+				//No bytecode loaded, so the engine owns jumping.
+				HLPlayerMove(hl_map, hl_origin, hl_velocity, move, speed,
+					ToBool(Bt(kbd.down_bitmap, hl_bind_key[HLBIND_JUMP])), HLSERVER_STEP,
+					&hl_on_ground, hl_water_level, FALSE, hl_angles,
+					hl_player_edict);
+			}
+
+			srv_accum -= HLSERVER_STEP;
+			srv_steps++;
+		}
+
+		//A long stall must not leave a backlog that replays later.
+		if (srv_accum > HLSERVER_STEP)
+			srv_accum = 0.0;
+
+		//Particles age on the render clock, not the game clock.
+		HLPartUpdate(dt, tS);
+
+		HLCenterView(Fs);
+		HLRenderFrame;
+		hl_ready = TRUE;
+
+		hl_frame_count++;
+		fps_frames++;
+		if (now - fps_time >= 0.5)
+		{
+			hl_fps      = ToF64(fps_frames) / (now - fps_time);
+			fps_frames = 0;
+			fps_time   = now;
+		}
+
+		//a level change is requested from inside a think, so it is serviced
+		//here, between frames. a death restart reloads the SAME map with no
+		//carried inventory, and goes first so the two cannot both fire.
+		if (hl_restart_pending)
+		{
+			hl_restart_pending = FALSE;
+			HLGameClearParms;
+			HLChangeLevel(hl_map_name);
+			goto ql_next_frame;
+		}
+
+		//"game <dir>" arrives from the console, which compiles before this
+		//file and cannot call in directly. serviced between frames like a
+		//changelevel, and BEFORE it, because it invalidates every archive the
+		//map would load from
+		if (hl_gamedir_pending)
+		{
+			hl_gamedir_pending = FALSE;
+			hl_change_pending  = FALSE;
+			HLGameDirSwitch(hl_gamedir_next);
+			goto ql_next_frame;
+		}
+
+		//Never during playback: the demo pump owns its own changelevels, and
+		//this copy would service one without the client precache rebuild.
+		if (hl_change_pending && !hl_demo_playing)
+		{
+			hl_change_pending = FALSE;
+			HLChangeLevel(hl_change_map);
+
+			//Guest: after map load, reply to signonnum 1 with "prespawn".
+			if (hl_udp_ready && !hl_udp_server && hl_net_need_prespawn)
+			{
+				hl_net_need_prespawn = FALSE;
+				HLLog("net: cl -> prespawn (map loaded)\n");
+				HLLogFlush;
+				HLNetClientSendStringCmd("prespawn");
+			}
+		}
+
+		LBts(&Fs->task_flags, TASKf_IDLE);
+		Yield;
+		LBtr(&Fs->task_flags, TASKf_IDLE);
+
+ql_next_frame:
+	}
+}
+
+U0 HLDocCursorPark()
+{//park the terminal's document cursor at the END.
+ //
+ //the cursor is left wherever the last write or click put it, which in DolDoc
+ //is a real editing position, not a prompt. anything typed after is inserted
+ //INTO existing text, and the shell hands the merged line to the compiler -
+ //a fault inside ExeCmdLine, after HL1 has fully exited.
+ //
+ //same idiom the doc utilities use.
+	CDoc *doc;
+	Bool  unlock;
+
+	doc = Fs->put_doc;
+	if (!doc)
+		return;
+
+	unlock = DocLock(doc);
+
+	doc->cur_entry = &doc->head;
+	doc->cur_col   = 0;
+
+	if (unlock)
+		DocUnlock(doc);
+}
+
+U0 HL1(U8 *mapname = HLDEFAULT_MAP)
+{
+	CHLCanvas	*canvas			= NULL;
+	CHLVisState	*vis			= NULL;
+	CHLMap		*map			= NULL;
+	Bool		 raw_was_on		= FALSE;
+	Bool		 demo_boot		= FALSE;
+	Bool		 final_active	= FALSE;
+	I64			 final_edicts	= 0;
+	I64			 final_thinks	= 0;
+	I64			 final_models	= 0;
+	I64			 final_snd		= 0;
+	I64			 final_drop		= 0;
+	I64			 final_move_ok	= 0;
+	I64			 final_move_fail = 0;
+	I64			 final_errors	= 0;
+	F64			 final_time		= 0.0;
+	U8			 line[256];
+	U8			 pakname[64];
+	I64			 i;
+
+	HLLogReset;
+
+	//before a single allocation of ours: corruption here did not come from
+	//here.
+	HLHeapCheck("entry");
+
+	HLPakInit;
+	HLWad3Init;
+	HLSndInit;
+	HLPartInit;
+	HLClipInit;
+	//ZealC does not honour a declaration initialiser on a global, and every
+	//pointer below is handed to Free() at teardown - one never assigned is
+	//freed as garbage, faulting inside the allocator.
+	hl_music_frames     = NULL;
+	hl_music_count      = 0;
+	hl_music_rate       = HLSND_RATE;
+	hl_music_track      = 0;
+	hl_save_buf         = NULL;
+	hl_mdl_preview      = NULL;
+	hl_mdl_preview_skin = NULL;
+	hl_vis              = NULL;
+	hl_map              = NULL;
+	hl_entities         = NULL;
+	hl_num_entities     = 0;
+
+	HLMdlCacheInit;
+	HLBiBspCacheInit;
+	HLSurfCacheInit;
+	HLMusicReset;
+	HLPlayerStateInit;
+	HLSvHostTickInit;
+	HLClientParmsInit;
+	HLDemoInit;
+	HLConHistoryInit;
+	HLLightInit;
+	HLTurbInit;
+	HLNetInit;
+	HLNetUdpInit;
+	HLNetStatesClear;
+	HLNetClockInit;
+	HLSetupDefaults;
+	HLCfgLoad;
+	HLViewKickInit;
+	HLCShiftInit;
+	HLStuckInit;
+
+	//Cvars once, before anything can read them - NOT in HLBiInit, which runs
+	//again on every map load and would throw away "registered" and "skill".
+	HLCvarInit;
+
+	//Applied AFTER the cvars exist: HLCfgLoad ran before this and only parked
+	//the value, because defining it there would have been shadowed here.
+	HLCvarSet("crosshair", ToF64(hl_opt_crosshair));
+
+	//COM_AddGameDirectory walks pak%i until one is missing
+	if (!FileFind("::/Apps/HL1/valve/PAK0.PAK") &&
+		!FileFind("::/Apps/HL1/valve/pak0.pak"))
+	{
+		"HL1: PAK0.PAK not found. See ::/Apps/HL1/README.md\n";
+		return;
+	}
+
+	HLPakMountGame;
+	HLWad3SetGameDir(hl_game_dir);
+
+	if (hl_game_dir[0])
+	{
+		StrPrint(pakname, "HL1: gamedir %s\n", hl_game_dir);
+		"%s", pakname;
+	}
+
+	//there is no shareware Half-Life, so there is no gfx/pop.lmp test and
+	//nothing to gate. the cvar stays because trigger_onlyregistered_touch
+	//and the menus still read it
+	HLCvarSet("registered", 1.0);
+
+	if (!HLPalLoad)
+	{
+		"HL1: palette load failed\n";
+		return;
+	}
+
+	//interface art: gfx.wad plus the standalone gfx/*.lmp menu pictures.
+	HLWadInit;
+	HLSbarInit;
+	HLMenuInit;
+
+	//a stock boot loads NO playable map: quake.rc's startdemos supplies the
+	//world, each demo naming its own level in svc_serverinfo. the direct load
+	//is only the fallback for a boot with no attract loop.
+	demo_boot = FALSE;
+	if (HLCvarGet("demoloop") != 0.0)
+		demo_boot = HLDemoNextInLoop;
+
+	if (demo_boot)
+		HLLog("demo: attract loop started\n");
+	else if (!HLLoadMap(mapname))
+	{
+		"HL1: could not load %s\n", mapname;
+		return;
+	}
+
+	//explicit, not initialisers - a global's declaration initialiser is not
+	//honoured.
+	hl_state       = HLST_MENU;
+	hl_menu_ingame = FALSE;
+
+	hl_canvas = HLDrawNew(hl_res_w[hl_opt_res], hl_res_h[hl_opt_res]);
+	hl_ready  = FALSE;
+
+	//checkpoints: the first of these that reports corruption brackets it.
+	HLHeapCheck("startup");
+
+	MenuPush(
+		"File {"
+		"  Exit(,CH_ESC);"
+		"}"
+	);
+	SettingsPush;
+
+	try
+	{
+		Fs->win_inhibit = WIG_TASK_DEFAULT - WIF_SELF_FOCUS -
+						  WIF_SELF_GRAB_SCROLL - WIF_FOCUS_TASK_MENU;
+		AutoComplete;
+		WinBorder;
+		WinMax;
+		DocCursor;
+		DocClear;
+
+		HLCenterView(Fs);
+
+		//raw mode gives relative deltas and keeps clicks off the window manager.
+		//must be turned back off on every exit path.
+		raw_was_on = MouseRaw(TRUE);
+		MouseRawReset;
+
+		Fs->draw_it = &HLDrawIt;
+
+		//raw_data.z is a delta the frame loop's MouseRawReset clears, not a
+		//position - discard what accumulated before the loop, or entering the
+		//game arrives as one large scroll.
+		MouseRawReset;
+
+		//MouseRawReset does not touch the button levels, and a click landing
+		//just before raw mode reads as fire held on the first frame.
+		mouse_hard.bttns[0] = FALSE;
+		mouse_hard.bttns[1] = FALSE;
+		mouse_hard.bttns[2] = FALSE;
+
+		HLGameLoop;
+	}
+	catch
+		PutExcept;
+
+	//--- teardown ---
+	//detaching draw_it is NOT enough - an already-entered HLDrawIt keeps
+	//running. stop it drawing, detach, let the in-flight call drain, then free.
+	hl_ready     = FALSE;
+	Fs->draw_it = NULL;
+	Sleep(100);
+
+	//clear each global before releasing it, so a late HLDrawIt sees NULL.
+	canvas   = hl_canvas;
+	hl_canvas = NULL;
+	vis      = hl_vis;
+	hl_vis    = NULL;
+	map      = hl_map;
+	hl_map    = NULL;
+
+	if (!raw_was_on)
+		MouseRaw(FALSE);
+
+	SettingsPop;
+	MenuPop;
+
+	//capture the VM stats before shutdown clears them. DocClear wiped the
+	//startup messages, so this summary is the only readable one.
+	final_active  = hl_game_active;
+	final_edicts  = hl_pr_num_edicts;
+	final_thinks  = hl_game_thinks;
+	final_time    = hl_game_time;
+	final_models  = hl_precache_model_count;
+
+	final_snd      = hl_snd_played;
+	final_drop     = hl_snd_dropped;
+	final_move_ok  = hl_move_ok;
+	final_move_fail = hl_move_fail;
+	final_errors    = hl_pr_errors;
+
+	//breadcrumbed and flushed after every step, so the last line in HL1LOG.TXT
+	//names the step that was running if it faults.
+	HLHeapCheck("teardown");
+
+	HLLog("teardown: begin\n");
+	HLLogFlush;
+
+	//the QuakeC world points at the map, so it goes first.
+	HLGameShutdown;
+	HLLog("teardown: HLGameShutdown ok\n");
+	HLLogFlush;
+
+	HLMusicFree;
+	HLSndFree;
+	HLLog("teardown: HLSndFree ok\n");
+	HLLogFlush;
+
+	//the socket is registered with the net stack, not this task - it outlives
+	//the app if it is not closed.
+	HLNetUdpClose;
+	HLMdlPreviewFree;
+	HLLog("teardown: net/preview ok\n");
+	HLLogFlush;
+
+	//released before the map, so nothing outlives what it was spawned from.
+	HLEntFree;
+	HLLog("teardown: HLEntFree ok\n");
+	HLLogFlush;
+
+	//up to 512 lit-surface blocks plus a slot table sized to the map's face
+	//count, both allocated during rendering - a menu-only session has neither.
+	HLSurfCacheFlush;
+	HLSurfCacheSetMap(NULL);
+	HLLog("teardown: HLSurfCacheFlush ok\n");
+	HLLogFlush;
+
+	HLDrawFree(canvas);
+	HLLog("teardown: HLDrawFree ok\n");
+	HLLogFlush;
+
+	HLVisFree(vis);
+	HLLog("teardown: HLVisFree ok\n");
+	HLLogFlush;
+
+	HLBSPFree(map);
+	HLLog("teardown: HLBSPFree ok\n");
+
+	//last: the precache and the static entity list both point into it.
+	HLMdlCacheFree;
+	HLLog("teardown: HLMdlCacheFree ok\n");
+	HLLogFlush;
+
+	StrPrint(line, "exit: %d frames rendered\n", hl_frame_count);
+	HLLog(line);
+
+	if (final_active)
+	{
+		StrPrint(line, "QuakeC: %d edicts, %d models precached\n",
+			final_edicts, final_models);
+		HLLog(line);
+		StrPrint(line, "QuakeC: %d thinks over %4.1f s of game time\n",
+			final_thinks, final_time);
+		HLLog(line);
+
+		//only four mixer streams, so drops are expected in a firefight. a zero
+		//played count means the audio path never worked at all.
+		StrPrint(line, "sound: %d played, %d dropped (4 streams)\n",
+			final_snd, final_drop);
+		HLLog(line);
+
+
+
+
+		//includes the ones the console suppressed - large with a healthy think
+		//count means they are being survived.
+		StrPrint(line, "QuakeC errors: %d\n", final_errors);
+		HLLog(line);
+
+		//spawning but never thinking is a different fault from not spawning.
+		if (final_thinks == 0)
+			HLLog("QuakeC: WARNING - nothing ever thought. Check nextthink.\n");
+	}
+	else
+		HLLog("QuakeC: did not load - entities were static\n");
+
+	//written LAST, so this line missing with everything above it present means
+	//the fault is after all of our own cleanup.
+	HLHeapCheck("returning");
+
+	HLLog("teardown: returning\n");
+	HLLogFlush;
+
+	"\nLog written to ::/Apps/HL1/HL1LOG.TXT\n";
+
+	//anything queued during teardown must not reach the shell either, and the
+	//cursor is parked only once nothing further writes to the document.
+	HLInputDrainAll;
+	HLDocCursorPark;
+
+	//THIS IS WHY EXITING FAULTED IN ExeCmdLine.
+	//
+	//the shell's lexer holds cur_entry into the terminal document and rebuilds
+	//the task title from it every iteration:
+	//
+	//    doc_e = cc->lex_include_stack->cur_entry;
+	//    while (doc_e != doc && ptr2 < ptr3)
+	//        switch (doc_e->type_u8) ...
+	//
+	//DocClear in the setup above freed every entry, so that walk reads freed
+	//memory and faults nowhere near this code.
+	//
+	//it only runs while title_src is TTS_CUR_LEX, and ExeCmdLine restores the
+	//previous value when its own loop finishes.
+	Fs->title_src = TTS_LOCKED_CONST;
+
+	//settle before handing the task back: the wm, the mixer and the block cache
+	//run on their own tasks and may still hold work referring to this one.
+	Sleep(200);
+
+}
