@@ -192,6 +192,12 @@ class CGxGlobals
 	I64		 js_ran;		//Next queue index to execute.
 } gx;
 
+//JS console drawer state. Deliberately NOT inside gx: ZincGX() MemSets that
+//whole struct, and anything else that ever resets it would silently close the
+//console mid-debug.
+Bool zinc_con_open = FALSE;		//globals are not zeroed by the JIT
+I64	 zinc_con_scroll = 0;
+
 CGxImg *GxImgFind(U8 *url)
 {
 	I64 i;
@@ -2444,6 +2450,94 @@ I64 GxClipTextGet(U8 *out, I64 max)
 	return n;
 }
 
+#define GX_CON_ROWS_MAX	40
+
+I64 GxConsoleH()
+{//Drawer height in px: about 40% of the content area, bounded.
+	I64 avail = Fs->pix_height - GX_CHROME_H - GX_STATUS_H;
+
+	if (!zinc_con_open)
+		return 0;
+
+	return MinI64(MaxI64(6 * (FONT_HEIGHT + 2), avail * 2 / 5),
+				  GX_CON_ROWS_MAX * (FONT_HEIGHT + 2));
+}
+
+U0 GxConEsc(U8 *src, U8 *dst, I64 max)
+{//Double dollars: console text is a page's own output and lands in a DolDoc
+ //printer, where a lone dollar would open a command.
+	I64 n = 0;
+
+	while (*src && n < max - 3)
+	{
+		if (*src == 0x24)
+		{
+			dst[n] = 0x24;
+			n++;
+		}
+		dst[n] = *src;
+		n++;
+		src++;
+	}
+	dst[n] = 0;
+}
+
+U0 GxDrawConsole(CDC *dc, CTask *task)
+{//The JS console, docked above the status bar. Newest at the bottom, like a
+ //terminal. Drawn as part of the normal frame, so the page underneath stays
+ //live and clickable - a PopUpPickList here blocked the whole browser.
+	I64	 h = GxConsoleH(), rows, i, idx, first, y0, y, lh = FONT_HEIGHT + 2;
+	U8	 line[220];
+	U8	*src;
+
+	if (!h)
+		return;
+	y0 = task->pix_height - GX_STATUS_H - h;
+	dc->color = de_theme.panel;
+	GrRect(dc, 0, y0, task->pix_width, h);
+	dc->color = de_theme.panel_edge;
+	GrRect(dc, 0, y0, task->pix_width, 1);
+
+	rows = (h - lh) / lh;
+	if (rows < 1)
+		rows = 1;
+	//newest-last: show the window ending con_scroll lines back from the end
+	first = js_con_n - rows - zinc_con_scroll;
+	if (first < 0)
+		first = 0;
+	dc->color = de_theme.text_dim;
+	GrPrint(dc, 4, y0 + 2, "JS console  %d line(s)   [wheel] scroll  [ESC] close",
+			js_con_n);
+	y = y0 + lh;
+	for (i = 0; i < rows; i++)
+	{
+		idx = first + i;
+		if (idx >= js_con_n)
+			break;
+		if (js_con_n >= JS_CON_LINES)
+			src = js_con[(js_con_head + idx) % JS_CON_LINES];
+		else
+			src = js_con[idx];
+		//tag-coloured: errors should stand out from ordinary logs
+		if (!MemCompare(src, "ERR", 3) || !MemCompare(src, "THROW", 5))
+			dc->color = ColorRGB(255, 110, 110); //no error pen in the theme
+		else if (!MemCompare(src, "warn", 4) || !MemCompare(src, "parse", 5))
+			dc->color = de_theme.accent;
+		else
+			dc->color = de_theme.text;
+		GxConEsc(src, line, 216);
+		line[MinI64(216, (task->pix_width - 8) / FONT_WIDTH)] = 0;
+		GrPrint(dc, 4, y, "%s", line);
+		y += lh;
+	}
+}
+
+U0 GxConsoleShow()
+{//Toggle the drawer. Opening jumps to the newest line.
+	zinc_con_open = !zinc_con_open;
+	zinc_con_scroll = 0;
+}
+
 U0 GxDrawIt(CTask *task, CDC *dc)
 {
 	I64	 i, oy, view_top = GX_CHROME_H, mx, my, wr, zpass;
@@ -2705,6 +2799,8 @@ gx_draw_next:;
 	}
 
 	//Status bar.
+	dc->color = de_theme.bar_bg;
+	GxDrawConsole(dc, task); //docked drawer sits above the status bar
 	dc->color = de_theme.bar_bg;
 	GrRect(dc, 0, task->pix_height - GX_STATUS_H, task->pix_width, GX_STATUS_H);
 	dc->color = de_theme.text_dim;
@@ -3274,13 +3370,11 @@ U0 GxClickContent(I64 x, I64 y)
 			gx.relayout = TRUE;
 			return;
 		}
-		if ((op->type == GXO_TEXT || op->type == GXO_IMG) && op->href)
-		{ // a linked image (<a><img></a>, e.g. 100r's rabbit nav) navigates too
-			GxNavTo(ZincResolveLink(op->href));
-			return;
-		}
-		if (op->type == GXO_TEXT && op->node && zinc_js)
-		{//Non-link text with a click handler (addEventListener / el.onclick).
+		if ((op->type == GXO_TEXT || op->type == GXO_IMG) && op->node && zinc_js)
+		{//The click event fires FIRST, even on a link. This used to run only for
+		 //hrefless nodes: an <a href="#" onclick="..."> navigated before its
+		 //handler ever saw the click, so the page appeared to just reload and
+		 //the app never advanced. preventDefault() now suppresses the nav.
 			if (JsDispatchEvent(zinc_js, op->node, "click"))
 			{
 				gx.relayout = TRUE;
@@ -3288,9 +3382,26 @@ U0 GxClickContent(I64 x, I64 y)
 				{
 					GxNavTo(StrNew(zinc_js->navigate));
 					zinc_js->navigate = NULL;
+					return;
 				}
+				if (zinc_js->evt_prevented)
+					return; // handler owns the click
+			}
+		}
+		if ((op->type == GXO_TEXT || op->type == GXO_IMG) && op->href)
+		{ // a linked image (<a><img></a>, e.g. 100r's rabbit nav) navigates too
+			s = op->href;
+			while (*s == ' ')
+				s++;
+			if (*s == '#' || !*s)
+			{ // a bare fragment link is NOT a page load: scroll home instead of
+			  // reloading, which is what made SPA buttons look like refreshes
+				gx.scroll = 0;
+				gx.relayout = TRUE;
 				return;
 			}
+			GxNavTo(ZincResolveLink(op->href));
+			return;
 		}
 		if (op->type == GXO_WIDGET)
 		{
@@ -3465,14 +3576,17 @@ U0 GxRightClick(I64 x, I64 y)
 			GxClipSet(img);
 		return;
 	}
-	pick = PopUpPickList("Back\0Forward\0Reload\0Save Page\0Copy Page URL\0Cancel\0");
+	// ONE literal: adjacent string literals concatenate by LENGTH, so a
+	// NUL-separated list split across two would collapse to its first entry
+	pick = PopUpPickList("Back\0Forward\0Reload\0JS Console\0Save Page\0Copy Page URL\0Cancel\0");
 	switch (pick)
 	{
 		case 0: GxNavTo(StrNew("b")); break;
 		case 1: GxNavTo(StrNew("f")); break;
 		case 2: GxNavTo(StrNew("r")); break;
-		case 3: GxDownload(gx.url);   break;
-		case 4: GxClipSet(gx.url);	  break;
+		case 3: GxConsoleShow;		  break;
+		case 4: GxDownload(gx.url);   break;
+		case 5: GxClipSet(gx.url);	  break;
 	}
 }
 
@@ -4002,7 +4116,17 @@ public U0 ZincGX(U8 *start_url=NULL)
 		//Wheel scroll - only when THIS window has focus (the wheel counter is
 		//global; without the gate an unfocused browser scrolled underneath).
 		view_h = Fs->pix_height - GX_CHROME_H - GX_STATUS_H;
-		if (mouse.pos.z != gx.last_wheel)
+		if (mouse.pos.z != gx.last_wheel && zinc_con_open &&
+			mouse.pos.y - Fs->pix_top >= Fs->pix_height - GX_STATUS_H - GxConsoleH())
+		{//pointer is over the drawer: scroll the log, not the page
+			zinc_con_scroll += (gx.last_wheel - mouse.pos.z) * 3;
+			if (zinc_con_scroll < 0)
+				zinc_con_scroll = 0;
+			if (zinc_con_scroll > js_con_n)
+				zinc_con_scroll = js_con_n;
+			gx.last_wheel = mouse.pos.z;
+		}
+		else if (mouse.pos.z != gx.last_wheel)
 		{
 			if (sys_focus_task == Fs)
 			{
@@ -4217,7 +4341,16 @@ public U0 ZincGX(U8 *start_url=NULL)
 					{
 						case CH_ESC:
 						case CH_SHIFT_ESC:
+							if (zinc_con_open)
+							{//ESC closes the console first, not the browser
+								zinc_con_open = FALSE;
+								zinc_con_scroll = 0;
+								break;
+							}
 							gx.quit = TRUE;
+							break;
+						case '`': //backtick toggles the JS console
+							GxConsoleShow;
 							break;
 						case 3: //Ctrl+C: copy the page text selection.
 							if (gx.sel_on)

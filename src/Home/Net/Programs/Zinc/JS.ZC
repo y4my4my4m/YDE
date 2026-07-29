@@ -319,6 +319,7 @@
 #define JSN_PROMISE_ASERR	303	// allSettled: record {status:"rejected"}
 #define JSN_PROMISE_ANYERR	304	// any: record reason, AggregateError at zero
 #define JSN_EVT_STOPPROP	305	// evt.stopPropagation(): halts the bubble walk
+#define JSN_EVT_PREVENT	307	// evt.preventDefault(): suppress the default action
 #define JSN_DOC_CREATE_FRAG	306	// document.createDocumentFragment()
 
 /* token types */
@@ -514,6 +515,7 @@ class CJsInterp
 	U8		*write_buf;
 	I64		 write_len;
 	Bool	 dom_dirty;
+	Bool	 evt_prevented;	// last dispatched event called preventDefault()
 	I64		 steps, depth, flow;
 	CJsVal	*ret_val;
 	CJsVal	*doc_obj, *loc_obj, *win_obj;
@@ -577,8 +579,65 @@ U8 *JsStrDup(CJsInterp *ji, U8 *s)
 	return d;
 }
 
+/* ---- console ring ----
+   Everything the engine would otherwise only whisper to the Network Log also
+   lands here, so the browser can show a page's own diagnostics next to the page
+   (right-click -> JS Console). Fixed-size and self-trimming: a script in a loop
+   must not be able to grow it.
+   Globals are NOT zeroed by the JIT, so js_con_n gates all reads. */
+
+#define JS_CON_LINES	160
+#define JS_CON_COLS		192
+
+U8	js_con[JS_CON_LINES][JS_CON_COLS];
+I64	js_con_head = 0;	// next slot to write
+I64	js_con_n	= 0;	// lines held, saturating at JS_CON_LINES
+
+U0 JsConsoleAdd(U8 *tag, U8 *msg)
+{ // tag is a short kind marker ("log", "err", ...) shown before the text
+	U8	*d;
+	I64	 i = 0;
+
+	if (!msg)
+		return;
+	d = js_con[js_con_head];
+	while (*tag && i < 6)
+	{
+		d[i] = *tag;
+		i++;
+		tag++;
+	}
+	if (i < JS_CON_COLS - 2)
+	{
+		d[i] = ' ';
+		i++;
+	}
+	while (*msg && i < JS_CON_COLS - 1)
+	{
+		if (*msg == '\n' || *msg == '\r' || *msg == '\t')
+			d[i] = ' '; // one entry per line: keep the ring rectangular
+		else
+			d[i] = *msg;
+		i++;
+		msg++;
+	}
+	d[i] = 0;
+	js_con_head++;
+	if (js_con_head >= JS_CON_LINES)
+		js_con_head = 0;
+	if (js_con_n < JS_CON_LINES)
+		js_con_n++;
+}
+
+U0 JsConsoleClear()
+{
+	js_con_head = 0;
+	js_con_n = 0;
+}
+
 U0 JsErr(CJsInterp *ji, U8 *msg)
 {
+	JsConsoleAdd("ERR", msg);
 	if (!ji->has_err)
 	{
 		StrPrint(ji->err, "JS: %s", msg);
@@ -1277,6 +1336,7 @@ CJsNode *JsParsePrimary(CJsInterp *ji)
 					embuf[emk] = '?';
 			if (++js_soft_errs <= 12)
 			{
+				JsConsoleAdd("parse", embuf);
 				NetLog("JS: %s", embuf);
 				JsSrcSnippet(ji, open_pos, embuf);
 				NetLog("JS:  open( at: %s", embuf); // the unclosed '(' = the ROOT
@@ -1469,6 +1529,7 @@ CJsNode *JsParsePrimary(CJsInterp *ji)
 			embuf[emk] = '?'; // dollars are live DolDoc commands in the log
 	if (++js_soft_errs <= 12)
 	{
+		JsConsoleAdd("parse", embuf);
 		NetLog("JS: %s", embuf);
 		JsSrcSnippet(ji, ji->pos, embuf);
 		NetLog("JS:  src: %s", embuf); // raw source at the desync
@@ -2610,6 +2671,7 @@ I64	 js_log_cap_max	= 0;
 
 U0 JsLogEmit(CJsInterp *ji, U8 *msg)
 {
+	JsConsoleAdd("log", msg); // always recorded, whatever the sink below is
 	switch (js_log_mode)
 	{
 		case JSLOG_TERM:
@@ -3588,6 +3650,7 @@ CJsVal *JsConstruct(CJsInterp *ji, CJsVal *fn, CJsVal **args, I64 argc, U8 *name
 		for (i = 0; buf[i]; i++)
 			if (buf[i] == 0x24)
 				buf[i] = '?';
+		JsConsoleAdd("warn", buf);
 		NetLog("%s", buf);
 		return JsValNew(ji, JV_OBJ);
 	}
@@ -4090,6 +4153,7 @@ CJsVal *JsEval(CJsInterp *ji, CJsNode *node)
 						NetLog("JS: %s (obj t=%d nid=%d)",
 							   nmbuf, obj->type, obj->native_id);
 					else
+						JsConsoleAdd("warn", nmbuf);
 						NetLog("JS: %s", nmbuf);
 				}
 				if (JsArrMethod(JsCtorName(node->a)))
@@ -5504,8 +5568,9 @@ CJsVal *JsEventObj(CJsInterp *ji, CZNode *node, U8 *type)
 		JsPropSet(ji, e, "target", JsElemV(ji, node));
 		JsPropSet(ji, e, "currentTarget", JsElemV(ji, node));
 	}
-	JsPropSet(ji, e, "preventDefault",  JsNativeV(ji, JSN_EVT_NOOP));
+	JsPropSet(ji, e, "preventDefault",  JsNativeV(ji, JSN_EVT_PREVENT));
 	JsPropSet(ji, e, "stopPropagation", JsNativeV(ji, JSN_EVT_STOPPROP));
+	JsPropSet(ji, e, "defaultPrevented", JsBoolV(ji, FALSE));
 	return e;
 }
 
@@ -5709,6 +5774,9 @@ Bool JsDispatchEvent(CJsInterp *ji, CZNode *node, U8 *type, Bool bubbles=TRUE)
 		return FALSE;
 
 	evt = JsEventObj(ji, node, type);
+	ji->evt_prevented = FALSE; // the front end reads this to decide whether the
+							   // default action (following a link, submitting a
+							   // form) still happens
 	while (cur && depth < 64)
 	{
 	// one Event object for the whole walk (as in the DOM); only the
@@ -6302,7 +6370,13 @@ Bool JsRunEx(CJsInterp *ji, U8 *src, CJsVal **_last)
 				*_last = val;
 		}
 		if (ji->flow == JF_THROW)
+		{ // the thrown value is what you actually want to see
+			if (ji->exc)
+				JsConsoleAdd("THROW", JsToStr(ji, ji->exc));
+			else
+				JsConsoleAdd("THROW", "uncaught exception");
 			NetLog("JS: uncaught exception."); // log, then keep executing
+		}
 		ji->flow = JF_NORMAL; // stray top-level break/return/throw
 		if (ji->pos == before)
 			ji->pos++;
