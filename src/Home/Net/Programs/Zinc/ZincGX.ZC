@@ -48,6 +48,10 @@
 //Scalable TrueType text via System/Gr/GrFont. FALSE => 8x8 bitmap fallback
 //(if the font file is missing). Set once at startup from grf_ui_font.ok.
 Bool zinc_ttf = FALSE;
+//Alpha-composited text (GrFontRenderCovDC + GxBlotBlend). TextBlend(FALSE)
+//reverts to the older pre-baked-background run DC drawn with GrBlot: use it to
+//bisect a crash or corruption to this path without rebuilding.
+public Bool zinc_text_blend = TRUE;
 
 //CJK fallback font load attempted (statically FALSE, unlike a JIT global). It
 //needs its own flag: the desktop's start menu loads the sans/mono slots too,
@@ -66,6 +70,8 @@ class CGxOp
 	U8				*img_url;	//GXO_IMG: absolute URL (MAlloc'ed).
 	I64				 radius;	//GXO_WIDGET: border-radius px (-1 = unset).
 	Bool			 bold, ul, has_bg;
+	Bool			 cov;		//GXO_TEXT: sc is a COVERAGE DC (alpha in the top
+								//byte) - composite with GxBlotBlend, not GrBlot.
 	I16				 bg_px, bg_py, bg_sw, bg_sh;	//GXO_BOX: CSS background-position/size (CSS.ZC encoding).
 	I8				 bg_rep;						//GXO_BOX: background-repeat (-1 unset / 0 repeat / 1 no-repeat / 2 x / 3 y).
 	I16				 grad;							//GXO_BOX: CSS linear-gradient index (-1 = none).
@@ -421,8 +427,15 @@ U0 GxRunFlush()
 		CGrFont *rf = GrFontPick(gx.run_style.mono == 1);
 		gx.run[gx.run_len] = 0;
 		px	= GxFontPx(&gx.run_style);
-		fdc = GrFontRenderDC(rf, px, GxRgbFg(&gx.run_style),
-							 GxRgbBg(&gx.run_style), gx.run);
+		//Coverage, not a baked background: GxRgbBg can only name one flat
+		//colour, so text over a gradient (the welcome hero) or an image used
+		//to carry a visible rectangle of the wrong shade. GxBlotBlend
+		//composites against the real destination at paint time instead.
+		if (zinc_text_blend)
+			fdc = GrFontRenderCovDC(rf, px, GxRgbFg(&gx.run_style), gx.run);
+		else
+			fdc = GrFontRenderDC(rf, px, GxRgbFg(&gx.run_style),
+								 GxRgbBg(&gx.run_style), gx.run);
 		if (fdc)
 		{//rendered ok: emit a run-DC op (else fall through to the 8x8 path)
 			op = GxOpAdd(GXO_TEXT, gx.run_x, gx.run_y, fdc->width,
@@ -430,6 +443,7 @@ U0 GxRunFlush()
 			if (op)
 			{
 				op->sc	 = fdc;		//owned; freed on reset (type != GXO_IMG)
+				op->cov	 = zinc_text_blend;	//blend it, or GrBlot the baked one
 				op->text = StrNew(gx.run); //kept for selection/clipboard copy
 				op->fg	 = GxPen(gx.run_style.fg, gx.text_pen);
 				op->ul	 = gx.run_style.underline == 1 ||
@@ -1835,10 +1849,110 @@ gx_sprite_skip:;
 
 public Bool zinc_gradients = TRUE; //Gradients(FALSE) disables CSS gradient rendering (debug/perf).
 
+public U0 TextBlend(Bool on)
+{//Runtime toggle for alpha-composited text. Reload the page to re-render.
+//TextBlend(OFF) restores the pre-baked background path (visible boxes behind
+//text over gradients, but it does not touch the window z-buffer).
+	zinc_text_blend = on;
+}
+
 public U0 Gradients(Bool on)
 {//Runtime toggle for CSS linear-gradient backgrounds. Reload the page to re-render.
 //Use Gradients(OFF); in a terminal to bisect a gradient-related hang/slowness.
 	zinc_gradients = on;
+}
+
+U0 GxBlotBlend(CDC *dst, I64 x, I64 y, CDC *src)
+{//Composite a COVERAGE DC (GrFontRenderCovDC: alpha in the top byte, colour in
+//the low 24 bits) onto dst, blending each pixel against what is ALREADY there.
+//That is the whole point - a pre-baked run DC has to guess one flat backdrop
+//colour, which is wrong over a gradient, an image, or a differently coloured
+//parent.
+//
+//Coordinates go through the SAME transform GrBlot applies (GrBitMap.ZC): on a
+//screen bitmap the window's scroll offset AND its pix_left/pix_top origin both
+//apply, and the right/bottom clip is the window edge, not the DC edge. Indexing
+//dst->body with the raw x/y instead put every glyph in the wrong place.
+	I64	 j, i, dx, dy, a, ia, sr, sg, sb, dr, dg, dbl, clip_r, clip_b, zi;
+	I64	 win_z_num = 0;
+	U16	*zb = NULL;
+	U32	 s, d, *srow, *drow;
+	CTask *wt;
+	Bool cell_ok = TRUE;
+
+	if (!dst || !src)
+		return;
+	clip_r = dst->width;
+	clip_b = dst->height;
+	if (dst->flags & DCF_SCREEN_BITMAP)
+	{
+		wt = dst->win_task;
+		if (!wt)
+			return;
+		x += wt->scroll_x + wt->pix_left;
+		y += wt->scroll_y + wt->pix_top;
+		if (wt->pix_right + 1 < clip_r)
+			clip_r = wt->pix_right + 1;
+		if (wt->pix_bottom + 1 < clip_b)
+			clip_b = wt->pix_bottom + 1;
+		if (!(dst->flags & DCF_ON_TOP))
+		{//Window z-buffer, per 8x8 screen cell: without this a blot paints over
+		 //cells another window owns - including the Window Manager's.
+			win_z_num = wt->win_z_num;
+			zb = gr.win_z_buf;
+		}
+	}
+	for (j = 0; j < src->height; j++)
+	{
+		dy = y + j;
+		if (dy < 0 || dy >= clip_b)
+			goto gx_bb_row;
+		srow = src->body + j	* src->width_internal;
+		drow = dst->body + dy	* dst->width_internal;
+		for (i = 0; i < src->width; i++)
+		{
+			dx = x + i;
+			if (dx < 0 || dx >= clip_r)
+				goto gx_bb_col;
+			if (zb && (!i || !(dx & 7)))
+			{//Cell ownership re-tested at each 8px boundary, like GrBlot.
+			 //Parenthesised: the kernel's own version RELIES on ZealC binding
+			 //>> tighter than *, the opposite of C. Bounds-checked separately
+			 //because an out-of-range read into this shared kernel buffer is
+			 //exactly the kind of thing that GP-faults.
+				zi = ((dy >> 3) * TEXT_COLS) + (dx >> 3);
+				cell_ok = FALSE;
+				if (0 <= zi < TEXT_ROWS * TEXT_COLS)
+					cell_ok = win_z_num >= zb[zi];
+			}
+			if (!cell_ok)
+				goto gx_bb_col;
+			s = srow[i];
+			a = (s >> 24) & 0xFF;
+			if (!a)
+				goto gx_bb_col;			//fully transparent: leave dst alone
+			if (a >= 255)
+			{
+				drow[dx] = s & 0x00FFFFFF;	//fully opaque glyph interior
+				goto gx_bb_col;
+			}
+			d	= drow[dx];
+			ia	= 255 - a;
+			sr	= (s >> 16) & 0xFF;
+			sg	= (s >> 8)  & 0xFF;
+			sb	= s		  & 0xFF;
+			dr	= (d >> 16) & 0xFF;
+			dg	= (d >> 8)  & 0xFF;
+			dbl	= d		  & 0xFF;
+			//EVERY shift parenthesised: in ZealC << binds TIGHTER than /, so
+			//`x / 255 << 16` means x / (255 << 16) and collapses to 0.
+			drow[dx] = (((sr * a + dr  * ia) / 255) << 16) |
+					   (((sg * a + dg  * ia) / 255) << 8)  |
+					    ((sb * a + dbl * ia) / 255);
+gx_bb_col:;
+		}
+gx_bb_row:;
+	}
 }
 
 CDC *GxGradientDC(I64 gi, I64 bw, I64 bh)
@@ -2424,11 +2538,16 @@ U0 GxDrawIt(CTask *task, CDC *dc)
 				break;
 			case GXO_TEXT:
 				if (op->sc)
-				{//Scalable font: pre-rendered run DC (bg + AA baked in).
+				{//Scalable font: pre-rendered run DC. cov = per-pixel coverage
+				 //blended against the destination; otherwise a legacy opaque
+				 //stamp that still goes through GrBlot.
 					if (op->href && op->x <= mx < op->x + op->w &&
 						oy <= my < oy + op->h)
 						hover = op->href;
-					GrBlot(dc, op->x, oy, op->sc);
+					if (op->cov)
+						GxBlotBlend(dc, op->x, oy, op->sc);
+					else
+						GrBlot(dc, op->x, oy, op->sc);
 					if (GxOpSelRange(op, &selc0, &selc1))
 					{//selection tint OVER the selected chars: alternate scanlines
 					 //(the run DC is opaque - stripes read as a translucent
