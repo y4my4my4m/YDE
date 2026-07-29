@@ -303,6 +303,8 @@
 #define JSN_DOC_CREATE_EVENT 293 // document.createEvent(type) -> event obj
 #define JSN_EVT_INIT		294	// event.initEvent(type, bubbles, cancelable)
 #define JSN_EL_DISPATCH		295	// element.dispatchEvent(evt) -> fires listeners
+#define JSN_PROMISE_SREJECT	296	// Promise.reject(v) - the static, not the
+									// executor's reject fn (that is 72)
 
 /* token types */
 #define JT_EOF		0
@@ -453,7 +455,9 @@ class CJsMicro
 	CJsMicro *next;
 	CJsVal	 *fn;
 	CJsVal	 *arg;
+	CJsVal	 *derived;	// promise settled with fn's result, so then() can chain
 	Bool	  has_arg;
+	Bool	  rejected;	// fn == NULL: pass-through, settle derived with arg
 };
 
 class CJsNode
@@ -520,6 +524,8 @@ extern CJsListener *JsListenerAdd(CJsInterp *ji, CZNode *node, U8 *type,
 								  CJsVal *fn, Bool is_prop);
 // JsMemberSet (styleEl.textContent = css) ingests CSS-in-JS; defined below.
 extern U0 JsStyleIngest(CJsInterp *ji, CZNode *node);
+// JsToNum sits just above the JSNum include but needs its decimal parser.
+extern F64 JsStr2F64(U8 *s);
 
 /* ---- arena ---- */
 
@@ -721,7 +727,7 @@ F64 JsToNum(CJsVal *v)
 		case JV_NUM:
 			return v->num;
 		case JV_STR:
-			return Str2F64(v->str);
+			return JsStr2F64(v->str);
 	}
 
 	return 0;
@@ -2057,6 +2063,7 @@ CJsNode *JsParseStmt(CJsInterp *ji)
 	CJsNode *node, *item, *mtail, *ctail, *stmt2;
 	CJsTok	*t;
 	I64		 k, kp, dep;
+	Bool	 blk;
 
 	if (JsEatPunct(ji, ';'))
 		return NULL;
@@ -2180,9 +2187,14 @@ CJsNode *JsParseStmt(CJsInterp *ji)
 		if (!JsIsPunct(ji, ';'))
 		{
 			if (JsIsKw(ji, "var") || JsIsKw(ji, "let") || JsIsKw(ji, "const"))
-			{
+			{ // let/const in a for-init get a FRESH binding per iteration, var
+			  // does not. JN_VAR's op is otherwise unused, so flag it there for
+			  // JN_FOR to read.
+				blk = JsIsKw(ji, "let") || JsIsKw(ji, "const");
 				ji->pos++;
 				node->a = JsParseVar(ji); // eats its ';'
+				if (node->a && blk)
+					node->a->op = 1;
 			}
 			else
 			{
@@ -2342,6 +2354,34 @@ U0 JsEnvDeclare(CJsInterp *ji, CJsEnv *env, U8 *name, CJsVal *val)
 	p->val	= val(U64);
 	p->next = env->vars;
 	env->vars = p;
+}
+
+CJsEnv *JsEnvPerIter(CJsInterp *ji, CJsEnv *src)
+{ // ECMAScript CreatePerIterationEnvironment: a fresh env holding a COPY of
+  // src's own bindings, sharing src's parent. `for (let j...)` runs each
+  // iteration in one of these, so a closure made during iteration N keeps
+  // N's value instead of every closure seeing the final one.
+	CJsEnv	*e = JsAlloc(ji, sizeof(CJsEnv))(CJsEnv *);
+	CJsProp *p, *q, *tail = NULL;
+
+	e->parent = src->parent;
+	e->vars = NULL;
+	p = src->vars;
+	while (p)
+	{
+		q = JsAlloc(ji, sizeof(CJsProp))(CJsProp *);
+		q->name = p->name;	// arena-owned, safe to share
+		q->val	= p->val;
+		q->next = NULL;
+		if (tail)
+			tail->next = q;
+		else
+			e->vars = q;
+		tail = q;
+		p = p->next;
+	}
+
+	return e;
 }
 
 U0 JsEnvSet(CJsInterp *ji, U8 *name, CJsVal *val)
@@ -2579,6 +2619,8 @@ CJsVal *JsMemberGet(CJsInterp *ji, CJsVal *obj, U8 *name)
 				return JsStrV(ji, "@@iterator");
 			if (obj->native_id == JSN_PROMISE_CTOR && !StrCompare(name, "resolve"))
 				return JsNativeV(ji, JSN_PROMISE_SRESOLVE);
+			if (obj->native_id == JSN_PROMISE_CTOR && !StrCompare(name, "reject"))
+				return JsNativeV(ji, JSN_PROMISE_SREJECT);
 			v = JsPropGet(obj, name); // bound-fn slots (_t/_this) live here
 			if (v)
 				return v;
@@ -3024,8 +3066,8 @@ Bool JsLooseEq(CJsVal *a, CJsVal *b)
 
 F64 JsFmod(F64 a, F64 b)
 {
-	if (b == 0)
-		return 0;
+	if (JsNumIsZero(b))
+		return JsNumNaN; // x % 0 is NaN in JS, not 0
 
 	return a - b * Trunc(a / b);
 }
@@ -3063,8 +3105,16 @@ CJsVal *JsEvalBin(CJsInterp *ji, I64 op, CJsVal *a, CJsVal *b)
 	{
 		na = JsToNum(a);
 		nb = JsToNum(b);
-		if (nb == 0)
-			return JsNumV(ji, 0); // no Infinity; close enough
+		// x/0 is Infinity/-Infinity/NaN in JS. This returned 0 ("close enough")
+		// back when the number printer could not render those. It can now.
+		if (JsNumIsZero(nb))
+		{
+			if (JsNumIsNaN(na) || JsNumIsZero(na))
+				return JsNumV(ji, JsNumNaN);
+			if (na < 0.0)
+				return JsNumV(ji, JsNumNInf);
+			return JsNumV(ji, JsNumInf);
+		}
 		return JsNumV(ji, na / nb);
 	}
 	if (op == '%')
@@ -3268,7 +3318,9 @@ CJsVal *JsConstruct(CJsInterp *ji, CJsVal *fn, CJsVal **args, I64 argc, U8 *name
 
 CJsVal *JsEval(CJsInterp *ji, CJsNode *node)
 {
-	CJsVal	*v, *obj, *fn, *cur, *sv;
+	CJsVal	*v, *obj, *fn, *cur, *sv, *fproto;
+	CJsEnv	*saved_env, *loop_env;
+	Bool	 per_iter;
 	CJsVal	*argv[JS_MAX_ARGS];
 	CJsNode *child, *item;
 	CJsProp *prp;
@@ -3752,17 +3804,39 @@ CJsVal *JsEval(CJsInterp *ji, CJsNode *node)
 				ji->flow = JF_NORMAL;
 			return NULL;
 		case JN_FOR:
+			// per_iter: the init used let/const (flagged by JsParseStmt), so
+			// each turn of the loop needs its own copy of the bindings
+			per_iter = FALSE;
+			if (node->a && node->a->type == JN_VAR && node->a->op)
+				per_iter = TRUE;
+			saved_env = ji->env;
+			if (per_iter)
+			{ // the loop variable lives in its own scope, not the enclosing one
+				loop_env = JsAlloc(ji, sizeof(CJsEnv))(CJsEnv *);
+				loop_env->parent = ji->env;
+				loop_env->vars = NULL;
+				ji->env = loop_env;
+			}
 			if (node->a)
 				JsEval(ji, node->a);
+			if (per_iter)
+				ji->env = JsEnvPerIter(ji, ji->env);
 			while (!ji->has_err && ji->flow == JF_NORMAL &&
 				   (!node->b || JsToBool(JsEval(ji, node->b))))
 			{
 				JsEval(ji, node->d);
 				if (ji->flow == JF_CONTINUE)
 					ji->flow = JF_NORMAL; // continue still runs the update expr
-				if (ji->flow == JF_NORMAL && node->c)
-					JsEval(ji, node->c);
+				if (ji->flow == JF_NORMAL)
+				{ // copy BEFORE the update runs, per the spec: the increment
+				  // belongs to the next iteration's environment
+					if (per_iter)
+						ji->env = JsEnvPerIter(ji, ji->env);
+					if (node->c)
+						JsEval(ji, node->c);
+				}
 			}
+			ji->env = saved_env;
 			if (ji->flow == JF_BREAK)
 				ji->flow = JF_NORMAL;
 			return NULL;
@@ -3778,6 +3852,13 @@ CJsVal *JsEval(CJsInterp *ji, CJsNode *node)
 			v = JsValNew(ji, JV_FUNC);
 			v->func = node(U64);
 			v->fenv = ji->env; // capture the defining env: closures
+			// Every function gets a .prototype object. Without one the classic
+			// `Ctor.prototype.method = fn` idiom wrote into undefined (soft, so
+			// it failed silently) and JsConstruct had nothing to link an
+			// instance's proto to, leaving every such method undefined.
+			// JN_CLASS overwrites this with its own prototype object.
+			fproto = JsValNew(ji, JV_OBJ);
+			JsPropSet(ji, v, "prototype", fproto);
 			if (node->str)
 				JsEnvDeclare(ji, ji->env, node->str, v);
 			return v;
@@ -3924,8 +4005,11 @@ CJsVal *JsArgOr(CJsInterp *ji, CJsVal **args, I64 argc, I64 i)
 
 /* ---- microtasks + promises (Phase B-2) ---- */
 
-U0 JsMicroAdd(CJsInterp *ji, CJsVal *fn, CJsVal *arg, Bool has_arg)
-{
+U0 JsMicroAdd(CJsInterp *ji, CJsVal *fn, CJsVal *arg, Bool has_arg,
+			  CJsVal *derived)
+{ // derived (may be NULL) is the promise then() handed back to the caller; the
+  // drain settles it with fn's return value, which is what makes a chain run in
+  // sequence instead of all reactions firing off the same promise.
 	CJsMicro *m;
 
 	if (!fn || (fn->type != JV_FUNC && fn->type != JV_NATIVE))
@@ -3934,6 +4018,8 @@ U0 JsMicroAdd(CJsInterp *ji, CJsVal *fn, CJsVal *arg, Bool has_arg)
 	m->fn = fn;
 	m->arg = arg;
 	m->has_arg = has_arg;
+	m->derived = derived;
+	m->rejected = FALSE;
 	m->next = NULL;
 	if (ji->micro_tail)
 		ji->micro_tail->next = m;
@@ -3942,10 +4028,38 @@ U0 JsMicroAdd(CJsInterp *ji, CJsVal *fn, CJsVal *arg, Bool has_arg)
 	ji->micro_tail = m;
 }
 
+U0 JsMicroPass(CJsInterp *ji, CJsVal *derived, CJsVal *val, Bool rejected)
+{ // a reaction with no handler for this outcome still costs one microtask tick:
+  // it is a job like any other. Settling derived inline instead made a bare
+  // then() resolve a whole turn early and reordered the queue.
+	CJsMicro *m;
+
+	if (!derived)
+		return;
+	m = JsAlloc(ji, sizeof(CJsMicro))(CJsMicro *);
+	m->fn = NULL;	// the drain reads this as "pass-through"
+	m->arg = val;
+	m->has_arg = TRUE;
+	m->derived = derived;
+	m->rejected = rejected;
+	m->next = NULL;
+	if (ji->micro_tail)
+		ji->micro_tail->next = m;
+	else
+		ji->micro_head = m;
+	ji->micro_tail = m;
+}
+
+// Settling a derived promise from the drain means calling forward. These MUST
+// be extern: a bare prototype compiles as an empty function in ZealC.
+extern U0 JsPromiseSettle(CJsInterp *ji, CJsVal *pr, CJsVal *val, Bool rejected);
+extern U0 JsPromiseReact(CJsInterp *ji, CJsVal *pr, CJsVal *cb, Bool on_rej,
+						 CJsVal *derived);
+
 U0 JsMicroDrain(CJsInterp *ji)
 { // run queued promise reactions; bounded so a self-queuing loop can't wedge
 	CJsMicro *m;
-	CJsVal	 *a1;
+	CJsVal	 *a1, *r;
 	I64		  ran = 0;
 
 	while (ji->micro_head && ran < 512)
@@ -3958,13 +4072,38 @@ U0 JsMicroDrain(CJsInterp *ji)
 		ji->depth = 0;
 		ji->flow = JF_NORMAL;
 		ji->env = ji->genv;
-		if (m->has_arg)
-		{
-			a1 = m->arg;
-			JsCall(ji, m->fn, NULL, &a1, 1);
+		if (!m->fn)
+		{ // pass-through job: no handler for this outcome, forward the value
+			JsPromiseSettle(ji, m->derived, m->arg, m->rejected);
 		}
 		else
-			JsCall(ji, m->fn, NULL, NULL, 0);
+		{
+			if (m->has_arg)
+			{
+				a1 = m->arg;
+				r = JsCall(ji, m->fn, NULL, &a1, 1);
+			}
+			else
+				r = JsCall(ji, m->fn, NULL, NULL, 0);
+			if (m->derived)
+			{ // settle the promise then() returned, so the next link can run
+				if (ji->flow == JF_THROW)
+				{ // a throw inside a handler rejects the chain, it does not
+				  // escape into the pump
+					JsPromiseSettle(ji, m->derived, ji->exc, TRUE);
+					ji->exc = NULL;
+				}
+				else if (r && r->type == JV_OBJ &&
+						 r->native_id == JSO_PROMISE)
+				{ // returning a promise adopts it: derived settles when it
+				  // does, via the same NULL-callback pass-through
+					JsPromiseReact(ji, r, NULL, FALSE, m->derived);
+					JsPromiseReact(ji, r, NULL, TRUE,  m->derived);
+				}
+				else
+					JsPromiseSettle(ji, m->derived, r, FALSE);
+			}
+		}
 		if (ji->has_err)
 		{
 			NetLog("%s", ji->err);
@@ -3983,12 +4122,25 @@ CJsVal *JsPromiseNew(CJsInterp *ji)
 	JsPropSet(ji, pr, "_state", JsNumV(ji, 0)); // 0 pending 1 resolved 2 rejected
 	JsPropSet(ji, pr, "_onres", JsArrV(ji));
 	JsPropSet(ji, pr, "_onrej", JsArrV(ji));
+	// derived promise per reaction, same index as _onres/_onrej. A slot holds
+	// JV_UNDEF when then() was called without capturing the result.
+	JsPropSet(ji, pr, "_onresd", JsArrV(ji));
+	JsPropSet(ji, pr, "_onrejd", JsArrV(ji));
 	return pr;
 }
 
-U0 JsPromiseSettle(CJsInterp *ji, CJsVal *pr, CJsVal *val, Bool rejected)
+Bool JsIsCallable(CJsVal *v)
 {
-	CJsVal *st, *cbs;
+	if (!v)
+		return FALSE;
+
+	return v->type == JV_FUNC || v->type == JV_NATIVE;
+}
+
+U0 JsPromiseSettle(CJsInterp *ji, CJsVal *pr, CJsVal *val, Bool rejected)
+{ // recurses directly into itself for the pass-through case (a reaction with no
+  // handler for this outcome forwards straight to its derived promise)
+	CJsVal *st, *cbs, *ds, *d;
 	I64		i;
 
 	if (!pr || pr->native_id != JSO_PROMISE)
@@ -4004,20 +4156,40 @@ U0 JsPromiseSettle(CJsInterp *ji, CJsVal *pr, CJsVal *val, Bool rejected)
 		JsPropSet(ji, pr, "_state", JsNumV(ji, 1));
 	JsPropSet(ji, pr, "_value", val);
 	if (rejected)
+	{
 		cbs = JsPropGet(pr, "_onrej");
+		ds	= JsPropGet(pr, "_onrejd");
+	}
 	else
+	{
 		cbs = JsPropGet(pr, "_onres");
+		ds	= JsPropGet(pr, "_onresd");
+	}
 	if (cbs && cbs->type == JV_ARR)
 		for (i = 0; i < cbs->count; i++)
-			JsMicroAdd(ji, cbs->items[i], val, TRUE);
+		{
+			d = NULL;
+			if (ds && ds->type == JV_ARR && i < ds->count &&
+				ds->items[i]->type == JV_OBJ)
+				d = ds->items[i];
+			if (JsIsCallable(cbs->items[i]))
+				JsMicroAdd(ji, cbs->items[i], val, TRUE, d);
+			else
+				JsMicroPass(ji, d, val, rejected); // no handler: forward
+		}
 }
 
-U0 JsPromiseReact(CJsInterp *ji, CJsVal *pr, CJsVal *cb, Bool on_rej)
-{ // then/catch registration (or immediate microtask when already settled)
-	CJsVal *st, *val, *cbs;
+U0 JsPromiseReact(CJsInterp *ji, CJsVal *pr, CJsVal *cb, Bool on_rej,
+				  CJsVal *derived)
+{ // then/catch registration (or immediate microtask when already settled).
+  // cb may be NULL: that registers a pass-through, which is how a returned
+  // promise is adopted and how then(f) still rejects its derived promise.
+	CJsVal *st, *val, *cbs, *ds;
 	I64		state;
 
-	if (!pr || pr->native_id != JSO_PROMISE || !cb)
+	if (!pr || pr->native_id != JSO_PROMISE)
+		return;
+	if (!cb && !derived)
 		return;
 	st = JsPropGet(pr, "_state");
 	state = 0;
@@ -4026,17 +4198,39 @@ U0 JsPromiseReact(CJsInterp *ji, CJsVal *pr, CJsVal *cb, Bool on_rej)
 	if (state == 0)
 	{
 		if (on_rej)
+		{
 			cbs = JsPropGet(pr, "_onrej");
+			ds	= JsPropGet(pr, "_onrejd");
+		}
 		else
+		{
 			cbs = JsPropGet(pr, "_onres");
+			ds	= JsPropGet(pr, "_onresd");
+		}
 		if (cbs && cbs->type == JV_ARR)
-			JsArrPush(ji, cbs, cb);
+		{
+			if (cb)
+				JsArrPush(ji, cbs, cb);
+			else
+				JsArrPush(ji, cbs, JsUndefV(ji));
+			// the derived slot must stay index-aligned with the callback slot
+			if (ds && ds->type == JV_ARR)
+			{
+				if (derived)
+					JsArrPush(ji, ds, derived);
+				else
+					JsArrPush(ji, ds, JsUndefV(ji));
+			}
+		}
 		return;
 	}
 	if ((state == 1 && !on_rej) || (state == 2 && on_rej))
 	{
 		val = JsPropGet(pr, "_value");
-		JsMicroAdd(ji, cb, val, TRUE);
+		if (JsIsCallable(cb))
+			JsMicroAdd(ji, cb, val, TRUE, derived);
+		else
+			JsMicroPass(ji, derived, val, on_rej);
 	}
 }
 
@@ -4207,7 +4401,7 @@ CJsVal *JsJsonParseVal(CJsInterp *ji, U8 **pp, I64 depth)
 	if (!n)
 	{ (*pp)++; return JsNullV(ji); }
 	no_warn neg;
-	return JsNumV(ji, Str2F64(buf));
+	return JsNumV(ji, JsStr2F64(buf));
 }
 
 U0 JsJsonAppend(U8 *out, I64 *n, I64 max, U8 *s)
@@ -4971,8 +5165,13 @@ CJsVal *JsCall(CJsInterp *ji, CJsVal *fn, CJsVal *this_val,
 /* ---- interpreter lifecycle ---- */
 
 U0 JsGlobalNative(CJsInterp *ji, U8 *name, I64 id)
-{
-	JsEnvDeclare(ji, ji->genv, name, JsNativeV(ji, id));
+{ // the binding name is stashed on the value itself: Error/TypeError/RangeError/
+  // SyntaxError all share JSN_ERROR_CTOR, and the constructor needs to know
+  // which name it was reached through to fill in err.name.
+	CJsVal *fn = JsNativeV(ji, id);
+
+	JsPropSet(ji, fn, "_name", JsStrV(ji, name));
+	JsEnvDeclare(ji, ji->genv, name, fn);
 }
 
 CJsInterp *JsInterpNew(CZNode *dom_root, U8 *url)
@@ -5025,6 +5224,13 @@ CJsInterp *JsInterpNew(CZNode *dom_root, U8 *url)
 	JsGlobalNative(ji, "String",	 JSN_STRING);
 	JsGlobalNative(ji, "Number",	 JSN_NUMBER);
 	JsGlobalNative(ji, "isNaN",		 JSN_ISNAN);
+
+	// NaN and Infinity are global BINDINGS in JS, not just shapes the number
+	// printer knows how to render. Without these, `NaN` resolved to undefined.
+	JsEnvDeclare(ji, ji->genv, "NaN",
+				 JsNumV(ji, JsNumConst(0x7FF8000000000000)));
+	JsEnvDeclare(ji, ji->genv, "Infinity",
+				 JsNumV(ji, JsNumConst(0x7FF0000000000000)));
 	JsGlobalNative(ji, "setTimeout",	JSN_SETTIMEOUT);
 	JsGlobalNative(ji, "setInterval",	JSN_SETINTERVAL);
 	JsGlobalNative(ji, "clearTimeout",	JSN_CLEARTIMER);

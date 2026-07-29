@@ -73,6 +73,19 @@ I16 js_num_pow_e[87] = {
 U32 js_num_pow10[10] = {
 	1, 10, 100, 1000, 10000, 100000, 1000000, 10000000, 100000000, 1000000000};
 
+// The fractional digit loop scales wp_w by 10^-kappa, and -kappa reaches ~17 for
+// a 17-significant-digit result, so the U32 table above is far too short. It
+// used to clamp to zero past 10^9, which silently DISABLED JsGrisuRound (its
+// loop starts `rest < wp_w`, never true against 0) and left the last digit
+// uncorrected: 0.1+0.2 printed 0.30000000000000007 instead of the closest
+// shortest form 0.30000000000000004 that Number::toString requires.
+// Stops at 10^18 because 10^19 does not fit an I64 source literal.
+U64 js_num_pow10_64[19] = {
+	1, 10, 100, 1000, 10000, 100000, 1000000, 10000000, 100000000,
+	1000000000, 10000000000, 100000000000, 1000000000000, 10000000000000,
+	100000000000000, 1000000000000000, 10000000000000000, 100000000000000000,
+	1000000000000000000};
+
 I64 JsNumCachedPow(I64 e, CJsDiyFp *out)
 { // pick the cached 10^k whose product with a diy_fp of exponent e lands the
   // result in the [alpha,gamma] window; returns k (the decimal exponent).
@@ -240,10 +253,12 @@ I64 JsGrisuDigits(CJsDiyFp *w, CJsDiyFp *mp, U64 delta, U8 *buf, I64 *_k)
 		{
 			*_k += kappa;
 			idx = -kappa;
-			if (idx < 10)
-				wp_w *= js_num_pow10[idx];
+			if (idx < 19)
+				wp_w *= js_num_pow10_64[idx];
 			else
-				wp_w = 0;
+				wp_w = 0; // past the table: skip the correction rather than
+						  // scale by a bogus factor. Unreachable for normal
+						  // doubles, which need at most ~17 fractional digits.
 			JsGrisuRound(buf, len, delta, p2, one.f, wp_w);
 			return len;
 		}
@@ -399,4 +414,182 @@ U8 *JsF64ToStr(U8 *out, F64 d)
 
 	out[o] = 0;
 	return out;
+}
+
+/* ---- decimal -> F64 (the other direction) ----
+   The kernel's Str2F64 accumulates the mantissa into an I64 and divides by
+   Pow10I64, so it is not correctly rounded -- the same reason JSNum.ZC refuses
+   to use it as a round-trip oracle (see the header). Every numeric literal in
+   every script went through it, so `1e21` became 999999999999999600000 and
+   Grisu2 then printed that wrong double perfectly.
+
+   Strategy is Clinger's fast path: an integer mantissa below 2^53 times an
+   exactly representable power of ten is correctly rounded by a single IEEE
+   operation. 10^0..10^22 are all exact (10^22 = 2^22 * 5^22 and 5^22 < 2^53),
+   which covers essentially every literal real source contains. Beyond that we
+   step in exact 10^22 chunks, so the error stays near one ulp instead of
+   compounding per digit. */
+
+F64	 js_num_p10[23];
+Bool js_num_p10_ready = FALSE;	// globals are NOT zeroed by the JIT
+
+U0 JsNumP10Init()
+{ // built by repeated multiplication rather than written as literals: the
+  // compiler would have to parse those literals with a converter of its own,
+  // which is the very thing being worked around here. Each step is exact.
+	I64 i;
+
+	js_num_p10[0] = 1.0;
+	i = 1;
+	while (i < 23)
+	{
+		js_num_p10[i] = js_num_p10[i - 1] * 10.0;
+		i++;
+	}
+	js_num_p10_ready = TRUE;
+}
+
+F64 JsNumConst(U64 bits)
+{ // reinterpret bits as an F64. KernelA.HH's `inf` uses a postfix cast, which is
+  // a no-op on anything but a literal in ZealC, so go through memory the same
+  // way JsDiyFromF64 does in the other direction.
+	F64 d;
+
+	MemCopy(&d, &bits, 8);
+
+	return d;
+}
+
+F64 JsNumNaN()	{ return JsNumConst(0x7FF8000000000000); }
+F64 JsNumInf()	{ return JsNumConst(0x7FF0000000000000); }
+// -Infinity is 0xFFF0.. which will not fit an I64 source literal, so subtract
+F64 JsNumNInf()	{ return 0.0 - JsNumConst(0x7FF0000000000000); }
+
+Bool JsNumIsNaN(F64 d)
+{ // NaN is the only value unequal to itself, but F64 comparison in ZealC has
+  // enough traps (negative zero, `!` on F64) that testing the bits is safer
+	U64 bits;
+
+	MemCopy(&bits, &d, 8);
+
+	return (bits & JSD_EXP_MASK) == JSD_EXP_MASK && (bits & JSD_SIG_MASK) != 0;
+}
+
+Bool JsNumIsZero(F64 d)
+{ // two relationals, not `== 0.0`: -0.0 fails equality here (gotcha #13)
+	return d <= 0.0 && d >= 0.0;
+}
+
+F64 JsMantScale(I64 mant, I64 dexp)
+{ // mant * 10^dexp
+	F64 m;
+
+	if (!js_num_p10_ready)
+		JsNumP10Init;
+	if (!mant)
+		return 0.0;
+	m = ToF64(mant); // postfix casts are no-ops in ZealC; ToF64 is the intrinsic
+	// clamp first so the chunk loops below cannot spin: past these the result
+	// is Infinity or 0 anyway
+	if (dexp > 400)
+		dexp = 400;
+	if (dexp < -400)
+		dexp = -400;
+	if (mant <= 9007199254740992) // 2^53: mantissa still exact as an F64
+	{ // written out rather than chained: ZealC chained comparison is fine for
+	  // one operator, but do not make a mixed <=/< chain carry a correctness fix
+		if (dexp >= 0 && dexp <= 22)
+			return m * js_num_p10[dexp];
+		if (dexp < 0 && dexp >= -22)
+			return m / js_num_p10[-dexp];
+	}
+	while (dexp > 22)
+	{
+		m *= js_num_p10[22];
+		dexp -= 22;
+	}
+	while (dexp < -22)
+	{
+		m /= js_num_p10[22];
+		dexp += 22;
+	}
+	if (dexp > 0)
+		m *= js_num_p10[dexp];
+	else if (dexp < 0)
+		m /= js_num_p10[-dexp];
+
+	return m;
+}
+
+F64 JsStr2F64(U8 *s)
+{ // decimal -> F64. Leading space and sign, digits, fraction, exponent; stops
+  // at the first byte that cannot continue the number. No hex, no Infinity
+  // spelling: JS literals of those forms never reach here.
+	I64	 mant = 0, ndig = 0, dexp = 0, eval = 0, esign = 1;
+	Bool neg = FALSE, any = FALSE;
+	F64	 r;
+
+	if (!s)
+		return 0.0;
+	while (*s == ' ' || *s == '\t' || *s == '\n' || *s == '\r')
+		s++;
+	if (*s == '+')
+		s++;
+	else if (*s == '-')
+	{
+		neg = TRUE;
+		s++;
+	}
+	while ('0' <= *s <= '9')
+	{
+		any = TRUE;
+		if (ndig < 18) // 18 digits is the most that always fits an I64
+		{
+			mant = mant * 10 + (*s - '0');
+			ndig++;
+		}
+		else
+			dexp++; // past our precision: count it as scale instead
+		s++;
+	}
+	if (*s == '.')
+	{
+		s++;
+		while ('0' <= *s <= '9')
+		{
+			any = TRUE;
+			if (ndig < 18)
+			{
+				mant = mant * 10 + (*s - '0');
+				ndig++;
+				dexp--;
+			}
+			s++;
+		}
+	}
+	if (!any)
+		return 0.0;
+	if (*s == 'e' || *s == 'E')
+	{
+		s++;
+		if (*s == '+')
+			s++;
+		else if (*s == '-')
+		{
+			esign = -1;
+			s++;
+		}
+		while ('0' <= *s <= '9')
+		{
+			if (eval < 100000)
+				eval = eval * 10 + (*s - '0');
+			s++;
+		}
+		dexp += esign * eval;
+	}
+	r = JsMantScale(mant, dexp);
+	if (neg)
+		return -r;
+
+	return r;
 }
