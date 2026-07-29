@@ -1,0 +1,937 @@
+//YDE Start Menu - a drawn launcher panel, not a DolDoc pick list.
+//
+//It is an ordinary ZealOS task that takes over its own window: borderless,
+//parked just above the taskbar, painted entirely from Fs->draw_it (window
+//relative, z-clipped like every other window). Input arrives through the task
+//message queue, so hover / click / wheel / typing all work without the WinMgr
+//knowing anything about it.
+//
+//Text: labels are pre-rendered ONCE into off-screen DCs with the scalable UI
+//font (::/System/Gr/UISANS.TTF - the same one the browser loads) and blotted
+//every frame. Rasterizing glyphs inside draw_it would stall the whole desktop,
+//since draw_it runs in the Window Manager. With no font file on disk every
+//label falls back to the 8x8 bitmap font and the panel still works.
+//
+//DE.ZC's taskbar chip spawns DEStartMenuTask through the de_menu_fp hook, so
+//DE.ZC needs no compile-time knowledge of this file.
+
+#define DE_SM_W				424		//panel size in pixels; both are multiples
+#define DE_SM_H				496		//of the 8x8 cell so the window lands exact
+#define DE_SM_COLS			(DE_SM_W / FONT_WIDTH)
+#define DE_SM_ROWS			(DE_SM_H / FONT_HEIGHT)
+
+#define DE_SM_HEAD_H		72
+#define DE_SM_SEARCH_Y		80
+#define DE_SM_SEARCH_H		26
+#define DE_SM_CHIP_Y		114
+#define DE_SM_CHIP_H		20
+#define DE_SM_LIST_Y		142
+#define DE_SM_ROW_H			38
+#define DE_SM_ROWS_VIS		8
+#define DE_SM_LIST_H		(DE_SM_ROWS_VIS * DE_SM_ROW_H)
+#define DE_SM_FOOT_Y		(DE_SM_LIST_Y + DE_SM_LIST_H + 12)
+#define DE_SM_FOOT_H		30
+#define DE_SM_PAD			12
+#define DE_SM_SBAR_X		(DE_SM_W - 17)
+
+#define DE_SM_F_NAME		15		//scalable font sizes, in pixels
+#define DE_SM_F_SMALL		12
+
+#define DE_SM_MAX			32
+#define DE_SM_QUERY_MAX		24
+
+//Categories. ALL must stay 0: it doubles as "no filter".
+#define DE_SMC_ALL			0
+#define DE_SMC_APPS			1
+#define DE_SMC_NET			2
+#define DE_SMC_MEDIA		3
+#define DE_SMC_SYS			4
+#define DE_SMC_FUN			5
+#define DE_SM_CATS			6
+
+//What activating an entry does.
+#define DE_SMA_CMD			0		//User(cmd)
+#define DE_SMA_NET			1		//bring the net stack up first, then User(cmd)
+#define DE_SMA_TERM			2		//bare terminal
+#define DE_SMA_DEMO			3		//the YDE vector intro, in this task
+#define DE_SMA_ABOUT		4
+
+//Icon glyphs, drawn as vectors in a 24x24 box.
+#define DE_SMI_TERM			0
+#define DE_SMI_GLOBE		1
+#define DE_SMI_CHAT			2
+#define DE_SMI_MAIL			3
+#define DE_SMI_NOTE			4
+#define DE_SMI_GAME			5
+#define DE_SMI_CALC			6
+#define DE_SMI_CAL			7
+#define DE_SMI_IMAGE		8
+#define DE_SMI_GEAR			9
+#define DE_SMI_FOLDER		10
+#define DE_SMI_CHART		11
+#define DE_SMI_STAR			12
+#define DE_SMI_INFO			13
+#define DE_SMI_POWER		14
+#define DE_SMI_EXIT			15
+
+#define DE_SM_FOOT_N		3
+
+#define DE_SM_HINT			"Enter opens   Tab filters   Esc closes"
+#define DE_SM_PLACE			"Search apps..."
+#define DE_SM_NONE			"Nothing matches that."
+
+class CDESMItem
+{
+	U8	*name, *desc, *cmd;
+	I64	 icon, cat, act;
+	CDC	*dc_name, *dc_desc;	//pre-rendered labels, NULL on the bitmap fallback
+};
+
+//Top-level array, like the kernel's glyph cache: a class array nested inside
+//another class is not worth relying on.
+CDESMItem de_sm_item[DE_SM_MAX];
+
+class CDESMState
+{
+	I64		 n;						//entries built
+	I64		 view[DE_SM_MAX];		//indices surviving the category + search filter
+	I64		 view_n;
+	I64		 sel, scroll;
+	I64		 cat;					//active category chip
+	I64		 cat_x0[DE_SM_CATS], cat_x1[DE_SM_CATS];
+	I64		 foot_x0[DE_SM_FOOT_N], foot_x1[DE_SM_FOOT_N];
+	CDC		*dc_cat[DE_SM_CATS];
+	CDC		*dc_ver, *dc_query, *dc_place, *dc_none, *dc_hint;
+	U8		 ver[STR_LEN];			//same text as dc_ver, for the 8x8 fallback
+	U8		 query[DE_SM_QUERY_MAX];
+	I64		 query_len;
+	I64		 pick;					//chosen entry, -1 = none
+	I64		 foot_pick;				//chosen footer button, -1 = none
+	I64		 last_z;				//mouse wheel tracking
+	F64		 t_open;
+	Bool	 done;
+} de_sm;
+
+/* ---------------- text: scalable font with an 8x8 fallback ---------------- */
+
+U0 DESMFontEnsure()
+{//The scalable UI fonts are normally loaded by the browser, but the start menu
+//is usually the first thing anyone opens. grf_ready is a real static FALSE, so
+//it is safe to test before anything has written it (globals are JIT garbage).
+//Load BOTH slots the browser loads, or grf_ready would go TRUE with no mono
+//font behind it and ZincGX would skip loading one. CJK stays browser-only:
+//1.8MB of glyphs no launcher needs (ZincGX has its own flag for it).
+	I64	 fsz = 0, msz = 0;
+	U8	*fbuf, *mbuf;
+
+	if (grf_ready)
+		return;
+	fbuf = FileRead("::/System/Gr/UISANS.TTF", &fsz);
+	mbuf = FileRead("::/System/Gr/UIMONO.TTF", &msz);
+	GrFontInit(fbuf, fsz);							//slot 0, sets grf_ready
+	GrFontInitInto(&grf_mono_font, 1, mbuf, msz);	//slot 1 (may fail -> sans)
+	if (fbuf)
+		Free(fbuf);
+	if (mbuf)
+		Free(mbuf);
+}
+
+CDC *DESMTextDC(U8 *s, I64 size, CColorROPU32 col)
+{//Pre-render one label into an off-screen DC. NULL means "no scalable font" -
+//callers then GrPrint with the 8x8 bitmap font instead.
+//bg < 0 keeps the background transparent; the anti-aliased edges blend toward
+//black, which on this dark panel reads as a faint text shadow.
+	if (!grf_ready || !s || !*s)
+		return NULL;
+	return GrFontRenderDC(&grf_ui_font, size, col & 0xFFFFFF, -1, s);
+}
+
+U0 DESMDCFree(CDC **p)
+{
+	if (*p)
+	{
+		DCDel(*p);
+		*p = NULL;
+	}
+}
+
+I64 DESMTextW(CDC *pre, U8 *s)
+{//Width of a label as it will actually be drawn.
+	if (pre)
+		return pre->width;
+	if (!s)
+		return 0;
+
+	return StrLen(s) * FONT_WIDTH;
+}
+
+I64 DESMTextH(CDC *pre)
+{
+	if (pre)
+		return pre->height;
+
+	return FONT_HEIGHT;
+}
+
+U0 DESMText(CDC *dc, I64 x, I64 y, CDC *pre, U8 *s, CColorROPU32 col)
+{//y is the TOP of the text box, matching GrPrint.
+	dc->color = col;
+	if (pre)
+		GrBlot(dc, x, y, pre);
+	else if (s)
+		GrPrint(dc, x, y, "%s", s);
+}
+
+U0 DESMLogo(CDC *dc, I64 lx, I64 ly, I64 sc, CColorROPU32 col)
+{//Pixel-upscaled "YDE" in the system font - the same logotype as the splash.
+	U8	*name = "YDE";
+	I64	 i, px, py;
+	U64	 bits;
+
+	dc->color = col;
+	for (i = 0; name[i]; i++)
+	{
+		bits = text.font[name[i]];
+		for (py = 0; py < FONT_HEIGHT; py++)
+			for (px = 0; px < FONT_WIDTH; px++)
+				if (bits >> (py * 8 + px) & 1)
+					GrRect(dc, lx + (i * FONT_WIDTH + px) * sc, ly + py * sc, sc, sc);
+	}
+}
+
+/* ---------------- icons ---------------- */
+
+U0 DESMIcon(CDC *dc, I64 x, I64 y, I64 id, CColorROPU32 c1, CColorROPU32 c2)
+{//Vector glyph in a 24x24 box at (x, y). c1 = detail/accent, c2 = body/shape.
+	I64 i, j;
+
+	switch (id)
+	{
+		case DE_SMI_TERM:
+			dc->color = c2;
+			GrRect(dc, x, y + 2, 24, 20);
+			dc->color = c1;
+			GrRect(dc, x, y + 2, 24, 4);
+			GrLine(dc, x + 5, y + 10, x + 9, y + 13);
+			GrLine(dc, x + 9, y + 13, x + 5, y + 16);
+			GrRect(dc, x + 12, y + 16, 7, 2);
+			break;
+		case DE_SMI_GLOBE:
+			dc->color = c2;
+			GrFillCircle(dc, x + 12, y + 12, 0, 22);
+			dc->color = c1;
+			GrCircle(dc, x + 12, y + 12, 11);
+			GrLine(dc, x + 1, y + 12, x + 23, y + 12);
+			GrEllipse(dc, x + 12, y + 12, 5, 11);
+			break;
+		case DE_SMI_CHAT:
+			dc->color = c2;
+			GrRect(dc, x + 1, y + 3, 22, 14);
+			GrRect(dc, x + 4, y + 17, 7, 4);
+			dc->color = c1;
+			GrRect(dc, x + 5, y + 7, 14, 2);
+			GrRect(dc, x + 5, y + 11, 9, 2);
+			break;
+		case DE_SMI_MAIL:
+			dc->color = c2;
+			GrRect(dc, x + 1, y + 5, 22, 15);
+			dc->color = c1;
+			GrLine(dc, x + 1, y + 5, x + 12, y + 14);
+			GrLine(dc, x + 12, y + 14, x + 23, y + 5);
+			break;
+		case DE_SMI_NOTE:
+			dc->color = c2;
+			GrFillCircle(dc, x + 9, y + 18, 0, 10);
+			dc->color = c1;
+			GrRect(dc, x + 13, y + 3, 2, 15);
+			GrRect(dc, x + 15, y + 3, 7, 2);
+			GrRect(dc, x + 20, y + 3, 2, 7);
+			break;
+		case DE_SMI_GAME:
+			dc->color = c2;
+			GrRect(dc, x + 1, y + 7, 22, 11);
+			dc->color = c1;
+			GrRect(dc, x + 4, y + 11, 7, 2);
+			GrRect(dc, x + 6, y + 9, 2, 6);
+			GrFillCircle(dc, x + 16, y + 11, 0, 5);
+			GrFillCircle(dc, x + 19, y + 15, 0, 5);
+			break;
+		case DE_SMI_CALC:
+			dc->color = c2;
+			GrRect(dc, x + 2, y + 2, 20, 20);
+			dc->color = c1;
+			GrRect(dc, x + 4, y + 4, 16, 5);
+			for (j = 0; j < 3; j++)
+				for (i = 0; i < 3; i++)
+					GrRect(dc, x + 5 + i * 6, y + 11 + j * 4, 4, 3);
+			break;
+		case DE_SMI_CAL:
+			dc->color = c2;
+			GrRect(dc, x + 2, y + 4, 20, 18);
+			dc->color = c1;
+			GrRect(dc, x + 2, y + 4, 20, 5);
+			GrRect(dc, x + 6, y + 1, 2, 5);
+			GrRect(dc, x + 16, y + 1, 2, 5);
+			for (j = 0; j < 2; j++)
+				for (i = 0; i < 3; i++)
+					GrRect(dc, x + 5 + i * 6, y + 12 + j * 5, 3, 3);
+			break;
+		case DE_SMI_IMAGE:
+			dc->color = c2;
+			GrRect(dc, x + 1, y + 4, 22, 16);
+			dc->color = c1;
+			GrFillCircle(dc, x + 7, y + 9, 0, 5);
+			GrLine(dc, x + 3, y + 19, x + 11, y + 11);
+			GrLine(dc, x + 11, y + 11, x + 16, y + 16);
+			GrLine(dc, x + 16, y + 16, x + 20, y + 12);
+			GrLine(dc, x + 20, y + 12, x + 22, y + 19);
+			break;
+		case DE_SMI_GEAR:
+			dc->color = c2;
+			GrRect(dc, x + 9, y + 1, 6, 22);
+			GrRect(dc, x + 1, y + 9, 22, 6);
+			GrFillCircle(dc, x + 12, y + 12, 0, 20);
+			dc->color = c1;
+			GrCircle(dc, x + 12, y + 12, 10);
+			GrFillCircle(dc, x + 12, y + 12, 0, 8);
+			break;
+		case DE_SMI_FOLDER:
+			dc->color = c2;
+			GrRect(dc, x + 1, y + 4, 10, 4);
+			GrRect(dc, x + 1, y + 7, 22, 14);
+			dc->color = c1;
+			GrRect(dc, x + 1, y + 7, 22, 2);
+			break;
+		case DE_SMI_CHART:
+			dc->color = c1;
+			GrRect(dc, x + 3, y + 13, 4, 9);
+			GrRect(dc, x + 10, y + 7, 4, 15);
+			GrRect(dc, x + 17, y + 10, 4, 12);
+			dc->color = c2;
+			GrRect(dc, x + 1, y + 22, 22, 2);
+			break;
+		case DE_SMI_STAR:
+			dc->color = c1;
+			GrRect(dc, x + 11, y + 2, 3, 20);
+			GrRect(dc, x + 2, y + 11, 20, 3);
+			dc->color = c2;
+			GrLine(dc, x + 5, y + 5, x + 19, y + 19);
+			GrLine(dc, x + 19, y + 5, x + 5, y + 19);
+			break;
+		case DE_SMI_INFO:
+			dc->color = c2;
+			GrFillCircle(dc, x + 12, y + 12, 0, 22);
+			dc->color = c1;
+			GrRect(dc, x + 11, y + 5, 3, 3);
+			GrRect(dc, x + 11, y + 10, 3, 9);
+			break;
+		case DE_SMI_POWER:
+			dc->color = c1;
+			GrCircle(dc, x + 12, y + 13, 9);
+			GrCircle(dc, x + 12, y + 13, 8);
+			dc->color = c2;
+			GrRect(dc, x + 8, y + 1, 8, 7);
+			dc->color = c1;
+			GrRect(dc, x + 11, y + 2, 3, 11);
+			break;
+		case DE_SMI_EXIT:
+			dc->color = c2;
+			GrRect(dc, x + 2, y + 3, 11, 18);
+			dc->color = c1;
+			GrRect(dc, x + 10, y + 11, 11, 3);
+			GrLine(dc, x + 17, y + 8, x + 21, y + 12);
+			GrLine(dc, x + 21, y + 12, x + 17, y + 17);
+			break;
+	}
+}
+
+/* ---------------- entries ---------------- */
+
+U0 DESMAdd(U8 *name, U8 *desc, I64 icon, I64 cat, I64 act, U8 *cmd)
+{
+	CDESMItem *it;
+
+	if (de_sm.n >= DE_SM_MAX)
+		return;
+	it			= &de_sm_item[de_sm.n++];
+	it->name	= name;
+	it->desc	= desc;
+	it->cmd		= cmd;
+	it->icon	= icon;
+	it->cat		= cat;
+	it->act		= act;
+	it->dc_name	= DESMTextDC(name, DE_SM_F_NAME,  de_theme.text);
+	it->dc_desc	= DESMTextDC(desc, DE_SM_F_SMALL, de_theme.text_dim);
+}
+
+U8 *DESMCatName(I64 c)
+{
+	switch (c)
+	{
+		case DE_SMC_APPS:	return "Apps";
+		case DE_SMC_NET:	return "Net";
+		case DE_SMC_MEDIA:	return "Media";
+		case DE_SMC_SYS:	return "System";
+		case DE_SMC_FUN:	return "Fun";
+		default:			return "All";
+	}
+}
+
+U0 DESMBuild()
+{//The launcher catalog. Order here is the order on screen.
+	I64 i;
+
+	DESMAdd("Terminal",			"ZealC command line",			DE_SMI_TERM,	DE_SMC_SYS,		DE_SMA_TERM,	NULL);
+	DESMAdd("Web Browser",		"Zinc V3 engine, TLS 1.3",		DE_SMI_GLOBE,	DE_SMC_NET,		DE_SMA_NET,		"ZincV3;\n");
+	DESMAdd("IRC Chat",			"yIRC - libera.chat and friends",DE_SMI_CHAT,	DE_SMC_NET,		DE_SMA_NET,		"ExeFile(\"::/DE/yIRC\");\n");
+	DESMAdd("Email",			"ZMail over IMAP + SMTP",		DE_SMI_MAIL,	DE_SMC_NET,		DE_SMA_NET,		"ExeFile(\"::/DE/ZMail\");\n");
+	DESMAdd("Harmony",			"Chat client",					DE_SMI_CHAT,	DE_SMC_NET,		DE_SMA_NET,		"Cd(\"::/Apps/yHarmony\");;ExeFile(\"Run\");\n");
+	DESMAdd("Telnet / BBS",		"Terminal over raw TCP",		DE_SMI_TERM,	DE_SMC_NET,		DE_SMA_NET,		"ExeFile(\"::/Home/Net/Programs/Telnet/Telnet\");\n");
+	DESMAdd("ZealAmp",			"MP3 player",					DE_SMI_NOTE,	DE_SMC_MEDIA,	DE_SMA_CMD,		"Cd(\"::/Apps/ZealAmp\");;ExeFile(\"Run\");\n");
+	DESMAdd("YTracker",			"Pattern music tracker",		DE_SMI_NOTE,	DE_SMC_MEDIA,	DE_SMA_CMD,		"Cd(\"::/Apps/Tracker\");;ExeFile(\"Run\");\n");
+	DESMAdd("Image Viewer",		"PNG, JPG and GIF",				DE_SMI_IMAGE,	DE_SMC_MEDIA,	DE_SMA_CMD,		"DEViewImage;\n");
+	DESMAdd("Quake",			"Native spec-clean port",		DE_SMI_GAME,	DE_SMC_FUN,		DE_SMA_CMD,		"Cd(\"::/Apps/Quake\");;ExeFile(\"Run\");\n");
+	DESMAdd("Calculator",		"Four-function desk calc",		DE_SMI_CALC,	DE_SMC_APPS,	DE_SMA_CMD,		"DECalc;\n");
+	DESMAdd("Calendar",			"Month view and clock",			DE_SMI_CAL,		DE_SMC_APPS,	DE_SMA_CMD,		"DECalendar;\n");
+	DESMAdd("File Manager",		"Browse the mounted drives",	DE_SMI_FOLDER,	DE_SMC_APPS,	DE_SMA_CMD,		"FileMgr;\n");
+	DESMAdd("Settings",			"Theme, display, audio, saver",	DE_SMI_GEAR,	DE_SMC_SYS,		DE_SMA_CMD,		"DESettings;\n");
+	DESMAdd("Task Manager",		"Live task and memory report",	DE_SMI_CHART,	DE_SMC_SYS,		DE_SMA_CMD,		"TaskRep;\n");
+	DESMAdd("Divine Intellect",	"The YDE vector intro",			DE_SMI_STAR,	DE_SMC_FUN,		DE_SMA_DEMO,	NULL);
+	DESMAdd("PNG Demo",			"Truecolor image decode",		DE_SMI_IMAGE,	DE_SMC_FUN,		DE_SMA_CMD,		"PNGDemo;\n");
+	DESMAdd("TrueColor Demo",	"24-bit framebuffer test",		DE_SMI_IMAGE,	DE_SMC_FUN,		DE_SMA_CMD,		"ExeFile(\"::/Demo/Graphics/TrueColor/TrueColor\");\n");
+	DESMAdd("About YDE",		"Version and credits",			DE_SMI_INFO,	DE_SMC_SYS,		DE_SMA_ABOUT,	NULL);
+
+	for (i = 0; i < DE_SM_CATS; i++)
+		de_sm.dc_cat[i] = DESMTextDC(DESMCatName(i), DE_SM_F_SMALL, de_theme.text);
+
+	StrPrint(de_sm.ver, "ZealOS core V%.02f   %d x %d truecolor",
+			 sys_os_version, GR_WIDTH, GR_HEIGHT);
+	de_sm.dc_ver	= DESMTextDC(de_sm.ver, DE_SM_F_SMALL, de_theme.text_dim);
+	de_sm.dc_place	= DESMTextDC(DE_SM_PLACE, DE_SM_F_SMALL, de_theme.text_dim);
+	de_sm.dc_none	= DESMTextDC(DE_SM_NONE,  DE_SM_F_NAME,  de_theme.text_dim);
+	de_sm.dc_hint	= DESMTextDC(DE_SM_HINT,  DE_SM_F_SMALL, de_theme.text_dim);
+}
+
+U0 DESMFree()
+{
+	I64 i;
+
+	for (i = 0; i < de_sm.n; i++)
+	{
+		DESMDCFree(&de_sm_item[i].dc_name);
+		DESMDCFree(&de_sm_item[i].dc_desc);
+	}
+	for (i = 0; i < DE_SM_CATS; i++)
+		DESMDCFree(&de_sm.dc_cat[i]);
+	DESMDCFree(&de_sm.dc_ver);
+	DESMDCFree(&de_sm.dc_query);
+	DESMDCFree(&de_sm.dc_place);
+	DESMDCFree(&de_sm.dc_none);
+	DESMDCFree(&de_sm.dc_hint);
+}
+
+/* ---------------- filtering + selection ---------------- */
+
+U0 DESMScrollClamp()
+{
+	I64 max = de_sm.view_n - DE_SM_ROWS_VIS;
+
+	if (max < 0)
+		max = 0;
+	if (de_sm.sel < de_sm.scroll)
+		de_sm.scroll = de_sm.sel;
+	if (de_sm.sel > de_sm.scroll + DE_SM_ROWS_VIS - 1)
+		de_sm.scroll = de_sm.sel - DE_SM_ROWS_VIS + 1;
+	de_sm.scroll = ClampI64(de_sm.scroll, 0, max);
+}
+
+U0 DESMFilter()
+{//Rebuild the visible index list from the category chip + the search box.
+	CDESMItem	*it;
+	I64			 i;
+	Bool		 ok;
+
+	de_sm.view_n = 0;
+	for (i = 0; i < de_sm.n; i++)
+	{
+		it = &de_sm_item[i];
+		ok = TRUE;
+		if (de_sm.cat != DE_SMC_ALL && it->cat != de_sm.cat)
+			ok = FALSE;
+		if (ok && de_sm.query_len &&
+			!StrFind(de_sm.query, it->name, SFF_IGNORE_CASE) &&
+			!StrFind(de_sm.query, it->desc, SFF_IGNORE_CASE))
+			ok = FALSE;
+		if (ok)
+			de_sm.view[de_sm.view_n++] = i;
+	}
+	de_sm.sel	 = 0;
+	de_sm.scroll = 0;
+}
+
+U0 DESMMove(I64 d)
+{
+	if (!de_sm.view_n)
+		return;
+	de_sm.sel = ClampI64(de_sm.sel + d, 0, de_sm.view_n - 1);
+	DESMScrollClamp;
+}
+
+U0 DESMQueryRender()
+{//Re-render the search box text after every keystroke. draw_it is reading the
+//old DC from the Window Manager right now, so publish the replacement FIRST
+//and only free the old one a frame later.
+	CDC *old = de_sm.dc_query, *fresh = NULL;
+
+	if (de_sm.query_len)
+		fresh = DESMTextDC(de_sm.query, DE_SM_F_SMALL, de_theme.text);
+	de_sm.dc_query = fresh;
+	if (old)
+	{
+		Sleep(20);
+		DCDel(old);
+	}
+}
+
+/* ---------------- paint ---------------- */
+
+U0 DESMDrawHead(CDC *dc)
+{
+	CColorROPU32	top = DEColorLerp(de_theme.win_bg, de_theme.accent_dim, 110, 255);
+	I64				gy;
+
+	for (gy = 0; gy < DE_SM_HEAD_H; gy++)
+	{
+		dc->color = DEColorLerp(top, de_theme.win_bg, gy, DE_SM_HEAD_H - 1);
+		GrRect(dc, 0, gy, DE_SM_W, 1);
+	}
+	DESMLogo(dc, DE_SM_PAD + 7, 15, 3, ColorRGB(0x1A, 0x0E, 0x2C));	//shadow
+	DESMLogo(dc, DE_SM_PAD + 6, 14, 3, de_theme.text);
+	DESMText(dc, DE_SM_PAD + 6, 46, de_sm.dc_ver, de_sm.ver, de_theme.text_dim);
+	dc->color = de_theme.accent;
+	GrRect(dc, DE_SM_PAD + 6, 40, 72, 2);
+}
+
+U0 DESMDrawSearch(CDC *dc, Bool hot)
+{
+	I64	 sy = DE_SM_SEARCH_Y, tx = DE_SM_PAD + 32, qw;
+	CDC	*q  = de_sm.dc_query;	//read once: the menu task swaps it as you type
+
+	dc->color = de_theme.panel;
+	GrRect(dc, DE_SM_PAD, sy, DE_SM_W - 2 * DE_SM_PAD, DE_SM_SEARCH_H);
+	dc->color = de_theme.accent;			//always focused: keys go here
+	GrRect(dc, DE_SM_PAD, sy + DE_SM_SEARCH_H - 2, DE_SM_W - 2 * DE_SM_PAD, 2);
+	if (hot)
+		dc->color = de_theme.text;
+	else
+		dc->color = de_theme.text_dim;
+	GrCircle(dc, DE_SM_PAD + 15, sy + 11, 5);
+	GrLine(dc, DE_SM_PAD + 19, sy + 15, DE_SM_PAD + 23, sy + 19);
+
+	if (de_sm.query_len)
+	{
+		DESMText(dc, tx, sy + 6, q, de_sm.query, de_theme.text);
+		qw = DESMTextW(q, de_sm.query);
+	}
+	else
+	{
+		DESMText(dc, tx, sy + 6, de_sm.dc_place, DE_SM_PLACE, de_theme.text_dim);
+		qw = 0;
+	}
+	if (Blink)
+	{
+		dc->color = de_theme.accent;
+		GrRect(dc, tx + qw + 2, sy + 5, 2, 14);
+	}
+}
+
+U0 DESMDrawChips(CDC *dc, I64 mx, I64 my)
+{
+	I64		 i, x = DE_SM_PAD, w, cy = DE_SM_CHIP_Y;
+	U8		*nm;
+	Bool	 hot, in_row = cy <= my < cy + DE_SM_CHIP_H;
+
+	for (i = 0; i < DE_SM_CATS; i++)
+	{
+		nm	= DESMCatName(i);
+		w	= DESMTextW(de_sm.dc_cat[i], nm) + 16;
+		hot	= in_row && x <= mx < x + w;
+		de_sm.cat_x0[i] = x;
+		de_sm.cat_x1[i] = x + w - 1;
+		if (i == de_sm.cat)
+			dc->color = de_theme.accent_dim;
+		else if (hot)
+			dc->color = de_theme.bttn_hot;
+		else
+			dc->color = de_theme.bttn;
+		GrRect(dc, x, cy, w, DE_SM_CHIP_H);
+		DESMText(dc, x + 8, cy + (DE_SM_CHIP_H - DESMTextH(de_sm.dc_cat[i])) / 2,
+				 de_sm.dc_cat[i], nm, de_theme.text);
+		x += w + 6;
+	}
+}
+
+U0 DESMDrawList(CDC *dc, I64 mx, I64 my)
+{
+	CDESMItem	*it;
+	I64			 r, vi, ry, ly = DE_SM_LIST_Y, rw = DE_SM_SBAR_X - DE_SM_PAD - 6,
+				 th, ty, max = de_sm.view_n - DE_SM_ROWS_VIS;
+	Bool		 sel, hot;
+
+	if (!de_sm.view_n)
+	{
+		DESMText(dc, DE_SM_PAD + 20, ly + 40, de_sm.dc_none,
+				 DE_SM_NONE, de_theme.text_dim);
+		return;
+	}
+
+	for (r = 0; r < DE_SM_ROWS_VIS; r++)
+	{
+		vi = de_sm.scroll + r;
+		if (vi >= de_sm.view_n)
+			break;
+		it	= &de_sm_item[de_sm.view[vi]];
+		ry	= ly + r * DE_SM_ROW_H;
+		sel	= vi == de_sm.sel;
+		hot	= DE_SM_PAD <= mx < DE_SM_PAD + rw && ry <= my < ry + DE_SM_ROW_H;
+		if (sel)
+		{
+			dc->color = de_theme.bttn_hot;
+			GrRect(dc, DE_SM_PAD, ry + 2, rw, DE_SM_ROW_H - 4);
+			dc->color = de_theme.accent;
+			GrRect(dc, DE_SM_PAD, ry + 2, 3, DE_SM_ROW_H - 4);
+		}
+		else if (hot)
+			GrRectAlpha(dc, DE_SM_PAD, ry + 2, rw, DE_SM_ROW_H - 4,
+						de_theme.accent & 0xFFFFFF, 26);
+		DESMIcon(dc, DE_SM_PAD + 14, ry + 7, it->icon, de_theme.accent, de_theme.panel_edge);
+		DESMText(dc, DE_SM_PAD + 50, ry + 5,  it->dc_name, it->name, de_theme.text);
+		DESMText(dc, DE_SM_PAD + 50, ry + 21, it->dc_desc, it->desc, de_theme.text_dim);
+	}
+
+	if (max > 0)
+	{//Scrollbar: track the full list height, thumb proportional to the window.
+		dc->color = de_theme.bttn;
+		GrRect(dc, DE_SM_SBAR_X, ly, 5, DE_SM_LIST_H);
+		th = DE_SM_LIST_H * DE_SM_ROWS_VIS / de_sm.view_n;
+		if (th < 20)
+			th = 20;
+		ty = ly + (DE_SM_LIST_H - th) * de_sm.scroll / max;
+		dc->color = de_theme.accent_dim;
+		GrRect(dc, DE_SM_SBAR_X, ty, 5, th);
+	}
+}
+
+I64 DESMFootIcon(I64 i)
+{
+	switch (i)
+	{
+		case 1:		return DE_SMI_POWER;
+		case 2:		return DE_SMI_EXIT;
+		default:	return DE_SMI_GEAR;
+	}
+}
+
+U0 DESMDrawFoot(CDC *dc, I64 mx, I64 my)
+{
+	I64		 i, bx, fy = DE_SM_FOOT_Y;
+	Bool	 hot, in_row = fy <= my < fy + DE_SM_FOOT_H;
+
+	dc->color = de_theme.panel_edge;
+	GrRect(dc, DE_SM_PAD, fy - 10, DE_SM_W - 2 * DE_SM_PAD, 1);
+	DESMText(dc, DE_SM_PAD + 4, fy + 10, de_sm.dc_hint,
+			 DE_SM_HINT, de_theme.text_dim);
+
+	for (i = 0; i < DE_SM_FOOT_N; i++)
+	{
+		bx	= DE_SM_W - DE_SM_PAD - DE_SM_FOOT_H -
+			  (DE_SM_FOOT_N - 1 - i) * (DE_SM_FOOT_H + 4);
+		hot	= in_row && bx <= mx < bx + DE_SM_FOOT_H;
+		de_sm.foot_x0[i] = bx;
+		de_sm.foot_x1[i] = bx + DE_SM_FOOT_H - 1;
+		if (hot)
+			dc->color = de_theme.bttn_hot;
+		else
+			dc->color = de_theme.bttn;
+		GrRect(dc, bx, fy, DE_SM_FOOT_H, DE_SM_FOOT_H);
+		if (i == 2)
+			DESMIcon(dc, bx + 3, fy + 3, DESMFootIcon(i),
+					 ColorRGB(0xE0, 0x70, 0x70), de_theme.panel_edge);
+		else
+			DESMIcon(dc, bx + 3, fy + 3, DESMFootIcon(i),
+					 de_theme.accent, de_theme.panel_edge);
+	}
+}
+
+U0 DESMDrawIt(CTask *task, CDC *dc)
+{//Runs in the Window Manager every frame. Window-relative coords; z-clip free.
+	I64 mx = mouse.pos.x - task->pix_left - task->scroll_x,
+		my = mouse.pos.y - task->pix_top  - task->scroll_y;
+
+	dc->color = de_theme.win_bg;
+	GrRect(dc, 0, 0, DE_SM_W, DE_SM_H);
+
+	DESMDrawHead(dc);
+	DESMDrawSearch(dc, DE_SM_SEARCH_Y <= my < DE_SM_SEARCH_Y + DE_SM_SEARCH_H);
+	DESMDrawChips(dc, mx, my);
+	DESMDrawList(dc, mx, my);
+	DESMDrawFoot(dc, mx, my);
+
+	dc->color = de_theme.accent_dim;			//panel outline, drawn last
+	GrRect(dc, 0, 0, DE_SM_W, 1);
+	GrRect(dc, 0, DE_SM_H - 1, DE_SM_W, 1);
+	GrRect(dc, 0, 0, 1, DE_SM_H);
+	GrRect(dc, DE_SM_W - 1, 0, 1, DE_SM_H);
+}
+
+/* ---------------- input ---------------- */
+
+U0 DESMClick(I64 mx, I64 my)
+{
+	I64 i, vi;
+
+	if (DE_SM_CHIP_Y <= my < DE_SM_CHIP_Y + DE_SM_CHIP_H)
+	{
+		for (i = 0; i < DE_SM_CATS; i++)
+			if (de_sm.cat_x0[i] <= mx <= de_sm.cat_x1[i])
+			{
+				de_sm.cat = i;
+				DESMFilter;
+				return;
+			}
+		return;
+	}
+	if (DE_SM_FOOT_Y <= my < DE_SM_FOOT_Y + DE_SM_FOOT_H)
+	{
+		for (i = 0; i < DE_SM_FOOT_N; i++)
+			if (de_sm.foot_x0[i] <= mx <= de_sm.foot_x1[i])
+			{
+				de_sm.foot_pick	= i;
+				de_sm.done		= TRUE;
+				return;
+			}
+		return;
+	}
+	if (DE_SM_LIST_Y <= my < DE_SM_LIST_Y + DE_SM_LIST_H)
+	{
+		vi = de_sm.scroll + (my - DE_SM_LIST_Y) / DE_SM_ROW_H;
+		if (0 <= vi < de_sm.view_n)
+		{
+			de_sm.sel	= vi;
+			de_sm.pick	= de_sm.view[vi];
+			de_sm.done	= TRUE;
+		}
+	}
+}
+
+U0 DESMKey(I64 ch, I64 sc)
+{
+	if (ch == CH_ESC || ch == CH_SHIFT_ESC)
+		de_sm.done = TRUE;
+	else if (ch == '\n')
+	{
+		if (de_sm.view_n)
+		{
+			de_sm.pick	= de_sm.view[de_sm.sel];
+			de_sm.done	= TRUE;
+		}
+	}
+	else if (ch == '\t')
+	{//Cycle the category chips.
+		de_sm.cat = (de_sm.cat + 1) % DE_SM_CATS;
+		DESMFilter;
+	}
+	else if (ch == CH_BACKSPACE)
+	{
+		if (de_sm.query_len)
+		{
+			de_sm.query[--de_sm.query_len] = 0;
+			DESMQueryRender;
+			DESMFilter;
+		}
+	}
+	else if (' ' <= ch < 0x7F)
+	{
+		if (de_sm.query_len < DE_SM_QUERY_MAX - 1)
+		{
+			de_sm.query[de_sm.query_len++]	= ch;
+			de_sm.query[de_sm.query_len]	= 0;
+			DESMQueryRender;
+			DESMFilter;
+		}
+	}
+	else if (!ch)
+		switch (sc)
+		{
+			case SC_CURSOR_UP:		DESMMove(-1);					break;
+			case SC_CURSOR_DOWN:	DESMMove(1);					break;
+			case SC_PAGE_UP:		DESMMove(-DE_SM_ROWS_VIS);		break;
+			case SC_PAGE_DOWN:		DESMMove(DE_SM_ROWS_VIS);		break;
+			case SC_HOME:			DESMMove(-DE_SM_MAX);			break;
+			case SC_END:			DESMMove(DE_SM_MAX);			break;
+		}
+}
+
+U0 DESMPoll()
+{
+	I64 m, a1, a2, dz;
+
+	while (m = MessageScan(&a1, &a2))
+		switch (m)
+		{
+			case MESSAGE_MS_L_DOWN:
+				DESMClick(a1, a2);
+				break;
+			case MESSAGE_KEY_DOWN:
+				DESMKey(a1, a2.u8[0]);
+				break;
+		}
+
+	//The wheel has no queued message: watch pos.z directly, like yIRC does.
+	//pos.z falls when the wheel goes up, and this list is indexed top-down, so
+	//the delta adds (yIRC's scrollback subtracts it - opposite convention).
+	dz = mouse.pos.z - de_sm.last_z;
+	de_sm.last_z = mouse.pos.z;
+	if (dz && de_sm.view_n > DE_SM_ROWS_VIS)
+		de_sm.scroll = ClampI64(de_sm.scroll + dz * 2, 0,
+								de_sm.view_n - DE_SM_ROWS_VIS);
+}
+
+/* ---------------- window life ---------------- */
+
+U0 DESMWinOpen()
+{//Take this Spawn()ed task's window: borderless, docked above the taskbar.
+	I64 rows = DE_SM_ROWS, top;
+
+	//On a screen too short for the full panel the bottom simply clips; never
+	//let it grow down over the taskbar.
+	if (rows > TEXT_ROWS - DE_BAR_ROWS - 1)
+		rows = TEXT_ROWS - DE_BAR_ROWS - 1;
+	if (rows < 1)
+		rows = 1;
+	top = TEXT_ROWS - DE_BAR_ROWS - rows;
+
+	DocTermNew;	//a raw Spawn()ed task has no put/display doc of its own yet
+	StrCopy(Fs->task_title, "Start");
+	//WIG_TASK_DEFAULT inhibits SELF_FOCUS/SELF_MS_L, so a Spawn()ed task can
+	//neither take focus nor be clicked. WIG_USER_TASK_DEFAULT is what a real
+	//terminal runs with; add the *_MS_L_D bit so L_DOWN skips the double-click
+	//timeout, and pin the window (no drag, no pull-down menu).
+	Fs->win_inhibit = WIG_USER_TASK_DEFAULT | WIF_FOCUS_TASK_MENU |
+					  WIF_FOCUS_TASK_MS_L_D | WIF_SELF_GRAB_SCROLL;
+	//NO_BORDER before WinVert: WinVert slides *bordered* windows off the rows
+	//the taskbar reserved, which would shove the panel upward.
+	LBts(&Fs->display_flags, DISPLAYf_NO_BORDER);
+	WinHorz(1, DE_SM_COLS);
+	WinVert(top, top + rows - 1);
+	DocCursor(OFF);
+	DocClear;
+	Fs->draw_it = &DESMDrawIt;
+	LBts(&Fs->display_flags, DISPLAYf_SHOW);
+	WinFocus;
+	WinToTop;
+	WinZBufUpdate;
+}
+
+U0 DESMWinClose()
+{
+	Fs->draw_it = NULL;
+	LBtr(&Fs->display_flags, DISPLAYf_SHOW);
+	LBts(&sys_semas[SEMA_UPDATE_WIN_Z_BUF], 0);
+	Sleep(40);	//let the in-flight frame stop reading our label DCs
+	DocCursor(ON);
+	DocClear;
+}
+
+U0 DESMLaunch(I64 idx)
+{//Runs AFTER the panel is down, so a slow launch never freezes the menu.
+	CDESMItem *it;
+
+	if (idx < 0 || idx >= de_sm.n)
+		return;
+	it = &de_sm_item[idx];
+	switch (it->act)
+	{
+		case DE_SMA_TERM:
+			User;
+			break;
+		case DE_SMA_NET:
+			if (!de.net_up)
+			{//Compile net + TLS + Zinc into the System task once, system-wide.
+				Sys("ExeFile(\"::/DE/BrowserBoot\");");
+				de.net_up = TRUE;
+			}
+			User("%s", it->cmd);
+			break;
+		case DE_SMA_CMD:
+			User("%s", it->cmd);
+			break;
+		case DE_SMA_DEMO:
+			YDEDemo;	//vector intro; any key or mouse move exits
+			break;
+		case DE_SMA_ABOUT:
+			PopUpOk("\n     YDE\n\n"
+					"The Y Desktop Environment,\n"
+					"on a heavily modified ZealOS:\n"
+					"1280x720 boot, truecolor,\n"
+					"native PNG + AC97 + MP3,\n"
+					"TLS 1.3 web browser.\n"
+					"No ELFs were harmed.\n\n");
+			break;
+	}
+}
+
+U0 DESMFootRun(I64 i)
+{
+	switch (i)
+	{
+		case 0:
+			User("DESettings;\n");
+			break;
+		case 1:
+			if (PopUpNoYes("Reboot?"))
+				Reboot;
+			break;
+		case 2:
+			if (PopUpNoYes("Stop YDE and return to stock ZealOS?"))
+				DEStop;
+			break;
+	}
+}
+
+U0 DEStartMenuTask(U8 *data=NULL)
+{//Spawned by the taskbar chip through de_menu_fp.
+	no_warn data;
+	MemSet(&de_sm, 0, sizeof(CDESMState));
+	MemSet(de_sm_item, 0, sizeof(CDESMItem) * DE_SM_MAX);
+	de_sm.pick		= -1;
+	de_sm.foot_pick	= -1;
+	de_sm.last_z	= mouse.pos.z;
+	de_sm.t_open	= tS;
+
+	DESMFontEnsure;
+	DESMBuild;
+	DESMFilter;
+	DESMWinOpen;
+
+	while (!de_sm.done)
+	{
+		DESMPoll;
+		if (de.menu_close)			//taskbar chip clicked again, or DEStop
+			de_sm.done = TRUE;
+		if (tS - de_sm.t_open > 0.4 && sys_focus_task != Fs)
+			de_sm.done = TRUE;		//clicked away: close like every launcher
+		Sleep(25);
+	}
+
+	DESMWinClose;
+	DESMFree;
+	de.menu_task = NULL;			//free the chip before a slow launch starts
+	de.menu_last = tS;
+	if (de_sm.pick >= 0)
+		DESMLaunch(de_sm.pick);
+	else if (de_sm.foot_pick >= 0)
+		DESMFootRun(de_sm.foot_pick);
+}
+
+de_menu_fp = &DEStartMenuTask;	//hand the launcher to DE.ZC's taskbar chip
