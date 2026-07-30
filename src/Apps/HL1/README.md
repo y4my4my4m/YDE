@@ -92,36 +92,48 @@ Also in, from this pass:
 - **Protocol 48** — delta compression complete and driven by `valve/delta.lst`
   (all seven tables), the real opcode table, resource lists, user messages.
 
+## Also in:
+
+- **Combat AI** — `HLAI.ZC`. A real schedule/task interpreter (17 tasks, 10
+  schedules, per-state selection), state machine, view-cone and trace-based
+  sensing with a relationship subset, melee and ranged attacks, death. Eight
+  monsters tuned from `valve/skill.cfg`, with sequence labels read out of the
+  shipped `.mdl` files rather than guessed.
+- **Entity coverage** — every classname in all **125** shipped maps is now
+  recognised (41513/41513). Rotating brushes, momentary doors and buttons,
+  `env_*` effects, `game_text`, `item_*` pickups, chargers, conveyors,
+  `trigger_gravity`, and `trigger_changelevel` that actually changes level.
+- **Brush rotation** — rotated rendering and rotated hull tracing, opt-in per
+  entity so a moving train's bookkeeping yaw cannot rotate its collision hull.
+
 ## Deliberately NOT done, with the reason
 
-Each of these was considered and left out on purpose. None is an oversight.
-
-- **Combat AI.** Real HL monsters run schedules of tasks over a node graph with
-  relationship tables. Faking it gives monsters that twitch convincingly and
-  behave senselessly — worse than idle animation, and harder to replace later
-  than to write properly.
-- **`m_fMoveTo` WALK/RUN** places the actor at the mark instead of pathing to
-  it, because pathing needs that node graph. It arrives in the right place
-  without the walk cycle, which at least lets the script complete and release
-  whatever it was gating.
-- **Rotating brushes** need `HLDrawBrushModel` to take angles *and*
-  `HLTraceHull` to trace a rotated hull. Neither exists. A brush that renders
-  unrotated while colliding rotated is worse than one that does not move.
-- **`svc_packetentities`.** The field encoding is finished; the frame header
-  around it is not. The entity-number encoding is one bit wide in places and
-  off by one bit every entity decodes as garbage at a plausible-looking
-  origin — which is much harder to notice than nothing decoding at all.
-- **Fragment buffers** are structured but not wired: the per-stream present
-  bits in the sequence word could not be confirmed, and the NETFLAG transport
-  underneath is known to work.
-- **The protocol 48 write side** exists but is never called. Flipping the
-  server is one atomic change — writer, reader and baseline capture together —
-  and half of it is worse than none.
-- **Studio gaps**: sequence groups (`<name>NN.mdl`), chrome skins, attachments,
-  four-way blends, per-vertex lighting from model normals. Everything is
-  flat-lit from `HLLightPoint` at the entity origin.
-- **Per-surface friction** — the `hl_surface_friction` hook is exposed;
-  filling it needs `materials.txt`.
+- **Node-graph pathing.** HL routes monsters over a compiled node graph. There
+  is none here and none can be generated from the shipped data, so movement is
+  direct with a single wall-slide and a floor probe. A monster will grind
+  against a wall between it and its target rather than walk around a corner.
+  This is the single biggest gap in the AI and it is structural.
+- **Monster-vs-monster and monster-vs-player collision.** `HLTraceEntity`
+  clips `SOLID_BSP` only; nothing traces a `SLIDEBOX`. Monsters pass through
+  each other.
+- **Animation events** (`mstudioevent_t`). The studio layer decodes bones, not
+  events, so an attack lands at the END of its sequence rather than on the
+  frame the claw connects.
+- **Runtime entity creation** — `monstermaker`, `env_shooter`, `gibshooter`.
+  `hl_entities` is sized to the parsed map; nothing allocates a slot mid-game.
+  That is an entity-table lifetime change, not a missing class.
+- **Beams and decals are not drawn.** `env_beam`/`env_laser`/`infodecal` hold
+  correct state; the renderer has no line primitive or decal layer.
+- **`rendermode`/`renderamt` are stored and ignored** — no alpha or additive
+  path on world faces yet, so `env_render` changes nothing visually.
+- **VGUI.** HL's real menu is a widget toolkit; this uses Quake's menu with
+  text stand-ins. Functional, structurally not HL's.
+- **Save/load for the native entity system.** `HLSave.ZC` still serialises the
+  QuakeC world, which no longer exists.
+- **`svc_packetentities`** — field encoding is done, the frame header is not.
+  Off by one bit and every entity decodes as garbage at a plausible origin.
+- **`m_fMoveTo` WALK/RUN** teleports the actor to the mark, for want of the
+  node graph above.
 
 `HLProgs.ZC`/`HLBuiltin.ZC` are the QuakeC VM carried over by the fork. They
 are dead weight now and will be deleted once nothing calls them.
