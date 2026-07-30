@@ -33,6 +33,7 @@
 #define HLM_DOOR_USE			14
 #define HLM_DOOR_TOUCH		15
 #define HLM_DOOR_BLOCKED		16
+#define HLM_DOOR_LEAF		17	//one leaf of a door group, no further fan out
 
 #define HLM_BUTTON_USE		20
 #define HLM_BUTTON_TOUCH		21
@@ -356,6 +357,9 @@ Bool	hl_ent_notarget			= FALSE;
 Bool	hl_ent_player_longjump	= FALSE;
 
 //MAX_NORMAL_BATTERY. a battery picked up at 100 armour is refused
+//pev->effects. EF_NODRAW is the only bit this port acts on.
+#define HLEF_NODRAW			128
+
 #define HLENT_MAX_ARMOR		100.0
 #define HLENT_MAX_HEALTH		100.0
 
@@ -974,6 +978,9 @@ U0 HLEntClipToSlideboxes(CHLMap *map, F64 *start, F64 *end, F64 *mins,
 	CHLEntity	*e;
 	F64			 emins[3];
 	F64			 emaxs[3];
+	F64			 smins[3];
+	F64			 smaxs[3];
+	F64			 v;
 	I64			 i;
 	I64			 j;
 
@@ -983,6 +990,24 @@ U0 HLEntClipToSlideboxes(CHLMap *map, F64 *start, F64 *end, F64 *mins,
 
 	if (!hl_entities)
 		return;
+
+	//SV_Move's trace box, the broad phase both loops below reject against.
+	//SV_ClipToLinks gets its candidates from the area tree; a linear pass over
+	//the whole table has to do the box test itself, and every move, every line
+	//of sight and every bullet in the frame comes through here
+	for (j = 0; j < 3; j++)
+	{
+		smins[j] = start[j] + mins[j];
+		smaxs[j] = start[j] + maxs[j];
+
+		v = end[j] + mins[j];
+		if (v < smins[j])
+			smins[j] = v;
+
+		v = end[j] + maxs[j];
+		if (v > smaxs[j])
+			smaxs[j] = v;
+	}
 
 	for (i = 0; i < hl_num_entities; i++)
 	{
@@ -994,6 +1019,14 @@ U0 HLEntClipToSlideboxes(CHLMap *map, F64 *start, F64 *end, F64 *mins,
 		//SOLID_NOT and SOLID_TRIGGER are not obstacles, SOLID_BSP was clipped
 		//by the brush pass, and a corpse has had its solid cleared
 		if (e->solid != HLSOLID_SLIDEBOX && e->solid != HLSOLID_BBOX)
+			goto qecs_next;
+
+		//broad phase. absmin/absmax are maintained by HLEntSetAbsBox and
+		//already carry SV_LinkEdict's unit of slop, so a box that misses the
+		//sweep here cannot narrow it below
+		if (e->absmin[0] > smaxs[0] || e->absmax[0] < smins[0] ||
+			e->absmin[1] > smaxs[1] || e->absmax[1] < smins[1] ||
+			e->absmin[2] > smaxs[2] || e->absmax[2] < smins[2])
 			goto qecs_next;
 
 		//a zero-sized box is a point entity that never had a hull set
@@ -1033,6 +1066,13 @@ qecs_next:
 	{
 		emins[j] = hl_ent_player_org[j] + hl_player_mins[j];
 		emaxs[j] = hl_ent_player_org[j] + hl_player_maxs[j];
+	}
+
+	//the same broad phase, on the one box that is not in the table
+	for (j = 0; j < 3; j++)
+	{
+		if (emins[j] - 1.0 > smaxs[j] || emaxs[j] + 1.0 < smins[j])
+			return;
 	}
 
 	HLClipMoveToBox(emins, emaxs, mins, maxs, start, end, &tr);
@@ -1447,6 +1487,90 @@ U0 HLEntUseTargets(I64 self, I64 activator, I64 use_type = HLUSE_TOGGLE,
 	HLEntFireTargets(self, activator, use_type, value);
 }
 
+//--- door groups ------------------------------------------------------------
+//
+// CBaseDoor::Blocked walks "all door pieces with the same targetname". That is
+// the whole of GoldSrc's door linking: Quake's LinkDoors, which fused doors by
+// touching brushes, is not in the HL SDK. A named pair already moves together
+// through SUB_UseTargets, which fires every entity holding the name.
+//
+// The direct player paths are what needs the group. HL reaches a two leaf door
+// by touch, and the player's box straddles the seam so both leaves run
+// DoorTouch. HLEntUseInFront fires one entity and stops, so the near leaf opens
+// alone.
+//
+// An unnamed pair has no name to group on and falls back to the brush test,
+// which is safe only between two unnamed doors. c0a0b rests a func_door named
+// "doors" against a func_door_rotating named "lockdoor"; linking those would
+// throw the lock open with the lift.
+
+#define HLDOOR_LINK_SLOP	1.0		//LinkDoors' tolerance
+
+Bool HLEntIsDoor(CHLEntity *e)
+{//func_door, func_water and func_door_rotating - the classes CBaseDoor::Blocked
+ //accepts. momentary_door carries HLC_DOOR and func_plat carries the door
+ //methods; neither is a leaf of anything, and the pair of tests excludes both
+	if (!e)
+		return FALSE;
+
+	if (e->ent_class != HLC_DOOR)
+		return FALSE;
+
+	return ToBool(e->use_fn == HLM_DOOR_USE || e->use_fn == HLM_ROT_DOOR_USE);
+}
+
+Bool HLEntDoorsTouch(CHLEntity *a, CHLEntity *b)
+{//LinkDoors' box test, over the bounds HLEntSetAbsBox already maintains
+	I64 i;
+
+	for (i = 0; i < 3; i++)
+	{
+		if (a->absmin[i] > b->absmax[i] + HLDOOR_LINK_SLOP)
+			return FALSE;
+
+		if (b->absmin[i] > a->absmax[i] + HLDOOR_LINK_SLOP)
+			return FALSE;
+	}
+
+	return TRUE;
+}
+
+I64 HLDoorGroupNext(I64 self, I64 start)
+{//next leaf of self's group, -1 when the group ends
+	CHLEntity	*e = HLEntGet(self);
+	CHLEntity	*o;
+	I64			 i;
+
+	if (!HLEntIsDoor(e))
+		return -1;
+
+	for (i = start; i < hl_num_entities; i++)
+	{
+		if (i == self)
+			goto qdgn_next;
+
+		o = HLEntGet(i);
+		if (!HLEntIsDoor(o))
+			goto qdgn_next;
+
+		//a named door groups by name and by nothing else
+		if (e->targetname[0])
+		{
+			if (!StrICompare(o->targetname, e->targetname))
+				return i;
+
+			goto qdgn_next;
+		}
+
+		if (!o->targetname[0] && HLEntDoorsTouch(e, o))
+			return i;
+
+qdgn_next:
+	}
+
+	return -1;
+}
+
 //--- doors ------------------------------------------------------------------
 //
 // func_door. SF_DOOR_START_OPEN swaps the two positions at spawn rather than
@@ -1530,8 +1654,8 @@ U0 HLDoorHitBottom(I64 self)
 	HLEntSound(e, HLEntDoorStopSound(e->stop_snd), HLENT_CHAN_MOVE);
 }
 
-U0 HLDoorUse(I64 self, I64 activator)
-{
+U0 HLDoorUseLeaf(I64 self, I64 activator)
+{//CBaseDoor::DoorActivate on one leaf, with no group fan out
 	CHLEntity *e = HLEntGet(self);
 
 	if (!e)
@@ -1551,6 +1675,22 @@ U0 HLDoorUse(I64 self, I64 activator)
 	}
 
 	HLDoorGoUp(self, activator);
+}
+
+U0 HLDoorUse(I64 self, I64 activator)
+{//CBaseDoor::Use, over every leaf of the group
+	I64 peer = HLDoorGroupNext(self, 0);
+
+	HLDoorUseLeaf(self, activator);
+
+	//queued rather than called: a peer may be a func_door_rotating, whose mover
+	//is defined further down this file. HLM_DOOR_LEAF does not fan out again,
+	//so a group of any size costs one round
+	while (peer >= 0)
+	{
+		HLEntQueueCall(peer, HLM_DOOR_LEAF, activator, HLUSE_TOGGLE, 0.0);
+		peer = HLDoorGroupNext(self, peer + 1);
+	}
 }
 
 //--- buttons ----------------------------------------------------------------
@@ -1678,12 +1818,24 @@ U0 HLButtonUse(I64 self, I64 activator)
 //HLEntSound per node does, gives one clipped hit per node instead of a loop.
 I64 hl_train_voice[HLENT_MAX];
 
+Bool hl_train_voice_valid = FALSE;
+
 U0 HLTrainVoiceReset()
-{//Globals are not zeroed, and a junk handle would stop somebody else's voice.
+{//S_StopAllSounds' share of this file: a looping voice is never released by the
+ //mixer on its own, so a train still moving when the level ends keeps its noise
+ //running under the next map. Only stop handles from a previous map - on the
+ //very first call the array is uninitialised garbage.
 	I64 i;
 
 	for (i = 0; i < HLENT_MAX; i++)
+	{
+		if (hl_train_voice_valid && hl_train_voice[i] >= 0)
+			AudioSFXStop(hl_train_voice[i]);
+
 		hl_train_voice[i] = -1;
+	}
+
+	hl_train_voice_valid = TRUE;
 }
 
 U0 HLTrainVoiceStop(I64 self)
@@ -2306,8 +2458,8 @@ U0 HLRotDoorHitBottom(I64 self)
 	HLEntSound(e, HLEntDoorStopSound(e->stop_snd), HLENT_CHAN_MOVE);
 }
 
-U0 HLRotDoorUse(I64 self, I64 activator)
-{
+U0 HLRotDoorUseLeaf(I64 self, I64 activator)
+{//CBaseDoor::DoorActivate on one swinging leaf, with no group fan out
 	CHLEntity *e = HLEntGet(self);
 
 	if (!e)
@@ -2325,6 +2477,20 @@ U0 HLRotDoorUse(I64 self, I64 activator)
 	}
 
 	HLRotDoorGoUp(self, activator);
+}
+
+U0 HLRotDoorUse(I64 self, I64 activator)
+{//CBaseDoor::Use, over every leaf of the group. A double door built as two
+ //swinging halves is the common case for this class
+	I64 peer = HLDoorGroupNext(self, 0);
+
+	HLRotDoorUseLeaf(self, activator);
+
+	while (peer >= 0)
+	{
+		HLEntQueueCall(peer, HLM_DOOR_LEAF, activator, HLUSE_TOGGLE, 0.0);
+		peer = HLDoorGroupNext(self, peer + 1);
+	}
 }
 
 //--- func_rotating ----------------------------------------------------------
@@ -3801,6 +3967,15 @@ U0 HLEntCallMethod(I64 self, I64 method, I64 activator = -1,
 		case HLM_DOOR_HIT_TOP:		HLDoorHitTop(self);				break;
 		case HLM_DOOR_HIT_BOTTOM:	HLDoorHitBottom(self);			break;
 		case HLM_DOOR_USE:			HLDoorUse(self, activator);		break;
+		case HLM_DOOR_LEAF:
+			//a leaf reached through its group. Whether it swings or slides is
+			//the leaf's own business, so a mixed group works
+			if (e->use_fn == HLM_ROT_DOOR_USE)
+				HLRotDoorUseLeaf(self, activator);
+			else
+				HLDoorUseLeaf(self, activator);
+			break;
+
 		case HLM_DOOR_TOUCH:
 			//a touch-opened door ignores the touch when USE_ONLY is set
 			if (!(e->spawnflags & HLSF_DOOR_USE_ONLY))
@@ -4140,6 +4315,12 @@ U0 HLEntSpawnTrigger(CHLMap *map, CHLEntity *e, Bool once)
 
 	e->movetype = HLMOVETYPE_NONE;
 	e->solid    = HLSOLID_TRIGGER;
+
+	//CBaseTrigger::InitTrigger: EF_NODRAW unless showtriggers is set. Without
+	//it the renderer draws the trigger volume as a wall, texture and all -
+	//AAATRIGGER and whatever else the mapper left on the brush.
+	if (HLCvarGet("showtriggers") == 0.0)
+		e->effects = e->effects | HLEF_NODRAW;
 	e->touch_fn = HLM_TRIGGER_TOUCH;
 	e->use_fn   = HLM_TRIGGER_USE;
 
@@ -4448,6 +4629,11 @@ U0 HLEntSpawnBubbles(CHLMap *map, CHLEntity *e)
 	e->solid    = HLSOLID_NOT;
 	e->use_fn   = HLM_BUBBLE_USE;
 
+	//"renderamt = 0 - the engine won't draw this model if this is set to 0 and
+	//blending is on". The comment above says never drawn; nothing enforced it,
+	//and the water volumes carry AAATRIGGER
+	e->effects = e->effects | HLEF_NODRAW;
+
 	HLEntSetAbsBox(e);
 
 	//"if ( !(pev->spawnflags & SF_BUBBLES_STARTOFF) ) nextthink = time + 2.0"
@@ -4514,14 +4700,23 @@ U0 HLEntSpawnCharger(CHLMap *map, CHLEntity *e, Bool health)
 	HLEntSetAbsBox(e);
 }
 
-U0 HLEntSpawnInert(CHLMap *map, CHLEntity *e)
+U0 HLEntSpawnInert(CHLMap *map, CHLEntity *e, Bool hide = FALSE)
 {//recognised, no behaviour. a brush entity still gets its bounds for a later
- //pass; neither is solid or drawn
+ //pass, and is never solid
+ //
+ //hide is for the classes whose own Spawn takes the model off the screen:
+ //CFuncMonsterClip and CFuncMortarField set EF_NODRAW, CFuncTankControls sets
+ //it too, and CTriggerVolume zeroes modelindex outright. The rest keep a
+ //visible brush in HL - func_guntarget and func_trackchange are meant to be
+ //seen - so this is per class rather than blanket
 	if (e->brush_model >= 1)
 		HLEntSetBrushSize(map, e);
 
 	e->movetype = HLMOVETYPE_NONE;
 	e->solid    = HLSOLID_NOT;
+
+	if (hide && HLCvarGet("showtriggers") == 0.0)
+		e->effects = e->effects | HLEF_NODRAW;
 }
 
 U0 HLEntSetSeqByName(CHLEntity *e, U8 *label)
@@ -4913,13 +5108,31 @@ I64 HLEntSpawnOne(CHLMap *map, I64 i)
 		return 1;
 	}
 
-	if (!StrCompare(e->classname, "func_illusionary") ||
-		!StrCompare(e->classname, "func_ladder"))
+	if (!StrCompare(e->classname, "func_illusionary"))
 	{
-		//drawn but not solid. func_ladder is climbable in HL, not here
+		//CFuncIllusionary: drawn, and not solid. The one brush class that is
+		//meant to be seen without being touched
 		HLEntSetBrushSize(map, e);
 		e->movetype = HLMOVETYPE_NONE;
 		e->solid    = HLSOLID_NOT;
+		return 1;
+	}
+
+	if (!StrCompare(e->classname, "func_ladder"))
+	{
+		//CLadder::Precache. Not solid, and invisible unless showtriggers is
+		//set - HL hides it with rendermode kRenderTransTexture and renderamt 0
+		//rather than EF_NODRAW, which comes to the same thing for a renderer
+		//that acts on the one bit. Climbing is not ported; the volume still has
+		//to disappear, and it is the single biggest source of a mapper texture
+		//left on screen: 171 of them over 55 maps, all AAATRIGGER
+		HLEntSetBrushSize(map, e);
+		e->movetype = HLMOVETYPE_NONE;
+		e->solid    = HLSOLID_NOT;
+
+		if (HLCvarGet("showtriggers") == 0.0)
+			e->effects = e->effects | HLEF_NODRAW;
+
 		return 1;
 	}
 
@@ -5406,16 +5619,31 @@ I64 HLEntSpawnOne(CHLMap *map, I64 i)
 	if (!StrCompare(e->classname, "monstermaker") ||
 		!StrCompare(e->classname, "weaponbox") ||
 		!StrCompare(e->classname, "world_items") ||
-		!StrCompare(e->classname, "func_monsterclip") ||
-		!StrCompare(e->classname, "trigger_monsterjump") ||
 		!StrCompare(e->classname, "info_bigmomma") ||
 		!StrCompare(e->classname, "func_guntarget") ||
-		!StrCompare(e->classname, "func_mortar_field") ||
 		!StrCompare(e->classname, "func_traincontrols") ||
 		!StrCompare(e->classname, "func_trackchange") ||
 		!StrCompare(e->classname, "func_trackautochange"))
 	{
 		HLEntSpawnInert(map, e);
+		return 1;
+	}
+
+	//CFuncMonsterClip::Spawn and CFuncMortarField::Spawn both set EF_NODRAW,
+	//and CTriggerMonsterJump is a CBaseTrigger, so InitTrigger sets it there
+	if (!StrCompare(e->classname, "func_monsterclip") ||
+		!StrCompare(e->classname, "trigger_monsterjump") ||
+		!StrCompare(e->classname, "func_mortar_field"))
+	{
+		HLEntSpawnInert(map, e, TRUE);
+		return 1;
+	}
+
+	//CFuncTankControls::Spawn sets EF_NODRAW; the guns themselves are the thing
+	//the player looks at, so the prefix test must not catch the controls
+	if (!StrCompare(e->classname, "func_tankcontrols"))
+	{
+		HLEntSpawnInert(map, e, TRUE);
 		return 1;
 	}
 
@@ -5426,6 +5654,10 @@ I64 HLEntSpawnOne(CHLMap *map, I64 i)
 		return 1;
 	}
 
+	//the brush volumes among these are all hidden by their own Spawn: the three
+	//triggers through CBaseTrigger::InitTrigger, trigger_transition by having
+	//its modelindex cleared. The point entities carry no model, so the flag
+	//costs them nothing
 	if (!StrCompare(e->classname, "trigger_autosave") ||
 		!StrCompare(e->classname, "trigger_transition") ||
 		!StrCompare(e->classname, "trigger_endsection") ||
@@ -5436,7 +5668,7 @@ I64 HLEntSpawnOne(CHLMap *map, I64 i)
 		!StrCompare(e->classname, "player_weaponstrip") ||
 		!StrCompare(e->classname, "speaker"))
 	{
-		HLEntSpawnInert(map, e);
+		HLEntSpawnInert(map, e, TRUE);
 		return 1;
 	}
 
@@ -5477,11 +5709,12 @@ U0 HLEntParseMultiManagers(CHLMap *map)
 
 	while (p < end && hl_mm_count < 32)
 	{
+		//No p++ here: qpmm_next_char below advances. Doing both stepped the
+		//scan two bytes per non-brace character, so it saw every other byte
+		//and missed any block opening on the wrong parity. Every
+		//multi_manager in the game parsed as empty.
 		if (*p != '{')
-		{
-			p++;
 			goto qpmm_next_char;
-		}
 
 		p++;
 		slot          = hl_mm_count;
@@ -5598,6 +5831,52 @@ qpmm_next_char:
 	}
 }
 
+//Bounded trace of the first entity events after a map loads, written to the
+//log. A scripted opening either fires or it does not, and the console is the
+//only place that can be observed from inside the VM.
+#define HLENT_TRACE_MAX		48
+#define HLENT_TRACE_WINDOW	20.0	//seconds of game time
+
+I64  hl_ent_trace_count = 0;
+Bool hl_ent_trace_on    = FALSE;
+
+U0 HLEntTraceReset()
+{
+	hl_ent_trace_count = 0;
+	hl_ent_trace_on    = FALSE;
+}
+
+U0 HLEntTrace(U8 *what, I64 ent)
+{//One line per dispatched event: who, what class, what name.
+	CHLEntity	*e;
+	U8			 line[192];
+
+	if (!hl_ent_trace_on || hl_ent_trace_count >= HLENT_TRACE_MAX)
+		return;
+
+	if (hl_ent_time > HLENT_TRACE_WINDOW)
+		return;
+
+	e = HLEntGet(ent);
+
+	if (!e)
+		return;
+
+	hl_ent_trace_count++;
+
+	StrPrint(line, "ENT %6.2f %-6s %3d %-22s \"%s\" -> \"%s\"\n",
+		hl_ent_time, what, ent, e->classname, e->targetname, e->target);
+
+	HLLog(line);
+	"%s", line;
+
+	if (hl_ent_trace_count == HLENT_TRACE_MAX)
+	{
+		HLLog("ENT trace budget reached\n");
+		"ENT trace budget reached\n";
+	}
+}
+
 I64 HLEntSpawnAll(CHLMap *map)
 {//ED_LoadFromFile's second half: run every class function
 	I64 i;
@@ -5624,6 +5903,11 @@ I64 HLEntSpawnAll(CHLMap *map)
 	//for the same reason.
 	HLTrainVoiceReset;
 
+	//Trace the opening seconds. Bounded by count and by game time, so it costs
+	//nothing after the level has settled.
+	HLEntTraceReset;
+	hl_ent_trace_on = TRUE;
+
 	//a fresh map means full health and no stale pending effect
 	HLEntPlayerReset;
 
@@ -5645,6 +5929,14 @@ I64 HLEntSpawnAll(CHLMap *map)
 			//unrecognised. left unspawned so the report counts it and a later
 			//pass can claim it once the class exists
 			hl_entities[i].spawned = FALSE;
+
+			//ED_LoadFromFile removes an entity whose classname resolves to no
+			//class, so nothing unrecognised is ever on screen in HL. Here the
+			//slot survives to be counted, and a brush model on it would be
+			//drawn with whatever the mapper left on the faces
+			if (hl_entities[i].brush_model > 0)
+				hl_entities[i].effects =
+					hl_entities[i].effects | HLEF_NODRAW;
 		}
 
 qesa_next:
@@ -5677,6 +5969,7 @@ U0 HLEntDrainCalls()
 
 		hl_ent_callq_head = (hl_ent_callq_head + 1) % HLENT_CALLQ_MAX;
 
+		HLEntTrace("use", ent);
 		HLEntCallMethod(ent, method, activator, use_type, value);
 
 		budget--;
@@ -5955,6 +6248,7 @@ qef_next_room:
 
 		hl_ent_thinks++;
 
+		HLEntTrace("think", i);
 		HLEntCallMethod(i, e->think_fn, e->activator, HLUSE_TOGGLE, 0.0);
 
 qef_next_think:
@@ -6041,6 +6335,14 @@ I64 HLEntUseInFront(F64 *player_org, F64 *forward)
 
 		//only classes the player operates by hand. A wall charger is reachable
 		//no other way - nothing in a map targets one
+		//FCAP_IMPULSE_USE. CBasePlatTrain grants it to func_plat, func_train
+		//and func_door; CFuncTrackTrain does not - it carries
+		//FCAP_DIRECTIONAL_USE, meaning the controls drive it, not a player
+		//walking up to the car. Without this a tracktrain toggles on every
+		//+use press, so the scripted tram can be started and stopped by hand.
+		if (e->ent_class == HLC_TRACKTRAIN)
+			goto qeuf_next;
+
 		if (e->use_fn != HLM_DOOR_USE && e->use_fn != HLM_BUTTON_USE &&
 			e->use_fn != HLM_TRAIN_USE && e->use_fn != HLM_ROT_DOOR_USE &&
 			e->use_fn != HLM_CHARGER_USE && e->use_fn != HLM_MOMENTARY_USE)
@@ -6127,7 +6429,10 @@ U0 HLEntReport()
 qer_next:
 	}
 
-	"HLEnt: %d entities, %d movers, %d triggers, %d multi_managers\n",
+	//hl_mm_count is filled by HLEntParseMultiManagers, which runs inside
+	//HLEntSpawnAll. Reported from the parse pass it is always 0 and reads as a
+	//failure that is not there.
+	"HLEnt: %d entities, %d movers, %d triggers, %d multi_manager blocks\n",
 		hl_num_entities, movers, triggers, hl_mm_count;
 
 	"HLEnt: %d rotating brushes, %d sprites, %d items\n",

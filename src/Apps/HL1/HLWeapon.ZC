@@ -73,11 +73,12 @@
 //   - item_healthkit / item_battery / item_suit. those belong to the item
 //     classes in HLEntity.ZC, not to the inventory.
 //   - inventory across a changelevel. HL carries it in the transition save.
-//   - beam and projectile VISUALS. HLDraw has no line primitive and no
-//     non-brush mover, so the egon and gauss beams and the grenade/satchel
-//     bodies are invisible. Their damage, ammo drain and timing are real. A
-//     rocket and a bolt get a particle trail, which is the only marker the
-//     particle layer can supply; nothing is faked with a stand-in sprite.
+//   - beam visuals. HLDraw has no line primitive, so the egon and gauss beams
+//     are invisible. Their damage, ammo drain and timing are real.
+//
+//     Projectile bodies ARE drawn - see HLProjDraw. Each kind loads its own
+//     world model through the studio cache and is drawn from the per-frame
+//     hook, pointing along its velocity.
 //   - the zoom on the crossbow and python secondaries changes hl_wpn_zoom_fov
 //     but nothing applies it: the view fov lives in HL1.ZC, which compiles
 //     later and cannot be reached from here.
@@ -219,6 +220,7 @@ class CHLProj
 	F64	 arm;			//rocket ignite time, tripmine powerup time
 	F64	 next_hurt;		//m_flNextAttack, BounceTouch's contact debounce
 	F64	 next_hop;		//CSqueakGrenade::HuntThink cadence
+	F64	 next_puff;		//rocket trail cadence, on the render clock
 	F64	 beam_len;		//tripmine beam length at the moment it armed
 
 	Bool bounce;		//MOVETYPE_BOUNCE rather than MOVETYPE_FLY
@@ -231,6 +233,51 @@ class CHLProj
 CHLProj	hl_proj[HLPROJ_MAX];
 I64		hl_proj_live	= 0;	//slots in use, for HLWeaponReport
 I64		hl_proj_dropped	= 0;	//shots the pool could not hold
+
+//--- projectile bodies ------------------------------------------------------
+//
+// SET_MODEL in each SDK Spawn, verified against valve/models:
+//
+//   HLPRJ_BOLT/STUCK  models/crossbow_bolt.mdl  crossbow.cpp:69
+//   HLPRJ_ROCKET      models/rpgrocket.mdl      rpg.cpp:131
+//   HLPRJ_CONTACT     models/grenade.mdl        ggrenade.cpp:351, CGrenade::Spawn
+//   HLPRJ_TIMED       models/w_grenade.mdl      ggrenade.cpp:419, ShootTimed
+//   HLPRJ_SATCHEL     models/w_satchel.mdl      satchel.cpp:238
+//   HLPRJ_TRIPMINE    models/v_tripmine.mdl     tripmine.cpp:361
+//   HLPRJ_SNARK       models/w_squeak.mdl       squeakgrenade.cpp:119
+//   HLPRJ_HORNET      models/hornet.mdl         hornet.cpp:93
+//
+// One model per kind, not per shot: a bag of snarks would otherwise load
+// w_squeak fifteen times. HLStudioCacheGet owns what it returns.
+
+#define HLPRJ_KINDS			10		//HLPRJ_FREE .. HLPRJ_HORNET
+
+//pev->sequence at spawn, checked against each model's own seqdesc table:
+//w_grenade carries 7 sequences and index 3 is "toss", w_satchel 2 and index 1
+//is "onback", v_tripmine 9 and index 7 is "world", w_squeak 4 and index 3 is
+//"run". the remaining kinds carry one sequence each
+#define HLPRJ_SEQ_TIMED		3		//RANDOM_LONG(3,6), ggrenade.cpp:410
+#define HLPRJ_SEQ_SATCHEL	1		//satchel.cpp:90
+#define HLPRJ_SEQ_TRIPMINE	7		//TRIPMINE_WORLD, tripmine.cpp:105
+#define HLPRJ_SEQ_SNARK		3		//WSQUEAK_RUN, squeakgrenade.cpp:145
+
+//pev->body = 3 on a placed mine. v_tripmine has two bodyparts, hands with base
+//1 and mine with base 2, so 3 picks submodel 1 of each: no hands, mine present
+#define HLPRJ_BODY_TRIPMINE	3		//tripmine.cpp:104
+
+//EF_LIGHT on a live rocket, and the smoke the TE_BEAMFOLLOW trail is made of.
+//The trail sprite the SDK sends is sprites/smoke.spr, which is the sprite
+//HLFxSmoke spawns; the cadence keeps the temp entity pool from saturating
+#define HLPRJ_PUFF_STEP		0.05
+#define HLPRJ_PUFF_SCALE		4.0		//tenths, as CEnvExplosion::Smoke sends it
+#define HLPRJ_GLOW_RADIUS	160.0
+
+CHLStudio	*hl_proj_mdl[HLPRJ_KINDS];
+Bool		 hl_proj_tried[HLPRJ_KINDS];
+
+//one neutral bone controller set per kind. raw 0 is the channel's start, not
+//its middle - see HLEntInitBoneControllers
+F64			 hl_proj_ctl[HLPRJ_KINDS * HLST_MAX_CONTROLLERS];
 
 //CBasePlayerItem::Touch's pickup box - UTIL_SetSize(-16,-16,0)..(16,16,16).
 //items are not linked into the world by the spawn pass (weapon_* and ammo_*
@@ -533,6 +580,17 @@ U0 HLWeaponInit()
 
 	hl_proj_live    = 0;
 	hl_proj_dropped = 0;
+
+	//the model cache is keyed by kind and a garbage pointer here is a draw
+	//into nothing. HLStudioCacheGet owns the models, so nothing is freed
+	for (i = 0; i < HLPRJ_KINDS; i++)
+	{
+		hl_proj_mdl[i]   = NULL;
+		hl_proj_tried[i] = FALSE;
+	}
+
+	for (i = 0; i < HLPRJ_KINDS * HLST_MAX_CONTROLLERS; i++)
+		hl_proj_ctl[i] = 0.0;
 
 	//*_MAX_CARRY from weapons.h
 	hl_wpn_ammo_max[HLAMMO_9MM]        = 250;	//_9MM_MAX_CARRY
@@ -1381,6 +1439,111 @@ U0 HLProjFree(I64 i)
 	hl_proj[i].kind = HLPRJ_FREE;
 }
 
+CHLStudio *HLProjModel(I64 kind)
+{//the world model for a kind, loaded once. NULL when the file is missing
+ //
+ //a comparison chain rather than a U8 *table[]: adjacent string literals
+ //concatenate and the array truncates at the first embedded NUL, which
+ //collapses a path table to a single entry
+	CHLStudio	*m;
+	U8			*path;
+	F64			 setting;
+	I64			 c;
+
+	if (kind <= HLPRJ_FREE || kind >= HLPRJ_KINDS)
+		return NULL;
+
+	//a missing file is remembered, so a saturated pool does not retry the load
+	//and reprint the failure every frame
+	if (hl_proj_tried[kind])
+		return hl_proj_mdl[kind];
+
+	hl_proj_tried[kind] = TRUE;
+
+	if (kind == HLPRJ_BOLT || kind == HLPRJ_STUCK)
+		path = "models/crossbow_bolt.mdl";
+	else if (kind == HLPRJ_ROCKET)
+		path = "models/rpgrocket.mdl";
+	else if (kind == HLPRJ_CONTACT)
+		path = "models/grenade.mdl";
+	else if (kind == HLPRJ_TIMED)
+		path = "models/w_grenade.mdl";
+	else if (kind == HLPRJ_SATCHEL)
+		path = "models/w_satchel.mdl";
+	else if (kind == HLPRJ_TRIPMINE)
+		path = "models/v_tripmine.mdl";
+	else if (kind == HLPRJ_SNARK)
+		path = "models/w_squeak.mdl";
+	else
+		path = "models/hornet.mdl";
+
+	m = HLStudioCacheGet(path);
+
+	hl_proj_mdl[kind] = m;
+
+	if (!m)
+		return NULL;
+
+	//CBaseAnimating::InitBoneControllers - SetController(0..3, 0.0). the raw
+	//setting HLStudioDraw wants is not neutral at zero, it is the channel's
+	//start, which is what made every NPC look sideways when NULL was passed.
+	//none of the retail projectile models carries a controller, so every
+	//channel resolves to -1 and stays at zero; a mod model that does carry one
+	//gets the mapped setting
+	for (c = 0; c < 4; c++)
+	{
+		setting = HLStudioCtlSetting(m, c, 0.0);
+
+		if (setting >= 0.0)
+			hl_proj_ctl[kind * HLST_MAX_CONTROLLERS + c] = setting;
+	}
+
+	return m;
+}
+
+I64 HLProjSeq(I64 kind)
+{//pev->sequence at Spawn, per kind
+	if (kind == HLPRJ_TIMED)
+		return HLPRJ_SEQ_TIMED;
+
+	if (kind == HLPRJ_SATCHEL)
+		return HLPRJ_SEQ_SATCHEL;
+
+	if (kind == HLPRJ_TRIPMINE)
+		return HLPRJ_SEQ_TRIPMINE;
+
+	if (kind == HLPRJ_SNARK)
+		return HLPRJ_SEQ_SNARK;
+
+	return 0;
+}
+
+I64 HLProjBody(I64 kind)
+{//pev->body at Spawn. only the tripmine has more than one bodypart
+	if (kind == HLPRJ_TRIPMINE)
+		return HLPRJ_BODY_TRIPMINE;
+
+	return 0;
+}
+
+U0 HLProjAngles(CHLProj *p, F64 *out)
+{//pev->angles = UTIL_VecToAngles(pev->velocity), the line CGrenade::ShootTimed,
+ //CGrenade::ShootContact, CCrossbowBolt::Spawn and CRpgRocket::FollowThink all
+ //carry, so a body in flight points where it is going
+ //
+ //at rest there is no velocity to read: p->dir is the flight direction the slot
+ //was spawned with, and on a tripmine it is the surface normal the mine faces
+ //along, which is the axis CTripmineGrenade builds its own angles from
+	F64 speed;
+
+	speed = HLVecLength(p->vel);
+
+	if (speed > 1.0)
+		HLVecToAngles(p->vel, out);
+	else
+		HLVecToAngles(p->dir, out);
+}
+
 I64 HLProjSpawn(I64 kind, F64 *org, F64 *vel, F64 damage, F64 life,
 	F64 gravity, F64 friction, Bool bounce, I64 owner)
 {//the common half of CGrenade::Shoot* - place it, aim it, start its clock
@@ -1412,6 +1575,11 @@ I64 HLProjSpawn(I64 kind, F64 *org, F64 *vel, F64 damage, F64 life,
 	p->arm       = 0.0;
 	p->next_hurt = 0.0;
 	p->next_hop  = 0.0;
+	p->next_puff = 0.0;
+
+	//loaded on the shot rather than in the draw pass: a load stalls, and a
+	//stall in the middle of a frame shows as a hitch on the first rocket
+	HLProjModel(kind);
 
 	if (life > 0.0)
 		p->die = hl_ent_time + life;
@@ -1864,12 +2032,22 @@ U0 HLProjFrame(CHLMap *map, F64 dt)
 
 		HLTraceEntity(map, start, end, zero, zero, hl_move_pass, FALSE, &tr);
 
-		//a rocket and a bolt leave the only marker the particle layer can
-		//supply. there is no mover renderer, so the trail IS the projectile
-		if (p->kind == HLPRJ_ROCKET)
-			HLPartTrail(start, tr.end_pos, HLTRAIL_ROCKET, tS);
-		else if (p->kind == HLPRJ_BOLT)
-			HLPartTrail(start, tr.end_pos, HLTRAIL_TRACER, tS);
+		//CRpgRocket::IgniteThink sends TE_BEAMFOLLOW with m_iTrail, which is
+		//sprites/smoke.spr - the sprite HLFxSmoke spawns - and sets EF_LIGHT.
+		//The trail is the sprite pool, not the Quake particle trail: a rocket
+		//is a drawn body here, so the trail is behind it rather than instead of
+		//it. Effects run on the render clock, the pool on hl_ent_time
+		if (p->kind == HLPRJ_ROCKET && tS >= p->next_puff)
+		{
+			p->next_puff = tS + HLPRJ_PUFF_STEP;
+
+			HLFxSmoke(start, HLPRJ_PUFF_SCALE, tS);
+
+			//EF_LIGHT. one render frame of life, replaced every step, so the
+			//glow rides the rocket instead of leaving a string of lamps
+			HLDlightAdd(start, HLPRJ_GLOW_RADIUS, HLPRJ_PUFF_STEP, 0.0, tS,
+				255, 190, 100);
+		}
 
 		HLVecCopy(tr.end_pos, p->org);
 
@@ -3437,6 +3615,77 @@ I64 HLWeaponReserve()
 
 //--- drawing ----------------------------------------------------------------
 
+U0 HLProjDraw(CHLCanvas *c)
+{//every live projectile as a studio model
+ //
+ //GoldSrc draws these as ordinary entities out of the server's entity list.
+ //hl_entities is sized to the parsed map and cannot allocate at runtime - see
+ //the header - so the pool is not in that list and HL1.ZC's entity pass never
+ //sees it. It is drawn here instead, from the per-frame hook, while the 1/z
+ //buffer for the frame is still live: this runs before HLHudDraw's own output,
+ //so a body is depth tested against the world and is still under the HUD.
+	CHLProj		*p;
+	CHLStudio	*m;
+	CHLStSeq	*sq;
+	F64			 ang[3];
+	F64			 cycle;
+	F64			 span;
+	I64			 seq;
+	I64			 i;
+
+	if (!c || !hl_map)
+		return;
+
+	for (i = 0; i < HLPROJ_MAX; i++)
+	{
+		p = &hl_proj[i];
+
+		if (p->kind == HLPRJ_FREE)
+			goto qpd_next;
+
+		m = HLProjModel(p->kind);
+
+		if (!m)
+			goto qpd_next;
+
+		seq = HLProjSeq(p->kind);
+
+		if (seq >= m->num_seqs)
+			seq = 0;
+
+		//StudioFrameAdvance off the render clock. There is no per-slot frame
+		//counter: every body of a kind shares one phase, which is invisible on
+		//a tumbling grenade and correct on the single-frame kinds
+		cycle = 0.0;
+
+		if (seq >= 0 && seq < m->num_seqs)
+		{
+			sq = &m->seqs[seq];
+
+			span = ToF64(sq->num_frames);
+
+			if (span < 2.0)
+				span = 2.0;
+
+			cycle = tS * sq->fps / (span - 1.0);
+			cycle -= ToF64(ToI64(cycle));
+
+			if (cycle < 0.0)
+				cycle = 0.0;
+		}
+
+		HLProjAngles(p, ang);
+
+		//hl_proj_ctl, not NULL: raw setting 0 is the channel's start, not its
+		//middle. HLLightPoint is the world sample HL1.ZC's entity pass uses
+		HLStudioDraw(c, m, p->org, ang, seq, cycle, 0.0,
+			HLProjBody(p->kind), 0, HLLightPoint(hl_map, p->org),
+			&hl_proj_ctl[p->kind * HLST_MAX_CONTROLLERS]);
+
+qpd_next:
+	}
+}
+
 U0 HLWeaponDrawViewModel(CHLCanvas *c)
 {//the first-person weapon
  //
@@ -3525,16 +3774,93 @@ U0 HLWeaponDrawCrosshair(CHLCanvas *c)
 		HLHUD_R, HLHUD_G, HLHUD_B);
 }
 
+U0 HLWeaponFillRect(CHLCanvas *c, I64 x, I64 y, I64 w, I64 h,
+	I64 r, I64 g, I64 b, I64 a)
+{//FillRGBA, the solid alpha-blended box cl_dll draws with
+ //
+ //The canvas carries 0x00RRGGBB per pixel, as HLSprDrawRect writes it
+	U32	*row;
+	I64	 px;
+	I64	 py;
+	I64	 dr, dg, db;
+	U32	 c32;
+
+	if (!c || w < 1 || h < 1 || a <= 0)
+		return;
+
+	if (a > 255)
+		a = 255;
+
+	for (py = y; py < y + h; py++)
+	{
+		if (py < 0 || py >= c->height)
+			goto qwfr_next_row;
+
+		row = c->pixels + py * c->width;
+
+		for (px = x; px < x + w; px++)
+		{
+			if (px < 0 || px >= c->width)
+				goto qwfr_next_col;
+
+			c32 = row[px];
+
+			dr = (c32 >> 16) & 255;
+			dg = (c32 >> 8) & 255;
+			db = c32 & 255;
+
+			dr += ((r - dr) * a) / 255;
+			dg += ((g - dg) * a) / 255;
+			db += ((b - db) * a) / 255;
+
+			row[px] = (dr << 16) | (dg << 8) | db;
+
+qwfr_next_col:
+		}
+
+qwfr_next_row:
+	}
+}
+
 U0 HLWeaponDrawSelection(CHLCanvas *c)
-{//CHudAmmo's weapon menu: the bucket row, and the open bucket's contents
+{//DrawWList, cl_dll/ammo.cpp:1046-1204. The bucket strip and the open bucket
  //
- //hud.txt ships bucket0..bucket5 but the SDK has MAX_WEAPON_SLOTS (5) buckets,
- //so bucket5 is unused.
+ //The strip is HORIZONTAL and anchored top left. Bucket N sits at
  //
- //the weapon glyph is hud.txt's "d_<name>" death-notice icon rather than the
- //"weapon"/"weapon_s" art in sprites/weapon_<name>.txt. at 2560 those are one
- //.spr file per weapon per state and the sheet table will not hold them; the
- //d_ icons are the same shape and already loaded.
+ //    x = 10 + N * (giBucketWidth + 5),  y = 10
+ //
+ //on one row, and only the OPEN bucket's contents stack downward from
+ //y = giBucketHeight + 10. Every closed slot's owned weapons are a column of
+ //plain boxes under it, not glyphs.
+ //
+ //Every number is read out of the art rather than assumed:
+ //
+ //  giBucketWidth / giBucketHeight   ammo.cpp:327-328, the rect of the sprite
+ //    NAMED bucket1. m_HUD_bucket0 is GetSpriteIndex("bucket1") and the row
+ //    walks m_HUD_bucket0 + i, so slot 0 is bucket1 and slot 4 is bucket5.
+ //    hud.txt lists bucket1..bucket5 and then bucket0, which is the sixth
+ //    glyph and belongs to no slot. 12x12 at 320, 20x20 at 640, 40x40 at 1280.
+ //
+ //  the weapon panel                 p->rcActive, out of the weapon's own
+ //    sprites/weapon_<name>.txt "weapon" row. Every weapon's rect matches
+ //    hud.txt's `selection` rect in every row set - 80x20 at 320, 170x45 at
+ //    640, 340x90 at 1280, 510x135 at 2560 - so `selection` supplies it and
+ //    no size is hardcoded.
+ //
+ //  x = 10, y = 10, 5 between cells  ammo.cpp:1063-1064, 1106, 1167, 1198.
+ //    Not scaled with the resolution in the SDK either: the sprite set is
+ //    chosen to match the canvas, so the margin lands the same way.
+ //
+ //The open bucket advances the top row by the PANEL width rather than the
+ //bucket width - "make active slot wide enough to accomodate gun pictures",
+ //ammo.cpp:1092-1102 - so the buckets to its right clear the column beneath.
+ //An open bucket holding nothing owned advances by the bucket width, since
+ //GetFirstPos returns NULL and iWidth falls back to giBucketWidth.
+ //
+ //The weapon glyph is hud.txt's "d_<name>" death notice icon rather than the
+ //"weapon"/"weapon_s" art in sprites/weapon_<name>.txt: at 1280 and 2560 that
+ //art is one .spr per weapon per state and the sheet table will not hold them.
+ //The d_ icons are the same shape and are already loaded.
 	U8	name[HLHUD_NAME_MAX];
 	I64	bucket[HLWPN_SLOTS];
 	I64	sel;
@@ -3545,6 +3871,7 @@ U0 HLWeaponDrawSelection(CHLCanvas *c)
 	I64	bh = 20;
 	I64	sel_w = 0;
 	I64	sel_h = 0;
+	I64	open_w;
 	I64	step;
 	I64	gap;
 	I64	slot;
@@ -3553,15 +3880,13 @@ U0 HLWeaponDrawSelection(CHLCanvas *c)
 	I64	x;
 	I64	y;
 	I64	row;
+	I64	alpha;
 	I64	r, g, b;
+	Bool hot;
 
 	if (!c || hl_wpn_sel_slot < 0)
 		return;
 
-	//m_HUD_bucket0 is GetSpriteIndex("bucket1") and the row walks bucket0 + i,
-	//so slot 0 is the sprite NAMED bucket1. hud.txt lists bucket1..bucket5 and
-	//then bucket0, which is the sixth glyph and belongs to no slot at all -
-	//reading bucket0..bucket4 put the wrong number in every box
 	for (slot = 0; slot < HLWPN_SLOTS; slot++)
 	{
 		StrPrint(name, "bucket%d", slot + 1);
@@ -3574,14 +3899,12 @@ U0 HLWeaponDrawSelection(CHLCanvas *c)
 		bh = hl_hud_entry[bucket[0]].h;	//giBucketHeight
 	}
 
-	//the `selection` panel is the size of a weapon's rcActive - 170x45 against a
-	//20x20 bucket at 640 - so it stands for rcActive in the widths below
 	sel = HLHudFind("selection");
 
 	if (sel >= 0)
 	{
-		sel_w = hl_hud_entry[sel].w;
-		sel_h = hl_hud_entry[sel].h;
+		sel_w = hl_hud_entry[sel].w;	//rcActive.right - rcActive.left
+		sel_h = hl_hud_entry[sel].h;	//rcActive.bottom - rcActive.top
 	}
 
 	if (sel_w < bw)
@@ -3589,61 +3912,59 @@ U0 HLWeaponDrawSelection(CHLCanvas *c)
 	if (sel_h < bh)
 		sel_h = bh;
 
-	//DrawWList's literals: x = 10, y = 10, and 5 between every cell on both
-	//axes. They are not scaled with the resolution in the SDK either - the
-	//sprite set is chosen to match the canvas, so the margin lands the same way
 	gap = 5;
 	x0  = 10;
 	y0  = 10;
 
 	step = sel_h + gap;
 
-	//--- the bucket row ---
-	//
-	//"make active slot wide enough to accomodate gun pictures": the open bucket
-	//advances by the weapon panel width, not by the bucket width, so the buckets
-	//to its right clear the column of panels underneath. Advancing every slot by
-	//the bucket width is what buried buckets 3, 4 and 5 under the open one
+	//GetFirstPos(iActiveSlot): iWidth is the panel width only when the open
+	//bucket actually holds something
+	open_w = bw;
+
+	if (HLWeaponNextInSlot(hl_wpn_sel_slot, -1) >= 0)
+		open_w = sel_w;
+
+	//--- the top row, one bucket per slot ---
+
 	x = x0;
 
 	for (slot = 0; slot < HLWPN_SLOTS; slot++)
 	{
-		//the open bucket is lit, the rest dimmed - the SDK uses two alpha levels
-		//on the same sprite
+		//ScaleColors(RGB_YELLOWISH, a) with a = 255 open and 192 closed. The
+		//sheets are additive, so the alpha is folded into the tint
+		alpha = 192;
+
 		if (slot == hl_wpn_sel_slot)
-		{
-			r = HLHUD_R;
-			g = HLHUD_G;
-			b = HLHUD_B;
-		}
-		else
-		{
-			r = 96;
-			g = 64;
-			b = 0;
-		}
+			alpha = 255;
+
+		r = (HLHUD_R * alpha) / 255;
+		g = (HLHUD_G * alpha) / 255;
+		b = (HLHUD_B * alpha) / 255;
 
 		if (bucket[slot] >= 0)
 			HLHudDrawElement(c, bucket[slot], x, y0, r, g, b);
 
 		if (slot == hl_wpn_sel_slot)
-			x += sel_w + gap;
+			x += open_w + gap;
 		else
 			x += bw + gap;
 	}
 
-	//--- the closed buckets ---
+	//--- the closed slots: one box per owned weapon, straight down ---
 	//
-	//DrawWList fills a plain giBucketWidth x giBucketHeight box per owned weapon
-	//under every slot that is not open. There is no rect primitive here, so the
-	//bucket glyph itself is redrawn dim - same cell, same pitch
+	//FillRGBA(x, y, giBucketWidth, giBucketHeight, r, g, b, a) at ammo.cpp:1196,
+	//with RGB_YELLOWISH at 128 for a weapon that has ammo and RGB_REDISH at 96
+	//for one that does not. A solid box, not the bucket sprite: redrawing the
+	//numbered glyph there prints the slot's number once per owned weapon
+
 	x = x0;
 
 	for (slot = 0; slot < HLWPN_SLOTS; slot++)
 	{
 		if (slot == hl_wpn_sel_slot)
 		{
-			x += sel_w + gap;
+			x += open_w + gap;
 			goto qwds_slot;
 		}
 
@@ -3656,23 +3977,22 @@ U0 HLWeaponDrawSelection(CHLCanvas *c)
 			if (id < 0 || !hl_wpn_have[id])
 				goto qwds_box;
 
-			//yellowish with ammo, redish without - the SDK's two colours for
-			//this row
 			if (HLWeaponCanFire(id) || HLWeaponPool(id) > 0)
 			{
-				r = 128;
-				g = 80;
-				b = 0;
+				r     = HLHUD_R;
+				g     = HLHUD_G;
+				b     = HLHUD_B;
+				alpha = 128;
 			}
 			else
 			{
-				r = 128;
-				g = 8;
-				b = 8;
+				r     = HLHUD_LOW_R;
+				g     = HLHUD_LOW_G;
+				b     = HLHUD_LOW_B;
+				alpha = 96;
 			}
 
-			if (bucket[slot] >= 0)
-				HLHudDrawElement(c, bucket[slot], x, y, r, g, b);
+			HLWeaponFillRect(c, x, y, bw, bh, r, g, b, alpha);
 
 			y += bh + gap;
 
@@ -3684,10 +4004,11 @@ qwds_box:
 qwds_slot:
 	}
 
-	//--- the open bucket ---
+	//--- the open bucket, stacked under its own column ---
 	//
-	//x is the left edge of the open column, which is every closed slot to its
-	//left advanced by the bucket width
+	//x is the left edge of that column: every slot to its left is closed and
+	//advanced the row by the bucket width
+
 	x   = x0 + hl_wpn_sel_slot * (bw + gap);
 	row = 0;
 
@@ -3698,54 +4019,59 @@ qwds_slot:
 		if (id < 0 || !hl_wpn_have[id])
 			goto qwds_next;
 
-		//"y = giBucketHeight + 10", then one panel plus 5 per entry
+		//"y = giBucketHeight + 10", then rcActive's height plus 5 per entry
 		y = bh + y0 + row * step;
 
-		//held weapon bright, owned-but-dry dimmed. HL greys a weapon with no
-		//ammo. With the two-step menu up the highlight follows the walk
-		//instead of the held weapon, so the player can see what +attack will
-		//confirm
-		if (hl_wpn_sel_pos >= 0 && pos == hl_wpn_sel_pos)
+		//gpActiveSel is the entry +attack will confirm. With the two-step menu
+		//up the highlight follows the walk rather than the held weapon, so the
+		//player can see what is about to be deployed
+		hot = FALSE;
+
+		if (hl_wpn_sel_pos >= 0)
+			hot = ToBool(pos == hl_wpn_sel_pos);
+		else
+			hot = ToBool(id == hl_wpn_active);
+
+		if (hot)
 		{
-			r = HLHUD_R;
-			g = HLHUD_G;
-			b = HLHUD_B;
-		}
-		else if (id == hl_wpn_active && hl_wpn_sel_pos < 0)
-		{
-			r = HLHUD_R;
-			g = HLHUD_G;
-			b = HLHUD_B;
+			//hActive at full RGB_YELLOWISH, with the `selection` frame drawn
+			//over it - ammo.cpp:1139-1146
+			r     = HLHUD_R;
+			g     = HLHUD_G;
+			b     = HLHUD_B;
+			alpha = 255;
 		}
 		else if (HLWeaponCanFire(id) || HLWeaponPool(id) > 0)
 		{
-			r = 160;
-			g = 100;
-			b = 0;
+			//hInactive, ScaleColors(RGB_YELLOWISH, 192)
+			r     = HLHUD_R;
+			g     = HLHUD_G;
+			b     = HLHUD_B;
+			alpha = 192;
 		}
 		else
 		{
-			r = 80;
-			g = 80;
-			b = 80;
+			//ScaleColors(RGB_REDISH, 128)
+			r     = HLHUD_LOW_R;
+			g     = HLHUD_LOW_G;
+			b     = HLHUD_LOW_B;
+			alpha = 128;
 		}
-
-		if (sel >= 0)
-			HLHudDrawElement(c, sel, x, y, r / 3, g / 3, b / 3);
 
 		StrPrint(name, "d_%s", hl_wpn_info[id].hud_name);
 		idx = HLHudFind(name);
 
 		if (idx >= 0)
-		{
-			//centred in the panel when there is one, otherwise inset
-			if (sel_w > hl_hud_entry[idx].w)
-				HLHudDrawElement(c, idx,
-					x + (sel_w - hl_hud_entry[idx].w) / 2,
-					y + (sel_h - hl_hud_entry[idx].h) / 2, r, g, b);
-			else
-				HLHudDrawElement(c, idx, x + gap, y + gap, r, g, b);
-		}
+			HLHudDrawElement(c, idx,
+				x + (sel_w - hl_hud_entry[idx].w) / 2,
+				y + (sel_h - hl_hud_entry[idx].h) / 2,
+				(r * alpha) / 255, (g * alpha) / 255, (b * alpha) / 255);
+
+		//the frame goes over the highlighted entry only. Drawn behind every
+		//entry it is a column of panels with nothing to distinguish the one
+		//+attack will take
+		if (hot && sel >= 0)
+			HLHudDrawElement(c, sel, x, y, HLHUD_R, HLHUD_G, HLHUD_B);
 
 		row++;
 
@@ -3789,6 +4115,10 @@ U0 HLWeaponHudHook(CHLCanvas *c)
 	//the canvas basis is the aim basis - HLDrawSetView built it with
 	//HLAngleVectors off the same view angles the player holds
 	HLWeaponFrame(dt, hl_map, c->origin, c->forward, c->right, c->up);
+
+	//the world layer first: projectile bodies are depth tested against the
+	//scene, the view model sits over them, and the 2D overlay over both
+	HLProjDraw(c);
 
 	//the gun under the reticle, both under whatever HLHudDraw prints next
 	HLWeaponDrawViewModel(c);
