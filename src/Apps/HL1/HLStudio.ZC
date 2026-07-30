@@ -16,9 +16,12 @@
 // the on-disk floats are binary32 and ZealC is F64-only, so every field is
 // pulled out by hand.
 //
-// Not implemented: sequence groups (<name>NN.mdl), chrome skins, attachments,
-// hitboxes, events, 4-way blends, per-vertex lighting from the normals.
-// Lighting is one flat scalar per model from HLLightPoint at the entity origin.
+// Lighting mirrors StudioSetupLighting and StudioLighting: one HLLightPoint
+// sample is split into an ambient and a shade term, and the shade term is
+// modulated per normal against the light vector rotated into bone space.
+//
+// Not implemented: a Gouraud span. HLDrawPolygon carries one light per polygon,
+// so a triangle takes the mean of its three vertex values.
 
 #define HLST_MAGIC			0x54534449	//"IDST" little-endian
 #define HLST_MAGIC_SEQ		0x51534449	//"IDSQ", a sequence group file
@@ -33,6 +36,19 @@
 #define HLST_MAX_SEQS		256
 #define HLST_MAX_CONTROLLERS 8		//4 generic + mouth, with headroom
 
+//A submodel carries more normals than vertices - a vertex on a crease appears
+//once but has one normal per face it belongs to. Largest in valve/models is
+//1198 normals against 1038 vertices.
+#define HLST_MAX_NORMS		2048
+
+//nihilanth carries 64 hitboxes and controller.mdl 44, so 128 is ample.
+//controller.mdl and nihilanth carry 4 attachments, the format's own ceiling.
+#define HLST_MAX_ATTACH		8
+#define HLST_MAX_HITBOXES	128
+
+//scientist.mdl has 8 sequence groups, the most anything valve shipped
+#define HLST_MAX_SEQGROUPS	16
+
 //record sizes, so a malformed count can be bounds checked before it is used
 #define HLST_HDR_SIZE		244
 #define HLST_BONE_SIZE		112
@@ -44,6 +60,16 @@
 #define HLST_MESH_SIZE		20
 #define HLST_ANIM_SIZE		12		//six u16 channel offsets
 #define HLST_EVENT_SIZE		76		//frame, event, type, char options[64]
+
+//mstudioattachment_t: name[32], type, bone, vec3 org, vec3 vectors[3]
+#define HLST_ATTACH_SIZE	88
+//mstudiobbox_t: bone, group, vec3 bbmin, vec3 bbmax
+#define HLST_HBOX_SIZE		32
+//mstudioseqgroup_t: label[32], name[64], two unused ints
+#define HLST_SEQGROUP_SIZE	104
+//studioseqhdr_t: id, version, name[64], length. A group file's anim offsets
+//are relative to the start of the file, so the first one is exactly this.
+#define HLST_SEQHDR_SIZE	76
 
 //Total events kept per model. A shipped monster carries tens, not hundreds.
 #define HLST_MAX_EVENTS		512
@@ -71,6 +97,23 @@
 #define HLST_NF_ALPHA		0x0010
 #define HLST_NF_ADDITIVE	0x0020
 #define HLST_NF_MASKED		0x0040
+
+//motion channel bits, shared by mstudiobonecontroller_t.type and
+//mstudioseqdesc_t.blendtype. Rotational channels are the ones that wrap and
+//the ones whose controller value converts to radians.
+#define HLST_X				0x0001
+#define HLST_Y				0x0002
+#define HLST_Z				0x0004
+#define HLST_XR				0x0008
+#define HLST_YR				0x0010
+#define HLST_ZR				0x0020
+#define HLST_TYPES			0x7FFF
+#define HLST_RLOOP			0x8000	//controller wraps the shortest way
+#define HLST_ROT_MASK		0x0038	//XR|YR|ZR
+
+//the fixed hemispherical term in StudioLighting. 1.5 is the studiomdl
+//default and nothing in valve/ overrides it
+#define HLST_LAMBERT		1.5
 
 class CHLStBone
 {
@@ -111,12 +154,47 @@ class CHLStSeq
 	F64	linear_movement[3];
 	I64	num_blends;
 	I64	anim_index;		//to mstudioanim_t[num_blends][num_bones]
+
+	//blendtype at 128, blendstart at 136, blendend at 144. A zero type means
+	//that axis is unused; hgrunt's standing_mp5 is type XR over -45..45
+	I64	blend_type[2];
+	F64	blend_start[2];
+	F64	blend_end[2];
+
 	I64	seq_group;
 	I64	next_seq;
 
 	//Slice of CHLStudio.events belonging to this sequence.
 	I64	first_event;
 	I64	num_events;
+};
+
+class CHLStAttach
+{//mstudioattachment_t, 88 bytes. The three vectors are written by studiomdl
+ //but every shipped model leaves them zero, so only org is kept
+	U8	name[32];
+	I64	type;
+	I64	bone;
+	F64	org[3];		//in the owning bone's space
+};
+
+class CHLStHitBox
+{//mstudiobbox_t, 32 bytes. group is the hit group a trace reports: 1 head,
+ //2 chest, 3 stomach, 4/5 arms, 6/7 legs
+	I64	bone;
+	I64	group;
+	F64	mins[3];	//in the owning bone's space
+	F64	maxs[3];
+};
+
+class CHLStSeqGroup
+{//mstudioseqgroup_t, 104 bytes. Group 0 is the model itself and carries no
+ //file name; the rest name a sibling written with backslashes
+	U8	 label[32];
+	U8	 name[64];
+	U8	*raw;		//owned, NULL until a sequence in this group is posed
+	I64	 raw_size;
+	Bool tried;		//a failed load is not retried every frame
 };
 
 class CHLStTexture
@@ -139,6 +217,14 @@ class CHLStSubModel
 	I64			num_verts;
 	I64			vert_info_index;	//byte per vertex: which bone owns it
 	I64			vert_index;			//vec3 per vertex, in its owning bone's space
+
+	//normals are a parallel set, indexed by the second short of a tri command
+	//and numbered across the whole submodel, not per mesh. numnorms at 92,
+	//norminfoindex at 96, normindex at 100 of mstudiomodel_t
+	I64			num_norms;
+	I64			norm_info_index;	//byte per normal: which bone owns it
+	I64			norm_index;			//vec3 per normal, in that bone's space
+
 	I64			num_meshes;
 	CHLStMesh	meshes[HLST_MAX_MESHES];
 };
@@ -171,6 +257,18 @@ class CHLStudio
 
 	I64				 num_seqs;
 	CHLStSeq		*seqs;
+
+	//numseqgroups at 172, seqgroupindex at 176. Group 0 is this file
+	I64				 num_seqgroups;
+	CHLStSeqGroup	*seqgroups;
+
+	//numattachments at 212, attachmentindex at 216
+	I64				 num_attachments;
+	CHLStAttach		*attachments;
+
+	//numhitboxes at 156, hitboxindex at 160
+	I64				 num_hitboxes;
+	CHLStHitBox		*hitboxes;
 
 	//Every sequence's events, flattened; CHLStSeq names its own slice.
 	I64				 num_events;

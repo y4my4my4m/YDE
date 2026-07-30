@@ -2522,3 +2522,519 @@ U0 HLDrawBlit(CHLCanvas *c, CDC *dc, I64 dst_x, I64 dst_y, I64 scale)
 		}
 	}
 }
+
+//--- decals ----------------------------------------------------------------
+//
+// R_DecalShoot. A decal is a texture patch on the world surface a trace struck.
+//
+// It is drawn as a screen space pass after the world rather than by re-cutting
+// the face: every pixel inside the patch's screen bounds casts a view ray, meets
+// the decal plane, and is kept when its 1/z agrees with the depth already in the
+// buffer. That makes the patch follow whatever geometry lies under it, at any
+// angle, with no clipping and no second surface cache entry.
+//
+// Textures come from decals.wad, mounted on first use. gDecals in dlls/world.cpp
+// names them and dlls/decals.h numbers them; both are reproduced below. The
+// leading masked-texture character of each name is prepended at run time.
+
+#define HLDECAL_MAX			128		//ring, oldest overwritten
+#define HLDECAL_TEX_MAX		42		//decal_e, DECAL_GUNSHOT1..DECAL_MOMMASPLAT
+#define HLDECAL_NAME_MAX	24
+
+//decal_e, dlls/decals.h. Only the bases the effect layer picks from are named
+#define HLDECAL_GUNSHOT1		0
+#define HLDECAL_SCORCH1			11
+#define HLDECAL_SCORCH2			12
+#define HLDECAL_BLOOD1			13
+#define HLDECAL_YBLOOD1			19
+#define HLDECAL_BIGSHOT1		28
+#define HLDECAL_SMALLSCORCH1	36
+
+class CHLDecal
+{
+	F64	 origin[3];
+	F64	 normal[3];
+	F64	 sdir[3];		//in plane basis, s across
+	F64	 tdir[3];		//in plane basis, t down
+	F64	 half_s;		//world units, half the texture width
+	F64	 half_t;
+	I64	 tex;			//decal_e
+	Bool active;
+};
+
+CHLDecal	hl_decals[HLDECAL_MAX];
+CHLTexture	hl_decal_tex[HLDECAL_TEX_MAX];
+Bool		hl_decal_tex_ok[HLDECAL_TEX_MAX];
+Bool		hl_decal_tex_tried[HLDECAL_TEX_MAX];
+I64			hl_decal_next	= 0;
+I64			hl_decal_drawn	= 0;
+Bool		hl_decal_wad_tried = FALSE;
+
+U8 *HLDecalName(I64 n)
+{//gDecals, dlls/world.cpp, without its leading masked-texture character
+ //
+ //a U8 *table[] of adjacent literals concatenates and truncates at the first
+ //NUL, so the table has to be a comparison chain
+	if (n == 0)		return "shot1";
+	if (n == 1)		return "shot2";
+	if (n == 2)		return "shot3";
+	if (n == 3)		return "shot4";
+	if (n == 4)		return "shot5";
+	if (n == 5)		return "lambda01";
+	if (n == 6)		return "lambda02";
+	if (n == 7)		return "lambda03";
+	if (n == 8)		return "lambda04";
+	if (n == 9)		return "lambda05";
+	if (n == 10)	return "lambda06";
+	if (n == 11)	return "scorch1";
+	if (n == 12)	return "scorch2";
+	if (n == 13)	return "blood1";
+	if (n == 14)	return "blood2";
+	if (n == 15)	return "blood3";
+	if (n == 16)	return "blood4";
+	if (n == 17)	return "blood5";
+	if (n == 18)	return "blood6";
+	if (n == 19)	return "yblood1";
+	if (n == 20)	return "yblood2";
+	if (n == 21)	return "yblood3";
+	if (n == 22)	return "yblood4";
+	if (n == 23)	return "yblood5";
+	if (n == 24)	return "yblood6";
+	if (n == 25)	return "break1";
+	if (n == 26)	return "break2";
+	if (n == 27)	return "break3";
+	if (n == 28)	return "bigshot1";
+	if (n == 29)	return "bigshot2";
+	if (n == 30)	return "bigshot3";
+	if (n == 31)	return "bigshot4";
+	if (n == 32)	return "bigshot5";
+	if (n == 33)	return "spit1";
+	if (n == 34)	return "spit2";
+	if (n == 35)	return "bproof1";
+	if (n == 36)	return "gargstomp";
+	if (n == 37)	return "smscorch1";
+	if (n == 38)	return "smscorch2";
+	if (n == 39)	return "smscorch3";
+	if (n == 40)	return "mommablob";
+	if (n == 41)	return "mommablob";
+
+	return NULL;
+}
+
+U0 HLDecalClear()
+{//a map change unmounts decals.wad, and every texture body here is borrowed
+ //from it, so the load state is dropped with the patches
+	I64 i;
+
+	for (i = 0; i < HLDECAL_MAX; i++)
+		hl_decals[i].active = FALSE;
+
+	for (i = 0; i < HLDECAL_TEX_MAX; i++)
+	{
+		hl_decal_tex_ok[i]    = FALSE;
+		hl_decal_tex_tried[i] = FALSE;
+		MemSet(&hl_decal_tex[i], 0, sizeof(CHLTexture));
+	}
+
+	hl_decal_next      = 0;
+	hl_decal_drawn     = 0;
+	hl_decal_wad_tried = FALSE;
+}
+
+U0 HLDecalInit()
+{//globals are not zeroed and this table is walked every frame
+	HLDecalClear;
+}
+
+Bool HLDecalTexGet(I64 n)
+{//one decal texture, loaded on demand
+ //
+ //decals.wad is not listed in the map's wad key - the engine mounts it always -
+ //so it is mounted here the first time a decal is placed. FALSE means the
+ //archive is absent and the caller records nothing
+	U8	*base;
+	U8	*mip;
+	U8	 name[HLDECAL_NAME_MAX];
+	I64	 size = 0;
+
+	if (n < 0 || n >= HLDECAL_TEX_MAX)
+		return FALSE;
+
+	if (hl_decal_tex_tried[n])
+		return hl_decal_tex_ok[n];
+
+	hl_decal_tex_tried[n] = TRUE;
+	hl_decal_tex_ok[n]    = FALSE;
+
+	base = HLDecalName(n);
+	if (!base)
+		return FALSE;
+
+	if (!hl_decal_wad_tried)
+	{
+		hl_decal_wad_tried = TRUE;
+		HLWad3MountByName("decals");
+	}
+
+	name[0] = 0x7B;		//the masked-texture prefix every gDecals name carries
+	StrCopy(name + 1, base);
+
+	mip = HLWad3FindMip(name, &size);
+	if (!mip)
+		return FALSE;
+
+	if (!HLBSPDecodeMiptex(&hl_decal_tex[n], mip, size))
+		return FALSE;
+
+	if (!hl_decal_tex[n].palette || !hl_decal_tex[n].texels[0])
+		return FALSE;
+
+	if (hl_decal_tex[n].width <= 0 || hl_decal_tex[n].height <= 0)
+		return FALSE;
+
+	hl_decal_tex_ok[n] = TRUE;
+	return TRUE;
+}
+
+U0 HLDecalAdd(F64 *origin, F64 *normal, I64 decal)
+{//UTIL_DecalTrace's client half. origin is the trace end and normal the plane
+ //it struck
+ //
+ //the patch is the texture's own size in world units, one texel per unit, which
+ //is how GoldSrc scales a decal
+	CHLDecal	*d;
+	CHLTexture	*t;
+	F64			 axis[3];
+
+	if (!HLDecalTexGet(decal))
+		return;
+
+	t = &hl_decal_tex[decal];
+	d = &hl_decals[hl_decal_next];
+
+	hl_decal_next++;
+	if (hl_decal_next >= HLDECAL_MAX)
+		hl_decal_next = 0;
+
+	d->active = FALSE;
+
+	HLVecCopy(origin, d->origin);
+	HLVecCopy(normal, d->normal);
+
+	if (HLVecNormalize(d->normal) < 0.001)
+		return;
+
+	//a decal carries no authored rotation, so any in plane basis serves. world
+	//up degenerates on a floor or a ceiling, where world x is used instead
+	HLVecSet(axis, 0.0, 0.0, 1.0);
+	if (d->normal[2] > 0.7 || d->normal[2] < -0.7)
+		HLVecSet(axis, 1.0, 0.0, 0.0);
+
+	HLVecCross(axis, d->normal, d->sdir);
+	if (HLVecNormalize(d->sdir) < 0.001)
+		return;
+
+	HLVecCross(d->normal, d->sdir, d->tdir);
+	if (HLVecNormalize(d->tdir) < 0.001)
+		return;
+
+	d->half_s = ToF64(t->width) * 0.5;
+	d->half_t = ToF64(t->height) * 0.5;
+	d->tex    = decal;
+	d->active = TRUE;
+}
+
+U0 HLDrawDecals(CHLCanvas *c)
+{//every live patch, depth tested against the world already in the buffer
+ //
+ //decals.wad holds two kinds. When the last palette entry is pure blue the
+ //texture is a cutout and the last index is the transparent key; otherwise the
+ //index is coverage and the last entry is the colour, the same rule HLSpr uses
+ //for an INDEXALPHA sprite
+	CHLDecal	*d;
+	CHLTexture	*t;
+	U8			*pal;
+	U8			*texels;
+	U32			*row;
+	F64			 corner[3];
+	F64			 rel[3];
+	F64			 dir[3];
+	F64			 hit[3];
+	F64			 cam_z;
+	F64			 inv_z;
+	F64			 denom;
+	F64			 ray;
+	F64			 plane_d;
+	F64			 eye_d;
+	F64			 sx;
+	F64			 sy;
+	F64			 min_x;
+	F64			 min_y;
+	F64			 max_x;
+	F64			 max_y;
+	F64			 a;
+	F64			 b;
+	F64			 fs;
+	F64			 ft;
+	I64			 i;
+	I64			 k;
+	I64			 x;
+	I64			 y;
+	I64			 x0;
+	I64			 x1;
+	I64			 y0;
+	I64			 y1;
+	I64			 cx0;
+	I64			 cx1;
+	I64			 cy0;
+	I64			 cy1;
+	I64			 tw;
+	I64			 th;
+	I64			 tx;
+	I64			 ty;
+	I64			 texel;
+	I64			 cr;
+	I64			 cg;
+	I64			 cb;
+	I64			 alpha;
+	I64			 dr;
+	I64			 dg;
+	I64			 db;
+	I64			 idx;
+	I64			 in_front;
+	Bool		 masked;
+	Bool		 behind;
+	U32			 c32;
+
+	hl_decal_drawn = 0;
+
+	if (!c || !c->pixels || !c->depth)
+		return;
+
+	//SCR_CalcRefdef vrect, so a decal cannot bleed into the border or the
+	//status bar
+	cx0 = c->vx;
+	cy0 = c->vy;
+	cx1 = c->vx + c->vw - 1;
+	cy1 = c->vy + c->vh - 1;
+
+	if (c->vw < 1 || c->vh < 1)
+	{
+		cx0 = 0;
+		cy0 = 0;
+		cx1 = c->width - 1;
+		cy1 = c->height - 1;
+	}
+
+	if (cx0 < 0)			cx0 = 0;
+	if (cy0 < 0)			cy0 = 0;
+	if (cx1 > c->width - 1)	cx1 = c->width - 1;
+	if (cy1 > c->height - 1) cy1 = c->height - 1;
+
+	for (i = 0; i < HLDECAL_MAX; i++)
+	{
+		d = &hl_decals[i];
+
+		if (!d->active)
+			goto qdc_next;
+
+		if (d->tex < 0 || d->tex >= HLDECAL_TEX_MAX)
+			goto qdc_next;
+
+		if (!hl_decal_tex_ok[d->tex])
+			goto qdc_next;
+
+		t      = &hl_decal_tex[d->tex];
+		pal    = t->palette;
+		texels = t->texels[0];
+		tw     = t->width;
+		th     = t->height;
+
+		if (!pal || !texels || tw <= 0 || th <= 0)
+			goto qdc_next;
+
+		//the eye is behind the surface the patch lies on
+		HLVecSub(d->origin, c->origin, rel);
+		if (HLVecDot(rel, d->normal) > 0.0)
+			goto qdc_next;
+
+		//screen bounds of the four corners. one behind the near clip projects
+		//to nothing usable, so the whole view rect is scanned instead - rare,
+		//and only when the patch is under the eye
+		min_x    = 1.0e30;
+		min_y    = 1.0e30;
+		max_x    = -1.0e30;
+		max_y    = -1.0e30;
+		behind   = FALSE;
+		in_front = 0;
+
+		for (k = 0; k < 4; k++)
+		{
+			HLVecCopy(d->origin, corner);
+
+			if (k == 0 || k == 3)
+				HLVecMA(corner, -d->half_s, d->sdir, corner);
+			else
+				HLVecMA(corner, d->half_s, d->sdir, corner);
+
+			if (k < 2)
+				HLVecMA(corner, -d->half_t, d->tdir, corner);
+			else
+				HLVecMA(corner, d->half_t, d->tdir, corner);
+
+			HLVecSub(corner, c->origin, rel);
+			cam_z = HLVecDot(rel, c->forward);
+
+			if (cam_z < HLNEAR_CLIP)
+			{
+				behind = TRUE;
+				goto qdc_next_corner;
+			}
+
+			in_front++;
+			inv_z = 1.0 / cam_z;
+			sx    = c->center_x + HLVecDot(rel, c->right) * c->x_scale * inv_z;
+			sy    = c->center_y - HLVecDot(rel, c->up) * c->y_scale * inv_z;
+
+			if (sx < min_x)	min_x = sx;
+			if (sx > max_x)	max_x = sx;
+			if (sy < min_y)	min_y = sy;
+			if (sy > max_y)	max_y = sy;
+
+qdc_next_corner:
+		}
+
+		if (!in_front)
+			goto qdc_next;
+
+		if (behind)
+		{
+			x0 = cx0;
+			y0 = cy0;
+			x1 = cx1;
+			y1 = cy1;
+		}
+		else
+		{
+			x0 = ToI64(min_x) - 1;
+			y0 = ToI64(min_y) - 1;
+			x1 = ToI64(max_x) + 1;
+			y1 = ToI64(max_y) + 1;
+		}
+
+		if (x0 < cx0)	x0 = cx0;
+		if (y0 < cy0)	y0 = cy0;
+		if (x1 > cx1)	x1 = cx1;
+		if (y1 > cy1)	y1 = cy1;
+
+		if (x0 > x1 || y0 > y1)
+			goto qdc_next;
+
+		masked = ToBool(pal[765] == 0 && pal[766] == 0 && pal[767] == 255);
+
+		//the last entry is the colour of an index-alpha patch
+		cr = pal[765];
+		cg = pal[766];
+		cb = pal[767];
+
+		plane_d = HLVecDot(d->normal, d->origin);
+		eye_d   = HLVecDot(d->normal, c->origin);
+
+		for (y = y0; y <= y1; y++)
+		{
+			row = c->pixels + y * c->width;
+			b   = -(ToF64(y) + 0.5 - c->center_y) / c->y_scale;
+
+			for (x = x0; x <= x1; x++)
+			{
+				a = (ToF64(x) + 0.5 - c->center_x) / c->x_scale;
+
+				//forward component is 1, so the plane parameter is the camera
+				//space z of the hit and needs no second projection
+				dir[0] = c->forward[0] + c->right[0] * a + c->up[0] * b;
+				dir[1] = c->forward[1] + c->right[1] * a + c->up[1] * b;
+				dir[2] = c->forward[2] + c->right[2] * a + c->up[2] * b;
+
+				denom = HLVecDot(d->normal, dir);
+
+				//parallel to the plane, or looking at its back
+				if (denom > -0.0001)
+					goto qdc_next_pixel;
+
+				ray = (plane_d - eye_d) / denom;
+				if (ray < HLNEAR_CLIP)
+					goto qdc_next_pixel;
+
+				idx = y * c->width + x;
+
+				//nothing was drawn here, so there is no surface to sit on
+				if (c->depth[idx] <= 0.0)
+					goto qdc_next_pixel;
+
+				//0.5% of 1/z, about a quarter unit at close range: enough slack
+				//for the span rasteriser's own error, tight enough that a wall
+				//in front still hides the patch
+				inv_z = 1.0 / ray;
+				if (inv_z < c->depth[idx] * 0.995)
+					goto qdc_next_pixel;
+
+				HLVecMA(c->origin, ray, dir, hit);
+				HLVecSub(hit, d->origin, rel);
+
+				fs = HLVecDot(rel, d->sdir);
+				ft = HLVecDot(rel, d->tdir);
+
+				if (fs < -d->half_s || fs >= d->half_s)
+					goto qdc_next_pixel;
+				if (ft < -d->half_t || ft >= d->half_t)
+					goto qdc_next_pixel;
+
+				tx = ToI64((fs + d->half_s) * ToF64(tw) / (d->half_s * 2.0));
+				ty = ToI64((ft + d->half_t) * ToF64(th) / (d->half_t * 2.0));
+
+				if (tx < 0)			tx = 0;
+				if (ty < 0)			ty = 0;
+				if (tx > tw - 1)	tx = tw - 1;
+				if (ty > th - 1)	ty = th - 1;
+
+				texel = texels[ty * tw + tx];
+
+				if (masked)
+				{
+					if (texel == 255)
+						goto qdc_next_pixel;
+
+					alpha = 255;
+					cr    = pal[texel * 3];
+					cg    = pal[texel * 3 + 1];
+					cb    = pal[texel * 3 + 2];
+				}
+				else
+				{
+					if (!texel)
+						goto qdc_next_pixel;
+
+					alpha = texel;
+				}
+
+				c32 = row[x];
+				dr  = (c32 >> 16) & 255;
+				dg  = (c32 >> 8) & 255;
+				db  = c32 & 255;
+
+				dr = (dr * (255 - alpha) + cr * alpha) / 255;
+				dg = (dg * (255 - alpha) + cg * alpha) / 255;
+				db = (db * (255 - alpha) + cb * alpha) / 255;
+
+				//the depth is left alone: the patch is coplanar with the
+				//surface under it and must not occlude anything
+				row[x] = (dr << 16) | (dg << 8) | db;
+				hl_decal_drawn++;
+
+qdc_next_pixel:
+			}
+		}
+
+qdc_next:
+	}
+}

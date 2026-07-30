@@ -83,6 +83,29 @@ I64  hl_sp_row       = 0;
 Bool hl_menu_save_req = FALSE;	//polled by the main loop, it owns save/load
 Bool hl_menu_load_req = FALSE;
 
+//CBasePlayer's flashlight, impulse 100. EF_DIMLIGHT is a projected spot in
+//the retail client and this renderer has none, so the beam is a dlight parked
+//ahead of the eye and refreshed once a frame. m_iFlashBattery drains and
+//recharges on the SDK's two clocks.
+#define HLFLASH_DRAIN	1.2		//FLASH_DRAIN_TIME, seconds per unit spent
+#define HLFLASH_CHARGE	0.2		//FLASH_CHARGE_TIME, seconds per unit regained
+#define HLFLASH_RADIUS	220.0	//dlight radius, no SDK counterpart
+#define HLFLASH_AHEAD	72.0	//how far down the view ray the beam lands
+
+Bool hl_flash_on		= FALSE;
+I64  hl_flash_battery	= 100;
+F64  hl_flash_next		= 0.0;	//next drain or charge tick, wall clock
+
+//CBasePlayer::m_pLastItem, for lastinv. HLWeaponSetActive does not record the
+//weapon it holstered, so the swap is noticed once a frame instead.
+I64  hl_con_wpn_seen	= -1;	//what hl_wpn_active was at the last sample
+I64  hl_con_wpn_prev	= -1;	//the one before that
+
+//ClientCommand "fov" reports the live value. hl_fov lives in the shell, which
+//compiles after this file and clears the request once it has applied it, so
+//the last value asked for is shadowed here.
+F64  hl_con_fov_last	= 90.0;
+
 //M_LanConfig, the JOIN GAME - TCP/IP page. address typed here, not console
 #define HLLAN_ADDRESS	0
 #define HLLAN_SEARCH		1		//broadcast query, results listed below
@@ -1350,6 +1373,12 @@ U0 HLMenuInit()
 	hl_menu_slot      = 0;
 	hl_opt_tab        = HLTAB_VIDEO;
 	hl_opt_row        = 0;
+	hl_flash_on       = FALSE;
+	hl_flash_battery  = 100;
+	hl_flash_next     = 0.0;
+	hl_con_wpn_seen   = -1;
+	hl_con_wpn_prev   = -1;
+	hl_con_fov_last   = 90.0;
 
 	U8	name[24];
 	I64	i;
@@ -1522,10 +1551,6 @@ Bool HLConKeyEdge(I64 sc)
 }
 
 //--- console command helpers ------------------------------------------------
-
-//FL_ bits from defs.qc
-#define HLFL_GODMODE_	64
-#define HLFL_NOTARGET_	128
 
 F64  hl_con_fov_want	= 0.0;	//non-zero, console asked for a new fov
 Bool hl_con_want_save	= FALSE;
@@ -1875,6 +1900,249 @@ U0 HLConReportFlag(U8 *name, Bool on)
 	HLConPrint(msg);
 }
 
+Bool HLConAimBasis(F64 *eye, F64 *fwd)
+{//the eye and forward vector FindEntityForward traces along.
+ //
+ //hl_angles and hl_view belong to the shell, which compiles after this file,
+ //so the eye is taken from the sound listener - HLSndListener is handed
+ //hl_view every frame - and the heading from listener_right. AngleVectors'
+ //right is roll free, right = (sin yaw, -cos yaw, 0), so forward at zero
+ //pitch is (-right[1], right[0], 0). Pitch is the one thing lost: the probe
+ //runs level with the eye rather than up or down the view ray.
+	if (!hl_game_active || !hl_map || !hl_entities)
+		return FALSE;
+
+	HLVecCopy(hl_snd_listener, eye);
+	HLVecSet(fwd, -hl_snd_right[1], hl_snd_right[0], 0.0);
+
+	if (HLVecNormalize(fwd) <= 0.0)
+		return FALSE;
+
+	return TRUE;
+}
+
+I64 HLConEntityForward()
+{//FindEntityForward. HLTraceEntity clips against SOLID_BSP brushes only, so a
+ //SLIDEBOX monster is invisible to it - the probe is HLEntUseInFront's box
+ //test walked out along the ray instead, which keeps +use and the aiming
+ //impulses agreeing on what is in front. -1 when nothing is.
+	CHLEntity	*e;
+	F64			 eye[3];
+	F64			 fwd[3];
+	F64			 probe[3];
+	F64			 pmins[3];
+	F64			 pmaxs[3];
+	F64			 d;
+	I64			 i;
+	I64			 j;
+
+	if (!HLConAimBasis(eye, fwd))
+		return -1;
+
+	d = 16.0;
+
+	while (d <= 2048.0)
+	{
+		HLVecMA(eye, d, fwd, probe);
+
+		for (j = 0; j < 3; j++)
+		{
+			pmins[j] = probe[j] - 16.0;
+			pmaxs[j] = probe[j] + 16.0;
+		}
+
+		for (i = 0; i < hl_num_entities; i++)
+		{
+			e = &hl_entities[i];
+
+			//SOLID_NOT is what the trace would pass straight through
+			if (!e->in_use || e->solid == HLSOLID_NOT || i == hl_ent_player)
+				goto qcef_next;
+
+			if (HLEntBoxOverlap(e, pmins, pmaxs))
+				return i;
+
+qcef_next:
+		}
+
+		d += 16.0;
+	}
+
+	return -1;
+}
+
+U8 *HLConMonStateName(I64 s)
+{//ReportAIState's pStateNames. A comparison chain, not a table: adjacent
+ //string literals in a U8 * array collapse to one entry on this compiler
+	if (s == HLMSTATE_IDLE)		return "Idle";
+	if (s == HLMSTATE_ALERT)		return "Alert";
+	if (s == HLMSTATE_COMBAT)	return "Combat";
+	if (s == HLMSTATE_SCRIPT)	return "Scripted";
+	if (s == HLMSTATE_DEAD)		return "Dead";
+
+	return "None";
+}
+
+U8 *HLConMonSchedName(I64 s)
+{//ReportAIState prints m_pSchedule->pName. These are the port's schedule ids
+	if (s == HLSCHED_IDLE_STAND)		return "IdleStand";
+	if (s == HLSCHED_ALERT_STAND)	return "AlertStand";
+	if (s == HLSCHED_ALERT_FACE)		return "AlertFace";
+	if (s == HLSCHED_WAKE_ANGRY)		return "WakeAngry";
+	if (s == HLSCHED_CHASE_ENEMY)	return "ChaseEnemy";
+	if (s == HLSCHED_MELEE_ATTACK1)	return "MeleeAttack1";
+	if (s == HLSCHED_RANGE_ATTACK1)	return "RangeAttack1";
+	if (s == HLSCHED_TAKE_COVER)		return "TakeCover";
+	if (s == HLSCHED_SMALL_FLINCH)	return "SmallFlinch";
+	if (s == HLSCHED_DIE)			return "Die";
+
+	return "None";
+}
+
+U8 *HLConGlobalStateName(I64 s)
+{//CGlobalState::DumpGlobals' estates
+	if (s == HLGLOBAL_ON)	return "On";
+	if (s == HLGLOBAL_DEAD)	return "Dead";
+
+	return "Off";
+}
+
+U0 HLConReportAIState(I64 ent)
+{//CBaseMonster::ReportAIState, for the one monster the probe found.
+ //
+ //Activity is absent: the port drives sequences by label off the schedule, so
+ //there is no activity_map to name.
+	CHLEntity	*e = HLEntGet(ent);
+	U8			 msg[128];
+	I64			 s;
+
+	if (!e)
+		return;
+
+	s = hl_ai_mon_of[ent];
+
+	if (s < 0)
+	{
+		StrPrint(msg, "%s: not a monster", e->classname);
+		HLConPrint(msg);
+		return;
+	}
+
+	StrPrint(msg, "%s: State: %s, Schedule %s, Task %d (status %d),",
+		e->classname,
+		HLConMonStateName(hl_ai_mon[s].state),
+		HLConMonSchedName(hl_ai_mon[s].sched),
+		hl_ai_mon[s].task, hl_ai_mon[s].task_status);
+	HLConPrint(msg);
+
+	if (!hl_ai_mon[s].have_enemy)
+		HLConPrint("No enemy");
+	else if (hl_ai_mon[s].enemy < 0)
+		HLConPrint("Enemy is player");
+	else
+	{
+		e = HLEntGet(hl_ai_mon[s].enemy);
+
+		if (e)
+			StrPrint(msg, "Enemy is %s", e->classname);
+		else
+			StrPrint(msg, "Enemy is entity %d", hl_ai_mon[s].enemy);
+
+		HLConPrint(msg);
+	}
+}
+
+U0 HLConFlashlightToggle()
+{//CBasePlayer::FlashlightTurnOn / FlashlightTurnOff. Both sounds are
+ //items/flashlight1.wav in the SDK, so the toggle plays one either way
+	if (!hl_game_active)
+		return;
+
+	if (hl_flash_on)
+	{
+		hl_flash_on   = FALSE;
+		hl_flash_next = tS + HLFLASH_CHARGE;
+		HLMenuSound("items/flashlight1.wav");
+		return;
+	}
+
+	//FlashlightTurnOn does nothing without WEAPON_SUIT
+	if (!hl_ent_player_suit)
+	{
+		HLConPrint("impulse 100: no HEV suit");
+		return;
+	}
+
+	if (hl_flash_battery <= 0)
+	{
+		HLConPrint("impulse 100: flashlight battery is flat");
+		return;
+	}
+
+	hl_flash_on   = TRUE;
+	hl_flash_next = tS + HLFLASH_DRAIN;
+	HLMenuSound("items/flashlight1.wav");
+}
+
+U0 HLConFlashlightFrame()
+{//CBasePlayer::UpdatePlayerSound's flashlight half: spend a battery unit every
+ //FLASH_DRAIN_TIME while lit, regain one every FLASH_CHARGE_TIME while off,
+ //and cut out when the cell is empty.
+ //
+ //The beam itself is a dlight re-added each frame. It is placed down the view
+ //ray at eye height rather than projected onto whatever is ahead - see
+ //HLConAimBasis for why there is no pitch here.
+	F64 eye[3];
+	F64 fwd[3];
+	F64 pos[3];
+
+	if (!hl_game_active)
+		return;
+
+	if (!hl_flash_on)
+	{
+		if (hl_flash_battery < 100 && tS >= hl_flash_next)
+		{
+			hl_flash_battery++;
+			hl_flash_next = tS + HLFLASH_CHARGE;
+		}
+		return;
+	}
+
+	if (tS >= hl_flash_next)
+	{
+		hl_flash_battery--;
+		hl_flash_next = tS + HLFLASH_DRAIN;
+
+		if (hl_flash_battery <= 0)
+		{
+			hl_flash_battery = 0;
+			hl_flash_on      = FALSE;
+			HLMenuSound("items/flashlight1.wav");
+			return;
+		}
+	}
+
+	if (!HLConAimBasis(eye, fwd))
+		return;
+
+	HLVecMA(eye, HLFLASH_AHEAD, fwd, pos);
+
+	//life is one frame's worth: the light is re-added below every frame, and a
+	//longer one would trail behind the player
+	HLDlightAdd(pos, HLFLASH_RADIUS, 0.1, 0.0, tS, 255, 250, 220);
+}
+
+U0 HLConTrackLastItem()
+{//CBasePlayer::m_pLastItem. HLWeaponSetActive keeps no record of the weapon it
+ //holstered, so the change is sampled here instead, once a frame
+	if (hl_wpn_active == hl_con_wpn_seen)
+		return;
+
+	hl_con_wpn_prev = hl_con_wpn_seen;
+	hl_con_wpn_seen = hl_wpn_active;
+}
+
 //Weapon-selection impulses ride the next move message: the input block
 //overwrites .impulse every tick, so one is queued here and survives one tick.
 I64 hl_con_impulse_want = 0;
@@ -1887,7 +2155,10 @@ U0 HLConImpulse(I64 n)
  //
  //Weapon-selection impulses (1..10) still ride the input block, which consumes
  //them once, so those are queued rather than handled.
-	U8 msg[96];
+	CHLEntity	*e;
+	U8			 msg[128];
+	I64			 ent;
+	I64			 i;
 
 	if (n >= 1 && n <= 10)
 	{
@@ -1897,8 +2168,40 @@ U0 HLConImpulse(I64 n)
 		return;
 	}
 
+	//--- ImpulseCommands, the three that are not cheats -----------------------
+
+	//case 99: the Logo user message toggles the client's valve logo sprite.
+	if (n == 99)
+	{
+		HLConPrint("impulse 99: no client Logo user message or logo sprite");
+		return;
+	}
+
+	//case 100: the level designer's flashlight.
+	if (n == 100)
+	{
+		HLConFlashlightToggle;
+		return;
+	}
+
+	//case 201: CSprayCan paints a decal where the eye ray lands.
+	if (n == 201)
+	{
+		HLConPrint("impulse 201: no decal layer - infodecal is unsupported, so a spraycan has nothing to mark");
+		return;
+	}
+
+	//--- CheatImpulseCommands ------------------------------------------------
+
 	if (!HLConCheatAllowed)
 		return;
+
+	//case 76: Create("monster_human_grunt", ...) after the map is running.
+	if (n == 76)
+	{
+		HLConPrint("impulse 76: no runtime entity creation - monsters exist only from the map's entity lump");
+		return;
+	}
 
 	//case 101: gEvilImpulse101, the give-all block.
 	if (n == 101)
@@ -1908,46 +2211,140 @@ U0 HLConImpulse(I64 n)
 		return;
 	}
 
-	//case 102 is a gib spray and 202 a blood decal; both need effect entities.
-	if (n == 102 || n == 202)
+	//case 102: CGib::SpawnRandomGibs.
+	if (n == 102)
 	{
-		HLConPrint("impulse: no gib or decal entities in this port");
+		HLConPrint("impulse 102: no gib models and no runtime entity creation for SpawnRandomGibs");
 		return;
 	}
 
-	//case 103: dump the AI state of everything the monster layer is running.
-	//The SDK reports only the monster under the crosshair, which needs a
-	//SLIDEBOX trace this port does not have.
+	//case 103: ReportAIState for the monster in front of the player.
 	if (n == 103)
 	{
-		HLAIMonReport;
+		ent = HLConEntityForward;
+
+		if (ent < 0)
+			HLConPrint("nothing in front");
+		else
+			HLConReportAIState(ent);
 		return;
 	}
 
-	//case 104: entity count.
+	//case 104: gGlobalState.DumpGlobals. The port's records carry no level
+	//name, so the "(levelName)" column of the SDK's line is absent.
 	if (n == 104)
 	{
+		HLConPrint("-- Globals --");
+
+		for (i = 0; i < hl_ent_global_count; i++)
+		{
+			if (!hl_ent_globals[i].name[0])
+				goto qci_glob;
+
+			StrPrint(msg, "%s: (%s)", hl_ent_globals[i].name,
+				HLConGlobalStateName(hl_ent_globals[i].state));
+			HLConPrint(msg);
+
+qci_glob:
+		}
+
 		StrPrint(msg, "%d entities in use", HLEntCountInUse);
 		HLConPrint(msg);
 		return;
 	}
 
-	//case 106: the texture under the crosshair. Needs the trace to report which
-	//face it hit, which HLTraceEntity does not carry back.
+	//case 105: m_fNoPlayerSound, which takes the player off the sound list the
+	//monsters listen to.
+	if (n == 105)
+	{
+		HLConPrint("impulse 105: HLAILook senses by sight alone - there is no CSoundEnt list to leave. notarget is the nearest equivalent");
+		return;
+	}
+
+	//case 106: name the entity in front of the player.
 	if (n == 106)
 	{
-		HLConPrint("impulse 106: the trace does not report a face");
+		ent = HLConEntityForward;
+		e   = HLEntGet(ent);
+
+		if (!e)
+		{
+			HLConPrint("nothing in front");
+			return;
+		}
+
+		if (e->targetname[0])
+			StrPrint(msg, "Classname: %s - Targetname: %s", e->classname,
+				e->targetname);
+		else
+			StrPrint(msg, "Classname: %s - TargetName: No Targetname",
+				e->classname);
+		HLConPrint(msg);
+
+		StrPrint(msg, "Model: %s", e->model_name);
+		HLConPrint(msg);
+
+		if (e->global_state[0])
+		{
+			StrPrint(msg, "Globalname: %s", e->global_state);
+			HLConPrint(msg);
+		}
 		return;
 	}
 
-	//cases 76, 107 and 195..197: monster spawning and node-graph tools.
-	if (n == 76 || n == 107 || (n >= 195 && n <= 197) || n == 203)
+	//case 107: TRACE_TEXTURE names the face the eye ray lands on. CHLTrace
+	//carries a plane, not the face behind it, so there is no name to report.
+	if (n == 107)
 	{
-		HLConPrint("impulse: needs runtime entity creation or a node graph");
+		HLConPrint("impulse 107: the trace reports a plane, not the face, so there is no texture name");
 		return;
 	}
 
-	StrPrint(msg, "impulse %d: not handled", n);
+	//cases 195..197 and 199: the node_viewer entities and WorldGraph.
+	if ((n >= 195 && n <= 197) || n == 199)
+	{
+		HLConPrint("impulse: no node graph - WorldGraph and the node_viewer entities are absent");
+		return;
+	}
+
+	//case 202: CBloodSplat, another decal.
+	if (n == 202)
+	{
+		HLConPrint("impulse 202: no decal layer for a blood splat");
+		return;
+	}
+
+	//case 203: remove the creature in front. SUB_Remove's effect, done the way
+	//HLEntFireTargets retires a killtarget.
+	if (n == 203)
+	{
+		ent = HLConEntityForward;
+		e   = HLEntGet(ent);
+
+		if (!e)
+		{
+			HLConPrint("nothing in front");
+			return;
+		}
+
+		if (!e->takedamage)
+		{
+			StrPrint(msg, "%s does not take damage", e->classname);
+			HLConPrint(msg);
+			return;
+		}
+
+		StrPrint(msg, "removed %s", e->classname);
+		HLConPrint(msg);
+
+		e->in_use     = FALSE;
+		e->solid      = HLSOLID_NOT;
+		e->think_fn   = HLM_NONE;
+		e->next_think = 0.0;
+		return;
+	}
+
+	StrPrint(msg, "impulse %d: not an impulse the game DLL handles", n);
 	HLConPrint(msg);
 }
 
@@ -2028,6 +2425,92 @@ U0 HLConGive(U8 *args)
 	HLConPrint(msg);
 }
 
+U0 HLConSelectItem(U8 *args)
+{//ClientCommand "use" and the weapon_* forms, both CBasePlayer::SelectItem.
+ //The argument is a weapon classname, not a targetname: HL's +use is a key,
+ //not a console command
+	U8	msg[96];
+	U8	name[64];
+	I64	id;
+	I64	i = 0;
+
+	while (args[i] && args[i] != ' ' && args[i] != '\t' && i < 63)
+	{
+		name[i] = args[i];
+		i++;
+	}
+	name[i] = 0;
+
+	if (!name[0])
+	{
+		HLConPrint("use <classname>, e.g. use weapon_shotgun");
+		return;
+	}
+
+	id = HLWeaponFindByClass(name);
+
+	//SelectItem walks the carried items only, so an unowned weapon is silently
+	//nothing rather than an error
+	if (id < 0 || !hl_wpn_have[id])
+		return;
+
+	if (id == hl_wpn_active)
+		return;
+
+	hl_con_wpn_prev = hl_wpn_active;
+	hl_con_wpn_seen = id;
+	HLWeaponSetActive(id);
+
+	StrPrint(msg, "selected %s", name);
+	HLConPrint(msg);
+}
+
+U0 HLConLastInv()
+{//ClientCommand "lastinv" - CBasePlayer::SelectLastItem
+	if (hl_con_wpn_prev < 0 || !hl_wpn_have[hl_con_wpn_prev])
+		return;
+
+	if (hl_con_wpn_prev == hl_wpn_active)
+		return;
+
+	hl_con_wpn_seen = hl_con_wpn_prev;
+	hl_con_wpn_prev = hl_wpn_active;
+	HLWeaponSetActive(hl_con_wpn_seen);
+}
+
+U0 HLConDrop(U8 *args)
+{//ClientCommand "drop" - CBasePlayer::DropPlayerItem
+	U8	name[64];
+	I64	id;
+	I64	i = 0;
+
+	//the SDK's first test: single player never drops, and weaponstay makes
+	//multiplayer behave the same way
+	if (HLCvarGet("deathmatch") == 0.0 && HLCvarGet("coop") == 0.0)
+	{
+		HLConPrint("no dropping in single player");
+		return;
+	}
+
+	while (args[i] && args[i] != ' ' && args[i] != '\t' && i < 63)
+	{
+		name[i] = args[i];
+		i++;
+	}
+	name[i] = 0;
+
+	//an empty name means the active item, as it does in the SDK
+	if (!name[0])
+		id = hl_wpn_active;
+	else
+		id = HLWeaponFindByClass(name);
+
+	if (id < 0 || !hl_wpn_have[id])
+		return;
+
+	HLConPrint("drop: no weaponbox - the port cannot create an entity after the map's entity lump is parsed");
+}
+
 U0 HLConStatus()
 {//Host_Status_f, cut to what this build can report
 	U8 msg[96];
@@ -2035,7 +2518,7 @@ U0 HLConStatus()
 	StrPrint(msg, "map %s", hl_map_name);
 	HLConPrint(msg);
 
-	StrPrint(msg, "edicts %d  time %4.1f", hl_pr_num_edicts, hl_game_time);
+	StrPrint(msg, "entities %d  time %4.1f", HLEntCountInUse, hl_game_time);
 	HLConPrint(msg);
 
 	//Native player state, not the QuakeC edict: single player has no edict.
@@ -2471,48 +2954,6 @@ U0 HLConExec(U8 *line, Bool echo = TRUE)
 		return;
 	}
 
-	//"edicts <classname>" - dump the link fields for a class. LinkDoors pairs
-	//neighbouring doors through .enemy and .owner, and a half that never moves
-	//is a half that never got linked. this shows which
-	if (!StrNICompare(line, "edicts ", 7))
-	{
-		p = line + 7;
-		while (*p == ' ')
-			p++;
-
-		if (!hl_game_active || hl_fld_classname < 0)
-		{
-			HLConPrint("no world");
-			return;
-		}
-
-		e = 0;
-		for (si = 1; si < hl_pr_num_edicts; si++)
-		{
-			if (hl_pr_edict_free[si])
-				goto qed_next;
-
-			if (StrCompare(HLPrStr(HLPrFieldI(si, hl_fld_classname)), p))
-				goto qed_next;
-
-			StrPrint(msg, "%3d %-14s enemy %3d owner %3d org %.0f %.0f %.0f",
-				si, p,
-				HLPrEdictNum(HLPrFieldI(si, hl_fld_enemy)),
-				HLPrEdictNum(HLPrFieldI(si, hl_fld_owner)),
-				HLPrFieldF(si, hl_fld_origin),
-				HLPrFieldF(si, hl_fld_origin + 1),
-				HLPrFieldF(si, hl_fld_origin + 2));
-			HLConPrint(msg);
-			e++;
-
-qed_next:
-		}
-
-		StrPrint(msg, "%d edicts", e);
-		HLConPrint(msg);
-		return;
-	}
-
 	//Cvar hostname. a string, so it is a command here rather than a cvar row
 	if (!StrNICompare(line, "hostname ", 9))
 	{
@@ -2591,12 +3032,11 @@ qed_next:
 				e = hl_sv_clients[si].edict;
 				if (e > 0)
 					StrPrint(hl_con_net_line,
-						"net: remote[%d] edict %d at %.0f %.0f %.0f mdl %d",
+						"net: remote[%d] edict %d at %.0f %.0f %.0f",
 						si, e,
 						hl_sv_clients[si].origin[0],
 						hl_sv_clients[si].origin[1],
-						hl_sv_clients[si].origin[2],
-						ToI64(HLPrFieldF(e, hl_fld_modelindex)));
+						hl_sv_clients[si].origin[2]);
 				else
 					StrPrint(hl_con_net_line,
 						"net: remote[%d] edict 0 (not spawned)", si);
@@ -2928,16 +3368,82 @@ ns_next:
 		return;
 	}
 
+	//ClientCommand "fov". Setting is gated on sv_cheats; reporting is not
 	if (!StrNICompare(line, "fov ", 4))
 	{
+		if (!HLConCheatAllowed)
+			return;
+
 		//hl_fov is in the app shell, compiled after this file - request it
 		hl_con_fov_want = ToF64(Str2I64(line + 4));
 		if (hl_con_fov_want < 30.0)	hl_con_fov_want = 30.0;
 		if (hl_con_fov_want > 130.0)	hl_con_fov_want = 130.0;
+		hl_con_fov_last = hl_con_fov_want;
 		StrPrint(msg, "fov %d", ToI64(hl_con_fov_want));
 		HLConPrint(msg);
 		return;
 	}
+
+	if (!StrICompare(line, "fov"))
+	{
+		StrPrint(msg, "\"fov\" is \"%d\"", ToI64(hl_con_fov_last));
+		HLConPrint(msg);
+		return;
+	}
+
+	//ClientCommand "drop"
+	if (!StrNICompare(line, "drop ", 5))
+	{
+		HLConDrop(line + 5);
+		return;
+	}
+
+	if (!StrICompare(line, "drop"))
+	{
+		HLConDrop("");
+		return;
+	}
+
+	//ClientCommand "use" and the weapon_* forms, both SelectItem
+	if (!StrNICompare(line, "use ", 4))
+	{
+		HLConSelectItem(line + 4);
+		return;
+	}
+
+	if (!StrICompare(line, "use"))
+	{
+		HLConPrint("use <classname>, e.g. use weapon_shotgun");
+		return;
+	}
+
+	if (!StrNICompare(line, "weapon_", 7))
+	{
+		HLConSelectItem(line);
+		return;
+	}
+
+	if (!StrICompare(line, "lastinv"))
+	{
+		HLConLastInv;
+		return;
+	}
+
+	//ClientCommand "fullupdate" - ForceClientDllUpdate resends every HUD value
+	//the client caches. The HUD here is drawn from live state each frame, so
+	//there is nothing to resend; a guest still forwards it to its host
+	if (!StrICompare(line, "fullupdate"))
+	{
+		if (hl_udp_ready && !hl_udp_server)
+			HLNetClientSendStringCmd(line);
+		else
+			HLConPrint("fullupdate: the hud reads live state, nothing to resend");
+		return;
+	}
+
+	//ClientCommand "closemenus" - ignored there too
+	if (!StrICompare(line, "closemenus"))
+		return;
 
 	if (!StrICompare(line, "save"))
 	{
@@ -3114,13 +3620,17 @@ ns_next:
 	if (!StrICompare(line, "help"))
 	{
 		HLConPrint("map <n>  changelevel <n>  restart  save  load");
-		HLConPrint("god  notarget  noclip  fly  kill  give <classname>  impulse 101");
-		HLConPrint("impulse <n>  give <s|n|r|c|h|1-8> <v>  fov <n>");
+		HLConPrint("god  notarget  noclip  fly  kill");
+		HLConPrint("give <classname>  drop [classname]  use <classname>");
+		HLConPrint("weapon_<name>  lastinv  fov [n]  fullupdate");
+		HLConPrint("impulse <n>: 100 light, 101 all, 103 ai, 104 globals, 106 name, 203 remove");
 		HLConPrint("say <text>  say_team <text>  tell <name> <text>");
 		HLConPrint("bind <key> <action>  unbind <key>  unbindall");
 		HLConPrint("alias <n> <text>  unalias <n>  exec <file>");
-		HLConPrint("echo <text>  cvarlist  wait");
-		HLConPrint("status  version  quit");
+		HLConPrint("echo <text>  cvarlist  set <name> <v>  wait");
+		HLConPrint("connect <ip>  disconnect  host  slist  netstat  qip <ip>");
+		HLConPrint("playdemo <n>  demos  stopdemo  music <n|stop>");
+		HLConPrint("hostname [name]  color <t> <b>  status  version  quit");
 		return;
 	}
 
@@ -3431,6 +3941,11 @@ U0 HLConDrawNotify(CHLCanvas *c)
 	U8	*row;
 	U8	 prompt[16];
 
+	//the shell calls this once a frame with the console down, which is the only
+	//per-frame hook this file owns - the flashlight and m_pLastItem ride it
+	HLConFlashlightFrame;
+	HLConTrackLastItem;
+
 	if (!hl_con_ready)
 		return;
 
@@ -3475,6 +3990,11 @@ U0 HLConDraw(CHLCanvas *c)
 	I64	 y;
 	I64	 con_h;
 	U8	*row;
+
+	//the notify path is skipped while the console is open, so the per-frame
+	//work it carries is repeated here or the flashlight goes out
+	HLConFlashlightFrame;
+	HLConTrackLastItem;
 
 	//a fraction of the screen, not a fixed 128 - at 640x480 a fixed slice
 	//covers a quarter of the view and the background stops part way across
