@@ -39,6 +39,56 @@ I64 HLClipBrushModel(I64 precache_index)
 	return hl_precache_bmodel[precache_index];
 }
 
+//--- which native brush entities are TURNED, not merely aimed ---------------
+//
+// hl_entities[i].angles is not a safe signal on its own, which is the whole
+// reason this array exists:
+//
+//   - HLEntSetMoveDir folds a sliding mover's "angle" key into movedir and
+//     clears angles[1], but only angles[1] - a func_door authored with a
+//     pitch or roll would keep it.
+//   - HLEntTrain WRITES angles[1] every frame with the yaw it is travelling
+//     at, as bookkeeping for whatever wants to read it. Rotating on any
+//     non-zero angle would silently turn every moving func_train's collision
+//     hull, breaking geometry that works today.
+//
+// So rotation is OPT IN, per entity, set by the spawn function of a class
+// that really does turn its brushwork - func_rotating, func_door_rotating,
+// momentary_rot_button, a banking func_tracktrain. Everything else is
+// untouched and pays one array read per trace.
+//
+// The angles themselves are still read live from the entity, so a spinning
+// brush needs no further notification: register once at spawn, then just move
+// angles.
+Bool hl_brush_rotates[HLENT_MAX];
+
+U0 HLClipRotatingReset()
+{//globals aren't zeroed, and this MUST also be called when a new map's
+ //entities are parsed - the flags are indexed by entity slot, and slot 12
+ //being a func_rotating in one map says nothing about the next one
+	I64 i;
+
+	for (i = 0; i < HLENT_MAX; i++)
+		hl_brush_rotates[i] = FALSE;
+}
+
+U0 HLClipSetRotating(I64 ent, Bool on)
+{//call from the spawn function of a class whose BRUSHWORK turns
+	if (ent < 0 || ent >= HLENT_MAX)
+		return;
+
+	hl_brush_rotates[ent] = on;
+}
+
+Bool HLClipIsRotating(I64 ent)
+{//for the renderer's entity loop: it has to make the same decision, and the
+ //two must not disagree or the brush draws turned and collides straight
+	if (ent < 0 || ent >= HLENT_MAX)
+		return FALSE;
+
+	return hl_brush_rotates[ent];
+}
+
 //SV_HullForEntity's hull choice. HL has FOUR hulls where quake had three, and
 //none of the boxes are the same size:
 //
@@ -115,13 +165,38 @@ U0 HLTraceInit(CHLTrace *trace, F64 *end)
 	HLVecCopy(end, trace->end_pos);
 }
 
-U0 HLTraceHull(CHLMap *map, I64 model, I64 hull, F64 *offset, F64 *start,
-	F64 *end, CHLTrace *trace)
+U0 HLTraceHullRotated(CHLMap *map, I64 model, I64 hull, F64 *offset,
+	F64 *angles, F64 *start, F64 *end, CHLTrace *trace)
 {//sweep one brush model's hull - clipnodes are authored around the origin, so
  //shift the move into model space and shift the result back out
-	F64 lstart[3];
-	F64 lend[3];
-	I64 head;
+ //
+ //angles is the brush entity's (pitch, yaw, roll) in degrees, NULL or
+ //identity for the overwhelming majority of traces. When it is identity this
+ //is the old HLTraceHull to the instruction: one call to HLMatAnglesActive
+ //and then the same two vector subtracts.
+ //
+ //When it is not, this is SV_ClipMoveToEntity's rotated branch: the move is
+ //carried INTO model space, traced against the un-rotated clipnodes, and the
+ //impact plane carried back out. Doing it the other way - rotating the hull -
+ //is not possible, the clipnodes are the map's and are shared.
+ //
+ //KNOWN INACCURACY, inherited from the original and not fixable here: hulls 1
+ //to 3 are the brushwork pre-grown by an AXIAL box, and that expansion was
+ //baked in model space. Tracing a rotated hull therefore sweeps a box that is
+ //rotated with the brush rather than one that stays axial in the world. The
+ //error is at most the difference between a box and its rotation - a few
+ //units on a 32-wide hull - and GoldSrc ships the same one. The box-to-hull
+ //correction in `offset` is likewise subtracted in world space before the
+ //rotation, exactly as SV_ClipMoveToEntity does it.
+	F64  lstart[3];
+	F64  lend[3];
+	F64  wstart[3];
+	F64  wend[3];
+	F64  nrm[3];
+	F64  m[12];
+	I64  head;
+	I64  i;
+	Bool rotated = FALSE;
 
 	HLTraceInit(trace, end);
 
@@ -154,16 +229,89 @@ U0 HLTraceHull(CHLMap *map, I64 model, I64 hull, F64 *offset, F64 *start,
 	if (model > 0 && head == 0)
 		return;
 
-	HLVecSub(start, offset, lstart);
-	HLVecSub(end, offset, lend);
+	if (angles)
+	{
+		if (HLMatAnglesActive(angles))
+			rotated = TRUE;
+	}
+
+	if (rotated)
+	{
+		//the matrix's translation column IS offset, so HLMatTransformInv does
+		//"subtract where the brush sits, then unrotate" in one pass
+		HLMatFromAngles(angles, offset, m);
+
+		HLMatTransformInv(start, m, lstart);
+		HLMatTransformInv(end, m, lend);
+	}
+	else
+	{
+		HLVecSub(start, offset, lstart);
+		HLVecSub(end, offset, lend);
+	}
 
 	HLVecCopy(lend, trace->end_pos);
 
 	hl_hull_head = head;
 	HLRecursiveHullCheck(map, head, 0.0, 1.0, lstart, lend, trace);
 
-	//back into world space
-	HLVecAdd(trace->end_pos, offset, trace->end_pos);
+	if (!rotated)
+	{
+		//back into world space
+		HLVecAdd(trace->end_pos, offset, trace->end_pos);
+		return;
+	}
+
+	//--- carry the result back out of model space ---
+
+	if (trace->hit)
+	{
+		//the normal rotates but must NOT translate, so this is HLMatRotate and
+		//not HLMatTransform. Getting that wrong puts the brush's position into
+		//a unit vector and the slide move then pushes the player at the map
+		//origin.
+		HLMatRotate(trace->plane_normal, m, nrm);
+		HLVecCopy(nrm, trace->plane_normal);
+
+		//and the plane distance follows the normal: for the model plane
+		//dot(n_m, x_m) = d, substituting x_m = R'(x_w - offset) gives
+		//dot(n_w, x_w) = d + dot(n_w, offset).
+		//
+		//ASYMMETRY, on purpose: the un-rotated path above leaves plane_dist in
+		//MODEL space, which it has always done, and callers live with it
+		//because a model-space distance still pairs with a model-space normal
+		//that happens to be identical to the world one. Once the normal is
+		//rotated that pairing is broken, so the rotated path has to be right.
+		trace->plane_dist += HLVecDot(trace->plane_normal, offset);
+	}
+
+	//end_pos from the fraction along the ORIGINAL world move rather than by
+	//transforming the model-space end_pos forward. Same answer when the trace
+	//is clean, and strictly better when it is not: HLRecursiveHullCheck's
+	//"backup past 0" escape hatch can leave end_pos slightly off the segment,
+	//and re-deriving it here keeps the result on the line the caller asked
+	//about. fraction is 1.0 when nothing was hit, so an untouched move lands
+	//exactly on end.
+	//
+	//copied to locals first because this writes trace->end_pos element by
+	//element while reading the endpoints, and a caller is free to hand us its
+	//own trace->end_pos as start or end.
+	HLVecCopy(start, wstart);
+	HLVecCopy(end, wend);
+
+	for (i = 0; i < 3; i++)
+		trace->end_pos[i] = wstart[i] + (wend[i] - wstart[i]) * trace->fraction;
+}
+
+U0 HLTraceHull(CHLMap *map, I64 model, I64 hull, F64 *offset, F64 *start,
+	F64 *end, CHLTrace *trace)
+{//the engine's un-rotated hull sweep, unchanged for every existing caller.
+ //
+ //a thin forward to the rotated form rather than a second copy of the head
+ //resolution and the validity checks above - two copies of that would drift,
+ //and a submodel that roots at clipnode 0 reporting the whole level as its
+ //own hull is exactly the sort of bug the drift would cause
+	HLTraceHullRotated(map, model, hull, offset, NULL, start, end, trace);
 }
 
 U0 HLClipMoveToBox(F64 *bmins, F64 *bmaxs, F64 *mins, F64 *maxs, F64 *start,
@@ -415,7 +563,14 @@ U0 HLClipToNativeBrushes(CHLMap *map, F64 *start, F64 *end, F64 *mins,
 		for (j = 0; j < 3; j++)
 			eofs[j] += e->origin[j];
 
-		HLTraceHull(map, e->brush_model, ehull, eofs, start, end, &tr);
+		//a registered rotating brush traces through its orientation; every
+		//other entity takes the same path it always has. the flag is tested
+		//FIRST so the angle test is not paid for by ordinary brushes
+		if (hl_brush_rotates[i])
+			HLTraceHullRotated(map, e->brush_model, ehull, eofs, e->angles,
+				start, end, &tr);
+		else
+			HLTraceHull(map, e->brush_model, ehull, eofs, start, end, &tr);
 
 		if (tr.fraction < trace->fraction)
 		{
@@ -697,6 +852,10 @@ U0 HLClipInit()
 	hl_move_pass = 0;
 
 	HLClipPrecacheReset;
+
+	//startup only - see the note on HLClipRotatingReset, the entity spawn pass
+	//has to call it again for each map
+	HLClipRotatingReset;
 }
 
 U0 HLTracePlayer(CHLMap *map, F64 *start, F64 *end, CHLTrace *trace)

@@ -1,4 +1,4 @@
-// HLAI.ZC - scripted sequences and sentences
+// HLAI.ZC - scripted sequences, sentences and combat AI
 //
 // Half-Life's character is almost entirely scripted rather than emergent. The
 // intro, the scientists at their consoles, the guard at the door - all of it is
@@ -10,11 +10,14 @@
 // dispatcher only RECORDS that a script was triggered and the frame function
 // here does the work.
 //
-// What is NOT here, deliberately: combat AI. Real HL monsters run a schedule of
-// tasks over a node graph, pick enemies through relationship tables, and route
-// around obstacles. Faking that produces monsters that twitch convincingly and
-// behave senselessly. Idle animation and scripted playback are honest; ersatz
-// combat is not.
+// Combat AI is in the second half of the file: the monster state machine, the
+// task/schedule interpreter, sensing through the CLASS_* relationship matrix,
+// attacks and death. What it does NOT have is the node graph every real HL
+// monster routes over - there is none in this tree and none to build one from -
+// so movement is straight at the goal with a wall slide, and a monster will not
+// go round a corner. The section header there states that limit and every other
+// one before any code, because each of them changes what you should expect to
+// see rather than only how it is written.
 
 //--- sentences --------------------------------------------------------------
 //
@@ -544,10 +547,2515 @@ U0 HLAIScriptEnd(I64 self)
 		script->toggle_state = HLTS_AT_TOP;
 }
 
+//--- combat AI --------------------------------------------------------------
+//
+// Ported from the SDK's dlls/: monsterstate.cpp (the state machine),
+// schedule.cpp and defaultai.cpp (schedules, tasks, StartTask/RunTask/
+// TaskComplete/TaskFail), monsters.cpp (Look, FInViewCone, FVisible, and the
+// CLASS_*/IRelationship matrix), plus the Spawn() and SelectSchedule() bodies
+// of headcrab.cpp, zombie.cpp, scientist.cpp, barney.cpp, houndeye.cpp,
+// hgrunt.cpp, islave.cpp and bullsquid.cpp for the numbers.
+//
+// WHAT IS REAL
+//
+//   - the five MONSTERSTATE_ values and the transitions between them
+//   - a task/schedule interpreter. A schedule is a list of (task, data); each
+//     task is Start-ed once and Run every tick until it completes or fails,
+//     and a failed task abandons the whole schedule, as TaskFail does.
+//   - sensing through the real Look(): the view cone from m_flFieldOfView, a
+//     point trace for FVisible, and the relationship matrix - so barney
+//     shoots aliens and ignores the player, and a scientist runs from a
+//     zombie rather than at it.
+//   - melee and ranged attacks gated on range, view cone, sight and refire
+//   - death: the die sequence plays and holds on its last frame
+//
+// WHAT IS NOT, AND WHAT EACH ONE COSTS
+//
+//   - THERE IS NO NODE GRAPH. HL routes every monster move through the map's
+//     info_node network (nodes.cpp, CGraph::FindShortestPath) built by a
+//     separate compile step; this tree has neither the graph nor the .nod
+//     files. Movement here is straight at the goal with ONE wall-slide retry
+//     and a floor probe that refuses a step off a ledge. The consequence is
+//     exact: a monster will not go round a corner. It grinds along the wall
+//     between it and its enemy until the enemy steps into the open. Nothing
+//     below is pathfinding - do not read the slide as routing.
+//
+//   - no monster-to-monster or monster-to-player collision. HLTraceEntity
+//     clips against the world and against SOLID_BSP brush entities only;
+//     there are no edicts and nothing traces a SLIDEBOX. Monsters walk
+//     through each other and through the player, so clearing solid on death
+//     is bookkeeping rather than an observable change.
+//
+//   - no animation events (mstudioevent_t). The SDK lands a melee hit on an
+//     event embedded in the attack sequence. Here the damage is applied when
+//     the attack SEQUENCE ENDS, with the range re-tested first, so stepping
+//     out of a swing still avoids it. Ranged fire is one shot at the end of
+//     the sequence rather than a per-event burst.
+//
+//   - no sound or scent sensing (CSound, bits_COND_HEAR_SOUND). Gunfire does
+//     not draw a monster and a scientist only panics at what it can see.
+//
+//   - no squads, no cover selection, no grenades, no hitgroup-specific
+//     flinches, no leap for the headcrab (its LeapTouch needs a monster
+//     mover with velocity, which does not exist here - the crab walks up and
+//     bites instead), no bullsquid spit, no islave rake or hornets, no
+//     hgrunt burst pattern, no gibs, no barnacle or scripted death poses.
+//
+//   - the PLAYER still cannot hurt a monster. HLWeapon.ZC's hitscan has no
+//     monster damage path (see its own header), so the death path below is
+//     only reachable through HLEntTakeDamage from a trigger_hurt, a
+//     func_breakable chain, or another monster.
+//
+// WHERE THE STATE LIVES
+//
+// Not in CHLEntity: HLEnt.ZC is not editable from here, so everything a
+// monster needs beyond what the shared struct already carries lives in the
+// parallel table below, indexed by a slot, with hl_ai_mon_of[] mapping an
+// entity index to its slot.
+//
+// THE DEATH PATH IS SHARED WITH func_breakable
+//
+// HLEntTakeDamage queues HLM_BREAK_DIE at zero health and HLBreakableDie
+// clears in_use - correct for glass, wrong for a monster, which has to stay
+// in the world and fall over. That call is in HLEntity.ZC and cannot be
+// changed from here, so HLAIMonSync notices a monster whose slot went away
+// under it and puts the corpse back, non-solid and immune, to play its die
+// sequence. hl_ai_mon_revive turns that off if it ever stops being wanted.
+
+#define HLAI_MON_MAX			192
+
+//MONSTERSTATE_*, monsterstate.cpp
+#define HLMSTATE_NONE			0
+#define HLMSTATE_IDLE			1
+#define HLMSTATE_ALERT			2
+#define HLMSTATE_COMBAT			3
+#define HLMSTATE_SCRIPT			4
+#define HLMSTATE_DEAD			5
+
+//CLASS_*, monsters.h. The values are HL's, with the gaps left in so a class
+//added later lands on the same number the SDK uses.
+#define HLCLASS_NONE			0
+#define HLCLASS_MACHINE			1
+#define HLCLASS_PLAYER			2
+#define HLCLASS_HUMAN_PASSIVE	3
+#define HLCLASS_HUMAN_MILITARY	4
+#define HLCLASS_ALIEN_MILITARY	5
+#define HLCLASS_ALIEN_MONSTER	6
+#define HLCLASS_ALIEN_PREY		7
+#define HLCLASS_ALIEN_PREDATOR	8
+#define HLCLASS_PLAYER_ALLY		10
+
+//R_*, monsters.h
+#define HLREL_ALLY				-2
+#define HLREL_FEAR				-1
+#define HLREL_NONE				0
+#define HLREL_DISLIKE			1
+#define HLREL_HATE				2
+
+//which sequence a task wants. Activity in the SDK, an index here: the
+//per-monster labels differ so much that ACT_ lookup by activity number would
+//pick the wrong take on half the models (houndeye has three sequences all
+//labelled "run" at ACT_RUN), and a scripted_sequence already resolves by
+//label. So the table names the sequence and this picks a slot in it.
+#define HLACT_IDLE				0
+#define HLACT_WALK				1
+#define HLACT_RUN				2
+#define HLACT_MELEE				3
+#define HLACT_RANGE				4
+#define HLACT_DIE				5
+#define HLACT_FLINCH			6
+#define HLACT_COUNT				7
+
+//TASK_*, schedule.h. Contiguous from zero: the dispatcher is a switch and a
+//sparse set would build a jump table with holes in it.
+#define HLTASK_WAIT				0
+#define HLTASK_WAIT_RANDOM		1
+#define HLTASK_WAIT_FOR_ANIM	2
+#define HLTASK_SET_ACTIVITY		3
+#define HLTASK_STOP_MOVING		4
+#define HLTASK_FACE_ENEMY		5
+#define HLTASK_FACE_GOAL		6
+#define HLTASK_PATH_TO_ENEMY	7
+#define HLTASK_PATH_AWAY		8
+#define HLTASK_WALK_PATH		9
+#define HLTASK_RUN_PATH			10
+#define HLTASK_MELEE_ATTACK1	11
+#define HLTASK_RANGE_ATTACK1	12
+#define HLTASK_SOUND_ATTACK		13
+#define HLTASK_SOUND_ALERT		14
+#define HLTASK_SOUND_DIE		15
+#define HLTASK_DIE				16
+#define HLTASK_COUNT			17
+
+//TASKSTATUS_*, but only the three states that matter without interrupts
+#define HLTK_RUNNING			0
+#define HLTK_DONE				1
+#define HLTK_FAILED				2
+
+//SCHED_*, defaultai.cpp. A subset: the ones a monster with no squad, no
+//cover and no node graph can actually run.
+#define HLSCHED_NONE			0
+#define HLSCHED_IDLE_STAND		1
+#define HLSCHED_ALERT_STAND		2
+#define HLSCHED_ALERT_FACE		3
+#define HLSCHED_WAKE_ANGRY		4
+#define HLSCHED_CHASE_ENEMY		5
+#define HLSCHED_MELEE_ATTACK1	6
+#define HLSCHED_RANGE_ATTACK1	7
+#define HLSCHED_TAKE_COVER		8
+#define HLSCHED_SMALL_FLINCH	9
+#define HLSCHED_DIE				10
+#define HLSCHED_COUNT			11
+
+#define HLAI_SCHED_TASKS		8
+
+//within this many degrees counts as facing. The SDK's FacingIdeal is 0.06
+//radians off pev->ideal_yaw, which is tighter than a monster turning at
+//yaw_speed can hold, so tasks that wait on it never finish.
+#define HLAI_FACE_TOL			12.0
+
+//eye height of the player above hl_origin. HLVIEW_HEIGHT in HL1.ZC, repeated
+//here because that file compiles later. Bob and step offset ride on top of it
+//and are worth a couple of units, which does not matter at sighting range.
+#define HLAI_PLAYER_EYE			22.0
+
+//how far a monster steps up or down in one move, and how far it probes for a
+//floor. 18 is HL's step height.
+#define HLAI_STEP_HEIGHT		18.0
+
+//a path task gives up after this long, or after this long making no progress
+#define HLAI_PATH_TIMEOUT		20.0
+#define HLAI_STUCK_TIME			0.8
+
+//COMBAT falls back to ALERT once the enemy has been out of sight this long -
+//CBaseMonster::CheckEnemy's MONSTER_LOST_ENEMY window
+#define HLAI_LOSE_ENEMY			8.0
+
+//idle chatter interval, seconds. An integer range because HLPartRandI takes
+//one and ToI64 on a float literal is a conversion this file does not need
+#define HLAI_IDLE_SND_MIN		8.0
+#define HLAI_IDLE_SND_RANGE		12
+
+//how often Look() runs, seconds. The SDK's MonsterThink is 0.1 and Look is
+//part of it; here the think itself is per tick because it also drives
+//movement, so the SENSING is throttled separately. It has to be: Look traces
+//against every candidate, and at tick rate a room of monsters would spend the
+//frame in HLTraceEntity for information that cannot change that fast.
+#define HLAI_LOOK_PERIOD		0.2
+
+//--- the monster table ------------------------------------------------------
+//
+// One row per monster, the same shape as CHLWeaponInfo in HLWeapon.ZC and for
+// the same reason: the SDK gives each monster a C++ class, but the ones in
+// scope differ only in numbers, hull, sequence labels and sounds. A monster
+// that needs its own CODE - the barnacle (no movement at all), the tentacle
+// (sound-driven), the gargantua (stomp), anything with a projectile - is
+// deliberately absent rather than approximated.
+//
+// Sequence labels are the REAL ones, read out of the shipped models with
+// python+struct; they are resolved through HLStudioSeqByName, never by index,
+// because no two of these models agree on order. Notable per-model facts that
+// forced a choice, all verified against the files in valve/models:
+//
+//   headcrab.mdl has no "die" - the death is "dieback", and its attack
+//   sequence "jump" is the leap, used here as the bite because the leap
+//   itself is not implemented.
+//   zombie.mdl has NO run sequence at all, only "walk", so a zombie's run
+//   slot is "walk" - which is why a zombie in HL never sprints.
+//   houndeye.mdl carries three sequences all called "run"; by-label lookup
+//   takes the first, which is the SDK's own weighting favourite.
+//   bullsquid.mdl's idle is "idle", not "idle1", and its death is "die".
+
+#define HLMON_HEADCRAB			0
+#define HLMON_ZOMBIE			1
+#define HLMON_SCIENTIST			2
+#define HLMON_BARNEY			3
+#define HLMON_HOUNDEYE			4
+#define HLMON_HGRUNT			5
+#define HLMON_ISLAVE			6
+#define HLMON_BULLSQUID			7
+#define HLMON_COUNT				8
+
+class CHLMonInfo
+{
+	U8	classname[32];		//monster_* entity classname
+	I64	classify;			//HLCLASS_*, Classify() in the SDK
+
+	F64	health;				//gSkillData at skill 1, from valve/skill.cfg
+	F64	mins[3];			//UTIL_SetSize in Spawn()
+	F64	maxs[3];
+	F64	view_ofs;			//pev->view_ofs z, the eye the traces run from
+
+	F64	fov;				//m_flFieldOfView, the COSINE of the half angle
+	F64	look_dist;			//m_flDistLook
+	F64	walk_speed;			//world units per second
+	F64	run_speed;
+	F64	yaw_speed;			//degrees per second
+
+	//melee: reach and damage. melee_range 0 means it has no melee attack
+	F64	melee_range;
+	F64	melee_dmg;
+
+	//ranged: hitscan unless blast_radius is set, in which case the attack
+	//damages everything inside that radius of the MONSTER (houndeye sonic)
+	F64	range_min;
+	F64	range_max;			//0 means it has no ranged attack
+	F64	range_dmg;
+	I64	range_bullets;
+	F64	blast_radius;
+
+	F64	attack_rate;		//seconds between attacks, either kind
+
+	//a monster with no attack at all. HL's CScientist runs from anything it
+	//dislikes; here that is anything the relationship makes fear or hate,
+	//because a monster with nothing to attack with cannot act on hate.
+	Bool flees;
+
+	//sequence LABELS, one 24-byte cell per HLACT_*. FLAT rather than
+	//[HLACT_COUNT][24]: a fixed-stride block indexed by hand is exactly what
+	//the compiler does with a two-dimensional array anyway, and this way the
+	//pointer handed to HLStudioSeqByName is unambiguously a U8*.
+	U8	seq[HLACT_COUNT * 24];
+
+	//sound paths under sound/. empty is silence, not a missing file.
+	U8	snd_idle[48];
+	U8	snd_alert[48];
+	U8	snd_attack[48];
+	U8	snd_die[48];
+};
+
+CHLMonInfo	hl_ai_mon_info[HLMON_COUNT];
+
+//--- per-monster state ------------------------------------------------------
+
+class CHLMonState
+{
+	I64		ent;			//entity index, -1 for a free slot
+	I64		kind;			//HLMON_*
+	I64		state;			//HLMSTATE_*
+
+	I64		sched;			//HLSCHED_*
+	I64		task;			//index into that schedule's task list
+	I64		task_status;	//HLTK_*
+	F64		task_start;		//hl_ent_time when the task was Start-ed
+	Bool	sched_done;		//ran off the end of the list
+
+	//enemy. -1 IS the player, so a separate flag says whether there is one at
+	//all rather than overloading the index the way m_hEnemy's NULL does
+	Bool	have_enemy;
+	I64		enemy;
+	F64		enemy_pos[3];	//last KNOWN position, not the live one
+	F64		enemy_seen;		//hl_ent_time of the last clear sight line
+
+	//movement goal
+	Bool	have_goal;
+	Bool	goal_is_enemy;	//refresh it from the enemy every tick
+	F64		goal[3];
+	F64	 	goal_tol;
+	F64		move_speed;
+	F64		path_start;
+	F64		stuck_since;
+
+	F64		ideal_yaw;
+	F64		next_attack;
+	F64		next_idle_snd;
+	F64		next_look;		//Look() is throttled - see HLAI_LOOK_PERIOD
+	F64		last_health;	//to notice damage without a hook in HLEntTakeDamage
+	Bool	scripted;		//a scripted_sequence owns it this tick
+
+	//DROP_TO_FLOOR, done on the first think rather than at registration:
+	//the trace it needs is defined further down the file and a single-pass
+	//compiler will not let the registration pass reach it
+	Bool	settled;
+};
+
+CHLMonState	hl_ai_mon[HLAI_MON_MAX];
+I64			hl_ai_mon_count = 0;
+
+//entity index -> slot, -1 for "not a monster we track"
+I64			hl_ai_mon_of[HLENT_MAX];
+
+//what the registration pass was last run against. A new map reuses the same
+//slots, so all three have to be compared: the block can be reallocated at the
+//same address, and hl_ent_time restarting at zero is the only signal that is
+//always true.
+CHLEntity	*hl_ai_mon_base  = NULL;
+I64			hl_ai_mon_ents   = 0;
+F64			hl_ai_mon_clock  = 0.0;
+
+Bool		hl_ai_mon_revive = TRUE;
+I64			hl_ai_mon_kills  = 0;
+
+//--- schedules --------------------------------------------------------------
+//
+// Flat arrays rather than nested initialisers: a global's initialiser is not
+// reliable on this compiler, so every row is appended by a call at runtime.
+
+I64	hl_ai_sched_task[HLSCHED_COUNT * HLAI_SCHED_TASKS];
+F64	hl_ai_sched_data[HLSCHED_COUNT * HLAI_SCHED_TASKS];
+I64	hl_ai_sched_len[HLSCHED_COUNT];
+
+U0 HLAISchedAdd(I64 sched, I64 task, F64 data)
+{//append one task to a schedule
+	I64 n;
+
+	if (sched < 0 || sched >= HLSCHED_COUNT)
+		return;
+
+	n = hl_ai_sched_len[sched];
+
+	if (n >= HLAI_SCHED_TASKS)
+	{
+		"HLAI: schedule %d full\n", sched;
+		return;
+	}
+
+	hl_ai_sched_task[sched * HLAI_SCHED_TASKS + n] = task;
+	hl_ai_sched_data[sched * HLAI_SCHED_TASKS + n] = data;
+
+	//not `hl_ai_sched_len[sched]++` after the two stores above for its own
+	//sake - it is clearer, and `x[i++] = f()` loses the store on this
+	//compiler, so incrementing separately is the habit here
+	hl_ai_sched_len[sched] = n + 1;
+}
+
+U0 HLAISchedInit()
+{//defaultai.cpp's slIdleStand, slAlertFace, slChaseEnemy and friends, cut
+ //down to the tasks a monster with no node graph and no squad can run
+	I64 i;
+
+	for (i = 0; i < HLSCHED_COUNT; i++)
+		hl_ai_sched_len[i] = 0;
+
+	//slIdleStand: stand there, look around, wait a random while
+	HLAISchedAdd(HLSCHED_IDLE_STAND, HLTASK_STOP_MOVING, 0.0);
+	HLAISchedAdd(HLSCHED_IDLE_STAND, HLTASK_SET_ACTIVITY, HLACT_IDLE);
+	HLAISchedAdd(HLSCHED_IDLE_STAND, HLTASK_WAIT_RANDOM, 5.0);
+
+	//slAlertStand: the same, but shorter, because an alert monster is meant
+	//to re-decide often
+	HLAISchedAdd(HLSCHED_ALERT_STAND, HLTASK_STOP_MOVING, 0.0);
+	HLAISchedAdd(HLSCHED_ALERT_STAND, HLTASK_SET_ACTIVITY, HLACT_IDLE);
+	HLAISchedAdd(HLSCHED_ALERT_STAND, HLTASK_WAIT_RANDOM, 2.0);
+
+	//slAlertFace: turn to whatever it noticed
+	HLAISchedAdd(HLSCHED_ALERT_FACE, HLTASK_STOP_MOVING, 0.0);
+	HLAISchedAdd(HLSCHED_ALERT_FACE, HLTASK_SET_ACTIVITY, HLACT_IDLE);
+	HLAISchedAdd(HLSCHED_ALERT_FACE, HLTASK_FACE_ENEMY, 0.0);
+	HLAISchedAdd(HLSCHED_ALERT_FACE, HLTASK_WAIT, 1.0);
+
+	//slWakeAngry: the noise a monster makes on first seeing its enemy, which
+	//is what gives HL's encounters their beat before anything moves
+	HLAISchedAdd(HLSCHED_WAKE_ANGRY, HLTASK_STOP_MOVING, 0.0);
+	HLAISchedAdd(HLSCHED_WAKE_ANGRY, HLTASK_SOUND_ALERT, 0.0);
+	HLAISchedAdd(HLSCHED_WAKE_ANGRY, HLTASK_SET_ACTIVITY, HLACT_IDLE);
+	HLAISchedAdd(HLSCHED_WAKE_ANGRY, HLTASK_FACE_ENEMY, 0.0);
+	HLAISchedAdd(HLSCHED_WAKE_ANGRY, HLTASK_WAIT, 0.4);
+
+	//slChaseEnemy. In the SDK TASK_GET_PATH_TO_ENEMY calls the node graph and
+	//fails when there is no route; here it only records the goal, so the run
+	//that follows is a straight line with a wall slide - see the header.
+	HLAISchedAdd(HLSCHED_CHASE_ENEMY, HLTASK_PATH_TO_ENEMY, 0.0);
+	HLAISchedAdd(HLSCHED_CHASE_ENEMY, HLTASK_SET_ACTIVITY, HLACT_RUN);
+	HLAISchedAdd(HLSCHED_CHASE_ENEMY, HLTASK_RUN_PATH, 0.0);
+	HLAISchedAdd(HLSCHED_CHASE_ENEMY, HLTASK_STOP_MOVING, 0.0);
+	HLAISchedAdd(HLSCHED_CHASE_ENEMY, HLTASK_FACE_ENEMY, 0.0);
+
+	//slMeleeAttack1
+	HLAISchedAdd(HLSCHED_MELEE_ATTACK1, HLTASK_STOP_MOVING, 0.0);
+	HLAISchedAdd(HLSCHED_MELEE_ATTACK1, HLTASK_FACE_ENEMY, 0.0);
+	HLAISchedAdd(HLSCHED_MELEE_ATTACK1, HLTASK_SOUND_ATTACK, 0.0);
+	HLAISchedAdd(HLSCHED_MELEE_ATTACK1, HLTASK_MELEE_ATTACK1, 0.0);
+
+	//slRangeAttack1
+	HLAISchedAdd(HLSCHED_RANGE_ATTACK1, HLTASK_STOP_MOVING, 0.0);
+	HLAISchedAdd(HLSCHED_RANGE_ATTACK1, HLTASK_FACE_ENEMY, 0.0);
+	HLAISchedAdd(HLSCHED_RANGE_ATTACK1, HLTASK_SOUND_ATTACK, 0.0);
+	HLAISchedAdd(HLSCHED_RANGE_ATTACK1, HLTASK_RANGE_ATTACK1, 0.0);
+
+	//slTakeCoverFromEnemy, with the cover node lookup replaced by "directly
+	//away from it". A scientist therefore runs into the nearest wall as often
+	//as it runs somewhere sensible; without a node graph there is no third
+	//option that is not a lie.
+	HLAISchedAdd(HLSCHED_TAKE_COVER, HLTASK_SOUND_ALERT, 0.0);
+	HLAISchedAdd(HLSCHED_TAKE_COVER, HLTASK_PATH_AWAY, 512.0);
+	HLAISchedAdd(HLSCHED_TAKE_COVER, HLTASK_SET_ACTIVITY, HLACT_RUN);
+	HLAISchedAdd(HLSCHED_TAKE_COVER, HLTASK_RUN_PATH, 0.0);
+	HLAISchedAdd(HLSCHED_TAKE_COVER, HLTASK_STOP_MOVING, 0.0);
+	HLAISchedAdd(HLSCHED_TAKE_COVER, HLTASK_WAIT, 1.0);
+
+	//slSmallFlinch
+	HLAISchedAdd(HLSCHED_SMALL_FLINCH, HLTASK_STOP_MOVING, 0.0);
+	HLAISchedAdd(HLSCHED_SMALL_FLINCH, HLTASK_SET_ACTIVITY, HLACT_FLINCH);
+	HLAISchedAdd(HLSCHED_SMALL_FLINCH, HLTASK_WAIT_FOR_ANIM, 0.0);
+
+	//slDie. TASK_DIE holds the last frame forever - there is no corpse
+	//removal and no gib, so the body stays where it fell.
+	HLAISchedAdd(HLSCHED_DIE, HLTASK_STOP_MOVING, 0.0);
+	HLAISchedAdd(HLSCHED_DIE, HLTASK_SOUND_DIE, 0.0);
+	HLAISchedAdd(HLSCHED_DIE, HLTASK_DIE, 0.0);
+}
+
+//--- the table's contents ---------------------------------------------------
+
+U0 HLAIMonSeq(I64 kind, I64 act, U8 *label)
+{//one sequence label. A setter because assigning into a 2D array of fixed
+ //byte blocks reads badly inline, and because the label has to be COPIED -
+ //a U8* table of literals collapses to one entry on this compiler
+	if (kind < 0 || kind >= HLMON_COUNT || act < 0 || act >= HLACT_COUNT)
+		return;
+
+	HLStrCopy(&hl_ai_mon_info[kind].seq[act * 24], label, 24);
+}
+
+U8 *HLAIMonSeqOf(I64 kind, I64 act)
+{//the label for one activity, NULL when the monster has no such sequence
+	U8 *p;
+
+	if (kind < 0 || kind >= HLMON_COUNT || act < 0 || act >= HLACT_COUNT)
+		return NULL;
+
+	p = &hl_ai_mon_info[kind].seq[act * 24];
+
+	if (!p[0])
+		return NULL;
+
+	return p;
+}
+
+U0 HLAIMonHull(I64 kind, F64 w, F64 h, F64 eye)
+{//UTIL_SetSize plus view_ofs. Monsters stand on their origin, so mins z is 0
+	CHLMonInfo *m;
+
+	if (kind < 0 || kind >= HLMON_COUNT)
+		return;
+
+	m = &hl_ai_mon_info[kind];
+
+	HLVecSet(m->mins, -w, -w, 0.0);
+	HLVecSet(m->maxs, w, w, h);
+	m->view_ofs = eye;
+}
+
+U0 HLAIMonTableInit()
+{//every row, assigned field by field
+ //
+ //health and damage are gSkillData at skill 1, read out of valve/skill.cfg
+ //rather than remembered. FOV values are m_flFieldOfView from each Spawn(),
+ //which is a cosine: 0.5 is a 120 degree cone, -1.0 is all round.
+	CHLMonInfo	*m;
+	I64			 i;
+	I64			 j;
+
+	for (i = 0; i < HLMON_COUNT; i++)
+	{
+		m = &hl_ai_mon_info[i];
+
+		m->classname[0]   = 0;
+		m->classify       = HLCLASS_NONE;
+		m->health         = 20.0;
+		m->view_ofs       = 20.0;
+		m->fov            = 0.5;
+		m->look_dist      = 2048.0;
+		m->walk_speed     = 32.0;
+		m->run_speed      = 120.0;
+		m->yaw_speed      = 120.0;
+		m->melee_range    = 0.0;
+		m->melee_dmg      = 0.0;
+		m->range_min      = 0.0;
+		m->range_max      = 0.0;
+		m->range_dmg      = 0.0;
+		m->range_bullets  = 1;
+		m->blast_radius   = 0.0;
+		m->attack_rate    = 1.0;
+		m->flees          = FALSE;
+		m->snd_idle[0]    = 0;
+		m->snd_alert[0]   = 0;
+		m->snd_attack[0]  = 0;
+		m->snd_die[0]     = 0;
+
+		HLVecSet(m->mins, -16.0, -16.0, 0.0);
+		HLVecSet(m->maxs, 16.0, 16.0, 72.0);
+
+		for (j = 0; j < HLACT_COUNT; j++)
+			m->seq[j * 24] = 0;
+	}
+
+	//--- headcrab. CHeadCrab: 10 health, bite 5, all-round vision, and in the
+	//SDK a 256-unit LEAP as its range attack. The leap needs a monster mover
+	//with velocity and a touch callback; neither exists, so the crab is
+	//melee-only here and closes on foot. It reads slower than HL's but it
+	//does not damage from across the room.
+	m = &hl_ai_mon_info[HLMON_HEADCRAB];
+	HLStrCopy(m->classname, "monster_headcrab", 32);
+	m->classify    = HLCLASS_ALIEN_PREY;
+	m->health      = 10.0;
+	m->fov         = -1.0;			//pev->view_ofs/FOV: crabs see everything
+	m->walk_speed  = 40.0;
+	m->run_speed   = 150.0;
+	m->yaw_speed   = 200.0;
+	m->melee_range = 40.0;
+	m->melee_dmg   = 5.0;
+	m->attack_rate = 0.6;
+	HLAIMonHull(HLMON_HEADCRAB, 12.0, 24.0, 12.0);
+	HLAIMonSeq(HLMON_HEADCRAB, HLACT_IDLE,   "idle1");
+	HLAIMonSeq(HLMON_HEADCRAB, HLACT_WALK,   "walk");
+	HLAIMonSeq(HLMON_HEADCRAB, HLACT_RUN,    "run");
+	HLAIMonSeq(HLMON_HEADCRAB, HLACT_MELEE,  "jump");
+	HLAIMonSeq(HLMON_HEADCRAB, HLACT_DIE,    "dieback");
+	HLAIMonSeq(HLMON_HEADCRAB, HLACT_FLINCH, "flinch");
+	HLStrCopy(m->snd_idle,   "headcrab/hc_idle1.wav", 48);
+	HLStrCopy(m->snd_alert,  "headcrab/hc_alert1.wav", 48);
+	HLStrCopy(m->snd_attack, "headcrab/hc_attack1.wav", 48);
+	HLStrCopy(m->snd_die,    "headcrab/hc_die1.wav", 48);
+
+	//--- zombie. CZombie: 50 health, one_slash 10 (both_slash 25 is the
+	//two-armed swing, which needs the animation event to distinguish - the
+	//single figure is the honest one here). No run sequence in the model.
+	m = &hl_ai_mon_info[HLMON_ZOMBIE];
+	HLStrCopy(m->classname, "monster_zombie", 32);
+	m->classify    = HLCLASS_ALIEN_MONSTER;
+	m->health      = 50.0;
+	m->fov         = 0.2;
+	m->walk_speed  = 30.0;
+	m->run_speed   = 60.0;
+	m->yaw_speed   = 90.0;
+	m->melee_range = 64.0;
+	m->melee_dmg   = 10.0;
+	m->attack_rate = 1.0;
+	HLAIMonHull(HLMON_ZOMBIE, 16.0, 72.0, 52.0);
+	HLAIMonSeq(HLMON_ZOMBIE, HLACT_IDLE,   "idle1");
+	HLAIMonSeq(HLMON_ZOMBIE, HLACT_WALK,   "walk");
+	HLAIMonSeq(HLMON_ZOMBIE, HLACT_RUN,    "walk");
+	HLAIMonSeq(HLMON_ZOMBIE, HLACT_MELEE,  "attack1");
+	HLAIMonSeq(HLMON_ZOMBIE, HLACT_DIE,    "diesimple");
+	HLAIMonSeq(HLMON_ZOMBIE, HLACT_FLINCH, "flinch");
+	HLStrCopy(m->snd_idle,   "zombie/zo_idle1.wav", 48);
+	HLStrCopy(m->snd_alert,  "zombie/zo_alert10.wav", 48);
+	HLStrCopy(m->snd_attack, "zombie/zo_attack1.wav", 48);
+	HLStrCopy(m->snd_die,    "zombie/zo_pain1.wav", 48);
+
+	//--- scientist. CScientist: 20 health, no attack of any kind, and its
+	//SelectSchedule is a chain of flee and follow behaviours. Following the
+	//player needs CTalkMonster's use handling and a player-relative goal, so
+	//what is here is the flee half only.
+	m = &hl_ai_mon_info[HLMON_SCIENTIST];
+	HLStrCopy(m->classname, "monster_scientist", 32);
+	m->classify   = HLCLASS_HUMAN_PASSIVE;
+	m->health     = 20.0;
+	m->fov        = 0.5;
+	m->walk_speed = 40.0;
+	m->run_speed  = 180.0;
+	m->yaw_speed  = 120.0;
+	m->flees      = TRUE;
+	HLAIMonHull(HLMON_SCIENTIST, 16.0, 72.0, 52.0);
+	HLAIMonSeq(HLMON_SCIENTIST, HLACT_IDLE,   "idle1");
+	HLAIMonSeq(HLMON_SCIENTIST, HLACT_WALK,   "walk_scared");
+	HLAIMonSeq(HLMON_SCIENTIST, HLACT_RUN,    "run");
+	HLAIMonSeq(HLMON_SCIENTIST, HLACT_DIE,    "diesimple");
+	HLAIMonSeq(HLMON_SCIENTIST, HLACT_FLINCH, "flinch1");
+	HLStrCopy(m->snd_alert, "scientist/sci_fear1.wav", 48);
+	HLStrCopy(m->snd_die,   "scientist/sci_die1.wav", 48);
+
+	//--- barney. CBarney: 35 health, the pistol does monDmg9MM (5), fires at
+	//up to 1024 units. PLAYER_ALLY, so the relationship matrix keeps him off
+	//the player and pointed at whatever the player is fighting.
+	m = &hl_ai_mon_info[HLMON_BARNEY];
+	HLStrCopy(m->classname, "monster_barney", 32);
+	m->classify     = HLCLASS_PLAYER_ALLY;
+	m->health       = 35.0;
+	m->fov          = 0.5;
+	m->walk_speed   = 40.0;
+	m->run_speed    = 160.0;
+	m->yaw_speed    = 120.0;
+	m->range_min    = 64.0;
+	m->range_max    = 1024.0;
+	m->range_dmg    = 5.0;
+	m->attack_rate  = 0.4;
+	HLAIMonHull(HLMON_BARNEY, 16.0, 72.0, 52.0);
+	HLAIMonSeq(HLMON_BARNEY, HLACT_IDLE,   "idle1");
+	HLAIMonSeq(HLMON_BARNEY, HLACT_WALK,   "walk");
+	HLAIMonSeq(HLMON_BARNEY, HLACT_RUN,    "run");
+	HLAIMonSeq(HLMON_BARNEY, HLACT_RANGE,  "shootgun");
+	HLAIMonSeq(HLMON_BARNEY, HLACT_DIE,    "diesimple");
+	HLAIMonSeq(HLMON_BARNEY, HLACT_FLINCH, "smlflinch");
+	HLStrCopy(m->snd_alert,  "barney/ba_attack1.wav", 48);
+	HLStrCopy(m->snd_attack, "barney/ba_attack2.wav", 48);
+	HLStrCopy(m->snd_die,    "barney/ba_die1.wav", 48);
+
+	//--- houndeye. CHoundeye: 20 health, the sonic blast is RADIUS damage of
+	//10 out to HOUNDEYE_MAX_ATTACK_RADIUS 384, not a hitscan - which is why
+	//it hurts through a corner and is modelled as a blast here too. The pack
+	//behaviour that makes the blast stronger with more houndeyes is squad
+	//code and is not here.
+	m = &hl_ai_mon_info[HLMON_HOUNDEYE];
+	HLStrCopy(m->classname, "monster_houndeye", 32);
+	m->classify     = HLCLASS_ALIEN_MONSTER;
+	m->health       = 20.0;
+	m->fov          = 0.5;
+	m->walk_speed   = 40.0;
+	m->run_speed    = 150.0;
+	m->yaw_speed    = 180.0;
+	m->range_min    = 0.0;
+	m->range_max    = 384.0;
+	m->range_dmg    = 10.0;
+	m->blast_radius = 384.0;
+	m->attack_rate  = 1.5;
+	HLAIMonHull(HLMON_HOUNDEYE, 16.0, 36.0, 20.0);
+	HLAIMonSeq(HLMON_HOUNDEYE, HLACT_IDLE,   "idle2");
+	HLAIMonSeq(HLMON_HOUNDEYE, HLACT_WALK,   "walk2");
+	HLAIMonSeq(HLMON_HOUNDEYE, HLACT_RUN,    "run");
+	HLAIMonSeq(HLMON_HOUNDEYE, HLACT_RANGE,  "attack");
+	HLAIMonSeq(HLMON_HOUNDEYE, HLACT_DIE,    "die");
+	HLAIMonSeq(HLMON_HOUNDEYE, HLACT_FLINCH, "flinch_small");
+	HLStrCopy(m->snd_idle,   "houndeye/he_idle1.wav", 48);
+	HLStrCopy(m->snd_alert,  "houndeye/he_alert1.wav", 48);
+	HLStrCopy(m->snd_attack, "houndeye/he_blast1.wav", 48);
+	HLStrCopy(m->snd_die,    "houndeye/he_die1.wav", 48);
+
+	//--- human grunt. CHGrunt: 50 health, MP5 at 9mmAR_bullet (3) x3 in a
+	//burst. No squad, no grenades, no signals, no crouching.
+	m = &hl_ai_mon_info[HLMON_HGRUNT];
+	HLStrCopy(m->classname, "monster_human_grunt", 32);
+	m->classify      = HLCLASS_HUMAN_MILITARY;
+	m->health        = 50.0;
+	m->fov           = 0.2;
+	m->walk_speed    = 40.0;
+	m->run_speed     = 160.0;
+	m->yaw_speed     = 150.0;
+	m->melee_range   = 64.0;
+	m->melee_dmg     = 5.0;			//sk_hgrunt_kick1, the frontkick
+	m->range_min     = 128.0;
+	m->range_max     = 2048.0;
+	m->range_dmg     = 3.0;
+	m->range_bullets = 3;
+	m->attack_rate   = 0.6;
+	HLAIMonHull(HLMON_HGRUNT, 16.0, 72.0, 52.0);
+	HLAIMonSeq(HLMON_HGRUNT, HLACT_IDLE,   "idle1");
+	HLAIMonSeq(HLMON_HGRUNT, HLACT_WALK,   "walk1");
+	HLAIMonSeq(HLMON_HGRUNT, HLACT_RUN,    "run");
+	HLAIMonSeq(HLMON_HGRUNT, HLACT_MELEE,  "frontkick");
+	HLAIMonSeq(HLMON_HGRUNT, HLACT_RANGE,  "standing_mp5");
+	HLAIMonSeq(HLMON_HGRUNT, HLACT_DIE,    "diesimple");
+	HLAIMonSeq(HLMON_HGRUNT, HLACT_FLINCH, "smflinch");
+	HLStrCopy(m->snd_idle,   "hgrunt/gr_idle1.wav", 48);
+	HLStrCopy(m->snd_alert,  "hgrunt/gr_alert1.wav", 48);
+	HLStrCopy(m->snd_attack, "hgrunt/gr_mgun1.wav", 48);
+	HLStrCopy(m->snd_die,    "hgrunt/gr_die1.wav", 48);
+
+	//--- alien slave. CISlave: 30 health, claw 8 in melee, zap 10 at range.
+	//The hornet swarm it summons and the electric arc between slaves are
+	//projectile and beam effects and are not here, so the zap is a hitscan
+	//with a sound.
+	m = &hl_ai_mon_info[HLMON_ISLAVE];
+	HLStrCopy(m->classname, "monster_alien_slave", 32);
+	m->classify    = HLCLASS_ALIEN_MILITARY;
+	m->health      = 30.0;
+	m->fov         = 0.2;
+	m->walk_speed  = 40.0;
+	m->run_speed   = 150.0;
+	m->yaw_speed   = 120.0;
+	m->melee_range = 64.0;
+	m->melee_dmg   = 8.0;
+	m->range_min   = 64.0;
+	m->range_max   = 1024.0;
+	m->range_dmg   = 10.0;
+	m->attack_rate = 1.2;
+	HLAIMonHull(HLMON_ISLAVE, 16.0, 72.0, 52.0);
+	HLAIMonSeq(HLMON_ISLAVE, HLACT_IDLE,   "idle1");
+	HLAIMonSeq(HLMON_ISLAVE, HLACT_WALK,   "walk1");
+	HLAIMonSeq(HLMON_ISLAVE, HLACT_RUN,    "run1");
+	HLAIMonSeq(HLMON_ISLAVE, HLACT_MELEE,  "attack1");
+	HLAIMonSeq(HLMON_ISLAVE, HLACT_RANGE,  "zapattack1");
+	HLAIMonSeq(HLMON_ISLAVE, HLACT_DIE,    "diesimple");
+	HLAIMonSeq(HLMON_ISLAVE, HLACT_FLINCH, "flinch2");
+	HLStrCopy(m->snd_alert,  "aslave/slv_alert1.wav", 48);
+	HLStrCopy(m->snd_attack, "debris/zap4.wav", 48);
+	HLStrCopy(m->snd_die,    "aslave/slv_die1.wav", 48);
+
+	//--- bullsquid. CBullsquid: 40 health, whip 25 at 85 units. The spit is a
+	//projectile entity and is left out, which makes it purely melee.
+	m = &hl_ai_mon_info[HLMON_BULLSQUID];
+	HLStrCopy(m->classname, "monster_bullchicken", 32);
+	m->classify    = HLCLASS_ALIEN_PREDATOR;
+	m->health      = 40.0;
+	m->fov         = 0.2;
+	m->walk_speed  = 40.0;
+	m->run_speed   = 180.0;
+	m->yaw_speed   = 150.0;
+	m->melee_range = 85.0;
+	m->melee_dmg   = 25.0;
+	m->attack_rate = 1.0;
+	HLAIMonHull(HLMON_BULLSQUID, 32.0, 64.0, 40.0);
+	HLAIMonSeq(HLMON_BULLSQUID, HLACT_IDLE,   "idle");
+	HLAIMonSeq(HLMON_BULLSQUID, HLACT_WALK,   "walk");
+	HLAIMonSeq(HLMON_BULLSQUID, HLACT_RUN,    "run");
+	HLAIMonSeq(HLMON_BULLSQUID, HLACT_MELEE,  "whip");
+	HLAIMonSeq(HLMON_BULLSQUID, HLACT_DIE,    "die");
+	HLAIMonSeq(HLMON_BULLSQUID, HLACT_FLINCH, "flinchs");
+	HLStrCopy(m->snd_idle,   "bullchicken/bc_idle1.wav", 48);
+	HLStrCopy(m->snd_alert,  "bullchicken/bc_attackgrowl.wav", 48);
+	HLStrCopy(m->snd_attack, "bullchicken/bc_attack1.wav", 48);
+	HLStrCopy(m->snd_die,    "bullchicken/bc_die1.wav", 48);
+}
+
+U0 HLAIMonInit()
+{//globals aren't zeroed and a declaration initialiser on one is unreliable
+	I64 i;
+
+	for (i = 0; i < HLAI_MON_MAX; i++)
+	{
+		hl_ai_mon[i].ent           = -1;
+		hl_ai_mon[i].kind          = -1;
+		hl_ai_mon[i].state         = HLMSTATE_NONE;
+		hl_ai_mon[i].sched         = HLSCHED_NONE;
+		hl_ai_mon[i].task          = 0;
+		hl_ai_mon[i].task_status   = HLTK_DONE;
+		hl_ai_mon[i].task_start    = 0.0;
+		hl_ai_mon[i].sched_done    = TRUE;
+		hl_ai_mon[i].have_enemy    = FALSE;
+		hl_ai_mon[i].enemy         = -1;
+		hl_ai_mon[i].enemy_seen    = 0.0;
+		hl_ai_mon[i].have_goal     = FALSE;
+		hl_ai_mon[i].goal_is_enemy = FALSE;
+		hl_ai_mon[i].goal_tol      = 32.0;
+		hl_ai_mon[i].move_speed    = 0.0;
+		hl_ai_mon[i].path_start    = 0.0;
+		hl_ai_mon[i].stuck_since   = 0.0;
+		hl_ai_mon[i].ideal_yaw     = 0.0;
+		hl_ai_mon[i].next_attack   = 0.0;
+		hl_ai_mon[i].next_idle_snd = 0.0;
+		hl_ai_mon[i].next_look     = 0.0;
+		hl_ai_mon[i].last_health   = 0.0;
+		hl_ai_mon[i].scripted      = FALSE;
+		hl_ai_mon[i].settled       = FALSE;
+
+		HLVecSet(hl_ai_mon[i].enemy_pos, 0.0, 0.0, 0.0);
+		HLVecSet(hl_ai_mon[i].goal, 0.0, 0.0, 0.0);
+	}
+
+	for (i = 0; i < HLENT_MAX; i++)
+		hl_ai_mon_of[i] = -1;
+
+	hl_ai_mon_count  = 0;
+	hl_ai_mon_base   = NULL;
+	hl_ai_mon_ents   = 0;
+	hl_ai_mon_clock  = 0.0;
+	hl_ai_mon_revive = TRUE;
+	hl_ai_mon_kills  = 0;
+
+	HLAIMonTableInit;
+	HLAISchedInit;
+}
+
+//top-level, so the tables are sane before anything can reach them
+HLAIMonInit;
+
+//--- relationships ----------------------------------------------------------
+//
+// CBaseMonster::IRelationship indexes a 13x13 table of R_* values by (my
+// class, their class). Reproduced as a comparison chain over the nine classes
+// the table above actually uses, rather than as a 169-entry array with 120
+// entries I would be guessing at. Anything not named below is R_NONE, which
+// means "ignore", and ignoring is the safe default: a wrong R_HATE makes
+// monsters attack their own side, a wrong R_NONE only makes them passive.
+//
+// This is what makes barney useful. He is CLASS_PLAYER_ALLY, so the player is
+// R_ALLY and every alien is R_DISLIKE - he will shoot a headcrab and will not
+// shoot you. Without it "allied" would just mean "inert".
+
+I64 HLAIRelationship(I64 mine, I64 theirs)
+{
+	if (mine == theirs)
+	{
+		//own kind. HL's diagonal is R_NO except for the military classes,
+		//which is why two grunts do not fight and two zombies do not either
+		return HLREL_NONE;
+	}
+
+	if (mine == HLCLASS_HUMAN_PASSIVE)
+	{
+		//the scientist row. Marines are hated (they execute scientists), the
+		//player and other allies are allies, and everything alien is feared.
+		//HL's own row hates rather than fears some of these, but a monster
+		//with no attack cannot act on hate - see CScientist::SelectSchedule,
+		//which flees either way.
+		if (theirs == HLCLASS_PLAYER)			return HLREL_ALLY;
+		if (theirs == HLCLASS_PLAYER_ALLY)		return HLREL_ALLY;
+		if (theirs == HLCLASS_HUMAN_MILITARY)	return HLREL_FEAR;
+		if (theirs == HLCLASS_ALIEN_MILITARY)	return HLREL_FEAR;
+		if (theirs == HLCLASS_ALIEN_MONSTER)	return HLREL_FEAR;
+		if (theirs == HLCLASS_ALIEN_PREY)		return HLREL_FEAR;
+		if (theirs == HLCLASS_ALIEN_PREDATOR)	return HLREL_FEAR;
+
+		return HLREL_NONE;
+	}
+
+	if (mine == HLCLASS_PLAYER_ALLY)
+	{
+		//barney. Hates the military, dislikes everything alien, allied to the
+		//player and to scientists
+		if (theirs == HLCLASS_PLAYER)			return HLREL_ALLY;
+		if (theirs == HLCLASS_HUMAN_PASSIVE)	return HLREL_ALLY;
+		if (theirs == HLCLASS_HUMAN_MILITARY)	return HLREL_HATE;
+		if (theirs == HLCLASS_MACHINE)			return HLREL_DISLIKE;
+		if (theirs == HLCLASS_ALIEN_MILITARY)	return HLREL_DISLIKE;
+		if (theirs == HLCLASS_ALIEN_MONSTER)	return HLREL_DISLIKE;
+		if (theirs == HLCLASS_ALIEN_PREY)		return HLREL_DISLIKE;
+		if (theirs == HLCLASS_ALIEN_PREDATOR)	return HLREL_DISLIKE;
+
+		return HLREL_NONE;
+	}
+
+	if (mine == HLCLASS_HUMAN_MILITARY)
+	{
+		//the grunts hate the player and his allies above all else
+		if (theirs == HLCLASS_PLAYER)			return HLREL_HATE;
+		if (theirs == HLCLASS_PLAYER_ALLY)		return HLREL_HATE;
+		if (theirs == HLCLASS_HUMAN_PASSIVE)	return HLREL_DISLIKE;
+		if (theirs == HLCLASS_ALIEN_MILITARY)	return HLREL_HATE;
+		if (theirs == HLCLASS_ALIEN_MONSTER)	return HLREL_DISLIKE;
+		if (theirs == HLCLASS_ALIEN_PREDATOR)	return HLREL_DISLIKE;
+
+		return HLREL_NONE;
+	}
+
+	if (mine == HLCLASS_ALIEN_MILITARY)
+	{
+		if (theirs == HLCLASS_PLAYER)			return HLREL_HATE;
+		if (theirs == HLCLASS_PLAYER_ALLY)		return HLREL_DISLIKE;
+		if (theirs == HLCLASS_HUMAN_PASSIVE)	return HLREL_DISLIKE;
+		if (theirs == HLCLASS_HUMAN_MILITARY)	return HLREL_HATE;
+		if (theirs == HLCLASS_MACHINE)			return HLREL_DISLIKE;
+
+		return HLREL_NONE;
+	}
+
+	if (mine == HLCLASS_ALIEN_MONSTER || mine == HLCLASS_ALIEN_PREY ||
+		mine == HLCLASS_ALIEN_PREDATOR)
+	{
+		//the wildlife. Dislikes anything human-shaped, ignores other aliens,
+		//with the one exception HL bothers to spell out: a predator HUNTS
+		//prey, which is what makes a bullsquid eat headcrabs.
+		if (mine == HLCLASS_ALIEN_PREDATOR && theirs == HLCLASS_ALIEN_PREY)
+			return HLREL_HATE;
+
+		if (mine == HLCLASS_ALIEN_PREY && theirs == HLCLASS_ALIEN_PREDATOR)
+			return HLREL_FEAR;
+
+		if (theirs == HLCLASS_PLAYER)			return HLREL_DISLIKE;
+		if (theirs == HLCLASS_PLAYER_ALLY)		return HLREL_DISLIKE;
+		if (theirs == HLCLASS_HUMAN_PASSIVE)	return HLREL_DISLIKE;
+		if (theirs == HLCLASS_HUMAN_MILITARY)	return HLREL_DISLIKE;
+		if (theirs == HLCLASS_MACHINE)			return HLREL_DISLIKE;
+
+		return HLREL_NONE;
+	}
+
+	return HLREL_NONE;
+}
+
+//--- registration -----------------------------------------------------------
+
+I64 HLAIMonKindFor(U8 *classname)
+{//classname to a table row. A comparison chain, not a U8* table - adjacent
+ //string literals concatenate by LENGTH on this compiler and a literal table
+ //collapses to its first entry, which is the bug HLEntModelForClass documents
+	I64 i;
+
+	if (!classname || !classname[0])
+		return -1;
+
+	for (i = 0; i < HLMON_COUNT; i++)
+	{
+		if (!StrICompare(hl_ai_mon_info[i].classname, classname))
+			return i;
+	}
+
+	//aliases the maps use. monster_generic wears whatever model the mapper
+	//named and has no behaviour of its own in the SDK either, so it is left
+	//out on purpose rather than guessed at from the model path.
+	if (!StrICompare(classname, "monster_scientist_dead"))
+		return -1;
+
+	return -1;
+}
+
+U0 HLAIMonReset(I64 s)
+{//one slot back to its resting state, keeping ent and kind
+	hl_ai_mon[s].state         = HLMSTATE_IDLE;
+	hl_ai_mon[s].sched         = HLSCHED_NONE;
+	hl_ai_mon[s].task          = 0;
+	hl_ai_mon[s].task_status   = HLTK_DONE;
+	hl_ai_mon[s].task_start    = 0.0;
+	hl_ai_mon[s].sched_done    = TRUE;
+	hl_ai_mon[s].have_enemy    = FALSE;
+	hl_ai_mon[s].enemy         = -1;
+	hl_ai_mon[s].enemy_seen    = 0.0;
+	hl_ai_mon[s].have_goal     = FALSE;
+	hl_ai_mon[s].goal_is_enemy = FALSE;
+	hl_ai_mon[s].goal_tol      = 32.0;
+	hl_ai_mon[s].move_speed    = 0.0;
+	hl_ai_mon[s].path_start    = 0.0;
+	hl_ai_mon[s].stuck_since   = 0.0;
+	hl_ai_mon[s].next_attack   = 0.0;
+	hl_ai_mon[s].next_look     = 0.0;
+	hl_ai_mon[s].scripted      = FALSE;
+	hl_ai_mon[s].settled       = FALSE;
+
+	HLVecSet(hl_ai_mon[s].enemy_pos, 0.0, 0.0, 0.0);
+	HLVecSet(hl_ai_mon[s].goal, 0.0, 0.0, 0.0);
+}
+
+U0 HLAIMonRegisterAll()
+{//claim a slot for every live monster in the entity table
+ //
+ //this is where the monster gets the parts of its Spawn() the generic monster
+ //branch in HLEntSpawnOne could not do: the hull, and the health from
+ //gSkillData. Overwriting the map's "health" key is not a liberty - every
+ //CBaseMonster::Spawn in the SDK assigns pev->health from gSkillData
+ //unconditionally and the key is ignored on monsters.
+	CHLEntity	*e;
+	CHLMonInfo	*mi;
+	I64			 i;
+	I64			 kind;
+	I64			 s;
+
+	for (i = 0; i < HLAI_MON_MAX; i++)
+	{
+		hl_ai_mon[i].ent  = -1;
+		hl_ai_mon[i].kind = -1;
+	}
+
+	for (i = 0; i < HLENT_MAX; i++)
+		hl_ai_mon_of[i] = -1;
+
+	hl_ai_mon_count = 0;
+
+	if (!hl_entities)
+		return;
+
+	for (i = 0; i < hl_num_entities; i++)
+	{
+		e = &hl_entities[i];
+
+		if (!e->in_use || e->ent_class != HLC_MONSTER)
+			goto qamr_next;
+
+		//no model means nothing to animate and no way to tell what it is;
+		//HLEntLoadModels already failed on it, so leave it as scenery
+		if (!e->studio)
+			goto qamr_next;
+
+		kind = HLAIMonKindFor(e->classname);
+
+		if (kind < 0)
+			goto qamr_next;
+
+		if (hl_ai_mon_count >= HLAI_MON_MAX)
+		{
+			"HLAI: more than %d monsters, the rest are idle\n", HLAI_MON_MAX;
+			goto qamr_done;
+		}
+
+		s  = hl_ai_mon_count;
+		mi = &hl_ai_mon_info[kind];
+
+		hl_ai_mon[s].ent  = i;
+		hl_ai_mon[s].kind = kind;
+		HLAIMonReset(s);
+
+		hl_ai_mon[s].last_health   = mi->health;
+		hl_ai_mon[s].ideal_yaw     = e->angles[1];
+		hl_ai_mon[s].next_idle_snd = hl_ent_time + HLAI_IDLE_SND_MIN +
+			ToF64(HLPartRandI(HLAI_IDLE_SND_RANGE));
+
+		//staggered, so forty monsters in one room do not all Look on the same
+		//tick and spike the frame that happens to land on it
+		hl_ai_mon[s].next_look = hl_ent_time +
+			ToF64(s % 8) * (HLAI_LOOK_PERIOD / 8.0);
+
+		hl_ai_mon_of[i] = s;
+		hl_ai_mon_count++;
+
+		//the parts of Spawn() the shared entity struct can carry
+		HLVecCopy(mi->mins, e->mins);
+		HLVecCopy(mi->maxs, e->maxs);
+		HLEntSetAbsBox(e);
+
+		e->health     = mi->health;
+		e->max_health = mi->health;
+		e->takedamage = HLDMG_TAKE_YES;
+
+		//pitch and roll are not animated, and a monster placed by a mapper
+		//with a pitch renders leaning over
+		e->angles[0] = 0.0;
+		e->angles[2] = 0.0;
+
+qamr_next:
+	}
+
+qamr_done:
+	if (hl_ai_mon_count)
+		"HLAI: %d monsters\n", hl_ai_mon_count;
+}
+
+U0 HLAIMonSync()
+{//re-register when the entity table has been rebuilt under us
+ //
+ //there is no per-map hook to hang this on - HLEntSpawnAll is in HLEntity.ZC
+ //and compiles first - so the change is DETECTED. All three tests are needed:
+ //a fresh CAlloc can land on the same address, an entity count can repeat
+ //across two maps, and hl_ent_time restarting at zero is the one signal
+ //HLEntSpawnAll always produces.
+	if (hl_entities == hl_ai_mon_base && hl_num_entities == hl_ai_mon_ents &&
+		hl_ent_time >= hl_ai_mon_clock)
+	{
+		hl_ai_mon_clock = hl_ent_time;
+		return;
+	}
+
+	hl_ai_mon_base  = hl_entities;
+	hl_ai_mon_ents  = hl_num_entities;
+	hl_ai_mon_clock = hl_ent_time;
+
+	HLAIMonRegisterAll;
+}
+
+//--- sensing ----------------------------------------------------------------
+
+U0 HLAIPlayerOrigin(F64 *out)
+{//the player's FEET, which is what a monster's range checks compare against
+ //
+ //hl_origin lives in HL1.ZC and compiles later, so the position comes from
+ //hl_snd_listener - the eye HL1.ZC hands the mixer every rendered frame. It
+ //carries view bob and the step offset on top of HLAI_PLAYER_EYE, worth a
+ //couple of units, which does not matter at sighting range.
+	HLVecCopy(hl_snd_listener, out);
+	out[2] -= HLAI_PLAYER_EYE;
+}
+
+U0 HLAIMonEye(I64 s, F64 *out)
+{//pev->origin + pev->view_ofs, where a monster's sight lines start
+	CHLEntity *e = HLEntGet(hl_ai_mon[s].ent);
+
+	if (!e)
+	{
+		HLVecSet(out, 0.0, 0.0, 0.0);
+		return;
+	}
+
+	HLVecCopy(e->origin, out);
+	out[2] += hl_ai_mon_info[hl_ai_mon[s].kind].view_ofs;
+}
+
+Bool HLAITargetIsPlayer(I64 target)
+{//the player is target -1. Every other index is an entity
+	return ToBool(target < 0);
+}
+
+Bool HLAITargetPos(I64 target, F64 *feet, F64 *eye)
+{//where a target is and where to aim at it. FALSE when it is gone or dead,
+ //which is how a monster stops shooting a corpse
+	CHLEntity	*e;
+	I64			 s;
+
+	if (HLAITargetIsPlayer(target))
+	{
+		if (hl_ent_player < 0 || hl_ent_player_dead)
+			return FALSE;
+
+		HLAIPlayerOrigin(feet);
+		HLVecCopy(hl_snd_listener, eye);
+
+		return TRUE;
+	}
+
+	e = HLEntGet(target);
+
+	if (!e || e->health <= 0.0)
+		return FALSE;
+
+	s = -1;
+
+	if (target < HLENT_MAX)
+		s = hl_ai_mon_of[target];
+
+	if (s < 0)
+		return FALSE;
+
+	if (hl_ai_mon[s].state == HLMSTATE_DEAD)
+		return FALSE;
+
+	HLVecCopy(e->origin, feet);
+	HLVecCopy(e->origin, eye);
+	eye[2] += hl_ai_mon_info[hl_ai_mon[s].kind].view_ofs;
+
+	return TRUE;
+}
+
+I64 HLAITargetClass(I64 target)
+{//Classify() for either kind of target
+	I64 s;
+
+	if (HLAITargetIsPlayer(target))
+		return HLCLASS_PLAYER;
+
+	if (target < 0 || target >= HLENT_MAX)
+		return HLCLASS_NONE;
+
+	s = hl_ai_mon_of[target];
+
+	if (s < 0)
+		return HLCLASS_NONE;
+
+	return hl_ai_mon_info[hl_ai_mon[s].kind].classify;
+}
+
+Bool HLAIInViewCone(I64 s, F64 *point)
+{//FInViewCone: the dot of the monster's facing with the direction to the
+ //point, against m_flFieldOfView. A cosine, so -1.0 really is all round.
+	CHLEntity	*e = HLEntGet(hl_ai_mon[s].ent);
+	F64			 forward[3];
+	F64			 ang[3];
+	F64			 dir[3];
+
+	if (!e)
+		return FALSE;
+
+	//yaw only. HL uses the full angle vector, but nothing here pitches a
+	//monster, and using pev->angles as-is would let a mapper's stray pitch
+	//key blind it
+	HLVecSet(ang, 0.0, e->angles[1], 0.0);
+	HLAngleVectors(ang, forward, NULL, NULL);
+
+	HLVecSub(point, e->origin, dir);
+	dir[2] = 0.0;
+
+	if (HLVecNormalize(dir) <= 0.0)
+		return TRUE;
+
+	return ToBool(HLVecDot(dir, forward) >=
+		hl_ai_mon_info[hl_ai_mon[s].kind].fov);
+}
+
+Bool HLAIVisible(I64 s, F64 *target_eye)
+{//FVisible: a POINT trace from eye to eye. Anything in the way blocks it
+ //
+ //HL also rejects a line that crosses from air into water; that test needs
+ //the trace to report both contents, which CHLTrace does carry, so it is
+ //applied here too
+	CHLTrace	tr;
+	F64			 eye[3];
+	F64			 zero[3];
+
+	if (!hl_map)
+		return FALSE;
+
+	HLAIMonEye(s, eye);
+	HLVecSet(zero, 0.0, 0.0, 0.0);
+
+	HLTraceEntity(hl_map, eye, target_eye, zero, zero, 0, TRUE, &tr);
+
+	if (tr.in_open && tr.in_water)
+		return FALSE;
+
+	return ToBool(tr.fraction >= 1.0);
+}
+
+U0 HLAILook(I64 s)
+{//CBaseMonster::Look plus BestVisibleEnemy, over the player and every live
+ //monster - there is no entity list to walk with ALL_CONTENTS here, so the
+ //candidates are the two things that can be a target at all.
+ //
+ //ONE DEVIATION, on purpose: BestVisibleEnemy only returns targets whose
+ //relationship is worse than R_NONE, so a FEARED target never becomes
+ //m_hEnemy. A monster that flees needs something to flee FROM, and with no
+ //sound sensing there is no other way for a scientist to learn a zombie is
+ //there. So fear counts, and the schedule selector is what decides whether
+ //the enemy is charged or run from.
+	CHLEntity	*e = HLEntGet(hl_ai_mon[s].ent);
+	CHLMonInfo	*mi;
+	F64			 feet[3];
+	F64			 eye[3];
+	F64			 d[3];
+	F64			 dist;
+	F64			 best_dist;
+	I64			 best      = -1;
+	I64			 best_rel  = 0;
+	I64			 rel;
+	I64			 target;
+	I64			 i;
+	Bool		 found     = FALSE;
+
+	if (!e)
+		return;
+
+	mi        = &hl_ai_mon_info[hl_ai_mon[s].kind];
+	best_dist = mi->look_dist;
+
+	//-1 is the player, then every entity index. One loop over both, so the
+	//player is not a special case in the middle of the scoring
+	target = -1;
+	i      = -1;
+
+	while (i < hl_num_entities)
+	{
+		target = i;
+
+		if (i >= 0)
+		{
+			if (hl_ai_mon_of[i] < 0 || i == hl_ai_mon[s].ent)
+				goto qal_next;
+		}
+
+		rel = HLAIRelationship(mi->classify, HLAITargetClass(target));
+
+		if (rel == HLREL_NONE || rel == HLREL_ALLY)
+			goto qal_next;
+
+		if (!HLAITargetPos(target, feet, eye))
+			goto qal_next;
+
+		HLVecSub(feet, e->origin, d);
+		dist = HLVecLength(d);
+
+		if (dist > mi->look_dist)
+			goto qal_next;
+
+		if (!HLAIInViewCone(s, feet))
+			goto qal_next;
+
+		if (!HLAIVisible(s, eye))
+			goto qal_next;
+
+		//a hated target beats a disliked one at any range; within one
+		//relationship the nearest wins. That is BestVisibleEnemy's rule.
+		//
+		//`found` rather than a sentinel in best_rel: R_NONE sits in the MIDDLE
+		//of the R_* range, between R_FEAR and R_DISLIKE, so there is no value
+		//that means "nothing yet" and also compares correctly against fear
+		if (found)
+		{
+			if (rel < best_rel)
+				goto qal_next;
+
+			if (rel == best_rel && dist >= best_dist)
+				goto qal_next;
+		}
+
+		best      = target;
+		best_rel  = rel;
+		best_dist = dist;
+		found     = TRUE;
+
+qal_next:
+		i++;
+	}
+
+	if (!found)
+		return;
+
+	hl_ai_mon[s].have_enemy = TRUE;
+	hl_ai_mon[s].enemy      = best;
+	hl_ai_mon[s].enemy_seen = hl_ent_time;
+
+	if (HLAITargetPos(best, feet, eye))
+		HLVecCopy(feet, hl_ai_mon[s].enemy_pos);
+}
+
+//--- turning ----------------------------------------------------------------
+
+F64 HLAIYawTo(F64 *from, F64 *to)
+{//UTIL_VecToYaw for the direction between two points
+	F64 d[3];
+
+	HLVecSub(to, from, d);
+	d[2] = 0.0;
+
+	if (HLVecNormalize(d) <= 0.0)
+		return 0.0;
+
+	return Arg(d[0], d[1]) / HLDEG2RAD;
+}
+
+F64 HLAIYawDiff(F64 want, F64 have)
+{//the SHORTEST signed arc between two yaws, degrees. Turning by the raw
+ //difference makes a monster spin the long way round through 359 degrees
+	F64 d = HLAngleNorm(want) - HLAngleNorm(have);
+
+	if (d > 180.0)
+		d -= 360.0;
+
+	if (d < -180.0)
+		d += 360.0;
+
+	return d;
+}
+
+Bool HLAITurnToward(I64 s, F64 want, F64 dt)
+{//ChangeYaw: step pev->angles towards ideal_yaw at yaw_speed. TRUE once it is
+ //within HLAI_FACE_TOL, which is what the facing tasks wait on
+	CHLEntity	*e = HLEntGet(hl_ai_mon[s].ent);
+	F64			 diff;
+	F64			 step;
+
+	if (!e)
+		return TRUE;
+
+	hl_ai_mon[s].ideal_yaw = HLAngleNorm(want);
+
+	diff = HLAIYawDiff(want, e->angles[1]);
+	step = hl_ai_mon_info[hl_ai_mon[s].kind].yaw_speed * dt;
+
+	if (diff < 0.0)
+	{
+		if (step > -diff)
+			step = -diff;
+
+		e->angles[1] = HLAngleNorm(e->angles[1] - step);
+	}
+	else
+	{
+		if (step > diff)
+			step = diff;
+
+		e->angles[1] = HLAngleNorm(e->angles[1] + step);
+	}
+
+	if (diff < 0.0)
+		diff = -diff;
+
+	return ToBool(diff <= HLAI_FACE_TOL);
+}
+
+//--- movement ---------------------------------------------------------------
+//
+// WALK_MOVE / RUN_MOVE, with the node graph amputated. The SDK's CBaseMonster
+// ::Move takes the next waypoint from m_Route, which CGraph filled; here the
+// goal is the destination itself and the only obstacle handling is one slide
+// along the plane that blocked the step. See the file header for what that
+// costs. Nothing about this is a substitute for routing.
+
+#define HLAI_MOVE_OK		0
+#define HLAI_MOVE_ARRIVED	1
+#define HLAI_MOVE_BLOCKED	2
+
+Bool HLAIDropToFloor(CHLEntity *e, F64 *pos, F64 *out)
+{//CheckLocalMove's floor test. Probe up to HLAI_STEP_HEIGHT for headroom,
+ //then down twice that for a floor, and REFUSE the move when there is none -
+ //without this a monster walks off a catwalk and keeps walking through the
+ //air, because nothing integrates gravity for a STEP entity here.
+	CHLTrace	tr;
+	F64			 up[3];
+	F64			 down[3];
+
+	HLVecCopy(pos, up);
+	up[2] += HLAI_STEP_HEIGHT;
+
+	//the step up has to be clear of a ceiling first, or the down trace starts
+	//inside solid and reports the whole sweep as blocked
+	HLTraceEntity(hl_map, pos, up, e->mins, e->maxs, 0, TRUE, &tr);
+	HLVecCopy(tr.end_pos, up);
+
+	HLVecCopy(up, down);
+	down[2] -= HLAI_STEP_HEIGHT * 3.0;
+
+	HLTraceEntity(hl_map, up, down, e->mins, e->maxs, 0, TRUE, &tr);
+
+	//no floor inside a step and a fall of one more step: a ledge
+	if (tr.fraction >= 1.0)
+		return FALSE;
+
+	HLVecCopy(tr.end_pos, out);
+
+	return TRUE;
+}
+
+I64 HLAIMoveStep(I64 s, F64 speed, F64 dt)
+{//one tick of movement toward the goal
+	CHLEntity	*e = HLEntGet(hl_ai_mon[s].ent);
+	CHLTrace	 tr;
+	F64			 dir[3];
+	F64			 want[3];
+	F64			 tryto[3];
+	F64			 rest[3];
+	F64			 slide[3];
+	F64			 floor[3];
+	F64			 dist;
+	F64			 step;
+	F64			 moved;
+	F64			 back;
+
+	if (!e || !hl_map || !hl_ai_mon[s].have_goal)
+		return HLAI_MOVE_BLOCKED;
+
+	HLVecSub(hl_ai_mon[s].goal, e->origin, dir);
+	dir[2] = 0.0;
+
+	dist = HLVecLength(dir);
+
+	if (dist <= hl_ai_mon[s].goal_tol)
+		return HLAI_MOVE_ARRIVED;
+
+	HLVecNormalize(dir);
+
+	step = speed * dt;
+
+	if (step > dist)
+		step = dist;
+
+	if (step <= 0.0)
+		return HLAI_MOVE_OK;
+
+	HLVecMA(e->origin, step, dir, tryto);
+
+	HLTraceEntity(hl_map, e->origin, tryto, e->mins, e->maxs, 0, TRUE, &tr);
+
+	if (tr.fraction < 1.0)
+	{
+		//the wall slide. Whatever is left of the step after the impact, with
+		//the component into the plane removed, tried once. One retry, not a
+		//loop: HLFlyMove's multi-plane clip belongs to the player move and
+		//iterating it here would let a monster corner-hug its way around
+		//geometry it has no business finding a way through.
+		HLVecCopy(tr.end_pos, tryto);
+
+		HLVecScale(dir, step * (1.0 - tr.fraction), rest);
+
+		back = HLVecDot(rest, tr.plane_normal);
+		HLVecMA(rest, -back, tr.plane_normal, slide);
+
+		if (HLVecLength(slide) > 0.0)
+		{
+			HLVecAdd(tryto, slide, want);
+			HLTraceEntity(hl_map, tryto, want, e->mins, e->maxs, 0, TRUE,
+				&tr);
+			HLVecCopy(tr.end_pos, tryto);
+		}
+	}
+
+	if (!HLAIDropToFloor(e, tryto, floor))
+		return HLAI_MOVE_BLOCKED;
+
+	HLVecSub(floor, e->origin, want);
+	want[2] = 0.0;
+	moved   = HLVecLength(want);
+
+	HLVecCopy(floor, e->origin);
+	HLEntSetAbsBox(e);
+
+	//stuck detection. A monster grinding on a wall makes almost no ground per
+	//tick; after HLAI_STUCK_TIME of that the path task fails and the state
+	//machine picks something else, rather than the monster pressing forever
+	if (moved < step * 0.2)
+	{
+		if (hl_ai_mon[s].stuck_since <= 0.0)
+			hl_ai_mon[s].stuck_since = hl_ent_time;
+		else if (hl_ent_time - hl_ai_mon[s].stuck_since >= HLAI_STUCK_TIME)
+			return HLAI_MOVE_BLOCKED;
+	}
+	else
+		hl_ai_mon[s].stuck_since = 0.0;
+
+	return HLAI_MOVE_OK;
+}
+
+//--- attacks ----------------------------------------------------------------
+
+U0 HLAIMonSound(I64 s, U8 *path)
+{//at the monster's own position, on the one channel HLEntity.ZC reserves for
+ //entity speech, so a new line cuts the previous one
+	CHLEntity *e = HLEntGet(hl_ai_mon[s].ent);
+
+	if (!e || !path || !path[0])
+		return;
+
+	HLSndPlayAt(path, e->origin, 1.0, HLENT_SND_ATTEN, 0, HLENT_CHAN_USE);
+}
+
+U0 HLAIHurt(I64 target, I64 attacker, F64 damage)
+{//one damage call for either kind of target. The player's health lives in
+ //HLEntity.ZC's native player state, a monster's in its entity slot
+	if (damage <= 0.0)
+		return;
+
+	if (HLAITargetIsPlayer(target))
+	{
+		HLEntHurtPlayer(damage);
+		return;
+	}
+
+	HLEntTakeDamage(target, attacker, damage);
+}
+
+U0 HLAIBlastDamage(I64 s, F64 radius, F64 damage)
+{//RadiusDamage, cut down: no falloff and no line-of-sight test, because the
+ //only user is the houndeye's sonic blast, which in the SDK is
+ //UTIL_MonstersInSphere plus a flat gSkillData figure and passes through
+ //cover by design
+	CHLEntity	*e = HLEntGet(hl_ai_mon[s].ent);
+	F64			 feet[3];
+	F64			 eye[3];
+	F64			 d[3];
+	I64			 mine;
+	I64			 target;
+	I64			 i;
+
+	if (!e)
+		return;
+
+	mine   = hl_ai_mon_info[hl_ai_mon[s].kind].classify;
+	target = -1;
+	i      = -1;
+
+	while (i < hl_num_entities)
+	{
+		target = i;
+
+		if (i >= 0)
+		{
+			if (hl_ai_mon_of[i] < 0 || i == hl_ai_mon[s].ent)
+				goto qabd_next;
+		}
+
+		//a blast still respects the relationship table - HL's houndeyes do
+		//not hurt each other, which is the whole point of the pack
+		if (HLAIRelationship(mine, HLAITargetClass(target)) <= HLREL_NONE)
+			goto qabd_next;
+
+		if (!HLAITargetPos(target, feet, eye))
+			goto qabd_next;
+
+		HLVecSub(feet, e->origin, d);
+
+		if (HLVecLength(d) > radius)
+			goto qabd_next;
+
+		HLAIHurt(target, hl_ai_mon[s].ent, damage);
+
+qabd_next:
+		i++;
+	}
+}
+
+U0 HLAIFireAttack(I64 s, Bool melee)
+{//land the hit at the END of the attack sequence
+ //
+ //the SDK fires on an animation event inside the sequence (mstudioevent_t,
+ //HandleAnimEvent) and the studio layer decodes bones and sequences, not
+ //events. Applying it at the end means the range and the sight line are
+ //re-tested a beat late, so stepping out of a swing avoids it - which is
+ //closer to how HL plays than a hit that lands the instant the task starts.
+	CHLEntity	*e = HLEntGet(hl_ai_mon[s].ent);
+	CHLMonInfo	*mi;
+	F64			 feet[3];
+	F64			 eye[3];
+	F64			 d[3];
+	F64			 dist;
+	F64			 dmg;
+
+	if (!e || !hl_ai_mon[s].have_enemy)
+		return;
+
+	mi = &hl_ai_mon_info[hl_ai_mon[s].kind];
+
+	if (!HLAITargetPos(hl_ai_mon[s].enemy, feet, eye))
+		return;
+
+	HLVecSub(feet, e->origin, d);
+	dist = HLVecLength(d);
+
+	if (melee)
+	{
+		//a little slop over the reach used to CHOOSE the attack, so an enemy
+		//backing away at walking pace does not dodge every swing by an inch
+		if (dist > mi->melee_range * 1.25)
+			return;
+
+		HLAIHurt(hl_ai_mon[s].enemy, hl_ai_mon[s].ent, mi->melee_dmg);
+		return;
+	}
+
+	if (mi->blast_radius > 0.0)
+	{
+		HLAIBlastDamage(s, mi->blast_radius, mi->range_dmg);
+		return;
+	}
+
+	//hitscan. FireBullets with no cone and no tracer: the spread values are
+	//per-weapon in the SDK's monster code and every one of them is small
+	//enough that at these ranges it decides misses, not damage - and there is
+	//no hit-group table here to spread damage across anyway.
+	if (dist > mi->range_max)
+		return;
+
+	if (!HLAIVisible(s, eye))
+		return;
+
+	dmg = mi->range_dmg * ToF64(mi->range_bullets);
+
+	HLAIHurt(hl_ai_mon[s].enemy, hl_ai_mon[s].ent, dmg);
+}
+
+//--- tasks ------------------------------------------------------------------
+//
+// schedule.cpp's interpreter. TaskComplete and TaskFail only set a status;
+// RunTask is what notices and moves on, so a task can finish inside its own
+// Start without the dispatcher losing its place.
+
+U0 HLAITaskComplete(I64 s)
+{
+	hl_ai_mon[s].task_status = HLTK_DONE;
+}
+
+U0 HLAITaskFail(I64 s)
+{//a failed task abandons the SCHEDULE, not just itself. The SDK has a
+ //per-schedule failure schedule to fall back on; here the state machine
+ //re-selects from scratch next tick, which lands in the same place for the
+ //schedules that exist.
+	hl_ai_mon[s].task_status = HLTK_FAILED;
+}
+
+U0 HLAISetActivity(I64 s, I64 act)
+{//point the entity at the sequence this monster uses for that activity
+ //
+ //by LABEL through HLAISetSequence, never by index: no two of these models
+ //agree on sequence order, and a die sequence played as an idle is the kind
+ //of wrongness that looks like a renderer bug
+	CHLEntity	*e = HLEntGet(hl_ai_mon[s].ent);
+	U8			*label;
+	I64			 seq;
+	Bool		 loop;
+
+	if (!e)
+		return;
+
+	label = HLAIMonSeqOf(hl_ai_mon[s].kind, act);
+
+	if (!label)
+		return;
+
+	//only the ambulatory and idle activities loop. An attack, a flinch and a
+	//death are one-shots, and HLAIEntityCycle holds a one-shot's last frame
+	loop = ToBool(act == HLACT_IDLE || act == HLACT_WALK || act == HLACT_RUN);
+
+	//already playing it: leave the cycle alone. HLAISetSequence restarts from
+	//anim_start unconditionally - correct for a script replaying a take, wrong
+	//here, where a schedule that re-selects every second would reset the walk
+	//cycle to frame zero every second and the legs would never get going
+	if (loop && e->studio)
+	{
+		seq = HLStudioSeqByName(e->studio, label);
+
+		if (seq >= 0 && seq == e->seq)
+			return;
+	}
+
+	HLAISetSequence(e, label, loop);
+}
+
+Bool HLAIAnimDone(I64 s)
+{//has the current one-shot sequence run out?
+	CHLEntity	*e = HLEntGet(hl_ai_mon[s].ent);
+	F64			 dur;
+
+	if (!e || !e->studio)
+		return TRUE;
+
+	dur = HLStudioSeqDuration(e->studio, e->seq);
+
+	//a sequence with no duration would wait forever
+	if (dur <= 0.0)
+		return TRUE;
+
+	return ToBool(hl_ent_time - e->anim_start >= dur);
+}
+
+U0 HLAIStartTask(I64 s, I64 task, F64 data)
+{//StartTask: the one-off half of a task. Anything that can be decided now is
+ //decided now and the task completes immediately
+	CHLEntity	*e = HLEntGet(hl_ai_mon[s].ent);
+	CHLMonInfo	*mi;
+	F64			 away[3];
+
+	if (!e)
+		return;
+
+	mi = &hl_ai_mon_info[hl_ai_mon[s].kind];
+
+	hl_ai_mon[s].task_status = HLTK_RUNNING;
+	hl_ai_mon[s].task_start  = hl_ent_time;
+
+	switch (task)
+	{
+		case HLTASK_WAIT:
+			break;
+
+		case HLTASK_WAIT_RANDOM:
+			//re-rolled into task_start rather than stored: RunTask compares
+			//against the same data every tick, so shortening the window means
+			//backdating the start
+			hl_ai_mon[s].task_start = hl_ent_time -
+				HLPartRand(1.0) * data * 0.5;
+			break;
+
+		case HLTASK_WAIT_FOR_ANIM:
+			break;
+
+		case HLTASK_SET_ACTIVITY:
+			HLAISetActivity(s, ToI64(data));
+			HLAITaskComplete(s);
+			break;
+
+		case HLTASK_STOP_MOVING:
+			hl_ai_mon[s].have_goal     = FALSE;
+			hl_ai_mon[s].goal_is_enemy = FALSE;
+			hl_ai_mon[s].move_speed    = 0.0;
+			hl_ai_mon[s].stuck_since   = 0.0;
+			HLAITaskComplete(s);
+			break;
+
+		case HLTASK_FACE_ENEMY:
+			break;
+
+		case HLTASK_FACE_GOAL:
+			break;
+
+		case HLTASK_PATH_TO_ENEMY:
+			//TASK_GET_PATH_TO_ENEMY in the SDK asks CGraph for a route and
+			//FAILS when there is none, which is what keeps a monster from
+			//walking at a wall. There is no graph, so this cannot fail and
+			//the monster will walk at the wall. Deliberate, and the single
+			//biggest behavioural difference in this file.
+			if (!hl_ai_mon[s].have_enemy)
+			{
+				HLAITaskFail(s);
+				break;
+			}
+
+			HLVecCopy(hl_ai_mon[s].enemy_pos, hl_ai_mon[s].goal);
+			hl_ai_mon[s].have_goal     = TRUE;
+			hl_ai_mon[s].goal_is_enemy = TRUE;
+			hl_ai_mon[s].path_start    = hl_ent_time;
+			hl_ai_mon[s].stuck_since   = 0.0;
+
+			//stop short of the enemy rather than inside it. Melee reach if it
+			//has one, otherwise just enough not to stand in the same spot
+			hl_ai_mon[s].goal_tol = 48.0;
+
+			if (mi->melee_range > 0.0)
+				hl_ai_mon[s].goal_tol = mi->melee_range * 0.75;
+
+			HLAITaskComplete(s);
+			break;
+
+		case HLTASK_PATH_AWAY:
+			//TASK_FIND_COVER_FROM_ENEMY, with the cover node lookup replaced
+			//by "directly away". Where the SDK picks a node the enemy cannot
+			//see, this picks a straight line, so a fleeing monster runs into
+			//whatever is behind it as often as it gets clear.
+			if (!hl_ai_mon[s].have_enemy)
+			{
+				HLAITaskFail(s);
+				break;
+			}
+
+			HLVecSub(e->origin, hl_ai_mon[s].enemy_pos, away);
+			away[2] = 0.0;
+
+			if (HLVecNormalize(away) <= 0.0)
+			{
+				HLAITaskFail(s);
+				break;
+			}
+
+			HLVecMA(e->origin, data, away, hl_ai_mon[s].goal);
+			hl_ai_mon[s].have_goal     = TRUE;
+			hl_ai_mon[s].goal_is_enemy = FALSE;
+			hl_ai_mon[s].goal_tol      = 32.0;
+			hl_ai_mon[s].path_start    = hl_ent_time;
+			hl_ai_mon[s].stuck_since   = 0.0;
+			HLAITaskComplete(s);
+			break;
+
+		case HLTASK_WALK_PATH:
+			hl_ai_mon[s].move_speed = mi->walk_speed;
+			HLAISetActivity(s, HLACT_WALK);
+			break;
+
+		case HLTASK_RUN_PATH:
+			hl_ai_mon[s].move_speed = mi->run_speed;
+			HLAISetActivity(s, HLACT_RUN);
+			break;
+
+		case HLTASK_MELEE_ATTACK1:
+			hl_ai_mon[s].next_attack = hl_ent_time + mi->attack_rate;
+
+			//no attack sequence in the model: land the hit now rather than
+			//wait on an animation that will never end. RunTask times the hit
+			//off the sequence, so without one there is nothing to time it to
+			if (!HLAIMonSeqOf(hl_ai_mon[s].kind, HLACT_MELEE))
+			{
+				HLAIFireAttack(s, TRUE);
+				HLAITaskComplete(s);
+				break;
+			}
+
+			HLAISetActivity(s, HLACT_MELEE);
+			break;
+
+		case HLTASK_RANGE_ATTACK1:
+			hl_ai_mon[s].next_attack = hl_ent_time + mi->attack_rate;
+
+			if (!HLAIMonSeqOf(hl_ai_mon[s].kind, HLACT_RANGE))
+			{
+				HLAIFireAttack(s, FALSE);
+				HLAITaskComplete(s);
+				break;
+			}
+
+			HLAISetActivity(s, HLACT_RANGE);
+			break;
+
+		case HLTASK_SOUND_ATTACK:
+			HLAIMonSound(s, mi->snd_attack);
+			HLAITaskComplete(s);
+			break;
+
+		case HLTASK_SOUND_ALERT:
+			HLAIMonSound(s, mi->snd_alert);
+			HLAITaskComplete(s);
+			break;
+
+		case HLTASK_SOUND_DIE:
+			HLAIMonSound(s, mi->snd_die);
+			HLAITaskComplete(s);
+			break;
+
+		case HLTASK_DIE:
+			//BecomeDead: out of the damage set, out of the collision set, and
+			//holding the last frame of the die sequence. Neither of the last
+			//two is observable yet - see the file header on collision - but a
+			//corpse that can still be killed would queue HLM_BREAK_DIE again
+			//every time something splashed it.
+			HLAISetActivity(s, HLACT_DIE);
+
+			e->takedamage = HLDMG_TAKE_NO;
+			e->solid      = HLSOLID_NOT;
+			e->movetype   = HLMOVETYPE_NONE;
+			e->health     = 0.0;
+
+			hl_ai_mon[s].have_goal  = FALSE;
+			hl_ai_mon[s].have_enemy = FALSE;
+			break;
+
+		default:
+			HLAITaskComplete(s);
+			break;
+	}
+}
+
+U0 HLAIRunPath(I64 s, F64 dt)
+{//the body of TASK_WALK_PATH and TASK_RUN_PATH, which differ only in the
+ //speed and the activity StartTask already chose. A function rather than two
+ //cases sharing one body, for the reason given in HLAIRunTask.
+	CHLEntity	*e = HLEntGet(hl_ai_mon[s].ent);
+	CHLMonInfo	*mi;
+	F64			 feet[3];
+	F64			 eye[3];
+	F64			 d[3];
+	I64			 res;
+
+	if (!e)
+		return;
+
+	mi = &hl_ai_mon_info[hl_ai_mon[s].kind];
+
+	if (!hl_ai_mon[s].have_goal)
+	{
+		HLAITaskComplete(s);
+		return;
+	}
+
+	//a chase re-aims at the enemy every tick. That is not a route update, it
+	//is the GOAL moving: without it a monster runs at the spot the enemy stood
+	//in when the schedule started. Out of sight it keeps going to the last
+	//known position instead, which is CheckEnemy's m_vecLastKnownPos.
+	if (hl_ai_mon[s].goal_is_enemy && hl_ai_mon[s].have_enemy)
+	{
+		if (hl_ent_time - hl_ai_mon[s].enemy_seen <= HLAI_LOOK_PERIOD * 2.0 &&
+			HLAITargetPos(hl_ai_mon[s].enemy, feet, eye))
+		{
+			HLVecCopy(feet, hl_ai_mon[s].enemy_pos);
+			HLVecCopy(feet, hl_ai_mon[s].goal);
+		}
+		else
+			HLVecCopy(hl_ai_mon[s].enemy_pos, hl_ai_mon[s].goal);
+	}
+
+	//walk facing where you are going. Strafing needs the four-way blends the
+	//studio layer does not do, so a monster always faces its travel direction
+	HLAITurnToward(s, HLAIYawTo(e->origin, hl_ai_mon[s].goal), dt);
+
+	res = HLAIMoveStep(s, hl_ai_mon[s].move_speed, dt);
+
+	if (res == HLAI_MOVE_ARRIVED)
+	{
+		HLAITaskComplete(s);
+		return;
+	}
+
+	if (res == HLAI_MOVE_BLOCKED)
+	{
+		HLAITaskFail(s);
+		return;
+	}
+
+	//an unreachable goal must not hold the schedule forever
+	if (hl_ent_time - hl_ai_mon[s].path_start > HLAI_PATH_TIMEOUT)
+	{
+		HLAITaskFail(s);
+		return;
+	}
+
+	//in melee reach mid-run: stop now, so the attack goes off this tick rather
+	//than after the goal tolerance happens to be met
+	if (mi->melee_range > 0.0 && hl_ai_mon[s].have_enemy)
+	{
+		if (HLAITargetPos(hl_ai_mon[s].enemy, feet, eye))
+		{
+			HLVecSub(feet, e->origin, d);
+
+			if (HLVecLength(d) <= mi->melee_range)
+				HLAITaskComplete(s);
+		}
+	}
+}
+
+U0 HLAIRunTask(I64 s, I64 task, F64 data, F64 dt)
+{//RunTask: the per-tick half. Only the tasks that take time appear here
+	CHLEntity	*e = HLEntGet(hl_ai_mon[s].ent);
+
+	if (!e)
+		return;
+
+	//not `case A: case B:` sharing one body anywhere below: consecutive case
+	//labels are a construct nothing else in this tree exercises, and this file
+	//cannot be compiled to find out. Every case carries its own body.
+	switch (task)
+	{
+		case HLTASK_WAIT:
+			if (hl_ent_time - hl_ai_mon[s].task_start >= data)
+				HLAITaskComplete(s);
+			break;
+
+		case HLTASK_WAIT_RANDOM:
+			if (hl_ent_time - hl_ai_mon[s].task_start >= data)
+				HLAITaskComplete(s);
+			break;
+
+		case HLTASK_WAIT_FOR_ANIM:
+			if (HLAIAnimDone(s))
+				HLAITaskComplete(s);
+			break;
+
+		case HLTASK_FACE_ENEMY:
+			if (!hl_ai_mon[s].have_enemy)
+			{
+				HLAITaskFail(s);
+				break;
+			}
+
+			if (HLAITurnToward(s, HLAIYawTo(e->origin,
+				hl_ai_mon[s].enemy_pos), dt))
+				HLAITaskComplete(s);
+
+			//a monster that cannot reach its ideal yaw would face-lock
+			//forever; the SDK has no such guard because ChangeYaw always
+			//gets there. It does here too, so this is only a backstop
+			if (hl_ent_time - hl_ai_mon[s].task_start > 3.0)
+				HLAITaskComplete(s);
+			break;
+
+		case HLTASK_FACE_GOAL:
+			if (!hl_ai_mon[s].have_goal)
+			{
+				HLAITaskComplete(s);
+				break;
+			}
+
+			if (HLAITurnToward(s, HLAIYawTo(e->origin, hl_ai_mon[s].goal), dt))
+				HLAITaskComplete(s);
+			break;
+
+		case HLTASK_WALK_PATH:
+			HLAIRunPath(s, dt);
+			break;
+
+		case HLTASK_RUN_PATH:
+			HLAIRunPath(s, dt);
+			break;
+
+		case HLTASK_MELEE_ATTACK1:
+			HLAITurnToward(s, HLAIYawTo(e->origin, hl_ai_mon[s].enemy_pos),
+				dt);
+
+			if (HLAIAnimDone(s))
+			{
+				HLAIFireAttack(s, TRUE);
+				HLAITaskComplete(s);
+			}
+			break;
+
+		case HLTASK_RANGE_ATTACK1:
+			HLAITurnToward(s, HLAIYawTo(e->origin, hl_ai_mon[s].enemy_pos),
+				dt);
+
+			if (HLAIAnimDone(s))
+			{
+				HLAIFireAttack(s, FALSE);
+				HLAITaskComplete(s);
+			}
+			break;
+
+		case HLTASK_DIE:
+			//never completes. There is no corpse cleanup and no gib, so the
+			//schedule parks here and the body holds its last frame
+			break;
+
+		default:
+			HLAITaskComplete(s);
+			break;
+	}
+}
+
+U0 HLAISetSchedule(I64 s, I64 sched)
+{//ChangeSchedule: take the list from the top
+	if (sched < 0 || sched >= HLSCHED_COUNT)
+		return;
+
+	hl_ai_mon[s].sched      = sched;
+	hl_ai_mon[s].task       = 0;
+	hl_ai_mon[s].sched_done = FALSE;
+
+	if (!hl_ai_sched_len[sched])
+	{
+		hl_ai_mon[s].sched_done  = TRUE;
+		hl_ai_mon[s].task_status = HLTK_DONE;
+		return;
+	}
+
+	HLAIStartTask(s, hl_ai_sched_task[sched * HLAI_SCHED_TASKS],
+		hl_ai_sched_data[sched * HLAI_SCHED_TASKS]);
+}
+
+U0 HLAIRunSchedule(I64 s, F64 dt)
+{//one tick of the current schedule, advancing through as many tasks as
+ //complete immediately
+	I64 sched = hl_ai_mon[s].sched;
+	I64 slot;
+	I64 budget = HLAI_SCHED_TASKS + 1;
+
+	if (sched <= HLSCHED_NONE || sched >= HLSCHED_COUNT)
+		return;
+
+	while (budget > 0)
+	{
+		budget--;
+
+		if (hl_ai_mon[s].sched_done)
+			return;
+
+		if (hl_ai_mon[s].task >= hl_ai_sched_len[sched])
+		{
+			hl_ai_mon[s].sched_done = TRUE;
+			return;
+		}
+
+		slot = sched * HLAI_SCHED_TASKS + hl_ai_mon[s].task;
+
+		if (hl_ai_mon[s].task_status == HLTK_RUNNING)
+		{
+			HLAIRunTask(s, hl_ai_sched_task[slot], hl_ai_sched_data[slot], dt);
+
+			//still running after its own RunTask: nothing more this tick
+			if (hl_ai_mon[s].task_status == HLTK_RUNNING)
+				return;
+		}
+
+		if (hl_ai_mon[s].task_status == HLTK_FAILED)
+		{
+			//TaskFail abandons the schedule. The selector picks again next
+			//tick, which is where the fail schedule would have gone
+			hl_ai_mon[s].sched      = HLSCHED_NONE;
+			hl_ai_mon[s].sched_done = TRUE;
+			return;
+		}
+
+		//done: next task
+		hl_ai_mon[s].task++;
+
+		if (hl_ai_mon[s].task >= hl_ai_sched_len[sched])
+		{
+			hl_ai_mon[s].sched_done = TRUE;
+			return;
+		}
+
+		slot = sched * HLAI_SCHED_TASKS + hl_ai_mon[s].task;
+
+		HLAIStartTask(s, hl_ai_sched_task[slot], hl_ai_sched_data[slot]);
+	}
+}
+
+//--- the state machine ------------------------------------------------------
+
+U0 HLAISetState(I64 s, I64 state)
+{//SetState. The schedule is dropped, so the selector runs fresh in the new
+ //state rather than finishing something that belonged to the old one
+	if (hl_ai_mon[s].state == state)
+		return;
+
+	hl_ai_mon[s].state      = state;
+	hl_ai_mon[s].sched      = HLSCHED_NONE;
+	hl_ai_mon[s].sched_done = TRUE;
+}
+
+Bool HLAICanMelee(I64 s, F64 dist)
+{//CheckMeleeAttack1: in reach, refire up, and roughly facing
+	CHLMonInfo *mi = &hl_ai_mon_info[hl_ai_mon[s].kind];
+
+	if (mi->melee_range <= 0.0)
+		return FALSE;
+
+	if (dist > mi->melee_range)
+		return FALSE;
+
+	return ToBool(hl_ent_time >= hl_ai_mon[s].next_attack);
+}
+
+Bool HLAICanRange(I64 s, F64 dist)
+{//CheckRangeAttack1: inside the band, refire up, and a clear sight line -
+ //the SDK's version traces from the gun position, this one from the eye
+	CHLMonInfo	*mi = &hl_ai_mon_info[hl_ai_mon[s].kind];
+	F64			 feet[3];
+	F64			 eye[3];
+
+	if (mi->range_max <= 0.0)
+		return FALSE;
+
+	if (dist < mi->range_min || dist > mi->range_max)
+		return FALSE;
+
+	if (hl_ent_time < hl_ai_mon[s].next_attack)
+		return FALSE;
+
+	if (!HLAITargetPos(hl_ai_mon[s].enemy, feet, eye))
+		return FALSE;
+
+	return HLAIVisible(s, eye);
+}
+
+I64 HLAISelectSchedule(I64 s)
+{//CBaseMonster::GetSchedule, per state
+	CHLEntity	*e  = HLEntGet(hl_ai_mon[s].ent);
+	CHLMonInfo	*mi = &hl_ai_mon_info[hl_ai_mon[s].kind];
+	F64			 d[3];
+	F64			 dist;
+
+	if (!e)
+		return HLSCHED_IDLE_STAND;
+
+	if (hl_ai_mon[s].state == HLMSTATE_DEAD)
+		return HLSCHED_DIE;
+
+	if (hl_ai_mon[s].state == HLMSTATE_COMBAT)
+	{
+		if (!hl_ai_mon[s].have_enemy)
+		{
+			HLAISetState(s, HLMSTATE_ALERT);
+			return HLSCHED_ALERT_STAND;
+		}
+
+		HLVecSub(hl_ai_mon[s].enemy_pos, e->origin, d);
+		dist = HLVecLength(d);
+
+		//a monster with nothing to fight with runs. CScientist's
+		//SelectSchedule is this and a stack of talk behaviours
+		if (mi->flees)
+			return HLSCHED_TAKE_COVER;
+
+		if (HLAICanMelee(s, dist))
+			return HLSCHED_MELEE_ATTACK1;
+
+		if (HLAICanRange(s, dist))
+			return HLSCHED_RANGE_ATTACK1;
+
+		//ALREADY close enough, just not ready to swing or shoot: stand and
+		//face rather than chase. Without this the chase schedule restarts
+		//every couple of ticks while the refire runs down, which reads as a
+		//monster running on the spot - and for a ranged monster it is also
+		//what makes barney and the grunts hold a firing line instead of
+		//closing to arm's length.
+		if (hl_ent_time < hl_ai_mon[s].next_attack)
+		{
+			if (mi->melee_range > 0.0 && dist <= mi->melee_range)
+				return HLSCHED_ALERT_FACE;
+
+			if (mi->range_max > 0.0 && dist >= mi->range_min &&
+				dist <= mi->range_max)
+				return HLSCHED_ALERT_FACE;
+		}
+
+		return HLSCHED_CHASE_ENEMY;
+	}
+
+	if (hl_ai_mon[s].state == HLMSTATE_ALERT)
+	{
+		if (hl_ai_mon[s].have_enemy)
+			return HLSCHED_ALERT_FACE;
+
+		return HLSCHED_ALERT_STAND;
+	}
+
+	return HLSCHED_IDLE_STAND;
+}
+
+U0 HLAIMonThink(I64 s, F64 dt)
+{//CBaseMonster::MonsterThink for one monster
+ //
+ //the SDK runs this on a 0.1s think and lets the engine's monster mover
+ //integrate movement in between. There is no such mover here - HLAIMoveStep
+ //IS the movement - so it runs on the server tick instead. Everything it
+ //decides is time-based, so the cadence change costs nothing but smoothness,
+ //which it gains.
+	CHLEntity	*e = HLEntGet(hl_ai_mon[s].ent);
+	CHLMonInfo	*mi;
+
+	if (!e)
+		return;
+
+	mi = &hl_ai_mon_info[hl_ai_mon[s].kind];
+
+	//--- death, first: nothing else applies to a corpse ---
+	if (hl_ai_mon[s].state == HLMSTATE_DEAD)
+	{
+		HLAIRunSchedule(s, dt);
+		return;
+	}
+
+	if (e->health <= 0.0)
+	{
+		hl_ai_mon[s].last_health = 0.0;
+		hl_ai_mon_kills++;
+		HLAISetState(s, HLMSTATE_DEAD);
+		HLAISetSchedule(s, HLSCHED_DIE);
+		return;
+	}
+
+	//--- damage taken since the last tick ---
+	//
+	//there is no hook in HLEntTakeDamage to call - HLEntity.ZC compiles first
+	//- so the drop is DETECTED. bits_COND_LIGHT_DAMAGE in the SDK; here it
+	//flinches and, if it had no enemy, goes alert so it turns around.
+	if (e->health < hl_ai_mon[s].last_health)
+	{
+		hl_ai_mon[s].last_health = e->health;
+
+		if (hl_ai_mon[s].state == HLMSTATE_IDLE)
+			HLAISetState(s, HLMSTATE_ALERT);
+
+		//not while attacking: interrupting an attack with a flinch every tick
+		//of incoming fire means it never lands one
+		if (hl_ai_mon[s].sched != HLSCHED_MELEE_ATTACK1 &&
+			hl_ai_mon[s].sched != HLSCHED_RANGE_ATTACK1 &&
+			hl_ai_mon[s].sched != HLSCHED_SMALL_FLINCH)
+			HLAISetSchedule(s, HLSCHED_SMALL_FLINCH);
+	}
+
+	hl_ai_mon[s].last_health = e->health;
+
+	//--- settle on the floor ---
+	//
+	//DROP_TO_FLOOR, which every CBaseMonster::Spawn does. Mappers place
+	//monsters a few units clear of the ground and nothing integrates gravity
+	//for a STEP entity here, so without this they hover for the whole level.
+	if (!hl_ai_mon[s].settled)
+	{
+		hl_ai_mon[s].settled = TRUE;
+
+		if (HLAIDropToFloor(e, e->origin, e->origin))
+			HLEntSetAbsBox(e);
+	}
+
+	//--- sensing ---
+	if (hl_ent_time >= hl_ai_mon[s].next_look)
+	{
+		hl_ai_mon[s].next_look = hl_ent_time + HLAI_LOOK_PERIOD;
+		HLAILook(s);
+	}
+
+	if (hl_ai_mon[s].have_enemy)
+	{
+		//lost it. CheckEnemy drops m_hEnemy after this long with no sight
+		//line, which is what stops a monster staring at a wall forever
+		if (hl_ent_time - hl_ai_mon[s].enemy_seen > HLAI_LOSE_ENEMY)
+		{
+			hl_ai_mon[s].have_enemy = FALSE;
+
+			if (hl_ai_mon[s].state == HLMSTATE_COMBAT)
+				HLAISetState(s, HLMSTATE_ALERT);
+		}
+		else if (hl_ai_mon[s].state != HLMSTATE_COMBAT)
+		{
+			//first sight: the wake-up beat, then combat
+			HLAISetState(s, HLMSTATE_COMBAT);
+			HLAISetSchedule(s, HLSCHED_WAKE_ANGRY);
+		}
+	}
+
+	//--- idle noises ---
+	//
+	//HL calls IdleSound on a random schedule inside the idle schedules. Doing
+	//it here rather than as a task keeps it out of the way of combat, where
+	//the attack and alert lines are the ones that matter
+	if (hl_ai_mon[s].state != HLMSTATE_COMBAT && mi->snd_idle[0])
+	{
+		if (hl_ent_time >= hl_ai_mon[s].next_idle_snd)
+		{
+			HLAIMonSound(s, mi->snd_idle);
+			hl_ai_mon[s].next_idle_snd = hl_ent_time + HLAI_IDLE_SND_MIN +
+				ToF64(HLPartRandI(HLAI_IDLE_SND_RANGE));
+		}
+	}
+
+	//--- schedule ---
+	if (hl_ai_mon[s].sched == HLSCHED_NONE || hl_ai_mon[s].sched_done)
+		HLAISetSchedule(s, HLAISelectSchedule(s));
+
+	HLAIRunSchedule(s, dt);
+}
+
+U0 HLAIMonsterFrame(F64 dt)
+{//every tracked monster, one tick
+	CHLEntity	*e;
+	I64			 s;
+	I64			 i;
+
+	HLAIMonSync;
+
+	if (!hl_ai_mon_count || !hl_map)
+		return;
+
+	//--- who is under script control this tick ---
+	//
+	//a scripted_sequence owns its actor while it runs, and HLAIScriptStart
+	//has already placed it and set its sequence. The AI must not fight that,
+	//so MONSTERSTATE_SCRIPT here means exactly "hands off".
+	for (i = 0; i < hl_ai_mon_count; i++)
+		hl_ai_mon[i].scripted = FALSE;
+
+	for (i = 0; i < hl_num_entities; i++)
+	{
+		e = &hl_entities[i];
+
+		if (!e->in_use || e->ent_class != HLC_SCRIPT)
+			goto qamf_next_script;
+
+		if (e->toggle_state != HLTS_GOING_UP)
+			goto qamf_next_script;
+
+		if (e->owner < 0 || e->owner >= HLENT_MAX)
+			goto qamf_next_script;
+
+		s = hl_ai_mon_of[e->owner];
+
+		if (s >= 0)
+			hl_ai_mon[s].scripted = TRUE;
+
+qamf_next_script:
+	}
+
+	//--- think ---
+	for (i = 0; i < hl_ai_mon_count; i++)
+	{
+		if (hl_ai_mon[i].ent < 0)
+			goto qamf_next;
+
+		e = HLEntGet(hl_ai_mon[i].ent);
+
+		if (!e)
+		{
+			//the entity system removed it. HLEntTakeDamage queues
+			//HLM_BREAK_DIE and HLBreakableDie clears in_use - right for glass,
+			//wrong for a monster, and that call is in HLEntity.ZC where it
+			//cannot be changed from here. Put the corpse back, inert, so it
+			//falls over instead of blinking out.
+			if (!hl_ai_mon_revive || hl_ai_mon[i].state == HLMSTATE_DEAD)
+				goto qamf_next;
+
+			if (hl_ai_mon[i].ent >= hl_num_entities)
+				goto qamf_next;
+
+			e = &hl_entities[hl_ai_mon[i].ent];
+
+			e->in_use     = TRUE;
+			e->solid      = HLSOLID_NOT;
+			e->movetype   = HLMOVETYPE_NONE;
+			e->takedamage = HLDMG_TAKE_NO;
+			e->think_fn   = HLM_NONE;
+			e->next_think = 0.0;
+			e->health     = 0.0;
+		}
+
+		if (hl_ai_mon[i].scripted)
+		{
+			//while scripted, keep the state readable but do nothing. The
+			//script's own end restores an idle sequence, and the selector
+			//takes over from there because the schedule was dropped.
+			HLAISetState(i, HLMSTATE_SCRIPT);
+			goto qamf_next;
+		}
+
+		if (hl_ai_mon[i].state == HLMSTATE_SCRIPT)
+			HLAISetState(i, HLMSTATE_IDLE);
+
+		if (hl_ai_mon[i].state == HLMSTATE_NONE)
+			HLAISetState(i, HLMSTATE_IDLE);
+
+		HLAIMonThink(i, dt);
+
+qamf_next:
+	}
+}
+
+U0 HLAIMonReport()
+{//what the AI thinks is going on. The fastest way to tell "no monsters
+ //registered" from "registered and idle", which look identical on screen
+	CHLEntity	*e;
+	I64			 i;
+
+	"HLAI: %d monsters tracked, %d dead\n", hl_ai_mon_count, hl_ai_mon_kills;
+
+	for (i = 0; i < hl_ai_mon_count; i++)
+	{
+		e = HLEntGet(hl_ai_mon[i].ent);
+
+		if (!e)
+			goto qamrp_next;
+
+		"  %-24s state %d sched %d task %d hp %6.1f enemy %d\n",
+			e->classname, hl_ai_mon[i].state, hl_ai_mon[i].sched,
+			hl_ai_mon[i].task, e->health, hl_ai_mon[i].enemy;
+
+qamrp_next:
+	}
+}
+
 //--- the frame --------------------------------------------------------------
 
 U0 HLAIFrame(F64 dt)
-{//drive every script and keep idle monsters animating
+{//drive every script, keep idle props animating, then tick the monsters
  //
  //this SCANS rather than being scheduled: HLEntity.ZC's dispatcher cannot call
  //into this file (single pass), so a triggered script only sets toggle_state
@@ -584,9 +3092,13 @@ U0 HLAIFrame(F64 dt)
 			goto qaif_next;
 		}
 
-		//a monster nothing has scripted plays its own first sequence - that is
-		//what makes a room of scientists look alive rather than frozen
-		if (e->studio && e->anim_start == 0.0)
+		//a studio prop nothing has scripted plays its own first sequence -
+		//that is what makes a room look alive rather than frozen.
+		//
+		//MONSTERS are excluded: HLAIMonsterFrame below owns their sequence,
+		//and leaving this to seed anim_start would race the state machine for
+		//the first tick after a spawn
+		if (e->studio && e->anim_start == 0.0 && e->ent_class != HLC_MONSTER)
 		{
 			e->anim_start = hl_ent_time;
 			e->anim_loop  = TRUE;
@@ -594,4 +3106,9 @@ U0 HLAIFrame(F64 dt)
 
 qaif_next:
 	}
+
+	//AFTER the script pass: a script that started or finished this tick has
+	//already claimed or released its actor, so HLAIMonsterFrame sees the
+	//settled ownership rather than last tick's
+	HLAIMonsterFrame(dt);
 }
