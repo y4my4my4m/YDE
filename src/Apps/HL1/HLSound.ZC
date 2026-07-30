@@ -1648,6 +1648,111 @@ I64 HLSndLoopHold(I64 handle, I64 held_pitch, U8 *name, F64 *origin,
 	return AudioSFXPlayRef(s->frames + first, count, rate, vol_l, vol_r, TRUE);
 }
 
+//--- func_rotating fan loop -------------------------------------------------
+//
+// CFuncRotating::RampPitchVol, dlls/bmodels.cpp:540. The running noise tracks
+// the brush's angular speed: pitch from FANPITCHMIN at rest to FANPITCHMAX at
+// full speed, volume from silence to the entity's Volume key, both linear in
+// the ratio of current to target angular speed. SpinDown reaching zero sends
+// SND_STOP.
+//
+// Held as one voice, as CHAN_STATIC is. The caller keeps the handle and the
+// pitch it was started at, one pair per entity, exactly as the tracktrain does.
+
+//dlls/bmodels.cpp:536-537
+#define HLFAN_PITCH_MIN		30
+#define HLFAN_PITCH_MAX		100
+
+I64 HLSndFanPitch(F64 fpct)
+{//RampPitchVol's fpitch. fpct is current over target angular speed
+	I64 pitch;
+
+	if (fpct < 0.0)
+		fpct = 0.0;
+	if (fpct > 1.0)
+		fpct = 1.0;
+
+	pitch = ToI64(HLFAN_PITCH_MIN +
+		(HLFAN_PITCH_MAX - HLFAN_PITCH_MIN) * fpct);
+
+	//Deviation: RampPitchVol substitutes PITCH_NORM-1 for PITCH_NORM, because
+	//PITCH_NORM is the wire's "no pitch shift" value and would be dropped by
+	//SND_CHANGE_PITCH. Nothing here goes over a wire, and 99 quantises down a
+	//whole loop-pitch step where 100 does not, so a fan at full speed plays at
+	//its recorded rate.
+	return pitch;
+}
+
+U0 HLSndFanStop(I64 *handle, I64 *held_pitch)
+{//SND_STOP at the end of SpinDown, dlls/bmodels.cpp:632
+	if (!handle)
+		return;
+
+	HLSndLoopStop(*handle);
+	*handle = -1;
+
+	if (held_pitch)
+		*held_pitch = 0;
+}
+
+U0 HLSndFanLoop(I64 *handle, I64 *held_pitch, U8 *name, F64 *origin,
+	F64 volume, F64 attenuation, F64 cur_speed, F64 target_speed)
+{//One tick of the fan's running noise. handle and held_pitch are the caller's
+ //per-entity state; pass -1 and 0 before the first call.
+ //
+ //cur_speed is the magnitude of the brush's angular velocity and target_speed
+ //the magnitude of its speed key. movedir on a func_rotating is a unit axis, so
+ //|movedir * speed| is |speed| and RampPitchVol's component picking collapses
+ //to these two magnitudes.
+ //
+ //Deviation: the pitch is quantised to steps of 10 by HLSndLoopHold, so a
+ //spin-up crosses 8 pitch steps and each one restarts the voice. A continuous
+ //sweep is not expressible - the mixer fixes a voice's resample step at start.
+ //Volume is continuous; the held voice is re-aimed, not restarted, for it.
+	F64	fpct;
+	F64	vol;
+	I64	pitch;
+	I64	got;
+
+	if (!handle || !held_pitch)
+		return;
+
+	if (target_speed <= 0.0)
+	{
+		HLSndFanStop(handle, held_pitch);
+		return;
+	}
+
+	fpct = cur_speed / target_speed;
+
+	if (fpct < 0.0)
+		fpct = 0.0;
+	if (fpct > 1.0)
+		fpct = 1.0;
+
+	//"slowdown volume ramps down to 0". The spinup branch is commented out in
+	//the SDK, so both directions use the same ramp.
+	vol = volume * fpct;
+
+	//a stopped fan holds no voice
+	if (vol <= 0.0)
+	{
+		HLSndFanStop(handle, held_pitch);
+		return;
+	}
+
+	pitch = HLSndFanPitch(fpct);
+
+	//through a temporary: a store into a dereference from the return of a call
+	//is the shape that loses the store on this compiler
+	got = HLSndLoopHold(*handle, *held_pitch, name, origin, vol,
+			attenuation, pitch);
+	*handle = got;
+
+	got = HLSndLoopPitchQuant(pitch);
+	*held_pitch = got;
+}
+
 //--- looping ambient sounds ------------------------------------------------
 //
 // ambientsound() places a permanent looping source: wind, water, torches. The
@@ -1710,6 +1815,12 @@ class CHLAmbient
 	Bool active;
 	Bool looping;
 
+	//m_fActive is cleared the moment a source is switched off, but RampThink
+	//keeps emitting while spindown or fadeout runs. active here doubles as the
+	//re-trigger gate, so the tail is held apart: active stays set through the
+	//ramp down and fading distinguishes the two states
+	Bool fading;
+
 	//m_dpv. Absent from the entity's keys, the whole block stays inert and
 	//volume above is used as it was
 	Bool dyn;
@@ -1731,6 +1842,10 @@ class CHLAmbient
 
 	//running state
 	I64	 pitch;
+	//the pitch actually issued this round. RampThink sends the LFO's output
+	//without writing it back into m_dpv, so an LFO with no envelope would
+	//otherwise random-walk m_dpv.pitch to its rail
+	I64	 send_pitch;
 	I64	 vol;
 	I64	 pitchfrac;
 	I64	 volfrac;
@@ -1907,8 +2022,10 @@ U0 HLSndAmbientAdd(F64 *origin, U8 *name, F64 volume, F64 attenuation)
 	//no modulation keys: the whole m_dpv block stays inert and pitch is normal
 	a->active      = TRUE;
 	a->looping     = TRUE;
+	a->fading      = FALSE;
 	a->dyn         = FALSE;
 	a->pitch       = HLPITCH_NORM;
+	a->send_pitch  = HLPITCH_NORM;
 	a->vol         = 100;
 	a->preset      = 0;
 	a->pitchrun    = HLPITCH_NORM;
@@ -2114,6 +2231,8 @@ I64 HLSndAmbientAddEx(F64 *origin, U8 *name, F64 attenuation, I64 preset,
 		a->pitch == HLPITCH_NORM)
 		a->pitch = HLPITCH_NORM + 1;
 
+	a->send_pitch = a->pitch;
+
 	vol0 = ToF64(a->vol) * 0.01;
 	if (vol0 > 1.0)
 		vol0 = 1.0;
@@ -2123,6 +2242,7 @@ I64 HLSndAmbientAddEx(F64 *origin, U8 *name, F64 attenuation, I64 preset,
 	//AMBIENT_SOUND_START_SILENT waits for a trigger, and a non-looping ambient
 	//is never marked active by Precache
 	a->active = looping && !start_silent;
+	a->fading = FALSE;
 
 	return slot;
 }
@@ -2178,6 +2298,7 @@ U0 HLSndAmbientRamp(F64 now)
 				a->pitch  = a->pitchstart;
 				a->spindown = 0;
 				a->active = FALSE;
+				a->fading = FALSE;
 				goto qar_next;
 			}
 
@@ -2208,6 +2329,7 @@ U0 HLSndAmbientRamp(F64 now)
 				a->vol     = a->volstart;
 				a->fadeout = 0;
 				a->active  = FALSE;
+				a->fading  = FALSE;
 				goto qar_next;
 			}
 
@@ -2276,8 +2398,11 @@ U0 HLSndAmbientRamp(F64 now)
 
 		//the LFO's output is not written back into m_dpv: it modulates the
 		//value sent this round only, around the envelope's own level
-		a->pitch  = pitch;
-		a->volume = ToF64(vol) * 0.01;
+		if (pitch == HLPITCH_NORM)
+			pitch = HLPITCH_NORM + 1;	//"don't send 'no pitch' !"
+
+		a->send_pitch = pitch;
+		a->volume     = ToF64(vol) * 0.01;
 
 qar_next:
 	}
@@ -2286,7 +2411,8 @@ qar_next:
 U0 HLSndAmbientToggle(I64 slot, Bool on, F64 now)
 {//CAmbientGeneric::ToggleUse. A looping source tracks whether it is playing; a
  //one-shot is retriggered and never marked active
-	CHLAmbient *a;
+	CHLAmbient	*a;
+	I64			 pitchinc;
 
 	if (slot < 0 || slot >= hl_ambient_count)
 		return;
@@ -2295,9 +2421,50 @@ U0 HLSndAmbientToggle(I64 slot, Bool on, F64 now)
 
 	if (!on)
 	{
+		//cspinup: switching a source off steps its running pitch one notch
+		//higher instead of stopping it, until the notches are used up
+		if (a->cspinup)
+		{
+			if (a->cspincount <= a->cspinup)
+			{
+				a->cspincount++;
+
+				pitchinc = (255 - a->pitchstart) / a->cspinup;
+
+				a->spinup   = a->spinupsav;
+				a->spindown = 0;
+
+				a->pitchrun = a->pitchstart + pitchinc * a->cspincount;
+				if (a->pitchrun > 255)
+					a->pitchrun = 255;
+
+				a->ramp_next = now;
+			}
+
+			return;
+		}
+
+		//a source with a spindown or fadeout keeps sounding through the ramp;
+		//the ramp clears active when it reaches bottom
+		if (a->spindownsav || a->fadeoutsav)
+		{
+			a->spindown = a->spindownsav;
+			a->spinup   = 0;
+
+			a->fadeout  = a->fadeoutsav;
+			a->fadein   = 0;
+
+			a->fading    = TRUE;
+			a->ramp_next = now;
+			return;
+		}
+
 		a->active = FALSE;
+		a->fading = FALSE;
 		return;
 	}
+
+	a->fading = FALSE;
 
 	//a restart runs the fadein and spinup envelopes again from their saved
 	//values, which is what makes a machine audibly wind up
@@ -2320,6 +2487,7 @@ U0 HLSndAmbientToggle(I64 slot, Bool on, F64 now)
 	if (a->pitch == 0)
 		a->pitch = HLPITCH_NORM;
 
+	a->send_pitch = a->pitch;
 	a->pitchfrac = a->pitch << 8;
 	a->volfrac   = a->vol << 8;
 	a->ramp_next = now;
@@ -2328,16 +2496,17 @@ U0 HLSndAmbientToggle(I64 slot, Bool on, F64 now)
 	if (a->dyn)
 		a->volume = ToF64(a->vol) * 0.01;
 
-	//cspinup: each trigger steps the running pitch one notch higher
+	//InitModulationParms' tail: the LFO restarts from phase zero and forwards
+	a->lfofrac = 0;
+	if (a->lforate < 0)
+		a->lforate = -a->lforate;
+
+	//cspinup counts from the first notch again
+	a->cspincount = 1;
+
 	if (a->cspinup)
 	{
-		a->cspincount++;
-
-		if (a->cspincount > a->cspinup)
-			a->cspincount = a->cspinup;
-
-		a->pitchrun = a->pitchstart +
-			(255 - a->pitchstart) * a->cspincount / a->cspinup;
+		a->pitchrun = a->pitchstart + (255 - a->pitchstart) / a->cspinup;
 
 		if (a->pitchrun > 255)
 			a->pitchrun = 255;
@@ -2365,6 +2534,8 @@ U0 HLSndAmbientSetPitch(I64 slot, F64 fraction)
 
 	if (hl_ambient[slot].pitch < 1)
 		hl_ambient[slot].pitch = 1;
+
+	hl_ambient[slot].send_pitch = hl_ambient[slot].pitch;
 }
 
 I64 HLSndAmbientFind(U8 *name, F64 *origin)
@@ -2388,6 +2559,29 @@ qsaf_next:
 	}
 
 	return -1;
+}
+
+Bool HLSndAmbientActive(I64 slot)
+{//m_fActive: TRUE while a looping source is sounding.
+ //
+ //The toggle state a source with a modulation block must be read through.
+ //HLSndAmbientRemove drops the slot from the table and takes the whole
+ //dynpitchvol_t with it, so a dyn source is switched off with
+ //HLSndAmbientToggle and stays registered.
+	if (slot < 0 || slot >= hl_ambient_count)
+		return FALSE;
+
+	//a source ramping down has already been switched off; only its tail is left
+	return hl_ambient[slot].active && !hl_ambient[slot].fading;
+}
+
+I64 HLSndAmbientPitch(I64 slot)
+{//the pitch the envelopes and LFO have arrived at, for a one-shot issued
+ //outside the ambient table
+	if (slot < 0 || slot >= hl_ambient_count)
+		return HLPITCH_NORM;
+
+	return hl_ambient[slot].send_pitch;
 }
 
 U0 HLSndAmbientRemove(U8 *name, F64 *origin)
@@ -2472,8 +2666,12 @@ qa_next:
 
 		//each source has its own entnum on a fixed channel, so a re-trigger
 		//replaces its own previous instance instead of stacking
+		//send_pitch, not pitch: the LFO's modulation lives there and the
+		//envelope's own level in pitch. A re-issue is the only place pitch can
+		//change - the mixer fixes a voice's resample step at start - so the
+		//modulation is sampled once per loop period, no faster.
 		HLSndPlayAt(a->name, a->origin, a->volume, a->attenuation,
-			-(best + 1), 1, a->pitch);
+			-(best + 1), 1, a->send_pitch);
 
 		//a non-looping ambient_generic sounds once per trigger
 		if (!a->looping)

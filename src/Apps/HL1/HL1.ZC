@@ -90,14 +90,89 @@ U0 HLDrawIt(CTask *task, CDC *dc)
 	//art and palette.
 }
 
+//--- deferred translucent pass ----------------------------------------------
+//
+// A translucent brush face and an entity sprite both read the framebuffer and
+// neither writes depth, so both have to be submitted after every opaque
+// surface in the frame - world, brush entities, alias and studio models.
+// Nothing behind them is available to blend against otherwise.
+//
+// Sorted back to front among themselves. Two windows down one corridor overlap
+// on screen; drawn near-first the far one composites over the near one and the
+// corridor reads inside out. The world pass has no such need - it is depth
+// tested and opaque.
+#define HLTRANS_MAX	256
+
+I64	hl_trans_ent[HLTRANS_MAX];
+F64	hl_trans_key[HLTRANS_MAX];
+I64	hl_trans_count;
+
+U0 HLTransCenter(CHLEntity *e, F64 *out)
+{//the point a deferred entity sorts on
+ //
+ //A brush entity's origin key is (0,0,0) unless the map gave it one, and most
+ //glass is a func_wall or func_illusionary that did not, so the submodel's
+ //bounding box centre is the only usable point. Point entities carry a real
+ //origin.
+	CHLModel *m;
+
+	if (e->brush_model > 0 && e->brush_model < hl_map->num_models)
+	{
+		m = &hl_map->models[e->brush_model];
+
+		out[0] = e->origin[0] + (m->mins[0] + m->maxs[0]) * 0.5;
+		out[1] = e->origin[1] + (m->mins[1] + m->maxs[1]) * 0.5;
+		out[2] = e->origin[2] + (m->mins[2] + m->maxs[2]) * 0.5;
+		return;
+	}
+
+	HLVecCopy(e->origin, out);
+}
+
+U0 HLTransAdd(I64 index, F64 *center)
+{//insert one deferred entity, farthest first
+ //
+ //Insertion sort. The list runs to tens of entries on the heaviest map and is
+ //near sorted frame to frame, so the shift rarely moves anything. Distance is
+ //kept squared; the ordering is the same and there is no root per entity.
+	F64	d[3];
+	F64	key;
+	I64	i;
+
+	if (hl_trans_count >= HLTRANS_MAX)
+		return;
+
+	HLVecSub(center, hl_view, d);
+	key = HLVecDot(d, d);
+
+	i = hl_trans_count;
+
+	while (i > 0 && hl_trans_key[i - 1] < key)
+	{
+		hl_trans_ent[i] = hl_trans_ent[i - 1];
+		hl_trans_key[i] = hl_trans_key[i - 1];
+		i--;
+	}
+
+	hl_trans_ent[i] = index;
+	hl_trans_key[i] = key;
+	hl_trans_count++;
+}
+
 U0 HLRenderEntities()
-{//brush models first, then alias. Depth tested, so order affects speed only.
+{//Three passes: opaque brush models, then alias and studio, then everything
+ //that reads the framebuffer. The first two are depth tested and opaque, so
+ //order within them affects speed only.
 	CHLEntity *e;
 	F64		  dist[3];
+	F64		  center[3];
 	F64		  cycle;
 	I64		  i;
+	I64		  amt;
+	I64		  frame;
 
-	hl_ent_drawn = 0;
+	hl_ent_drawn   = 0;
+	hl_trans_count = 0;
 
 	//Model 0 is the world itself and is already drawn by the PVS path.
 	for (i = 0; i < hl_num_entities; i++)
@@ -115,16 +190,34 @@ U0 HLRenderEntities()
 
 		if (e->brush_model > 0)
 		{
+			//rendermode/renderamt go through raw: HLDrawFace normalises the
+			//modes it has no blend for and rejects renderamt 0 itself.
+			if (HLRenderTranslucent(e->rendermode))
+			{
+				HLTransCenter(e, center);
+				HLTransAdd(i, center);
+				goto qde_next_brush;
+			}
+
 			//Same registry the trace uses, so draw and collide agree.
 			//e->angles is not a valid signal: HLTrainNext writes yaw into
 			//angles[1] every frame as bookkeeping.
 			if (HLClipIsRotatingDraw(i))
 				HLDrawBrushModel(hl_canvas, hl_map, e->brush_model,
-					e->origin, e->frame, e->angles);
+					e->origin, e->frame, e->angles,
+					e->rendermode, ToI64(e->renderamt));
 			else
 				HLDrawBrushModel(hl_canvas, hl_map, e->brush_model,
-					e->origin, e->frame);
+					e->origin, e->frame, NULL,
+					e->rendermode, ToI64(e->renderamt));
 			hl_ent_drawn++;
+		}
+		else if (e->ent_class == HLC_SPRITE && e->spr && e->visible)
+		{
+			//env_sprite, env_glow, cycler_sprite. Part of the 3D view and
+			//blended, so they ride the deferred pass with the glass.
+			HLTransCenter(e, center);
+			HLTransAdd(i, center);
 		}
 
 qde_next_brush:
@@ -166,6 +259,36 @@ qde_next_brush:
 		hl_ent_drawn++;
 
 qde_next:
+	}
+
+	//Deferred pass, back to front. Every surface here reads the framebuffer and
+	//writes no depth.
+	for (i = 0; i < hl_trans_count; i++)
+	{
+		e = &hl_entities[hl_trans_ent[i]];
+
+		amt = ClampI64(ToI64(e->renderamt), 0, 255);
+
+		if (e->ent_class == HLC_SPRITE)
+		{
+			//CSprite::AnimateThink runs off pev->framerate. No per-entity
+			//frame clock exists, so the render clock drives the cycle.
+			frame = 0;
+
+			if (e->spr->num_frames > 1 && e->framerate > 0.0)
+				frame = ToI64(tS * e->framerate) % e->spr->num_frames;
+
+			HLSprDrawEntity(hl_canvas, e->spr, frame, e->origin, e->angles,
+				HLEntLightPoint(hl_map, e), e->rendermode, amt, e->scale);
+		}
+		else if (HLClipIsRotatingDraw(hl_trans_ent[i]))
+			HLDrawBrushModel(hl_canvas, hl_map, e->brush_model,
+				e->origin, e->frame, e->angles, e->rendermode, amt);
+		else
+			HLDrawBrushModel(hl_canvas, hl_map, e->brush_model,
+				e->origin, e->frame, NULL, e->rendermode, amt);
+
+		hl_ent_drawn++;
 	}
 }
 
@@ -1820,7 +1943,7 @@ U0 HLRenderFrame()
 			HLBiDrawBeams(hl_canvas, tS);
 		}
 		else
-			HLRenderEntities;
+			HLRenderEntities();
 	}
 
 	//env_beam and env_laser, after the world and entity passes. Additive and
