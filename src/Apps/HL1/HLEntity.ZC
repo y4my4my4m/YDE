@@ -2038,6 +2038,11 @@ U0 HLTrainNext(I64 self)
 		e->yaw_delta += dyaw;
 	}
 
+	//"m_flWait = pTarg->GetDelay()", plats.cpp:775, where CPathCorner::GetDelay
+	//returns its own wait key (cbase.h:548). Carried on the train because Wait
+	//runs a move later, by which time the corner is no longer resolvable
+	e->wait = corner->wait;
+
 	if (corner->wait > 0.0)
 	{
 		//pause at this corner before leaving
@@ -2049,7 +2054,7 @@ U0 HLTrainNext(I64 self)
 }
 
 U0 HLTrainWait(I64 self)
-{//parked at a corner with a wait - resume after it
+{//CFuncTrain::Wait, plats.cpp:728. Parked at a corner - resume after its wait
 	CHLEntity *e = HLEntGet(self);
 
 	if (!e)
@@ -2057,7 +2062,10 @@ U0 HLTrainWait(I64 self)
 
 	HLVecSet(e->velocity, 0.0, 0.0, 0.0);
 
-	HLEntSetThink(e, HLM_TRAIN_NEXT, hl_ent_time + 1.0);
+	//HLTrainNext stored the arrived-at corner's wait here. A zero means
+	//"Next() right now"; the entity clock cannot dispatch at exactly now, so
+	//the next think does it
+	HLEntSetThink(e, HLM_TRAIN_NEXT, hl_ent_time + e->wait);
 }
 
 U0 HLTrainUse(I64 self)
@@ -3097,14 +3105,17 @@ U0 HLRenderUse(I64 self)
 
 //--- env_sprite / env_glow / env_beam / env_laser ---------------------------
 //
-// All four are either showing or not. The toggle is here; the drawing is
-// HL1.ZC's, which walks the entity list - see CHLEntity.spr and
-// CHLEntity.visible.
+// All four are either showing or not, and the toggle is here.
+//
+// Beams draw: HLEntDrawBeams at the end of this file walks the entity list and
+// calls HLDrawBeam per active one. env_sprite and env_glow do not - no caller
+// of HLSprDrawModel exists anywhere in the tree - so e->visible on a sprite
+// still drives nothing but its own removal.
 #define HLSF_SPRITE_STARTON		1
 #define HLSF_SPRITE_ONCE			2
 
 //effects.h's SF_BEAM_*. The three texture bits (SHADEIN, SHADEOUT, DECALS) are
-//recognised and unused - there is no beam renderer to shade
+//recognised and unused: HLDrawBeam shades the ribbon uniformly
 #define HLSF_BEAM_STARTON		1
 #define HLSF_BEAM_TOGGLE			2
 #define HLSF_BEAM_RANDOM			4
@@ -3898,8 +3909,9 @@ U0 HLBeamDamageThink(I64 self)
 // 1050 of the 1925 infodecals in the shipped maps. A name outside it resolves
 // to -1 and the entity is dropped, as CDecal::KeyValue does on a miss
 // (world.cpp:191).
-
-#define HLSF_DECAL_NOTINDEATHMATCH	2048
+//
+// SF_DECAL_NOTINDEATHMATCH gates a decal on gpGlobals->deathmatch. This port is
+// single-player, so the bit never applies.
 
 I64 HLDecalIndexByName(U8 *name)
 {//DECAL_INDEX. The map spells the name with the masked-texture prefix and in
@@ -4017,6 +4029,339 @@ U0 HLCDAudioRadiusThink(I64 self)
 	}
 
 	HLEntSetThink(e, HLM_CDAUDIO_RADIUS, hl_ent_time + 0.5);
+}
+
+//--- monstermaker -----------------------------------------------------------
+//
+// CMonsterMaker, dlls/monstermaker.cpp:33. 331 makers across 52 shipped maps.
+//
+// Its three own keys - monstertype, monstercount, m_imaxlivechildren - are not
+// in the generic key table, so the entity lump is re-scanned for maker blocks
+// the way HLEntParseMultiManagers re-scans for multi_manager ones. The rest of
+// the state (live count, ground plane, active flag) has no CHLEntity field
+// either and lives beside it.
+//
+// Children are allocated above hl_num_entities, which the parse pass leaves as
+// the parsed count while the table itself is HLENT_MAX slots wide and zeroed by
+// CAlloc (HLEnt.ZC:792). Growing the count is what makes HLAIMonSync notice a
+// new monster.
+//
+// Deviations from the SDK, both forced:
+//
+//   DeathNotice is a callback the child fires at its owner. Nothing here calls
+//   it, so the live count is recounted from the entity table on each think
+//   instead. Same result, one scan per maker per delay.
+//
+//   SF_MONSTER_FALL_TO_GROUND is an engine drop the child gets on spawn. There
+//   is none here, so the child is placed on the traced ground plane directly.
+
+#define HLSF_MAKER_START_ON		1
+#define HLSF_MAKER_CYCLIC		4
+
+//SF_MONSTERMAKER_MONSTERCLIP passes SF_MONSTER_HITMONSTERCLIP to the child.
+//func_monsterclip is inert here, so the bit is recognised and unused
+#define HLSF_MAKER_MONSTERCLIP	8
+
+//makers per map. c3a1, the busiest, has 33. Headroom for children comes out of
+//HLENT_MAX: the fullest single-player map parses 719 entities against 1024
+#define HLMAKER_MAX	64
+
+class CHLMonsterMaker
+{
+	I64		ent;				//owning entity index
+	U8		monster[64];		//monstertype, a monster_* classname
+	I64		num_monsters;		//m_cNumMonsters, what is left to make
+	I64		max_live;			//m_iMaxLiveChildren, 0 = no ceiling
+	I64		live;				//m_cLiveChildren
+	F64		ground;				//m_flGround, 0 until the first make traces it
+	Bool	active;				//m_fActive
+};
+
+CHLMonsterMaker	hl_maker[HLMAKER_MAX];
+I64				hl_maker_count = 0;
+I64				hl_maker_made  = 0;		//children spawned this map, for the report
+
+U0 HLMakerReset()
+{//globals are not zeroed and this table is walked by name lookup
+	I64 i;
+
+	for (i = 0; i < HLMAKER_MAX; i++)
+	{
+		hl_maker[i].ent          = -1;
+		hl_maker[i].monster[0]   = 0;
+		hl_maker[i].num_monsters = 0;
+		hl_maker[i].max_live     = 0;
+		hl_maker[i].live         = 0;
+		hl_maker[i].ground       = 0.0;
+		hl_maker[i].active       = FALSE;
+	}
+
+	hl_maker_count = 0;
+	hl_maker_made  = 0;
+}
+
+I64 HLMakerFind(I64 ent)
+{
+	I64 i;
+
+	for (i = 0; i < hl_maker_count; i++)
+	{
+		if (hl_maker[i].ent == ent)
+			return i;
+	}
+
+	return -1;
+}
+
+I64 HLMakerCountLive(I64 owner)
+{//DeathNotice's decrement, recovered by counting. A child keeps its slot and
+ //its owner after it dies; health at or below zero is what HLAI reads as dead
+	I64 n = 0;
+	I64 i;
+
+	for (i = 0; i < hl_num_entities; i++)
+	{
+		if (hl_entities[i].in_use && hl_entities[i].owner == owner &&
+			hl_entities[i].ent_class == HLC_MONSTER &&
+			hl_entities[i].health > 0.0)
+			n++;
+	}
+
+	return n;
+}
+
+Bool HLMakerBoxClear(CHLEntity *e, F64 ground)
+{//"don't build a stack of monsters", monstermaker.cpp:176-183. A 68 unit square
+ //column from the ground up to the maker, tested against monsters and the player
+	F64	mins[3];
+	F64	maxs[3];
+	I64	i;
+
+	HLVecSet(mins, e->origin[0] - 34.0, e->origin[1] - 34.0, ground);
+	HLVecSet(maxs, e->origin[0] + 34.0, e->origin[1] + 34.0, e->origin[2]);
+
+	if (!hl_ent_player_dead &&
+		hl_ent_player_org[0] + 16.0 > mins[0] &&
+		hl_ent_player_org[0] - 16.0 < maxs[0] &&
+		hl_ent_player_org[1] + 16.0 > mins[1] &&
+		hl_ent_player_org[1] - 16.0 < maxs[1] &&
+		hl_ent_player_org[2] + 72.0 > mins[2] &&
+		hl_ent_player_org[2] < maxs[2])
+		return FALSE;
+
+	for (i = 0; i < hl_num_entities; i++)
+	{
+		if (!hl_entities[i].in_use ||
+			hl_entities[i].ent_class != HLC_MONSTER ||
+			hl_entities[i].health <= 0.0)
+			goto qmbc_next;
+
+		if (hl_entities[i].absmax[0] > mins[0] &&
+			hl_entities[i].absmin[0] < maxs[0] &&
+			hl_entities[i].absmax[1] > mins[1] &&
+			hl_entities[i].absmin[1] < maxs[1] &&
+			hl_entities[i].absmax[2] > mins[2] &&
+			hl_entities[i].absmin[2] < maxs[2])
+			return FALSE;
+
+qmbc_next:
+	}
+
+	return TRUE;
+}
+
+U0 HLMakerMakeMonster(I64 self)
+{//CMonsterMaker::MakeMonster, monstermaker.cpp:158
+	CHLEntity	*e = HLEntGet(self);
+	CHLEntity	*c;
+	CHLTrace	 tr;
+	U8			*path;
+	F64			 down[3];
+	I64			 mk;
+	I64			 child;
+	I64			 n;
+
+	if (!e)
+		return;
+
+	mk = HLMakerFind(self);
+
+	if (mk < 0)
+		return;
+
+	//CREATE_NAMED_ENTITY takes any class; the child path here is the monster
+	//spawn only. Two makers in the shipped maps name ammo_357 instead
+	if (StrNICompare(hl_maker[mk].monster, "monster_", 8))
+		return;
+
+	if (hl_maker[mk].max_live > 0)
+	{
+		hl_maker[mk].live = HLMakerCountLive(self);
+
+		if (hl_maker[mk].live >= hl_maker[mk].max_live)
+			return;
+	}
+
+	//"set altitude. Now that I'm activated, any breakables, etc should be out
+	//from under me", monstermaker.cpp:168-173. Traced once and kept
+	if (hl_maker[mk].ground == 0.0 && hl_map)
+	{
+		HLVecSet(down, e->origin[0], e->origin[1], e->origin[2] - 2048.0);
+		HLTraceMove(hl_map, e->origin, down, &tr);
+		hl_maker[mk].ground = tr.end_pos[2];
+	}
+
+	if (!HLMakerBoxClear(e, hl_maker[mk].ground))
+		return;
+
+	if (hl_num_entities >= HLENT_MAX)
+		return;
+
+	child = hl_num_entities;
+	c     = &hl_entities[child];
+
+	//a slot above the parsed count has never been written: HLEnt.ZC CAllocs the
+	//whole HLENT_MAX table on every map load, so everything not set here is
+	//already zero. Only the members whose resting value is not zero are listed
+	HLStrCopy(c->classname, hl_maker[mk].monster, 64);
+
+	c->brush_model      = -1;
+	c->owner            = self;
+	c->activator        = -1;
+	c->beam_start       = -1;
+	c->beam_end         = -1;
+	c->light_style      = -1;
+	c->light_valid      = FALSE;
+	c->anim_event_frame = -1;
+	c->anim_loop        = TRUE;
+	c->framerate        = 10.0;
+	c->scale            = 1.0;
+	c->volume           = 1.0;
+	c->modifier         = 100.0;
+	c->blood_color      = 247;
+	c->text_x           = -1.0;
+	c->text_y           = -1.0;
+	c->trigger_mode     = HLUSE_TOGGLE;
+	c->toggle_state     = HLTS_AT_BOTTOM;
+
+	HLVecCopy(e->origin, c->origin);
+	HLVecCopy(e->angles, c->angles);
+
+	//no engine drop for SF_MONSTER_FALL_TO_GROUND: stand the child on the plane
+	//the altitude trace already found
+	if (hl_maker[mk].ground != 0.0)
+		c->origin[2] = hl_maker[mk].ground;
+
+	//"if I have a netname (overloaded), give the child monster that name as a
+	//targetname", monstermaker.cpp:210
+	if (e->netname[0])
+		HLStrCopy(c->targetname, e->netname, 64);
+
+	//the parts of the monster_ spawn branch a child needs. That branch is in
+	//HLEntSpawnClass, which compiles after this function, so it cannot be
+	//called; HLAIMonRegisterAll overwrites the hull and health per kind
+	c->movetype   = HLMOVETYPE_STEP;
+	c->solid      = HLSOLID_SLIDEBOX;
+	c->ent_class  = HLC_MONSTER;
+	c->takedamage = HLDMG_TAKE_YES;
+	c->health     = 20.0;
+	c->spawned    = TRUE;
+	c->in_use     = TRUE;
+
+	HLVecSet(c->mins, -16.0, -16.0, 0.0);
+	HLVecSet(c->maxs, 16.0, 16.0, 72.0);
+	HLEntSetAbsBox(c);
+
+	//UTIL_PrecacheOther's model. A child with none is scenery to
+	//HLAIMonRegisterAll and never gets an AI slot
+	path = HLEntModelForClass(c->classname);
+
+	if (path)
+	{
+		c->studio = HLStudioCacheGet(path);
+
+		if (c->studio)
+			HLEntInitBoneControllers(c);
+	}
+
+	//the count moves last: HLAIMonSync registers on the change and must not see
+	//a half-built slot
+	hl_num_entities++;
+	hl_maker_made++;
+
+	//"delay already overloaded for this entity, so can't call SUB_UseTargets",
+	//monstermaker.cpp:196-200
+	if (e->target[0])
+		HLEntFireTargetsNamed(e->target, self, self, HLUSE_TOGGLE, 0.0);
+
+	hl_maker[mk].live++;
+
+	if (hl_maker[mk].num_monsters > 0)
+	{
+		n = hl_maker[mk].num_monsters - 1;
+		hl_maker[mk].num_monsters = n;
+
+		//"Disable this forever. Don't kill it because it still gets death
+		//notices", monstermaker.cpp:219
+		if (n == 0)
+		{
+			hl_maker[mk].active = FALSE;
+			e->use_fn   = HLM_NONE;
+			e->think_fn = HLM_NONE;
+			e->next_think = 0.0;
+		}
+	}
+}
+
+U0 HLMakerThink(I64 self)
+{//CMonsterMaker::MakerThink, monstermaker.cpp:270
+	CHLEntity *e = HLEntGet(self);
+
+	if (!e)
+		return;
+
+	HLEntSetThink(e, HLM_MAKER_THINK, hl_ent_time + e->delay);
+
+	HLMakerMakeMonster(self);
+}
+
+U0 HLMakerUse(I64 self, I64 use_type)
+{//CyclicUse drops one child per fire, monstermaker.cpp:241. ToggleUse flips the
+ //think on and off, monstermaker.cpp:249
+	CHLEntity	*e = HLEntGet(self);
+	I64			 mk;
+
+	if (!e)
+		return;
+
+	mk = HLMakerFind(self);
+
+	if (mk < 0)
+		return;
+
+	if (e->spawnflags & HLSF_MAKER_CYCLIC)
+	{
+		HLMakerMakeMonster(self);
+		return;
+	}
+
+	//ShouldToggle: an explicit ON or OFF that matches the current state is a
+	//no-op, and only a TOGGLE flips
+	if (use_type == HLUSE_ON && hl_maker[mk].active)
+		return;
+
+	if (use_type == HLUSE_OFF && !hl_maker[mk].active)
+		return;
+
+	if (hl_maker[mk].active)
+	{
+		hl_maker[mk].active = FALSE;
+		HLEntSetThink(e, HLM_NONE, 0.0);
+		return;
+	}
+
+	hl_maker[mk].active = TRUE;
+	HLEntSetThink(e, HLM_MAKER_THINK, hl_ent_time);
 }
 
 //--- env_global -------------------------------------------------------------
@@ -4532,6 +4877,8 @@ U0 HLEntCallMethod(I64 self, I64 method, I64 activator = -1,
 		case HLM_DECAL_USE:			HLDecalPlace(self);				break;
 		case HLM_CDAUDIO_PLAY:		HLCDAudioPlay(self);			break;
 		case HLM_CDAUDIO_RADIUS:	HLCDAudioRadiusThink(self);		break;
+		case HLM_MAKER_USE:			HLMakerUse(self, use_type);		break;
+		case HLM_MAKER_THINK:		HLMakerThink(self);				break;
 
 		case HLM_SENTENCE_USE:
 			//scripted_sentence lives in HLAI.ZC, which owns the sentence
@@ -5305,7 +5652,8 @@ U0 HLEntSpawnDeadMonster(CHLEntity *e)
 
 I64 HLEntSpawnOne(CHLMap *map, I64 i)
 {//returns 1 if the classname was recognised
-	CHLEntity *e = &hl_entities[i];
+	CHLEntity	*e = &hl_entities[i];
+	I64			 slot;
 
 	if (e->spawned)
 		return 0;
@@ -5861,10 +6209,8 @@ I64 HLEntSpawnOne(CHLMap *map, I64 i)
 	{
 		//speech without a sequence. HLAI.ZC owns the sentence scheduler and
 		//compiles after this file, so this only posts the request, with the same
-		//GOING_DOWN convention as scripted_sequence.
-		//
-		//Inert until HLAIFrame grows a HLC_SENTENCE branch calling
-		//HLAISentenceStart with ai_sentence.
+		//GOING_DOWN convention as scripted_sequence. HLAIFrame picks it up at
+		//its HLC_SENTENCE branch, HLAI.ZC:8259.
 		e->movetype     = HLMOVETYPE_NONE;
 		e->solid        = HLSOLID_NOT;
 		e->ent_class    = HLC_SENTENCE;
@@ -6037,6 +6383,46 @@ I64 HLEntSpawnOne(CHLMap *map, I64 i)
 		!StrCompare(e->classname, "info_node_air"))
 		return 1;
 
+	//--- monstermaker ---
+	if (!StrCompare(e->classname, "monstermaker"))
+	{
+		//CMonsterMaker::Spawn, dlls/monstermaker.cpp:103
+		e->movetype = HLMOVETYPE_NONE;
+		e->solid    = HLSOLID_NOT;
+		e->effects  = e->effects | HLEF_NODRAW;
+
+		slot = HLMakerFind(i);
+
+		//no monstertype, or the block scan overflowed: nothing to make
+		if (slot < 0)
+			return 1;
+
+		//the spawn pass runs at time zero and the think loop reads a next_think
+		//of zero as disarmed, so a maker with no delay key needs a floor. Every
+		//monstermaker in the shipped maps carries delay 1 or more
+		if (e->delay <= 0.0)
+			e->delay = 0.1;
+
+		if (e->targetname[0])
+		{
+			e->use_fn = HLM_MAKER_USE;
+
+			if (e->spawnflags & HLSF_MAKER_START_ON)
+			{
+				hl_maker[slot].active = TRUE;
+				HLEntSetThink(e, HLM_MAKER_THINK, hl_ent_time + e->delay);
+			}
+		}
+		else
+		{
+			//"no targetname, just start"
+			hl_maker[slot].active = TRUE;
+			HLEntSetThink(e, HLM_MAKER_THINK, hl_ent_time + e->delay);
+		}
+
+		return 1;
+	}
+
 	//--- infodecal ---
 	if (!StrCompare(e->classname, "infodecal"))
 	{
@@ -6055,8 +6441,11 @@ I64 HLEntSpawnOne(CHLMap *map, I64 i)
 			return 1;
 		}
 
+		//"the decal will spray itself on as soon as the world is done
+		//spawning", world.cpp:127. Not at hl_ent_time: the spawn pass runs at
+		//time zero and the think loop treats a next_think of zero as disarmed
 		if (!e->targetname[0])
-			HLEntSetThink(e, HLM_DECAL_THINK, hl_ent_time);
+			HLEntSetThink(e, HLM_DECAL_THINK, hl_ent_time + 0.1);
 		else
 			e->use_fn = HLM_DECAL_USE;
 
@@ -6345,6 +6734,145 @@ qpmm_next_char:
 	}
 }
 
+U0 HLEntParseMakers(CHLMap *map)
+{//monstertype, monstercount and m_imaxlivechildren are CMonsterMaker's own
+ //keys and are not in the generic field table, so the lump is re-scanned for
+ //monstermaker blocks. Same scan and same block-to-entity binding as
+ //HLEntParseMultiManagers above - read the notes there
+	U8	*p;
+	U8	*end;
+	U8	 key[64];
+	U8	 val[64];
+	U8	 name[64];
+	U8	 monster[64];
+	I64	 k;
+	I64	 slot;
+	I64	 ent;
+	I64	 n;
+	I64	 block;
+	I64	 seen;
+	I64	 count;
+	I64	 max_live;
+
+	HLMakerReset;
+	block = 0;
+
+	if (!map->entities || map->entities_size <= 0)
+		return;
+
+	p   = map->entities;
+	end = map->entities + map->entities_size;
+
+	while (p < end && hl_maker_count < HLMAKER_MAX)
+	{
+		if (*p != '{')
+			goto qpmk_next_char;
+
+		p++;
+		name[0]    = 0;
+		monster[0] = 0;
+		count      = 0;
+		max_live   = 0;
+
+		while (p < end && *p != '}')
+		{
+			while (p < end && *p != '"' && *p != '}')
+				p++;
+			if (p >= end || *p == '}')
+				break;
+
+			p++;
+			k = 0;
+			while (p < end && *p != '"')
+			{
+				if (k < 63)
+				{
+					key[k] = *p;
+					k++;
+				}
+
+				p++;
+			}
+			key[k] = 0;
+			if (p < end)
+				p++;
+
+			while (p < end && *p != '"' && *p != '}')
+				p++;
+			if (p >= end || *p == '}')
+				break;
+
+			p++;
+			k = 0;
+			while (p < end && *p != '"')
+			{
+				if (k < 63)
+				{
+					val[k] = *p;
+					k++;
+				}
+
+				p++;
+			}
+			val[k] = 0;
+			if (p < end)
+				p++;
+
+			if (!StrCompare(key, "classname"))
+				HLStrCopy(name, val, 64);
+			else if (!StrCompare(key, "monstertype"))
+				HLStrCopy(monster, val, 64);
+			else if (!StrCompare(key, "monstercount"))
+				count = ToI64(HLAtoF(val));
+			else if (!StrCompare(key, "m_imaxlivechildren"))
+				max_live = ToI64(HLAtoF(val));
+		}
+
+		if (!StrCompare(name, "monstermaker"))
+		{
+			ent  = -1;
+			seen = 0;
+
+			for (n = 0; n < hl_num_entities; n++)
+			{
+				if (StrCompare(hl_entities[n].classname, "monstermaker"))
+					goto qpmk_next_ent;
+
+				if (seen == block)
+				{
+					ent = n;
+					break;
+				}
+
+				seen++;
+
+qpmk_next_ent:
+			}
+
+			block++;
+
+			if (ent >= 0 && monster[0])
+			{
+				slot = hl_maker_count;
+
+				hl_maker[slot].ent          = ent;
+				HLStrCopy(hl_maker[slot].monster, monster, 64);
+				hl_maker[slot].num_monsters = count;
+				hl_maker[slot].max_live     = max_live;
+				hl_maker[slot].live         = 0;
+				hl_maker[slot].ground       = 0.0;
+				hl_maker[slot].active       = FALSE;
+
+				hl_maker_count++;
+			}
+		}
+
+qpmk_next_char:
+		if (p < end)
+			p++;
+	}
+}
+
 //Bounded trace of the first entity events after a map loads, written to the
 //log. A scripted opening either fires or it does not, and the console is the
 //only place that can be observed from inside the VM.
@@ -6435,6 +6963,9 @@ I64 HLEntSpawnAll(CHLMap *map)
 	hl_ent_title_misses = 0;
 
 	HLEntParseMultiManagers(map);
+
+	//monstermaker keys, on the same terms and before the spawn pass reads them
+	HLEntParseMakers(map);
 
 	for (i = 0; i < hl_num_entities; i++)
 	{
@@ -7158,6 +7689,10 @@ qer_next:
 
 	"HLEnt: %d rotating brushes, %d sprites, %d items\n",
 		rotating, sprites, items;
+
+	if (hl_maker_count)
+		"HLEnt: %d monstermakers, %d children spawned\n",
+			hl_maker_count, hl_maker_made;
 
 	if (unknown)
 		"HLEnt: %d classnames not recognised (inert)\n", unknown;
