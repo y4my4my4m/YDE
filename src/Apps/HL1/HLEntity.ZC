@@ -158,6 +158,12 @@
 //multi_manager fires up to this many targets, each at its own offset
 #define HLENT_MM_MAX			16
 
+//concurrent cycles one SF_MULTIMAN_THREAD manager may have in flight. The SDK
+//is unbounded - ManagerUse clones a whole entity per use, triggers.cpp:432 -
+//and this is not; a use with every run busy displaces the oldest. 1098
+//multi_managers ship across 109 maps, 19 of them threaded across 8 maps
+#define HLENT_MM_THREADS		4
+
 //ATTN_NORM, common/const.h:628. Attenuation divides sound_nominal_clip_dist
 //1000, so 0.8 is silence at 1250 units and 0 means "audible everywhere".
 //Every user of this constant is an ATTN_NORM site in the SDK.
@@ -185,8 +191,13 @@ class CHLMultiManager
 	U8	name[HLENT_MM_MAX * 64];
 	F64	delay[HLENT_MM_MAX];
 	I64	count;
-	I64	fired;					//how many have gone off this cycle
-	F64	started;
+
+	//one entry per concurrent cycle. started < 0 marks a free run; an unthreaded
+	//manager only ever uses run 0. This is the whole of what CMultiManager::Clone
+	//duplicates that is not shared - m_index and m_startTime - since the target
+	//list and delays are copied verbatim and the class has no other mutable state
+	I64	fired[HLENT_MM_THREADS];	//bit per target already fired in this run
+	F64	started[HLENT_MM_THREADS];
 };
 
 CHLMultiManager	hl_mm[32];
@@ -404,6 +415,11 @@ F64		hl_ent_suit_update;		//m_flSuitUpdate, 0 = the queue is idle
 U8		hl_ent_suitnr[HLENT_SUITNR_MAX * HLENT_SUITNAME];
 F64		hl_ent_suitnr_time[HLENT_SUITNR_MAX];
 
+//GEIGERDELAY, player.cpp:2361. m_flgeigerDelay: the next entity-clock time the
+//range is re-measured
+#define HLENT_GEIGER_DELAY	0.25
+F64		hl_ent_geiger_delay;
+
 U0 HLEntSuitQueueReset()
 {//SetSuitUpdate(NULL): empty the playlist. The norepeat list goes with it,
  //since its times are on the entity clock and a new map restarts that
@@ -555,6 +571,11 @@ U0 HLEntPlayerReset()
 	hl_ent_respawn_pending = FALSE;
 
 	HLEntSuitQueueReset;
+
+	//m_flgeigerRange starts at its no-source value; the counter is silent until
+	//a scan lowers it
+	hl_hud_geiger_range   = 1000.0;
+	hl_ent_geiger_delay   = 0.0;
 
 	HLVecSet(hl_ent_respawn_org, 0.0, 0.0, 0.0);
 	HLVecSet(hl_ent_respawn_ang, 0.0, 0.0, 0.0);
@@ -814,17 +835,95 @@ U0 HLEntSuitGroup(U8 *group)
 	HLEntSuitUpdate(group, 0.0);
 }
 
+U0 HLEntUpdateGeigerCounter()
+{//CBasePlayer::UpdateGeigerCounter (player.cpp:2363) and
+ //CTriggerHurt::RadiationThink (triggers.cpp:838) collapsed into one scan.
+ //
+ //The SDK splits the measurement: every radiation trigger_hurt runs its own
+ //0.25s think that lowers m_flgeigerRange when it is nearer than the current
+ //value, and the player's own 0.25s tick raises it back to 1000 one time in
+ //four. That min-with-decay reconstructs "nearest source" from N independent
+ //writers. One writer scanning all of them gives the same answer directly, and
+ //without the up-to-four-tick lag before the range recovers on leaving a pool.
+ //
+ //Range is centre to centre: the trigger's absbox centre against the player's,
+ //triggers.cpp:877-878. Units are world units, 1000 meaning "no source".
+ //
+ //FIND_CLIENT_IN_PVS (triggers.cpp:862) is not reproduced. It is a visibility
+ //gate on a warning whose whole purpose is to sound before the pool is in
+ //sight; honouring it silences the counter the moment the player rounds a
+ //corner toward the source, which is when it should be loudest.
+ //
+ //SF_TRIGGER_HURT_START_OFF is not consulted, matching the SDK: Spawn clears
+ //solid but leaves RadiationThink scheduled, so a switched-off volume still
+ //ranges. in_use is the only gate, since a removed entity loses its think
+	F64	 nearest = 1000.0;
+	F64	 pc[3];
+	F64	 tc[3];
+	F64	 d[3];
+	F64	 range;
+	I64	 i;
+	I64	 j;
+
+	if (hl_ent_time < hl_ent_geiger_delay)
+		return;
+
+	hl_ent_geiger_delay = hl_ent_time + HLENT_GEIGER_DELAY;
+
+	if (!hl_entities)
+	{
+		hl_hud_geiger_range = 1000.0;
+		return;
+	}
+
+	//the player has no entity slot and so no absbox; its centre comes from the
+	//live hull, which is the ducked one while ducked
+	for (j = 0; j < 3; j++)
+		pc[j] = hl_ent_player_org[j] +
+			(hl_player_mins[j] + hl_player_maxs[j]) * 0.5;
+
+	for (i = 0; i < hl_num_entities; i++)
+	{
+		if (!hl_entities[i].in_use)
+			goto qeug_next;
+
+		if (!(hl_entities[i].damage_type & HLDMG_RADIATION))
+			goto qeug_next;
+
+		if (StrCompare(hl_entities[i].classname, "trigger_hurt"))
+			goto qeug_next;
+
+		for (j = 0; j < 3; j++)
+		{
+			tc[j] = (hl_entities[i].absmin[j] + hl_entities[i].absmax[j]) * 0.5;
+			d[j]  = tc[j] - pc[j];
+		}
+
+		range = HLVecLength(d);
+
+		if (range < nearest)
+			nearest = range;
+
+qeug_next:
+	}
+
+	hl_hud_geiger_range = nearest;
+}
+
 U0 HLEntCheckSuitUpdate()
 {//CBasePlayer::CheckSuitUpdate, dlls/player.cpp:2403, run from PostThink.
  //One line per call, at most one every SUITUPDATETIME.
- //
- //The geiger counter half is absent: nothing here carries a radiation source
 	U8	*slot;
 	I64	 search;
 	I64	 i;
 
 	if (!hl_ent_player_suit)
 		return;
+
+	//player.cpp:2409-2414: no suit means no geiger, and the geiger runs on its
+	//own cadence ahead of the suit's timer. Placing it after the timer test
+	//would gate a 0.25s measurement on a 3.5s voice queue
+	HLEntUpdateGeigerCounter;
 
 	if (hl_ent_suit_update <= 0.0 || hl_ent_time < hl_ent_suit_update)
 		return;
@@ -3555,6 +3654,10 @@ U0 HLTriggerToggleUse(I64 self)
 // key/values whose keys are the target names, so the generic key parser cannot
 // pick them up and they are re-scanned here
 
+//SF_MULTIMAN_THREAD, triggers.cpp:261. SF_MULTIMAN_CLONE (0x80000000) has no
+//counterpart: a clone is a run slot here, not an entity, and needs no marker
+#define HLSF_MULTIMAN_THREAD	1
+
 I64 HLMMFind(I64 ent)
 {
 	I64 i;
@@ -3569,33 +3672,11 @@ I64 HLMMFind(I64 ent)
 }
 
 U0 HLMMUse(I64 self, I64 activator)
-{
+{//CMultiManager::ManagerUse, triggers.cpp:429
 	CHLEntity	*e = HLEntGet(self);
 	I64			 m;
-
-	if (!e)
-		return;
-
-	m = HLMMFind(self);
-	if (m < 0)
-		return;
-
-	//re-triggering mid-cycle restarts it, matching CMultiManager::Use with
-	//no SF_MULTIMAN_THREAD
-	hl_mm[m].fired   = 0;
-	hl_mm[m].started = hl_ent_time;
-	e->activator     = activator;
-
-	HLEntSetThink(e, HLM_MULTI_MANAGER_TICK, hl_ent_time);
-}
-
-U0 HLMMTick(I64 self)
-{//walk the schedule, firing everything whose offset has come due
-	CHLEntity	*e = HLEntGet(self);
-	I64			 m;
-	I64			 t;
-	F64			 elapsed;
-	F64			 soonest = -1.0;
+	I64			 r;
+	I64			 oldest;
 	I64			 i;
 
 	if (!e)
@@ -3605,39 +3686,122 @@ U0 HLMMTick(I64 self)
 	if (m < 0)
 		return;
 
-	elapsed = hl_ent_time - hl_mm[m].started;
-
-	for (i = 0; i < hl_mm[m].count; i++)
+	if (e->spawnflags & HLSF_MULTIMAN_THREAD)
 	{
-		if (hl_mm[m].fired & (1 << i))
-			goto qmmt_next;
+		//"In multiplayer games, clone the MM and execute in the clone (like a
+		//thread) to allow multiple players to trigger the same multimanager".
+		//Take a free run; with all four busy the oldest is displaced, which is
+		//where this stops matching an unbounded clone chain
+		r      = -1;
+		oldest = 0;
 
-		if (hl_mm[m].delay[i] > elapsed)
+		for (i = 0; i < HLENT_MM_THREADS; i++)
 		{
-			//track the next one due so the think can be scheduled exactly
-			if (soonest < 0.0 || hl_mm[m].delay[i] < soonest)
-				soonest = hl_mm[m].delay[i];
+			if (r < 0 && hl_mm[m].started[i] < 0.0)
+				r = i;
 
-			goto qmmt_next;
+			if (hl_mm[m].started[i] < hl_mm[m].started[oldest])
+				oldest = i;
 		}
 
-		hl_mm[m].fired |= 1 << i;
+		if (r < 0)
+			r = oldest;
+	}
+	else
+	{
+		//"SetUse( NULL ); // disable use until all targets have fired",
+		//triggers.cpp:449. A use arriving mid-cycle is dropped. ManagerThink
+		//restores the use only once m_index has reached m_cTargets
+		if (hl_mm[m].started[0] >= 0.0)
+			return;
 
-		t = HLEntFindByTargetname(&hl_mm[m].name[i * 64], 0);
+		r = 0;
+	}
 
-		while (t >= 0)
+	hl_mm[m].fired[r]   = 0;
+	hl_mm[m].started[r] = hl_ent_time;
+
+	//one activator for the entity, where a clone carries its own m_hActivator.
+	//Concurrent runs started by different activators all fire under the last
+	//one. Single player has one activator, so the two agree there
+	e->activator        = activator;
+
+	HLEntSetThink(e, HLM_MULTI_MANAGER_TICK, hl_ent_time);
+}
+
+U0 HLMMTick(I64 self)
+{//CMultiManager::ManagerThink, triggers.cpp:387. Walks every run in flight,
+ //firing everything whose offset has come due
+	CHLEntity	*e = HLEntGet(self);
+	I64			 m;
+	I64			 t;
+	I64			 all;
+	F64			 elapsed;
+	F64			 due;
+	F64			 soonest = -1.0;
+	I64			 r;
+	I64			 i;
+
+	if (!e)
+		return;
+
+	m = HLMMFind(self);
+	if (m < 0)
+		return;
+
+	//every target fired, as a mask over count bits
+	all = (1 << hl_mm[m].count) - 1;
+
+	for (r = 0; r < HLENT_MM_THREADS; r++)
+	{
+		if (hl_mm[m].started[r] < 0.0)
+			goto qmmt_next_run;
+
+		elapsed = hl_ent_time - hl_mm[m].started[r];
+
+		for (i = 0; i < hl_mm[m].count; i++)
 		{
-			if (t != self && hl_entities[t].use_fn)
+			if (hl_mm[m].fired[r] & (1 << i))
+				goto qmmt_next;
+
+			if (hl_mm[m].delay[i] > elapsed)
 			{
-				hl_entities[t].activator = e->activator;
-				HLEntQueueCall(t, hl_entities[t].use_fn, e->activator,
-					HLUSE_TOGGLE, 0.0, self);
+				//track the next one due so the think can be scheduled exactly.
+				//Absolute, not an offset: two runs started at different times
+				//have no common origin to compare offsets against
+				due = hl_mm[m].started[r] + hl_mm[m].delay[i];
+
+				if (soonest < 0.0 || due < soonest)
+					soonest = due;
+
+				goto qmmt_next;
 			}
 
-			t = HLEntFindByTargetname(&hl_mm[m].name[i * 64], t + 1);
-		}
+			hl_mm[m].fired[r] |= 1 << i;
+
+			t = HLEntFindByTargetname(&hl_mm[m].name[i * 64], 0);
+
+			while (t >= 0)
+			{
+				if (t != self && hl_entities[t].use_fn)
+				{
+					hl_entities[t].activator = e->activator;
+					HLEntQueueCall(t, hl_entities[t].use_fn, e->activator,
+						HLUSE_TOGGLE, 0.0, self);
+				}
+
+				t = HLEntFindByTargetname(&hl_mm[m].name[i * 64], t + 1);
+			}
 
 qmmt_next:
+		}
+
+		//"if ( m_index >= m_cTargets )". UTIL_Remove of a spent clone and the
+		//SetUse that re-arms an original are the same act on a run: free it
+		if (hl_mm[m].fired[r] == all)
+			hl_mm[m].started[r] = -1.0;
+
+qmmt_next_run:
 	}
 
 	if (soonest < 0.0)
@@ -3646,8 +3810,7 @@ qmmt_next:
 		return;
 	}
 
-	HLEntSetThink(e, HLM_MULTI_MANAGER_TICK,
-		hl_mm[m].started + soonest);
+	HLEntSetThink(e, HLM_MULTI_MANAGER_TICK, soonest);
 }
 
 //--- lights -----------------------------------------------------------------
@@ -5378,16 +5541,19 @@ U0 HLGameTextUse(I64 self)
 {//game_text's message is the text, escapes unprocessed - a literal backslash
  //then n, which HLHudMsgDraw breaks on.
  //
- //Drawn white: CHLEntity has no colour pair for it. HLEnt.ZC's "color" key is
- //claimed by env_blood's selector and "color2" is not parsed at all, so both
- //would have to be added there before this can honour them.
+ //effect is 0. m_textParms.effect (maprules.cpp:271) selects flicker or
+ //writeout over the plain fade; HLHudMsgShow stores the value in hl_msg_effect
+ //and no draw path reads it, so all three render alike
 	CHLEntity *e = HLEntGet(self);
 
 	if (!e)
 		return;
 
 	HLHudMsgShow(e->message, 0, e->text_x, e->text_y,
-		255, 255, 255, 255, 255, 255,
+		ToI64(e->text_color[0]), ToI64(e->text_color[1]),
+		ToI64(e->text_color[2]),
+		ToI64(e->text_color2[0]), ToI64(e->text_color2[1]),
+		ToI64(e->text_color2[2]),
 		e->fade_in, e->fade_out, e->hold_time, 0.25);
 }
 
@@ -6794,6 +6960,30 @@ U0 HLGlobalUse(I64 self, I64 use_type)
 // A failed pickup leaves the item in the world: a medkit walked over at full
 // health stays for later.
 
+//gSkillData, gamerules.cpp:287-290. The four amounts that vary with difficulty.
+//HLSkillApply in HLGame.ZC overwrites them from valve/skill.cfg at map load;
+//the figures here are the skill 1 fallback and stand if the file is missing.
+//30 is the deathmatch suit charger, multiplay_gamerules.cpp:139.
+//
+//Globals, not defines, because HLGame.ZC compiles after this file and can only
+//push. Assigned by HLEntSkillDefaults below, since a declaration initialiser on
+//a global does not run in this compiler
+F64		hl_ent_healthkit;		//sk_healthkit,      skill.cfg:344
+F64		hl_ent_battery;			//sk_battery,        skill.cfg:336
+F64		hl_ent_charge_health;	//sk_healthcharger,  skill.cfg:340
+F64		hl_ent_charge_armor;	//sk_suitcharger,    skill.cfg:332
+
+U0 HLEntSkillDefaults()
+{//run once at build time, not per map: HLSkillApply pushes over these at map
+ //load and a per-map reset here would undo it
+	hl_ent_healthkit     = 15.0;
+	hl_ent_battery       = 15.0;
+	hl_ent_charge_health = 50.0;
+	hl_ent_charge_armor  = 75.0;
+}
+
+HLEntSkillDefaults;
+
 U0 HLItemTouch(I64 self)
 {
 	CHLEntity	*e = HLEntGet(self);
@@ -6804,10 +6994,10 @@ U0 HLItemTouch(I64 self)
 
 	if (!StrICompare(e->classname, "item_healthkit"))
 	{
-		//gSkillData.healthkitCapacity, skill 1
+		//gSkillData.healthkitCapacity, healthkit.cpp:76
 		if (hl_ent_player_health < HLENT_MAX_HEALTH)
 		{
-			hl_ent_player_health += 15.0;
+			hl_ent_player_health += hl_ent_healthkit;
 
 			if (hl_ent_player_health > HLENT_MAX_HEALTH)
 				hl_ent_player_health = HLENT_MAX_HEALTH;
@@ -6825,8 +7015,8 @@ U0 HLItemTouch(I64 self)
 		//the battery stays on the floor for after item_suit
 		if (hl_ent_player_armor < HLENT_MAX_ARMOR && hl_ent_player_suit)
 		{
-			//gSkillData.batteryCapacity, sk_battery1, skill.cfg:336
-			hl_ent_player_armor += 15.0;
+			//gSkillData.batteryCapacity, items.cpp:231
+			hl_ent_player_armor += hl_ent_battery;
 
 			if (hl_ent_player_armor > HLENT_MAX_ARMOR)
 				hl_ent_player_armor = HLENT_MAX_ARMOR;
@@ -6911,10 +7101,9 @@ U0 HLItemTouch(I64 self)
 // later; one that delivers a held key drains for as long as it is held.
 //
 // The range test stands in for the SDK's trace to the charger.
-//gSkillData, gamerules.cpp:287 and :289, read from valve/skill.cfg at skill 1.
-//30 is the deathmatch suit charger, multiplay_gamerules.cpp:139
-#define HLENT_CHARGE_HEALTH		50.0	//sk_healthcharger1, skill.cfg:340
-#define HLENT_CHARGE_ARMOR		75.0	//sk_suitcharger1, skill.cfg:332
+//
+// The two pool sizes are hl_ent_charge_health and hl_ent_charge_armor, above
+// HLItemTouch: they vary with difficulty and so cannot be defines.
 #define HLENT_CHARGE_STEP		0.1		//seconds between points
 #define HLENT_CHARGE_RANGE		72.0	//how far you can stand and still charge
 
@@ -8495,10 +8684,12 @@ U0 HLEntSpawnCharger(CHLMap *map, CHLEntity *e, Bool health)
 	e->ent_class = HLC_CHARGER;
 	e->use_fn    = HLM_CHARGER_USE;
 
+	//m_iJuice, healthkit.cpp:169 and h_battery.cpp:95. Taken at spawn, so a
+	//charger keeps the pool it was built with for the map's life
 	if (health)
-		e->charge = HLENT_CHARGE_HEALTH;
+		e->charge = hl_ent_charge_health;
 	else
-		e->charge = HLENT_CHARGE_ARMOR;
+		e->charge = hl_ent_charge_armor;
 
 	HLEntSetAbsBox(e);
 }
@@ -9922,9 +10113,15 @@ qpmm_next_ent:
 
 			if (ent >= 0 && hl_mm[slot].count > 0)
 			{
-				hl_mm[slot].ent     = ent;
-				hl_mm[slot].fired   = 0;
-				hl_mm[slot].started = 0.0;
+				hl_mm[slot].ent = ent;
+
+				//every run free. A slot is reused across map loads
+				for (k = 0; k < HLENT_MM_THREADS; k++)
+				{
+					hl_mm[slot].fired[k]   = 0;
+					hl_mm[slot].started[k] = -1.0;
+				}
+
 				hl_mm_count++;
 			}
 		}
@@ -11518,6 +11715,7 @@ U0 HLEntDrawBeams(CHLCanvas *c)
 	F64			 start[3];
 	F64			 end[3];
 	I64			 lit;
+	I64			 frame;
 	I64			 i;
 
 	if (!c || !hl_entities)
@@ -11558,7 +11756,18 @@ U0 HLEntDrawBeams(CHLCanvas *c)
 		else if (lit > 255)
 			lit = 255;
 
-		fr = &sp->frames[0];
+		//"framestart", the starting texture frame. The beam holds it: CBeam
+		//animates pev->frame only through the client, which this port has no
+		//counterpart for. Clamped, since the key names a frame in the sprite
+		//the mapper picked and nothing verifies the two agree
+		frame = e->beam_frame;
+
+		if (frame < 0)
+			frame = 0;
+		else if (frame >= sp->num_frames)
+			frame = sp->num_frames - 1;
+
+		fr = &sp->frames[frame];
 
 		//BoltWidth and TextureScroll are stored in 0.1s, NoiseAmplitude in
 		//0.01s - const.h:130-135. tS is the render clock: scroll and noise are
