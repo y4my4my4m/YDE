@@ -2267,6 +2267,13 @@ I64 hl_train_voice[HLENT_MAX];		//HLSndLoopHold handle, -1 when silent
 I64 hl_train_pitch[HLENT_MAX];		//quantised pitch hl_train_voice runs at
 Bool hl_train_playing[HLENT_MAX];	//m_soundPlaying, plats.cpp:1099
 
+//CFuncRotating holds noiseRunning open on CHAN_STATIC and stops it at the
+//bottom of SpinDown, dlls/bmodels.cpp:641. Registering the fan through the
+//ambient table instead gave a loop that could be started and never stopped or
+//retuned, so a switched-off fan hummed on.
+I64 hl_fan_voice[HLENT_MAX];		//HLSndLoopHold handle, -1 when silent
+I64 hl_fan_pitch[HLENT_MAX];		//quantised pitch hl_fan_voice runs at
+
 Bool hl_train_voice_valid = FALSE;
 
 //UpdateSound, plats.cpp:1092-1094 and :1129
@@ -2284,11 +2291,17 @@ U0 HLTrainVoiceReset()
 	for (i = 0; i < HLENT_MAX; i++)
 	{
 		if (hl_train_voice_valid)
+		{
 			HLSndLoopStop(hl_train_voice[i]);
+			HLSndLoopStop(hl_fan_voice[i]);
+		}
 
 		hl_train_voice[i]   = -1;
 		hl_train_pitch[i]   = 0;
 		hl_train_playing[i] = FALSE;
+
+		hl_fan_voice[i]     = -1;
+		hl_fan_pitch[i]     = 0;
 	}
 
 	hl_train_voice_valid = TRUE;
@@ -3707,6 +3720,11 @@ U0 HLTrainBlocked(I64 self, I64 blocker)
 #define HLSF_ROTATE_HURT			32
 #define HLSF_ROTATE_NOT_SOLID	64
 
+//dlls/util.h:407-409. Radius selectors for the running noise, not booleans
+#define HLSF_ROTATE_SMALLRADIUS	128
+#define HLSF_ROTATE_MEDIUMRADIUS	256
+#define HLSF_ROTATE_LARGERADIUS	512
+
 U8 *HLEntFanSound(I64 n)
 {//CFuncRotating::Precache. a comparison chain for the reason given in
  //HLEntModelForClass
@@ -3717,6 +3735,47 @@ U8 *HLEntFanSound(I64 n)
 	if (n == 5)		return "fans/fan5.wav";
 
 	return NULL;
+}
+
+U0 HLFanVoiceTick(I64 self, CHLEntity *e)
+{//One tick of a func_rotating's running noise. CFuncRotating::RampPitchVol,
+ //dlls/bmodels.cpp:520, folded into HLSndFanLoop: the pitch and volume both
+ //track current over target angular speed.
+	F64	 cur;
+	F64	 target;
+	F64	 vol;
+	F64	 centre[3];
+	U8	*snd;
+	I64	 j;
+
+	if (self < 0 || self >= HLENT_MAX)
+		return;
+
+	snd = HLEntFanSound(e->snd_index);
+
+	if (!snd)
+	{
+		HLSndFanStop(&hl_fan_voice[self], &hl_fan_pitch[self]);
+		return;
+	}
+
+	//movedir is a unit axis, so |avelocity| and |speed| are the two magnitudes
+	//RampPitchVol compares component by component
+	cur    = HLVecLength(e->avelocity);
+	target = HLEntAbsF(e->speed);
+
+	//func_rotating's "volume" is 0-10, like ambient_generic's
+	vol = e->volume;
+	if (vol > 1.0)
+		vol = vol / 10.0;
+	if (vol <= 0.0 || vol > 1.0)
+		vol = 1.0;
+
+	for (j = 0; j < 3; j++)
+		centre[j] = e->origin[j] + (e->mins[j] + e->maxs[j]) * 0.5;
+
+	HLSndFanLoop(&hl_fan_voice[self], &hl_fan_pitch[self], snd, centre,
+		vol, e->fan_atten, cur, target);
 }
 
 //--- ambient_generic --------------------------------------------------------
@@ -3770,14 +3829,22 @@ F64 HLAmbientAtten(CHLEntity *e)
 	return 1.25;
 }
 
-U0 HLAmbientUse(I64 self)
-{//CAmbientGeneric::ToggleUse.
+U0 HLAmbientUse(I64 self, I64 use_type, F64 value)
+{//CAmbientGeneric::ToggleUse, dlls/sound.cpp:512.
  //
- //A non-looping source plays once per trigger and is never in the ambient
- //table. A looping one toggles: added to the table to start, removed to stop.
+ //A looping source is registered once at spawn and toggled in place.
+ //HLSndAmbientRemove is not used: it swaps the last slot down over this one,
+ //which renumbers every slot after it and discards the dynpitchvol_t the
+ //envelopes and the LFO run out of.
+ //
+ //A non-looping source is issued directly. Registering it would leave it inert
+ //- HLSndAmbientUpdate only plays entries whose active flag is set, and
+ //HLSndAmbientToggle clears that for a one-shot.
 	CHLEntity	*e = HLEntGet(self);
 	F64			 centre[3];
+	I64			 slot;
 	I64			 i;
+	Bool		 on;
 
 	if (!e || !e->message[0])
 		return;
@@ -3794,11 +3861,29 @@ U0 HLAmbientUse(I64 self)
 		return;
 	}
 
-	if (HLSndAmbientFind(e->message, e->origin) >= 0)
-		HLSndAmbientRemove(e->message, e->origin);
-	else
-		HLSndAmbientAdd(e->origin, e->message, HLAmbientVolume(e),
-			HLAmbientAtten(e));
+	slot = HLSndAmbientFind(e->message, e->origin);
+	if (slot < 0)
+		return;
+
+	on = HLSndAmbientActive(slot);
+
+	//"ignore if we're just turning something on that's already on"
+	if (use_type == HLUSE_ON && on)
+		return;
+	if (use_type == HLUSE_OFF && !on)
+		return;
+
+	//"Directly change pitch if arg passed. Only works if sound is already
+	//playing", sound.cpp:521. momentary_rot_button is the only sender
+	if (use_type == HLUSE_SET)
+	{
+		if (on)
+			HLSndAmbientSetPitch(slot, value);
+
+		return;
+	}
+
+	HLSndAmbientToggle(slot, !on, hl_ent_time);
 }
 
 U0 HLSpeakerUse(I64 self, I64 use_type)
@@ -3838,12 +3923,92 @@ U0 HLSpeakerUse(I64 self, I64 use_type)
 	HLSndSpeakerToggle(slot, hl_ent_time);
 }
 
+//CFuncRotating::SpinUp and SpinDown reschedule on a fixed tenth,
+//dlls/bmodels.cpp:588 and :620. The step per think is movedir * speed *
+//fanfriction, so the constant and the step size go together.
+#define HLENT_ROTATE_STEP	0.1
+
+U0 HLRotatingSpinUp(I64 self)
+{//CFuncRotating::SpinUp, dlls/bmodels.cpp:585
+	CHLEntity	*e = HLEntGet(self);
+	F64			 target;
+	Bool		 done;
+	I64			 j;
+
+	if (!e)
+		return;
+
+	for (j = 0; j < 3; j++)
+		e->avelocity[j] += e->move_dir[j] * e->speed * e->fan_friction;
+
+	//"if we've met or exceeded target speed" - per axis, against the same axis
+	//of movedir * speed
+	done = TRUE;
+
+	for (j = 0; j < 3; j++)
+	{
+		target = e->move_dir[j] * e->speed;
+
+		if (HLEntAbsF(e->avelocity[j]) < HLEntAbsF(target))
+			done = FALSE;
+	}
+
+	if (done)
+	{
+		//"set speed in case we overshot"
+		HLVecScale(e->move_dir, e->speed, e->avelocity);
+		return;
+	}
+
+	HLEntSetThink(e, HLM_ROTATE_SPIN_UP, hl_ent_time + HLENT_ROTATE_STEP);
+}
+
+U0 HLRotatingSpinDown(I64 self)
+{//CFuncRotating::SpinDown, dlls/bmodels.cpp:615
+	CHLEntity	*e = HLEntGet(self);
+	F64			 dir;
+	Bool		 done;
+	I64			 j;
+
+	if (!e)
+		return;
+
+	for (j = 0; j < 3; j++)
+		e->avelocity[j] -= e->move_dir[j] * e->speed * e->fan_friction;
+
+	//the sign of the spin axis decides which way the crossing is tested
+	dir = e->move_dir[2];
+
+	if (e->move_dir[0] != 0.0)
+		dir = e->move_dir[0];
+	else if (e->move_dir[1] != 0.0)
+		dir = e->move_dir[1];
+
+	done = FALSE;
+
+	if (dir > 0.0 && e->avelocity[0] <= 0.0 && e->avelocity[1] <= 0.0 &&
+		e->avelocity[2] <= 0.0)
+		done = TRUE;
+
+	if (dir < 0.0 && e->avelocity[0] >= 0.0 && e->avelocity[1] >= 0.0 &&
+		e->avelocity[2] >= 0.0)
+		done = TRUE;
+
+	if (done)
+	{
+		HLVecSet(e->avelocity, 0.0, 0.0, 0.0);
+		return;
+	}
+
+	HLEntSetThink(e, HLM_ROTATE_SPIN_DOWN, hl_ent_time + HLENT_ROTATE_STEP);
+}
+
 U0 HLRotatingUse(I64 self, I64 use_type)
-{//spinning or stopped. not the SDK's SpinUp/SpinDown ramp:
+{//CFuncRotating::RotatingUse, dlls/bmodels.cpp:660
  //
- //SF_BRUSH_ACCDCC eases in over fanfriction, and the ease also drives the pitch
- //shift on the fan loop. The ambient mixer here can start a loop but not retune
- //or stop one, so the pitch half is unreachable. Full speed immediately.
+ //toggle_state is the port's "is it meant to be running": the fan loop and the
+ //next use both read it, and avelocity alone cannot answer while a ramp is
+ //part way through.
 	CHLEntity	*e = HLEntGet(self);
 	Bool		 on;
 
@@ -3860,15 +4025,33 @@ U0 HLRotatingUse(I64 self, I64 use_type)
 		on = !on;
 
 	if (on)
-	{
-		HLVecScale(e->move_dir, e->speed, e->avelocity);
 		e->toggle_state = HLTS_AT_TOP;
-	}
 	else
-	{
-		HLVecSet(e->avelocity, 0.0, 0.0, 0.0);
 		e->toggle_state = HLTS_AT_BOTTOM;
+
+	//SF_BRUSH_ACCDCC, bmodels.cpp:30: ease in and out over fanfriction rather
+	//than snapping to speed
+	if (e->spawnflags & HLSF_ROTATE_ACCDCC)
+	{
+		//"pev->nextthink = pev->ltime + 0.1": the first increment lands a tenth
+		//after the press, not on it
+		if (on)
+			HLEntSetThink(e, HLM_ROTATE_SPIN_UP,
+				hl_ent_time + HLENT_ROTATE_STEP);
+		else
+			HLEntSetThink(e, HLM_ROTATE_SPIN_DOWN,
+				hl_ent_time + HLENT_ROTATE_STEP);
+
+		return;
 	}
+
+	//a snap start cancels a ramp left running by a previous use
+	HLEntSetThink(e, HLM_NONE, 0.0);
+
+	if (on)
+		HLVecScale(e->move_dir, e->speed, e->avelocity);
+	else
+		HLVecSet(e->avelocity, 0.0, 0.0, 0.0);
 }
 
 //--- func_pendulum ----------------------------------------------------------
@@ -6153,9 +6336,10 @@ U0 HLPushableUse(I64 self, I64 activator)
 	if (!e)
 		return;
 
-	//"if ( !pActivator || !pActivator->IsPlayer() )": a script firing a
-	//SF_PUSH_BREAKABLE crate breaks it instead of pulling it
-	if (activator != hl_ent_player)
+	//"if ( !pActivator || !pActivator->IsPlayer() )". A fired chain carries a
+	//caller; HLEntUseInFront, which is the +use path, leaves it -1. That is the
+	//only distinction available - hl_ent_player is 0, and so is worldspawn
+	if (hl_ent_call_caller >= 0)
 	{
 		if (e->spawnflags & HLSF_PUSH_BREAKABLE)
 			HLEntQueueCall(self, HLM_BREAK_DIE, activator, HLUSE_TOGGLE, 0.0);
@@ -6657,7 +6841,9 @@ U0 HLEntCallMethod(I64 self, I64 method, I64 activator = -1,
 				e->in_use = FALSE;
 			break;
 
-		case HLM_AMBIENT_USE:		HLAmbientUse(self);				break;
+		case HLM_AMBIENT_USE:
+			HLAmbientUse(self, use_type, value);
+			break;
 		case HLM_SPEAKER_USE:		HLSpeakerUse(self, use_type);	break;
 
 		case HLM_MULTISOURCE_USE:
@@ -6710,6 +6896,8 @@ U0 HLEntCallMethod(I64 self, I64 method, I64 activator = -1,
 				HLRotDoorUse(self, activator);
 			break;
 		case HLM_ROTATE_USE:		HLRotatingUse(self, use_type);	break;
+		case HLM_ROTATE_SPIN_UP:	HLRotatingSpinUp(self);			break;
+		case HLM_ROTATE_SPIN_DOWN:	HLRotatingSpinDown(self);		break;
 		case HLM_PENDULUM_USE:		HLPendulumUse(self);			break;
 		case HLM_PENDULUM_SWING:	HLPendulumSwing(self);			break;
 
@@ -7123,9 +7311,6 @@ U0 HLEntSpawnRotDoor(CHLMap *map, CHLEntity *e, I64 self)
 U0 HLEntSpawnRotating(CHLMap *map, CHLEntity *e, I64 self)
 {//func_rotating - fans and turbines. its own axis flag bits, 4 and 8, not the
  //door's 64 and 128
-	U8	*snd;
-	F64	 vol;
-
 	HLEntSpawnRotBrush(map, e, self, HLSF_ROTATE_Z_AXIS, HLSF_ROTATE_X_AXIS);
 
 	e->ent_class    = HLC_ROTATE;
@@ -7137,26 +7322,29 @@ U0 HLEntSpawnRotating(CHLMap *map, CHLEntity *e, I64 self)
 	else
 		e->solid = HLSOLID_BSP;
 
-	//the fan loop. registered once, at spawn, and only for a fan that starts
-	//running: the ambient mixer can start a loop but cannot stop or retune one,
-	//so a toggled fan would hum on after being switched off
-	snd = HLEntFanSound(e->snd_index);
+	//dlls/bmodels.cpp:376-390. The radius bits are not ambient_generic's, and
+	//neither is the default: no bit set is ATTN_NORM here, ATTN_STATIC there
+	e->fan_atten = HLATTN_NORM;
 
-	//func_rotating's "volume" is 0-10, like ambient_generic's
-	vol = e->volume;
-	if (vol > 1.0)
-		vol = vol / 10.0;
-	if (vol <= 0.0 || vol > 1.0)
-		vol = 1.0;
+	if (e->spawnflags & HLSF_ROTATE_SMALLRADIUS)
+		e->fan_atten = HLATTN_IDLE;
+	else if (e->spawnflags & HLSF_ROTATE_MEDIUMRADIUS)
+		e->fan_atten = HLATTN_STATIC;
+	else if (e->spawnflags & HLSF_ROTATE_LARGERADIUS)
+		e->fan_atten = HLATTN_NORM;
+
+	//"prevent divide by zero if level designer forgets friction",
+	//bmodels.cpp:390. The key was divided by 100 at parse
+	if (e->fan_friction == 0.0)
+		e->fan_friction = 1.0;
 
 	//SF_BRUSH_ROTATE_INSTANT, or nothing in the map can name it: a fan with a
-	//speed and no trigger is meant to be running
+	//speed and no trigger is meant to be running. Instant, so the ramp is
+	//skipped even under ACCDCC
 	if ((e->spawnflags & HLSF_ROTATE_INSTANT) || !e->targetname[0])
 	{
-		HLRotatingUse(self, HLUSE_ON);
-
-		if (snd)
-			HLSndAmbientAdd(e->origin, snd, vol, HLENT_SND_ATTEN);
+		e->toggle_state = HLTS_AT_TOP;
+		HLVecScale(e->move_dir, e->speed, e->avelocity);
 	}
 }
 
@@ -8318,13 +8506,27 @@ I64 HLEntSpawnOne(CHLMap *map, I64 i)
 		if (!e->message[0])
 			return 1;
 
-		//START_SILENT waits for a trigger. Everything else is playing from the
-		//first frame - and c0a0's two announcer lines are 49, EVERYWHERE plus
+		//Registered whatever the spawnflags say. InitModulationParms derives
+		//the starting active and looping state from START_SILENT and
+		//NOT_LOOPING itself, and the modulation block has to exist before the
+		//first trigger: HLAmbientUse toggles a slot rather than creating one.
+		//
+		//"health" is the volume key on a 0-10 scale. HLAmbientVolume folds an
+		//absent key to full, which is the FGD default of 10.
+		//
+		//fadein/fadeout share fade_in/fade_out with env_fade - identical key
+		//names, and no entity is both classes.
+		//
+		//c0a0's two announcer lines are spawnflags 49: EVERYWHERE plus
 		//START_SILENT plus NOT_LOOPING, fired by a multi_manager.
-		if (!(e->spawnflags & HLSF_AMBIENT_START_SILENT) &&
-			!(e->spawnflags & HLSF_AMBIENT_NOT_LOOPING))
-			HLSndAmbientAdd(e->origin, e->message, HLAmbientVolume(e),
-				HLAmbientAtten(e));
+		HLSndAmbientAddEx(e->origin, e->message, HLAmbientAtten(e),
+			e->preset, ToI64(HLAmbientVolume(e) * 10.0),
+			e->amb_pitch, e->amb_pitchstart, e->amb_spinup, e->amb_spindown,
+			e->amb_volstart, ToI64(e->fade_in), ToI64(e->fade_out),
+			e->amb_lfotype, e->amb_lforate, e->amb_lfomodpitch,
+			e->amb_lfomodvol, e->amb_cspinup,
+			ToBool(e->spawnflags & HLSF_AMBIENT_START_SILENT),
+			ToBool(!(e->spawnflags & HLSF_AMBIENT_NOT_LOOPING)));
 
 		return 1;
 	}
@@ -8698,6 +8900,22 @@ U0 HLEntParseMultiManagers(CHLMap *map)
 				!StrCompare(key, "model"))
 				goto qpmm_next_key;
 
+			//UTIL_StripToken, dlls/util.cpp:1631, called from
+			//CMultiManager::KeyValue. A key is truncated at '#': the suffix is
+			//how a mapper repeats one target at two delays, since the block
+			//cannot carry the same key twice. 960 keys in the shipped maps
+			//carry one, and unstripped every last one names nothing.
+			for (k = 0; key[k] != 0; k++)
+			{
+				if (key[k] == '#')
+				{
+					key[k] = 0;
+					goto qpmm_stripped;
+				}
+			}
+
+qpmm_stripped:
+
 			if (hl_mm[slot].count < HLENT_MM_MAX)
 			{
 				n = hl_mm[slot].count;
@@ -8901,10 +9119,58 @@ qpmk_next_char:
 I64  hl_ent_trace_count = 0;
 Bool hl_ent_trace_on    = FALSE;
 
+//CFuncTrackTrain carries FL_ALWAYSTHINK, plats.cpp:995, so it dispatches at the
+//server rate: 72 lines a second, which spends the whole budget in one and
+//buries every other event behind "trace budget reached". An always-think class
+//is logged on a state change only. -1 is "nothing logged for this slot yet".
+I64 hl_ent_trace_sig[HLENT_MAX];
+
 U0 HLEntTraceReset()
 {
+	I64 i;
+
 	hl_ent_trace_count = 0;
 	hl_ent_trace_on    = FALSE;
+
+	for (i = 0; i < HLENT_MAX; i++)
+		hl_ent_trace_sig[i] = -1;
+}
+
+I64 HLEntTraceSig(CHLEntity *e, I64 method)
+{//method, current path node and speed, folded into one comparable value. Taken
+ //modulo a prime: every arithmetic here is F64, and an unbounded rolling hash
+ //over a 64 byte name runs past the mantissa
+	I64 h = method;
+	I64 i;
+
+	for (i = 0; i < 64 && e->target[i] != 0; i++)
+		h = (h * 31 + e->target[i]) % 1000003;
+
+	return (h * 31 + ToI64(e->speed)) % 1000003;
+}
+
+Bool HLEntTraceChanged(I64 ent, CHLEntity *e, I64 method)
+{//TRUE when this dispatch says something the last logged one did not.
+ //
+ //Only the always-think classes are filtered. A repeated think on anything else
+ //is the kind of thing the trace exists to show - two on one entity are a
+ //delayed fire behind an auto trigger, four are a bug
+	I64 sig;
+
+	if (!e || e->ent_class != HLC_TRACKTRAIN)
+		return TRUE;
+
+	if (ent < 0 || ent >= HLENT_MAX)
+		return TRUE;
+
+	sig = HLEntTraceSig(e, method);
+
+	if (hl_ent_trace_sig[ent] == sig)
+		return FALSE;
+
+	hl_ent_trace_sig[ent] = sig;
+
+	return TRUE;
 }
 
 U0 HLEntTrace(U8 *what, I64 ent, I64 method)
@@ -9423,6 +9689,78 @@ Bool HLEntBoxInBrush(CHLMap *map, I64 self, F64 *borg, F64 *bang, F64 *org,
 	return tr.start_solid;
 }
 
+//HLEntPushPlayer's answer
+#define HLPUSHP_CLEAR		0	//the pusher's new position does not reach them
+#define HLPUSHP_MOVED		1	//displaced by the pusher's delta
+#define HLPUSHP_STUCK		2	//inside it and nowhere to go
+
+I64 HLEntPushPlayer(CHLMap *map, I64 self, CHLEntity *e, F64 *move,
+	F64 *player_org)
+{//SV_PushMove's displacement half, for the player.
+ //
+ //The pusher has already stepped. Anything its new position now occupies is
+ //moved by the same delta and re-tested; only a box that is still solid after
+ //that counts as blocking.
+ //
+ //Base velocity cannot stand in for this. The carry runs later in the tick,
+ //inside the player's own move, and a box that is already inside a wall
+ //resolves outward the wrong way - which is how a moving tram's rear wall swept
+ //through the player and left them outside the car, while a stationary one was
+ //solid and could not be left at all.
+ //
+ //A rider standing on the deck is above the brush, not inside it, and is not
+ //displaced: the carry keeps that motion smooth.
+ //
+ //Linear only. A pusher that is turning banks yaw_delta and carries riders
+ //through hl_platform_avel_z; a player swept into a rotating brush is left to
+ //the blocked method, which is what reverses a door.
+	CHLTrace	tr;
+	F64			want[3];
+	F64			pmins[3];
+	F64			pmaxs[3];
+	I64			j;
+
+	if (!player_org || hl_ent_player < 0 || hl_ent_player_health <= 0.0)
+		return HLPUSHP_CLEAR;
+
+	//broad phase over the linked bounds: every moving pusher runs this every
+	//tick, and the brush trace below is not free
+	for (j = 0; j < 3; j++)
+	{
+		pmins[j] = player_org[j] + hl_player_mins[j];
+		pmaxs[j] = player_org[j] + hl_player_maxs[j];
+	}
+
+	if (!HLEntBoxOverlap(e, pmins, pmaxs))
+		return HLPUSHP_CLEAR;
+
+	if (!HLEntBoxInBrush(map, self, e->origin, e->angles, player_org,
+		hl_player_mins, hl_player_maxs))
+		return HLPUSHP_CLEAR;
+
+	for (j = 0; j < 3; j++)
+		want[j] = player_org[j] + move[j];
+
+	//relative to the pusher this is where they stood before the step, which was
+	//clear. Still inside means the pusher turned, or something else put them
+	//there
+	if (HLEntBoxInBrush(map, self, e->origin, e->angles, want,
+		hl_player_mins, hl_player_maxs))
+		return HLPUSHP_STUCK;
+
+	//and the destination has to be clear of the world too: a player pressed
+	//between the pusher and a wall is crushed, not moved through it
+	HLTraceEntity(map, want, want, hl_player_mins, hl_player_maxs, 0, TRUE,
+		&tr);
+
+	if (tr.all_solid || tr.start_solid)
+		return HLPUSHP_STUCK;
+
+	HLVecCopy(want, player_org);
+
+	return HLPUSHP_MOVED;
+}
+
 U0 HLEntCheckBlocked(CHLMap *map, I64 self, F64 *oldorg, F64 *oldang,
 	Bool rides, F64 *player_org)
 {//SV_PushMove's blocked case: the step this tick put a solid box inside the
@@ -9500,11 +9838,13 @@ U0 HLEntPushableStep(CHLMap *map, I64 self, CHLEntity *e, F64 dt,
  //hull is the one the player is leaning on.
 	CHLTrace	tr;
 	F64			end[3];
+	F64			left;
 	F64			speed;
 	F64			drop;
 	F64			scale;
 	F64			dot;
 	I64			saved;
+	I64			bump;
 	I64			j;
 	Bool		grounded;
 
@@ -9518,25 +9858,8 @@ U0 HLEntPushableStep(CHLMap *map, I64 self, CHLEntity *e, F64 dt,
 		HLIsZeroF(e->velocity[2]))
 		return;
 
-	for (j = 0; j < 3; j++)
-		end[j] = e->origin[j] + e->velocity[j] * dt;
-
-	saved    = e->solid;
-	e->solid = HLSOLID_NOT;
-
-	HLTraceEntity(map, e->origin, end, e->mins, e->maxs, 0, TRUE, &tr);
-
-	e->solid = saved;
-
-	//a crate that starts embedded stays where it is rather than being flung
-	if (tr.all_solid || tr.start_solid)
-	{
-		HLVecSet(e->velocity, 0.0, 0.0, 0.0);
-		return;
-	}
-
-	//the rider is carried by the same channel every other mover uses
-	if (player_org && hl_ent_player >= 0 && tr.fraction > 0.0)
+	//Riders are decided against the pre-step position, as SV_PushMove does
+	if (player_org && hl_ent_player >= 0)
 	{
 		if (HLEntPlayerRides(self, e, player_org))
 		{
@@ -9547,13 +9870,44 @@ U0 HLEntPushableStep(CHLMap *map, I64 self, CHLEntity *e, F64 dt,
 		}
 	}
 
-	HLVecCopy(tr.end_pos, e->origin);
-	HLEntSetAbsBox(e);
+	saved    = e->solid;
+	e->solid = HLSOLID_NOT;
 
 	grounded = FALSE;
+	left     = dt;
 
-	if (tr.fraction < 1.0)
+	//PM_FlyMove. One trace is not enough: gravity puts a downward component on
+	//every step, so a single sweep stops on the floor at a fraction near zero
+	//and takes the horizontal slide down with it - the crate would not move.
+	for (bump = 0; bump < 4; bump++)
 	{
+		if (HLIsZeroF(e->velocity[0]) && HLIsZeroF(e->velocity[1]) &&
+			HLIsZeroF(e->velocity[2]))
+			goto qeps_moved;
+
+		for (j = 0; j < 3; j++)
+			end[j] = e->origin[j] + e->velocity[j] * left;
+
+		HLTraceEntity(map, e->origin, end, e->mins, e->maxs, 0, TRUE, &tr);
+
+		//embedded: leave it where it is rather than flinging it out
+		if (tr.all_solid || tr.start_solid)
+		{
+			HLVecSet(e->velocity, 0.0, 0.0, 0.0);
+			goto qeps_moved;
+		}
+
+		HLVecCopy(tr.end_pos, e->origin);
+
+		left = left - left * tr.fraction;
+
+		if (tr.fraction == 1.0)
+			goto qeps_moved;
+
+		//an upward face is a floor, the same 0.7 PM_CatagorizePosition uses
+		if (tr.plane_normal[2] > 0.7)
+			grounded = TRUE;
+
 		//PM_ClipVelocity with no bounce: slide along the face it hit
 		dot = e->velocity[0] * tr.plane_normal[0] +
 			  e->velocity[1] * tr.plane_normal[1] +
@@ -9561,11 +9915,13 @@ U0 HLEntPushableStep(CHLMap *map, I64 self, CHLEntity *e, F64 dt,
 
 		for (j = 0; j < 3; j++)
 			e->velocity[j] -= tr.plane_normal[j] * dot;
-
-		//an upward face is a floor, the same 0.7 PM_CatagorizePosition uses
-		if (tr.plane_normal[2] > 0.7)
-			grounded = TRUE;
 	}
+
+qeps_moved:
+
+	e->solid = saved;
+
+	HLEntSetAbsBox(e);
 
 	if (!grounded)
 		return;
@@ -9616,6 +9972,7 @@ U0 HLEntFrame(CHLMap *map, F64 dt, F64 *player_org)
 	Bool		 found;
 	I64			 room;
 	I64			 think;
+	I64			 pushed;
 	I64			 i;
 	I64			 j;
 
@@ -9658,13 +10015,26 @@ U0 HLEntFrame(CHLMap *map, F64 dt, F64 *player_org)
 	{
 		e = &hl_entities[i];
 
-		if (e->ent_class != HLC_TRACKTRAIN)
+		if (e->ent_class == HLC_TRACKTRAIN)
+		{
+			if (e->in_use && e->think_fn != HLM_NONE)
+				HLTrainVoiceStart(i, e);
+			else
+				HLTrainVoiceStop(i);
+
+			goto qef_next_voice;
+		}
+
+		//A fan's noise follows its angular speed, not a think: SpinUp and
+		//SpinDown disarm themselves at the top and bottom of the ramp, and a
+		//fan at full speed has no think at all.
+		if (e->ent_class != HLC_ROTATE || e->use_fn != HLM_ROTATE_USE)
 			goto qef_next_voice;
 
-		if (e->in_use && e->think_fn != HLM_NONE)
-			HLTrainVoiceStart(i, e);
+		if (e->in_use)
+			HLFanVoiceTick(i, e);
 		else
-			HLTrainVoiceStop(i);
+			HLSndFanStop(&hl_fan_voice[i], &hl_fan_pitch[i]);
 
 qef_next_voice:
 	}
@@ -9742,6 +10112,18 @@ qef_next_voice:
 			e->origin[2] += move[2];
 
 			HLEntSetAbsBox(e);
+
+			//SV_PushMove displaces what the pusher has swept into before it
+			//decides anything is blocking. player_org is the shell's hl_origin
+			//and HLEntFrame runs ahead of the player's move, so the write
+			//lands this tick.
+			pushed = HLEntPushPlayer(map, i, e, move, player_org);
+
+			//Inside it and nowhere to go. The rider exemption below is for a
+			//box being carried, not a box being crushed, so the block test has
+			//to see this one.
+			if (pushed == HLPUSHP_STUCK)
+				rides = FALSE;
 
 			if (rides)
 			{
@@ -9912,7 +10294,9 @@ qef_next_room:
 		e->think_fn   = HLM_NONE;
 		e->next_think = 0.0;
 
-		HLEntTrace("think", i, think);
+		if (HLEntTraceChanged(i, e, think))
+			HLEntTrace("think", i, think);
+
 		HLEntCallMethod(i, think, e->activator, HLUSE_TOGGLE, 0.0);
 
 qef_next_think:
@@ -9935,6 +10319,8 @@ U0 HLEntTouchPlayer(F64 *player_org)
 	CHLEntity	*e;
 	F64			 pmins[3];
 	F64			 pmaxs[3];
+	F64			 tmins[3];
+	F64			 tmaxs[3];
 	I64			 i;
 
 	if (!hl_entities || !player_org)
@@ -9957,6 +10343,12 @@ U0 HLEntTouchPlayer(F64 *player_org)
 	{
 		pmins[i] = player_org[i] + hl_player_mins[i];
 		pmaxs[i] = player_org[i] + hl_player_maxs[i];
+
+		//A solid brush is never overlapped: the move stops the player a trace
+		//epsilon short of it, so an exact AABB test never reports contact.
+		//SV_TouchLinks links against a box grown by 1 for the same reason.
+		tmins[i] = pmins[i] - 1.0;
+		tmaxs[i] = pmaxs[i] + 1.0;
 	}
 
 	for (i = 0; i < hl_num_entities; i++)
@@ -9976,7 +10368,14 @@ U0 HLEntTouchPlayer(F64 *player_org)
 			e->touch_fn != HLM_PUSH_MOVE_TOUCH)
 			goto qetp_next;
 
-		if (!HLEntBoxOverlap(e, pmins, pmaxs))
+		//the grown box for the solid classes only; a trigger volume is entered,
+		//not bumped, and widening it would fire it a unit early
+		if (e->solid == HLSOLID_TRIGGER)
+		{
+			if (!HLEntBoxOverlap(e, pmins, pmaxs))
+				goto qetp_next;
+		}
+		else if (!HLEntBoxOverlap(e, tmins, tmaxs))
 			goto qetp_next;
 
 		//hl_ent_player is 0, which is also worldspawn's index, while
