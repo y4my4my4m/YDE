@@ -134,6 +134,12 @@
 #define HLM_MAKER_THINK			126	//CMonsterMaker::MakerThink
 #define HLM_SPEAKER_USE			127	//CSpeaker::ToggleUse
 
+#define HLM_PUSH_MOVE_TOUCH		128	//CPushable::Touch, func_break.cpp:910
+#define HLM_PUSH_MOVE_USE		129	//CPushable::Use, func_break.cpp:895
+#define HLM_MULTISOURCE_USE		130	//CMultiSource::Use, buttons.cpp:182
+#define HLM_ROTATE_SPIN_UP		131	//CFuncRotating::SpinUp, bmodels.cpp:585
+#define HLM_ROTATE_SPIN_DOWN		132	//CFuncRotating::SpinDown, bmodels.cpp:615
+
 //how long a "toggle" trigger stays untouchable after firing
 #define HLENT_TRIGGER_DEBOUNCE	0.2
 
@@ -1782,6 +1788,11 @@ class CHLEntCall
 	I64	activator;
 	I64	use_type;
 	F64	value;
+
+	//pCaller: the entity that fired, distinct from pActivator, the player or
+	//monster that started the chain. Only CMultiSource::Use reads it - it
+	//identifies which of its registered inputs just toggled
+	I64	caller;
 };
 
 CHLEntCall	hl_ent_callq[HLENT_CALLQ_MAX];
@@ -1789,7 +1800,13 @@ I64			hl_ent_callq_head = 0;
 I64			hl_ent_callq_tail = 0;
 I64			hl_ent_callq_lost = 0;
 
-U0 HLEntQueueCall(I64 ent, I64 method, I64 activator, I64 use_type, F64 value)
+//pCaller of the method HLEntDrainCalls is running, -1 for none. Carried beside
+//the dispatch rather than through HLEntCallMethod's signature, which every
+//spawn and think path already calls with five arguments.
+I64			hl_ent_call_caller = -1;
+
+U0 HLEntQueueCall(I64 ent, I64 method, I64 activator, I64 use_type, F64 value,
+	I64 caller = -1)
 {
 	I64 next = (hl_ent_callq_tail + 1) % HLENT_CALLQ_MAX;
 
@@ -1812,6 +1829,7 @@ U0 HLEntQueueCall(I64 ent, I64 method, I64 activator, I64 use_type, F64 value)
 	hl_ent_callq[hl_ent_callq_tail].activator = activator;
 	hl_ent_callq[hl_ent_callq_tail].use_type  = use_type;
 	hl_ent_callq[hl_ent_callq_tail].value     = value;
+	hl_ent_callq[hl_ent_callq_tail].caller    = caller;
 
 	hl_ent_callq_tail = next;
 }
@@ -1852,7 +1870,7 @@ U0 HLEntFireTargets(I64 self, I64 activator, I64 use_type, F64 value)
 		{
 			hl_entities[t].activator = activator;
 			HLEntQueueCall(t, hl_entities[t].use_fn, activator, use_type,
-				value);
+				value, self);
 		}
 
 		t = HLEntFindByTargetname(e->target, t + 1);
@@ -1876,7 +1894,7 @@ U0 HLEntFireTargetsNamed(U8 *name, I64 self, I64 activator, I64 use_type,
 		{
 			hl_entities[t].activator = activator;
 			HLEntQueueCall(t, hl_entities[t].use_fn, activator, use_type,
-				value);
+				value, self);
 		}
 
 		t = HLEntFindByTargetname(name, t + 1);
@@ -2898,7 +2916,7 @@ U0 HLMMTick(I64 self)
 			{
 				hl_entities[t].activator = e->activator;
 				HLEntQueueCall(t, hl_entities[t].use_fn, e->activator,
-					HLUSE_TOGGLE, 0.0);
+					HLUSE_TOGGLE, 0.0, self);
 			}
 
 			t = HLEntFindByTargetname(&hl_mm[m].name[i * 64], t + 1);
@@ -5957,21 +5975,448 @@ Bool HLEntCapsContinuousUse(CHLEntity *e)
 	if (e->use_fn == HLM_CHARGER_USE)
 		return TRUE;
 
+	//CPushable, func_break.cpp:790: the pull runs for as long as the key is
+	//held, which is also what suppresses the push in Touch
+	if (e->use_fn == HLM_PUSH_MOVE_USE)
+		return TRUE;
+
 	if (e->use_fn != HLM_MOMENTARY_USE)
 		return FALSE;
 
 	return ToBool(!(e->spawnflags & HLSF_MOMENTARY_DOOR));
 }
 
+//func_conveyor, dlls/bmodels.cpp:144-145
+#define HLSF_CONVEYOR_VISUAL		1
+#define HLSF_CONVEYOR_NOTSOLID	2
+
+//--- func_pushable ----------------------------------------------------------
+//
+// CPushable, dlls/func_break.cpp:790. A crate the player shoves along the floor
+// to climb on. Sharing func_breakable's branch left all of them nailed down.
+//
+// Two deviations from the SDK, both forced:
+//
+//   MOVETYPE_PUSHSTEP has no counterpart here - HLMOVETYPE_ stops at BOUNCE -
+//   and the HLMOVETYPE_PUSH mover pass integrates velocity with no world
+//   trace, which a crate would use to leave the map. A pushable is stepped by
+//   HLEntPushableStep instead: gravity, a traced move, ground friction.
+//
+//   SOLID_BBOX is not collidable in this tree. HLClipToNativeBrushes clips only
+//   entities whose solid is HLSOLID_BSP, so a pushable on SOLID_BBOX could be
+//   walked through and not stood on. It keeps SOLID_BSP and its brush hull.
+//
+// Also absent: the "size" key's player-hull bboxes (func_break.cpp:860). The
+// brush hull is what the trace and the draw already agree on.
+
+#define HLSF_PUSH_BREAKABLE		128		//dlls/util.h:447
+#define HLPUSH_MAX_FRICTION		399.0	//func_break.cpp:831
+#define HLPUSH_BASE_SPEED		400.0	//m_maxSpeed = 400 - friction
+#define HLPUSH_SOUND_GAP			0.7		//func_break.cpp:996
+
+//sv_friction and its floor, PM_Friction. The engine runs MOVETYPE_PUSHSTEP
+//through SV_Physics_Step, which applies ground friction the same way.
+#define HLPUSH_FRICTION			4.0
+#define HLPUSH_STOP_SPEED		100.0
+
+//below this the crate is parked, so it does not creep for minutes after a shove
+#define HLPUSH_MIN_SPEED			2.0
+
+//1000 units^3 standard volume, func_break.cpp:922
+#define HLPUSH_BUOY_SCALE		0.0005
+
+U8 *HLPushableSound(I64 n)
+{//CPushable::m_soundNames, func_break.cpp:817
+	if (n == 1)		return "debris/pushbox2.wav";
+	if (n == 2)		return "debris/pushbox3.wav";
+
+	return "debris/pushbox1.wav";
+}
+
+Bool HLPushableInWater(CHLEntity *e)
+{//pev->waterlevel on the crate. No entity here carries one, so the brush
+ //centre is sampled directly
+	F64 centre[3];
+	I64 i;
+
+	if (!hl_map)
+		return FALSE;
+
+	for (i = 0; i < 3; i++)
+		centre[i] = e->origin[i] + (e->mins[i] + e->maxs[i]) * 0.5;
+
+	return ToBool(HLPointContents(hl_map, centre) == HLCONTENTS_WATER);
+}
+
+U0 HLPushableMove(I64 self, Bool push)
+{//CPushable::Move, func_break.cpp:919. pOther is always the player: nothing
+ //else in this port shoves crates, so playerTouch is implied and the 0.25
+ //monster factor is unreachable.
+ //
+ //push is the SDK's argument: 1 from Touch, 0 from Use, which is the pull.
+	CHLEntity	*e = HLEntGet(self);
+	F64			 factor;
+	F64			 length;
+	F64			 vx;
+	F64			 vy;
+	Bool		 wet;
+
+	if (!e)
+		return;
+
+	wet = HLPushableInWater(e);
+
+	//"Is entity standing on this pushable?" A rider only makes it bob
+	if (hl_pm_onground != -1 && hl_ground_native == self)
+	{
+		if (wet)
+			e->velocity[2] += hl_pm_vel[2] * 0.1;
+
+		return;
+	}
+
+	//"Don't push away from jumping/falling players unless in water"
+	if (hl_pm_onground == -1)
+	{
+		if (!wet)
+			return;
+
+		factor = 0.1;
+	}
+	else
+		factor = 1.0;
+
+	//"Always apply this if pushing, or if under the player's velocity"
+	vx = e->velocity[0];
+	vy = e->velocity[1];
+
+	if (push || HLEntAbsF(vx) <
+		HLEntAbsF(hl_pm_vel[0] - hl_pm_vel[0] * factor))
+		e->velocity[0] = vx + hl_pm_vel[0] * factor;
+
+	if (push || HLEntAbsF(vy) <
+		HLEntAbsF(hl_pm_vel[1] - hl_pm_vel[1] * factor))
+		e->velocity[1] = vy + hl_pm_vel[1] * factor;
+
+	length = Sqrt(e->velocity[0] * e->velocity[0] +
+				  e->velocity[1] * e->velocity[1]);
+
+	if (length > e->push_max_speed && length > 0.0)
+	{
+		e->velocity[0] = e->velocity[0] * e->push_max_speed / length;
+		e->velocity[1] = e->velocity[1] * e->push_max_speed / length;
+	}
+
+	//Deviation: "Match the player to our pushable's velocity" is dropped. The
+	//player's velocity for this tick has already been written back by
+	//HLPlayerMove - the touch pass runs after the move - and the crate is
+	//SOLID_BSP, so the block that produced the touch already stopped them.
+
+	//func_break.cpp:995. One scrape at most every 0.7s while the crate is
+	//actually sliding on the ground
+	if (hl_ent_time - e->push_snd_time <= HLPUSH_SOUND_GAP)
+		return;
+
+	e->push_snd_time = hl_ent_time;
+
+	//The SDK's else branch is a STOP_SOUND on CHAN_WEAPON. A scrape here is a
+	//one-shot half a second long with no handle to stop, and CPushable's own
+	//StopSound is compiled out of the SDK (func_break.cpp:1012).
+	if (length <= 0.0 || hl_pm_onground == -1)
+		return;
+
+	e->push_snd_last = HLPartRandI(3);
+
+	HLEntSound(self, e, HLPushableSound(e->push_snd_last),
+		HLCHAN_WEAPON, 0.5);
+}
+
+U0 HLPushableTouch(I64 self)
+{//CPushable::Touch, func_break.cpp:910
+	CHLEntity *e = HLEntGet(self);
+
+	if (!e)
+		return;
+
+	//"Don't push unless the player is not useing (pull)". use_last is the +use
+	//stamp HLEntUseInFront leaves on this crate, standing in for IN_USE
+	if (hl_ent_time - e->use_last <= HLENT_USE_HOLD_GAP)
+		return;
+
+	HLPushableMove(self, TRUE);
+}
+
+U0 HLPushableUse(I64 self, I64 activator)
+{//CPushable::Use, func_break.cpp:895 - the +use pull
+	CHLEntity *e = HLEntGet(self);
+
+	if (!e)
+		return;
+
+	//"if ( !pActivator || !pActivator->IsPlayer() )": a script firing a
+	//SF_PUSH_BREAKABLE crate breaks it instead of pulling it
+	if (activator != hl_ent_player)
+	{
+		if (e->spawnflags & HLSF_PUSH_BREAKABLE)
+			HLEntQueueCall(self, HLM_BREAK_DIE, activator, HLUSE_TOGGLE, 0.0);
+
+		return;
+	}
+
+	e->use_last = hl_ent_time;
+
+	//"if ( pActivator->pev->velocity != g_vecZero )"
+	if (hl_pm_vel[0] == 0.0 && hl_pm_vel[1] == 0.0 && hl_pm_vel[2] == 0.0)
+		return;
+
+	HLPushableMove(self, FALSE);
+}
+
+
+//--- multisource ------------------------------------------------------------
+//
+// CMultiSource, dlls/buttons.cpp:169. An AND gate in front of a master check:
+// every entity that targets it must have fired before a door naming it as
+// master will open.
+//
+// Register, buttons.cpp:239, walks the map collecting the inputs. The SDK runs
+// it from a think at spawn + 0.1, which lands after ED_LoadFromFile has built
+// every entity. This port has no Activate phase, so the walk runs at the end of
+// HLEntSpawnAll - the same point in the load, without the think.
+//
+// The satisfied state lives in toggle_state, where HLEntMasterAllows already
+// reads it: AT_TOP is m_fActive.
+
+#define HLSF_MULTI_INIT		1		//buttons.cpp:169
+#define HLENT_MS_TARGETS	32		//MS_MAX_TARGETS, cbase.h:428
+#define HLENT_MS_MAX		64		//multisources tracked per map
+
+class CHLMultiSource
+{
+	I64		ent;						//owning entity index
+	I64		count;						//m_iTotal
+	I64		target[HLENT_MS_TARGETS];	//m_rgEntities, as entity indices
+	Bool	fired[HLENT_MS_TARGETS];	//m_rgTriggered
+};
+
+CHLMultiSource	hl_ms[HLENT_MS_MAX];
+I64				hl_ms_count = 0;
+
+I64 HLMultiSourceSlot(I64 self)
+{//the registration record for an entity index, -1 for none
+	I64 i;
+
+	for (i = 0; i < hl_ms_count; i++)
+	{
+		if (hl_ms[i].ent == self)
+			return i;
+	}
+
+	return -1;
+}
+
+Bool HLMultiSourceTriggered(I64 self)
+{//CMultiSource::IsTriggered, buttons.cpp:213
+	CHLEntity	*e = HLEntGet(self);
+	I64			 s;
+	I64			 i;
+
+	if (!e)
+		return FALSE;
+
+	//"Still initializing?" - the registration walk has not run yet
+	if (e->spawnflags & HLSF_MULTI_INIT)
+		return FALSE;
+
+	s = HLMultiSourceSlot(self);
+
+	//No record means no inputs were collected. IsTriggered's loop exits with
+	//i == m_iTotal at zero, so an input-less multisource is satisfied; a map
+	//that names one and targets it from nowhere is not meant to lock
+	if (s >= 0)
+	{
+		for (i = 0; i < hl_ms[s].count; i++)
+		{
+			if (!hl_ms[s].fired[i])
+				return FALSE;
+		}
+	}
+
+	//m_globalstate: a cross-level lock is satisfied by its inputs and by a flag
+	//an earlier map set
+	if (e->global_state[0])
+		return ToBool(HLEntGlobalGet(e->global_state) == HLGLOBAL_ON);
+
+	return TRUE;
+}
+
+U0 HLMultiSourcePublish(I64 self)
+{//IsTriggered's answer, into the field HLEntMasterAllows reads
+	CHLEntity *e = HLEntGet(self);
+
+	if (!e)
+		return;
+
+	if (HLMultiSourceTriggered(self))
+		e->toggle_state = HLTS_AT_TOP;
+	else
+		e->toggle_state = HLTS_AT_BOTTOM;
+}
+
+U0 HLMultiSourceUse(I64 self, I64 activator, I64 caller)
+{//CMultiSource::Use, buttons.cpp:182
+	CHLEntity	*e = HLEntGet(self);
+	I64			 s;
+	I64			 i;
+	I64			 use;
+
+	if (!e)
+		return;
+
+	s = HLMultiSourceSlot(self);
+
+	if (s >= 0 && caller >= 0)
+	{
+		for (i = 0; i < hl_ms[s].count; i++)
+		{
+			if (hl_ms[s].target[i] != caller)
+				goto qms_next;
+
+			//"a Use input to the multisource always toggles" - the useType is
+			//deliberately ignored
+			hl_ms[s].fired[i] = !hl_ms[s].fired[i];
+			break;
+
+qms_next:
+		}
+	}
+
+	HLMultiSourcePublish(self);
+
+	if (e->toggle_state != HLTS_AT_TOP)
+		return;
+
+	//USE_ON rather than USE_TOGGLE when a global state gates it, so a
+	//cross-level lock cannot close what it just opened
+	use = HLUSE_TOGGLE;
+	if (e->global_state[0])
+		use = HLUSE_ON;
+
+	HLEntUseTargets(self, activator, use, 0.0);
+}
+
+U0 HLMultiSourceRegister(I64 self)
+{//CMultiSource::Register, buttons.cpp:239
+	CHLEntity	*e = HLEntGet(self);
+	I64			 s;
+	I64			 i;
+	I64			 j;
+	I64			 m;
+
+	if (!e || !e->targetname[0])
+		return;
+
+	if (hl_ms_count >= HLENT_MS_MAX)
+		return;
+
+	s = hl_ms_count;
+	hl_ms_count++;
+
+	hl_ms[s].ent   = self;
+	hl_ms[s].count = 0;
+
+	//"search for all entities which target this multisource"
+	for (i = 0; i < hl_num_entities; i++)
+	{
+		if (hl_ms[s].count >= HLENT_MS_TARGETS)
+			goto qmsr_done;
+
+		if (!hl_entities[i].in_use || i == self)
+			goto qmsr_next;
+
+		if (StrCompare(hl_entities[i].target, e->targetname))
+			goto qmsr_next;
+
+		hl_ms[s].target[hl_ms[s].count] = i;
+		hl_ms[s].fired[hl_ms[s].count]  = FALSE;
+		hl_ms[s].count++;
+
+qmsr_next:
+	}
+
+	//The second pass: a multi_manager holds its targets as keys, not in
+	//pev->target, so HasTarget is the only way to see them
+	for (i = 0; i < hl_num_entities; i++)
+	{
+		if (hl_ms[s].count >= HLENT_MS_TARGETS)
+			goto qmsr_done;
+
+		if (!hl_entities[i].in_use || i == self)
+			goto qmsr_mm_next;
+
+		if (StrCompare(hl_entities[i].classname, "multi_manager"))
+			goto qmsr_mm_next;
+
+		m = HLMMFind(i);
+		if (m < 0)
+			goto qmsr_mm_next;
+
+		for (j = 0; j < hl_mm[m].count; j++)
+		{
+			if (StrCompare(&hl_mm[m].name[j * 64], e->targetname))
+				goto qmsr_key_next;
+
+			hl_ms[s].target[hl_ms[s].count] = i;
+			hl_ms[s].fired[hl_ms[s].count]  = FALSE;
+			hl_ms[s].count++;
+			goto qmsr_mm_next;
+
+qmsr_key_next:
+		}
+
+qmsr_mm_next:
+	}
+
+qmsr_done:
+
+	//SF_MULTI_INIT is cleared last: IsTriggered answers FALSE while it is set.
+	//Subtracted rather than masked out - the bit is known to be set here
+	if (e->spawnflags & HLSF_MULTI_INIT)
+		e->spawnflags = e->spawnflags - HLSF_MULTI_INIT;
+
+	HLMultiSourcePublish(self);
+}
+
+U0 HLMultiSourceRegisterAll()
+{//every multisource in the map, once the spawn pass has built them all
+	I64 i;
+
+	hl_ms_count = 0;
+
+	for (i = 0; i < hl_num_entities; i++)
+	{
+		if (!hl_entities[i].in_use)
+			goto qmsra_next;
+
+		if (hl_entities[i].use_fn != HLM_MULTISOURCE_USE)
+			goto qmsra_next;
+
+		HLMultiSourceRegister(i);
+
+qmsra_next:
+	}
+}
+
 //--- trigger volumes that act on the player ---------------------------------
 
 U0 HLConveyorTouch(I64 self)
-{//func_conveyor. speed along movedir, as a push
+{//func_conveyor. FL_CONVEYOR, dlls/bmodels.cpp:162: the engine folds
+ //movedir * speed into pmove->basevelocity for whatever stands on the brush.
  //
- //HL uses pmove->basevelocity, which does not accumulate and does not survive
- //stepping off. That global belongs to HLClip.ZC and is overwritten from the
- //water current every tick, so the push queue is used instead. Shows as extra
- //momentum when jumping off the belt.
+ //hl_conveyor_velocity is that channel. Base velocity is added before the move
+ //and subtracted after, so it neither accumulates nor survives stepping off;
+ //HLEntTouchPlayer clears it beside hl_surface_friction, which has no event to
+ //hang a restore on either.
 	CHLEntity	*e = HLEntGet(self);
 	F64			 speed;
 	I64			 i;
@@ -5979,14 +6424,16 @@ U0 HLConveyorTouch(I64 self)
 	if (!e)
 		return;
 
+	//dlls/bmodels.cpp:170. Signed: CFuncConveyor::Use negates it to reverse
+	//the belt
 	speed = e->speed;
 	if (speed == 0.0)
 		speed = 100.0;
 
 	for (i = 0; i < 3; i++)
-		hl_ent_push_vel[i] = e->move_dir[i] * speed;
+		hl_conveyor_velocity[i] = e->move_dir[i] * speed;
 
-	hl_ent_push_pending = TRUE;
+	hl_conveyor_active = TRUE;
 }
 
 U0 HLFrictionTouch(I64 self)
@@ -6213,6 +6660,10 @@ U0 HLEntCallMethod(I64 self, I64 method, I64 activator = -1,
 		case HLM_AMBIENT_USE:		HLAmbientUse(self);				break;
 		case HLM_SPEAKER_USE:		HLSpeakerUse(self, use_type);	break;
 
+		case HLM_MULTISOURCE_USE:
+			HLMultiSourceUse(self, activator, hl_ent_call_caller);
+			break;
+
 		case HLM_MULTI_MANAGER_USE:	HLMMUse(self, activator);		break;
 		case HLM_MULTI_MANAGER_TICK: HLMMTick(self);				break;
 
@@ -6321,6 +6772,8 @@ U0 HLEntCallMethod(I64 self, I64 method, I64 activator = -1,
 		case HLM_CHARGER_USE:		HLChargerUse(self);				break;
 		case HLM_CHARGER_THINK:		HLChargerThink(self);			break;
 		case HLM_CONVEYOR_TOUCH:	HLConveyorTouch(self);			break;
+		case HLM_PUSH_MOVE_TOUCH:	HLPushableTouch(self);			break;
+		case HLM_PUSH_MOVE_USE:		HLPushableUse(self, activator);	break;
 		case HLM_FRICTION_TOUCH:	HLFrictionTouch(self);			break;
 		case HLM_GRAVITY_TOUCH:		HLGravityTouch(self);			break;
 		case HLM_CHANGELEVEL_TOUCH:	HLChangeLevelTouch(self);		break;
@@ -7349,18 +7802,19 @@ I64 HLEntSpawnOne(CHLMap *map, I64 i)
 
 	if (!StrCompare(e->classname, "multisource"))
 	{
-		//every input must be on before it satisfies a master check. no input
-		//logic here, so it starts satisfied: unlocked rather than locked
+		//CMultiSource::Spawn, buttons.cpp:186. Locked until every input has
+		//fired; HLMultiSourceRegisterAll collects them once the spawn pass is
+		//through and clears SF_MULTI_INIT
 		e->movetype     = HLMOVETYPE_NONE;
 		e->solid        = HLSOLID_NOT;
-		e->toggle_state = HLTS_AT_TOP;
-		e->use_fn       = HLM_TRIGGER_USE;
+		e->toggle_state = HLTS_AT_BOTTOM;
+		e->use_fn       = HLM_MULTISOURCE_USE;
+		e->spawnflags   = e->spawnflags | HLSF_MULTI_INIT;
 		return 1;
 	}
 
 	//--- static brushwork ---
-	if (!StrCompare(e->classname, "func_breakable") ||
-		!StrCompare(e->classname, "func_pushable"))
+	if (!StrCompare(e->classname, "func_breakable"))
 	{
 		HLEntSetBrushSize(map, e);
 
@@ -7381,6 +7835,52 @@ I64 HLEntSpawnOne(CHLMap *map, I64 i)
 		}
 		else
 			e->use_fn = HLM_BREAK_USE;
+
+		return 1;
+	}
+
+	if (!StrCompare(e->classname, "func_pushable"))
+	{
+		//CPushable::Spawn, dlls/func_break.cpp:820
+		HLEntSetBrushSize(map, e);
+
+		//SOLID_BBOX in the SDK; HLClipToNativeBrushes only clips HLSOLID_BSP,
+		//and a pushable that is not solid can be neither pushed nor stood on
+		e->solid     = HLSOLID_BSP;
+		e->ent_class = HLC_PUSHABLE;
+		e->use_fn    = HLM_PUSH_MOVE_USE;
+		e->touch_fn  = HLM_PUSH_MOVE_TOUCH;
+
+		//SF_PUSH_BREAKABLE splits the class: with it the crate is also a
+		//CBreakable and takes damage, without it TakeDamage returns 1 and
+		//nothing happens
+		if (e->spawnflags & HLSF_PUSH_BREAKABLE)
+		{
+			e->takedamage = HLDMG_TAKE_YES;
+
+			if (e->health <= 0.0)
+				e->health = 1.0;
+		}
+		else
+			e->takedamage = HLDMG_TAKE_NO;
+
+		if (e->push_friction > HLPUSH_MAX_FRICTION)
+			e->push_friction = HLPUSH_MAX_FRICTION;
+
+		e->push_max_speed = HLPUSH_BASE_SPEED - e->push_friction;
+		e->push_friction  = 0.0;
+
+		//"Multiply by area of the box's cross-section", func_break.cpp:922
+		e->push_buoyancy = e->push_buoyancy *
+			(e->maxs[0] - e->mins[0]) * (e->maxs[1] - e->mins[1]) *
+			HLPUSH_BUOY_SCALE;
+
+		e->push_snd_time = 0.0;
+		e->push_snd_last = 0;
+
+		//"Pick up off of the floor", func_break.cpp:840
+		e->origin[2] += 1.0;
+		HLEntSetAbsBox(e);
 
 		return 1;
 	}
@@ -7426,9 +7926,10 @@ I64 HLEntSpawnOne(CHLMap *map, I64 i)
 
 	if (!StrCompare(e->classname, "func_conveyor"))
 	{
-		//solid, since the player stands on the belt, and it pushes on touch.
-		//HLEntTouchPlayer special-cases this touch_fn - a solid brush is not
-		//otherwise touch tested
+		//CFuncConveyor::Spawn, dlls/bmodels.cpp:155. Solid, since the player
+		//stands on the belt, and it pushes on touch. HLEntTouchPlayer
+		//special-cases this touch_fn - a solid brush is not otherwise touch
+		//tested
 		HLEntSetBrushSize(map, e);
 		HLEntSetMoveDir(e);
 
@@ -7436,6 +7937,18 @@ I64 HLEntSpawnOne(CHLMap *map, I64 i)
 		e->solid     = HLSOLID_BSP;
 		e->ent_class = HLC_WALL;
 		e->touch_fn  = HLM_CONVEYOR_TOUCH;
+
+		//SF_CONVEYOR_VISUAL: FL_CONVEYOR is not set, so the brush scrolls its
+		//texture and carries nothing
+		if (e->spawnflags & HLSF_CONVEYOR_VISUAL)
+			e->touch_fn = HLM_NONE;
+
+		//SF_CONVEYOR_NOTSOLID, bmodels.cpp:163
+		if (e->spawnflags & HLSF_CONVEYOR_NOTSOLID)
+			e->solid = HLSOLID_NOT;
+
+		if (e->speed == 0.0)
+			e->speed = 100.0;
 
 		HLEntSetAbsBox(e);
 		return 1;
@@ -8624,6 +9137,11 @@ I64 HLEntSpawnAll(CHLMap *map)
 qesa_next:
 	}
 
+	//CMultiSource::Register, buttons.cpp:239, deferred by the SDK to a think at
+	//spawn + 0.1 so it sees a fully built map. This is that point: every class
+	//function has run and every target field is final
+	HLMultiSourceRegisterAll;
+
 	hl_ent_spawned = known;
 
 	return known;
@@ -8649,10 +9167,16 @@ U0 HLEntDrainCalls()
 		use_type  = hl_ent_callq[hl_ent_callq_head].use_type;
 		value     = hl_ent_callq[hl_ent_callq_head].value;
 
+		//live for the duration of this one dispatch. A method that queues
+		//further calls does not inherit it: those carry their own.
+		hl_ent_call_caller = hl_ent_callq[hl_ent_callq_head].caller;
+
 		hl_ent_callq_head = (hl_ent_callq_head + 1) % HLENT_CALLQ_MAX;
 
 		HLEntTrace("use", ent, method);
 		HLEntCallMethod(ent, method, activator, use_type, value);
+
+		hl_ent_call_caller = -1;
 
 		budget--;
 	}
@@ -8966,6 +9490,111 @@ qecb_next:
 	}
 }
 
+U0 HLEntPushableStep(CHLMap *map, I64 self, CHLEntity *e, F64 dt,
+	F64 *player_org)
+{//SV_Physics_Step for one crate: gravity, a traced move, ground friction.
+ //
+ //Traced with the crate itself taken out of the world - it is SOLID_BSP and
+ //HLClipToNativeBrushes has no pass-entity argument, so it would report itself
+ //start-solid every tick. nomonsters keeps the player out of the sweep: the
+ //hull is the one the player is leaning on.
+	CHLTrace	tr;
+	F64			end[3];
+	F64			speed;
+	F64			drop;
+	F64			scale;
+	F64			dot;
+	I64			saved;
+	I64			j;
+	Bool		grounded;
+
+	if (dt <= 0.0)
+		return;
+
+	//gravity first, so a crate shoved off a ledge falls this tick
+	e->velocity[2] -= HLPHYS_GRAVITY * dt;
+
+	if (HLIsZeroF(e->velocity[0]) && HLIsZeroF(e->velocity[1]) &&
+		HLIsZeroF(e->velocity[2]))
+		return;
+
+	for (j = 0; j < 3; j++)
+		end[j] = e->origin[j] + e->velocity[j] * dt;
+
+	saved    = e->solid;
+	e->solid = HLSOLID_NOT;
+
+	HLTraceEntity(map, e->origin, end, e->mins, e->maxs, 0, TRUE, &tr);
+
+	e->solid = saved;
+
+	//a crate that starts embedded stays where it is rather than being flung
+	if (tr.all_solid || tr.start_solid)
+	{
+		HLVecSet(e->velocity, 0.0, 0.0, 0.0);
+		return;
+	}
+
+	//the rider is carried by the same channel every other mover uses
+	if (player_org && hl_ent_player >= 0 && tr.fraction > 0.0)
+	{
+		if (HLEntPlayerRides(self, e, player_org))
+		{
+			hl_platform_active = TRUE;
+
+			HLVecCopy(e->velocity, hl_platform_velocity);
+			HLVecCopy(e->origin, hl_platform_pivot);
+		}
+	}
+
+	HLVecCopy(tr.end_pos, e->origin);
+	HLEntSetAbsBox(e);
+
+	grounded = FALSE;
+
+	if (tr.fraction < 1.0)
+	{
+		//PM_ClipVelocity with no bounce: slide along the face it hit
+		dot = e->velocity[0] * tr.plane_normal[0] +
+			  e->velocity[1] * tr.plane_normal[1] +
+			  e->velocity[2] * tr.plane_normal[2];
+
+		for (j = 0; j < 3; j++)
+			e->velocity[j] -= tr.plane_normal[j] * dot;
+
+		//an upward face is a floor, the same 0.7 PM_CatagorizePosition uses
+		if (tr.plane_normal[2] > 0.7)
+			grounded = TRUE;
+	}
+
+	if (!grounded)
+		return;
+
+	//PM_Friction, on the horizontal only
+	speed = Sqrt(e->velocity[0] * e->velocity[0] +
+				 e->velocity[1] * e->velocity[1]);
+
+	if (speed < HLPUSH_MIN_SPEED)
+	{
+		e->velocity[0] = 0.0;
+		e->velocity[1] = 0.0;
+		return;
+	}
+
+	drop = speed;
+	if (drop < HLPUSH_STOP_SPEED)
+		drop = HLPUSH_STOP_SPEED;
+
+	drop = drop * HLPUSH_FRICTION * dt;
+
+	scale = (speed - drop) / speed;
+	if (scale < 0.0)
+		scale = 0.0;
+
+	e->velocity[0] = e->velocity[0] * scale;
+	e->velocity[1] = e->velocity[1] * scale;
+}
+
 U0 HLEntFrame(CHLMap *map, F64 dt, F64 *player_org)
 {//one server tick of the entity world
  //
@@ -9157,6 +9786,23 @@ qef_next_voice:
 qef_next_move:
 	}
 
+	//--- pushables ---------------------------------------------------------
+	//
+	// SV_Physics_Step's share. Separate from the mover pass above: that one
+	// integrates velocity with no world trace, which is correct for a brush on
+	// rails and would put a crate through a wall.
+	for (i = 0; i < hl_num_entities; i++)
+	{
+		e = &hl_entities[i];
+
+		if (!e->in_use || e->ent_class != HLC_PUSHABLE)
+			goto qef_next_push;
+
+		HLEntPushableStep(map, i, e, dt, player_org);
+
+qef_next_push:
+	}
+
 	//After the movers and before the thinks: the think pass recomputes a
 	//tracktrain's velocity and avelocity for the next tick
 	HLEntRideLogTick(player_org);
@@ -9302,6 +9948,11 @@ U0 HLEntTouchPlayer(F64 *player_org)
 	//before PM_Friction ever read it.
 	hl_surface_friction = 1.0;
 
+	//The belt, on the same terms: stepping off a func_conveyor produces no
+	//event, and a stale base velocity would carry the player forever
+	HLVecSet(hl_conveyor_velocity, 0.0, 0.0, 0.0);
+	hl_conveyor_active = FALSE;
+
 	for (i = 0; i < 3; i++)
 	{
 		pmins[i] = player_org[i] + hl_player_mins[i];
@@ -9321,7 +9972,8 @@ U0 HLEntTouchPlayer(F64 *player_org)
 		if (e->solid != HLSOLID_TRIGGER && e->touch_fn != HLM_DOOR_TOUCH &&
 			e->touch_fn != HLM_ROT_DOOR_TOUCH &&
 			e->touch_fn != HLM_BUTTON_TOUCH &&
-			e->touch_fn != HLM_CONVEYOR_TOUCH)
+			e->touch_fn != HLM_CONVEYOR_TOUCH &&
+			e->touch_fn != HLM_PUSH_MOVE_TOUCH)
 			goto qetp_next;
 
 		if (!HLEntBoxOverlap(e, pmins, pmaxs))
@@ -9389,7 +10041,8 @@ I64 HLEntUseInFront(F64 *player_org, F64 *forward, Bool held = FALSE)
 
 		if (e->use_fn != HLM_DOOR_USE && e->use_fn != HLM_BUTTON_USE &&
 			e->use_fn != HLM_TRAIN_USE && e->use_fn != HLM_ROT_DOOR_USE &&
-			e->use_fn != HLM_CHARGER_USE && e->use_fn != HLM_MOMENTARY_USE)
+			e->use_fn != HLM_CHARGER_USE && e->use_fn != HLM_MOMENTARY_USE &&
+			e->use_fn != HLM_PUSH_MOVE_USE)
 			goto qeuf_next;
 
 		//a held key reaches only the continuous classes; a door would toggle
