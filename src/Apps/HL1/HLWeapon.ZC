@@ -73,8 +73,12 @@
 //   - item_healthkit / item_battery / item_suit. those belong to the item
 //     classes in HLEntity.ZC, not to the inventory.
 //   - inventory across a changelevel. HL carries it in the transition save.
-//   - beam visuals. HLDraw has no line primitive, so the egon and gauss beams
-//     are invisible. Their damage, ammo drain and timing are real.
+//   - the glow sprites that ride the beams: the gauss exit flare and its
+//     reflection glow (R_TempSprite, ev_hldm.cpp:1011 and :1033) and the egon's
+//     EGON_FLARE_SPRITE. Those are sprites, not beams.
+//
+//     The beams themselves ARE drawn - see HLWeaponDrawBeams. Tripmine, gauss
+//     and egon, through HLDrawBeam.
 //
 //     Projectile bodies ARE drawn - see HLProjDraw. Each kind loads its own
 //     world model through the studio cache and is drawn from the per-frame
@@ -230,6 +234,10 @@ class CHLProj
 	F64	 next_hop;		//CSqueakGrenade::HuntThink cadence
 	F64	 next_puff;		//rocket trail cadence, on the render clock
 	F64	 beam_len;		//tripmine beam length at the moment it armed
+
+	//CTripmineGrenade::MakeBeam's vecTmpEnd - where the tripwire trace lands
+	//this frame. World space, valid for HLPRJ_TRIPMINE only
+	F64	 beam_end[3];
 
 	Bool bounce;		//MOVETYPE_BOUNCE rather than MOVETYPE_FLY
 	Bool on_ground;
@@ -430,6 +438,59 @@ Bool	hl_wpn_egon_on		= FALSE;
 I64		hl_wpn_egon_mode	= HLFIRE_EGON_WIDE;
 F64		hl_wpn_egon_pulse	= 0.0;	//pev->dmgtime
 F64		hl_wpn_egon_ammo	= 0.0;	//m_flAmmoUseTime
+
+//CEgon::UpdateEffect's two endpoints, refreshed on every frame the trigger is
+//down. The beam is drawn from the stored pair, not retraced in the draw pass
+F64		hl_wpn_egon_src[3];
+F64		hl_wpn_egon_hit[3];
+Bool	hl_wpn_egon_beam	= FALSE;
+
+//--- weapon beams -----------------------------------------------------------
+//
+// Three weapons carry one: the tripmine's tripwire, the gauss bolt and the
+// egon's twin strand. Sprite paths are weapons.cpp:41 (g_pModelNameLaser),
+// gauss.cpp:92 and egon.cpp:29. EV_FireGauss looks up the same smoke.spr the
+// server precaches - ev_hldm.cpp:902.
+//
+// Loaded once per session and never freed, as HLTEntLoadSprites does: the
+// files live in valve/sprites for the whole run and a map change only moves
+// what is drawn.
+
+CHLSpr	*hl_wpn_spr_laser	= NULL;		//sprites/laserbeam.spr
+CHLSpr	*hl_wpn_spr_gauss	= NULL;		//sprites/smoke.spr
+CHLSpr	*hl_wpn_spr_egon	= NULL;		//sprites/xbeam1.spr
+Bool	 hl_wpn_spr_tried	= FALSE;
+
+//The SDK's beam setters take ints and the wire format carries the scale:
+//width and scroll in 0.1s, noise amplitude in 0.01s - const.h:128-135. The
+//ints below are the SDK's own, scaled here into the world units HLDrawBeam
+//wants
+#define HLWPN_BEAM_WIDTH	0.1
+#define HLWPN_BEAM_NOISE	0.01
+#define HLWPN_BEAM_SCROLL	0.1
+
+//R_BeamPoints life for the gauss bolt, ev_hldm.cpp:952
+#define HLWPN_BEAM_LIFE		0.1
+
+//nMaxHits is 10 and the punch-through adds one exit segment. Sized past that
+//so a full-charge shot that bounces ten times keeps every segment
+#define HLWPN_BEAM_MAX		16
+
+class CHLWpnBeam
+{
+	F64	 start[3];
+	F64	 end[3];
+	F64	 width;			//world units
+	F64	 bright;		//0-255
+	F64	 die;			//render clock, tS
+	I64	 r;
+	I64	 g;
+	I64	 b;
+};
+
+//gauss only: the tripmine and egon beams are read from live state, not queued
+CHLWpnBeam	hl_wpn_beam[HLWPN_BEAM_MAX];
+I64			hl_wpn_beam_next	= 0;	//ring cursor
 
 //CHgun::m_iFirePhase, the eight point rosette the fast mode fires around
 I64		hl_wpn_hornet_phase	= 0;
@@ -716,6 +777,24 @@ U0 HLWeaponInit()
 	hl_wpn_egon_pulse = 0.0;
 	hl_wpn_egon_ammo  = 0.0;
 
+	hl_wpn_egon_beam = FALSE;
+	HLVecSet(hl_wpn_egon_src, 0.0, 0.0, 0.0);
+	HLVecSet(hl_wpn_egon_hit, 0.0, 0.0, 0.0);
+
+	//a garbage die here draws a beam through whatever the start and end words
+	//happen to hold
+	for (i = 0; i < HLWPN_BEAM_MAX; i++)
+		hl_wpn_beam[i].die = 0.0;
+
+	hl_wpn_beam_next = 0;
+
+	//this runs at build time, before the game directory is known, so the
+	//sprites are only marked absent here. HLWeaponBeamSprites does the load
+	hl_wpn_spr_laser = NULL;
+	hl_wpn_spr_gauss = NULL;
+	hl_wpn_spr_egon  = NULL;
+	hl_wpn_spr_tried = FALSE;
+
 	hl_wpn_hornet_phase  = 0;
 	hl_wpn_hornet_charge = 0.0;
 
@@ -952,6 +1031,46 @@ U0 HLWeaponInit()
 //top-level, so the state is sane before any frame
 HLWeaponInit;
 
+U0 HLWeaponBeamSprites()
+{//the three beam textures, once. Called from HLWeaponPlayerSpawn, which is a
+ //map load rather than a draw: HLSprLoad reads a pak and a read inside the
+ //frame shows as a hitch, the same reason HLProjSpawn loads its model on the
+ //shot
+ //
+ //A missing file leaves its pointer NULL and that weapon draws no beam
+	if (hl_wpn_spr_tried)
+		return;
+
+	hl_wpn_spr_tried = TRUE;
+
+	hl_wpn_spr_laser = HLSprLoad("sprites/laserbeam.spr");
+	hl_wpn_spr_gauss = HLSprLoad("sprites/smoke.spr");
+	hl_wpn_spr_egon  = HLSprLoad("sprites/xbeam1.spr");
+}
+
+U0 HLWeaponBeamAdd(F64 *start, F64 *end, F64 width, F64 bright,
+	I64 r, I64 g, I64 b)
+{//one gauss segment into the ring, on the render clock. The ring is a ring:
+ //a shot that outruns HLWPN_BEAM_MAX drops its oldest segment rather than its
+ //newest, which is the one under the crosshair
+	CHLWpnBeam *w = &hl_wpn_beam[hl_wpn_beam_next];
+
+	hl_wpn_beam_next++;
+
+	if (hl_wpn_beam_next >= HLWPN_BEAM_MAX)
+		hl_wpn_beam_next = 0;
+
+	HLVecCopy(start, w->start);
+	HLVecCopy(end, w->end);
+
+	w->width  = width;
+	w->bright = bright;
+	w->r      = r;
+	w->g      = g;
+	w->b      = b;
+	w->die    = tS + HLWPN_BEAM_LIFE;
+}
+
 //--- inventory queries ------------------------------------------------------
 
 I64 HLWeaponPool(I64 id)
@@ -1132,6 +1251,7 @@ U0 HLWeaponSetActive(I64 id)
 	HLSndStop(HLWPN_SND_ENT, HLCHAN_WEAPON);
 
 	hl_wpn_egon_on       = FALSE;
+	hl_wpn_egon_beam     = FALSE;
 	hl_wpn_gauss_state   = 0;
 	hl_wpn_gauss_primary = FALSE;
 
@@ -1383,12 +1503,21 @@ U0 HLWeaponPlayerSpawn()
 
 	hl_proj_live = 0;
 
+	for (i = 0; i < HLWPN_BEAM_MAX; i++)
+		hl_wpn_beam[i].die = 0.0;
+
+	hl_wpn_beam_next = 0;
+
+	//the game directory is live by the time this runs, and this is not a draw
+	HLWeaponBeamSprites;
+
 	hl_wpn_pump_time     = 0.0;
 	hl_wpn_gren_start    = 0.0;
 	hl_wpn_satchel_ready = 0;
 	hl_wpn_gauss_state   = 0;
 	hl_wpn_gauss_primary = FALSE;
 	hl_wpn_egon_on       = FALSE;
+	hl_wpn_egon_beam     = FALSE;
 	hl_wpn_hornet_phase  = 0;
 	hl_wpn_hornet_charge = 0.0;
 	hl_wpn_spot_on       = FALSE;
@@ -1831,6 +1960,7 @@ I64 HLProjSpawn(I64 kind, F64 *org, F64 *vel, F64 damage, F64 life,
 	p->armed     = FALSE;
 	p->owner     = owner;
 	p->beam_len  = 0.0;
+	HLVecCopy(org, p->beam_end);
 	p->arm       = 0.0;
 	p->next_hurt = 0.0;
 	p->next_hop  = 0.0;
@@ -2152,6 +2282,10 @@ U0 HLProjMineThink(CHLMap *map, I64 i)
 	HLTraceEntity(map, p->org, end, zero, zero, hl_move_pass, FALSE, &tr);
 
 	len = HLPRJ_MINE_BEAM * tr.fraction;
+
+	//MakeBeam's vecTmpEnd, tripmine.cpp:255. The drawn beam ends where the
+	//tripwire trace lands, so it is kept for the draw pass
+	HLVecCopy(tr.end_pos, p->beam_end);
 
 	if (!p->armed)
 	{
@@ -2705,13 +2839,12 @@ Bool HLWeaponMelee(CHLMap *map, F64 *src, F64 *forward, F64 damage, F64 range)
 }
 
 U0 HLWeaponFireGauss(CHLMap *map, F64 *src, F64 *aim, F64 damage, Bool primary)
-{//CGauss::Fire.
+{//CGauss::Fire, with EV_FireGauss's beam.
  //
- //NO BEAM IS DRAWN. HLDraw has no line primitive, so the visible half of this
- //weapon - the bolt, the reflections, the exit flare - is absent. Everything
- //that decides the outcome is here: the reflect-or-punch test off each
- //surface, the energy the beam loses to each, and the blast a punch-through
- //leaves at its exit. Nothing is faked with a stand-in sprite.
+ //The exit flare and the reflection glow are still absent - both are glow
+ //sprites, not beams. The bolt itself is one HLDrawBeam segment per bounce,
+ //queued here and drawn by HLWeaponDrawBeams: this runs during the weapon
+ //tick, before the frame's draw pass.
 	CHLTrace	tr;
 	CHLTrace	beam;
 	F64			dir[3];
@@ -2723,9 +2856,30 @@ U0 HLWeaponFireGauss(CHLMap *map, F64 *src, F64 *aim, F64 damage, Bool primary)
 	F64			n;
 	F64			thick;
 	F64			radius;
+	F64			bwidth;
+	F64			bbright;
+	I64			bg;
+	I64			bb;
 	I64			hits = 10;
 	I64			hit;
 	Bool		punched = FALSE;
+
+	//R_BeamPoints, ev_hldm.cpp:966-980. Width is already in world units there,
+	//and the secondary's brightness is the charge it went off at
+	if (primary)
+	{
+		bwidth  = 1.0;
+		bbright = 128.0;
+		bg      = 128;
+		bb      = 0;
+	}
+	else
+	{
+		bwidth  = 2.5;
+		bbright = damage;
+		bg      = 255;
+		bb      = 255;
+	}
 
 	HLVecSet(zero, 0.0, 0.0, 0.0);
 	HLVecCopy(aim, dir);
@@ -2742,6 +2896,11 @@ U0 HLWeaponFireGauss(CHLMap *map, F64 *src, F64 *aim, F64 damage, Bool primary)
 			return;
 
 		HLVecCopy(tr.end_pos, end);
+
+		//one segment per pass, drawn before the surface is resolved -
+		//ev_hldm.cpp:948. The first is R_BeamEntPoint from the muzzle, the rest
+		//R_BeamPoints from the bounce; both start at the current segment origin
+		HLWeaponBeamAdd(from, end, bwidth, bbright, 255, bg, bb);
 
 		hit = hl_trace_native_ent;
 
@@ -2836,13 +2995,16 @@ qwfg_again:
 U0 HLWeaponFireEgon(CHLMap *map, F64 *src, F64 *aim, F64 damage, Bool wide)
 {//CEgon::Fire.
  //
- //NO BEAM IS DRAWN, for the same reason as the gauss. The pulse timing, the
- //damage per pulse and the ammo drain are the SDK's; the beam sprite and the
- //impact flare are not available.
+ //The impact flare - EGON_FLARE_SPRITE, a sprite rather than a beam - is still
+ //absent. The pair of beams is drawn: this stores the two endpoints and
+ //HLWeaponDrawBeams lays them down, which is CEgon::UpdateEffect's split.
 	CHLTrace	tr;
 	F64			dest[3];
 	F64			zero[3];
 	I64			hit;
+
+	//an allsolid trace returns before UpdateEffect, so the beam goes with it
+	hl_wpn_egon_beam = FALSE;
 
 	HLVecSet(zero, 0.0, 0.0, 0.0);
 	HLVecMA(src, 2048.0, aim, dest);
@@ -2851,6 +3013,12 @@ U0 HLWeaponFireEgon(CHLMap *map, F64 *src, F64 *aim, F64 damage, Bool wide)
 
 	if (tr.all_solid)
 		return;
+
+	//UpdateEffect runs every frame the trigger is down, not per pulse, so the
+	//endpoints are stored ahead of the pulse gate below - egon.cpp:390
+	HLVecCopy(src, hl_wpn_egon_src);
+	HLVecCopy(tr.end_pos, hl_wpn_egon_hit);
+	hl_wpn_egon_beam = TRUE;
 
 	//pev->dmgtime: the beam only bites at the pulse interval, not every frame
 	if (hl_ent_time < hl_wpn_egon_pulse)
@@ -2891,7 +3059,10 @@ U0 HLWeaponEgonStop()
 	if (!hl_wpn_egon_on)
 		return;
 
-	hl_wpn_egon_on = FALSE;
+	hl_wpn_egon_on   = FALSE;
+
+	//EV_EgonStop drops both beams with the sound, ev_hldm.cpp:1512-1523
+	hl_wpn_egon_beam = FALSE;
 
 	//EV_EgonStop, ev_hldm.cpp:1500-1504: kill the run loop, then the shutdown.
 	//Without the stop the run sample loops for the rest of the level
@@ -4416,6 +4587,158 @@ qpd_next:
 	}
 }
 
+U0 HLWeaponBeamSpr(CHLCanvas *c, CHLSpr *sp, F64 *start, F64 *end,
+	F64 width, F64 amplitude, F64 scroll, I64 r, I64 g, I64 b, F64 bright)
+{//one beam out of a sprite. HLDrawBeam takes a texture plane rather than a
+ //CHLSpr because HLSpr.ZC compiles after HLDraw.ZC
+ //
+ //Frame 0: every weapon beam in the SDK sends startFrame 0 and framerate 0
+	CHLSprFrame	*fr;
+	I64			 lit;
+
+	if (!c || !sp || sp->num_frames < 1 || !sp->palette)
+		return;
+
+	fr = &sp->frames[0];
+
+	lit = ToI64(bright);
+
+	if (lit < 0)
+		lit = 0;
+
+	if (lit > 255)
+		lit = 255;
+
+	HLDrawBeam(c, start, end, fr->pixels, sp->palette, fr->width, fr->height,
+		width, amplitude, scroll, tS, r, g, b, lit);
+}
+
+U0 HLWeaponDrawBeams(CHLCanvas *c)
+{//the three weapon beams, depth tested against the world and additive over it.
+ //Runs after the world and entity passes; it writes no depth
+ //
+ //BEAM_FSINE on the egon core - egon.cpp:435 - has no counterpart here.
+ //HLDrawBeam carries one noise waveform, so the core wobbles like the strand
+ //instead of as a clean sine
+	CHLProj		*p;
+	CHLWpnBeam	*w;
+	F64			 blend;
+	F64			 pulse;
+	F64			 core_scroll;
+	F64			 core_noise;
+	F64			 hum_noise;
+	I64			 cr;
+	I64			 cg;
+	I64			 hr;
+	I64			 hg;
+	I64			 hb;
+	I64			 i;
+
+	if (!c || !hl_map)
+		return;
+
+	//--- tripmine, CTripmineGrenade::MakeBeam, tripmine.cpp:257-261 ---
+	//
+	//MakeBeam runs out of PowerupThink, so an unarmed mine has no wire.
+	//BeamCreate width 10, SetScrollRate 255, SetColor(0,214,198),
+	//SetBrightness 64, and no SetNoise
+
+	if (hl_wpn_spr_laser)
+	{
+		for (i = 0; i < HLPROJ_MAX; i++)
+		{
+			p = &hl_proj[i];
+
+			if (p->kind != HLPRJ_TRIPMINE || !p->armed)
+				goto qwdb_mine;
+
+			HLWeaponBeamSpr(c, hl_wpn_spr_laser, p->org, p->beam_end,
+				10.0 * HLWPN_BEAM_WIDTH, 0.0, 255.0 * HLWPN_BEAM_SCROLL,
+				0, 214, 198, 64.0);
+
+qwdb_mine:
+		}
+	}
+
+	//--- gauss, EV_FireGauss, ev_hldm.cpp:966-980 ---
+	//
+	//Colour, width and brightness were fixed when the segment was queued; only
+	//the 0.1s life is read here
+
+	if (hl_wpn_spr_gauss)
+	{
+		for (i = 0; i < HLWPN_BEAM_MAX; i++)
+		{
+			w = &hl_wpn_beam[i];
+
+			if (tS >= w->die)
+				goto qwdb_ring;
+
+			HLWeaponBeamSpr(c, hl_wpn_spr_gauss, w->start, w->end,
+				w->width, 0.0, 0.0, w->r, w->g, w->b, w->bright);
+
+qwdb_ring:
+		}
+	}
+
+	//--- egon, CEgon::CreateEffect and UpdateEffect, egon.cpp:398-471 ---
+
+	if (!hl_wpn_egon_on || !hl_wpn_egon_beam || !hl_wpn_spr_egon)
+		return;
+
+	//timedist, egon.cpp:334 and :386 - how much of the pulse interval is left,
+	//clamped to 0..1 and inverted, so it runs 0 to 1 as the bite approaches
+	blend = (hl_wpn_egon_pulse - hl_ent_time) / 0.1;
+
+	if (blend < 0.0)
+		blend = 0.0;
+
+	if (blend > 1.0)
+		blend = 1.0;
+
+	blend = 1.0 - blend;
+
+	//the blue channel the core flickers on. The SDK samples the server clock;
+	//a beam is visual, so this is the render clock
+	pulse = 64.0 + 80.0 * Abs(Sin(tS * 10.0));
+
+	if (hl_wpn_egon_mode == HLFIRE_EGON_WIDE)
+	{
+		cr          = ToI64(30.0 + 25.0 * blend);
+		cg          = ToI64(30.0 + 30.0 * blend);
+		core_scroll = 50.0;
+		core_noise  = 20.0;
+		hum_noise   = 8.0;
+		hr          = 50;
+		hg          = 50;
+		hb          = 255;
+	}
+	else
+	{
+		cr          = ToI64(60.0 + 25.0 * blend);
+		cg          = ToI64(120.0 + 30.0 * blend);
+		core_scroll = 110.0;
+		core_noise  = 5.0;
+		hum_noise   = 2.0;
+		hr          = 80;
+		hg          = 120;
+		hb          = 255;
+	}
+
+	//core: BeamCreate width 40, then SetWidth(40 - timeBlend*20) and
+	//SetBrightness(255 - timeBlend*180) every frame - egon.cpp:407-408
+	HLWeaponBeamSpr(c, hl_wpn_spr_egon, hl_wpn_egon_src, hl_wpn_egon_hit,
+		(40.0 - blend * 20.0) * HLWPN_BEAM_WIDTH,
+		core_noise * HLWPN_BEAM_NOISE, core_scroll * HLWPN_BEAM_SCROLL,
+		cr, cg, ToI64(pulse), 255.0 - blend * 180.0);
+
+	//the strand over it: BeamCreate width 55, brightness 100, scroll 25, and a
+	//colour of its own that never tracks the pulse - egon.cpp:441-444
+	HLWeaponBeamSpr(c, hl_wpn_spr_egon, hl_wpn_egon_src, hl_wpn_egon_hit,
+		55.0 * HLWPN_BEAM_WIDTH, hum_noise * HLWPN_BEAM_NOISE,
+		25.0 * HLWPN_BEAM_SCROLL, hr, hg, hb, 100.0);
+}
+
 U0 HLWeaponDrawViewModel(CHLCanvas *c)
 {//the first-person weapon
  //
@@ -5264,6 +5587,11 @@ U0 HLWeaponHudHook(CHLCanvas *c)
 	//the world layer first: projectile bodies are depth tested against the
 	//scene, the view model sits over them, and the 2D overlay over both
 	HLProjDraw(c);
+
+	//beams after the bodies: additive and depth tested, writing no depth, so a
+	//tripmine's wire crosses in front of its own body. HLWeaponFrame above has
+	//already run, so these are this frame's endpoints, not last frame's
+	HLWeaponDrawBeams(c);
 
 	//the gun under the reticle, both under whatever HLHudDraw prints next
 	HLWeaponDrawViewModel(c);
