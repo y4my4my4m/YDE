@@ -32,6 +32,10 @@ game.
 - **Truecolor canvas** — `CHLCanvas.pixels` is `0x00RRGGBB`. Gamma and the
   damage/water tint are applied in the blit rather than the palette, so they
   cover the world as well as the 2D layer.
+- **Mip selection** is texels per screen pixel, using the texinfo vector length
+  as Quake's `mipadjust` does, not distance alone. HL scales its textures far
+  more than Quake and ships them at 128 or 256 against Quake's 64, so ignoring
+  the vector length costs one to two mip levels on most world geometry.
 - **Four clip hulls** — 32x32x72 standing, 64x64x64 large, 32x32x36 ducked.
 - **Studio models** (`IDST` v10) — `HLStudio.ZC`. Bones, RLE animation
   channels, quaternion slerp, two-way blends, bodyparts/submodels/meshes,
@@ -47,8 +51,14 @@ game.
 
 - **Player movement** — air acceleration with the 30-unit target cap
   (airstrafing), half-gravity leapfrog integration, jump at `sqrt(2*800*45)`
-  with bunnyhop scaling and no auto-hop, and a duck state machine that swaps to
-  hull 3. Duck is bound to `c`.
+  with bunnyhop scaling and no auto-hop. Duck is bound to `c`.
+- **Ducking** follows `PM_Duck`/`PM_UnDuck`: the press edge arms a 1s timer, the
+  transition completes after `TIME_TO_DUCK` 0.4s or immediately when airborne,
+  the origin drops 18 units so the feet stay put, `PM_FixPlayerCrouchStuck`
+  nudges up to 36 units if the smaller hull lands inside geometry, unducking
+  traces the raised position with both hulls before committing, and the command
+  is scaled by 0.333 while ducked. The view eases to `VEC_DUCK_VIEW - fMore`,
+  below the ducked eye height, because the origin has not moved yet.
 - **Ladders, water and falling** — `PM_Ladder` plane decomposition,
   `PM_WaterMove`, `PM_CheckWaterJump`, `PM_CheckFalling` damage and sound
   tiers, conveyor base velocity.
@@ -57,6 +67,15 @@ game.
   method-ID virtual dispatch, `SUB_UseTargets` with delay and killtarget,
   `SUB_CalcMove`, master/multisource gating, pusher movement that carries the
   player. `+use` is bound to `e`.
+- **Trains** — `func_train` walks `path_corner`; `func_tracktrain` walks
+  `path_track` and yaws to the direction of travel, with Valve's 180 degree
+  offset because tracktrain brushwork is modelled facing west. Its collision
+  hull turns with it.
+- **Animation events** — `mstudioevent_t` is decoded per sequence and dispatched
+  from the frame the tick stepped over, not the frame it landed on. The shared
+  script events are interpreted: 1004 and 1008 play the sound named in
+  `options` on CHAN_BODY and CHAN_VOICE with a real entnum, 1005 and 1010 speak
+  a sentence. This is where most monster foley and vocalisation lives.
 - **Entity coverage** — every classname in all 125 shipped maps is recognised
   (41513/41513). Doors, buttons, trains and `path_corner`/`path_track`, the
   `trigger_*` family, `multi_manager`, `multisource`, switchable lights,
@@ -94,11 +113,27 @@ game.
 
 ### Menu
 
-The main menu follows HL's VGUI layout: the tiled backdrop from
-`resource/background`, a left-aligned item column, and the armed item's help
-text to its right. Items, order, `OnlyInGame` filtering, strings and colours
-come from `resource/GameMenu.res`, `resource/gameui_english.txt` and
-`resource/ClientScheme.res`. Submenus still use the Quake page furniture.
+Built from the shipped `resource/` files rather than approximated.
+
+- **Main menu** — the tiled backdrop composited from
+  `resource/background/800_*.tga` (12 TGA tiles, 4x3 at 256 pitch, cropping to
+  exactly 800x600, nearest-neighbour scaled to the canvas), a left-aligned item
+  column, and the armed item's help text to its right. Items, order and
+  `OnlyInGame` filtering from `GameMenu.res`; labels and hints from
+  `gameui_english.txt`; colours from `ClientScheme.res` — `BrightControlText`
+  for items, white for armed, `DimBaseText` for help.
+- **Dialogs** — New Game with the `#GameUI_Difficulty` combo (skill 1/2/3,
+  default Medium), and multi-slot Save Game and Load Game lists. All three are
+  laid out at their `.res` coordinates, which are authored in 800x600 space, on
+  a `ControlBG`-blended panel.
+- **Options** — HL's tabbed dialog. Keyboard, Aim, Audio and Video, with the
+  labels from `OptionsSub*.res`. Multiplayer, Voice and Lock are not shown:
+  nothing in this port drives them. Row 0 of each page is the tab strip, so Up
+  from the first control reaches it and Left/Right there changes page.
+- Text is recoloured per glyph rather than drawn in the font's own colours:
+  CONCHARS glyphs are pre-coloured orange over a dark outline, so a flat colour
+  is modulated by each texel's luminance. That keeps the outline and stays
+  legible over a photograph.
 
 There is no screen-size option and `-`/`=` are unbound: Quake shrank the 3D
 view inside the status bar, HL always renders full screen.
@@ -113,9 +148,10 @@ view inside the status bar, HL always renders full screen.
   teleports the actor to the mark for the same reason.
 - **Monster-vs-monster and monster-vs-player collision.** `HLTraceEntity`
   clips `SOLID_BSP` only; nothing traces a `SLIDEBOX`.
-- **Animation events** (`mstudioevent_t`). The studio layer decodes bones, not
-  events, so an attack lands at the end of its sequence rather than on the
-  frame the claw connects.
+- **Per-monster animation events.** The shared script events (1004/1005/1008/
+  1010) are dispatched. Codes at 2000 and above are interpreted by each
+  monster's own `HandleAnimEvent`, which does not exist here, so an attack still
+  lands at the end of its sequence rather than on the frame the claw connects.
 - **Runtime entity creation** — `monstermaker`, `env_shooter`, `gibshooter`.
   `hl_entities` is sized to the parsed map and nothing allocates a slot
   mid-game. That is an entity-table lifetime change, not a missing class.
@@ -127,8 +163,10 @@ view inside the status bar, HL always renders full screen.
   chrome skins, attachments, four-way blends, per-vertex lighting from the
   model normals. Everything is flat-lit from `HLLightPoint` at the entity
   origin.
-- **Save/load for the native entity system.** `HLSave.ZC` still serialises the
-  QuakeC world, which no longer exists.
+- **Save/load for the native entity system.** The menu writes and lists eight
+  slots, but `HLSave.ZC` still serialises the QuakeC world, which no longer
+  exists: a restored game gets the player back and an unmodified map. Entity
+  state is not in the file.
 - **`svc_packetentities`** — field encoding is done, the frame header is not.
   Off by one bit and every entity decodes as garbage at a plausible origin.
 
