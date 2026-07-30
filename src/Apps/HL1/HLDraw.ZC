@@ -1272,6 +1272,110 @@ I64 HLTextureAnimation(CHLMap *map, I64 miptex, I64 frame, F64 time)
 	return idx;
 }
 
+//--- sky -------------------------------------------------------------------
+//
+// GoldSrc has no scrolling sky. It draws a six-face skybox from
+// gfx/env/<skyname>{rt,lf,bk,ft,up,dn}.tga and clips it to the surfaces whose
+// texture is named "sky". worldspawn's "skyname" key names the set and is
+// forwarded to the sv_skyname cvar, dlls/world.cpp:674.
+//
+// The BSP's "sky" miptex is 16x16 with a zero data offset - boot_camp.bsp and
+// c1a3b.bsp both carry exactly that - so it holds no image. Quake's two 128x128
+// scrolling layers have nothing to read there and the path drew nothing.
+//
+// Face axes are GLQuake's st_to_vec and skytexorder from gl_warp.c, inverted
+// to go from a view ray to a face and a texel. Writing a face's ray as
+// v(s,t) = A + s*S + t*T with s and t in -1..1:
+//
+//   rt   A +x   S -y   T +z
+//   lf   A -x   S +y   T +z
+//   bk   A +y   S +x   T +z
+//   ft   A -y   S -x   T +z
+//   up   A +z   S -y   T -x
+//   dn   A -z   S -y   T +x
+//
+// with u = (s+1)/2 and v = (1-t)/2 across the image, v growing down the rows.
+// Checked against the shipped desert set: under this mapping every shared edge
+// of every face pair agrees to a mean per-channel error of 7 to 22 of 255,
+// against 67 to 85 for any other pairing, reversal or flip.
+
+#define HLSKY_FACES		6
+#define HLSKY_RT			0
+#define HLSKY_LF			1
+#define HLSKY_BK			2
+#define HLSKY_FT			3
+#define HLSKY_UP			4
+#define HLSKY_DN			5
+
+//sv_skyname's engine default. worldspawn omits the key on maps with no sky
+#define HLSKY_DEFAULT	"desert"
+
+U32	*hl_sky_pix[HLSKY_FACES];	//0x00RRGGBB, one owned block per face
+I64	 hl_sky_w[HLSKY_FACES];
+I64	 hl_sky_h[HLSKY_FACES];
+U8	 hl_sky_name[64];			//loaded set, empty when none
+U32	 hl_sky_solid	= 0;			//sv_skycolor, drawn where a face is missing
+Bool hl_sky_ready	= FALSE;
+
+//the map the loaded set belongs to. HLLoadMap frees the old CHLMap before
+//allocating the new one and the allocator reuses the address, so the pointer
+//alone cannot tell two maps apart
+CHLMap	*hl_sky_map = NULL;
+U8		 hl_sky_map_name[96];
+
+//underwater view distortion, set from the player's water level. amount is in
+//source pixels of sideways shear, zero disables the path
+F64 hl_warp_amount = 0.0;
+F64 hl_warp_time   = 0.0;
+
+U8 *HLSkySuffix(I64 face)
+{//file name suffix per face, GoldSrc's own
+	if (face == HLSKY_RT)	return "rt";
+	if (face == HLSKY_LF)	return "lf";
+	if (face == HLSKY_BK)	return "bk";
+	if (face == HLSKY_FT)	return "ft";
+	if (face == HLSKY_UP)	return "up";
+
+	return "dn";
+}
+
+U0 HLSkyFree()
+{//release the loaded set. HLSkyInit runs first and nulls the table, so a NULL
+ //here is a face that never loaded, not startup garbage
+	I64 i;
+
+	for (i = 0; i < HLSKY_FACES; i++)
+	{
+		if (hl_sky_pix[i])
+			Free(hl_sky_pix[i]);
+
+		hl_sky_pix[i] = NULL;
+		hl_sky_w[i]   = 0;
+		hl_sky_h[i]   = 0;
+	}
+
+	hl_sky_ready   = FALSE;
+	hl_sky_name[0] = 0;
+}
+
+U0 HLSkyInit()
+{//before any face is ever loaded, when hl_sky_pix holds startup garbage
+	I64 i;
+
+	for (i = 0; i < HLSKY_FACES; i++)
+	{
+		hl_sky_pix[i] = NULL;
+		hl_sky_w[i]   = 0;
+		hl_sky_h[i]   = 0;
+	}
+
+	hl_sky_ready       = FALSE;
+	hl_sky_name[0]     = 0;
+	hl_sky_solid       = 0;
+	hl_sky_map         = NULL;
+	hl_sky_map_name[0] = 0;
+}
+
 //--- surface cache ----------------------------------------------------------
 //
 // D_CacheSurface. a wall is not lit per pixel per frame - the texture is built
@@ -1333,6 +1437,11 @@ U0 HLSurfCacheInit()
 {//globals are not zeroed, and every pointer here goes to Free on map load -
  //garbage faults inside the allocator, nowhere near here
 	I64 i;
+
+	//the sky faces are freed on map load for the same reason and this is the
+	//only one-time init the shell calls. HLLightInit runs again at every level
+	//start and would leak the loaded set
+	HLSkyInit;
 
 	for (i = 0; i < HLSURF_SLOTS; i++)
 	{
@@ -2247,69 +2356,309 @@ U0 HLDrawPolygon(CHLCanvas *c, CHLScreenVert *v, I64 count,
 	}
 }
 
-//--- sky -------------------------------------------------------------------
+//--- sky faces ------------------------------------------------------------
 //
-// a sky texture is 256x128 holding two 128x128 layers side by side: RIGHT is
-// the solid starfield, LEFT is clouds where index 0 shows the layer behind
-//
-// sky is textured by the direction from the eye through each pixel, not by
-// surface position, so it never slides as the player walks. the direction is
-// flattened vertically onto a fixed-radius dome and the two layers scroll at
-// different speeds for parallax
+// Loading and sampling. The state and its init live above, with the surface
+// cache, because both are freed on map load.
 
-#define HLSKY_LAYER		128		//each layer is 128x128
-#define HLSKY_MASK		127
-#define HLSKY_DOME		378.0	//dome radius
-#define HLSKY_FLATTEN	3.0		//vertical squash, reads as a ceiling
-#define HLSKY_SPEED_BG	8.0		//starfield drift, units/sec
-#define HLSKY_SPEED_FG	16.0	//clouds twice as fast, parallax
+Bool HLSkyLoadFace(U8 *name, I64 face)
+{//one gfx/env face into an owned 0x00RRGGBB block
+ //
+ //the CDC body is 0xFFRRGGBB and its rows are width_internal apart, so the
+ //copy is per row and masks the top byte off
+	U8	*data;
+	U8	*sfx;
+	CDC	*dc;
+	U32	*out;
+	U8	 path[96];
+	I64	 size = 0;
+	I64	 w;
+	I64	 h;
+	I64	 x;
+	I64	 y;
 
-F64 hl_sky_time = 0.0;
+	sfx = HLSkySuffix(face);
+	StrPrint(path, "gfx/env/%s%s.tga", name, sfx);
 
-//underwater view distortion, set from the player's water level. amount is in
-//source pixels of sideways shear, zero disables the path
-F64 hl_warp_amount = 0.0;
-F64 hl_warp_time   = 0.0;
+	data = HLFileLoad(path, &size);
+	if (!data)
+		return FALSE;
 
-U0 HLDrawSkySpan(CHLCanvas *c, I64 y, I64 x1, I64 x2, F64 iz1, F64 iz2,
-	CHLTexture *tex)
-{//build the view ray, warp onto the dome, sample both layers. the ray is
- //linear across the span so it steps, only the rescale needs a sqrt
+	dc = TGAReadBuf(data, size);
+	Free(data);
+
+	if (!dc)
+		return FALSE;
+
+	w = dc->width;
+	h = dc->height;
+
+	if (w < 1 || h < 1)
+	{
+		DCDel(dc);
+		return FALSE;
+	}
+
+	out = MAlloc(w * h * sizeof(U32));
+
+	if (!out)
+	{
+		DCDel(dc);
+		return FALSE;
+	}
+
+	for (y = 0; y < h; y++)
+	{
+		for (x = 0; x < w; x++)
+			out[y * w + x] = dc->body[y * dc->width_internal + x] & 0x00FFFFFF;
+	}
+
+	DCDel(dc);
+
+	hl_sky_pix[face] = out;
+	hl_sky_w[face]   = w;
+	hl_sky_h[face]   = h;
+
+	return TRUE;
+}
+
+U0 HLSkyLoad(U8 *name)
+{//R_LoadSkys. a missing face draws hl_sky_solid rather than failing the set:
+ //some third party skies ship five files
+	I64 ok = 0;
+	I64 i;
+
+	HLSkyFree;
+
+	if (!name || !name[0])
+		return;
+
+	HLStrCopy(hl_sky_name, name, 64);
+
+	for (i = 0; i < HLSKY_FACES; i++)
+	{
+		if (HLSkyLoadFace(name, i))
+			ok++;
+	}
+
+	if (ok > 0)
+		hl_sky_ready = TRUE;
+	else
+		hl_sky_name[0] = 0;
+}
+
+U0 HLSkySetColor(I64 r, I64 g, I64 b)
+{//sv_skycolor_r/g/b, set from light_environment - dlls/lights.cpp:173
+	hl_sky_solid = (ClampI64(r, 0, 255) << 16) |
+				   (ClampI64(g, 0, 255) << 8) |
+					ClampI64(b, 0, 255);
+}
+
+U0 HLSkyNameFromMap(CHLMap *map, U8 *out, I64 max)
+{//worldspawn's "skyname" value out of the entity lump. empty when absent
+	U8	*e;
+	I64	 n;
+	I64	 i;
+	I64	 j;
+	I64	 k;
+
+	out[0] = 0;
+
+	if (!map || !map->entities || map->entities_size < 12)
+		return;
+
+	e = map->entities;
+	n = map->entities_size;
+
+	//the key is quoted, seven characters between the quotes
+	for (i = 0; i + 9 < n; i++)
+	{
+		if (e[i] != '"' || e[i + 8] != '"')
+			goto qsn_next;
+		if (StrNICompare(&e[i + 1], "skyname", 7))
+			goto qsn_next;
+
+		j = i + 9;
+
+		while (j < n && e[j] != '"')
+			j++;
+		j++;
+
+		k = 0;
+		while (j < n && k < max - 1 && e[j] != '"')
+		{
+			out[k] = e[j];
+			k++;
+			j++;
+		}
+
+		out[k] = 0;
+		return;
+
+qsn_next:
+	}
+}
+
+U0 HLSkySetName(U8 *name)
+{//sv_skyname arriving from the server, overriding worldspawn
+	if (!name || !name[0])
+		return;
+
+	if (hl_sky_ready && !StrICompare(hl_sky_name, name))
+		return;
+
+	HLSkyLoad(name);
+
+	//claim the current map so the per-frame check does not undo this
+	hl_sky_map = hl_surf_map;
+	HLStrCopy(hl_sky_map_name, hl_map_name, 96);
+}
+
+U0 HLSkyCheckMap(CHLMap *map)
+{//load the set this map asks for, once per map
+	U8 name[64];
+
+	if (map == hl_sky_map && !StrCompare(hl_sky_map_name, hl_map_name))
+		return;
+
+	hl_sky_map = map;
+	HLStrCopy(hl_sky_map_name, hl_map_name, 96);
+
+	HLSkyNameFromMap(map, name, 64);
+
+	if (!name[0])
+		HLStrCopy(name, HLSKY_DEFAULT, 64);
+
+	HLSkyLoad(name);
+}
+
+U0 HLSkyRay(F64 *d, I64 *_face, F64 *_u, F64 *_v)
+{//view ray to face and texel. st_to_vec inverted - see the table above
+	F64 ax;
+	F64 ay;
+	F64 az;
+	F64 den;
+	F64 s;
+	F64 t;
+	I64 face;
+
+	ax = d[0];
+	if (ax < 0.0)
+		ax = -ax;
+	ay = d[1];
+	if (ay < 0.0)
+		ay = -ay;
+	az = d[2];
+	if (az < 0.0)
+		az = -az;
+
+	if (ax >= ay && ax >= az)
+	{
+		if (d[0] > 0.0)
+		{
+			face = HLSKY_RT;	den =  d[0];	s = -d[1];	t =  d[2];
+		}
+		else
+		{
+			face = HLSKY_LF;	den = -d[0];	s =  d[1];	t =  d[2];
+		}
+	}
+	else if (ay >= az)
+	{
+		if (d[1] > 0.0)
+		{
+			face = HLSKY_BK;	den =  d[1];	s =  d[0];	t =  d[2];
+		}
+		else
+		{
+			face = HLSKY_FT;	den = -d[1];	s = -d[0];	t =  d[2];
+		}
+	}
+	else
+	{
+		if (d[2] > 0.0)
+		{
+			face = HLSKY_UP;	den =  d[2];	s = -d[1];	t = -d[0];
+		}
+		else
+		{
+			face = HLSKY_DN;	den = -d[2];	s = -d[1];	t =  d[0];
+		}
+	}
+
+	//den is the dominant magnitude and cannot be zero for a real ray
+	if (den < 0.000001)
+		den = 0.000001;
+
+	s /= den;
+	t /= den;
+
+	*_face = face;
+	*_u    = (s + 1.0) * 0.5 * ToF64(hl_sky_w[face]);
+	*_v    = (1.0 - t) * 0.5 * ToF64(hl_sky_h[face]);
+}
+
+U32 HLSkyTexel(I64 face, F64 u, F64 v)
+{//nearest texel, clamped. the ray is exact only at block ends, so an
+ //interpolated coordinate can land one outside at a face edge
+	U32	*p;
+	I64	 w;
+	I64	 h;
+	I64	 iu;
+	I64	 iv;
+
+	if (!hl_sky_ready || face < 0 || face >= HLSKY_FACES)
+		return hl_sky_solid;
+
+	p = hl_sky_pix[face];
+	if (!p)
+		return hl_sky_solid;
+
+	w  = hl_sky_w[face];
+	h  = hl_sky_h[face];
+	iu = ToI64(u);
+	iv = ToI64(v);
+
+	if (iu < 0)
+		iu = 0;
+	if (iu >= w)
+		iu = w - 1;
+	if (iv < 0)
+		iv = 0;
+	if (iv >= h)
+		iv = h - 1;
+
+	return p[iv * w + iu];
+}
+
+U0 HLDrawSkySpan(CHLCanvas *c, I64 y, I64 x1, I64 x2, F64 iz1, F64 iz2)
+{//one run of sky. the ray is linear across the span, the cube projection is
+ //not, so it is solved exactly at block ends and interpolated between
+ //
+ //the depth TEST uses the sky surface's own 1/z, so geometry already drawn in
+ //front of it wins. the depth WRITE is zero, the far value the buffer clears
+ //to, so the skybox sits behind everything drawn after it as well
 	U32	*row;
-	U8	*texels;
-	U8	*pal;
 	F64	*zrow;
 	F64	 dir[3];
 	F64	 step[3];
+	F64	 cur[3];
 	F64	 sxf;
 	F64	 syf;
-	F64	 vx;
-	F64	 vy;
-	F64	 vz;
-	F64	 len;
-	F64	 scale;
-	F64	 dx;
-	F64	 dy;
 	F64	 span;
 	F64	 d_iz;
 	F64	 iz;
-	F64	 bg;
-	F64	 fg;
+	F64	 u0, v0;
+	F64	 u1, v1;
+	F64	 du, dv;
+	F64	 u, v;
+	I64	 f0;
+	I64	 f1;
+	I64	 fc;
 	I64	 x;
-	I64	 tw;
-	I64	 s1;
-	I64	 t1;
-	I64	 s2;
-	I64	 t2;
-	I64	 texel;
-	I64	 cloud;
-	I64	 i;
 	I64	 xe;
 	I64	 n;
-	F64	 dx_e;
-	F64	 dy_e;
-	F64	 ddx;
-	F64	 ddy;
+	I64	 i;
 
 	//clipped to the VIEW RECT, not the canvas - outside is border or sbar
 	if (y < c->vy || y >= c->vy + c->vh)
@@ -2321,20 +2670,14 @@ U0 HLDrawSkySpan(CHLCanvas *c, I64 y, I64 x1, I64 x2, F64 iz1, F64 iz2,
 
 	d_iz = (iz2 - iz1) / span;
 
-	if (x1 < 0)
+	if (x1 < c->vx)
 	{
-		iz1 += d_iz * ToF64(-x1);
-		x1 = c->vx;
+		iz1 += d_iz * ToF64(c->vx - x1);
+		x1   = c->vx;
 	}
 	if (x2 > c->vx + c->vw)
 		x2 = c->vx + c->vw;
 	if (x1 >= x2)
-		return;
-
-	tw     = tex->width;
-	texels = tex->texels[0];
-	pal    = tex->palette;
-	if (!texels || !pal || tw < 2 * HLSKY_LAYER || tex->height < HLSKY_LAYER)
 		return;
 
 	hl_rs_sky_px += x2 - x1;
@@ -2349,32 +2692,12 @@ U0 HLDrawSkySpan(CHLCanvas *c, I64 y, I64 x1, I64 x2, F64 iz1, F64 iz2,
 		step[i] = c->right[i] / c->x_scale;
 	}
 
-	bg = hl_sky_time * HLSKY_SPEED_BG;
-	fg = hl_sky_time * HLSKY_SPEED_FG;
-
 	row  = c->pixels + y * c->width;
 	zrow = c->depth + y * c->width;
 	iz   = iz1;
+	x    = x1;
 
-	//the dome warp costs a sqrt and a divide, so it goes at block boundaries
-	//only - the sky is smooth and distant, the error is invisible
-	vx  = dir[0];
-	vy  = dir[1];
-	vz  = dir[2] * HLSKY_FLATTEN;
-	len = Sqrt(vx * vx + vy * vy + vz * vz);
-	if (len > 0.0)
-	{
-		scale = HLSKY_DOME / len;
-		dx    = vx * scale;
-		dy    = vy * scale;
-	}
-	else
-	{
-		dx = 0.0;
-		dy = 0.0;
-	}
-
-	x = x1;
+	HLSkyRay(dir, &f0, &u0, &v0);
 
 	while (x < x2)
 	{
@@ -2383,70 +2706,70 @@ U0 HLDrawSkySpan(CHLCanvas *c, I64 y, I64 x1, I64 x2, F64 iz1, F64 iz2,
 			xe = x2;
 		n = xe - x;
 
-		//ray at the far end of this block, warped exactly
-		vx  = dir[0] + step[0] * ToF64(n);
-		vy  = dir[1] + step[1] * ToF64(n);
-		vz  = (dir[2] + step[2] * ToF64(n)) * HLSKY_FLATTEN;
-		len = Sqrt(vx * vx + vy * vy + vz * vz);
+		for (i = 0; i < 3; i++)
+			cur[i] = dir[i] + step[i] * ToF64(n);
 
-		if (len > 0.0)
+		HLSkyRay(cur, &f1, &u1, &v1);
+
+		if (f1 == f0)
 		{
-			scale = HLSKY_DOME / len;
-			dx_e  = vx * scale;
-			dy_e  = vy * scale;
+			//one face across the block: u and v step
+			du = (u1 - u0) / ToF64(n);
+			dv = (v1 - v0) / ToF64(n);
+			u  = u0;
+			v  = v0;
+			fc = f0;
+
+			while (x < xe)
+			{
+				if (iz > zrow[x])
+				{
+					row[x]  = HLSkyTexel(fc, u, v);
+					zrow[x] = 0.0;
+				}
+
+				u  += du;
+				v  += dv;
+				iz += d_iz;
+				x++;
+			}
 		}
 		else
 		{
-			dx_e = dx;
-			dy_e = dy;
-		}
+			//the block crosses an edge, where the two faces' coordinates have
+			//nothing in common. solve every pixel
+			for (i = 0; i < 3; i++)
+				cur[i] = dir[i];
 
-		ddx = (dx_e - dx) / ToF64(n);
-		ddy = (dy_e - dy) / ToF64(n);
-
-		while (x < xe)
-		{
-			if (iz > zrow[x])
+			while (x < xe)
 			{
-				//clouds in front, index 0 there lets the starfield show
-				s2    = ToI64(Floor(fg + dx)) & HLSKY_MASK;
-				t2    = ToI64(Floor(fg + dy)) & HLSKY_MASK;
-				cloud = texels[t2 * tw + s2];
-
-				if (cloud)
-					texel = cloud;
-				else
+				if (iz > zrow[x])
 				{
-					s1    = ToI64(Floor(bg + dx)) & HLSKY_MASK;
-					t1    = ToI64(Floor(bg + dy)) & HLSKY_MASK;
-					texel = texels[t1 * tw + s1 + HLSKY_LAYER];
+					HLSkyRay(cur, &fc, &u, &v);
+					row[x]  = HLSkyTexel(fc, u, v);
+					zrow[x] = 0.0;
 				}
 
-				//sky is emissive, never shaded. HL sky textures carry their
-				//own palette like every other miptex
-				row[x]  = (pal[texel * 3] << 16) |
-						  (pal[texel * 3 + 1] << 8) |
-						   pal[texel * 3 + 2];
-				zrow[x] = iz;
+				cur[0] += step[0];
+				cur[1] += step[1];
+				cur[2] += step[2];
+				iz     += d_iz;
+				x++;
 			}
-
-			dx += ddx;
-			dy += ddy;
-			iz += d_iz;
-			x++;
 		}
 
-		dir[0] += step[0] * ToF64(n);
-		dir[1] += step[1] * ToF64(n);
-		dir[2] += step[2] * ToF64(n);
-		dx      = dx_e;
-		dy      = dy_e;
+		for (i = 0; i < 3; i++)
+			dir[i] += step[i] * ToF64(n);
+
+		f0 = f1;
+		u0 = u1;
+		v0 = v1;
 	}
 
 	c->spans_drawn++;
 }
 
-U0 HLDrawSkyPolygon(CHLCanvas *c, CHLScreenVert *v, I64 count, CHLTexture *tex)
+U0 HLDrawSkyPolygon(CHLCanvas *c, CHLScreenVert *v, I64 count)
 {//same edge walk as the textured path, but only depth interpolates - the
  //texture comes from the view ray, not surface coords
 	F64	 y_min = 1.0e30;
@@ -2529,7 +2852,7 @@ U0 HLDrawSkyPolygon(CHLCanvas *c, CHLScreenVert *v, I64 count, CHLTexture *tex)
 		}
 
 		if (found && xr > xl)
-			HLDrawSkySpan(c, y, ToI64(Ceil(xl)), ToI64(Ceil(xr)), izl, izr, tex);
+			HLDrawSkySpan(c, y, ToI64(Ceil(xl)), ToI64(Ceil(xr)), izl, izr);
 	}
 }
 
@@ -2672,7 +2995,12 @@ U0 HLDrawFace(CHLCanvas *c, CHLMap *map, I64 face_index, F64 *offset = NULL,
 	}
 
 	if (tex->is_sky)
-		HLDrawSkyPolygon(c, scr, count, tex);
+	{
+		//the miptex is a 16x16 stub, so the sky surface is a stencil and the
+		//image comes from gfx/env. The set is per map and loaded on first use
+		HLSkyCheckMap(map);
+		HLDrawSkyPolygon(c, scr, count);
+	}
 	else
 	{
 		//D_MipLevelForScale. The decision is texels per screen pixel at the
