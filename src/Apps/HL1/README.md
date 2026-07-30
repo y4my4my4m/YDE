@@ -69,8 +69,11 @@ game.
   player. `+use` is bound to `e`.
 - **Trains** — `func_train` walks `path_corner`; `func_tracktrain` walks
   `path_track` and yaws to the direction of travel, with Valve's 180 degree
-  offset because tracktrain brushwork is modelled facing west. Its collision
-  hull turns with it.
+  offset because tracktrain brushwork is modelled facing west.
+- **Path node pass-fires** — a `path_track`'s `message` key names an entity to
+  fire as the train passes, which is not the same as its `target` (the next
+  node). c0a0's entire opening hangs off this: `trainstop8` opens the room2
+  door, `trainstop9` runs the scientist script, `trainstop11` fades out.
 - **Animation events** — `mstudioevent_t` is decoded per sequence and dispatched
   from the frame the tick stepped over, not the frame it landed on. The shared
   script events are interpreted: 1004 and 1008 play the sound named in
@@ -107,7 +110,24 @@ game.
   the game code resolves, not as paths), `ambient_generic` loops, the
   `movesnd`/`stopsnd`/`sounds`/`volume` keys, and distance-cadenced footsteps.
   Twelve ambient voices: a map ships 60+ `ambient_generic`, and at Quake's
-  three only the nearest three are ever audible.
+  three only the nearest three are ever audible. Sixteen dynamic channels
+  against Quake's eight — HL routes every weapon report, footstep, door,
+  machine and monster voice line through that pool. `func_tracktrain` holds its
+  running noise open as a looping voice re-aimed per tick, rather than
+  retriggering a one-shot at each `path_track`.
+
+  This needs more mixer voices than stock ZealOS provides:
+  `AUDIO_MAX_SFX_VOICES` in `src/System/AC97.ZC` is raised from 24 to 48. AC'97
+  has one PCM-Out DMA engine and all voice mixing is software, so the cost is
+  the mix loop and ~72 bytes per slot.
+- **Cheats** — `CBasePlayer::CheatImpulseCommands`, gated on `sv_cheats` alone
+  as HL gates it, not on Quake's deathmatch rule. `god` and `notarget` are
+  native flags (FL_GODMODE returns before the armour ratio, so suit charge is
+  not spent; FL_NOTARGET makes `CBaseMonster::Look` skip the player entirely).
+  `impulse 101` runs the `gEvilImpulse101` list. `give` takes a classname —
+  `give weapon_shotgun`, `give ammo_buckshot`, `give item_battery` — as HL's
+  ClientCommand does, not Quake's letter-and-amount. `impulse 103` dumps AI
+  state, `impulse 104` the entity count.
 - **Protocol 48** — delta compression driven by `valve/delta.lst` (all seven
   tables), the real opcode table, resource lists, user messages.
 
@@ -146,38 +166,84 @@ full-screen view.
 
 ## Not done
 
+Grouped by what it would take, largest first.
+
+### Structural
+
 - **Node-graph pathing.** HL routes monsters over a compiled node graph. There
   is none here and none can be generated from the shipped data, so movement is
   direct with a single wall-slide and a floor probe. A monster grinds against a
   wall between it and its target rather than walking around a corner. This is
-  the largest gap in the AI and it is structural. `m_fMoveTo` WALK/RUN
-  teleports the actor to the mark for the same reason.
-- **Monster-vs-monster and monster-vs-player collision.** `HLTraceEntity`
-  clips `SOLID_BSP` only; nothing traces a `SLIDEBOX`.
-- **Per-monster animation events.** The shared script events (1004/1005/1008/
-  1010) are dispatched. Codes at 2000 and above are interpreted by each
-  monster's own `HandleAnimEvent`, which does not exist here, so an attack still
-  lands at the end of its sequence rather than on the frame the claw connects.
-- **Runtime entity creation** — `monstermaker`, `env_shooter`, `gibshooter`.
-  `hl_entities` is sized to the parsed map and nothing allocates a slot
-  mid-game. That is an entity-table lifetime change, not a missing class.
-- **Beams and decals.** `env_beam`/`env_laser`/`infodecal` hold correct state;
-  the renderer has no line primitive or decal layer.
-- **`rendermode`/`renderamt`** are stored and ignored — no alpha or additive
-  path on world faces, so `env_render` changes nothing visually.
-- **Studio gaps**, in the order they bite: sequence groups (`<name>NN.mdl`),
-  chrome skins, attachments, four-way blends, per-vertex lighting from the
-  model normals. Everything is flat-lit from `HLLightPoint` at the entity
-  origin.
+  the largest gap in the AI. `m_fMoveTo` WALK/RUN teleports the actor to the
+  mark for the same reason.
 - **Save/load for the native entity system.** The menu writes and lists eight
   slots, but `HLSave.ZC` still serialises the QuakeC world, which no longer
   exists: a restored game gets the player back and an unmodified map. Entity
   state is not in the file.
+- **Runtime entity creation** — `monstermaker`, `env_shooter`, `gibshooter`.
+  `hl_entities` is sized to the parsed map and nothing allocates a slot
+  mid-game. That is an entity-table lifetime change, not a missing class.
+- **The projectile path.** Every weapon and attack in scope is hitscan.
+  Crossbow bolts, RPG rockets, grenades, satchels, tripmines, snarks, hornets,
+  the M203, and Bullsquid spit are all absent because there is no moving
+  damage-carrying entity type.
+- **VGUI proper.** The menus reproduce HL's layout, strings and colours from
+  `resource/`, but there is no widget toolkit: no mouse, no combo boxes, no
+  scrolling lists, no tab clicking. Navigation is arrow keys and Enter.
+- **Monster-vs-monster and monster-vs-player collision.** `HLTraceEntity` clips
+  `SOLID_BSP` only; nothing traces a `SLIDEBOX`.
+- **Squad behaviour.** No squad slots, no cover selection, no suppressing fire,
+  no grenade arcs. HGrunts fight as individuals.
+
+### Renderer
+
+- **Beams and decals.** `env_beam`/`env_laser`/`infodecal` hold correct state;
+  there is no line primitive and no decal layer, so no bullet holes, blood
+  splatter, laser sights, or tripmine beams.
+- **`rendermode`/`renderamt`** are stored and ignored — no alpha or additive
+  path on world faces, so glass is opaque and `env_render` changes nothing.
+- **Studio gaps**, in the order they bite: sequence groups (`<name>NN.mdl`),
+  chrome skins, attachments (so muzzle flashes have nowhere to attach), 4-way
+  blends, hitboxes, and per-vertex lighting from the model normals. Everything
+  is flat-lit from `HLLightPoint` at the entity origin.
+- **Sprite and particle effects.** No gibs, no explosion sprites, no smoke, no
+  glow/halo pass, no `env_sprite` animation.
+- **Detail textures**, water reflection, and the skybox is drawn by direction
+  rather than from the six `gfx/env` sides.
+
+### Gameplay detail
+
+- **Per-monster animation events.** The shared script events (1004/1005/1008/
+  1010) are dispatched. Codes at 2000 and above are interpreted by each
+  monster's own `HandleAnimEvent`, which does not exist here, so an attack still
+  lands at the end of its sequence rather than on the frame the claw connects,
+  and monster-specific foley (body drops, weapon swishes) is silent.
+- **Weapon secondaries and the two-step weapon menu** — the M203, the shotgun's
+  double barrel, gauss charging, egon beams.
+- **`func_pendulum` damping** — the "damp" key is absent, so a pendulum never
+  settles.
+- **CD audio triggers** — `trigger_cdaudio`, `target_cdaudio`. Ripped tracks
+  play from `valve/music`, but nothing in a map switches them.
+- **`materials.txt`** — footsteps do not vary by surface.
+- **Triggered and one-shot `ambient_generic`** — SF_START_ON loops work;
+  toggling, pitch changes and one-shots do not, because the ambient mixer holds
+  a permanent voice per source and cannot retune it.
+- **`func_tracktrain` collision does not rotate.** The car turns on screen but
+  its hull stays axial: the trace applies angles by rotating the ray into brush
+  space with no bevels, and a long thin car with the player standing on it
+  leaks at the seams. Bank is not applied either.
+- **`func_tracktrain` controls** — no driveable trains, so
+  `SF_TRACKTRAIN_NOCONTROL` is the only behaviour.
+- **Hazard Course, Configuration and Custom Game** menu items. These are not in
+  `GameMenu.res` — GameUI.dll injects them — so the main menu shows the file's
+  contents only.
 - **`svc_packetentities`** — field encoding is done, the frame header is not.
   Off by one bit and every entity decodes as garbage at a plausible origin.
 
 `HLProgs.ZC`/`HLBuiltin.ZC` are the QuakeC VM carried over by the fork. They
-are dead weight and will be deleted once nothing calls them.
+are dead weight and will be deleted once nothing calls them. Anything still
+reading `hl_player_edict` is on that list: single player has no QuakeC player,
+so a command written against it reports "no player" and does nothing.
 
 ## Game data
 
