@@ -393,6 +393,29 @@ U8		hl_ent_changelevel[64];
 U8		hl_ent_changelevel_landmark[64];
 Bool	hl_ent_changelevel_pending	= FALSE;
 
+//--- transition carry --------------------------------------------------------
+//
+// CChangeLevel::ChangeLevelNow carries the entities inside the transition
+// volume into the next map, and DispatchRestore merges each one onto the
+// destination map's entity of the same globalname, repositioned by the landmark
+// offset (saverestore.cpp). Without that merge the destination copy sits at its
+// own first path node: c0a0a's tram parks at trainstop27, 2408 units along the
+// track from trainstop16 where the player arrives, and drives away.
+//
+// Only the tracktrain the player is riding is carried. That is narrower than
+// the SDK, which carries everything in the volume, and it is the case the intro
+// ride needs.
+//
+// The match is on targetname, not globalname: HLEnt.ZC parses no globalname
+// key. Every map in the intro chain names its tram "train" and no other
+// tracktrain in those maps shares the name.
+U8		hl_ent_carry_name[64];
+U8		hl_ent_carry_path[64];		//m_ppath - the node the car last passed
+F64		hl_ent_carry_org[3];		//relative to the OLD map's landmark
+F64		hl_ent_carry_ang[3];
+F64		hl_ent_carry_speed			= 0.0;
+Bool	hl_ent_carry_valid			= FALSE;
+
 //item_suit / item_longjump. flags for the layers that own the HUD gating and
 //the jump change
 Bool	hl_ent_player_suit		= FALSE;
@@ -458,12 +481,17 @@ U0 HLEntPlayerReset()
 	hl_ent_gravity  = 1.0;
 	hl_ent_roomtype = 0;
 
-	hl_ent_changelevel[0]          = 0;
-	hl_ent_changelevel_landmark[0] = 0;
-	hl_ent_changelevel_pending     = FALSE;
+	hl_ent_changelevel[0]      = 0;
+	hl_ent_changelevel_pending = FALSE;
 
 	//not the suit or the longjump: those are inventory and survive a
 	//changelevel. See HLEntPlayerNewGame
+	//
+	//Nor the landmark name or the transition carry. HLEntSpawnAll calls this at
+	//the top of the new map's spawn pass, and both are read after that: the
+	//carry by HLEntSpawnTrain during the pass, the landmark by HLChangeLevel
+	//once the pass has finished. Clearing them here places every transition at
+	//info_player_start instead of at the landmark.
 }
 
 HLEntPlayerReset;
@@ -475,6 +503,17 @@ U0 HLEntPlayerNewGame()
 	hl_ent_godmode         = FALSE;
 	hl_ent_notarget        = FALSE;
 	hl_ent_player_longjump = FALSE;
+
+	//A landmark and a carried car belong to a transition in progress. They
+	//outlive HLEntPlayerReset by design; a new game is where they end
+	hl_ent_changelevel_landmark[0] = 0;
+
+	hl_ent_carry_name[0] = 0;
+	hl_ent_carry_path[0] = 0;
+	hl_ent_carry_speed   = 0.0;
+	hl_ent_carry_valid   = FALSE;
+	HLVecSet(hl_ent_carry_org, 0.0, 0.0, 0.0);
+	HLVecSet(hl_ent_carry_ang, 0.0, 0.0, 0.0);
 }
 
 HLEntPlayerNewGame;
@@ -1954,19 +1993,269 @@ U0 HLTrainVoiceStart(I64 self, CHLEntity *e)
 							vol, vol, TRUE);
 }
 
+//--- path_track traversal ---------------------------------------------------
+
+//CPathTrack spawnflags, trains.h:25
+#define HLSF_PATH_FIREONCE			2
+#define HLSF_PATH_DISABLE_TRAIN		8
+
+F64 HLAngleDistance(F64 next, F64 cur)
+{//UTIL_AngleDistance, util.cpp: signed shortest way from cur to next, degrees.
+ //Both arguments must already be in [0,360)
+	F64 delta = next - cur;
+
+	if (delta < -180.0)
+		return delta + 360.0;
+
+	if (delta > 180.0)
+		return delta - 360.0;
+
+	return delta;
+}
+
+F64 HLAngleNorm(F64 a)
+{//FixupAngles, plats.cpp:1113, for one axis
+	while (a >= 360.0)
+		a -= 360.0;
+
+	while (a < 0.0)
+		a += 360.0;
+
+	return a;
+}
+
+I64 HLPathLookAhead(I64 node, F64 *pos, F64 dist)
+{//CPathTrack::LookAhead, pathcorner.cpp:287, forward only
+ //
+ //pos carries in the point to start from and carries out the point dist units
+ //further along the track polyline. The return is the node that sample lands
+ //on, or -1 at the end of the path.
+ //
+ //Backward travel is absent: nothing in this port reverses a tracktrain, and
+ //the reverse walk needs the previous-node links CPathTrack::Link builds.
+ //SF_PATH_DISABLED and CPathTrack::Project are absent for the same reason -
+ //no path_track in the shipped intro chain carries either case.
+	CHLEntity	*n;
+	F64			 dir[3];
+	F64			 len;
+	F64			 frac;
+	I64			 cur = node;
+	I64			 nxt;
+	I64			 hops;
+	I64			 i;
+
+	if (cur < 0)
+		return -1;
+
+	//bounded rather than "while dist > 0": a path_track ring joined by a zero
+	//length leg subtracts nothing and never terminates
+	for (hops = 0; hops < HLENT_MAX; hops++)
+	{
+		if (dist <= 0.0)
+			return cur;
+
+		nxt = HLEntFindByTargetname(hl_entities[cur].target, 0);
+
+		if (nxt < 0)
+			return -1;
+
+		n = &hl_entities[nxt];
+
+		HLVecSub(n->origin, pos, dir);
+		len = HLVecLength(dir);
+
+		if (len > dist)
+		{
+			frac = dist / len;
+
+			for (i = 0; i < 3; i++)
+				pos[i] += dir[i] * frac;
+
+			return cur;
+		}
+
+		dist -= len;
+		HLVecCopy(n->origin, pos);
+		cur = nxt;
+	}
+
+	return cur;
+}
+
+U0 HLTrackTrainNext(I64 self)
+{//CFuncTrackTrain::Next, plats.cpp:1162
+ //
+ //Runs every server tick, not once per node. plats.cpp:1266 asks for a think
+ //0.5s out but passes alwaysThink, which sets FL_ALWAYSTHINK and makes the
+ //engine run the think every frame regardless; the 10x factors below are 1/0.1
+ //and are only a turn rate at that cadence.
+ //
+ //The car is aimed at a point 100 units up the track and turns toward it at ten
+ //times the residual per second, so the facing settles with a 0.1s time
+ //constant and the deck never steps out from under a rider. Snapping the yaw at
+ //each node instead walks a passenger off the deck: the one-tick omega x r
+ //carry is a chord across the turn, its outward error is r*(1-cos(theta/2)) per
+ //node, and on c0a0's 15 degree corners that accumulates past the 288 by 150
+ //deck within six nodes.
+ //
+ //Pitch is not driven. UTIL_VecToAngles' pitch sign is not established for this
+ //port's brush rotation, every tracktrain in the intro chain carries
+ //SF_TRACKTRAIN_NOPITCH, and every other shipped tracktrain path is flat.
+ //
+ //Bank is not driven: the "bank" key is not parsed, and no shipped tracktrain
+ //sets it.
+	CHLEntity	*e = HLEntGet(self);
+	CHLEntity	*fire;
+	F64			 next_pos[3];
+	F64			 next_front[3];
+	F64			 delta[3];
+	F64			 want;
+	F64			 vy;
+	I64			 ppath;
+	I64			 pnext;
+	I64			 i;
+
+	if (!e)
+		return;
+
+	//"TRAIN(%s): Speed is 0", plats.cpp:1166
+	if (HLIsZeroF(e->speed))
+	{
+		HLVecSet(e->velocity, 0.0, 0.0, 0.0);
+		HLVecSet(e->avelocity, 0.0, 0.0, 0.0);
+		HLTrainVoiceStop(self);
+		HLEntSetThink(e, HLM_NONE, 0.0);
+		return;
+	}
+
+	//m_ppath, the node the car last passed, held in e->target. The SDK keeps
+	//pev->target naming the first node for the life of the entity and m_ppath
+	//beside it; there is no m_ppath field here, and nothing reads a tracktrain's
+	//target after spawn
+	ppath = HLEntFindByTargetname(e->target, 0);
+
+	if (ppath < 0)
+	{
+		//"TRAIN(%s): Lost path", plats.cpp:1176
+		HLVecSet(e->velocity, 0.0, 0.0, 0.0);
+		HLVecSet(e->avelocity, 0.0, 0.0, 0.0);
+		HLTrainVoiceStop(self);
+		HLEntSetThink(e, HLM_NONE, 0.0);
+		return;
+	}
+
+	HLTrainVoiceStart(self, e);
+
+	//Velocity is the 0.1s-ahead sample over 0.1s. Sampling the polyline rather
+	//than aiming at the next node is what puts the car ON the track through a
+	//corner instead of across its chord.
+	//
+	//m_height lifts the car above the rail, so the track is sampled from the
+	//rail plane and the result lifted back
+	HLVecCopy(e->origin, next_pos);
+	next_pos[2] -= e->height;
+	pnext = HLPathLookAhead(ppath, next_pos, e->speed * 0.1);
+	next_pos[2] += e->height;
+
+	for (i = 0; i < 3; i++)
+		e->velocity[i] = (next_pos[i] - e->origin[i]) * 10.0;
+
+	//"length" is not parsed and no shipped tracktrain carries the key, so this
+	//is always the SDK's 100 unit fallback, plats.cpp:1197
+	HLVecCopy(e->origin, next_front);
+	next_front[2] -= e->height;
+	HLPathLookAhead(ppath, next_front, 100.0);
+	next_front[2] += e->height;
+
+	HLVecSub(next_front, e->origin, delta);
+
+	want = e->angles[1];
+
+	//"if ( !pnext || (delta.x == 0 && delta.y == 0) ) angles = pev->angles":
+	//at a dead end, or with the sample point directly overhead, hold the
+	//current facing rather than deriving one from nothing
+	if (pnext >= 0 && (!HLIsZeroF(delta[0]) || !HLIsZeroF(delta[1])))
+	{
+		//The 180 is Valve's: tracktrain brushwork is modelled facing west, so
+		//the yaw derived from the direction of travel is a half turn out
+		want = HLAngleNorm(Arg(delta[0], delta[1]) / HLDEG2RAD + 180.0);
+	}
+
+	e->angles[1] = HLAngleNorm(e->angles[1]);
+
+	vy = HLAngleDistance(want, e->angles[1]);
+
+	e->avelocity[0] = 0.0;
+	e->avelocity[1] = vy * 10.0;
+	e->avelocity[2] = 0.0;
+
+	if (pnext < 0)
+	{
+		//End of path. CFuncTrackTrain::DeadEnd glides the remaining gap at the
+		//old speed; SUB_CalcMove does the same thing and schedules the arrival
+		HLVecSet(e->avelocity, 0.0, 0.0, 0.0);
+		HLTrainVoiceStop(self);
+		HLEntCalcMove(e, next_pos, e->speed, HLM_NONE);
+		e->speed = 0.0;
+		return;
+	}
+
+	if (pnext != ppath)
+	{
+		//pFire, plats.cpp:1235. Speed here is always positive - reverse is not
+		//reachable - so the node that fires is the one just entered
+		fire = &hl_entities[pnext];
+
+		HLStrCopy(e->target, fire->targetname, 64);
+
+		//A node's pass-fire is its `message` key, not its `target`: `target`
+		//names the next node. c0a0's whole intro hangs off this - trainstop8
+		//opens the room2 door, trainstop9 runs the scientist script,
+		//trainstop11 fades out.
+		if (fire->message[0])
+		{
+			HLEntFireTargetsNamed(fire->message, pnext, self, HLUSE_TOGGLE, 0.0);
+
+			if (fire->spawnflags & HLSF_PATH_FIREONCE)
+				fire->message[0] = 0;
+		}
+
+		if (fire->spawnflags & HLSF_PATH_DISABLE_TRAIN)
+			e->spawnflags = e->spawnflags | HLSF_TRACKTRAIN_NOCONTROL;
+
+		//"don't copy speed from target if it is 0 (uninitialized)". c0a0's
+		//trainstop17 carries speed 0 and must not park the tram there
+		if (e->spawnflags & HLSF_TRACKTRAIN_NOCONTROL)
+		{
+			if (!HLIsZeroF(fire->speed))
+				e->speed = fire->speed;
+		}
+	}
+
+	//FL_ALWAYSTHINK. The think loop fires anything whose next_think is at or
+	//before the clock, and the clock has already advanced this tick, so this
+	//lands on the next one
+	HLEntSetThink(e, HLM_TRAIN_NEXT, hl_ent_time);
+}
+
 U0 HLTrainNext(I64 self)
 {//the train has arrived at its current corner: fire that corner's target,
  //then head for the next one
 	CHLEntity	*e = HLEntGet(self);
 	CHLEntity	*corner;
 	F64			 dest[3];
-	F64			 delta[3];
-	F64			 was;
-	F64			 dyaw;
 	I64			 next;
 
 	if (!e)
 		return;
+
+	//func_tracktrain follows the track continuously and shares nothing with
+	//CFuncTrain's corner-to-corner hop below
+	if (e->ent_class == HLC_TRACKTRAIN)
+	{
+		HLTrackTrainNext(self);
+		return;
+	}
 
 	HLVecSet(e->velocity, 0.0, 0.0, 0.0);
 
@@ -1994,61 +2283,17 @@ U0 HLTrainNext(I64 self)
 	if (corner->speed > 0.0)
 		e->speed = corner->speed;
 
-	//where the train parks relative to the node differs by class:
-	//
-	//  func_train      the node marks where the brush's mins corner goes, so
-	//                  the origin is offset by it
-	//  func_tracktrain the node is where the origin goes: the brush is modelled
-	//                  around it and rotates there
-	if (e->ent_class == HLC_TRACKTRAIN)
-		HLVecCopy(corner->origin, dest);
-	else
-	{
-		dest[0] = corner->origin[0] - e->mins[0];
-		dest[1] = corner->origin[1] - e->mins[1];
-		dest[2] = corner->origin[2] - e->mins[2];
-	}
+	//The node marks where the brush's mins corner goes, so the origin is offset
+	//by it. A tracktrain parks its origin on the node instead and never reaches
+	//here.
+	dest[0] = corner->origin[0] - e->mins[0];
+	dest[1] = corner->origin[1] - e->mins[1];
+	dest[2] = corner->origin[2] - e->mins[2];
 
 	HLTrainVoiceStart(self, e);
 
-	//CFuncTrackTrain::Next orientation. HL looks m_length units ahead along the
-	//track spline; the direction of the leg being entered is the same vector
-	//wherever the leg is straight, which every shipped path_track run is
-	//between nodes.
-	//
-	//The 180 is Valve's: tracktrain brushwork is modelled facing west, so the
-	//yaw derived from the direction of travel is a half turn out.
-	//
-	//func_train does not turn. Its yaw is bookkeeping only and it is not
-	//registered with HLClipSetRotating, so writing it would rotate nothing but
-	//would still be a lie.
-	HLVecSub(dest, e->origin, delta);
-
-	if (e->ent_class == HLC_TRACKTRAIN &&
-		(!HLIsZeroF(delta[0]) || !HLIsZeroF(delta[1])))
-	{
-		was = e->angles[1];
-
-		e->angles[1] = Arg(delta[0], delta[1]) / HLDEG2RAD + 180.0;
-
-		while (e->angles[1] >= 360.0)
-			e->angles[1] -= 360.0;
-		while (e->angles[1] < 0.0)
-			e->angles[1] += 360.0;
-
-		//Shortest way round, or a car turning from 350 to 10 degrees swings its
-		//passenger 340 degrees the wrong way.
-		dyaw = e->angles[1] - was;
-
-		while (dyaw > 180.0)
-			dyaw -= 360.0;
-		while (dyaw < -180.0)
-			dyaw += 360.0;
-
-		//Banked rather than applied here: HLEntPlayerRides is defined with the
-		//mover pass and cannot be called from this far up the file.
-		e->yaw_delta += dyaw;
-	}
+	//func_train does not turn: its brush is not registered with
+	//HLClipSetRotating, so angles are left alone.
 
 	//"m_flWait = pTarg->GetDelay()", plats.cpp:775, where CPathCorner::GetDelay
 	//returns its own wait key (cbase.h:548). Carried on the train because Wait
@@ -2091,6 +2336,10 @@ U0 HLTrainUse(I64 self)
 	{
 		HLEntSetThink(e, HLM_NONE, 0.0);
 		HLVecSet(e->velocity, 0.0, 0.0, 0.0);
+
+		//a tracktrain stopped mid-corner keeps turning otherwise: the mover pass
+		//integrates avelocity with no think involved
+		HLVecSet(e->avelocity, 0.0, 0.0, 0.0);
 		return;
 	}
 
@@ -2527,6 +2776,10 @@ U0 HLEntTakeDamageType(I64 self, I64 attacker, F64 damage, I64 bits)
 		return;
 	}
 
+	//The death path reads the mask and the overkill from the note: health is
+	//clamped below, and HLDmgHurt lives in HLAI which compiles after this file.
+	HLDmgNote(self, bits, e->health);
+
 	//dead. the break is queued rather than run here so a chain of breakables
 	//taking splash damage cannot recurse
 	e->health    = 0.0;
@@ -2540,11 +2793,35 @@ U0 HLEntTakeDamage(I64 self, I64 attacker, F64 damage)
 	HLEntTakeDamageType(self, attacker, damage, HLDMG_GENERIC);
 }
 
+U8 *HLEntMatGibModel(I64 mat)
+{//CBreakable::Die's shard model, func_break.cpp:284-341
+	if (mat == HLMAT_WOOD)
+		return "models/woodgibs.mdl";
+
+	if (mat == HLMAT_METAL)
+		return "models/metalplategibs.mdl";
+
+	if (mat == HLMAT_FLESH)
+		return "models/fleshgibs.mdl";
+
+	if (mat == HLMAT_CINDERBLOCK)
+		return "models/cindergibs.mdl";
+
+	if (mat == HLMAT_CEILINGTILE)
+		return "models/ceilinggibs.mdl";
+
+	if (mat == HLMAT_COMPUTER)
+		return "models/computergibs.mdl";
+
+	if (mat == HLMAT_ROCKS)
+		return "models/rockgibs.mdl";
+
+	//GLASS and UNBREAKGLASS share one set
+	return "models/glassgibs.mdl";
+}
+
 U0 HLBreakableDie(I64 self)
 {//CBreakable::Die - the material burst, then fire the target and stop existing
- //
- //Debris models are absent: the gib pool in HLPart.ZC carries one model bit
- //(hgibs/agibs) and has no slot for woodgibs.mdl and its siblings
 	CHLEntity	*e = HLEntGet(self);
 	F64			 fvol;
 	I64			 pitch;
@@ -2566,6 +2843,12 @@ U0 HLBreakableDie(I64 self)
 
 		HLEntSoundDyn(self, HLEntMatBreakSound(e->material), HLENT_CHAN_VOICE,
 			fvol, pitch);
+
+		//TE_BREAKMODEL. The gib pool is aged on the render clock, so tS and
+		//not hl_ent_time. Velocity is zero: expDirected needs the attack
+		//direction, which the queued break no longer carries.
+		HLGibSpawnDebris(e->absmin, e->size, NULL, 8,
+			HLEntMatGibModel(e->material), tS);
 	}
 	else
 		HLEntSound(e, HLEntDoorStopSound(e->stop_snd), HLENT_CHAN_MOVE);
@@ -2876,7 +3159,7 @@ U0 HLDoorBlocked(I64 self, I64 blocker)
 		if (blocker < 0)
 			HLEntHurtPlayer(e->dmg, HLDMG_CRUSH);
 		else
-			HLEntTakeDamage(blocker, self, e->dmg);
+			HLEntTakeDamageType(blocker, self, e->dmg, HLDMG_CRUSH);
 	}
 
 	//a negative wait never comes back, so the door squashes instead of
@@ -2963,7 +3246,7 @@ U0 HLPlatBlocked(I64 self, I64 blocker)
 	if (blocker < 0)
 		HLEntHurtPlayer(1.0, HLDMG_CRUSH);
 	else
-		HLEntTakeDamage(blocker, self, 1.0);
+		HLEntTakeDamageType(blocker, self, 1.0, HLDMG_CRUSH);
 
 	//the travel is the door mover's, so the reversal is too. A plat blocked
 	//while parked has no direction to reverse and is left alone
@@ -3000,7 +3283,7 @@ U0 HLTrainBlocked(I64 self, I64 blocker)
 	if (blocker < 0)
 		HLEntHurtPlayer(e->dmg, HLDMG_CRUSH);
 	else
-		HLEntTakeDamage(blocker, self, e->dmg);
+		HLEntTakeDamageType(blocker, self, e->dmg, HLDMG_CRUSH);
 }
 
 //--- func_rotating ----------------------------------------------------------
@@ -5242,7 +5525,10 @@ U0 HLChangeLevelTouch(I64 self)
  //the trigger takes itself out of use immediately: the request sits for several
  //ticks until the shell's loop drains it, and a brush trigger re-touches on
  //every one of them
-	CHLEntity *e = HLEntGet(self);
+	CHLEntity	*e = HLEntGet(self);
+	CHLEntity	*car;
+	I64			 lm;
+	I64			 ride;
 
 	if (!e)
 		return;
@@ -5259,6 +5545,31 @@ U0 HLChangeLevelTouch(I64 self)
 	HLStrCopy(hl_ent_changelevel, e->next_map, 64);
 	HLStrCopy(hl_ent_changelevel_landmark, e->landmark, 64);
 	hl_ent_changelevel_pending = TRUE;
+
+	//The car the player is riding goes with them. See the hl_ent_carry_* note:
+	//placement is stored relative to this map's landmark, because the two maps
+	//share no world origin.
+	hl_ent_carry_valid = FALSE;
+
+	lm   = HLEntFindByTargetname(e->landmark, 0);
+	ride = hl_ground_native;
+
+	if (lm >= 0 && HLEntValid(ride))
+	{
+		car = &hl_entities[ride];
+
+		if (car->ent_class == HLC_TRACKTRAIN)
+		{
+			HLVecSub(car->origin, hl_entities[lm].origin, hl_ent_carry_org);
+			HLVecCopy(car->angles, hl_ent_carry_ang);
+			//globalname is the transition identity, saverestore.cpp. targetname
+			//is reused freely between maps; globalname is not.
+			HLStrCopy(hl_ent_carry_name, car->global_name, 64);
+			HLStrCopy(hl_ent_carry_path, car->target, 64);
+			hl_ent_carry_speed = car->speed;
+			hl_ent_carry_valid = TRUE;
+		}
+	}
 
 	e->in_use = FALSE;
 	e->solid  = HLSOLID_NOT;
@@ -5600,7 +5911,11 @@ U0 HLEntSpawnButton(CHLMap *map, CHLEntity *e)
 U0 HLEntSpawnTrain(CHLMap *map, CHLEntity *e, I64 cls)
 {
 	CHLEntity	*node;
+	F64			 look[3];
+	F64			 delta[3];
 	I64			 first;
+	I64			 lm;
+	Bool		 carried = FALSE;
 
 	HLEntSetBrushSize(map, e);
 
@@ -5613,22 +5928,72 @@ U0 HLEntSpawnTrain(CHLMap *map, CHLEntity *e, I64 cls)
 	if (e->speed <= 0.0)
 		e->speed = 100.0;
 
-	//CFuncTrackTrain::Activate snaps the train onto its first path node at
-	//spawn. Without this a train sits wherever its brush was built, which for
-	//c0a0's tram is thousands of units from the track the player spawns on.
+	//DispatchRestore's global-entity merge, saverestore.cpp: this map's copy of
+	//a car carried through the transition takes the carried placement, path node
+	//and speed, positioned relative to this map's landmark. It replaces Find,
+	//not adds to it - Find would park it at its own first node.
+	if (cls == HLC_TRACKTRAIN && hl_ent_carry_valid && e->global_name[0] &&
+		!StrICompare(e->global_name, hl_ent_carry_name))
+	{
+		lm = HLEntFindByTargetname(hl_ent_changelevel_landmark, 0);
+
+		if (lm >= 0)
+		{
+			HLVecAdd(hl_entities[lm].origin, hl_ent_carry_org, e->origin);
+			HLVecCopy(hl_ent_carry_ang, e->angles);
+			HLStrCopy(e->target, hl_ent_carry_path, 64);
+
+			e->speed       = hl_ent_carry_speed;
+			e->start_speed = hl_ent_carry_speed;
+
+			//one destination per carry
+			hl_ent_carry_valid = FALSE;
+			carried            = TRUE;
+		}
+	}
+
+	//CFuncTrackTrain::Find and CFuncTrain::Activate both snap the train onto its
+	//first path node at spawn. Without it a train sits wherever its brush was
+	//built, which for c0a0's tram is thousands of units from the track.
 	//
 	//Path nodes need not have spawned yet: the whole entity list is parsed
 	//before any spawn function runs, so a targetname lookup resolves regardless
 	//of spawn order.
 	first = HLEntFindByTargetname(e->target, 0);
 
-	if (first >= 0)
+	if (first >= 0 && !carried)
 	{
 		node = &hl_entities[first];
 
-		//same parking rule as HLTrainNext - see the note there
+		//where the train parks relative to the node differs by class:
+		//
+		//  func_train      the node marks where the brush's mins corner goes
+		//  func_tracktrain the node is where the origin goes, plus m_height:
+		//                  the brush is modelled around it and rotates there
 		if (cls == HLC_TRACKTRAIN)
+		{
+			//"nextPos.z += m_height", plats.cpp:1389: the car rides m_height
+			//above the rail the path_track chain is laid on, and Next samples
+			//the track from the rail plane on the same offset
 			HLVecCopy(node->origin, e->origin);
+			e->origin[2] += e->height;
+
+			//CFuncTrackTrain::Find, plats.cpp:1392: the spawn facing comes from
+			//a point 100 units up the track, not from the first leg, so a car
+			//parked on a curve starts aligned with the curve. Without it the
+			//first tick of Next has to swing the whole error out.
+			//
+			//Sampled from the rail plane and lifted back, as the origin is
+			HLVecCopy(node->origin, look);
+			HLPathLookAhead(first, look, 100.0);
+			look[2] += e->height;
+
+			HLVecSub(look, e->origin, delta);
+
+			if (!HLIsZeroF(delta[0]) || !HLIsZeroF(delta[1]))
+				e->angles[1] =
+					HLAngleNorm(Arg(delta[0], delta[1]) / HLDEG2RAD + 180.0);
+		}
 		else
 		{
 			e->origin[0] = node->origin[0] - e->mins[0];
@@ -7774,17 +8139,26 @@ Bool HLEntBoxOverlap(CHLEntity *e, F64 *mins, F64 *maxs)
 	return TRUE;
 }
 
-Bool HLEntPlayerRides(CHLEntity *e, F64 *player_org)
+Bool HLEntPlayerRides(I64 self, CHLEntity *e, F64 *player_org)
 {//is the player standing on, or inside, this mover?
  //
  //Asked before the mover is stepped: riders are decided against the pre-step
  //position, as SV_PushMove does.
+ //
+ //SV_PushMove's first clause is ".groundentity == pusher", tested before any
+ //box work: a rider standing on a deck is above the brush, not inside it, and
+ //on a car turning under them the box test alone loses them for the tick the
+ //feet cross the edge. hl_ground_native is PM_CatagorizePosition's answer from
+ //the last move, which is the same generation of the flag SV_PushMove reads.
 	F64 pmins[3];
 	F64 pmaxs[3];
 	I64 i;
 
 	if (!player_org)
 		return FALSE;
+
+	if (self >= 0 && hl_ground_native == self)
+		return TRUE;
 
 	for (i = 0; i < 3; i++)
 	{
@@ -8041,7 +8415,7 @@ qef_next_voice:
 			//riders are decided against the pre-step position, as SV_PushMove
 			//does
 			if (player_org && hl_ent_player >= 0)
-				rides = HLEntPlayerRides(e, player_org);
+				rides = HLEntPlayerRides(i, e, player_org);
 
 			e->origin[0] += move[0];
 			e->origin[1] += move[1];
@@ -8067,10 +8441,15 @@ qef_next_voice:
 				//SV_PushRotate's angular term, as a rate:
 				//HLPMPlatformBaseVelocity evaluates v + w x r at the rider's
 				//own position.
+				//
+				//Both sources are summed. avelocity is the continuous one a
+				//tracktrain and every rotating brush turn on; yaw_delta is the
+				//banked discrete step a mover that repositions its angles
+				//without an angular velocity leaves behind.
+				hl_platform_avel_z = e->avelocity[1];
+
 				if (dt > 0.0)
-					hl_platform_avel_z = e->yaw_delta / dt;
-				else
-					hl_platform_avel_z = 0.0;
+					hl_platform_avel_z += e->yaw_delta / dt;
 			}
 
 			//Consumed whether or not anyone was riding: a banked delta would
