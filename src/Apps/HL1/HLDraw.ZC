@@ -99,6 +99,7 @@ I64	hl_rs_surf_hit	= 0;	//surface cache reuses
 I64	hl_rs_surf_build	= 0;	//surface cache builds this frame
 I64	hl_rs_surf_texels = 0;	//texels lit by those builds
 I64	hl_rs_surf_evict	= 0;	//slots released to make room
+I64	hl_rs_surf_dlit	= 0;	//faces R_MarkLights reached this frame
 I64	hl_rs_decals		= 0;	//decal patches scanned
 I64	hl_rs_decal_px	= 0;	//decal pixels ray cast
 I64	hl_rs_decal_hit	= 0;	//decal pixels blended
@@ -124,6 +125,7 @@ U0 HLRSpeedsReset()
 	hl_rs_surf_build	= 0;
 	hl_rs_surf_texels	= 0;
 	hl_rs_surf_evict	= 0;
+	hl_rs_surf_dlit	= 0;
 	hl_rs_decals		= 0;
 	hl_rs_decal_px	= 0;
 	hl_rs_decal_hit	= 0;
@@ -142,9 +144,11 @@ U0 HLRSpeedsPrint()
 	"wsurf %d spans %d px %d sky %d\n",
 		hl_rs_faces, hl_rs_spans, hl_rs_span_px, hl_rs_sky_px;
 	//texels are 4 bytes each, so the build cost reads directly as bytes written
-	"surf  hit %d build %d texels %d bytes %d evict %d\n",
+	//dlit is what a dynamic light costs: every face in it is a candidate
+	//rebuild, and the flashlight re-adds its light every frame
+	"surf  hit %d build %d texels %d bytes %d evict %d dlit %d\n",
 		hl_rs_surf_hit, hl_rs_surf_build, hl_rs_surf_texels,
-		hl_rs_surf_texels * 4, hl_rs_surf_evict;
+		hl_rs_surf_texels * 4, hl_rs_surf_evict, hl_rs_surf_dlit;
 	"decal %d px %d blend %d\n",
 		hl_rs_decals, hl_rs_decal_px, hl_rs_decal_hit;
 	"model tris %d px %d\n", hl_rs_tris, hl_rs_model_px;
@@ -457,6 +461,97 @@ ql_next:
 	}
 }
 
+Bool HLLightTouchesFace(CHLMap *map, CHLDlight *light, CHLFace *f)
+{//Does this light brighten any luxel of this face?
+ //
+ //R_MarkLights marks every face on a straddled NODE, and a node's face list
+ //covers the whole extent of its plane. Quake's nodes are small enough for
+ //that to be close; HL's brushwork is not, and a 220 unit flashlight marked
+ //hundreds of faces that its sphere never reached. Each of those is a full
+ //surface-cache rebuild.
+ //
+ //The test is the same projection R_AddDynamicLights uses, run once against
+ //the face's whole lightmap rectangle instead of per luxel: project the light
+ //onto the surface plane, clamp the impact into [0,extent] in each axis, and
+ //compare the resulting distance against the radius left after the off-plane
+ //part is spent. The metric is R_AddDynamicLights' own (larger axis plus half
+ //the smaller), so a face passes here exactly when at least one point of its
+ //rectangle would be brightened there.
+	CHLPlane	*plane;
+	CHLTexInfo	*ti;
+	CHLTexture	*tex;
+	F64			 impact[3];
+	F64			 dist;
+	F64			 rad;
+	F64			 local_s;
+	F64			 local_t;
+	F64			 sd;
+	F64			 td;
+	F64			 adist;
+	I64			 j;
+
+	//BSP indices used to form pointers - out of range is a wild address
+	if (f->plane_num < 0 || f->plane_num >= map->num_planes)
+		return FALSE;
+	if (f->tex_info < 0 || f->tex_info >= map->num_texinfo)
+		return FALSE;
+
+	ti = &map->texinfo[f->tex_info];
+
+	//sky and turb carry no lightmap, so a dlight on them changes nothing
+	if (ti->miptex >= 0 && ti->miptex < map->num_textures)
+	{
+		tex = &map->textures[ti->miptex];
+		if (tex->is_sky || tex->is_turb)
+			return FALSE;
+	}
+
+	plane = &map->planes[f->plane_num];
+
+	//signed distance off the plane, then the radius left on the plane itself
+	dist = HLVecDot(light->origin, plane->normal) - plane->dist;
+
+	if (dist < 0.0)
+		rad = light->radius + dist;
+	else
+		rad = light->radius - dist;
+
+	if (rad < light->min_light)
+		return FALSE;
+
+	rad -= light->min_light;
+
+	for (j = 0; j < 3; j++)
+		impact[j] = light->origin[j] - plane->normal[j] * dist;
+
+	local_s = HLVecDot(impact, &ti->vecs[0]) + ti->vecs[3] - f->mins_s;
+	local_t = HLVecDot(impact, &ti->vecs[4]) + ti->vecs[7] - f->mins_t;
+
+	//distance from the impact to the nearest point of the lightmap rectangle,
+	//zero inside it
+	sd = 0.0;
+	if (local_s < 0.0)
+		sd = -local_s;
+	else if (local_s > ToF64(f->extent_s))
+		sd = local_s - ToF64(f->extent_s);
+
+	td = 0.0;
+	if (local_t < 0.0)
+		td = -local_t;
+	else if (local_t > ToF64(f->extent_t))
+		td = local_t - ToF64(f->extent_t);
+
+	if (sd > td)
+		adist = sd + td * 0.5;
+	else
+		adist = td + sd * 0.5;
+
+	if (adist < rad)
+		return TRUE;
+
+	return FALSE;
+}
+
 U0 HLMarkLights(CHLMap *map, CHLDlight *light, I64 bit, I64 node_index)
 {//R_MarkLights - flag every face the light sphere reaches, descending only
  //the side(s) it straddles
@@ -497,11 +592,15 @@ U0 HLMarkLights(CHLMap *map, CHLDlight *light, I64 bit, I64 node_index)
 
 		f = &map->faces[node->first_face + i];
 
+		if (!HLLightTouchesFace(map, light, f))
+			goto qml_next;
+
 		//first light to reach this face this frame resets the mask
 		if (f->dlight_frame != hl_dlight_frame)
 		{
 			f->dlight_bits  = 0;
 			f->dlight_frame = hl_dlight_frame;
+			hl_rs_surf_dlit++;
 		}
 
 		f->dlight_bits |= bit;
@@ -1468,10 +1567,17 @@ I64 HLTexWrap(I64 v, I64 n)
 	return v;
 }
 
+//quantum the dlight hash rounds a light's origin and radius to, in world
+//units. A light that has not crossed a step contributes the same key and its
+//surfaces stay cached. One step moves a luxel by 2/264 of full scale, under
+//one output level of 255
+#define HLDLIGHT_KEY_QUANT	2.0
+
 I64 HLSurfLightKey(CHLFace *f)
 {//any change here means rebuild
-	I64 key = 0;
-	I64 j;
+	CHLDlight	*d;
+	I64			 key = 0;
+	I64			 j;
 
 	for (j = 0; j < 4; j++)
 	{
@@ -1483,9 +1589,41 @@ I64 HLSurfLightKey(CHLFace *f)
 
 	key = key * 31 + hl_ambient_light;
 
-	//a marked face rebuilds every frame, plus once more when the light leaves
+	//A marked face has to rebuild whenever the light on it CHANGES, not
+	//whenever a light is present. Folding in hl_dlight_frame made the key
+	//differ every frame by construction, so the flashlight - one wide dlight
+	//re-added each frame at the same place while the player stands still -
+	//re-lit its whole visible set every frame at a guaranteed cache miss.
+	//
+	//Hashing the lights themselves instead: same lights in the same place at
+	//the same radius and colour produce the same key and the cached pixels
+	//are already correct. The mask is part of the key, so a light arriving or
+	//leaving rebuilds once.
 	if (f->dlight_frame == hl_dlight_frame && f->dlight_bits)
-		key = key * 31 + hl_dlight_frame + 1;
+	{
+		key = key * 31 + f->dlight_bits;
+
+		for (j = 0; j < hl_dlight_count && j < HLMAX_DLIGHTS; j++)
+		{
+			if (!(f->dlight_bits & (1 << j)))
+				goto qslk_next;
+
+			d   = &hl_dlight[j];
+			key = key * 31 +
+				ToI64(d->origin[0] / HLDLIGHT_KEY_QUANT);
+			key = key * 31 +
+				ToI64(d->origin[1] / HLDLIGHT_KEY_QUANT);
+			key = key * 31 +
+				ToI64(d->origin[2] / HLDLIGHT_KEY_QUANT);
+			key = key * 31 +
+				ToI64(d->radius / HLDLIGHT_KEY_QUANT);
+			key = key * 31 + d->color[0];
+			key = key * 31 + d->color[1];
+			key = key * 31 + d->color[2];
+
+qslk_next:
+		}
+	}
 
 	return key;
 }
