@@ -789,15 +789,9 @@ Bool hl_step_play  = FALSE;
 F64  hl_step_dist  = 0.0;
 
 //PM_UpdateStepSound's chosen sample set and volume, published for whoever owns
-//sound. step kinds follow the SDK's STEP_* enum as far as this tree can tell
-//them apart: there is no materials.txt texture lookup, so every dry surface is
-//STEP_CONCRETE.
-#define HLPM_STEP_CONCRETE	0
-#define HLPM_STEP_SLOSH		6
-#define HLPM_STEP_WADE		7
-#define HLPM_STEP_LADDER		8
-
-I64 hl_step_kind = HLPM_STEP_CONCRETE;
+//sound. The step kinds are HLSound.ZC's HLSTEP_*, which is the SDK's STEP_*
+//enum; materials.txt and the texture under the player both resolve there.
+I64 hl_step_kind = HLSTEP_CONCRETE;
 F64 hl_step_vol  = 0.5;
 
 //trigger_gravity's multiplier on sv_gravity, pmove->gravity. A hook, like
@@ -842,7 +836,7 @@ U0 HLDuckReset()
 	hl_step_dist      = 0.0;
 	hl_step_side      = 0;
 	hl_step_play      = FALSE;
-	hl_step_kind      = HLPM_STEP_CONCRETE;
+	hl_step_kind      = HLSTEP_CONCRETE;
 	hl_step_vol       = 0.5;
 	hl_ducking        = FALSE;
 	hl_duck_pending   = FALSE;
@@ -977,6 +971,153 @@ F64		hl_stair_last_nz	  = 0.0;
 F64		hl_stair_last_frac = 0.0;
 F64		hl_stair_nz[4];
 I64		hl_stair_nz_count  = 0;
+
+//--- ride trace ------------------------------------------------------------
+//
+// One record per server tick of every input the pusher-carry path reads. Armed
+// from the console with `ridelog 1`, written to ::/Apps/HL1/RIDELOG.TXT.
+//
+// A ring, not a prefix: the tick that matters is the one the rider leaves the
+// deck on, and that is minutes into c0a0's tram. The last HLRIDE_LINES ticks
+// are kept, older ones overwritten. At 72 Hz that is 14 seconds.
+//
+// Not HL1LOG.TXT: hl_log_buf is 8192 bytes and one record here is 250.
+//
+// The record is assembled from both sides of the tick. This file fills the
+// ground-probe and pmove columns; HLEntity.ZC owns the movers, compiles later,
+// and formats and emits the line.
+#define HLRIDE_LINES	1024
+#define HLRIDE_WIDTH	256
+#define HLRIDE_FLUSH	256		//ticks between disk writes
+
+U8	   *hl_ride_buf		= NULL;	//HLRIDE_LINES * HLRIDE_WIDTH, live while armed
+Bool	hl_ride_log		= FALSE;
+I64		hl_ride_ticks	= 0;	//records written since arming
+I64		hl_ride_head	= 0;	//next ring slot
+
+//HLPMCatagorizePosition's ground probe. It runs up to three times per move and
+//the last answer is the one the mover pass reads, so each call overwrites.
+I64		hl_ride_probe_calls	= 0;
+Bool	hl_ride_probe_hit	= FALSE;
+Bool	hl_ride_probe_solid	= FALSE;	//trace.start_solid
+F64		hl_ride_probe_frac	= 1.0;
+F64		hl_ride_probe_nrm[3];
+I64		hl_ride_probe_ent	= -1;		//trace.ent, an edict number
+I64		hl_ride_probe_nat	= -1;		//hl_trace_native_ent
+
+//HLEntPlayerRides' answer for the tracktrain the record names. rides is -1 when
+//the mover pass never asked. branch is 1 for the ground-entity clause, 2 for
+//the box overlap, 3 for neither, 0 for not asked.
+I64		hl_ride_rides	= -1;
+I64		hl_ride_branch	= 0;
+
+//the tracktrain's yaw_delta, sampled where the mover pass consumes it
+F64		hl_ride_yaw_delta	= 0.0;
+
+U0 HLRideLogFree()
+{
+	if (hl_ride_buf)
+		Free(hl_ride_buf);
+
+	hl_ride_buf   = NULL;
+	hl_ride_log   = FALSE;
+	hl_ride_ticks = 0;
+	hl_ride_head  = 0;
+}
+
+U0 HLRideLogArm()
+{//allocate the ring and clear the gathered fields
+	HLRideLogFree;
+
+	hl_ride_buf = CAlloc(HLRIDE_LINES * HLRIDE_WIDTH);
+
+	hl_ride_probe_calls	= 0;
+	hl_ride_probe_hit	= FALSE;
+	hl_ride_probe_solid	= FALSE;
+	hl_ride_probe_frac	= 1.0;
+	HLVecSet(hl_ride_probe_nrm, 0.0, 0.0, 0.0);
+	hl_ride_probe_ent	= -1;
+	hl_ride_probe_nat	= -1;
+	hl_ride_rides		= -1;
+	hl_ride_branch		= 0;
+	hl_ride_yaw_delta	= 0.0;
+
+	hl_ride_log = ToBool(hl_ride_buf != NULL);
+}
+
+U0 HLRideLogPut(U8 *s)
+{//one formatted record into the ring
+	if (!hl_ride_buf)
+		return;
+
+	HLStrCopy(hl_ride_buf + hl_ride_head * HLRIDE_WIDTH, s, HLRIDE_WIDTH);
+
+	hl_ride_head = (hl_ride_head + 1) % HLRIDE_LINES;
+	hl_ride_ticks++;
+}
+
+U0 HLRideLogFlush()
+{//oldest record first, one write
+	U8 *out;
+	U8 *slot;
+	I64 count = hl_ride_ticks;
+	I64 first;
+	I64 len;
+	I64 n;
+	I64 i;
+	I64 k;
+
+	if (!hl_ride_buf || !hl_disk_writes || count <= 0)
+		return;
+
+	if (count > HLRIDE_LINES)
+		count = HLRIDE_LINES;
+
+	first = (hl_ride_head - count + HLRIDE_LINES) % HLRIDE_LINES;
+
+	//the slack is the legend below, which runs to about 800 bytes
+	out = CAlloc(count * (HLRIDE_WIDTH + 1) + 2048);
+
+	if (!out)
+		return;
+
+	//Legend first: the record is 250 columns and the field names have to travel
+	//with it.
+	StrPrint(out,
+		"ridelog. one record per server tick, oldest first, 72 Hz.\n"
+		"  N T      tick index, hl_ent_time\n"
+		"  og ge gn hl_pm_onground, hl_ground_entity, hl_ground_native\n"
+		"  pc h s   ground probes this tick, trace.hit, trace.start_solid\n"
+		"  f n      probe fraction, probe plane normal xyz\n"
+		"  pe pn    probe trace.ent (edict), hl_trace_native_ent\n"
+		"  pa       hl_platform_active\n"
+		"  rd br    HLEntPlayerRides for the tracktrain: -1 not asked, 0 no,\n"
+		"           1 yes. branch 1 ground clause, 2 box, 3 neither, 4 no player\n"
+		"  pv av pi hl_platform_velocity, hl_platform_avel_z, pivot xy\n"
+		"  o v      player origin, player velocity\n"
+		"  T        tracktrain index, then its origin, angles[1],\n"
+		"           avelocity[1], yaw_delta\n\n");
+
+	len = StrLen(out);
+
+	for (i = 0; i < count; i++)
+	{
+		k    = (first + i) % HLRIDE_LINES;
+		slot = hl_ride_buf + k * HLRIDE_WIDTH;
+		n    = StrLen(slot);
+
+		MemCopy(out + len, slot, n);
+		len += n;
+
+		out[len] = '\n';
+		len++;
+	}
+
+	out[len] = 0;
+
+	FileWrite("::/Apps/HL1/RIDELOG.TXT", out, len);
+	Free(out);
+}
 
 //--- the pm_shared parts that needed the entity world ----------------------
 //
@@ -1147,6 +1288,14 @@ U0 HLClipInit()
 	//startup only; the entity spawn pass calls it again for each map - see
 	//HLClipRotatingReset
 	HLClipRotatingReset;
+
+	//The ring pointer is a heap allocation, so it is claimed here and not in
+	//HLMoveStateReset: that runs again on every level change and would drop the
+	//block instead of freeing it.
+	hl_ride_buf   = NULL;
+	hl_ride_log   = FALSE;
+	hl_ride_ticks = 0;
+	hl_ride_head  = 0;
 }
 
 U0 HLTracePlayer(CHLMap *map, F64 *start, F64 *end, CHLTrace *trace)
@@ -1464,6 +1613,16 @@ U0 HLPMCatagorizePosition()
 	hl_ground_entity = 0;
 	hl_ground_native = -1;
 
+	//ride trace: the probe is recorded whichever way this returns, so a tick
+	//that never traced is distinguishable from one that traced and missed
+	hl_ride_probe_calls++;
+	hl_ride_probe_hit   = FALSE;
+	hl_ride_probe_solid = FALSE;
+	hl_ride_probe_frac  = 1.0;
+	HLVecSet(hl_ride_probe_nrm, 0.0, 0.0, 0.0);
+	hl_ride_probe_ent   = -1;
+	hl_ride_probe_nat   = -1;
+
 	//"shooting up really fast. Definitely not on ground." This is what stops a
 	//jump being cancelled by its own ground probe on the tick it fires: a
 	//268 unit jump clears 180 comfortably.
@@ -1475,6 +1634,13 @@ U0 HLPMCatagorizePosition()
 
 	hl_trace_native_ent = -1;
 	HLPMTrace(hl_pm_org, point, &tr);
+
+	hl_ride_probe_hit   = tr.hit;
+	hl_ride_probe_solid = tr.start_solid;
+	hl_ride_probe_frac  = tr.fraction;
+	HLVecCopy(tr.plane_normal, hl_ride_probe_nrm);
+	hl_ride_probe_ent   = tr.ent;
+	hl_ride_probe_nat   = hl_trace_native_ent;
 
 	if (tr.plane_normal[2] < 0.7)
 	{
@@ -2584,12 +2750,10 @@ U0 HLPMCheckFalling()
 U0 HLPMUpdateStepSound()
 {//PM_UpdateStepSound: a step every flTimeStepSound, so the cadence tracks speed
  //
- //deviation: there is no materials.txt and no way to name the texture under the
- //player, so PM_CatagorizeTextureType and the CHAR_TEX_* switch are absent and
- //every dry surface reports STEP_CONCRETE. All the concrete cases carry the same
- //volumes and intervals anyway - 0.2/400ms walking, 0.5/300ms running - so only
- //vent, dirt and grate lose their distinct volume. The knee and feet water
- //probes are kept: those change the sample set, not just its loudness.
+ //PM_CatagorizeTextureType and the CHAR_TEX_* switch are HLSndMaterialAt and
+ //HLSndStepForMaterial: HLSound.ZC parses materials.txt and names the texture
+ //under the player through the render tree. The dry branch below is the SDK's,
+ //dirt and duct volumes included.
 	F64		knee[3];
 	F64		feet[3];
 	F64		height;
@@ -2599,6 +2763,7 @@ U0 HLPMUpdateStepSound()
 	F64		flduck;
 	F64		fvol;
 	I64		step;
+	I64		mat;
 	Bool	walking;
 	Bool	moving;
 
@@ -2645,19 +2810,19 @@ U0 HLPMUpdateStepSound()
 
 	if (hl_pm_on_ladder)
 	{
-		step         = HLPM_STEP_LADDER;
+		step         = HLSTEP_LADDER;
 		fvol         = 0.35;
 		hl_step_time = 0.35;
 	}
 	else if (HLPointContents(hl_pm_map, knee) == HLCONTENTS_WATER)
 	{
-		step         = HLPM_STEP_WADE;
+		step         = HLSTEP_WADE;
 		fvol         = 0.65;
 		hl_step_time = 0.6;
 	}
 	else if (HLPointContents(hl_pm_map, feet) == HLCONTENTS_WATER)
 	{
-		step = HLPM_STEP_SLOSH;
+		step = HLSTEP_SLOSH;
 
 		if (walking)
 		{
@@ -2672,18 +2837,39 @@ U0 HLPMUpdateStepSound()
 	}
 	else
 	{
-		step = HLPM_STEP_CONCRETE;
+		//one render-tree descent per step, not per frame: the guard at the top
+		//holds this branch to the cadence interval
+		mat  = HLSndMaterialAt(hl_pm_map, hl_pm_org);
+		step = HLSndStepForMaterial(mat);
 
-		if (walking)
+		//dirt and ventilation duct are the two sets that are not mixed at the
+		//common level
+		if (mat == HLTEX_DIRT)
 		{
-			fvol         = 0.2;
-			hl_step_time = 0.4;
+			if (walking)
+				fvol = 0.25;
+			else
+				fvol = 0.55;
+		}
+		else if (mat == HLTEX_VENT)
+		{
+			if (walking)
+				fvol = 0.4;
+			else
+				fvol = 0.7;
 		}
 		else
 		{
-			fvol         = 0.5;
-			hl_step_time = 0.3;
+			if (walking)
+				fvol = 0.2;
+			else
+				fvol = 0.5;
 		}
+
+		if (walking)
+			hl_step_time = 0.4;
+		else
+			hl_step_time = 0.3;
 	}
 
 	//"slower step time if ducking"
@@ -2947,6 +3133,11 @@ U0 HLPMJump()
 	//scale the whole velocity back before adding the jump, or each hop compounds
 	//the last without limit
 	HLPreventMegaBunny;
+
+	//PM_Jump, pm_shared.c:2568. There is no jump sample: the takeoff is one step
+	//on the surface underfoot at full volume, played immediately rather than
+	//through hl_step_play - the cadence timer is not touched
+	HLSndJumpStep(hl_pm_map, hl_pm_org, 0);
 
 	//sqrt(2 * 800 * 45), exactly enough to clear 45 units, ducked or not
 	hl_pm_vel[2] = HLPHYS_JUMP;

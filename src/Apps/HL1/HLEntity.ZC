@@ -132,6 +132,7 @@
 #define HLM_CDAUDIO_RADIUS		124	//CTargetCDAudio::Think, the radius poll
 #define HLM_MAKER_USE			125	//CMonsterMaker::CyclicUse / ToggleUse
 #define HLM_MAKER_THINK			126	//CMonsterMaker::MakerThink
+#define HLM_SPEAKER_USE			127	//CSpeaker::ToggleUse
 
 //how long a "toggle" trigger stays untouchable after firing
 #define HLENT_TRIGGER_DEBOUNCE	0.2
@@ -219,6 +220,11 @@ F64		hl_ent_spin_yaw			= 0.0;
 
 //damage the player has taken this tick, applied and cleared by the shell
 F64		hl_ent_player_damage	= 0.0;
+
+//the last hit applied to the player and its bitsDamageType, for the death trace
+//in HL1.ZC. Post-armour, so it is the figure the health actually lost
+F64		hl_ent_last_dmg			= 0.0;
+I64		hl_ent_last_dmg_type	= 0;
 
 //--- damage types -----------------------------------------------------------
 //
@@ -344,11 +350,60 @@ Bool	hl_ent_respawn_pending	= FALSE;
 F64		hl_ent_respawn_org[3];
 F64		hl_ent_respawn_ang[3];
 
-//EMIT_GROUPNAME_SUIT. The HEV suit's sentence groups are played by the sentence
-//scheduler in HLAI.ZC, which compiles after this file, so the group name is
-//posted rather than spoken. "HEV_DEAD" is the one DeathSound asks for
-U8		hl_ent_suit_group[32];
-Bool	hl_ent_suit_pending		= FALSE;
+//--- HEV suit voice ---------------------------------------------------------
+//
+// CBasePlayer::SetSuitUpdate / CheckSuitUpdate, dlls/player.cpp:2403-2557. A
+// short queue rather than a single slot: several lines are raised by one hit and
+// the suit reads them out one at a time, 3.5 seconds apart.
+//
+// The queue holds names, not the SDK's sentence and group indices. HLSound.ZC
+// resolves a name at playback and a group index has no reverse lookup here.
+// A leading ! is a specific sentence, as it is everywhere else in the tree;
+// anything else is a group. That distinction carries the SDK's fgroup argument.
+//
+// The word scheduler is in HLAI.ZC and compiles after this file, so a picked
+// line goes out through HLSound.ZC's sentence request queue, which HLAI.ZC
+// drains.
+
+//CSUITPLAYLIST, CSUITNOREPEAT, CBSENTENCENAME_MAX+1, player.h:45,58
+#define HLENT_SUITQ_MAX		4
+#define HLENT_SUITNR_MAX		32
+#define HLENT_SUITNAME		32
+
+//SUITUPDATETIME, SUITFIRSTUPDATETIME, player.cpp:2400-2401
+#define HLENT_SUIT_UPDATE	3.5
+#define HLENT_SUIT_FIRST		0.1
+
+//EMIT_SOUND_SUIT's level. The suit speaks into the player's ear, so it is heard
+//everywhere: attenuation 0
+#define HLENT_SUIT_VOL		0.85
+
+//flat blocks at a fixed stride: an array of string pointers collapses to one
+//entry. An empty slot is a leading NUL
+U8		hl_ent_suitq[HLENT_SUITQ_MAX * HLENT_SUITNAME];
+I64		hl_ent_suitq_next;		//m_iSuitPlayNext
+F64		hl_ent_suit_update;		//m_flSuitUpdate, 0 = the queue is idle
+
+U8		hl_ent_suitnr[HLENT_SUITNR_MAX * HLENT_SUITNAME];
+F64		hl_ent_suitnr_time[HLENT_SUITNR_MAX];
+
+U0 HLEntSuitQueueReset()
+{//SetSuitUpdate(NULL): empty the playlist. The norepeat list goes with it,
+ //since its times are on the entity clock and a new map restarts that
+	I64 i;
+
+	for (i = 0; i < HLENT_SUITQ_MAX; i++)
+		hl_ent_suitq[i * HLENT_SUITNAME] = 0;
+
+	for (i = 0; i < HLENT_SUITNR_MAX; i++)
+	{
+		hl_ent_suitnr[i * HLENT_SUITNAME] = 0;
+		hl_ent_suitnr_time[i]             = 0.0;
+	}
+
+	hl_ent_suitq_next  = 0;
+	hl_ent_suit_update = 0.0;
+}
 
 //--- pending screen and player effects, from the env_* / trigger_* classes ---
 //
@@ -439,6 +494,8 @@ U0 HLEntPlayerReset()
 	hl_ent_player_armor    = 0.0;
 	hl_ent_player_dead     = FALSE;
 	hl_ent_player_damage   = 0.0;
+	hl_ent_last_dmg        = 0.0;
+	hl_ent_last_dmg_type   = 0;
 
 	//CBasePlayer::Spawn's deadflag = DEAD_NO and view_ofs = VEC_VIEW
 	hl_ent_deadflag        = HLDEAD_NO;
@@ -450,8 +507,8 @@ U0 HLEntPlayerReset()
 	hl_ent_input_locked    = FALSE;
 	hl_ent_death_button    = FALSE;
 	hl_ent_respawn_pending = FALSE;
-	hl_ent_suit_group[0]   = 0;
-	hl_ent_suit_pending    = FALSE;
+
+	HLEntSuitQueueReset;
 
 	HLVecSet(hl_ent_respawn_org, 0.0, 0.0, 0.0);
 	HLVecSet(hl_ent_respawn_ang, 0.0, 0.0, 0.0);
@@ -479,7 +536,11 @@ U0 HLEntPlayerReset()
 	hl_ent_fade_pending  = FALSE;
 
 	hl_ent_gravity  = 1.0;
+
+	//a new map starts dry: the mixer holds the last roomtype until an env_sound
+	//replaces it, so it has to be told
 	hl_ent_roomtype = 0;
+	HLSndRoomtypeSet(0);
 
 	hl_ent_changelevel[0]      = 0;
 	hl_ent_changelevel_pending = FALSE;
@@ -615,15 +676,135 @@ I64 HLEntCountInUse()
 	return n;
 }
 
-U0 HLEntSuitGroup(U8 *group)
-{//EMIT_GROUPNAME_SUIT. Posted for the sentence scheduler in HLAI.ZC - see
- //hl_ent_suit_group. A pending group is not queued behind another: the SDK's
- //SetSuitUpdate also drops a line when one is already speaking
-	if (!group || !group[0] || hl_ent_suit_pending)
+U0 HLEntSuitUpdate(U8 *name, F64 norepeat = 0.0)
+{//CBasePlayer::SetSuitUpdate, dlls/player.cpp:2463. name is "!HEV_DMG4" for one
+ //sentence or "HEV_DEAD" for a group. norepeat is in seconds; 0 is SUIT_REPEAT_OK
+	I64	i;
+	I64	empty = -1;
+
+	//"Ignore suit updates if no suit"
+	if (!hl_ent_player_suit || !name || !name[0])
 		return;
 
-	HLStrCopy(hl_ent_suit_group, group, 32);
-	hl_ent_suit_pending = TRUE;
+	//SENTENCEG_Lookup / SENTENCEG_GetIndex reject an unknown name before it
+	//reaches the queue, so a typo in a map or a missing sentences.txt does not
+	//stall the playlist on a line that can never be spoken
+	if (name[0] == '!')
+	{
+		if (HLSndSentenceLookup(name) < 0)
+			return;
+	}
+	else if (HLSndSentenceGroupIndex(name) < 0)
+		return;
+
+	//the norepeat list cancels a line already spoken inside its window
+	for (i = 0; i < HLENT_SUITNR_MAX; i++)
+	{
+		if (!hl_ent_suitnr[i * HLENT_SUITNAME])
+		{
+			empty = i;
+			goto qesu_next_nr;
+		}
+
+		if (StrCompare(&hl_ent_suitnr[i * HLENT_SUITNAME], name))
+			goto qesu_next_nr;
+
+		//still marked
+		if (hl_ent_suitnr_time[i] >= hl_ent_time)
+			return;
+
+		//the window has expired, take the slot back
+		hl_ent_suitnr[i * HLENT_SUITNAME] = 0;
+		hl_ent_suitnr_time[i]             = 0.0;
+		empty                             = i;
+		break;
+
+qesu_next_nr:
+	}
+
+	if (norepeat > 0.0)
+	{
+		//"pick random slot to take over"
+		if (empty < 0)
+			empty = HLPartRandI(HLENT_SUITNR_MAX);
+
+		HLStrCopy(&hl_ent_suitnr[empty * HLENT_SUITNAME], name, HLENT_SUITNAME);
+		hl_ent_suitnr_time[empty] = hl_ent_time + norepeat;
+	}
+
+	//"find empty spot in queue, or overwrite last spot" - m_iSuitPlayNext walks
+	//forward and wraps, so a fifth line displaces the oldest
+	HLStrCopy(&hl_ent_suitq[hl_ent_suitq_next * HLENT_SUITNAME], name,
+		HLENT_SUITNAME);
+
+	hl_ent_suitq_next++;
+	if (hl_ent_suitq_next == HLENT_SUITQ_MAX)
+		hl_ent_suitq_next = 0;
+
+	if (hl_ent_suit_update <= hl_ent_time)
+	{
+		//"play queue is empty, don't delay too long before playback"
+		if (hl_ent_suit_update == 0.0)
+			hl_ent_suit_update = hl_ent_time + HLENT_SUIT_FIRST;
+		else
+			hl_ent_suit_update = hl_ent_time + HLENT_SUIT_UPDATE;
+	}
+}
+
+U0 HLEntSuitGroup(U8 *group)
+{//EMIT_GROUPNAME_SUIT with SUIT_REPEAT_OK
+	HLEntSuitUpdate(group, 0.0);
+}
+
+U0 HLEntCheckSuitUpdate()
+{//CBasePlayer::CheckSuitUpdate, dlls/player.cpp:2403, run from PostThink.
+ //One line per call, at most one every SUITUPDATETIME.
+ //
+ //The geiger counter half is absent: nothing here carries a radiation source
+	U8	*slot;
+	I64	 search;
+	I64	 i;
+
+	if (!hl_ent_player_suit)
+		return;
+
+	if (hl_ent_suit_update <= 0.0 || hl_ent_time < hl_ent_suit_update)
+		return;
+
+	//"play a sentence off of the end of the queue"
+	search = hl_ent_suitq_next;
+	slot   = NULL;
+
+	for (i = 0; i < HLENT_SUITQ_MAX; i++)
+	{
+		if (hl_ent_suitq[search * HLENT_SUITNAME])
+		{
+			slot = &hl_ent_suitq[search * HLENT_SUITNAME];
+			break;
+		}
+
+		search++;
+		if (search == HLENT_SUITQ_MAX)
+			search = 0;
+	}
+
+	if (!slot)
+	{
+		//"queue is empty, don't check"
+		hl_ent_suit_update = 0.0;
+		return;
+	}
+
+	//ATTN_NONE: the suit speaks inside the helmet
+	if (slot[0] == '!')
+		HLSndSentenceQueue(slot, hl_ent_player_org, HLENT_SUIT_VOL, 0.0,
+			HLPITCH_NORM, hl_ent_player + 1);
+	else
+		HLSndSentencePlayRndSz(slot, hl_ent_player_org, HLENT_SUIT_VOL, 0.0,
+			HLPITCH_NORM, hl_ent_player + 1);
+
+	slot[0]            = 0;
+	hl_ent_suit_update = hl_ent_time + HLENT_SUIT_UPDATE;
 }
 
 U0 HLEntPlayerDeathSound(I64 damage_type)
@@ -765,13 +946,21 @@ U0 HLEntKillPlayer()
 	HLEntPlayerKilled(HLDMG_GENERIC);
 }
 
-U0 HLEntHurtPlayer(F64 damage, I64 damage_type = HLDMG_GENERIC)
+U0 HLEntHurtPlayer(F64 damage, I64 damage_type = HLDMG_GENERIC,
+	F64 *source = NULL)
 {//CBasePlayer::TakeDamage
  //
  //ArmorRatio: the suit soaks 80% of incoming damage while charge remains, at 2
  //points of charge per point absorbed. ARMOR_RATIO 0.2, ARMOR_BONUS 0.5
-	F64 absorbed;
-	F64 to_armor;
+ //
+ //source is the attacker's world position for the damage compass. NULL is
+ //damage with no bearing - drowning, falling, a trigger_hurt - and leaves the
+ //wedges alone rather than aiming them at the world origin
+	F64  absorbed;
+	F64  to_armor;
+	F64  health_prev;
+	Bool fmajor;
+	Bool fcritical;
 
 	if (damage <= 0.0 || hl_ent_player_dead)
 		return;
@@ -799,6 +988,16 @@ U0 HLEntHurtPlayer(F64 damage, I64 damage_type = HLDMG_GENERIC)
 		damage -= absorbed;
 	}
 
+	//CHudHealth::MsgFunc_Damage's vecFrom
+	HLHudDamageSource(source);
+
+	//the damage that actually reached the player, after the suit, with the mask
+	//that carried it. Read by the death trace in HL1.ZC
+	hl_ent_last_dmg      = damage;
+	hl_ent_last_dmg_type = damage_type;
+
+	health_prev = hl_ent_player_health;
+
 	hl_ent_player_damage += damage;
 	hl_ent_player_health -= damage;
 
@@ -809,6 +1008,84 @@ U0 HLEntHurtPlayer(F64 damage, I64 damage_type = HLDMG_GENERIC)
 		HLEntPlayerKilled(damage_type);
 		hl_ent_player_health = 0.0;
 		return;
+	}
+
+	//--- HEV voice ---
+	//
+	//CBasePlayer::TakeDamage's bitsDamage cascade, dlls/player.cpp:551-680. The
+	//SDK loops so that one hit carrying several bits raises one line per bit;
+	//the tests below are flat for the same reason - the bits are disjoint in
+	//everything this tree raises.
+	//
+	//ftrivial (damage under 20 with no armour change) is not reproduced: it
+	//gates only the loop, and every line below is already gated by fmajor.
+	fmajor    = ToBool(damage > 25.0);
+	fcritical = ToBool(hl_ent_player_health < 30.0);
+
+	if (damage_type & HLDMG_CLUB)
+	{
+		if (fmajor)
+			HLEntSuitUpdate("!HEV_DMG4", 30.0);		//minor fracture
+	}
+
+	if (damage_type & (HLDMG_FALL | HLDMG_CRUSH))
+	{
+		if (fmajor)
+			HLEntSuitUpdate("!HEV_DMG5", 30.0);		//major fracture
+		else
+			HLEntSuitUpdate("!HEV_DMG4", 30.0);
+	}
+
+	//"if (m_lastDamageAmount > 5)" - blood loss, not every graze
+	if (damage_type & HLDMG_BULLET)
+	{
+		if (damage > 5.0)
+			HLEntSuitUpdate("!HEV_DMG6", 30.0);		//blood loss detected
+	}
+
+	if (damage_type & HLDMG_SLASH)
+	{
+		if (fmajor)
+			HLEntSuitUpdate("!HEV_DMG1", 30.0);		//major laceration
+		else
+			HLEntSuitUpdate("!HEV_DMG0", 30.0);		//minor laceration
+	}
+
+	if (damage_type & HLDMG_SONIC)
+	{
+		if (fmajor)
+			HLEntSuitUpdate("!HEV_DMG2", 60.0);		//internal bleeding
+	}
+
+	if (damage_type & (HLDMG_POISON | HLDMG_PARALYZE))
+		HLEntSuitUpdate("!HEV_DMG3", 60.0);			//blood toxins detected
+
+	if (damage_type & HLDMG_ACID)
+		HLEntSuitUpdate("!HEV_DET1", 60.0);			//hazardous chemicals
+
+	if (damage_type & HLDMG_NERVEGAS)
+		HLEntSuitUpdate("!HEV_DET0", 60.0);			//biohazard detected
+
+	if (damage_type & HLDMG_RADIATION)
+		HLEntSuitUpdate("!HEV_DET2", 60.0);			//radiation detected
+
+	//"first time we take major damage"
+	if (fmajor && health_prev >= 75.0)
+	{
+		HLEntSuitUpdate("!HEV_MED1", 1800.0);		//automedic on
+		HLEntSuitUpdate("!HEV_HEAL7", 1800.0);		//morphine shot
+	}
+
+	//"already took major damage, now it's critical"
+	if (fcritical && health_prev < 75.0)
+	{
+		if (hl_ent_player_health < 6.0)
+			HLEntSuitUpdate("!HEV_HLTH3", 600.0);	//near death
+		else if (hl_ent_player_health < 20.0)
+			HLEntSuitUpdate("!HEV_HLTH2", 600.0);	//health critical
+
+		if (!HLPartRandI(4) && health_prev < 50.0)
+			HLEntSuitUpdate("!HEV_DMG7", 300.0);	//seek medical attention
 	}
 
 	//"no pain sound during death animation" - CBaseMonster::TakeDamage plays it
@@ -3330,6 +3607,10 @@ U8 *HLEntFanSound(I64 n)
 #define HLSF_AMBIENT_START_SILENT	16
 #define HLSF_AMBIENT_NOT_LOOPING		32
 
+//SPEAKER_START_SILENT, dlls/util.h:386. A different entity and a different
+//bit: "wait for trigger 'on' to start announcements"
+#define HLSF_SPEAKER_START_SILENT	1
+
 F64 HLAmbientVolume(CHLEntity *e)
 {//"health" is 0-10.
 	F64 vol = e->health / 10.0;
@@ -3386,6 +3667,43 @@ U0 HLAmbientUse(I64 self)
 	else
 		HLSndAmbientAdd(e->origin, e->message, HLAmbientVolume(e),
 			HLAmbientAtten(e));
+}
+
+U0 HLSpeakerUse(I64 self, I64 use_type)
+{//CSpeaker::ToggleUse, dlls/sound.cpp:1923. A pending announcement is cancelled,
+ //no pending announcement starts one
+	I64		slot = HLSndSpeakerSlotFor(self);
+	Bool	active;
+
+	if (slot < 0)
+		return;
+
+	active = HLSndSpeakerPending(slot);
+
+	//"ignore if we're just turning something on that's already on, or turning
+	//something off that's already off"
+	if (use_type != HLUSE_TOGGLE)
+	{
+		if (active && use_type == HLUSE_ON)
+			return;
+
+		if (!active && use_type == HLUSE_OFF)
+			return;
+	}
+
+	if (use_type == HLUSE_ON)
+	{
+		HLSndSpeakerSetNext(slot, hl_ent_time + 0.1);
+		return;
+	}
+
+	if (use_type == HLUSE_OFF)
+	{
+		HLSndSpeakerSetNext(slot, 0.0);
+		return;
+	}
+
+	HLSndSpeakerToggle(slot, hl_ent_time);
 }
 
 U0 HLRotatingUse(I64 self, I64 use_type)
@@ -4183,7 +4501,7 @@ U0 HLExplosionUse(I64 self)
 		//RadiusDamage's linear falloff. no trace to the target, so a wall
 		//between the player and the blast does not shield them
 		damage = e->magnitude * (1.0 - len / radius);
-		HLEntHurtPlayer(damage, HLDMG_BLAST);
+		HLEntHurtPlayer(damage, HLDMG_BLAST, e->origin);
 	}
 
 qeu_done:
@@ -5703,6 +6021,7 @@ U0 HLEntCallMethod(I64 self, I64 method, I64 activator = -1,
 			break;
 
 		case HLM_AMBIENT_USE:		HLAmbientUse(self);				break;
+		case HLM_SPEAKER_USE:		HLSpeakerUse(self, use_type);	break;
 
 		case HLM_MULTI_MANAGER_USE:	HLMMUse(self, activator);		break;
 		case HLM_MULTI_MANAGER_TICK: HLMMTick(self);				break;
@@ -7521,6 +7840,29 @@ I64 HLEntSpawnOne(CHLMap *map, I64 i)
 		return 1;
 	}
 
+	//--- speaker ---
+	//
+	//CSpeaker::Spawn, dlls/sound.cpp:1823. The public address announcer. The
+	//schedule and the sentence pick live in HLSound.ZC; this registers the
+	//entity and routes its use.
+	//
+	//No ObjectCaps beyond CBaseEntity's, so HLEntUseInFront never reaches one:
+	//a speaker answers a targetname and nothing else.
+	if (!StrCompare(e->classname, "speaker"))
+	{
+		e->movetype = HLMOVETYPE_NONE;
+		e->solid    = HLSOLID_NOT;
+		e->effects |= HLEF_NODRAW;
+		e->use_fn   = HLM_SPEAKER_USE;
+
+		//"SPEAKER with no Level/Sentence" - the SDK removes it on the next
+		//think. HLSndSpeakerAdd refuses the same case and returns -1
+		HLSndSpeakerAdd(e->origin, e->message, e->preset, e->health,
+			ToBool(e->spawnflags & HLSF_SPEAKER_START_SILENT), hl_ent_time, i);
+
+		return 1;
+	}
+
 	//the brush volumes among these are all hidden by their own Spawn: the three
 	//triggers through CBaseTrigger::InitTrigger, trigger_transition by having
 	//its modelindex cleared. The point entities carry no model, so the flag
@@ -7530,8 +7872,7 @@ I64 HLEntSpawnOne(CHLMap *map, I64 i)
 		!StrCompare(e->classname, "trigger_endsection") ||
 		!StrCompare(e->classname, "trigger_camera") ||
 		!StrCompare(e->classname, "player_loadsaved") ||
-		!StrCompare(e->classname, "player_weaponstrip") ||
-		!StrCompare(e->classname, "speaker"))
+		!StrCompare(e->classname, "player_weaponstrip"))
 	{
 		HLEntSpawnInert(map, e, TRUE);
 		return 1;
@@ -8024,8 +8365,10 @@ I64 HLEntSpawnAll(CHLMap *map)
 	hl_ent_callq_lost = 0;
 
 	//ambients are re-registered by the spawn pass below, so the previous
-	//map's must go first or they accumulate
+	//map's must go first or they accumulate. Speakers are keyed by entity
+	//index and carry the same hazard
 	HLSndAmbientClear;
+	HLSndSpeakerClear;
 
 	//HLClip.ZC's rotation registry is indexed by entity slot and HLClipInit runs
 	//at startup only. A slot that held a func_rotating in one map says nothing
@@ -8036,6 +8379,12 @@ I64 HLEntSpawnAll(CHLMap *map)
 	//Looping train voices are indexed the same way and leak across a map change
 	//for the same reason.
 	HLTrainVoiceReset;
+
+	//HLCvarInit runs at startup and this file compiles after it, so the ride
+	//trace registers its own cvar here. HLConCvarCommand rejects names that are
+	//not in the table, so without this `ridelog 1` reads as an unknown command.
+	if (HLCvarIndex("ridelog") < 0)
+		HLCvarDefine("ridelog", 0.0);
 
 	//Trace the opening seconds. Bounded by count and by game time, so it costs
 	//nothing after the level has settled.
@@ -8150,15 +8499,24 @@ Bool HLEntPlayerRides(I64 self, CHLEntity *e, F64 *player_org)
  //on a car turning under them the box test alone loses them for the tick the
  //feet cross the edge. hl_ground_native is PM_CatagorizePosition's answer from
  //the last move, which is the same generation of the flag SV_PushMove reads.
-	F64 pmins[3];
-	F64 pmaxs[3];
-	I64 i;
+	F64	 pmins[3];
+	F64	 pmaxs[3];
+	I64	 i;
+	I64	 branch = 3;	//ride trace: 1 ground clause, 2 box, 3 neither, 4 no player
+	Bool got    = FALSE;
 
 	if (!player_org)
-		return FALSE;
+	{
+		branch = 4;
+		goto qepr_done;
+	}
 
 	if (self >= 0 && hl_ground_native == self)
-		return TRUE;
+	{
+		branch = 1;
+		got    = TRUE;
+		goto qepr_done;
+	}
 
 	for (i = 0; i < 3; i++)
 	{
@@ -8171,7 +8529,135 @@ Bool HLEntPlayerRides(I64 self, CHLEntity *e, F64 *player_org)
 	//than exact
 	pmins[2] -= 4.0;
 
-	return HLEntBoxOverlap(e, pmins, pmaxs);
+	if (HLEntBoxOverlap(e, pmins, pmaxs))
+	{
+		branch = 2;
+		got    = TRUE;
+	}
+
+qepr_done:
+	//Recorded for the tracktrain only: the mover pass asks this of every pusher
+	//in the table and a later one would overwrite the answer the record wants.
+	if (e && e->ent_class == HLC_TRACKTRAIN)
+		hl_ride_branch = branch;
+
+	return got;
+}
+
+U0 HLEntRideLogTick(F64 *player_org)
+{//one record of the pusher-carry state, emitted after the mover pass
+ //
+ //Placed there and not after the thinks: the think pass recomputes a
+ //tracktrain's velocity and avelocity for the NEXT tick, and the record is of
+ //what this tick applied.
+ //
+ //The cvar is the arming edge. Raising it allocates the ring, dropping it
+ //writes the file.
+	CHLEntity	*e;
+	U8			 line[HLRIDE_WIDTH];
+	U8			 part[HLRIDE_WIDTH];
+	F64			 torg[3];
+	F64			 tyaw	= 0.0;
+	F64			 tavel	= 0.0;
+	I64			 train	= -1;
+	I64			 plat	= 0;
+	I64			 hit	= 0;
+	I64			 solid	= 0;
+	I64			 i;
+	Bool		 want;
+
+	want = ToBool(HLCvarGet("ridelog") != 0.0);
+
+	if (want != hl_ride_log)
+	{
+		if (want)
+			HLRideLogArm;
+		else
+		{
+			HLRideLogFlush;
+			HLRideLogFree;
+		}
+	}
+
+	if (!hl_ride_log || !player_org)
+		return;
+
+	//The first live tracktrain. c0a0's intro chain has one car at a time, and
+	//the index is in the record for a map that does not.
+	for (i = 0; i < hl_num_entities; i++)
+	{
+		if (hl_entities[i].in_use &&
+			hl_entities[i].ent_class == HLC_TRACKTRAIN)
+		{
+			train = i;
+			break;
+		}
+	}
+
+	HLVecSet(torg, 0.0, 0.0, 0.0);
+
+	if (train >= 0)
+	{
+		e = &hl_entities[train];
+
+		HLVecCopy(e->origin, torg);
+		tyaw  = e->angles[1];
+		tavel = e->avelocity[1];
+	}
+
+	if (hl_platform_active)
+		plat = 1;
+
+	if (hl_ride_probe_hit)
+		hit = 1;
+
+	if (hl_ride_probe_solid)
+		solid = 1;
+
+	//Four prints appended in place: no call carries more arguments than the
+	//tree's existing longest StrPrint.
+	StrPrint(line,
+		"%5d %7.2f og%2d ge%3d gn%4d pc%1d hs%1d%1d",
+		hl_ride_ticks, hl_ent_time, hl_pm_onground, hl_ground_entity,
+		hl_ground_native, hl_ride_probe_calls, hit, solid);
+
+	StrPrint(part,
+		" f%6.3f n%5.2f%5.2f%5.2f pe%3d pn%4d",
+		hl_ride_probe_frac, hl_ride_probe_nrm[0], hl_ride_probe_nrm[1],
+		hl_ride_probe_nrm[2], hl_ride_probe_ent, hl_ride_probe_nat);
+
+	HLStrCopy(line + StrLen(line), part, HLRIDE_WIDTH - StrLen(line));
+
+	StrPrint(part,
+		" |pa%1d rd%2d br%1d pv%7.1f%7.1f%7.1f av%7.2f pi%8.1f%8.1f",
+		plat, hl_ride_rides, hl_ride_branch,
+		hl_platform_velocity[0], hl_platform_velocity[1],
+		hl_platform_velocity[2], hl_platform_avel_z,
+		hl_platform_pivot[0], hl_platform_pivot[1]);
+
+	HLStrCopy(line + StrLen(line), part, HLRIDE_WIDTH - StrLen(line));
+
+	StrPrint(part,
+		" |o%8.1f%8.1f%8.1f v%7.1f%7.1f%7.1f",
+		player_org[0], player_org[1], player_org[2],
+		hl_pm_vel[0], hl_pm_vel[1], hl_pm_vel[2]);
+
+	HLStrCopy(line + StrLen(line), part, HLRIDE_WIDTH - StrLen(line));
+
+	StrPrint(part,
+		" |T%3d%8.1f%8.1f%8.1f y%6.1f a%7.2f d%6.2f",
+		train, torg[0], torg[1], torg[2], tyaw, tavel, hl_ride_yaw_delta);
+
+	HLStrCopy(line + StrLen(line), part, HLRIDE_WIDTH - StrLen(line));
+
+	HLRideLogPut(line);
+
+	//Bounded staleness rather than a write per tick: the ring holds 14 seconds
+	//and a 256 kB write at 72 Hz would dominate the frame.
+	if (hl_ride_ticks % HLRIDE_FLUSH == 0)
+		HLRideLogFlush;
+
+	hl_ride_probe_calls = 0;
 }
 
 U0 HLEntPushPlayer(F64 *move, F64 *player_org)
@@ -8295,11 +8781,14 @@ U0 HLEntFrame(CHLMap *map, F64 dt, F64 *player_org)
  //
  //player_org is passed in rather than read from a global because the shell
  //owns it and compiles after this file
+	CHLTrace	 sndtr;
 	CHLEntity	*e;
 	F64			 move[3];
 	F64			 oldorg[3];
 	F64			 oldang[3];
 	F64			 dist[3];
+	F64			 zero[3];
+	F64			 eye[3];
 	F64			 best;
 	F64			 len;
 	Bool		 rides;
@@ -8327,6 +8816,12 @@ U0 HLEntFrame(CHLMap *map, F64 dt, F64 *player_org)
 	hl_platform_active      = FALSE;
 	hl_platform_avel_z      = 0.0;
 	HLVecSet(hl_platform_velocity, 0.0, 0.0, 0.0);
+
+	//ride trace: -1 is "the mover pass never asked", which a tracktrain that is
+	//not moving this tick produces and a bug in the rider test does not
+	hl_ride_rides     = -1;
+	hl_ride_branch    = 0;
+	hl_ride_yaw_delta = 0.0;
 
 	//friction belongs to HLClip.ZC and is read inside PM_Friction. Cleared here
 	//rather than by func_friction, because stepping OFF a slippery brush
@@ -8417,6 +8912,16 @@ qef_next_voice:
 			if (player_org && hl_ent_player >= 0)
 				rides = HLEntPlayerRides(i, e, player_org);
 
+			//ride trace: sampled here, ahead of the yaw_delta consume below
+			if (hl_ride_log && e->ent_class == HLC_TRACKTRAIN)
+			{
+				hl_ride_rides     = 0;
+				hl_ride_yaw_delta = e->yaw_delta;
+
+				if (rides)
+					hl_ride_rides = 1;
+			}
+
 			e->origin[0] += move[0];
 			e->origin[1] += move[1];
 			e->origin[2] += move[2];
@@ -8466,19 +8971,37 @@ qef_next_voice:
 qef_next_move:
 	}
 
+	//After the movers and before the thinks: the think pass recomputes a
+	//tracktrain's velocity and avelocity for the next tick
+	HLEntRideLogTick(player_org);
+
 	//--- env_sound ---------------------------------------------------------
 	//
-	// The nearest env_sound whose radius contains the player wins, as in HL: the
-	// reverb preset is a property of where the player stands, not of an entity
-	// touched.
+	// CEnvSound::Think, dlls/sound.cpp:891. The nearest env_sound that is in
+	// radius and has line of sight to the player wins; its roomtype goes to the
+	// mixer through HLSndRoomtypeSet.
 	//
-	// Nothing reads hl_ent_roomtype: HLSound.ZC mixes dry, with no reverb tail to
-	// configure. Costs one pass over the entity list.
+	// The SDK runs this from each env_sound's own think against
+	// FIND_CLIENT_IN_PVS and keeps m_pentSndLast per player. One pass over the
+	// list per tick reaches the same answer: the nearest visible in-range entity.
+	//
+	// "we do not actually change the player's room_type until we have a new
+	// valid room_type to change it to" (sound.cpp:920) - with no candidate the
+	// previous room is held, not reset to dry.
+	//
+	// FEnvSoundInRange's water-boundary rejection is absent: HLTraceEntity
+	// reports no fInOpen/fInWater pair.
 	if (player_org)
 	{
 		best  = 0.0;
 		room  = 0;
 		found = FALSE;
+
+		HLVecSet(zero, 0.0, 0.0, 0.0);
+
+		//vecSpot2 = origin + view_ofs, sound.cpp:854
+		HLVecCopy(player_org, eye);
+		eye[2] += HLPHYS_VIEW_Z;
 
 		for (i = 0; i < hl_num_entities; i++)
 		{
@@ -8490,7 +9013,7 @@ qef_next_move:
 			if (StrCompare(e->classname, "env_sound"))
 				goto qef_next_room;
 
-			HLVecSub(player_org, e->origin, dist);
+			HLVecSub(eye, e->origin, dist);
 			len = HLVecLength(dist);
 
 			if (len > e->radius)
@@ -8502,6 +9025,13 @@ qef_next_move:
 			if (found && len >= best)
 				goto qef_next_room;
 
+			//UTIL_TraceLine(vecSpot1, vecSpot2, ignore_monsters), sound.cpp:860.
+			//Traced last, so the cheap radius and distance rejects run first
+			HLTraceEntity(map, e->origin, eye, zero, zero, 0, TRUE, &sndtr);
+
+			if (sndtr.fraction != 1.0)
+				goto qef_next_room;
+
 			best  = len;
 			room  = e->roomtype;
 			found = TRUE;
@@ -8509,8 +9039,18 @@ qef_next_move:
 qef_next_room:
 		}
 
-		hl_ent_roomtype = room;
+		if (found)
+		{
+			hl_ent_roomtype = room;
+			HLSndRoomtypeSet(room);
+		}
 	}
+
+	//--- speaker -----------------------------------------------------------
+	//
+	// CSpeaker::SpeakerThink for every registered speaker. The announcer runs on
+	// the entity clock, which a paused game stops.
+	HLSndSpeakerUpdate(hl_ent_time);
 
 	//--- thinks ---
 	for (i = 0; i < hl_num_entities; i++)
@@ -8547,6 +9087,10 @@ qef_next_think:
 	}
 
 	HLEntDrainCalls();
+
+	//CBasePlayer::PostThink, dlls/player.cpp:1979. One HEV line per call at most,
+	//after the thinks that raise them
+	HLEntCheckSuitUpdate;
 
 	//CBasePlayer::PlayerDeathThink. Last, so a trigger that killed the player
 	//this tick has already run and the death state machine starts on the tick
@@ -8589,6 +9133,9 @@ U0 HLEntTouchPlayer(F64 *player_org)
 		if (!HLEntBoxOverlap(e, pmins, pmaxs))
 			goto qetp_next;
 
+		//hl_ent_player is 0, which is also worldspawn's index, while
+		//HLAITargetIsPlayer and HLDoorBlocked spell the player -1. A handler
+		//that tests this activator for being the player reads worldspawn.
 		HLEntQueueCall(i, e->touch_fn, hl_ent_player, HLUSE_TOGGLE, 0.0);
 
 qetp_next:
@@ -8612,6 +9159,7 @@ I64 HLEntUseInFront(F64 *player_org, F64 *forward, Bool held = FALSE)
 	I64			 use_type;
 	I64			 i;
 	I64			 fired = 0;
+	Bool		 found = FALSE;
 
 	if (!hl_entities || !player_org || !forward)
 		return 0;
@@ -8658,6 +9206,8 @@ I64 HLEntUseInFront(F64 *player_org, F64 *forward, Bool held = FALSE)
 		if (!HLEntBoxOverlap(e, pmins, pmaxs))
 			goto qeuf_next;
 
+		//same activator hazard as HLEntTouchPlayer: hl_ent_player is 0, the
+		//-1 convention lives in HLAITargetIsPlayer and HLDoorBlocked
 		HLEntQueueCall(i, e->use_fn, hl_ent_player, use_type, 0.0);
 		fired++;
 		break;
@@ -8666,6 +9216,46 @@ qeuf_next:
 	}
 
 	HLEntDrainCalls();
+
+	//CBasePlayer::PlayerUse, dlls/player.cpp:1666 and :1682. wpn_select when the
+	//search found an object, wpn_denyselect when it found none. On the press edge
+	//only: the held pass would otherwise click once a tick on a charger.
+	//
+	//The SDK's search is one pass over everything with FCAP_*_USE, and
+	//CTalkMonster carries FCAP_IMPULSE_USE, so a scientist counts as an object
+	//and answers with wpn_select. The use pass above sees no monster - they have
+	//no use_fn - so the friend classes are probed here for the sound alone.
+	//m_szFriends, talkmonster.cpp:53-58
+	if (!held)
+	{
+		found = ToBool(fired > 0);
+
+		if (!found)
+		{
+			for (i = 0; i < hl_num_entities; i++)
+			{
+				e = &hl_entities[i];
+
+				if (!e->in_use || e->health <= 0.0)
+					goto qeuf_next_friend;
+
+				if (StrCompare(e->classname, "monster_barney") &&
+					StrCompare(e->classname, "monster_scientist") &&
+					StrCompare(e->classname, "monster_sitting_scientist"))
+					goto qeuf_next_friend;
+
+				if (!HLEntBoxOverlap(e, pmins, pmaxs))
+					goto qeuf_next_friend;
+
+				found = TRUE;
+				break;
+
+qeuf_next_friend:
+			}
+		}
+
+		HLSndPlayerUse(found, player_org, hl_ent_player + 1);
+	}
 
 	return fired;
 }

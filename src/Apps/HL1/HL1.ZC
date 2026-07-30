@@ -839,6 +839,285 @@ U0 HLLiquidView()
 	hl_water_last = hl_water_level;
 }
 
+//--- shell half of the player damage and death path -------------------------
+//
+// The entity world owns health, armour and the death state machine. The shell
+// owns the keyboard, the view, the origin and the water level, so every damage
+// source that reads one of those is raised here.
+//
+// hl_ent_player_damage is the entity world's per-tick accumulator. Nothing
+// consumed it on the native path, so a hit produced no red flash and no view
+// kick: HLViewKickUpdate returns immediately without a player edict, and HL
+// ships no progs.dat.
+
+//AIRTIME, dlls/player.cpp:1215. Seconds of breath from a full lung
+#define HLDROWN_AIRTIME		12.0
+
+//pev->dmg is set to 2 whenever the head is out (dlls/player.cpp:1243) and
+//pre-incremented before each drowning hit to a ceiling of 5 (:1271-1273), so
+//the series is 3, 4, 5, 5. One hit per second, :1276
+#define HLDROWN_DMG_BASE		2.0
+#define HLDROWN_DMG_MAX		5.0
+#define HLDROWN_PERIOD		1.0
+
+F64	hl_air_finished	= 0.0;	//entity clock time the lung empties
+F64	hl_drown_dmg		= HLDROWN_DMG_BASE;
+F64	hl_drown_next	= 0.0;	//pev->pain_finished, the next drowning hit
+
+//--- death trace ---
+//
+// hl_debug_death 1 writes one line per server tick to ::/Apps/HL1/HL1DEATH.TXT,
+// 2 also echoes state changes to the console. hl_debug_hurt <n> applies n
+// points of damage on the next tick and clears itself; hl_debug_hurt_type is
+// the HLDMG_* mask that damage carries.
+
+#define HLDBG_DEATH_MAX	400		//lines per capture, then the trace stops
+#define HLDBG_DEATH_BUF	32768
+
+U8	hl_dbg_death_buf[HLDBG_DEATH_BUF];
+U8	hl_dbg_death_line[192];
+I64	hl_dbg_death_len	= 0;
+I64	hl_dbg_death_lines	= 0;
+Bool hl_dbg_death_on		= FALSE;
+
+//last hit applied to the player and its HLDMG_* mask. A hit raised inside the
+//entity world carries no mask across, so its type reads -1
+F64	hl_dbg_last_dmg		= 0.0;
+I64	hl_dbg_last_type		= -1;
+Bool hl_dbg_type_known	= FALSE;
+
+//previous line's health and deadflag, for the console echo edge
+F64	hl_dbg_prev_hp		= 0.0;
+I64	hl_dbg_prev_flag		= 0;
+
+U0 HLShellDeathInit()
+{//globals are not zeroed and their declaration initialisers do not run
+	hl_air_finished = 0.0;
+	hl_drown_dmg    = HLDROWN_DMG_BASE;
+	hl_drown_next   = 0.0;
+
+	hl_dbg_death_len    = 0;
+	hl_dbg_death_lines  = 0;
+	hl_dbg_death_on     = FALSE;
+	hl_dbg_death_buf[0] = 0;
+
+	hl_dbg_last_dmg   = 0.0;
+	hl_dbg_last_type  = -1;
+	hl_dbg_type_known = FALSE;
+
+	hl_dbg_prev_hp   = 0.0;
+	hl_dbg_prev_flag = 0;
+}
+
+U0 HLShellHurt(F64 damage, I64 damage_type)
+{//every damage the shell raises itself, with the mask recorded for the trace
+	if (damage <= 0.0)
+		return;
+
+	hl_dbg_last_type  = damage_type;
+	hl_dbg_type_known = TRUE;
+
+	HLEntHurtPlayer(damage, damage_type);
+}
+
+U8 *HLDbgDmgName(I64 bits)
+{//shortest name of the highest-priority bit set, for one fixed-width column
+	if (bits < 0)
+		return "ent";
+
+	if (bits == HLDMG_GENERIC)
+		return "gen";
+	if (bits & HLDMG_FALL)
+		return "fall";
+	if (bits & HLDMG_DROWN)
+		return "drwn";
+	if (bits & HLDMG_CRUSH)
+		return "crsh";
+	if (bits & HLDMG_BLAST)
+		return "blst";
+	if (bits & HLDMG_BULLET)
+		return "bull";
+	if (bits & HLDMG_CLUB)
+		return "club";
+	if (bits & HLDMG_SLASH)
+		return "slsh";
+	if (bits & HLDMG_BURN)
+		return "burn";
+	if (bits & HLDMG_SHOCK)
+		return "shck";
+	if (bits & HLDMG_SONIC)
+		return "snic";
+
+	return "othr";
+}
+
+U0 HLDbgDeathFlush()
+{//eager, so a fault mid-death still leaves the capture on disk
+	if (!hl_disk_writes || hl_dbg_death_len <= 0)
+		return;
+
+	FileWrite("::/Apps/HL1/HL1DEATH.TXT", hl_dbg_death_buf, hl_dbg_death_len);
+}
+
+U0 HLDbgDeathPut(U8 *s)
+{
+	I64 n = StrLen(s);
+
+	if (hl_dbg_death_len + n + 1 >= HLDBG_DEATH_BUF)
+		return;
+
+	MemCopy(hl_dbg_death_buf + hl_dbg_death_len, s, n);
+	hl_dbg_death_len += n;
+	hl_dbg_death_buf[hl_dbg_death_len] = 0;
+}
+
+U0 HLDbgDeathTick()
+{//one line per server tick while hl_debug_death is set
+ //
+ //Columns: entity clock, health, armour, hl_ent_player_dead, hl_ent_deadflag,
+ //hl_ent_input_locked, hl_ent_death_time, hl_ent_dead_time,
+ //hl_ent_respawn_pending, hl_ent_death_button, last damage and its type
+	I64 echo;
+
+	echo = ToI64(HLCvarGet("hl_debug_death"));
+
+	if (echo == 0)
+	{
+		if (hl_dbg_death_on)
+		{
+			hl_dbg_death_on = FALSE;
+			HLDbgDeathPut("-- trace off\n");
+			HLDbgDeathFlush;
+		}
+
+		return;
+	}
+
+	if (!hl_dbg_death_on)
+	{
+		hl_dbg_death_on     = TRUE;
+		hl_dbg_death_len    = 0;
+		hl_dbg_death_lines  = 0;
+		hl_dbg_death_buf[0] = 0;
+
+		HLDbgDeathPut(
+			"   time     hp    ar dd df lk   dtime  ddtime rp bt    hit type\n");
+	}
+
+	if (hl_dbg_death_lines >= HLDBG_DEATH_MAX)
+		return;
+
+	StrPrint(hl_dbg_death_line,
+		"%7.2f %6.1f %5.1f %2d %2d %2d %7.2f %7.2f %2d %2d %6.1f %s\n",
+		hl_ent_time, hl_ent_player_health, hl_ent_player_armor,
+		hl_ent_player_dead, hl_ent_deadflag, hl_ent_input_locked,
+		hl_ent_death_time, hl_ent_dead_time,
+		hl_ent_respawn_pending, hl_ent_death_button,
+		hl_dbg_last_dmg, HLDbgDmgName(hl_dbg_last_type));
+
+	HLDbgDeathPut(hl_dbg_death_line);
+	hl_dbg_death_lines++;
+
+	//the console is 40 columns and wraps, so only a change is echoed
+	if (echo >= 2 && (hl_ent_player_health != hl_dbg_prev_hp ||
+		hl_ent_deadflag != hl_dbg_prev_flag))
+	{
+		HLConPrint(hl_dbg_death_line);
+	}
+
+	hl_dbg_prev_hp   = hl_ent_player_health;
+	hl_dbg_prev_flag = hl_ent_deadflag;
+
+	if (hl_dbg_death_lines % 8 == 0 ||
+		hl_dbg_death_lines >= HLDBG_DEATH_MAX)
+	{
+		HLDbgDeathFlush;
+	}
+}
+
+U0 HLShellDrown()
+{//CBasePlayer::WaterMove's drowning half, dlls/player.cpp:1217-1287. The
+ //bubbles and the DMG_DROWNRECOVER heal are not modelled; the damage is
+ //
+ //Waterlevel 3 is the eye under. Anything less refills the lung outright
+	if (hl_noclip || hl_ent_player_dead)
+	{
+		hl_air_finished = hl_ent_time + HLDROWN_AIRTIME;
+		hl_drown_dmg    = HLDROWN_DMG_BASE;
+		return;
+	}
+
+	if (hl_water_level != 3)
+	{
+		//"pev->air_finished = gpGlobals->time + AIRTIME; pev->dmg = 2"
+		hl_air_finished = hl_ent_time + HLDROWN_AIRTIME;
+		hl_drown_dmg    = HLDROWN_DMG_BASE;
+		return;
+	}
+
+	if (hl_ent_time < hl_air_finished)
+		return;
+
+	if (hl_ent_time < hl_drown_next)
+		return;
+
+	//pre-incremented, then clamped, then dealt - the SDK's order
+	hl_drown_dmg += 1.0;
+
+	if (hl_drown_dmg > HLDROWN_DMG_MAX)
+		hl_drown_dmg = HLDROWN_DMG_MAX;
+
+	HLShellHurt(hl_drown_dmg, HLDMG_DROWN);
+
+	hl_drown_next = hl_ent_time + HLDROWN_PERIOD;
+}
+
+U0 HLShellDamageFrame()
+{//V_ParseDamage with no message channel: the entity world accumulates the tick's
+ //damage into hl_ent_player_damage and the shell is the only thing that can turn
+ //it into a red flash and a view kick.
+ //
+ //The kick has no inflictor here, so it is a pitch punch rather than a
+ //directional roll - the entity world records no attacker for the player
+	F64 count;
+	F64 want;
+
+	count = hl_ent_player_damage;
+	hl_ent_player_damage = 0.0;
+
+	if (count > 0.0)
+	{
+		hl_dbg_last_dmg = count;
+
+		if (!hl_dbg_type_known)
+			hl_dbg_last_type = -1;
+
+		hl_dbg_type_known = FALSE;
+
+		//V_ParseDamage reads armour and blood as bytes
+		if (count < 10.0)
+			count = 10.0;
+		if (count > 255.0)
+			count = 255.0;
+
+		HLCShiftDamage(count);
+
+		hl_punch[0] += count * HLKICK_PITCH * 0.1;
+	}
+
+	HLDbgDeathTick;
+
+	//hl_debug_hurt is a request in points, cleared once it lands. A hazard does
+	//not have to be found to reach the death path
+	want = HLCvarGet("hl_debug_hurt");
+
+	if (want > 0.0)
+	{
+		HLCvarSet("hl_debug_hurt", 0.0);
+		HLShellHurt(want, ToI64(HLCvarGet("hl_debug_hurt_type")));
+	}
+}
+
 U0 HLHudDrawFrame(CHLCanvas *c)
 {//HL HUD in place of Quake's status bar: none of Sbar's art (SBAR, IBAR, the
  //big digits) exists in valve/.
@@ -1214,6 +1493,13 @@ U0 HLRenderFrame()
 	//Bob and roll are view-only: hl_angles feeds .v_angle. Updated once here,
 	//read twice below, for the eye and for the weapon.
 	HLViewBobUpdate;
+
+	//V_CalcRefdef hands the view model cl_viewangles raw and applies punch and
+	//the damage kick to the camera alone, so recoil does not carry the muzzle
+	//with the crosshair. The bob tilt is the gun's own.
+	HLVecCopy(hl_angles, hl_wpn_vm_ang);
+	hl_wpn_vm_bob = HLViewBob();
+	hl_wpn_vm_fed = TRUE;
 
 	HLVecCopy(hl_origin, hl_view);
 
@@ -3096,7 +3382,10 @@ U0 HLGameLoop()
 		//A dead player has no input. SV_ClientThink bails before the move:
 		//    if (movetype == MOVETYPE_NONE) return;
 		//    if (health <= 0) return;
-		else if (hl_game_active && HLPlayerFrozen)
+		//
+		//Not gated on hl_game_active: HL ships no progs.dat, so that gate was
+		//never true and the native path built a full movement wish while dead.
+		else if (HLPlayerFrozen)
 		{
 			//Movement only: PlayerDeathThink waits on a button release then a
 			//press to respawn, so attack must survive. SV_ClientThink returns
@@ -3441,11 +3730,22 @@ U0 HLGameLoop()
 			}
 			else if (!hl_noclip)
 			{
+				//The corpse still falls, so the move runs with a null wish
+				//rather than being skipped. Jump and duck are dropped with it:
+				//they reach HLPlayerMove directly and not through move.
+				if (hl_ent_input_locked)
+				{
+					HLVecSet(move, 0.0, 0.0, 0.0);
+					speed = 0.0;
+				}
+
 				//No bytecode loaded, so the engine owns jumping.
 				HLPlayerMove(hl_map, hl_origin, hl_velocity, move, speed,
-					HLInDown(HLIN_JUMP), HLSERVER_STEP,
+					ToBool(HLInDown(HLIN_JUMP) && !hl_ent_input_locked),
+					HLSERVER_STEP,
 					&hl_on_ground, hl_water_level, FALSE, hl_angles,
-					hl_player_edict, HLInDown(HLIN_DUCK));
+					hl_player_edict,
+					ToBool(HLInDown(HLIN_DUCK) && !hl_ent_input_locked));
 			}
 
 			//Native entities run on the same fixed step as the player, after
@@ -3457,6 +3757,16 @@ U0 HLGameLoop()
 				//nothing else advances it. The ambient mixer, the texture
 				//animation and the light styles all read it.
 				hl_game_time += HLSERVER_STEP;
+
+				//PlayerDeathThink's respawn gate needs both edges: every button
+				//released, then one pressed. The entity layer cannot read the
+				//keyboard, so the state is published here - ahead of HLEntFrame,
+				//which runs the death think last, or the gate reads a tick-old
+				//keyboard.
+				hl_ent_death_button = ToBool(HLInDown(HLIN_JUMP) ||
+					HLInDown(HLIN_ATTACK) || HLInDown(HLIN_ATTACK2) ||
+					HLInDown(HLIN_USE) || HLInDown(HLIN_FORWARD) ||
+					HLInDown(HLIN_BACK));
 
 				HLEntFrame(hl_map, HLSERVER_STEP, hl_origin);
 				HLEntTouchPlayer(hl_origin);
@@ -3475,19 +3785,21 @@ U0 HLGameLoop()
 				//cannot reach the health that lives in the entity world.
 				if (hl_fall_damage_pending > 0.0)
 				{
-					HLEntHurtPlayer(hl_fall_damage_pending, HLDMG_FALL);
+					HLShellHurt(hl_fall_damage_pending, HLDMG_FALL);
 					hl_fall_damage_pending = 0.0;
 				}
 
-				//Footsteps: HLClip.ZC decides when, HLSound.ZC decides which
-				//sample. materials.txt maps the texture under the player to one
-				//of nine step sets; the hardcoded player/pl_step%d here ignored
-				//all of it, so metal, ducts and grates sounded like concrete.
+				//CBasePlayer::WaterMove. The water level is the shell's, so the
+				//lung timer is too.
+				HLShellDrown;
+
+				//Footsteps: PM_UpdateStepSound already picked the material and
+				//the volume, so this only emits. Calling HLSndFootstep here
+				//would repeat the materials.txt lookup and gate the sound a
+				//second time on its own timer.
 				if (hl_step_play)
 				{
-					HLSndFootstep(hl_map, hl_origin, HLVecLength(hl_velocity),
-						hl_ducking, hl_on_ladder, hl_water_level, tS, 0);
-
+					HLSndPlayStepSound(hl_step_kind, hl_step_vol, hl_origin, 0);
 					hl_step_play = FALSE;
 				}
 
@@ -3570,14 +3882,6 @@ U0 HLGameLoop()
 					hl_ent_push_pending = FALSE;
 				}
 
-				//PlayerDeathThink's respawn gate needs both edges: every button
-				//released, then one pressed. The entity layer cannot read the
-				//keyboard, so the state is published here.
-				hl_ent_death_button = ToBool(HLInDown(HLIN_JUMP) ||
-					HLInDown(HLIN_ATTACK) || HLInDown(HLIN_ATTACK2) ||
-					HLInDown(HLIN_USE) || HLInDown(HLIN_FORWARD) ||
-					HLInDown(HLIN_BACK));
-
 				//respawn(): the entity layer picks the spawn point, the shell
 				//owns the origin.
 				if (hl_ent_respawn_pending)
@@ -3611,8 +3915,10 @@ U0 HLGameLoop()
 				}
 
 				//+use on the edge, not while held: a held key would re-fire a
-				//toggle door every tick.
-				use_now = HLInDown(HLIN_USE);
+				//toggle door every tick. A dead player operates nothing - the
+				//key still reaches hl_ent_death_button, which is the respawn
+				//gate's only reader.
+				use_now = ToBool(HLInDown(HLIN_USE) && !hl_ent_input_locked);
 
 				if (use_now && !hl_use_held)
 				{
@@ -3646,6 +3952,10 @@ U0 HLGameLoop()
 				//No flashlight test here: impulse 100 is an ordinary binding
 				//and HLConImpulse toggles it on the press edge the key table
 				//already provides.
+
+				//Last in the tick: the entity pass, the fall and the drowning
+				//have all landed, so this tick's damage total is final.
+				HLShellDamageFrame;
 			}
 
 			srv_accum -= HLSERVER_STEP;
@@ -3897,6 +4207,16 @@ U0 HL1(U8 *mapname = HLDEFAULT_MAP)
 	//Applied after the cvars exist: HLCfgLoad ran earlier and only parked the
 	//value, which defining it there would have shadowed.
 	HLCvarSet("crosshair", ToF64(hl_opt_crosshair));
+
+	//The death trace and the deterministic hurt. Defined rather than set:
+	//HLConCvarCommand rejects a name the table does not already carry, so a
+	//created-on-demand cvar cannot be typed at the console.
+	HLCvarDefine("hl_debug_death",		0.0);
+	HLCvarDefine("hl_debug_hurt",		0.0);
+	HLCvarDefine("hl_debug_hurt_type",	0.0);
+
+	"  init HLShellDeathInit\n";
+	HLShellDeathInit;
 
 	//Search root first: HLFileResolve needs it before anything is looked up.
 	HLPakSetGameDir(hl_game_dir);
