@@ -16,12 +16,14 @@ Bool hl_r_dynamic     = TRUE;
 Bool hl_r_drawentities = TRUE;
 Bool hl_r_drawsprites = TRUE;
 Bool hl_r_lightpoint  = TRUE;
+Bool hl_r_beams       = TRUE;
 
 hl_r_decals       = TRUE;
 hl_r_dynamic      = TRUE;
 hl_r_drawentities = TRUE;
 hl_r_drawsprites  = TRUE;
 hl_r_lightpoint   = TRUE;
+hl_r_beams        = TRUE;
 
 #define HLSCR_W			320
 #define HLSCR_H			240
@@ -105,6 +107,8 @@ I64	hl_rs_model_px	= 0;	//studio span pixels
 I64	hl_rs_sprites	= 0;	//sprites blitted
 I64	hl_rs_sprite_px	= 0;	//sprite pixels stepped
 I64	hl_rs_part_px	= 0;	//particle block pixels
+I64	hl_rs_beams		= 0;	//beams submitted
+I64	hl_rs_beam_px	= 0;	//beam ribbon pixels stepped
 I64	hl_rs_lightpoint	= 0;	//R_LightPoint traces, one BSP trace each
 
 //off by default: the readout is a Print and costs a line of output a frame
@@ -128,6 +132,8 @@ U0 HLRSpeedsReset()
 	hl_rs_sprites		= 0;
 	hl_rs_sprite_px	= 0;
 	hl_rs_part_px		= 0;
+	hl_rs_beams		= 0;
+	hl_rs_beam_px		= 0;
 	hl_rs_lightpoint	= 0;
 }
 
@@ -144,6 +150,7 @@ U0 HLRSpeedsPrint()
 	"model tris %d px %d\n", hl_rs_tris, hl_rs_model_px;
 	"efx   spr %d px %d part %d lightpt %d\n",
 		hl_rs_sprites, hl_rs_sprite_px, hl_rs_part_px, hl_rs_lightpoint;
+	"beam  %d px %d\n", hl_rs_beams, hl_rs_beam_px;
 }
 
 U0 HLRSpeeds(Bool on = TRUE)
@@ -2559,7 +2566,15 @@ U0 HLDrawFace(CHLCanvas *c, CHLMap *map, I64 face_index, F64 *offset = NULL,
 			tex_len = 1.0;
 
 		//World units per screen pixel at this depth, times texels per unit.
-		ratio = tex_len * near_z / c->x_scale;
+		//
+		//Against the 90 degree reference scale, vw*0.5, not the live x_scale.
+		//x_scale is vw*0.5/Tan(fov/2), so a scoped fov of 20 is 5.67x wider and
+		//divides the ratio down by that, dragging surfaces from mip 3 to mip 0.
+		//A cached surface is ((extent_s>>mip)+1)*((extent_t>>mip)+1)*4 bytes, so
+		//that is 64x each and a room's worth no longer fits HLSURF_BUDGET; the
+		//cache then rebuilds and evicts itself every frame. The slot key carries
+		//the mip, so the level may still change with distance.
+		ratio = tex_len * near_z / (ToF64(c->vw) * 0.5);
 
 		//Quake's d_scalemip thresholds, inverted: basemip 1.0, 0.4, 0.2.
 		if (ratio < 1.0)
@@ -3432,4 +3447,446 @@ qdc_next_pixel:
 
 qdc_next:
 	}
+}
+
+//--- beams ------------------------------------------------------------------
+//
+// A beam is a screen-facing ribbon between two world points, textured along its
+// length and added to what is behind it. env_beam, env_laser, the gauss and egon
+// bolts and the tripmine tripwire are all this one primitive.
+//
+// HLSpr.ZC compiles after this file, so the texture arrives as one sprite
+// frame's texels and palette rather than as a sprite handle.
+//
+// Width and noise amplitude reach the entity layer in tenths of a world unit.
+// CBeam holds width in pev->scale and noise in pev->body as ints
+// (dlls/effects.h:130,131) while R_BeamPoints takes a float width in world units
+// (common/r_efx.h:181); both feed beam_s.width and beam_s.amplitude
+// (common/beamdef.h:47,49), and the tripmine's SetWidth(10)
+// (dlls/tripmine.cpp:257) is a one unit tripwire against the gauss beam's 1.0
+// (cl_dll/ev_hldm.cpp:972). This takes world units; the caller applies the tenth.
+//
+// Absent: BEAM_HOSE and BEAM_ENTS attachment tracking, both entity-side
+// concerns, and the ring variant. SF_BEAM_RING (dlls/effects.h:21) is set on 5
+// of the 803 env_beam/env_laser entities in the shipped maps.
+
+#define HLBEAM_SEG_MAX		64		//ribbon segments, the noise resolution
+#define HLBEAM_PTS			65		//HLBEAM_SEG_MAX + 1 segment boundaries
+#define HLBEAM_SEG_LEN		24.0	//world units per segment
+#define HLBEAM_TEX_REPEAT	100.0	//world units per texture repeat along t
+#define HLBEAM_MIN_PX		0.75	//projected half width floor, pixels
+#define HLBEAM_NOISE_CYCLES	3.0		//sine periods along the beam
+#define HLBEAM_NOISE_RATE	12.0	//noise phase, radians per second
+
+U0 HLDrawBeamSpan(CHLCanvas *c, I64 y, I64 x1, I64 x2,
+	F64 iz1, F64 soz1, F64 toz1, F64 iz2, F64 soz2, F64 toz2,
+	U8 *texels, U8 *pal, I64 tw, I64 th, I64 mod_r, I64 mod_g, I64 mod_b)
+{//one additive run across the ribbon
+ //
+ //mod_* are colour times brightness, folded to 0-255 by the caller
+ //
+ //one divide per pixel: a beam covers a small fraction of the canvas, so the
+ //block stepping HLDrawSpan carries buys nothing here
+	U32	*row;
+	F64	*zrow;
+	F64	 span;
+	F64	 d_iz;
+	F64	 d_soz;
+	F64	 d_toz;
+	F64	 iz;
+	F64	 soz;
+	F64	 toz;
+	F64	 z;
+	I64	 x;
+	I64	 tx;
+	I64	 ty;
+	I64	 texel;
+	I64	 sr;
+	I64	 sg;
+	I64	 sb;
+	I64	 dr;
+	I64	 dg;
+	I64	 db;
+	U32	 c32;
+
+	//the view rect, not the canvas - outside it is border and status bar
+	if (y < c->vy || y >= c->vy + c->vh)
+		return;
+
+	span = ToF64(x2 - x1);
+	if (span <= 0.0)
+		return;
+
+	d_iz  = (iz2 - iz1) / span;
+	d_soz = (soz2 - soz1) / span;
+	d_toz = (toz2 - toz1) / span;
+
+	if (x1 < c->vx)
+	{
+		iz1  += d_iz * ToF64(c->vx - x1);
+		soz1 += d_soz * ToF64(c->vx - x1);
+		toz1 += d_toz * ToF64(c->vx - x1);
+		x1 = c->vx;
+	}
+
+	if (x2 > c->vx + c->vw)
+		x2 = c->vx + c->vw;
+
+	if (x1 >= x2)
+		return;
+
+	hl_rs_beam_px += x2 - x1;
+
+	row  = c->pixels + y * c->width;
+	zrow = c->depth + y * c->width;
+
+	iz  = iz1;
+	soz = soz1;
+	toz = toz1;
+
+	for (x = x1; x < x2; x++)
+	{
+		//depth holds 1/z, larger nearer. an untouched pixel reads 0 and lets
+		//any positive 1/z through, so a beam over open sky still draws
+		if (iz <= zrow[x])
+			goto qbs_next;
+
+		z = 1.0 / iz;
+
+		//s spans the width once, t repeats along the length
+		tx = ToI64(soz * z);
+		if (tx < 0)			tx = 0;
+		if (tx > tw - 1)	tx = tw - 1;
+
+		ty = HLTexWrap(ToI64(toz * z), th);
+
+		texel = texels[ty * tw + tx];
+
+		sr = pal[texel * 3];
+		sg = pal[texel * 3 + 1];
+		sb = pal[texel * 3 + 2];
+
+		//additive, so black is the cutout whatever the sprite's texFormat says
+		//and no index may be keyed out. lgtning.spr is SPR_NORMAL with palette
+		//entry 255 black; xbeam3.spr is SPR_ADDITIVE with entry 255 white
+		if (!(sr | sg | sb))
+			goto qbs_next;
+
+		c32 = row[x];
+
+		dr = ((c32 >> 16) & 255) + (sr * mod_r) / 255;
+		dg = ((c32 >> 8) & 255) + (sg * mod_g) / 255;
+		db = (c32 & 255) + (sb * mod_b) / 255;
+
+		if (dr > 255)	dr = 255;
+		if (dg > 255)	dg = 255;
+		if (db > 255)	db = 255;
+
+		//depth is left alone: a beam is translucent, so it occludes nothing and
+		//two crossing beams both show
+		row[x] = (dr << 16) | (dg << 8) | db;
+
+qbs_next:
+		iz  += d_iz;
+		soz += d_soz;
+		toz += d_toz;
+	}
+}
+
+U0 HLDrawBeamQuad(CHLCanvas *c, CHLScreenVert *v, I64 count,
+	U8 *texels, U8 *pal, I64 tw, I64 th, I64 mod_r, I64 mod_g, I64 mod_b)
+{//HLDrawPolygon's scanline fill against the additive span
+	F64	 y_min = 1.0e30;
+	F64	 y_max = -1.0e30;
+	F64	 xl;
+	F64	 xr;
+	F64	 izl;
+	F64	 izr;
+	F64	 sozl;
+	F64	 sozr;
+	F64	 tozl;
+	F64	 tozr;
+	F64	 ya;
+	F64	 yb;
+	F64	 frac;
+	F64	 xi;
+	F64	 izi;
+	F64	 sozi;
+	F64	 tozi;
+	F64	 yc;
+	I64	 i;
+	I64	 j;
+	I64	 y;
+	I64	 y0;
+	I64	 y1;
+	Bool found;
+
+	if (count < 3)
+		return;
+
+	for (i = 0; i < count; i++)
+	{
+		if (v[i].y < y_min)
+			y_min = v[i].y;
+		if (v[i].y > y_max)
+			y_max = v[i].y;
+	}
+
+	y0 = ToI64(Ceil(y_min));
+	y1 = ToI64(Floor(y_max));
+
+	if (y0 < c->vy)
+		y0 = c->vy;
+	if (y1 >= c->vy + c->vh)
+		y1 = c->vy + c->vh - 1;
+
+	for (y = y0; y <= y1; y++)
+	{
+		yc    = ToF64(y);
+		found = FALSE;
+		xl    = 0.0;
+		xr    = 0.0;
+		izl   = 0.0;
+		izr   = 0.0;
+		sozl  = 0.0;
+		sozr  = 0.0;
+		tozl  = 0.0;
+		tozr  = 0.0;
+
+		for (i = 0; i < count; i++)
+		{
+			j  = (i + 1) % count;
+			ya = v[i].y;
+			yb = v[j].y;
+
+			//half open so a shared vertex isn't counted twice
+			if ((ya <= yc && yb > yc) || (yb <= yc && ya > yc))
+			{
+				frac = (yc - ya) / (yb - ya);
+				xi   = v[i].x + frac * (v[j].x - v[i].x);
+				izi  = v[i].inv_z + frac * (v[j].inv_z - v[i].inv_z);
+				sozi = v[i].s_over_z + frac * (v[j].s_over_z - v[i].s_over_z);
+				tozi = v[i].t_over_z + frac * (v[j].t_over_z - v[i].t_over_z);
+
+				if (!found)
+				{
+					xl = xi; izl = izi; sozl = sozi; tozl = tozi;
+					xr = xi; izr = izi; sozr = sozi; tozr = tozi;
+					found = TRUE;
+				}
+				else
+				{
+					if (xi < xl)
+					{
+						xl = xi; izl = izi; sozl = sozi; tozl = tozi;
+					}
+					if (xi > xr)
+					{
+						xr = xi; izr = izi; sozr = sozi; tozr = tozi;
+					}
+				}
+			}
+		}
+
+		if (found && xr > xl)
+		{
+			HLDrawBeamSpan(c, y, ToI64(Ceil(xl)), ToI64(Ceil(xr)),
+				izl, sozl, tozl, izr, sozr, tozr,
+				texels, pal, tw, th, mod_r, mod_g, mod_b);
+		}
+	}
+}
+
+U0 HLDrawBeam(CHLCanvas *c, F64 *start, F64 *end,
+	U8 *texels, U8 *pal, I64 tw, I64 th,
+	F64 width, F64 amplitude, F64 scroll, F64 time,
+	I64 r = 255, I64 g = 255, I64 b = 255, I64 brightness = 255)
+{//one beam from start to end, world units throughout
+ //
+ //texels/pal/tw/th are one sprite frame. A NULL palette is not accepted: every
+ //shipped beam sprite is version 2 and carries its own 256 colours
+ //
+ //time is the RENDER clock. Scroll and noise are visual, not simulation
+	CHLPolyVert		quad[4];
+	CHLPolyVert		clipped[HLMAX_POLY_VERTS];
+	CHLScreenVert	scr[HLMAX_POLY_VERTS];
+	//camera space ribbon edges, one point per segment boundary
+	F64	edge_a[HLBEAM_PTS * 3];
+	F64	edge_b[HLBEAM_PTS * 3];
+	F64	tex_t[HLBEAM_PTS];
+	F64	dir[3];
+	F64	nrm[3];
+	F64	ptv[3];
+	F64	pt[3];
+	F64	rel[3];
+	F64	len;
+	F64	half;
+	F64	hw;
+	F64	frac;
+	F64	phase;
+	F64	wave;
+	F64	ang;
+	F64	disp;
+	F64	cz;
+	F64	px_w;
+	F64	inv_z;
+	I64	mod_r;
+	I64	mod_g;
+	I64	mod_b;
+	I64	segs;
+	I64	count;
+	I64	i;
+	I64	k;
+
+	if (!hl_r_beams)
+		return;
+
+	if (!c || !c->pixels || !c->depth || !texels || !pal)
+		return;
+
+	if (tw < 1 || th < 1)
+		return;
+
+	HLVecSub(end, start, dir);
+	len = HLVecNormalize(dir);
+
+	if (len < 1.0)
+		return;
+
+	if (width < 0.1)
+		width = 0.1;
+	half = width * 0.5;
+
+	//colour times brightness, folded once per beam
+	mod_r = ClampI64(r, 0, 255) * ClampI64(brightness, 0, 255) / 255;
+	mod_g = ClampI64(g, 0, 255) * ClampI64(brightness, 0, 255) / 255;
+	mod_b = ClampI64(b, 0, 255) * ClampI64(brightness, 0, 255) / 255;
+
+	if (!(mod_r | mod_g | mod_b))
+		return;
+
+	//a straight beam is one quad. only noise needs subdivision
+	segs = 1;
+	if (amplitude > 0.0)
+	{
+		segs = ToI64(len / HLBEAM_SEG_LEN);
+		if (segs < 2)
+			segs = 2;
+		if (segs > HLBEAM_SEG_MAX)
+			segs = HLBEAM_SEG_MAX;
+	}
+
+	//texture scrolls along t. scroll is world units per second, so the phase is
+	//in repeats and folds into 0..1 to keep the texel coordinate small
+	phase = time * scroll / HLBEAM_TEX_REPEAT;
+	phase -= Floor(phase);
+
+	wave = time * HLBEAM_NOISE_RATE;
+
+	for (i = 0; i <= segs; i++)
+	{
+		frac = ToF64(i) / ToF64(segs);
+		HLVecMA(start, len * frac, dir, pt);
+
+		HLVecSub(pt, c->origin, ptv);
+
+		//the ribbon lies in the plane holding the beam and the eye, so it turns
+		//to face the viewer about its own axis and never presents an edge
+		HLVecCross(dir, ptv, nrm);
+
+		//looking straight down the beam leaves no such plane; any perpendicular
+		//serves at that angle
+		if (HLVecNormalize(nrm) < 0.001)
+			HLVecCopy(c->up, nrm);
+
+		if (amplitude > 0.0)
+		{
+			//zero at both ends: the endpoints are anchored to the entities that
+			//own them. two incommensurate sines, or the arc reads as a rope
+			//swinging in one plane
+			ang  = frac * HLBEAM_NOISE_CYCLES * 2.0 * pi;
+			disp = Sin(ang + wave) * 0.6 + Sin(ang * 2.7 - wave * 1.3) * 0.4;
+			disp *= Sin(frac * pi) * amplitude;
+
+			HLVecMA(pt, disp, nrm, pt);
+			HLVecSub(pt, c->origin, ptv);
+		}
+
+		cz = HLVecDot(ptv, c->forward);
+
+		//a beam narrower than a pixel drops out in gaps and reads as a dashed
+		//line. the floor is converted back to world units at this point's depth
+		//so the strip stays continuous
+		hw = half;
+		if (cz > HLNEAR_CLIP)
+		{
+			px_w = hw * c->x_scale / cz;
+			if (px_w < HLBEAM_MIN_PX)
+				hw = HLBEAM_MIN_PX * cz / c->x_scale;
+		}
+
+		HLVecMA(ptv, -hw, nrm, rel);
+		edge_a[i * 3]     = HLVecDot(rel, c->right);
+		edge_a[i * 3 + 1] = HLVecDot(rel, c->up);
+		edge_a[i * 3 + 2] = HLVecDot(rel, c->forward);
+
+		HLVecMA(ptv, hw, nrm, rel);
+		edge_b[i * 3]     = HLVecDot(rel, c->right);
+		edge_b[i * 3 + 1] = HLVecDot(rel, c->up);
+		edge_b[i * 3 + 2] = HLVecDot(rel, c->forward);
+
+		tex_t[i] = (phase + frac * len / HLBEAM_TEX_REPEAT) * ToF64(th);
+	}
+
+	for (i = 0; i < segs; i++)
+	{
+		//wound around the segment, so the clipper sees a convex quad
+		quad[0].cam[0] = edge_a[i * 3];
+		quad[0].cam[1] = edge_a[i * 3 + 1];
+		quad[0].cam[2] = edge_a[i * 3 + 2];
+		quad[0].s      = 0.0;
+		quad[0].t      = tex_t[i];
+
+		quad[1].cam[0] = edge_b[i * 3];
+		quad[1].cam[1] = edge_b[i * 3 + 1];
+		quad[1].cam[2] = edge_b[i * 3 + 2];
+		quad[1].s      = ToF64(tw);
+		quad[1].t      = tex_t[i];
+
+		quad[2].cam[0] = edge_b[(i + 1) * 3];
+		quad[2].cam[1] = edge_b[(i + 1) * 3 + 1];
+		quad[2].cam[2] = edge_b[(i + 1) * 3 + 2];
+		quad[2].s      = ToF64(tw);
+		quad[2].t      = tex_t[i + 1];
+
+		quad[3].cam[0] = edge_a[(i + 1) * 3];
+		quad[3].cam[1] = edge_a[(i + 1) * 3 + 1];
+		quad[3].cam[2] = edge_a[(i + 1) * 3 + 2];
+		quad[3].s      = 0.0;
+		quad[3].t      = tex_t[i + 1];
+
+		count = HLDrawClipNear(quad, 4, clipped);
+		if (count < 3)
+			goto qbm_next;
+
+		for (k = 0; k < count; k++)
+		{
+			inv_z = 1.0 / clipped[k].cam[2];
+
+			//screen y grows down, camera y grows up
+			scr[k].x = c->center_x + clipped[k].cam[0] * c->x_scale * inv_z;
+			scr[k].y = c->center_y - clipped[k].cam[1] * c->y_scale * inv_z;
+
+			scr[k].inv_z    = inv_z;
+			scr[k].s_over_z = clipped[k].s * inv_z;
+			scr[k].t_over_z = clipped[k].t * inv_z;
+		}
+
+		HLDrawBeamQuad(c, scr, count, texels, pal, tw, th,
+			mod_r, mod_g, mod_b);
+
+qbm_next:
+	}
+
+	hl_rs_beams++;
 }

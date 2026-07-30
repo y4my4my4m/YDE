@@ -42,26 +42,56 @@ CHLSentence	hl_ai_sent[HLAI_MAX_SENTENCES];
 I64			hl_ai_sent_count = 0;
 U8			*hl_ai_sent_raw  = NULL;
 
-//one sentence in flight. HL can run several at once on different entities;
-//one is enough for the scripted speech of the campaign
-I64			hl_ai_sent_active = -1;
-I64			hl_ai_sent_word   = 0;
-F64			hl_ai_sent_next   = 0.0;
-F64			hl_ai_sent_org[3];
-U8			hl_ai_sent_dir[HLAI_WORD_MAX];
+// A sentence runs on the speaker's CHAN_VOICE, one per entity, not one for the
+// whole world: EMIT_SOUND_DYN on CHAN_VOICE replaces that entity's line and
+// leaves every other entity's alone (talkmonster.cpp:1214). Two characters in
+// the same room are both heard. A channel is keyed by entity index, so a second
+// line from the same speaker cuts the first.
+#define HLAI_SENT_CHANS		6
+
+class CHLSentChan
+{
+	I64	sent;		//index into hl_ai_sent, -1 when idle
+	I64	word;		//next word to play
+	F64	next;		//hl_ent_time the next word starts
+	I64	ent;		//speaking entity index, -1 for a fixed world position
+	F64	org[3];
+	F64	volume;
+	F64	atten;
+	I64	pitch;		//percentage of the recorded rate
+	F64	claimed;	//hl_ent_time the channel was taken, for eviction
+	U8	dir[HLAI_WORD_MAX];	//the sound/ subdirectory the sentence has reached
+};
+
+CHLSentChan	hl_ai_sentch[HLAI_SENT_CHANS];
+
+//scratch directory buffer for a word lookup made outside any channel
+U8	hl_ai_sent_dir[HLAI_WORD_MAX];
 
 U0 HLAIInit()
 {//globals aren't zeroed and a declaration initialiser on one is unreliable
+	I64 i;
+
 	hl_ai_sent_count  = 0;
 	hl_ai_sent_raw    = NULL;
-	hl_ai_sent_active = -1;
-	hl_ai_sent_word   = 0;
-	hl_ai_sent_next   = 0.0;
 	hl_ai_sent_dir[0] = 0;
 
-	hl_ai_sent_org[0] = 0.0;
-	hl_ai_sent_org[1] = 0.0;
-	hl_ai_sent_org[2] = 0.0;
+	for (i = 0; i < HLAI_SENT_CHANS; i++)
+	{
+		hl_ai_sentch[i].sent    = -1;
+		hl_ai_sentch[i].word    = 0;
+		hl_ai_sentch[i].next    = 0.0;
+		hl_ai_sentch[i].ent     = -1;
+		hl_ai_sentch[i].volume  = 1.0;
+		hl_ai_sentch[i].atten   = HLENT_SND_ATTEN;
+		hl_ai_sentch[i].pitch   = HLPITCH_NORM;
+		hl_ai_sentch[i].claimed = 0.0;
+		hl_ai_sentch[i].dir[0]  = 0;
+
+		hl_ai_sentch[i].org[0] = 0.0;
+		hl_ai_sentch[i].org[1] = 0.0;
+		hl_ai_sentch[i].org[2] = 0.0;
+	}
 }
 
 //top-level, so the table is sane before anything can reach it
@@ -185,8 +215,12 @@ I64 HLAISentenceFind(U8 *name)
 	return -1;
 }
 
-I64 HLAISentenceWord(I64 idx, I64 want, U8 *out)
+I64 HLAISentenceWord(I64 idx, I64 want, U8 *out, U8 *dir = NULL)
 {//word number `want`, resolved to a sound path. returns 1 on success
+ //
+ //dir is the caller's HLAI_WORD_MAX directory buffer, carried per channel: the
+ //'/' prefix is sticky across the words of one sentence and two sentences run
+ //at once. NULL takes the shared scratch, for a one-off lookup
  //
  //(...) modifiers are skipped: they carry pitch and timing, and the mixer has no
  //pitch control. punctuation is stripped, so "grenade!" is the file grenade.wav
@@ -198,6 +232,12 @@ I64 HLAISentenceWord(I64 idx, I64 want, U8 *out)
 	I64	 c;
 
 	out[0] = 0;
+
+	if (!dir)
+	{
+		dir    = hl_ai_sent_dir;
+		dir[0] = 0;
+	}
 
 	if (idx < 0 || idx >= hl_ai_sent_count)
 		return 0;
@@ -239,7 +279,7 @@ I64 HLAISentenceWord(I64 idx, I64 want, U8 *out)
 			if (c == '/')
 			{
 				word[k] = 0;
-				HLRdName(word, hl_ai_sent_dir, HLAI_WORD_MAX);
+				HLRdName(word, dir, HLAI_WORD_MAX);
 				k = 0;
 				i++;
 				goto qasw_next_char;
@@ -271,8 +311,8 @@ qasw_next_char:
 
 		if (n == want)
 		{
-			if (hl_ai_sent_dir[0])
-				StrPrint(out, "%s/%s.wav", hl_ai_sent_dir, word);
+			if (dir[0])
+				StrPrint(out, "%s/%s.wav", dir, word);
 			else
 				StrPrint(out, "%s.wav", word);
 
@@ -287,53 +327,193 @@ qasw_next_token:
 	return 0;
 }
 
-U0 HLAISentenceStart(U8 *name, F64 *origin)
-{//begin a sentence at a world position
-	I64 idx = HLAISentenceFind(name);
+I64 HLAISentenceChan(I64 ent)
+{//the channel this entity speaks on: its own if it already holds one, else a
+ //free one, else the one claimed longest ago
+	I64	i;
+	I64	free_slot = -1;
+	I64	oldest    = 0;
 
-	if (idx < 0)
-		return;
+	if (ent >= 0)
+	{
+		for (i = 0; i < HLAI_SENT_CHANS; i++)
+		{
+			if (hl_ai_sentch[i].sent >= 0 && hl_ai_sentch[i].ent == ent)
+				return i;
+		}
+	}
 
-	hl_ai_sent_active = idx;
-	hl_ai_sent_word   = 0;
-	hl_ai_sent_next   = 0.0;
-	hl_ai_sent_dir[0] = 0;
+	for (i = 0; i < HLAI_SENT_CHANS; i++)
+	{
+		if (hl_ai_sentch[i].sent < 0 && free_slot < 0)
+			free_slot = i;
 
-	if (origin)
-		HLVecCopy(origin, hl_ai_sent_org);
-	else
-		HLVecSet(hl_ai_sent_org, 0.0, 0.0, 0.0);
+		if (hl_ai_sentch[i].claimed < hl_ai_sentch[oldest].claimed)
+			oldest = i;
+	}
+
+	if (free_slot >= 0)
+		return free_slot;
+
+	return oldest;
 }
 
-U0 HLAISentenceUpdate(F64 now)
-{//advance to the next word once the previous one has had its time
+Bool HLAISentenceTalking(I64 ent)
+{//is this entity's voice channel still running words
+	I64 i;
+
+	if (ent < 0)
+		return FALSE;
+
+	for (i = 0; i < HLAI_SENT_CHANS; i++)
+	{
+		if (hl_ai_sentch[i].sent >= 0 && hl_ai_sentch[i].ent == ent)
+			return TRUE;
+	}
+
+	return FALSE;
+}
+
+U0 HLAISentenceStop(I64 ent)
+{//SENTENCE_STOP, reached through CBaseMonster::SentenceStop. Drops the word
+ //scheduler and cuts the word already in the mixer
+	I64 i;
+
+	for (i = 0; i < HLAI_SENT_CHANS; i++)
+	{
+		if (hl_ai_sentch[i].sent < 0 || hl_ai_sentch[i].ent != ent)
+			goto qass_next;
+
+		hl_ai_sentch[i].sent = -1;
+
+		if (ent >= 0)
+			HLSndStop(ent + 1, HLENT_CHAN_VOICE);
+
+qass_next:
+	}
+}
+
+Bool HLAISentencePlay(U8 *name, I64 ent, F64 *origin, F64 volume, F64 atten,
+	I64 pitch = HLPITCH_NORM)
+{//CTalkMonster::PlaySentence's dispatch, talkmonster.cpp:1206-1216: a leading
+ //! names one sentence, anything else names a group and SENTENCEG_PlayRndSz
+ //draws a member from it without repeating until the group is exhausted.
+ //
+ //The group table and its LRU live in HLSound.ZC (HLSndSentencePick,
+ //HLSound.ZC:2841), which is loaded from the same sound/sentences.txt. The pick
+ //comes back as "!NAMEn" and resolves in this file's own name table.
+	I64	idx;
+	I64	grp;
+	U8	picked[48];
+
+	if (!name || !name[0])
+		return FALSE;
+
+	//a map or a table can reference speech before HL1.ZC has loaded it
+	if (!hl_ai_sent_count)
+		HLAISentencesLoad;
+
+	if (name[0] == '!')
+		idx = HLAISentenceFind(name);
+	else
+	{
+		grp = HLSndSentenceGroupIndex(name);
+
+		if (grp < 0)
+			return FALSE;
+
+		picked[0] = 0;
+
+		if (HLSndSentencePick(grp, picked) < 0 || !picked[0])
+			return FALSE;
+
+		idx = HLAISentenceFind(picked);
+	}
+
+	if (idx < 0)
+		return FALSE;
+
+	grp = HLAISentenceChan(ent);
+
+	//taking a live channel means the previous line stops mid-word
+	if (hl_ai_sentch[grp].sent >= 0 && hl_ai_sentch[grp].ent >= 0)
+		HLSndStop(hl_ai_sentch[grp].ent + 1, HLENT_CHAN_VOICE);
+
+	hl_ai_sentch[grp].sent    = idx;
+	hl_ai_sentch[grp].word    = 0;
+	hl_ai_sentch[grp].next    = 0.0;
+	hl_ai_sentch[grp].ent     = ent;
+	hl_ai_sentch[grp].volume  = volume;
+	hl_ai_sentch[grp].atten   = atten;
+	hl_ai_sentch[grp].pitch   = pitch;
+	hl_ai_sentch[grp].claimed = hl_ent_time;
+	hl_ai_sentch[grp].dir[0]  = 0;
+
+	if (origin)
+		HLVecCopy(origin, hl_ai_sentch[grp].org);
+	else
+		HLVecSet(hl_ai_sentch[grp].org, 0.0, 0.0, 0.0);
+
+	return TRUE;
+}
+
+U0 HLAISentenceStart(U8 *name, F64 *origin)
+{//begin a sentence at a world position, with no entity owning the channel
+	HLAISentencePlay(name, -1, origin, 1.0, HLENT_SND_ATTEN, HLPITCH_NORM);
+}
+
+U0 HLAISentenceChanTick(I64 c, F64 now)
+{//advance one channel to its next word once the previous one has had its time
  //
  //the duration comes from the decoded sample rather than a fixed step, so a
  //long word is not cut off and a short one leaves no gap
+	CHLEntity	*e;
 	CHLSound	*snd;
 	U8			 path[96];
 	F64			 dur;
+	I64			 entnum;
 
-	if (hl_ai_sent_active < 0)
+	if (hl_ai_sentch[c].sent < 0)
 		return;
 
-	if (now < hl_ai_sent_next)
-		return;
-
-	if (!HLAISentenceWord(hl_ai_sent_active, hl_ai_sent_word, path))
+	//the voice follows its speaker: a character walking while talking is heard
+	//where they are, not where they started
+	if (hl_ai_sentch[c].ent >= 0)
 	{
-		hl_ai_sent_active = -1;
+		e = HLEntGet(hl_ai_sentch[c].ent);
+
+		if (e)
+			HLVecCopy(e->origin, hl_ai_sentch[c].org);
+	}
+
+	if (now < hl_ai_sentch[c].next)
+		return;
+
+	if (!HLAISentenceWord(hl_ai_sentch[c].sent, hl_ai_sentch[c].word, path,
+		hl_ai_sentch[c].dir))
+	{
+		hl_ai_sentch[c].sent = -1;
 		return;
 	}
 
 	snd = HLSndLoad(path);
 
+	entnum = 0;
+
+	if (hl_ai_sentch[c].ent >= 0)
+		entnum = hl_ai_sentch[c].ent + 1;
+
 	if (snd && snd->rate > 0)
 	{
-		HLSndPlayAt(path, hl_ai_sent_org, 1.0, HLENT_SND_ATTEN, 0,
-			HLENT_CHAN_USE);
+		HLSndPlayAt(path, hl_ai_sentch[c].org, hl_ai_sentch[c].volume,
+			hl_ai_sentch[c].atten, entnum, HLENT_CHAN_VOICE,
+			hl_ai_sentch[c].pitch);
 
 		dur = ToF64(snd->count) / ToF64(snd->rate);
+
+		//pitch is a percentage of the recorded rate, so it shortens the word
+		if (hl_ai_sentch[c].pitch > 0)
+			dur = dur * 100.0 / ToF64(hl_ai_sentch[c].pitch);
 	}
 	else
 	{
@@ -342,8 +522,34 @@ U0 HLAISentenceUpdate(F64 now)
 	}
 
 	//HL leaves a small gap between words; without it a sentence slurs
-	hl_ai_sent_next = now + dur + 0.03;
-	hl_ai_sent_word++;
+	hl_ai_sentch[c].next = now + dur + 0.03;
+	hl_ai_sentch[c].word++;
+}
+
+U0 HLAISentenceUpdate(F64 now)
+{//every live channel, plus the requests HLSound.ZC parked
+ //
+ //HLSndEmitDyn, the speaker and anything else that hands a "!NAME" to the mixer
+ //queue their request there (HLSound.ZC:2941) because the word scheduler
+ //compiles later. Draining it here is what makes those requests audible.
+	CHLSentReq	req;
+	I64			 ent;
+	I64			 i;
+
+	while (HLSndSentenceNext(&req))
+	{
+		//HLSndPlayAt's entnum convention is entity index + 1, 0 for the world
+		ent = -1;
+
+		if (req.entnum > 0)
+			ent = req.entnum - 1;
+
+		HLAISentencePlay(req.name, ent, req.origin, req.volume,
+			req.attenuation, req.pitch);
+	}
+
+	for (i = 0; i < HLAI_SENT_CHANS; i++)
+		HLAISentenceChanTick(i, now);
 }
 
 //--- animation --------------------------------------------------------------
@@ -489,13 +695,22 @@ F64 HLAIEntityCycle(CHLEntity *e)
 }
 
 //--- scripted_sequence ------------------------------------------------------
+//
+// dlls/scripted.cpp. A scripted_sequence names an actor, a mark to stand on,
+// an idle take to hold until the cue and a play take to run on the cue. The
+// driver itself is at the foot of this file: it walks the actor to the mark
+// through the monster mover, which is defined a few thousand lines below here
+// and ZealC is single-pass. Only the constants and the by-name lookup the
+// sentence player also needs live at this point.
 
-//SF_ flags, scripted.cpp
-#define HLAI_SF_WAITTILLSEEN	1
-#define HLAI_SF_EXITAGITATED	2
-#define HLAI_SF_REPEATABLE		4
-#define HLAI_SF_LEAVECORPSE		8
-#define HLAI_SF_NOINTERRUPT		32
+//SF_SCRIPT_*, scripted.h:22
+#define HLAI_SF_WAITTILLSEEN		1
+#define HLAI_SF_EXITAGITATED		2
+#define HLAI_SF_REPEATABLE			4
+#define HLAI_SF_LEAVECORPSE			8
+#define HLAI_SF_NOINTERRUPT			32
+#define HLAI_SF_OVERRIDESTATE		64
+#define HLAI_SF_NOSCRIPTMOVEMENT	128
 
 //m_fMoveTo
 #define HLAI_MOVE_NONE			0
@@ -504,9 +719,29 @@ F64 HLAIEntityCycle(CHLEntity *e)
 #define HLAI_MOVE_INSTANT		4
 #define HLAI_MOVE_TURN			5
 
-I64 HLAIFindActor(CHLEntity *script)
-{//m_iszEntity names the actor by targetname OR by classname. HL tries
- //targetname first and falls back to a classname search within m_flRadius
+//SCRIPTSTATE, basemonster.h:30. m_scriptState of the possessed actor.
+#define HLSS_PLAYING			0
+#define HLSS_WAIT				1
+#define HLSS_CLEANUP			2
+#define HLSS_WALK_TO_MARK		3
+#define HLSS_RUN_TO_MARK		4
+
+//SS_INTERRUPT, scripted.h:33. How far up the state ladder a script may reach
+//for its actor: by targetname reaches ALERT, by classname only IDLE.
+#define HLSS_INT_IDLE			0
+#define HLSS_INT_BY_NAME		1
+#define HLSS_INT_AI				2
+
+//m_startTime parked. CCineMonster::Spawn puts a named script 1e6 seconds out
+//so TASK_WAIT_FOR_SCRIPT holds until a trigger or DelayStart brings it back.
+#define HLAI_CINE_NEVER			1.0e6
+
+//CineThink's retry interval when no actor was free, seconds. scripted.cpp:487
+#define HLAI_CINE_RETRY			1.0
+
+I64 HLAIFindSpeaker(CHLEntity *script)
+{//CScriptedSentence::FindEntity, scripted.cpp:1140. m_iszEntity is a
+ //targetname or a classname; the classname pass is limited to m_flRadius.
 	F64 d[3];
 	I64 i;
 
@@ -521,10 +756,10 @@ I64 HLAIFindActor(CHLEntity *script)
 	for (i = 0; i < hl_num_entities; i++)
 	{
 		if (!hl_entities[i].in_use || !hl_entities[i].studio)
-			goto qaf_next;
+			goto qafs_next;
 
 		if (StrICompare(hl_entities[i].classname, script->ai_entity))
-			goto qaf_next;
+			goto qafs_next;
 
 		//a radius of 0 means anywhere in the map
 		if (script->ai_radius > 0.0)
@@ -532,94 +767,15 @@ I64 HLAIFindActor(CHLEntity *script)
 			HLVecSub(hl_entities[i].origin, script->origin, d);
 
 			if (HLVecLength(d) > script->ai_radius)
-				goto qaf_next;
+				goto qafs_next;
 		}
 
 		return i;
 
-qaf_next:
+qafs_next:
 	}
 
 	return -1;
-}
-
-U0 HLAIScriptStart(I64 self)
-{//StartScript: claim the actor, place it if asked, play the sequence
-	CHLEntity	*script = HLEntGet(self);
-	CHLEntity	*actor;
-	I64			 t;
-
-	if (!script)
-		return;
-
-	t = HLAIFindActor(script);
-
-	if (t < 0)
-	{
-		//no actor. retire rather than retry every frame for the whole map
-		script->toggle_state = HLTS_AT_TOP;
-		return;
-	}
-
-	actor = &hl_entities[t];
-
-	//the script owns the actor while it runs, so the end can find it again
-	script->owner        = t;
-	script->toggle_state = HLTS_GOING_UP;
-
-	//INSTANT and TURN place the actor outright. WALK and RUN would path to the
-	//mark, which needs the node graph, so they place it too: the actor arrives
-	//without the walk cycle rather than never arriving and stalling the script.
-	if (script->ai_moveto != HLAI_MOVE_NONE)
-	{
-		HLVecCopy(script->origin, actor->origin);
-		HLEntSetAbsBox(actor);
-		actor->angles[1] = script->angles[1];
-	}
-
-	HLAISetSequence(actor, script->ai_play, FALSE);
-
-	//the end is scheduled off the sequence duration, not detected from the
-	//renderer's cycle: the renderer does not run for an off-screen actor and
-	//the script still has to complete
-	script->pain_finished = hl_ent_time;
-
-	if (actor->studio)
-		script->pain_finished +=
-			HLStudioSeqDuration(actor->studio, actor->seq);
-}
-
-U0 HLAIScriptEnd(I64 self)
-{//SequenceDone: hand the actor back, fire the target, retire
-	CHLEntity	*script = HLEntGet(self);
-	CHLEntity	*actor;
-
-	if (!script)
-		return;
-
-	if (script->owner >= 0 && script->owner < hl_num_entities)
-	{
-		actor = &hl_entities[script->owner];
-
-		//back to the idle the script named, or the model's own first sequence
-		if (script->ai_idle[0])
-			HLAISetSequence(actor, script->ai_idle, TRUE);
-		else if (actor->studio && actor->studio->num_seqs > 0)
-		{
-			actor->seq        = 0;
-			actor->anim_start = hl_ent_time;
-			actor->anim_loop  = TRUE;
-		}
-	}
-
-	script->owner = -1;
-
-	HLEntUseTargets(self, hl_ent_player, HLUSE_TOGGLE, 0.0);
-
-	if (script->spawnflags & HLAI_SF_REPEATABLE)
-		script->toggle_state = HLTS_AT_BOTTOM;
-	else
-		script->toggle_state = HLTS_AT_TOP;
 }
 
 //--- combat AI --------------------------------------------------------------
@@ -844,7 +1000,13 @@ U0 HLAIScriptEnd(I64 self)
 //per-monster GetSchedule this port replaces with a table
 #define HLTASK_OCCUPY_SLOT		41
 
-#define HLTASK_COUNT			42
+//TASK_FACE_TARGET and TASK_MOVE_TO_TARGET_RANGE, AI_BaseNPC_Schedule.cpp:828
+//and :879. The target is m_hTargetEnt, the follow leader, not m_hEnemy.
+//data on the move task is the stand-off distance in world units.
+#define HLTASK_FACE_TARGET		42
+#define HLTASK_MOVE_TO_TARGET	43
+
+#define HLTASK_COUNT			44
 
 //TASKSTATUS_*, but only the three states that matter without interrupts
 #define HLTK_RUNNING			0
@@ -884,7 +1046,15 @@ U0 HLAIScriptEnd(I64 self)
 #define HLSCHED_BARNACLE_GRAB	28	//slBarnacleVictimGrab
 #define HLSCHED_BARNACLE_CHOMP	29	//slBarnacleVictimChomp
 #define HLSCHED_FAIL			30
-#define HLSCHED_COUNT			31
+
+//the follow loop. slFaceTarget (scientist.cpp:236-240) jumps to slFollow
+//(scientist.cpp:132-137), which walks to within 128 units and ends; the
+//selector then hands back FACE, so the pair cycles for as long as the
+//follower has a leader.
+#define HLSCHED_TARGET_FACE		31
+#define HLSCHED_TARGET_CHASE	32
+
+#define HLSCHED_COUNT			33
 
 //slInvestigateSound is twelve tasks long, the longest in defaultai.cpp that
 //this port reproduces
@@ -1180,6 +1350,105 @@ F64			hl_ai_mon_clock  = 0.0;
 
 Bool		hl_ai_mon_revive = TRUE;
 I64			hl_ai_mon_kills  = 0;
+
+//--- scripted_sequence state ------------------------------------------------
+//
+// The CCineMonster fields the shared CHLEntity does not carry, one row per
+// entity index. A scripted_sequence uses its own row; an entity being acted on
+// uses owner only. Indexed by entity rather than by a script slot so
+// CanPlaySequence can ask "is this one already taken" in one load.
+
+class CHLCineState
+{
+	F64	start;		//m_startTime, absolute game time
+	F64	retry;		//next CineThink. 0 is unspawned, negative is no think
+	I64	delay;		//m_iDelay, actors of this group still walking to a mark
+	I64	state;		//m_scriptState of the actor this script holds
+	I64	movetype;	//m_saved_movetype
+	I64	solid;		//m_saved_solid
+	I64	actor;		//m_hTargetEnt as an entity index, -1 for none
+	I64	owner;		//m_pCine of THIS entity as a script index, -1 for none
+};
+
+CHLCineState	hl_ai_cine[HLENT_MAX];
+
+U0 HLAICineResetRow(I64 i)
+{//globals are not zeroed and the whole table is walked every tick
+	hl_ai_cine[i].start    = HLAI_CINE_NEVER;
+	hl_ai_cine[i].retry    = 0.0;
+	hl_ai_cine[i].delay    = 0;
+	hl_ai_cine[i].state    = HLSS_WAIT;
+	hl_ai_cine[i].movetype = HLMOVETYPE_STEP;
+	hl_ai_cine[i].solid    = HLSOLID_SLIDEBOX;
+	hl_ai_cine[i].actor    = -1;
+	hl_ai_cine[i].owner    = -1;
+}
+
+//--- talk monster state -----------------------------------------------------
+//
+// dlls/talkmonster.cpp. CTalkMonster is what separates a scientist from a
+// headcrab: it greets the player, holds conversations with its own kind, turns
+// its head at whoever is speaking, and follows on +use. The fields live one row
+// per entity index for the reason CHLCineState does - CHLEntity belongs to
+// HLEntity.ZC.
+//
+// Rows exist for every entity, not only tracked monsters: CSittingScientist
+// takes no AI slot and still talks.
+
+//m_bitsSaid, talkmonster.h:30-37
+#define HLTLK_SAID_DMG_LIGHT	1
+#define HLTLK_SAID_DMG_MEDIUM	2
+#define HLTLK_SAID_DMG_HEAVY	4
+#define HLTLK_SAID_HELLO		8
+#define HLTLK_SAID_WOUND_LIGHT	16
+#define HLTLK_SAID_WOUND_HEAVY	32
+#define HLTLK_SAID_HEARD		64
+#define HLTLK_SAID_SMELLED		128
+
+//m_hTalkTarget / m_hTargetEnt as an index. The player is not in the monster
+//table and its live position comes from the listener, so it needs its own value
+#define HLTLK_NOBODY			-1
+#define HLTLK_PLAYER			-2
+
+class CHLTalkState
+{
+	I64		bits_said;		//m_bitsSaid
+	I64		n_speak;		//m_nSpeak, how often this one has started talking
+	I64		voice_pitch;	//m_voicePitch, a percentage of the recorded rate
+	F64		use_time;		//m_useTime, no +USE until then
+	F64		stop_talk;		//m_flStopTalkTime, when the current line ends
+	F64		last_smelled;	//m_flLastSaidSmelled
+	F64		response;		//CSittingScientist::m_flResponseDelay
+	F64		next_think;		//SittingThink's own 0.1s cadence
+	F64		head_turn;		//m_headTurn, degrees off the body's yaw
+	I64		talk_target;	//m_hTalkTarget
+	I64		follow;			//m_hTargetEnt, the follow leader
+	Bool	inited;			//TalkInit has run for this row
+};
+
+CHLTalkState	hl_ai_talk[HLENT_MAX];
+
+//CTalkMonster::g_talkWaitTime, talkmonster.cpp:30. One global for the whole
+//map: only one character starts a line at a time, which is what keeps a room of
+//scientists from all speaking at once. It gates the START of a line, not the
+//line itself, so two already-running sentences still overlap.
+F64	hl_ai_talk_wait = 0.0;
+
+U0 HLAITalkResetRow(I64 i)
+{//globals are not zeroed and the whole table is walked every tick
+	hl_ai_talk[i].bits_said    = 0;
+	hl_ai_talk[i].n_speak      = 0;
+	hl_ai_talk[i].voice_pitch  = HLPITCH_NORM;
+	hl_ai_talk[i].use_time     = 0.0;
+	hl_ai_talk[i].stop_talk    = 0.0;
+	hl_ai_talk[i].last_smelled = 0.0;
+	hl_ai_talk[i].response     = 0.0;
+	hl_ai_talk[i].next_think   = 0.0;
+	hl_ai_talk[i].head_turn    = 0.0;
+	hl_ai_talk[i].talk_target  = HLTLK_NOBODY;
+	hl_ai_talk[i].follow       = HLTLK_NOBODY;
+	hl_ai_talk[i].inited       = FALSE;
+}
 
 //--- the world sound list ---------------------------------------------------
 //
@@ -1606,6 +1875,20 @@ U0 HLAISchedInit()
 	HLAISchedAdd(HLSCHED_FAIL, HLTASK_STOP_MOVING, 0.0);
 	HLAISchedAdd(HLSCHED_FAIL, HLTASK_SET_ACTIVITY, HLACT_IDLE);
 	HLAISchedAdd(HLSCHED_FAIL, HLTASK_WAIT, 2.0);
+
+	//slFaceTarget, scientist.cpp:236-240. Ends by jumping to the chase, so a
+	//follower that has caught up turns to its leader and then waits on the
+	//move task rather than falling back through the selector.
+	HLAISchedAdd(HLSCHED_TARGET_FACE, HLTASK_STOP_MOVING, 0.0);
+	HLAISchedAdd(HLSCHED_TARGET_FACE, HLTASK_FACE_TARGET, 0.0);
+	HLAISchedAdd(HLSCHED_TARGET_FACE, HLTASK_SET_ACTIVITY, HLACT_IDLE);
+	HLAISchedAdd(HLSCHED_TARGET_FACE, HLTASK_SET_SCHEDULE,
+		HLSCHED_TARGET_CHASE);
+
+	//slFollow, scientist.cpp:132-137. 128 units is tlFollow's own figure.
+	//TASK_SET_FAIL_SCHEDULE(SCHED_CANT_FOLLOW) has no counterpart here: the
+	//move task stops the follow itself when it cannot reach the leader.
+	HLAISchedAdd(HLSCHED_TARGET_CHASE, HLTASK_MOVE_TO_TARGET, 128.0);
 }
 
 //--- the table's contents ---------------------------------------------------
@@ -2330,9 +2613,15 @@ U0 HLAIMonRegisterAll()
 	}
 
 	for (i = 0; i < HLENT_MAX; i++)
+	{
 		hl_ai_mon_of[i] = -1;
 
+		HLAICineResetRow(i);
+		HLAITalkResetRow(i);
+	}
+
 	hl_ai_mon_count = 0;
+	hl_ai_talk_wait = 0.0;
 
 	if (!hl_entities)
 		return;
@@ -3922,9 +4211,9 @@ Bool HLAISharedEvent(I64 s, CHLEntity *e, I64 self, I64 code, U8 *options)
 	}
 
 	//1001, 1002, 1006 and 1007 control a scripted_sequence's interruptibility
-	//and its exit animation. Scripts here are not interruptible and
-	//HLAIScriptEnd picks the exit take off m_iszIdle, so all four are no-ops
-	//rather than unhandled.
+	//and its exit animation. Scripts here are not interruptible and CineCleanup
+	//drops the actor straight into IDLE, so all four are no-ops rather than
+	//unhandled.
 	if (code == HLAI_EV_NOINTERRUPT || code == HLAI_EV_CANINTERRUPT ||
 		code == HLAI_EV_INAIR || code == HLAI_EV_ENDANIMATION)
 		return TRUE;
@@ -4391,6 +4680,35 @@ Bool HLAIAnimDone(I64 s)
 	return ToBool(hl_ent_time - e->anim_start >= dur);
 }
 
+Bool HLAITalkPointOf(I64 who, F64 *out)
+{//where a talk target or follow leader stands. FALSE when it is gone or dead
+	CHLEntity *e;
+
+	HLVecSet(out, 0.0, 0.0, 0.0);
+
+	if (who == HLTLK_PLAYER)
+	{
+		if (hl_ent_player < 0 || hl_ent_player_dead)
+			return FALSE;
+
+		HLAIPlayerOrigin(out);
+
+		return TRUE;
+	}
+
+	if (who < 0)
+		return FALSE;
+
+	e = HLEntGet(who);
+
+	if (!e || e->health <= 0.0)
+		return FALSE;
+
+	HLVecCopy(e->origin, out);
+
+	return TRUE;
+}
+
 U0 HLAIStartTask(I64 s, I64 task, F64 data)
 {//StartTask: the one-off half of a task. Anything decidable now is decided here
  //and the task completes immediately
@@ -4805,6 +5123,50 @@ U0 HLAIStartTask(I64 s, I64 task, F64 data)
 				HLAITaskFail(s);
 			break;
 
+		case HLTASK_FACE_TARGET:
+			//AI_BaseNPC_Schedule.cpp:828 - MakeIdealYaw at m_hTargetEnt and
+			//let RunTask turn. No target is a task failure there too
+			if (hl_ai_mon[s].ent < 0 || hl_ai_mon[s].ent >= HLENT_MAX)
+			{
+				HLAITaskFail(s);
+				break;
+			}
+
+			if (!HLAITalkPointOf(hl_ai_talk[hl_ai_mon[s].ent].follow, away))
+			{
+				HLAITaskFail(s);
+				break;
+			}
+
+			hl_ai_mon[s].ideal_yaw = HLAIYawTo(e->origin, away);
+			break;
+
+		case HLTASK_MOVE_TO_TARGET:
+			//AI_BaseNPC_Schedule.cpp:879. MoveToTarget walks, so the follow is
+			//a walk and not a run
+			if (hl_ai_mon[s].ent < 0 || hl_ai_mon[s].ent >= HLENT_MAX)
+			{
+				HLAITaskFail(s);
+				break;
+			}
+
+			if (!HLAITalkPointOf(hl_ai_talk[hl_ai_mon[s].ent].follow, away))
+			{
+				HLAITaskFail(s);
+				break;
+			}
+
+			HLVecCopy(away, hl_ai_mon[s].goal);
+			hl_ai_mon[s].have_goal     = TRUE;
+			hl_ai_mon[s].goal_is_enemy = FALSE;
+			hl_ai_mon[s].goal_tol      = data;
+			hl_ai_mon[s].path_start    = hl_ent_time;
+			hl_ai_mon[s].stuck_since   = 0.0;
+			hl_ai_mon[s].move_speed    = mi->walk_speed;
+
+			HLAISetActivity(s, HLACT_WALK);
+			break;
+
 		default:
 			HLAITaskComplete(s);
 			break;
@@ -4891,6 +5253,8 @@ U0 HLAIRunPath(I64 s, F64 dt)
 U0 HLAIRunTask(I64 s, I64 task, F64 data, F64 dt)
 {//RunTask: the per-tick half. Only the tasks that take time appear here
 	CHLEntity	*e = HLEntGet(hl_ai_mon[s].ent);
+	F64			 tpos[3];
+	F64			 tdiff[3];
 
 	if (!e)
 		return;
@@ -5179,6 +5543,618 @@ U0 HLAISetState(I64 s, I64 state)
 	hl_ai_mon[s].state      = state;
 	hl_ai_mon[s].sched      = HLSCHED_NONE;
 	hl_ai_mon[s].sched_done = TRUE;
+}
+
+//--- the scripted_sequence driver -------------------------------------------
+//
+// CCineMonster, dlls/scripted.cpp, plus the tlScriptedWalk / tlScriptedRun /
+// tlScriptedWait task lists (defaultai.cpp:799-862) that carry the actor
+// through it. Kept as one state machine on m_scriptState rather than as rows
+// in the schedule table: these tasks are private to the script, never
+// interleave with the combat schedules, and three of the five have no
+// equivalent among the HLTASK_ set.
+//
+// Placed after the mover, HLAISetActivity and HLAISetState because it uses all
+// three. ZealC is single-pass and has no forward declarations.
+//
+// toggle_state on the script entity, the only field HLEntity.ZC's dispatcher
+// can reach:
+//
+//   AT_BOTTOM   no cue yet. The script may already hold its actor, posed in
+//               m_iszIdle on the mark: a script naming an idle take possesses
+//               at map load even when it is named (scripted.cpp:143), which is
+//               how the guard is already leaning on his rail when you see him.
+//   GOING_DOWN  cue posted by the dispatcher. Consumed here on the next tick.
+//   GOING_UP    m_iszPlay running.
+//   AT_TOP      retired. The SDK removes the entity instead.
+//
+// Not reproduced: SF_SCRIPT_WAITTILLSEEN, m_flRepeat, m_iFinishSchedule, and
+// the root-bone query CineCleanup uses to find where a sequence left the
+// actor. The last means an actor whose play take walks it forward snaps back
+// to the mark's floor position on release rather than to where it ended.
+
+Bool HLAICanPlaySequence(I64 t, Bool disregard, I64 level)
+{//CBaseMonster::CanPlaySequence, monsters.cpp:3110
+	CHLEntity	*e;
+	I64			 s;
+
+	if (t < 0 || t >= HLENT_MAX)
+		return FALSE;
+
+	e = HLEntGet(t);
+
+	if (!e)
+		return FALSE;
+
+	//m_pCine: already held, by this script or another
+	if (hl_ai_cine[t].owner >= 0)
+		return FALSE;
+
+	s = hl_ai_mon_of[t];
+
+	//an actor with no AI slot - monster_generic wearing the forklift or the
+	//loader - has no state to conflict with. It needs only a model to animate.
+	if (s < 0)
+		return ToBool(e->studio != NULL);
+
+	if (hl_ai_mon[s].state == HLMSTATE_DEAD || e->health <= 0.0)
+		return FALSE;
+
+	//SF_SCRIPT_OVERRIDESTATE, and every aiscripted_sequence
+	if (disregard)
+		return TRUE;
+
+	if (hl_ai_mon[s].state == HLMSTATE_NONE ||
+		hl_ai_mon[s].state == HLMSTATE_IDLE)
+		return TRUE;
+
+	return ToBool(hl_ai_mon[s].state == HLMSTATE_ALERT &&
+		level >= HLSS_INT_BY_NAME);
+}
+
+I64 HLAICineFind(I64 self)
+{//CCineMonster::FindEntity, scripted.cpp:272. Every targetname match is tried
+ //at SS_INTERRUPT_BY_NAME before the classname pass, which is limited to
+ //m_flRadius and reaches only an idle actor.
+	CHLEntity	*script = HLEntGet(self);
+	F64			 d[3];
+	Bool		 over;
+	I64			 i;
+
+	if (!script || !script->ai_entity[0])
+		return -1;
+
+	over = ToBool((script->spawnflags & HLAI_SF_OVERRIDESTATE) ||
+		!StrCompare(script->classname, "aiscripted_sequence"));
+
+	i = HLEntFindByTargetname(script->ai_entity, 0);
+
+	while (i >= 0)
+	{
+		if (HLAICanPlaySequence(i, over, HLSS_INT_BY_NAME))
+			return i;
+
+		i = HLEntFindByTargetname(script->ai_entity, i + 1);
+	}
+
+	for (i = 0; i < hl_num_entities; i++)
+	{
+		if (!hl_entities[i].in_use || !hl_entities[i].studio)
+			goto qacf_next;
+
+		if (StrICompare(hl_entities[i].classname, script->ai_entity))
+			goto qacf_next;
+
+		//a radius of 0 means anywhere in the map
+		if (script->ai_radius > 0.0)
+		{
+			HLVecSub(hl_entities[i].origin, script->origin, d);
+
+			if (HLVecLength(d) > script->ai_radius)
+				goto qacf_next;
+		}
+
+		if (HLAICanPlaySequence(i, over, HLSS_INT_IDLE))
+			return i;
+
+qacf_next:
+	}
+
+	return -1;
+}
+
+U0 HLAICineDelayStart(I64 self, I64 state)
+{//CCineMonster::DelayStart, scripted.cpp:725. Every scripted_sequence sharing
+ //this targetname counts one actor still on its way; the group starts when the
+ //count reaches zero. Two scientists walking to two marks both arrive before
+ //either plays, which is what "act in concert" means in the entity comment.
+	CHLEntity	*script = HLEntGet(self);
+	I64			 i;
+
+	if (!script)
+		return;
+
+	for (i = 0; i < hl_num_entities; i++)
+	{
+		if (!hl_entities[i].in_use || hl_entities[i].ent_class != HLC_SCRIPT)
+			goto qacd_next;
+
+		//an unnamed script is a group of one
+		if (!script->targetname[0])
+		{
+			if (i != self)
+				goto qacd_next;
+		}
+		else if (StrICompare(hl_entities[i].targetname, script->targetname))
+			goto qacd_next;
+
+		if (state)
+			hl_ai_cine[i].delay++;
+		else
+		{
+			hl_ai_cine[i].delay--;
+
+			if (hl_ai_cine[i].delay <= 0)
+				hl_ai_cine[i].start = hl_ent_time + 0.05;
+		}
+
+qacd_next:
+	}
+}
+
+Bool HLAICineSetSeq(I64 t, U8 *label)
+{//CCineMonster::StartSequence, scripted.cpp:493. An unknown label falls back
+ //to sequence 0 as the SDK does after its error: leaving the previous take
+ //running would play a walk cycle through a scripted death.
+	CHLEntity	*e;
+	I64			 seq;
+
+	if (t < 0 || t >= HLENT_MAX || !label || !label[0])
+		return FALSE;
+
+	e = HLEntGet(t);
+
+	if (!e || !e->studio)
+		return FALSE;
+
+	seq = HLStudioSeqByName(e->studio, label);
+
+	if (seq < 0)
+	{
+		"HLAI: %s has no sequence \"%s\"\n", e->classname, label;
+		seq = 0;
+	}
+
+	e->seq              = seq;
+	e->anim_start       = hl_ent_time;
+	e->anim_done        = FALSE;
+	e->anim_event_frame = -1;
+	e->anim_loop        = HLStudioSeqLoops(e->studio, seq);
+
+	return TRUE;
+}
+
+U0 HLAICineRelease(I64 self)
+{//CBaseMonster::CineCleanup, scripted.cpp:796. Hand the actor back with the
+ //movetype and solid the script saved, put it on the floor, and drop its
+ //schedule so the selector runs fresh in IDLE.
+	CHLEntity	*script = HLEntGet(self);
+	CHLEntity	*actor;
+	F64			 floor[3];
+	I64			 t;
+	I64			 s;
+
+	if (!script)
+		return;
+
+	t = hl_ai_cine[self].actor;
+
+	hl_ai_cine[self].actor = -1;
+	hl_ai_cine[self].state = HLSS_CLEANUP;
+
+	if (t < 0 || t >= HLENT_MAX)
+		return;
+
+	hl_ai_cine[t].owner = -1;
+
+	actor = HLEntGet(t);
+
+	if (!actor)
+		return;
+
+	actor->movetype = hl_ai_cine[self].movetype;
+	actor->solid    = hl_ai_cine[self].solid;
+
+	s = hl_ai_mon_of[t];
+
+	if (s < 0)
+		return;
+
+	//SF_SCRIPT_NOSCRIPTMOVEMENT leaves the actor where the take ended. The SDK
+	//otherwise reads bone 0 to find that position and drops from there; there
+	//is no bone query outside the renderer here, so only the drop is done.
+	if (!(script->spawnflags & HLAI_SF_NOSCRIPTMOVEMENT))
+	{
+		if (HLAIDropToFloor(actor, actor->origin, floor))
+			HLVecCopy(floor, actor->origin);
+
+		HLEntSetAbsBox(actor);
+	}
+
+	hl_ai_mon[s].scripted   = FALSE;
+	hl_ai_mon[s].have_goal  = FALSE;
+	hl_ai_mon[s].activity   = HLACT_IDLE;
+	hl_ai_mon[s].sched      = HLSCHED_NONE;
+	hl_ai_mon[s].sched_done = TRUE;
+
+	//m_IdealMonsterState. A script that killed its actor leaves it dead
+	if (actor->health > 0.0)
+		HLAISetState(s, HLMSTATE_IDLE);
+	else
+		HLAISetState(s, HLMSTATE_DEAD);
+}
+
+U0 HLAICineDone(I64 self)
+{//CCineMonster::SequenceDone, scripted.cpp:561. The actor is released before
+ //the targets fire: firing hands it straight to the next script in the chain,
+ //which is how the walking scientists in c0a0 bounce between two marks.
+	CHLEntity *script = HLEntGet(self);
+
+	if (!script)
+		return;
+
+	HLAICineRelease(self);
+
+	hl_ai_cine[self].start = HLAI_CINE_NEVER;
+	hl_ai_cine[self].delay = 0;
+
+	//no think scheduled: a repeatable script waits to be fired again rather
+	//than snatching its actor back from whatever the targets just started
+	hl_ai_cine[self].retry = -1.0;
+
+	if (script->spawnflags & HLAI_SF_REPEATABLE)
+		script->toggle_state = HLTS_AT_BOTTOM;
+	else
+		script->toggle_state = HLTS_AT_TOP;
+
+	HLEntUseTargets(self, hl_ent_player, HLUSE_TOGGLE, 0.0);
+}
+
+U0 HLAICinePossess(I64 self)
+{//CCineMonster::PossessEntity, scripted.cpp:321. Claim the actor, record what
+ //will be handed back, set m_scriptState from m_fMoveTo, pose the idle take.
+	CHLEntity	*script = HLEntGet(self);
+	CHLEntity	*actor;
+	F64			 floor[3];
+	I64			 t;
+	I64			 s;
+
+	if (!script)
+		return;
+
+	t = HLAICineFind(self);
+
+	if (t < 0)
+	{
+		//CineThink retries rather than retiring: the actor is often finishing
+		//an earlier script in the same chain
+		hl_ai_cine[self].retry = hl_ent_time + HLAI_CINE_RETRY;
+		return;
+	}
+
+	actor = HLEntGet(t);
+
+	hl_ai_cine[self].actor    = t;
+	hl_ai_cine[self].movetype = actor->movetype;
+	hl_ai_cine[self].solid    = actor->solid;
+	hl_ai_cine[self].retry    = -1.0;
+	hl_ai_cine[t].owner       = self;
+
+	s = hl_ai_mon_of[t];
+
+	if (s >= 0)
+	{
+		hl_ai_mon[s].scripted  = TRUE;
+		hl_ai_mon[s].have_goal = FALSE;
+
+		HLAISetState(s, HLMSTATE_SCRIPT);
+
+		//DROP_TO_FLOOR, which every CBaseMonster::Spawn runs before a script
+		//can reach the actor. HLAIMonThink does it on the first think and a
+		//monster possessed at map load never gets one, so it is done here too.
+		if (!hl_ai_mon[s].settled)
+		{
+			hl_ai_mon[s].settled = TRUE;
+
+			if (!hl_ai_mon_info[hl_ai_mon[s].kind].flies &&
+				HLAIDropToFloor(actor, actor->origin, floor))
+			{
+				HLVecCopy(floor, actor->origin);
+				HLEntSetAbsBox(actor);
+			}
+		}
+	}
+
+	//m_fMoveTo. 1 and 2 leave the actor where it stands and route it; the rest
+	//place it. An actor with no AI slot cannot route, so it is placed too.
+	if (script->ai_moveto == HLAI_MOVE_WALK && s >= 0)
+	{
+		hl_ai_cine[self].state = HLSS_WALK_TO_MARK;
+
+		HLAICineDelayStart(self, 1);
+	}
+	else if (script->ai_moveto == HLAI_MOVE_RUN && s >= 0)
+	{
+		hl_ai_cine[self].state = HLSS_RUN_TO_MARK;
+
+		HLAICineDelayStart(self, 1);
+	}
+	else
+	{
+		hl_ai_cine[self].state = HLSS_WAIT;
+
+		//5 turns to face without moving
+		if (script->ai_moveto != HLAI_MOVE_NONE &&
+			script->ai_moveto != HLAI_MOVE_TURN)
+		{
+			HLVecCopy(script->origin, actor->origin);
+			HLEntSetAbsBox(actor);
+		}
+
+		if (script->ai_moveto != HLAI_MOVE_NONE)
+			actor->angles[1] = HLAngleNorm(script->angles[1]);
+
+		//m_startTime = time + 1E6 on a teleport: a placed actor holds its idle
+		//until the trigger whether or not the script carries a targetname
+		if (script->ai_moveto == HLAI_MOVE_INSTANT)
+			hl_ai_cine[self].start = HLAI_CINE_NEVER;
+	}
+
+	if (s >= 0)
+		hl_ai_mon[s].ideal_yaw = actor->angles[1];
+
+	//m_iszIdle poses the actor now. The play take waits for the cue.
+	if (script->ai_idle[0])
+		HLAICineSetSeq(t, script->ai_idle);
+}
+
+U0 HLAICineBeginPlay(I64 self)
+{//TASK_WAIT_FOR_SCRIPT completing, schedule.cpp:522. m_iszPlay starts and
+ //TASK_PLAY_SCRIPT waits it out. An empty m_iszPlay finishes the script here
+ //(scripted.cpp:495): ten of the seventeen scripts in c0a0 carry none and
+ //exist only to move an actor to a mark and fire the next link.
+	CHLEntity	*script = HLEntGet(self);
+	CHLEntity	*actor;
+	I64			 t;
+	I64			 s;
+
+	if (!script)
+		return;
+
+	t = hl_ai_cine[self].actor;
+
+	if (t < 0 || !script->ai_play[0])
+	{
+		HLAICineDone(self);
+		return;
+	}
+
+	HLAICineSetSeq(t, script->ai_play);
+
+	hl_ai_cine[self].state = HLSS_PLAYING;
+	script->toggle_state   = HLTS_GOING_UP;
+
+	actor = HLEntGet(t);
+	s     = hl_ai_mon_of[t];
+
+	//the end is scheduled off the sequence duration rather than watched on the
+	//renderer's cycle: the renderer does not run for an off-screen actor and
+	//the script still has to complete
+	script->pain_finished = hl_ent_time;
+
+	if (actor && actor->studio)
+		script->pain_finished += HLStudioSeqDuration(actor->studio, actor->seq);
+
+	//the take is the script's, not an activity. Leaving m_Activity on WALK
+	//would let the next HLAISetActivity call decide it is already playing.
+	if (s >= 0)
+		hl_ai_mon[s].activity = HLACT_IDLE;
+}
+
+U0 HLAICineActorTick(I64 s, F64 dt)
+{//tlScriptedWalk, tlScriptedRun and tlScriptedWait as one state machine. Runs
+ //in place of the AI think for a monster a script holds.
+	CHLEntity	*actor = HLEntGet(hl_ai_mon[s].ent);
+	CHLEntity	*script;
+	CHLMonInfo	*mi;
+	F64			 speed;
+	I64			 self;
+	I64			 st;
+	I64			 moved;
+
+	if (!actor || hl_ai_mon[s].ent < 0 || hl_ai_mon[s].ent >= HLENT_MAX)
+		return;
+
+	self = hl_ai_cine[hl_ai_mon[s].ent].owner;
+
+	if (self < 0)
+		return;
+
+	script = HLEntGet(self);
+
+	if (!script)
+		return;
+
+	mi = &hl_ai_mon_info[hl_ai_mon[s].kind];
+	st = hl_ai_cine[self].state;
+
+	//CineCleanup's deadflag branch, scripted.cpp:818: an actor killed on its
+	//way to the mark leaves the script. One killed during the play take does
+	//not - a scripted death is a take like any other and runs to its end.
+	if (st != HLSS_PLAYING && actor->health <= 0.0)
+	{
+		HLAICineDone(self);
+		return;
+	}
+
+	if (st == HLSS_WALK_TO_MARK || st == HLSS_RUN_TO_MARK)
+	{
+		//TASK_WALK_TO_TARGET / TASK_RUN_TO_TARGET at TARGET_MOVE_SCRIPTED, then
+		//TASK_WAIT_FOR_MOVEMENT. No node graph, so the route is straight at the
+		//mark with the mover's one wall slide.
+		speed = mi->walk_speed;
+
+		if (st == HLSS_RUN_TO_MARK)
+			speed = mi->run_speed;
+
+		hl_ai_mon[s].have_goal     = TRUE;
+		hl_ai_mon[s].goal_is_enemy = FALSE;
+		hl_ai_mon[s].goal_tol      = 8.0;
+		hl_ai_mon[s].move_speed    = speed;
+
+		HLVecCopy(script->origin, hl_ai_mon[s].goal);
+
+		if (st == HLSS_WALK_TO_MARK)
+			HLAISetActivity(s, HLACT_WALK);
+		else
+			HLAISetActivity(s, HLACT_RUN);
+
+		HLAITurnToward(s, HLAIYawTo(actor->origin, script->origin), dt);
+
+		moved = HLAIMoveStep(s, speed, dt);
+
+		if (moved == HLAI_MOVE_OK)
+			return;
+
+		//TASK_PLANT_ON_SCRIPT: on the mark exactly, arrived or blocked. An
+		//actor that cannot route the last few units would otherwise hold the
+		//whole group on its DelayStart count for the rest of the map.
+		HLVecCopy(script->origin, actor->origin);
+		HLEntSetAbsBox(actor);
+
+		hl_ai_mon[s].have_goal = FALSE;
+
+		//TASK_FACE_SCRIPT then TASK_FACE_IDEAL. The turn is instant: the actor
+		//is standing on the mark and the wait below has nothing to turn during.
+		hl_ai_mon[s].ideal_yaw = HLAngleNorm(script->angles[1]);
+		actor->angles[1]       = hl_ai_mon[s].ideal_yaw;
+
+		if (script->ai_idle[0])
+			HLAICineSetSeq(hl_ai_mon[s].ent, script->ai_idle);
+		else
+			HLAISetActivity(s, HLACT_IDLE);
+
+		//TASK_ENABLE_SCRIPT: one fewer actor still walking
+		hl_ai_cine[self].state = HLSS_WAIT;
+
+		HLAICineDelayStart(self, 0);
+
+		return;
+	}
+
+	if (st == HLSS_WAIT)
+	{
+		//TASK_WAIT_FOR_SCRIPT, schedule.cpp:1251
+		if (!script->ai_idle[0])
+			HLAISetActivity(s, HLACT_IDLE);
+		else if (!StrICompare(script->ai_idle, script->ai_play))
+			//pev->framerate = 0 when idle and play name the same take: frame 0
+			//is held until the cue. scripted.cpp:384
+			actor->anim_start = hl_ent_time;
+
+		HLAITurnToward(s, hl_ai_mon[s].ideal_yaw, dt);
+
+		if (hl_ai_cine[self].delay <= 0 &&
+			hl_ent_time >= hl_ai_cine[self].start)
+			HLAICineBeginPlay(self);
+
+		return;
+	}
+
+	//HLSS_PLAYING is TASK_PLAY_SCRIPT: nothing to do but hold still. The take
+	//running out is noticed on the script's own clock in HLAICineTick, so an
+	//actor with no AI slot reaches the end the same way this one does.
+}
+
+U0 HLAICineTick(I64 self)
+{//one scripted_sequence, one tick: Spawn, Use, CineThink and the end of
+ //TASK_PLAY_SCRIPT. The actor's half is HLAICineActorTick when it has an AI
+ //slot; an actor without one is driven entirely from here.
+	CHLEntity	*script = HLEntGet(self);
+	CHLEntity	*actor;
+	I64			 t;
+	I64			 s;
+
+	if (!script)
+		return;
+
+	//CCineMonster::Spawn, scripted.cpp:143. A script with no targetname, or
+	//one naming an idle take, thinks a second after the map loads and takes its
+	//actor then; a named script parks m_startTime until it is used.
+	if (hl_ai_cine[self].retry == 0.0)
+	{
+		if (!script->targetname[0] || script->ai_idle[0])
+			hl_ai_cine[self].retry = hl_ent_time + 1.0;
+		else
+			hl_ai_cine[self].retry = -1.0;
+
+		if (script->targetname[0])
+			hl_ai_cine[self].start = HLAI_CINE_NEVER;
+		else
+			hl_ai_cine[self].start = 0.0;
+	}
+
+	t = hl_ai_cine[self].actor;
+
+	//--- the cue, posted by the dispatcher in HLEntity.ZC ---
+	if (script->toggle_state == HLTS_GOING_DOWN)
+	{
+		script->toggle_state = HLTS_AT_BOTTOM;
+
+		//CCineMonster::Use, scripted.cpp:181. An actor already in hand needs
+		//only its start time brought forward; otherwise think now and find one.
+		if (t >= 0)
+			hl_ai_cine[self].start = hl_ent_time + 0.05;
+		else
+			hl_ai_cine[self].retry = hl_ent_time;
+	}
+
+	if (script->toggle_state == HLTS_AT_TOP)
+		return;
+
+	//--- CineThink ---
+	if (t < 0)
+	{
+		if (hl_ai_cine[self].retry >= 0.0 &&
+			hl_ent_time >= hl_ai_cine[self].retry)
+			HLAICinePossess(self);
+
+		return;
+	}
+
+	//--- an actor with no AI slot ---
+	s = hl_ai_mon_of[t];
+
+	if (s < 0 && hl_ai_cine[self].state == HLSS_WAIT)
+	{
+		if (script->ai_idle[0] &&
+			!StrICompare(script->ai_idle, script->ai_play))
+		{
+			actor = HLEntGet(t);
+
+			if (actor)
+				actor->anim_start = hl_ent_time;
+		}
+
+		if (hl_ai_cine[self].delay <= 0 &&
+			hl_ent_time >= hl_ai_cine[self].start)
+			HLAICineBeginPlay(self);
+	}
+
+	//--- TASK_PLAY_SCRIPT: the take has run out ---
+	if (hl_ai_cine[self].state == HLSS_PLAYING &&
+		hl_ent_time >= script->pain_finished)
+		HLAICineDone(self);
 }
 
 Bool HLAICanMelee(I64 s, F64 dist)
@@ -5555,31 +6531,18 @@ U0 HLAIMonsterFrame(F64 dt)
 
 	//--- who is under script control this tick ---
 	//
-	//a scripted_sequence owns its actor while it runs, and HLAIScriptStart has
-	//already placed it and set its sequence. MONSTERSTATE_SCRIPT means the AI
-	//leaves it alone.
+	//m_pCine, which here is hl_ai_cine[ent].owner. It is set from the moment a
+	//script possesses its actor, not from the moment the play take starts: an
+	//actor posed in m_iszIdle on its mark is already the script's and must not
+	//be walked off it by the selector.
 	for (i = 0; i < hl_ai_mon_count; i++)
-		hl_ai_mon[i].scripted = FALSE;
-
-	for (i = 0; i < hl_num_entities; i++)
 	{
-		e = &hl_entities[i];
+		s = hl_ai_mon[i].ent;
 
-		if (!e->in_use || e->ent_class != HLC_SCRIPT)
-			goto qamf_next_script;
-
-		if (e->toggle_state != HLTS_GOING_UP)
-			goto qamf_next_script;
-
-		if (e->owner < 0 || e->owner >= HLENT_MAX)
-			goto qamf_next_script;
-
-		s = hl_ai_mon_of[e->owner];
-
-		if (s >= 0)
-			hl_ai_mon[s].scripted = TRUE;
-
-qamf_next_script:
+		if (s < 0 || s >= HLENT_MAX)
+			hl_ai_mon[i].scripted = FALSE;
+		else
+			hl_ai_mon[i].scripted = ToBool(hl_ai_cine[s].owner >= 0);
 	}
 
 	//--- think ---
@@ -5615,10 +6578,10 @@ qamf_next_script:
 
 		if (hl_ai_mon[i].scripted)
 		{
-			//while scripted, record the state and do nothing. The script's
-			//end restores an idle sequence and the selector takes over, the
-			//schedule having been dropped.
+			//MONSTERSTATE_SCRIPT: the script's task list runs instead of the
+			//AI's. CineCleanup drops the schedule and returns it to IDLE.
 			HLAISetState(i, HLMSTATE_SCRIPT);
+			HLAICineActorTick(i, dt);
 			goto qamf_next;
 		}
 
@@ -5840,18 +6803,7 @@ U0 HLAIFrame(F64 dt)
 
 		if (e->ent_class == HLC_SCRIPT)
 		{
-			//GOING_DOWN is "start requested", set by the dispatcher. GOING_UP
-			//running, AT_TOP finished, AT_BOTTOM waiting
-			if (e->toggle_state == HLTS_GOING_DOWN)
-			{
-				HLAIScriptStart(i);
-				goto qaif_next;
-			}
-
-			if (e->toggle_state == HLTS_GOING_UP &&
-				hl_ent_time >= e->pain_finished)
-				HLAIScriptEnd(i);
-
+			HLAICineTick(i);
 			goto qaif_next;
 		}
 
@@ -5867,7 +6819,7 @@ U0 HLAIFrame(F64 dt)
 			{
 				I64 who;
 
-				who = HLAIFindActor(e);
+				who = HLAIFindSpeaker(e);
 
 				if (who >= 0)
 					HLAISentenceStart(e->ai_sentence,
