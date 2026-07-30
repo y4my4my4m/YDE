@@ -130,13 +130,19 @@ Built from the shipped `resource/` files rather than approximated.
   labels from `OptionsSub*.res`. Multiplayer, Voice and Lock are not shown:
   nothing in this port drives them. Row 0 of each page is the tab strip, so Up
   from the first control reaches it and Left/Right there changes page.
+- Without `resource/background/800_*.tga` the backdrop falls back to
+  `gfx/lambda.bmp` over black plus a text wordmark. Only those 12 tiles are
+  needed, 1.9 MB; the rest of `resource/background` is the 21:9 set.
+  `HLTest;` reports which of the two you will get.
 - Text is recoloured per glyph rather than drawn in the font's own colours:
   CONCHARS glyphs are pre-coloured orange over a dark outline, so a flat colour
   is modulated by each texel's luminance. That keeps the outline and stays
   legible over a photograph.
 
-There is no screen-size option and `-`/`=` are unbound: Quake shrank the 3D
-view inside the status bar, HL always renders full screen.
+There is no screen-size option and `-`/`=` are unbound, and `HLSbarLines` is
+always 0: Quake reserved rows at the bottom of the screen for the status bar and
+shrank the 3D view above them. HL has no status bar — the HUD is an overlay on a
+full-screen view.
 
 ## Not done
 
@@ -199,7 +205,7 @@ subset. The minimum that gets a map on screen:
 | `valve/maps/*.bsp` | ~3 MB ea | whatever you want to look at |
 | `valve/models/*.mdl` | ~1 MB ea | plus the matching `*T.mdl` |
 | `valve/gfx/palette.lmp` | 768 B | 2D art colours; optional |
-| `valve/resource/` | ~40 MB | menu backdrop, strings, scheme |
+| `valve/resource/background/800_*.tga` | 1.9 MB | menu backdrop (12 tiles) |
 
 To find which wads a map wants, from the host:
 
