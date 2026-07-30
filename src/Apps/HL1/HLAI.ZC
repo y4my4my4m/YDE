@@ -1242,6 +1242,18 @@ class CHLMonState
 	F64		path_start;
 	F64		stuck_since;
 
+	//FTriangulate's apex, monsters.cpp:1901-1903. m_Route holds ROUTE_SIZE
+	//waypoints and InsertWaypoint pushes the apex in front of the goal; with no
+	//node graph the route is never longer than one detour plus the goal, so it
+	//is one slot rather than an array.
+	Bool	have_detour;
+	F64		detour[3];
+
+	//next CheckLocalMove lookahead, on CBaseMonster::MonsterThink's own 0.1s
+	//cadence. The lookahead walks 200 units in 16-unit hops and each hop is
+	//three hull sweeps; the server tick is faster than the SDK's think
+	F64		next_move_check;
+
 	F64		ideal_yaw;
 	F64		next_attack;
 	F64		next_idle_snd;
@@ -1281,6 +1293,12 @@ class CHLMonState
 
 	//current HLACT_, for ReportAIState. m_Activity in the SDK
 	I64		activity;
+
+	//the sequence index `activity` last resolved to, -1 for none. Anything that
+	//moves the entity off it - a scripted_sequence taking the actor, a death
+	//take - breaks the "already playing it" gate in HLAISetActivity, so the
+	//activity is resolved again instead of being left on the foreign sequence
+	I64		act_seq;
 
 	//m_fGunDrawn, barney's holster bodygroup. The draw take runs once, on the
 	//first transition out of idle
@@ -2332,6 +2350,8 @@ U0 HLAIMonInit()
 		hl_ai_mon[i].move_speed    = 0.0;
 		hl_ai_mon[i].path_start    = 0.0;
 		hl_ai_mon[i].stuck_since   = 0.0;
+		hl_ai_mon[i].have_detour   = FALSE;
+		hl_ai_mon[i].next_move_check = 0.0;
 		hl_ai_mon[i].ideal_yaw     = 0.0;
 		hl_ai_mon[i].next_attack   = 0.0;
 		hl_ai_mon[i].next_idle_snd = 0.0;
@@ -2349,6 +2369,7 @@ U0 HLAIMonInit()
 		hl_ai_mon[i].heard         = -1;
 		hl_ai_mon[i].heard_type    = HLSOUND_NONE;
 		hl_ai_mon[i].activity      = HLACT_IDLE;
+		hl_ai_mon[i].act_seq       = -1;
 		hl_ai_mon[i].gun_drawn     = FALSE;
 		hl_ai_mon[i].in_cover      = FALSE;
 		hl_ai_mon[i].fail_sched    = HLSCHED_FAIL;
@@ -2520,6 +2541,8 @@ U0 HLAIMonReset(I64 s)
 	hl_ai_mon[s].move_speed    = 0.0;
 	hl_ai_mon[s].path_start    = 0.0;
 	hl_ai_mon[s].stuck_since   = 0.0;
+	hl_ai_mon[s].have_detour   = FALSE;
+	hl_ai_mon[s].next_move_check = 0.0;
 	hl_ai_mon[s].next_attack   = 0.0;
 	hl_ai_mon[s].next_look     = 0.0;
 	hl_ai_mon[s].scripted      = FALSE;
@@ -2533,6 +2556,7 @@ U0 HLAIMonReset(I64 s)
 	hl_ai_mon[s].heard         = -1;
 	hl_ai_mon[s].heard_type    = HLSOUND_NONE;
 	hl_ai_mon[s].activity      = HLACT_IDLE;
+	hl_ai_mon[s].act_seq       = -1;
 	hl_ai_mon[s].gun_drawn     = FALSE;
 	hl_ai_mon[s].in_cover      = FALSE;
 	hl_ai_mon[s].fail_sched    = HLSCHED_FAIL;
@@ -3499,14 +3523,27 @@ Bool HLAITurnToward(I64 s, F64 want, F64 dt)
 
 //--- movement ---------------------------------------------------------------
 //
-// WALK_MOVE / RUN_MOVE without the node graph. The SDK's CBaseMonster::Move
-// takes the next waypoint from m_Route, which CGraph filled; here the goal is
-// the destination itself and the only obstacle handling is one slide along the
-// plane that blocked the step. This is not a substitute for routing.
+// CBaseMonster::Move, MoveExecute, CheckLocalMove and FTriangulate,
+// dlls/monsters.cpp:1798, :1980, :1300 and :1626.
+//
+// The SDK's Move walks m_Route, which CGraph filled. There is no node graph
+// here, so the route is the goal plus at most one triangulated apex. Everything
+// below the route is the SDK's: the same 16-unit hop, the same lift-carry-drop
+// step, the same 200-unit lookahead, the same eight-iteration apex search. A
+// monster still cannot route around a room, but it no longer enters geometry.
 
 #define HLAI_MOVE_OK		0
 #define HLAI_MOVE_ARRIVED	1
 #define HLAI_MOVE_BLOCKED	2
+
+//LOCALMOVE_*, monsters.h:28-30
+#define HLAI_LM_INVALID		0
+#define HLAI_LM_NOTRI		1
+#define HLAI_LM_VALID		2
+
+#define HLAI_LOCAL_STEP		16.0	//LOCAL_STEP_SIZE, monsters.cpp:1299
+#define HLAI_DIST_CHECK		200.0	//DIST_TO_CHECK, monsters.cpp:1796
+#define HLAI_MOVE_CHECK		0.1		//CBaseMonster::MonsterThink's interval
 
 Bool HLAIDropToFloor(CHLEntity *e, F64 *pos, F64 *out)
 {//CheckLocalMove's floor test. Probe up HLAI_STEP_HEIGHT for headroom, then
@@ -3539,95 +3576,464 @@ Bool HLAIDropToFloor(CHLEntity *e, F64 *pos, F64 *out)
 	return TRUE;
 }
 
-I64 HLAIMoveStep(I64 s, F64 speed, F64 dt)
-{//one tick of movement toward the goal
+Bool HLAIStepTo(I64 s, F64 *from, F64 *to, F64 *out)
+{//SV_movestep, which is what the engine's WALK_MOVE runs: lift by one step
+ //height, carry the box across, drop two step heights onto a floor. FALSE is
+ //WALKMOVE_CHECKONLY failing - a step too tall, nothing to land on, or
+ //something solid in between. Every mover below is built on this.
+ //
+ //Destination and source are at the same height in every caller: the direction
+ //is flattened before the hop is taken.
+ //
+ //Deviation: SV_movestep does not sweep the horizontal leg, it traces straight
+ //down at the destination, which is why CheckLocalMove and MoveExecute both cap
+ //the hop at 16 units. The leg is swept here too. A monster cutting the corner
+ //of a doorframe is what the destination-only test misses, and the sweep is one
+ //trace.
+ //
+ //A trace that begins embedded reports the whole sweep clear: HLTraceEntity
+ //returns on all_solid before any entity pass, HLClip.ZC:618, leaving
+ //HLTraceInit's fraction of 1.0 and end_pos on the far end, HLClip.ZC:181-188.
+ //Taken at face value that walks a stuck monster through the wall it is stuck
+ //in, so all_solid and start_solid both refuse the step.
 	CHLEntity	*e = HLEntGet(hl_ai_mon[s].ent);
 	CHLTrace	 tr;
+	F64			 up[3];
+	F64			 over[3];
+	F64			 down[3];
+	Bool		 ok = FALSE;
+
+	if (!e || !hl_map)
+		return FALSE;
+
+	//the sweep clips the box solids as well, so a monster is stopped by another
+	//monster and by the player. hl_ent_clip_ignore keeps it out of its own box
+	//and is lowered again on every exit: left raised, the player stays solid to
+	//everything that traces afterwards, HLEntity.ZC:1094-1097
+	hl_ent_clip_ignore = hl_ai_mon[s].ent;
+
+	//a MOVETYPE_FLY monster holds the height it is given. There is no floor
+	//under a controller
+	if (hl_ai_mon_info[hl_ai_mon[s].kind].flies)
+	{
+		HLTraceEntity(hl_map, from, to, e->mins, e->maxs, 0, FALSE, &tr);
+
+		if (!tr.all_solid && !tr.start_solid && tr.fraction >= 1.0)
+		{
+			HLVecCopy(to, out);
+			ok = TRUE;
+		}
+
+		hl_ent_clip_ignore = -1;
+
+		return ok;
+	}
+
+	HLVecCopy(from, up);
+	up[2] += HLAI_STEP_HEIGHT;
+
+	HLVecCopy(to, over);
+	over[2] = up[2];
+
+	HLTraceEntity(hl_map, up, over, e->mins, e->maxs, 0, FALSE, &tr);
+
+	if (tr.all_solid || tr.start_solid || tr.fraction < 1.0)
+	{
+		//the lift put the box in a ceiling. SV_movestep drops it by one step
+		//and retries flat, which is how a monster crosses a low crawlspace
+		up[2]   = from[2];
+		over[2] = from[2];
+
+		HLTraceEntity(hl_map, up, over, e->mins, e->maxs, 0, FALSE, &tr);
+
+		if (tr.all_solid || tr.start_solid || tr.fraction < 1.0)
+		{
+			hl_ent_clip_ignore = -1;
+			return FALSE;
+		}
+	}
+
+	//two step heights down from one step up: a net fall of one step, the drop
+	//the engine lets a monster walk off
+	HLVecCopy(over, down);
+	down[2] -= HLAI_STEP_HEIGHT * 2.0;
+
+	HLTraceEntity(hl_map, over, down, e->mins, e->maxs, 0, FALSE, &tr);
+
+	hl_ent_clip_ignore = -1;
+
+	if (tr.all_solid || tr.start_solid)
+		return FALSE;
+
+	//nothing to land on within a step: walked off an edge
+	if (tr.fraction >= 1.0)
+		return FALSE;
+
+	HLVecCopy(tr.end_pos, out);
+
+	return TRUE;
+}
+
+I64 HLAICheckLocalMove(I64 s, F64 *start, F64 *end, F64 *_dist)
+{//::CheckLocalMove, monsters.cpp:1300. Walk the straight line in
+ //LOCAL_STEP_SIZE hops; *_dist is how far it got, which FTriangulate needs to
+ //place its apex past the obstruction.
+ //
+ //Deviation: the SDK carries the monster along the line with UTIL_SetOrigin and
+ //undoes the move afterwards, monsters.cpp:1316 and :1397. The walk here is on
+ //a local position and the entity never moves, so no trace observes the probe.
+ //
+ //The pTarget case, "if this step hits target ent the move is legal",
+ //monsters.cpp:1356-1361, has no counterpart: callers pass a position rather
+ //than an entity, and the goal tolerance already stops the monster short of a
+ //body.
+	F64	at[3];
+	F64	to[3];
+	F64	dir[3];
+	F64	dist;
+	F64	walked;
+	F64	size;
+
+	if (_dist)
+		*_dist = 0.0;
+
+	HLVecSub(end, start, dir);
+	dir[2] = 0.0;
+
+	dist = HLVecNormalize(dir);
+
+	if (dist <= 0.0)
+		return HLAI_LM_VALID;
+
+	HLVecCopy(start, at);
+
+	walked = 0.0;
+
+	while (walked < dist)
+	{
+		size = HLAI_LOCAL_STEP;
+
+		//the last hop stops one unit short of the goal, monsters.cpp:1344-1345
+		if (walked + HLAI_LOCAL_STEP >= dist - 1.0)
+			size = (dist - walked) - 1.0;
+
+		if (size <= 0.0)
+			goto qclm_done;
+
+		HLVecMA(at, size, dir, to);
+
+		if (!HLAIStepTo(s, at, to, at))
+		{
+			if (_dist)
+				*_dist = walked;
+
+			return HLAI_LM_INVALID;
+		}
+
+		walked += HLAI_LOCAL_STEP;
+	}
+
+qclm_done:
+	if (_dist)
+		*_dist = dist;
+
+	//"the monster can move to a spot UNDER the target, but not to it",
+	//monsters.cpp:1375-1382. 64 is the SDK's own constant, chosen because
+	//pev->size.z is wrong for a headcrab. Triangulating out of this only walks
+	//the same line again
+	if (!hl_ai_mon_info[hl_ai_mon[s].kind].flies)
+	{
+		if (end[2] - at[2] > 64.0 || at[2] - end[2] > 64.0)
+			return HLAI_LM_NOTRI;
+	}
+
+	return HLAI_LM_VALID;
+}
+
+Bool HLAITriangulate(I64 s, F64 *start, F64 *end, F64 dist, F64 *apex)
+{//::FTriangulate, monsters.cpp:1626. Probe an apex either side of the
+ //obstruction and take the first from which the goal is still reachable.
+ //
+ //vecFarSide is m_Route[m_iRouteIndex].vecLocation, monsters.cpp:1668; with no
+ //route that is the goal itself.
+	CHLEntity	*e = HLEntGet(hl_ai_mon[s].ent);
+	F64			 fwd[3];
+	F64			 side[3];
+	F64			 rise[3];
+	F64			 ahead[3];
+	F64			 left[3];
+	F64			 right[3];
+	F64			 top[3];
+	F64			 bottom[3];
+	F64			 push[3];
+	F64			 pushz[3];
+	F64			 size_x;
+	F64			 size_z;
+	Bool		 flies;
+	I64			 i;
+
+	if (!e)
+		return FALSE;
+
+	flies = hl_ai_mon_info[hl_ai_mon[s].kind].flies;
+
+	//CheckLocalMove works in 16-unit hops and the SDK clamps the apex offset to
+	//[24, 48] regardless of hull, monsters.cpp:1638-1644
+	size_x = e->maxs[0] - e->mins[0];
+
+	if (size_x < 24.0)
+		size_x = 24.0;
+	else if (size_x > 48.0)
+		size_x = 48.0;
+
+	size_z = e->maxs[2] - e->mins[2];
+
+	HLVecSub(end, start, fwd);
+
+	if (HLVecNormalize(fwd) <= 0.0)
+		return FALSE;
+
+	HLVecSet(rise, 0.0, 0.0, 1.0);
+	HLVecCross(fwd, rise, side);
+
+	//one hull width past the obstruction so the turn back onto course clears
+	//it, three hull widths out to the side, monsters.cpp:1660-1661
+	HLVecMA(start, dist + size_x, fwd, ahead);
+
+	HLVecMA(ahead, -(size_x * 3.0), side, left);
+	HLVecMA(ahead, size_x * 3.0, side, right);
+
+	//over and under, for a flier only, monsters.cpp:1662-1665
+	HLVecMA(start, dist, fwd, ahead);
+	HLVecMA(ahead, size_z * 3.0, rise, top);
+	HLVecMA(ahead, -(size_z * 3.0), rise, bottom);
+
+	HLVecScale(side, size_x * 2.0, push);
+	HLVecScale(rise, size_z * 2.0, pushz);
+
+	for (i = 0; i < 8; i++)
+	{
+		if (HLAICheckLocalMove(s, start, right, NULL) == HLAI_LM_VALID)
+		{
+			if (HLAICheckLocalMove(s, right, end, NULL) == HLAI_LM_VALID)
+			{
+				HLVecCopy(right, apex);
+				return TRUE;
+			}
+		}
+
+		if (HLAICheckLocalMove(s, start, left, NULL) == HLAI_LM_VALID)
+		{
+			if (HLAICheckLocalMove(s, left, end, NULL) == HLAI_LM_VALID)
+			{
+				HLVecCopy(left, apex);
+				return TRUE;
+			}
+		}
+
+		if (flies)
+		{
+			if (HLAICheckLocalMove(s, start, top, NULL) == HLAI_LM_VALID)
+			{
+				if (HLAICheckLocalMove(s, top, end, NULL) == HLAI_LM_VALID)
+				{
+					HLVecCopy(top, apex);
+					return TRUE;
+				}
+			}
+
+			if (HLAICheckLocalMove(s, start, bottom, NULL) == HLAI_LM_VALID)
+			{
+				if (HLAICheckLocalMove(s, bottom, end, NULL) == HLAI_LM_VALID)
+				{
+					HLVecCopy(bottom, apex);
+					return TRUE;
+				}
+			}
+		}
+
+		HLVecAdd(right, push, right);
+		HLVecSub(left, push, left);
+
+		if (flies)
+		{
+			HLVecAdd(top, pushz, top);
+			HLVecSub(bottom, pushz, bottom);
+		}
+	}
+
+	return FALSE;
+}
+
+F64 HLAIGroundSpeed(I64 s, F64 fallback)
+{//m_flGroundSpeed. GetSequenceInfo derives it from the distance studiomdl baked
+ //into the sequence, animating.cpp:114, so the feet match the ground. The table
+ //figure is two to five times wrong - a scientist walk is 58.75 u/s derived
+ //against 40 in the table - and the difference is the feet sliding.
+ //
+ //The fallback covers a sequence that carries no linear movement.
+ //monsters.cpp:1953 and :1987 both divide by this and must never see zero
+	CHLEntity	*e = HLEntGet(hl_ai_mon[s].ent);
+	F64			 gs;
+
+	if (e && e->studio)
+	{
+		gs = HLStudioSeqGroundSpeed(e->studio, e->seq);
+
+		if (gs > 0.0)
+			return gs;
+	}
+
+	return fallback;
+}
+
+I64 HLAIMoveStep(I64 s, F64 speed, F64 dt)
+{//::Move plus ::MoveExecute, monsters.cpp:1798 and :1980, for one tick
+	CHLEntity	*e = HLEntGet(hl_ai_mon[s].ent);
+	F64			 way[3];
 	F64			 dir[3];
-	F64			 want[3];
-	F64			 tryto[3];
-	F64			 rest[3];
-	F64			 slide[3];
-	F64			 floor[3];
+	F64			 at[3];
+	F64			 to[3];
+	F64			 apex[3];
 	F64			 dist;
-	F64			 step;
+	F64			 tol;
+	F64			 check;
+	F64			 hit;
+	F64			 ground;
+	F64			 total;
+	F64			 sub;
 	F64			 moved;
-	F64			 back;
+	I64			 local;
 
 	if (!e || !hl_map || !hl_ai_mon[s].have_goal)
 		return HLAI_MOVE_BLOCKED;
 
-	HLVecSub(hl_ai_mon[s].goal, e->origin, dir);
+	//m_Route reduced to the goal plus at most one detour. FTriangulate's apex
+	//is inserted in front of the goal, monsters.cpp:1901-1903
+	tol = hl_ai_mon[s].goal_tol;
+
+	if (hl_ai_mon[s].have_detour)
+	{
+		HLVecCopy(hl_ai_mon[s].detour, way);
+
+		//an apex is a waypoint, not the destination, so it is left behind at
+		//MONSTER_CUT_CORNER_DIST rather than at the task's own tolerance -
+		//which is 128 units for a follow, wide enough to skip the detour
+		//entirely. monsters.cpp:37 and :1968-1977
+		tol = 8.0;
+	}
+	else
+		HLVecCopy(hl_ai_mon[s].goal, way);
+
+	HLVecSub(way, e->origin, dir);
 	dir[2] = 0.0;
 
-	dist = HLVecLength(dir);
+	dist = HLVecNormalize(dir);
 
-	if (dist <= hl_ai_mon[s].goal_tol)
-		return HLAI_MOVE_ARRIVED;
+	if (dist <= tol)
+	{
+		if (!hl_ai_mon[s].have_detour)
+			return HLAI_MOVE_ARRIVED;
 
-	HLVecNormalize(dir);
+		//AdvanceRoute: the apex is behind us, aim at the goal again this tick
+		hl_ai_mon[s].have_detour = FALSE;
 
-	step = speed * dt;
+		HLVecCopy(hl_ai_mon[s].goal, way);
 
-	if (step > dist)
-		step = dist;
+		HLVecSub(way, e->origin, dir);
+		dir[2] = 0.0;
 
-	if (step <= 0.0)
+		dist = HLVecNormalize(dir);
+
+		if (dist <= hl_ai_mon[s].goal_tol)
+			return HLAI_MOVE_ARRIVED;
+	}
+
+	ground = HLAIGroundSpeed(s, speed);
+
+	if (ground <= 0.0)
 		return HLAI_MOVE_OK;
 
-	HLVecMA(e->origin, step, dir, tryto);
-
-	//the step sweep clips the box solids as well, so a monster is stopped by
-	//another monster and by the player. hl_ent_clip_ignore keeps it out of its
-	//own box; the probes either side of this pass ask for nomonsters and never
-	//reach the hook, but it is lowered again before them all the same
-	hl_ent_clip_ignore = hl_ai_mon[s].ent;
-
-	HLTraceEntity(hl_map, e->origin, tryto, e->mins, e->maxs, 0, FALSE, &tr);
-
-	if (tr.fraction < 1.0)
+	//--- lookahead, monsters.cpp:1851-1874 ---
+	//
+	//throttled to CBaseMonster::MonsterThink's own 0.1s interval rather than run
+	//per server tick: this walks up to 200 units in 16-unit hops and every hop
+	//costs two hull sweeps
+	if (hl_ent_time >= hl_ai_mon[s].next_move_check)
 	{
-		//wall slide: whatever is left of the step after the impact, with the
-		//component into the plane removed, tried once. One retry, not a loop -
-		//HLFlyMove's multi-plane clip belongs to the player move, and iterating
-		//it here would let a monster corner-hug its way around geometry it
-		//cannot route through.
-		HLVecCopy(tr.end_pos, tryto);
+		hl_ai_mon[s].next_move_check = hl_ent_time + HLAI_MOVE_CHECK;
 
-		HLVecScale(dir, step * (1.0 - tr.fraction), rest);
+		check = HLAI_DIST_CHECK;
 
-		back = HLVecDot(rest, tr.plane_normal);
-		HLVecMA(rest, -back, tr.plane_normal, slide);
+		if (dist < check)
+			check = dist;
 
-		if (HLVecLength(slide) > 0.0)
+		HLVecMA(e->origin, check, dir, to);
+
+		hit   = 0.0;
+		local = HLAICheckLocalMove(s, e->origin, to, &hit);
+
+		if (local != HLAI_LM_VALID)
 		{
-			HLVecAdd(tryto, slide, want);
-			HLTraceEntity(hl_map, tryto, want, e->mins, e->maxs, 0, FALSE,
-				&tr);
-			HLVecCopy(tr.end_pos, tryto);
+			//nothing further to try: the SDK falls back to the node graph here
+			//and there is none
+			if (local == HLAI_LM_NOTRI)
+				return HLAI_MOVE_BLOCKED;
+
+			if (!HLAITriangulate(s, e->origin, way, hit, apex))
+				return HLAI_MOVE_BLOCKED;
+
+			hl_ai_mon[s].have_detour = TRUE;
+			HLVecCopy(apex, hl_ai_mon[s].detour);
+
+			HLVecSub(apex, e->origin, dir);
+			dir[2] = 0.0;
+
+			dist = HLVecNormalize(dir);
+
+			if (dist <= 0.0)
+				return HLAI_MOVE_BLOCKED;
 		}
 	}
 
-	hl_ent_clip_ignore = -1;
+	//--- MoveExecute, monsters.cpp:1987-1995 ---
+	//
+	//"don't walk more than 16 units or stairs stop working": each hop lifts a
+	//step height and drops again, and a longer hop steps over the tread
+	total = ground * dt;
 
-	//a MOVETYPE_FLY monster holds its height instead of stepping onto a floor.
-	//The controller floats, and dropping it would put it on the ground
-	if (hl_ai_mon_info[hl_ai_mon[s].kind].flies)
-		HLVecCopy(tryto, floor);
-	else if (!HLAIDropToFloor(e, tryto, floor))
-		return HLAI_MOVE_BLOCKED;
+	if (total > dist)
+		total = dist;
 
-	HLVecSub(floor, e->origin, want);
-	want[2] = 0.0;
-	moved   = HLVecLength(want);
+	HLVecCopy(e->origin, at);
 
-	HLVecCopy(floor, e->origin);
+	while (total > 0.001)
+	{
+		sub = HLAI_LOCAL_STEP;
+
+		if (sub > total)
+			sub = total;
+
+		HLVecMA(at, sub, dir, to);
+
+		if (!HLAIStepTo(s, at, to, at))
+			goto qms_moved;
+
+		total -= sub;
+	}
+
+qms_moved:
+	HLVecSub(at, e->origin, to);
+	to[2] = 0.0;
+	moved = HLVecLength(to);
+
+	HLVecCopy(at, e->origin);
 	HLEntSetAbsBox(e);
 
-	//stuck detection. A monster grinding on a wall makes almost no ground per
-	//tick; after HLAI_STUCK_TIME the path task fails and the state machine
-	//picks something else
-	if (moved < step * 0.2)
+	//stuck detection. A monster grinding on geometry makes almost no ground per
+	//tick; after HLAI_STUCK_TIME the path task fails and the state machine picks
+	//something else. The SDK has no equivalent - it has a node graph
+	if (moved < ground * dt * 0.2)
 	{
 		if (hl_ai_mon[s].stuck_since <= 0.0)
 			hl_ai_mon[s].stuck_since = hl_ent_time;
@@ -4572,35 +4978,127 @@ U0 HLAITaskFail(I64 s)
 	hl_ai_mon[s].task_status = HLTK_FAILED;
 }
 
-U0 HLAISetActivity(I64 s, I64 act)
-{//point the entity at the sequence this monster uses for that activity
+//dlls/activity.h. HLACT_ is this port's own dense enum; LookupActivity matches
+//against the number studiomdl baked into the sequence, so the two have to be
+//mapped. -1 for an activity with no SDK counterpart.
+//
+//Verified against the shipped models: scientist.mdl carries walk at 3, run at
+//4 and six idle takes at 1 with actweights 50/1/2/1/1/10.
+I64 HLAIActToSDK(I64 act)
+{
+	if (act == HLACT_IDLE)			return 1;	//ACT_IDLE
+	if (act == HLACT_WALK)			return 3;	//ACT_WALK
+	if (act == HLACT_RUN)			return 4;	//ACT_RUN
+	if (act == HLACT_MELEE)			return 30;	//ACT_MELEE_ATTACK1
+	if (act == HLACT_RANGE)			return 28;	//ACT_RANGE_ATTACK1
+	if (act == HLACT_DIE)			return 36;	//ACT_DIESIMPLE
+	if (act == HLACT_FLINCH)		return 26;	//ACT_SMALL_FLINCH
+	if (act == HLACT_MELEE2)		return 31;	//ACT_MELEE_ATTACK2
+	if (act == HLACT_RANGE2)		return 29;	//ACT_RANGE_ATTACK2
+	if (act == HLACT_RELOAD)		return 32;	//ACT_RELOAD
+	if (act == HLACT_COMBAT_IDLE)	return 62;	//ACT_COMBAT_IDLE
+	if (act == HLACT_SIGNAL)		return 21;	//ACT_SIGNAL1
+	if (act == HLACT_THREAT)		return 57;	//ACT_THREAT_DISPLAY
+	if (act == HLACT_VICTORY)		return 65;	//ACT_VICTORY_DANCE
+	if (act == HLACT_COWER)			return 25;	//ACT_COWER
+	if (act == HLACT_ARM)			return 33;	//ACT_ARM
+	if (act == HLACT_EAT)			return 35;	//ACT_EAT
+	if (act == HLACT_SPECIAL)		return 60;	//ACT_SPECIAL_ATTACK1
+	if (act == HLACT_BARN_HIT)		return 40;	//ACT_BARNACLE_HIT
+	if (act == HLACT_BARN_PULL)		return 41;	//ACT_BARNACLE_PULL
+	if (act == HLACT_BARN_CHOMP)	return 42;	//ACT_BARNACLE_CHOMP
+	if (act == HLACT_BARN_CHEW)		return 43;	//ACT_BARNACLE_CHEW
+
+	return -1;
+}
+
+I64 HLAIResolveActivity(I64 s, I64 act)
+{//::LookupActivity first, the label table second. -1 when the model has
+ //neither.
  //
- //by label through HLAISetSequence, never by index: no two of these models agree
- //on sequence order
+ //The label table picks one hardcoded take per activity, so a scientist with
+ //six idles always played idle1. LookupActivity draws from all of them in
+ //proportion to actweight, animation.cpp:84-109
 	CHLEntity	*e = HLEntGet(hl_ai_mon[s].ent);
 	U8			*label;
 	I64			 seq;
+	I64			 sdk;
+
+	if (!e || !e->studio)
+		return -1;
+
+	sdk = HLAIActToSDK(act);
+
+	if (sdk > 0)
+	{
+		seq = HLStudioLookupActivity(e->studio, sdk);
+
+		if (seq >= 0)
+			return seq;
+	}
+
+	//models whose sequences carry activity 0 - and the takes this port names
+	//that studiomdl never tagged - still resolve through the table
+	label = HLAIMonSeqOf(hl_ai_mon[s].kind, act);
+
+	if (!label)
+		return -1;
+
+	return HLStudioSeqByName(e->studio, label);
+}
+
+U0 HLAISetActivity(I64 s, I64 act)
+{//::SetActivity, monsters.cpp:1222
+	CHLEntity	*e = HLEntGet(hl_ai_mon[s].ent);
+	F64			 cycle;
+	F64			 dur;
+	I64			 seq;
+	I64			 was;
 	Bool		 loop;
+	Bool		 keep;
 
 	if (!e)
 		return;
 
-	label = HLAIMonSeqOf(hl_ai_mon[s].kind, act);
+	was = hl_ai_mon[s].activity;
+
+	//schedule.cpp:277 and :296 call SetActivity only on m_Activity !=
+	//m_IdealActivity. Several callers here run every tick instead, and
+	//LookupActivity re-rolls its weighted pick on every call, so without this
+	//gate a scientist would draw a new idle take and restart the cycle at frame
+	//zero for as long as it stood still.
+	//
+	//A one-shot is exempt: monsters.cpp:1231 forces frame 0 when the sequence
+	//does not loop, which is how a schedule replays an attack take back to back
+	if (act == was && e->studio && e->anim_loop &&
+		e->seq >= 0 && e->seq == hl_ai_mon[s].act_seq)
+		return;
+
+	seq = HLAIResolveActivity(s, act);
 
 	//an activity the model has no take for falls back to idle rather than
-	//leaving the previous one running: a monster that has no combat idle
-	//should stand, not keep walking on the spot
-	if (!label && act != HLACT_IDLE)
+	//leaving the previous one running: a monster with no combat idle should
+	//stand, not keep walking on the spot
+	if (seq < 0 && act != HLACT_IDLE)
 	{
-		act   = HLACT_IDLE;
-		label = HLAIMonSeqOf(hl_ai_mon[s].kind, act);
+		act = HLACT_IDLE;
+		seq = HLAIResolveActivity(s, act);
 	}
 
-	if (!label)
+	if (seq < 0)
 		return;
 
 	//m_Activity, which ReportAIState prints
 	hl_ai_mon[s].activity = act;
+	hl_ai_mon[s].act_seq  = seq;
+
+	//monsters.cpp:1231: the cycle restarts when the sequence index changes, or
+	//when the current sequence does not loop - which is how a schedule replays
+	//an attack take back to back. Re-selecting the same looping take leaves it
+	//running, so a weighted re-roll landing where it already was does not
+	//stutter the walk
+	if (seq == e->seq && e->anim_loop)
+		return;
 
 	//only the ambulatory and idle activities loop. Attack, flinch and death are
 	//one-shots, and HLAIEntityCycle holds a one-shot's last frame
@@ -4608,19 +5106,31 @@ U0 HLAISetActivity(I64 s, I64 act)
 		act == HLACT_COMBAT_IDLE || act == HLACT_BARN_PULL ||
 		act == HLACT_BARN_CHEW);
 
-	//already playing it: leave the cycle alone. HLAISetSequence restarts from
-	//anim_start unconditionally - correct for a script replaying a take, but a
-	//schedule that re-selects every second would reset the walk cycle to frame
-	//zero every second
-	if (loop && e->studio)
-	{
-		seq = HLStudioSeqByName(e->studio, label);
+	//"don't reset frame between walk and run", monsters.cpp:1234. The SDK keeps
+	//the raw frame index; the two takes differ in length, so the phase is what
+	//carries over here
+	keep = ToBool((was == HLACT_WALK || was == HLACT_RUN) &&
+		(act == HLACT_WALK || act == HLACT_RUN));
 
-		if (seq >= 0 && seq == e->seq)
-			return;
-	}
+	cycle = 0.0;
 
-	HLAISetSequence(e, label, loop);
+	if (keep)
+		cycle = HLAIEntityCycle(e);
+
+	e->seq        = seq;
+	e->anim_done  = FALSE;
+
+	//a new sequence has its own event list; the old frame index means nothing
+	e->anim_event_frame = -1;
+
+	//the sequence's own STUDIO_LOOPING flag overrides the choice above
+	e->anim_loop = ToBool(loop || HLStudioSeqLoops(e->studio, seq));
+
+	//ResetSequenceInfo's pev->animtime = gpGlobals->time, animating.cpp:116,
+	//backed off by the phase being carried over
+	dur = HLStudioSeqDuration(e->studio, seq);
+
+	e->anim_start = hl_ent_time - cycle * dur;
 }
 
 Bool HLAIAnimDone(I64 s)
@@ -4711,6 +5221,7 @@ U0 HLAIStartTask(I64 s, I64 task, F64 data)
 			hl_ai_mon[s].goal_is_enemy = FALSE;
 			hl_ai_mon[s].move_speed    = 0.0;
 			hl_ai_mon[s].stuck_since   = 0.0;
+			hl_ai_mon[s].have_detour   = FALSE;
 			HLAITaskComplete(s);
 			break;
 
@@ -4736,6 +5247,7 @@ U0 HLAIStartTask(I64 s, I64 task, F64 data)
 			hl_ai_mon[s].goal_is_enemy = TRUE;
 			hl_ai_mon[s].path_start    = hl_ent_time;
 			hl_ai_mon[s].stuck_since   = 0.0;
+			hl_ai_mon[s].have_detour   = FALSE;
 
 			//stop short of the enemy rather than inside it: melee reach if it
 			//has one, otherwise 48 units
@@ -4773,6 +5285,7 @@ U0 HLAIStartTask(I64 s, I64 task, F64 data)
 			hl_ai_mon[s].goal_tol      = 32.0;
 			hl_ai_mon[s].path_start    = hl_ent_time;
 			hl_ai_mon[s].stuck_since   = 0.0;
+			hl_ai_mon[s].have_detour   = FALSE;
 			HLAITaskComplete(s);
 			break;
 
@@ -4890,6 +5403,7 @@ U0 HLAIStartTask(I64 s, I64 task, F64 data)
 			hl_ai_mon[s].goal_tol      = 24.0;
 			hl_ai_mon[s].path_start    = hl_ent_time;
 			hl_ai_mon[s].stuck_since   = 0.0;
+			hl_ai_mon[s].have_detour   = FALSE;
 			hl_ai_mon[s].in_cover      = TRUE;
 			HLAITaskComplete(s);
 			break;
@@ -4914,6 +5428,7 @@ U0 HLAIStartTask(I64 s, I64 task, F64 data)
 			hl_ai_mon[s].goal_tol      = 24.0;
 			hl_ai_mon[s].path_start    = hl_ent_time;
 			hl_ai_mon[s].stuck_since   = 0.0;
+			hl_ai_mon[s].have_detour   = FALSE;
 			hl_ai_mon[s].in_cover      = TRUE;
 			HLAITaskComplete(s);
 			break;
@@ -4934,6 +5449,7 @@ U0 HLAIStartTask(I64 s, I64 task, F64 data)
 			hl_ai_mon[s].goal_tol      = 24.0;
 			hl_ai_mon[s].path_start    = hl_ent_time;
 			hl_ai_mon[s].stuck_since   = 0.0;
+			hl_ai_mon[s].have_detour   = FALSE;
 			HLAITaskComplete(s);
 			break;
 
@@ -4951,6 +5467,7 @@ U0 HLAIStartTask(I64 s, I64 task, F64 data)
 			hl_ai_mon[s].goal_tol      = 48.0;
 			hl_ai_mon[s].path_start    = hl_ent_time;
 			hl_ai_mon[s].stuck_since   = 0.0;
+			hl_ai_mon[s].have_detour   = FALSE;
 
 			//the facing task that follows turns toward the noise
 			hl_ai_mon[s].ideal_yaw =
@@ -4978,6 +5495,7 @@ U0 HLAIStartTask(I64 s, I64 task, F64 data)
 			hl_ai_mon[s].goal_tol      = 32.0;
 			hl_ai_mon[s].path_start    = hl_ent_time;
 			hl_ai_mon[s].stuck_since   = 0.0;
+			hl_ai_mon[s].have_detour   = FALSE;
 			HLAITaskComplete(s);
 			break;
 
@@ -5122,6 +5640,7 @@ U0 HLAIStartTask(I64 s, I64 task, F64 data)
 			hl_ai_mon[s].goal_tol      = data;
 			hl_ai_mon[s].path_start    = hl_ent_time;
 			hl_ai_mon[s].stuck_since   = 0.0;
+			hl_ai_mon[s].have_detour   = FALSE;
 			hl_ai_mon[s].move_speed    = mi->walk_speed;
 
 			HLAISetActivity(s, HLACT_WALK);
@@ -5418,6 +5937,7 @@ U0 HLAIRunTask(I64 s, I64 task, F64 data, F64 dt)
 				HLVecCopy(tpos, hl_ai_mon[s].goal);
 				hl_ai_mon[s].path_start  = hl_ent_time;
 				hl_ai_mon[s].stuck_since = 0.0;
+				hl_ai_mon[s].have_detour = FALSE;
 			}
 
 			HLVecSub(hl_ai_mon[s].goal, e->origin, tdiff);
@@ -6019,6 +6539,8 @@ U0 HLAICineActorTick(I64 s, F64 dt)
 		hl_ai_mon[s].goal_tol      = 8.0;
 		hl_ai_mon[s].move_speed    = speed;
 
+		//the mark does not move, so a triangulated apex stays valid until the
+		//actor reaches it. This block runs every tick and must not clear it
 		HLVecCopy(script->origin, hl_ai_mon[s].goal);
 
 		if (st == HLSS_WALK_TO_MARK)

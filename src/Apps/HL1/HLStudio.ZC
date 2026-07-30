@@ -36,6 +36,14 @@
 #define HLST_MAX_SEQS		256
 #define HLST_MAX_CONTROLLERS 8		//4 generic + mouth, with headroom
 
+//mstudiobonecontroller_t.index, engine/studio.h:132: 0..3 are the generic
+//channels a monster aims with, 4 is the mouth. The mouth carries no animation
+//data - the client feeds it the amplitude of the voice that entity is speaking,
+//through mouth.mouthopen (common/cl_entity.h:32), and StudioCalcBoneAdj scales
+//that by 64 rather than by 255 (cl_dll/StudioModelRenderer.cpp:150)
+#define HLST_MOUTH_CTL		4
+#define HLST_MOUTH_SCALE	64.0
+
 //A submodel carries more normals than vertices - a vertex on a crease appears
 //once but has one normal per face it belongs to. Largest in valve/models is
 //1198 normals against 1038 vertices.
@@ -1477,7 +1485,7 @@ U0 HLStCalcBoneAdj(CHLStudio *m, F64 *raw, F64 *adj)
 		else
 		{
 			//the mouth is a 0..64 channel, not 0..255
-			value = raw[idx] / 64.0;
+			value = raw[idx] / HLST_MOUTH_SCALE;
 
 			if (value < 0.0)	value = 0.0;
 			if (value > 1.0)	value = 1.0;
@@ -1608,15 +1616,110 @@ F64 HLStudioCtlSetting(CHLStudio *m, I64 controller, F64 value)
 	return setting;
 }
 
-U0 HLStSetupBones(CHLStudio *m, I64 seq, F64 cycle, F64 blend, F64 *adj,
-	F64 *root, F64 blend2 = 0.0)
-{//evaluate the sequence and concatenate the hierarchy into hl_st_bone_tf
+Bool HLStudioHasMouth(CHLStudio *m)
+{//whether the model carries a jaw channel at all. scientist.mdl slot 1 is bone
+ //21 (Bone01) type ZR over 0..20 at index 4; barney.mdl slot 1 is bone 22
+ //(Bone05) type ZR over 0..45. hgrunt, agrunt and every helmeted model have none
+	I64 j;
+
+	if (!m || !m->controllers)
+		return FALSE;
+
+	for (j = 0; j < m->num_controllers; j++)
+	{
+		if (m->controllers[j].index == HLST_MOUTH_CTL)
+			return TRUE;
+	}
+
+	return FALSE;
+}
+
+F64 HLStudioMouthSetting(F64 open)
+{//an amplitude 0..1 to the raw mouth setting HLStudioDraw takes at index 4
  //
- //cycle is 0..1 through the sequence. blend and blend2 are 0..1 along the
- //sequence's two blend axes. root is the entity's world 3x4
+ //not HLStudioCtlSetting: that returns a 0..255 setting, and StudioCalcBoneAdj
+ //divides the mouth channel by 64. Feeding a 255 here would clamp to fully open
+ //for any amplitude above a quarter
+ //
+ //the range's start is the closed jaw on every shipped model, so zero is rest
+	if (open < 0.0)	open = 0.0;
+	if (open > 1.0)	open = 1.0;
+
+	return open * HLST_MOUTH_SCALE;
+}
+
+//--- sequence transition ----------------------------------------------------
+//
+// A sequence change is a discontinuity. StudioSetupBones holds the pose the
+// entity left and fades it out over 0.2 seconds
+// (cl_dll/StudioModelRenderer.cpp:858, :900), so a limb travels between takes
+// instead of teleporting. The old take is frozen at the frame it was on, which
+// is what latched.prevframe holds while the fade runs.
+//
+// The engine latches prevsequence/sequencetime where the sequence is written
+// (cl_dll/GameStudioModelRenderer_Sample.cpp:585). Nothing in this port owns
+// that write, so the latch is kept here, keyed by the caller's entity index.
+// A caller passing no index gets no transition, which is what a hitbox trace
+// and an attachment query want: those must not depend on when they are asked.
+
+#define HLST_XFADE		0.2		//seconds; latched.sequencetime + 0.2
+
+//slots 0..1023 mirror the entity table, HLENT_MAX. 1024..1087 are for drawers
+//with no entity index of their own - the view model, a projectile - each of
+//which picks a slot and keeps it
+#define HLST_LATCH_MAX	1088
+
+//the pose being faded out. hl_st_q2..q4 are scratch for a sequence's own
+//internal blends and are consumed by both poses in turn, so the outgoing one
+//needs a set of its own
+F64 hl_st_qb[HLST_MAX_BONES * 4];
+F64 hl_st_posb[HLST_MAX_BONES * 3];
+
+//which model the slot last held. A recycled entity index must not inherit the
+//previous occupant's pose
+CHLStudio *hl_st_latch_mdl[HLST_LATCH_MAX];
+
+//what the slot was drawn with last frame
+I64 hl_st_latch_seq[HLST_LATCH_MAX];
+F64 hl_st_latch_cycle[HLST_LATCH_MAX];
+F64 hl_st_latch_blend[HLST_LATCH_MAX];
+F64 hl_st_latch_blend2[HLST_LATCH_MAX];
+
+//the outgoing take, frozen. prev is -1 when no fade is running
+I64 hl_st_latch_prev[HLST_LATCH_MAX];
+F64 hl_st_latch_pcycle[HLST_LATCH_MAX];
+F64 hl_st_latch_pblend[HLST_LATCH_MAX];
+F64 hl_st_latch_pblend2[HLST_LATCH_MAX];
+F64 hl_st_latch_time[HLST_LATCH_MAX];
+
+U0 HLStudioLatchClear()
+{//globals are not zeroed, and a stale model pointer would compare equal to a
+ //freshly allocated one at the same address
+	I64 i;
+
+	for (i = 0; i < HLST_LATCH_MAX; i++)
+	{
+		hl_st_latch_mdl[i]     = NULL;
+		hl_st_latch_seq[i]     = -1;
+		hl_st_latch_cycle[i]   = 0.0;
+		hl_st_latch_blend[i]   = 0.0;
+		hl_st_latch_blend2[i]  = 0.0;
+		hl_st_latch_prev[i]    = -1;
+		hl_st_latch_pcycle[i]  = 0.0;
+		hl_st_latch_pblend[i]  = 0.0;
+		hl_st_latch_pblend2[i] = 0.0;
+		hl_st_latch_time[i]    = 0.0;
+	}
+}
+
+U0 HLStEvalPose(CHLStudio *m, I64 seq, F64 cycle, F64 blend, F64 blend2,
+	F64 *adj, F64 *out_q, F64 *out_pos)
+{//one sequence sampled at cycle, with its own internal blends folded in
+ //
+ //hl_st_q2..q4 and hl_st_pos2..pos4 are scratch here, so a caller wanting two
+ //poses alive at once must give each its own out_q/out_pos
 	CHLStSeq	*sq;
 	CHLStBone	*b;
-	F64			 bone_matrix[12];
 	F64			 frame_f;
 	F64			 s;
 	I64			 frame;
@@ -1632,57 +1735,128 @@ U0 HLStSetupBones(CHLStudio *m, I64 seq, F64 cycle, F64 blend, F64 *adj,
 		for (i = 0; i < m->num_bones; i++)
 		{
 			b = &m->bones[i];
-			HLStAngleQuaternion(&b->value[3], &hl_st_q[i * 4]);
+			HLStAngleQuaternion(&b->value[3], &out_q[i * 4]);
 			for (j = 0; j < 3; j++)
-				hl_st_pos[i * 3 + j] = b->value[j];
+				out_pos[i * 3 + j] = b->value[j];
+		}
+
+		return;
+	}
+
+	sq = &m->seqs[seq];
+
+	if (cycle < 0.0)	cycle = 0.0;
+	if (cycle > 1.0)	cycle = 1.0;
+
+	//the last frame duplicates the first in a looping sequence, so the
+	//playable span is one shorter
+	frame_f = cycle * ToF64(sq->num_frames - 1);
+	frame   = ToI64(Floor(frame_f));
+	s       = frame_f - ToF64(frame);
+
+	if (frame < 0)
+		frame = 0;
+	if (frame > sq->num_frames - 1)
+		frame = sq->num_frames - 1;
+
+	HLStCalcRotations(m, sq, 0, frame, s, adj, out_q, out_pos);
+
+	//two-way blends cover aim pitch and the walk/run pairs. valve shipped
+	//no four-way sequence, but the format defines one and mods use it:
+	//poses 1 and 2 blend along axis one, 3 and 4 likewise, and the two
+	//results blend along axis two
+	if (sq->num_blends > 1)
+	{
+		HLStCalcRotations(m, sq, 1, frame, s, adj, hl_st_q2, hl_st_pos2);
+		HLStSlerpBones(m->num_bones, out_q, out_pos,
+			hl_st_q2, hl_st_pos2, blend);
+
+		if (sq->num_blends == 4)
+		{
+			HLStCalcRotations(m, sq, 2, frame, s, adj,
+				hl_st_q3, hl_st_pos3);
+			HLStCalcRotations(m, sq, 3, frame, s, adj,
+				hl_st_q4, hl_st_pos4);
+
+			HLStSlerpBones(m->num_bones, hl_st_q3, hl_st_pos3,
+				hl_st_q4, hl_st_pos4, blend);
+
+			HLStSlerpBones(m->num_bones, out_q, out_pos,
+				hl_st_q3, hl_st_pos3, blend2);
 		}
 	}
-	else
+}
+
+U0 HLStSetupBones(CHLStudio *m, I64 seq, F64 cycle, F64 blend, F64 *adj,
+	F64 *root, F64 blend2 = 0.0, I64 ent_id = -1)
+{//evaluate the sequence and concatenate the hierarchy into hl_st_bone_tf
+ //
+ //cycle is 0..1 through the sequence. blend and blend2 are 0..1 along the
+ //sequence's two blend axes. root is the entity's world 3x4
+ //
+ //ent_id names a transition latch slot. -1 poses the sequence alone, with no
+ //fade from whatever the same caller drew last
+	F64	bone_matrix[12];
+	F64	age;
+	F64	s;
+	I64	prev;
+	I64	i;
+
+	//clamped here as well as inside HLStEvalPose: the latch stores the sequence
+	//it compares against, and an out of range one would latch a change on every
+	//frame and hold the fade open forever
+	if (seq < 0 || seq >= m->num_seqs)
+		seq = 0;
+
+	HLStEvalPose(m, seq, cycle, blend, blend2, adj, hl_st_q, hl_st_pos);
+
+	if (ent_id >= 0 && ent_id < HLST_LATCH_MAX)
 	{
-		sq = &m->seqs[seq];
-
-		if (cycle < 0.0)	cycle = 0.0;
-		if (cycle > 1.0)	cycle = 1.0;
-
-		//the last frame duplicates the first in a looping sequence, so the
-		//playable span is one shorter
-		frame_f = cycle * ToF64(sq->num_frames - 1);
-		frame   = ToI64(Floor(frame_f));
-		s       = frame_f - ToF64(frame);
-
-		if (frame < 0)
-			frame = 0;
-		if (frame > sq->num_frames - 1)
-			frame = sq->num_frames - 1;
-
-		HLStCalcRotations(m, sq, 0, frame, s, adj, hl_st_q, hl_st_pos);
-
-		//two-way blends cover aim pitch and the walk/run pairs. valve shipped
-		//no four-way sequence, but the format defines one and mods use it:
-		//poses 1 and 2 blend along axis one, 3 and 4 likewise, and the two
-		//results blend along axis two
-		if (sq->num_blends > 1)
+		if (hl_st_latch_mdl[ent_id] != m)
 		{
-			HLStCalcRotations(m, sq, 1, frame, s, adj, hl_st_q2, hl_st_pos2);
-			HLStSlerpBones(m->num_bones, hl_st_q, hl_st_pos,
-				hl_st_q2, hl_st_pos2, blend);
+			//first sight of this model in this slot: nothing to fade from
+			hl_st_latch_mdl[ent_id]  = m;
+			hl_st_latch_prev[ent_id] = -1;
+		}
+		else if (hl_st_latch_seq[ent_id] != seq)
+		{
+			//the take the entity left, frozen where it stopped
+			hl_st_latch_prev[ent_id]    = hl_st_latch_seq[ent_id];
+			hl_st_latch_pcycle[ent_id]  = hl_st_latch_cycle[ent_id];
+			hl_st_latch_pblend[ent_id]  = hl_st_latch_blend[ent_id];
+			hl_st_latch_pblend2[ent_id] = hl_st_latch_blend2[ent_id];
+			hl_st_latch_time[ent_id]    = tS;
+		}
 
-			if (sq->num_blends == 4)
+		hl_st_latch_seq[ent_id]    = seq;
+		hl_st_latch_cycle[ent_id]  = cycle;
+		hl_st_latch_blend[ent_id]  = blend;
+		hl_st_latch_blend2[ent_id] = blend2;
+
+		prev = hl_st_latch_prev[ent_id];
+
+		if (prev >= 0 && prev < m->num_seqs)
+		{
+			age = tS - hl_st_latch_time[ent_id];
+
+			//a clock that ran backwards, or a window that has closed
+			if (age < 0.0 || age >= HLST_XFADE)
+				hl_st_latch_prev[ent_id] = -1;
+			else
 			{
-				HLStCalcRotations(m, sq, 2, frame, s, adj,
-					hl_st_q3, hl_st_pos3);
-				HLStCalcRotations(m, sq, 3, frame, s, adj,
-					hl_st_q4, hl_st_pos4);
+				HLStEvalPose(m, prev, hl_st_latch_pcycle[ent_id],
+					hl_st_latch_pblend[ent_id], hl_st_latch_pblend2[ent_id],
+					adj, hl_st_qb, hl_st_posb);
 
-				HLStSlerpBones(m->num_bones, hl_st_q3, hl_st_pos3,
-					hl_st_q4, hl_st_pos4, blend);
+				//1 at the change, 0 at the end of the window: the outgoing
+				//pose is shown whole, then given up
+				s = 1.0 - age / HLST_XFADE;
 
 				HLStSlerpBones(m->num_bones, hl_st_q, hl_st_pos,
-					hl_st_q3, hl_st_pos3, blend2);
+					hl_st_qb, hl_st_posb, s);
 			}
 		}
 	}
-
 
 	for (i = 0; i < m->num_bones; i++)
 	{
@@ -2046,7 +2220,7 @@ qsdm_next_vert:
 
 U0 HLStudioDraw(CHLCanvas *c, CHLStudio *m, F64 *origin, F64 *angles,
 	I64 seq, F64 cycle, F64 blend, I64 body, I64 skin, I64 light,
-	F64 *controllers = NULL, F64 blend2 = 0.0)
+	F64 *controllers = NULL, F64 blend2 = 0.0, I64 ent_id = -1)
 {//one studio model at a world position
  //
  //body packs one submodel choice per bodypart into a single integer, base
@@ -2054,7 +2228,10 @@ U0 HLStudioDraw(CHLCanvas *c, CHLStudio *m, F64 *origin, F64 *angles,
  //
  //controllers is five raw settings as the entity carries them: 0..3 over
  //0..255 and the mouth at 4 over 0..64. HLStudioCtlSetting converts a world
- //space angle into one
+ //space angle into one, HLStudioMouthSetting an amplitude
+ //
+ //ent_id is the caller's entity index, and is what makes a sequence change
+ //blend instead of snap. -1 disables the transition
 	CHLStBodyPart	*bp;
 	CHLStSubModel	*sm;
 	CHLTexture		*tex;
@@ -2098,7 +2275,7 @@ U0 HLStudioDraw(CHLCanvas *c, CHLStudio *m, F64 *origin, F64 *angles,
 
 	HLStAngleMatrix(ang, origin, root);
 
-	HLStSetupBones(m, seq, cycle, blend, adj, root, blend2);
+	HLStSetupBones(m, seq, cycle, blend, adj, root, blend2, ent_id);
 	HLStSetupLighting(m, light);
 
 	for (i = 0; i < m->num_bodyparts; i++)
@@ -2193,6 +2370,11 @@ U0 HLStudioPose(CHLStudio *m, F64 *origin, F64 *angles, I64 seq, F64 cycle,
  //
  //this is the same transform HLStudioDraw uses, pitch inversion included, so
  //an attachment queried here lands exactly where the drawn model puts it
+ //
+ //no transition latch: a query must not depend on when it is asked. For the
+ //0.2s after a sequence change this poses the new take alone while the drawn
+ //model is still fading out of the old one. The engine splits the same way -
+ //the server traces bones the client's blend never touched
 	F64 root[12];
 	F64 ang[3];
 	F64 adj[HLST_MAX_CONTROLLERS];
@@ -2425,6 +2607,10 @@ U0 HLStudioCacheInit()
 	}
 
 	hl_st_cache_count = 0;
+
+	//slots key on a model pointer, and the cache is about to hand out fresh
+	//allocations that can land on a freed one's address
+	HLStudioLatchClear();
 }
 
 U0 HLStudioCacheFree()
@@ -2441,6 +2627,8 @@ U0 HLStudioCacheFree()
 	}
 
 	hl_st_cache_count = 0;
+
+	HLStudioLatchClear();
 }
 
 CHLStudio *HLStudioCacheGet(U8 *name)
@@ -2612,7 +2800,10 @@ U0 HLStudioReport(CHLStudio *m)
 
 	"  name         %s\n", m->name;
 	"  bones        %6d\n", m->num_bones;
-	"  controllers  %6d\n", m->num_controllers;
+	if (HLStudioHasMouth(m))
+		"  controllers  %6d (mouth present)\n", m->num_controllers;
+	else
+		"  controllers  %6d (no mouth)\n", m->num_controllers;
 	"  sequences    %6d\n", m->num_seqs;
 	if (m->tex_raw)
 		"  textures     %6d (external T file)\n", m->num_textures;

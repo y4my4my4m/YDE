@@ -1,7 +1,5 @@
 // HLNetSv.ZC - server datagram out, client parse in.
 //
-// Single player runs the loopback, so it walks the same path a net game does.
-//
 // Split from HLNet.ZC: needs the hl_fld_* bindings, and HLNet.ZC compiles before
 // HLProgs.ZC. HLNet.ZC is the pure wire codecs, which depend on nothing.
 //
@@ -17,13 +15,18 @@
 //   HLNetClientParse     router - dispatches on hl_net_protocol.
 //
 // The writers (HLNetWriteServerInfo, HLNetWriteClientdata, the entity sweep via
-// HLNetWriteEntityUpdate) are protocol 15.
+// HLNetWriteEntityUpdate) are protocol 15. Everything under "PROTOCOL 48: the
+// write side" at the end of this file is unreferenced.
 //
-// Single player runs through the loopback: HL1.ZC calls HLNetServerFrame and
-// HLNetClientFrame every tick even solo, so the writer and the 15 reader are a
-// matched pair. The switchover is one atomic change - writer, reader and
-// baseline capture together. The 48 reader sits beside the 15 one so it can be
-// exercised against a real server's stream with nothing solo depending on it.
+// The 48 reader cannot carry a game: HLNetParse48Unverified refuses 21 opcodes,
+// among them svc_packetentities, svc_spawnbaseline, svc_sound and
+// svc_temp_entity. The control channel is NetQuake CCREQ_CONNECT, which GoldSrc
+// does not speak, so a real Half-Life server is not reachable at all.
+//
+// The protocol 15 side is a complete listen server - CTL handshake, reliable
+// NETFLAG framing, signon stages, entity deltas - and reaches Ironwail over UDP
+// (build/IRONWAIL_NQ.md). Its world source was the QuakeC edict table, which HL
+// does not have; see the native player slot note below.
 //
 // Protocol 48 opcodes/constants use the plain HLSVC_/HLCLC_ names from HLNet.ZC.
 // The four whose number was reused in 48, plus the wholesale-renumbered clc_
@@ -203,6 +206,216 @@ CHLSvClient	hl_sv_clients[HLSV_MAX_CLIENTS];
 Bool	hl_sv_edict_warned = FALSE;
 U8		hl_sv_edict_line[96];
 I64			hl_sv_client_count = 0;
+
+//--- native player slots ----------------------------------------------------
+//
+// Everything else in this file replicates the world through QuakeC edicts:
+// HLNetCaptureState reads hl_fld_*, HLNetWriteEntities sweeps hl_pr_num_edicts,
+// HLSvRunClients moves an edict. HL ships no progs.dat, so HLPrLoad fails,
+// HLGameInit returns FALSE (HLGame.ZC:1456), hl_player_edict stays 0 and every
+// one of those reads returns nothing. The world that exists is the native one
+// in HLEntity.ZC, and it has no player entity at all - the local player is a
+// set of shell globals.
+//
+// This table is the replication record the edict used to be. One per connected
+// player, no progs dependency: the shell publishes the local player into its
+// slot, HLSvRunClientsNative moves the remotes, and both go out on the existing
+// protocol 15 entity wire as entity number slot + 1 - the numbering a protocol
+// 15 client already assumes for players (SV_SpawnServer reserves edicts
+// 1..maxclients).
+//
+// Only players are replicated. Every peer loads the same map and runs the same
+// deterministic HLEntFrame, so doors and monsters do not need the wire; NetQuake
+// sends them because its world lives in bytecode on the server alone.
+
+class CHLNetPlayer
+{
+	Bool	active;
+	F64		origin[3];		//body origin, not the eye
+	F64		angles[3];		//view angles; body pitch is angles[0]/-3 on the wire
+	F64		velocity[3];
+	Bool	on_ground;
+	I64		frame;
+	I64		colormap;		//(top << 4) | bottom, as HLNetDrawEntities decodes it
+	F64		health;
+};
+
+CHLNetPlayer	hl_net_pl[HLSV_MAX_CLIENTS];
+
+//Precache slot of the player model, resolved once per level. 0 means not
+//precached; an entity update with modelindex 0 is dropped by the client.
+I64		hl_net_pl_modelindex = 0;
+
+//The player body as a studio model, for the client draw. hl_precache_mdl holds
+//IDPO alias models only and is NULL at the player's slot on HL data, so the
+//draw path needs its own handle. The cache owns it; never freed here.
+CHLStudio	*hl_net_pl_studio = NULL;
+I64			 hl_net_pl_seq    = 0;		//"walk", or 0 when the model has none
+
+//Slot held by the listen host itself, or -1. HLSvFindLocalSlot does the same
+//search but is declared far below; the datagram builder needs it above.
+I64		hl_sv_local_slot = -1;
+
+U0 HLNetPlayersInit()
+{//ZealC does not zero globals.
+	I64 i;
+	I64 j;
+
+	hl_net_pl_modelindex = 0;
+	hl_net_pl_studio     = NULL;
+	hl_net_pl_seq        = 0;
+	hl_sv_local_slot     = -1;
+
+	for (i = 0; i < HLSV_MAX_CLIENTS; i++)
+	{
+		hl_net_pl[i].active    = FALSE;
+		hl_net_pl[i].on_ground = FALSE;
+		hl_net_pl[i].frame     = 0;
+		hl_net_pl[i].colormap  = 0;
+		hl_net_pl[i].health    = 0.0;
+
+		for (j = 0; j < 3; j++)
+		{
+			hl_net_pl[i].origin[j]   = 0.0;
+			hl_net_pl[i].angles[j]   = 0.0;
+			hl_net_pl[i].velocity[j] = 0.0;
+		}
+	}
+}
+
+I64 HLNetPlayerModelIndex()
+{//Precache index of the player body. HL precaches models/player.mdl, a studio
+ //model; progs/player.mdl is accepted so a Quake data set replicates bodies
+ //through the same path.
+	I64 i;
+
+	if (hl_net_pl_modelindex > 0 &&
+		hl_net_pl_modelindex < hl_precache_model_count)
+		return hl_net_pl_modelindex;
+
+	for (i = 1; i < hl_precache_model_count; i++)
+	{
+		if (hl_precache_model[i] && hl_precache_model[i][0])
+		{
+			if (!StrICompare(hl_precache_model[i], "models/player.mdl") ||
+				!StrICompare(hl_precache_model[i], "progs/player.mdl"))
+			{
+				hl_net_pl_modelindex = i;
+				return i;
+			}
+		}
+	}
+
+	return 0;
+}
+
+CHLStudio *HLNetPlayerStudio()
+{//Resolved once. HLStudioCacheGet loads on a miss and does not cache a failure,
+ //so the NULL result is latched here: a retry every frame reloads from disk.
+	I64 seq;
+
+	if (hl_net_pl_studio)
+		return hl_net_pl_studio;
+
+	if (hl_net_pl_seq < 0)
+		return NULL;			//lookup already failed
+
+	hl_net_pl_studio = HLStudioCacheGet("models/player.mdl");
+	if (!hl_net_pl_studio)
+	{
+		hl_net_pl_seq = -1;
+		return NULL;
+	}
+
+	seq = HLStudioSeqByName(hl_net_pl_studio, "walk");
+	if (seq < 0)
+		seq = 0;
+	hl_net_pl_seq = seq;
+
+	return hl_net_pl_studio;
+}
+
+U0 HLNetPlayerActivate(I64 slot, F64 *origin, F64 *angles, I64 top, I64 bottom)
+{//Give a slot a body. The baseline for its entity number is zeroed here: the
+ //protocol 15 writer deltas against hl_net_baseline and globals hold junk, so a
+ //stale baseline sends no origin bits and the body appears at the old position.
+	I64 num;
+
+	if (slot < 0 || slot >= HLSV_MAX_CLIENTS)
+		return;
+
+	hl_net_pl[slot].active    = TRUE;
+	hl_net_pl[slot].on_ground = FALSE;
+	hl_net_pl[slot].frame     = 0;
+	hl_net_pl[slot].colormap  = ((top & 15) << 4) | (bottom & 15);
+	hl_net_pl[slot].health    = 100.0;
+
+	HLVecCopy(origin, hl_net_pl[slot].origin);
+	HLVecCopy(angles, hl_net_pl[slot].angles);
+	HLVecSet(hl_net_pl[slot].velocity, 0.0, 0.0, 0.0);
+
+	num = slot + 1;
+	if (num < HLNET_MAX_ENTS)
+	{
+		HLNetStateClear(&hl_net_baseline[num]);
+		HLNetStateClear(&hl_net_sent[num]);
+	}
+}
+
+U0 HLNetPlayerDeactivate(I64 slot)
+{
+	if (slot < 0 || slot >= HLSV_MAX_CLIENTS)
+		return;
+
+	hl_net_pl[slot].active = FALSE;
+}
+
+U0 HLNetPublishPlayer(I64 slot, F64 *origin, F64 *angles, F64 *velocity,
+	Bool on_ground, F64 health)
+{//The shell owns the local player's position; this is the only route by which
+ //it reaches the server. Called once per server tick from the game loop.
+	if (slot < 0 || slot >= HLSV_MAX_CLIENTS)
+		return;
+
+	hl_net_pl[slot].active    = TRUE;
+	hl_net_pl[slot].on_ground = on_ground;
+	hl_net_pl[slot].health    = health;
+
+	if (origin)
+		HLVecCopy(origin, hl_net_pl[slot].origin);
+	if (angles)
+		HLVecCopy(angles, hl_net_pl[slot].angles);
+	if (velocity)
+		HLVecCopy(velocity, hl_net_pl[slot].velocity);
+}
+
+U0 HLNetCapturePlayerState(I64 slot, CHLEntState *st)
+{//HLNetCaptureState for a native slot. Same serialisation boundary; the source
+ //is hl_net_pl instead of the edict fields.
+	CHLNetPlayer *pl;
+
+	HLNetStateClear(st);
+
+	if (slot < 0 || slot >= HLSV_MAX_CLIENTS)
+		return;
+
+	pl = &hl_net_pl[slot];
+
+	HLVecCopy(pl->origin, st->origin);
+
+	//SV_ClientThink stores body pitch as view pitch / 3, negated, and zero roll.
+	st->angles[0] = -pl->angles[0] / 3.0;
+	st->angles[1] = pl->angles[1];
+	st->angles[2] = 0.0;
+
+	st->modelindex = HLNetPlayerModelIndex();
+	st->frame      = pl->frame;
+	st->colormap   = pl->colormap;
+	st->skin       = 0;
+	st->effects    = 0;
+	st->step       = FALSE;
+	st->active     = TRUE;
+}
 
 U0 HLNetClientClear()
 {//ZealC does not zero globals.
@@ -853,11 +1066,44 @@ qne_p2:
 	}
 }
 
+U0 HLNetWriteNativePlayers(CHLMsg *m, I64 view_slot)
+{//SV_WriteEntitiesToClient over hl_net_pl. Entity number is slot + 1.
+ //
+ //No PVS cull: players are never culled in the edict path either, and a body one
+ //leaf away dropping out is worse than the bytes.
+	CHLEntState	now;
+	I64			i;
+	I64			num;
+
+	for (i = 0; i < HLSV_MAX_CLIENTS; i++)
+	{
+		if (hl_net_pl[i].active && i != view_slot)
+		{
+			//Capped to one ethernet frame; see HLNET_MAX_DATAGRAM.
+			if (HLNET_MAX_DATAGRAM - m->len < 16)
+				return;
+
+			num = i + 1;
+			if (num >= HLNET_MAX_ENTS)
+				return;
+
+			HLNetCapturePlayerState(i, &now);
+			HLNetWriteEntityUpdate(m, num, &now, &hl_net_baseline[num]);
+			MemCopy(&hl_net_sent[num], &now, sizeof(CHLEntState));
+
+			if (num >= hl_net_num_ents)
+				hl_net_num_ents = num + 1;
+		}
+	}
+}
+
 Bool HLNetBuildClientDatagram(I64 client_ent, CHLVisState *vis, F64 time,
 	Bool include_shared)
 {//Fills hl_net_datagram for one client's eyes; caller sends it.
  //include_shared appends sv.datagram (TE/sounds): remotes only, the host already
  //played those through the builtins.
+	I64 view_slot;
+
 	HLMsgClear(&hl_net_datagram);
 
 	//svc_time first: it advances the client clock, and everything after it
@@ -865,8 +1111,29 @@ Bool HLNetBuildClientDatagram(I64 client_ent, CHLVisState *vis, F64 time,
 	HLMsgWriteByte(&hl_net_datagram, HLSVC_TIME);
 	HLMsgWriteFloat(&hl_net_datagram, time);
 
-	HLNetWriteClientdata(&hl_net_datagram, client_ent);
-	HLNetWriteEntities(&hl_net_datagram, client_ent, vis);
+	//hl_game_active is FALSE for the whole of HL: no progs.dat, so the edict
+	//sweep has nothing to sweep. See the native player slot note above.
+	//
+	//svc_clientdata is skipped with it. Every field it carries comes from
+	//hl_fld_*, which reads back 0 with no edicts loaded, and the client applies
+	//what it receives - so sending it zeroes the receiver's health, ammo and
+	//items. The guest keeps its own simulated HUD until clientdata has a native
+	//source.
+	if (hl_game_active)
+	{
+		HLNetWriteClientdata(&hl_net_datagram, client_ent);
+		HLNetWriteEntities(&hl_net_datagram, client_ent, vis);
+	}
+	else
+	{
+		//Remote datagrams are built with the client's own edict number, which is
+		//slot + 1. The host builds its own with hl_player_edict, which is 0.
+		view_slot = client_ent - 1;
+		if (client_ent <= 0)
+			view_slot = hl_sv_local_slot;
+
+		HLNetWriteNativePlayers(&hl_net_datagram, view_slot);
+	}
 
 	if (include_shared)
 		HLMsgAppendIfRoom(&hl_net_datagram, &hl_sv_datagram, HLNET_MAX_DATAGRAM);
@@ -3103,6 +3370,10 @@ qscc_next:
 			hl_sv_client_count++;
 	}
 
+	//Bodies are per level. A surviving remote is re-spawned by the connect path
+	//and the local one by the shell.
+	HLNetPlayersInit;
+
 	HLSvClearWriteDests;
 }
 
@@ -3175,6 +3446,9 @@ I64 HLSvAddClient(U32 ip, Bool local, I64 edict, F64 now)
 
 		HLVecCopy(org, hl_sv_clients[i].origin);
 		HLVecSet(hl_sv_clients[i].velocity, 0.0, 0.0, 0.0);
+
+		if (local)
+			hl_sv_local_slot = i;
 
 		hl_sv_client_count++;
 
@@ -3290,6 +3564,35 @@ Bool HLSvSpawnRemote(I64 slot, U8 *name, I64 top=0, I64 bottom=0)
 	//as SV_SpawnServer lays them out. Never allocated on demand.
 	edict = slot + 1;
 
+	//No progs.dat: HLClientSpawnAt below returns FALSE at its PutClientInServer
+	//lookup, so the body would never exist. The native world has no player
+	//entity to outfit either - a slot record and a spawn point are the whole
+	//body. Every peer spawns on info_player_start; the deathmatch spawn ring
+	//is not selected here.
+	if (!hl_game_active)
+	{
+		HLEntFindPlayerStart(org, ang);
+
+		hl_sv_clients[slot].top    = top & 15;
+		hl_sv_clients[slot].bottom = bottom & 15;
+		HLStrCopy(hl_sv_clients[slot].name, join_name, 32);
+		hl_sv_clients[slot].edict   = edict;
+		hl_sv_clients[slot].spawned = TRUE;
+		HLVecCopy(org, hl_sv_clients[slot].origin);
+		HLVecSet(hl_sv_clients[slot].velocity, 0.0, 0.0, 0.0);
+		HLVecCopy(ang, hl_sv_clients[slot].angles);
+
+		HLNetPlayerActivate(slot, org, ang, top, bottom);
+
+		StrPrint(hl_net_cmd_line,
+			"net: native remote spawn slot %d at %.0f %.0f %.0f\n",
+			slot, org[0], org[1], org[2]);
+		HLLog(hl_net_cmd_line);
+		HLLogFlush;
+
+		return TRUE;
+	}
+
 	//Game mode must be live before PutClientInServer picks a spot, or both bodies
 	//share info_player_start. Coop sends SelectSpawnPoint to the
 	//info_player_coop set instead.
@@ -3357,6 +3660,10 @@ U0 HLSvDropClient(I64 slot)
 	hl_sv_clients[slot].sent_ident = FALSE;
 	hl_sv_clients[slot].edict     = 0;
 	hl_sv_client_count--;
+
+	HLNetPlayerDeactivate(slot);
+	if (hl_sv_local_slot == slot)
+		hl_sv_local_slot = -1;
 }
 
 U0 HLSvCheckTimeouts(F64 now)
@@ -4347,6 +4654,84 @@ qcr_next:
 	}
 }
 
+U0 HLSvRunClientsNative(F64 dt, F64 now)
+{//SV_RunClients with no edicts: the remote's last clc_move drives HLPlayerMove
+ //directly on its slot record.
+ //
+ //The server owns remote origin, as stock does; nothing is taken from the
+ //client but buttons and the wish direction.
+	F64	ang[3];
+	F64	forward[3];
+	F64	right[3];
+	F64	upv[3];
+	F64	org[3];
+	F64	vel[3];
+	F64	wish_move[3];
+	F64	wishspeed;
+	I64	i;
+	I64	j;
+	I64	water_level;
+	I64	water_type;
+	Bool	on_ground;
+
+	if (dt < 0.0)
+		dt = 0.0;
+
+	for (i = 0; i < HLSV_MAX_CLIENTS; i++)
+	{
+		if (hl_sv_clients[i].active && !hl_sv_clients[i].local &&
+			hl_net_pl[i].active)
+		{
+			HLVecCopy(hl_sv_clients[i].angles, ang);
+			HLVecCopy(hl_net_pl[i].origin, org);
+			HLVecCopy(hl_net_pl[i].velocity, vel);
+			on_ground = hl_net_pl[i].on_ground;
+
+			water_level = 0;
+			water_type  = 0;
+			if (hl_map)
+				water_level = HLWaterLevelGet(hl_map, org, &water_type);
+
+			//wishdir = view basis applied to the client's forward/side/up
+			//(SV_ClientThink), the same world-space unit vector the local path
+			//builds.
+			HLAngleVectors(ang, forward, right, upv);
+			wish_move[0] = forward[0] * hl_sv_clients[i].cmd[0] +
+				right[0] * hl_sv_clients[i].cmd[1];
+			wish_move[1] = forward[1] * hl_sv_clients[i].cmd[0] +
+				right[1] * hl_sv_clients[i].cmd[1];
+			wish_move[2] = forward[2] * hl_sv_clients[i].cmd[0] +
+				right[2] * hl_sv_clients[i].cmd[1] + hl_sv_clients[i].cmd[2];
+			if (water_level < 2)
+				wish_move[2] = 0.0;
+
+			wishspeed = HLVecLength(wish_move);
+			if (wishspeed > 0.0)
+				HLVecNormalize(wish_move);
+
+			//mover 0: no edict to write the reached position onto.
+			if (hl_map)
+				HLPlayerMove(hl_map, org, vel, wish_move, wishspeed,
+					hl_sv_clients[i].jump, dt, &on_ground, water_level,
+					FALSE, ang, 0);
+
+			HLVecCopy(org, hl_net_pl[i].origin);
+			HLVecCopy(vel, hl_net_pl[i].velocity);
+			HLVecCopy(ang, hl_net_pl[i].angles);
+			hl_net_pl[i].on_ground = on_ground;
+
+			for (j = 0; j < 3; j++)
+			{
+				hl_sv_clients[i].origin[j]   = org[j];
+				hl_sv_clients[i].velocity[j] = vel[j];
+			}
+			hl_sv_clients[i].on_ground = on_ground;
+		}
+	}
+
+	HLSvCheckTimeouts(now);
+}
+
 U0 HLSvRunClients(F64 dt, F64 now)
 {//SV_RunClients for the remote clients only; the shell drives the local one,
  //which owns the keyboard and the view.
@@ -4373,6 +4758,13 @@ U0 HLSvRunClients(F64 dt, F64 now)
 
 	if (dt < 0.0)
 		dt = 0.0;
+
+	//No progs.dat, no edicts to run. See the native player slot note above.
+	if (!hl_game_active)
+	{
+		HLSvRunClientsNative(dt, now);
+		return;
+	}
 
 	//Before the cached origins go back onto the edicts.
 	if (hl_coop_respawn_pending)
@@ -4644,6 +5036,7 @@ U0 HLNetDrawEntities(CHLCanvas *c, CHLMap *map, F64 *view_origin, F64 max_dist,
 	F64			 eorg[3];
 	F64			 d[3];
 	CHLMdl		*mdl;
+	CHLStudio	*st_mdl;
 	I64			 i;
 	I64			 frame;
 	I64			 bm;
@@ -4655,6 +5048,7 @@ U0 HLNetDrawEntities(CHLCanvas *c, CHLMap *map, F64 *view_origin, F64 max_dist,
 	F64			 delta[3];
 	F64			 frac;
 	F64			 f;
+	F64			 cyc;
 	F64			 dang;
 	I64			 k;
 	U8			*name;
@@ -4715,6 +5109,31 @@ U0 HLNetDrawEntities(CHLCanvas *c, CHLMap *map, F64 *view_origin, F64 max_dist,
 		}
 
 		name = hl_precache_model[e->modelindex];
+
+		//Player bodies on HL data are studio models, and hl_precache_mdl holds
+		//IDPO alias models only, so the alias path below drops them. Entity
+		//numbers 1..maxclients are the player slots (SV_SpawnServer's edict
+		//reservation); the wire carries no model type.
+		//
+		//Sequence is fixed and runs on the wall clock: the wire has no
+		//animation state, so a standing body walks on the spot. cycle is 0..1
+		//through the sequence, one turn per second.
+		if (!hl_game_active && i <= HLSV_MAX_CLIENTS)
+		{
+			st_mdl = HLNetPlayerStudio();
+			if (st_mdl)
+			{
+				HLVecSub(eorg, view_origin, d);
+				if (HLVecLength(d) <= max_dist)
+				{
+					cyc = hl_cl.time - ToF64(ToI64(hl_cl.time));
+					HLStudioDraw(c, st_mdl, eorg, eang, hl_net_pl_seq,
+						cyc, 0.0, 0, 0, HLLightPoint(map, eorg));
+				}
+			}
+
+			goto qnd_next;
+		}
 
 		//Brush models are not distance-culled, as in the server path: the origin
 		//is an offset, not a position.
