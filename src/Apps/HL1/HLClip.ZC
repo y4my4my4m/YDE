@@ -728,7 +728,20 @@ U0 HLPushEntity(CHLMap *map, I64 ent, F64 *push, CHLTrace *trace)
 		HLImpact(ent, trace->ent);
 }
 
-//the player box QuakeC's setsize gives the client, for moves with no edict
+//--- pm_shared.c ------------------------------------------------------------
+//
+// Everything below this line is a port of pm_shared/pm_shared.c. The engine's
+// pmove_t is a single struct the PM_ functions read and write in place; there is
+// no such struct here, so its fields are file globals named hl_pm_*. They are
+// live only for the duration of one HLPlayerMove call, which copies the caller's
+// origin and velocity in at the top and back out at the bottom.
+//
+// Naming: HLPM<Name> mirrors PM_<Name> one for one. Functions without the PM
+// prefix (HLTracePlayer, HLGameLinkEdict) are engine-side services pm_shared
+// reached through function pointers.
+
+//the player box QuakeC's setsize gives the client, for moves with no edict.
+//pmove->player_mins[pmove->usehull] / player_maxs[usehull]
 F64 hl_player_mins[3];
 F64 hl_player_maxs[3];
 
@@ -741,30 +754,60 @@ F64 hl_player_maxs[3];
 // midpoint of the box, not the feet, so a change of size under stationary feet
 // moves the origin by half the height difference
 
+//PLAYER_DUCKING_MULTIPLIER. Scales cmd.forwardmove/sidemove/upmove inside
+//PM_Duck, before PM_WalkMove builds wishvel from them - not the normalised
+//wishspeed afterwards. See HLPMDuck.
+#define HLPM_DUCK_MULT		0.333
+
+//pmove->flDuckTime, in seconds rather than the SDK's milliseconds. PM_Duck arms
+//it at 1.0 (the SDK's 1000) and PM_ReduceTimers counts it down; the transition
+//completes once it has fallen to 1.0 - TIME_TO_DUCK.
+#define HLPM_DUCK_TIMER		1.0
+
 //PM_Jump refuses to fire again until the key is released, so holding jump
-//does not auto-hop. tracked here because there is no pmove->oldbuttons yet
+//does not auto-hop. pmove->oldbuttons & IN_JUMP
 Bool hl_jump_held    = FALSE;
 
-//PM_UpdateStepSound. Distance travelled since the last footstep, and which of
-//the four step samples is next. HL alternates left/right rather than choosing
-//at random, so the cadence is regular.
-F64  hl_step_dist  = 0.0;
+//pmove->oldbuttons & IN_DUCK
+Bool hl_duck_held_last = FALSE;
+
+//PM_UpdateStepSound. pmove->flTimeStepSound, in seconds; which of the four step
+//samples is next; and the one-shot the shell drains to play it. HL alternates
+//rather than choosing at random, so the cadence is regular.
+F64  hl_step_time  = 0.0;
 I64  hl_step_side  = 0;
 Bool hl_step_play  = FALSE;
 
-//trigger_gravity's multiplier on sv_gravity. A hook, like hl_surface_friction:
-//HLEntity.ZC owns trigger_gravity but compiles after this file, so the shell
-//copies hl_ent_gravity into this each tick
+//the distance counter the pre-pm_shared cadence used, kept only because
+//HLSaveWriteMove/HLSaveReadMove still carry it in the move block. Nothing reads
+//it; PM_UpdateStepSound is a timer, not an odometer. Retire it with the save
+//slot, replacing it with hl_step_time.
+F64  hl_step_dist  = 0.0;
+
+//PM_UpdateStepSound's chosen sample set and volume, published for whoever owns
+//sound. step kinds follow the SDK's STEP_* enum as far as this tree can tell
+//them apart: there is no materials.txt texture lookup, so every dry surface is
+//STEP_CONCRETE.
+#define HLPM_STEP_CONCRETE	0
+#define HLPM_STEP_SLOSH		6
+#define HLPM_STEP_WADE		7
+#define HLPM_STEP_LADDER		8
+
+I64 hl_step_kind = HLPM_STEP_CONCRETE;
+F64 hl_step_vol  = 0.5;
+
+//trigger_gravity's multiplier on sv_gravity, pmove->gravity. A hook, like
+//hl_surface_friction: HLEntity.ZC owns trigger_gravity but compiles after this
+//file, so the shell copies hl_ent_gravity into this each tick
 F64 hl_gravity_scale = 1.0;
 
-Bool hl_ducking      = FALSE;	//box is currently the small one
-Bool hl_duck_pending = FALSE;	//key held, animating down, box still large
-Bool hl_duck_held_last = FALSE;	//pmove->oldbuttons & IN_DUCK
-F64	 hl_duck_time    = 0.0;		//seconds spent in the transition
+Bool hl_ducking      = FALSE;	//pmove->flags & FL_DUCKING, box is the small one
+Bool hl_duck_pending = FALSE;	//pmove->bInDuck, key held, box still large
+F64	 hl_duck_time    = 0.0;		//pmove->flDuckTime, counting down
 F64	 hl_view_ofs_z   = HLPHYS_VIEW_Z;
 
 U0 HLDuckSetHull(Bool ducked)
-{//point the trace box at hull 1 or hull 3
+{//pmove->usehull: point the trace box at hull 1 or hull 3
 	if (ducked)
 	{
 		HLVecSet(hl_player_mins, -16.0, -16.0, HLPHYS_DUCK_MINS_Z);
@@ -778,7 +821,8 @@ U0 HLDuckSetHull(Bool ducked)
 }
 
 F64 HLDuckSpline(F64 t)
-{//PM_SplineFraction: ease the view down instead of dropping it in one frame
+{//PM_SplineFraction: ease the view down instead of dropping it in one frame.
+ //the SDK's scale argument is folded into t by the caller
 	F64 tt = t * t;
 
 	return 3.0 * tt - 2.0 * tt * t;
@@ -787,22 +831,30 @@ F64 HLDuckSpline(F64 t)
 U0 HLDuckReset()
 {//globals aren't zeroed and a declaration initialiser on one is not honoured,
  //so every field is set here; HLClipInit calls it
-	hl_jump_held     = FALSE;
-	hl_gravity_scale = 1.0;
-	hl_step_dist     = 0.0;
-	hl_step_side     = 0;
-	hl_step_play     = FALSE;
-	hl_ducking       = FALSE;
-	hl_duck_pending = FALSE;
+	hl_jump_held      = FALSE;
 	hl_duck_held_last = FALSE;
-	hl_duck_time    = 0.0;
-	hl_view_ofs_z   = HLPHYS_VIEW_Z;
+	hl_gravity_scale  = 1.0;
+	hl_step_time      = 0.0;
+	hl_step_dist      = 0.0;
+	hl_step_side      = 0;
+	hl_step_play      = FALSE;
+	hl_step_kind      = HLPM_STEP_CONCRETE;
+	hl_step_vol       = 0.5;
+	hl_ducking        = FALSE;
+	hl_duck_pending   = FALSE;
+	hl_duck_time      = 0.0;
+	hl_view_ofs_z     = HLPHYS_VIEW_Z;
 	HLDuckSetHull(FALSE);
 }
+
 I64 hl_move_pass = 0;		//edict doing the current player move, 0 = none
 
-//what the last move came to rest on, 0 = world
+//what the last move came to rest on. hl_ground_entity is an edict number with 0
+//for the world, as .groundentity is; hl_ground_native is an index into
+//hl_entities, -1 for none. The two numbering schemes are disjoint and a brush
+//entity owned by HLEntity.ZC has no edict, so both are needed.
 I64 hl_ground_entity = 0;
+I64 hl_ground_native = -1;
 
 I64 HLStairFlag(Bool b)
 {//ToI64 on a Bool reads the seven bytes after it, so branch instead
@@ -830,7 +882,7 @@ I64		hl_stair_nz_count  = 0;
 // files later in the include order, so the state is global; there is no pmove_t
 // to hang it off.
 
-Bool	hl_on_ladder		= FALSE;	//PM_Ladder found one this tick
+Bool	hl_on_ladder		= FALSE;	//g_onladder
 I64		hl_ladder_ent		= -1;		//index into hl_entities, -1 for none
 
 //pmove->waterjumptime, in seconds; the SDK counts it in cmd.msec
@@ -849,16 +901,79 @@ F64		hl_fall_sound_vol	= 0.0;		//landing step sound volume, 0 = silent
 Bool	hl_fall_pain			= FALSE;	//also player/pl_fallpain3.wav
 F64		hl_fall_punch_z		= 0.0;		//punchangle roll for the landing shake
 
-//pmove->friction, the per-surface multiplier.
-//
-// Nothing sets it: materials.txt texture types and func_friction are the two
-// sources and neither belongs to this file. Stays 1.0 unless something else
-// assigns it; PM_Friction reads it either way.
+//pmove->friction, the per-surface multiplier. func_friction sets it; the
+//materials.txt texture types do not exist here. PM_Friction, PM_Accelerate,
+//PM_AirAccelerate and PM_WaterMove all scale by it.
 F64		hl_surface_friction	= 1.0;
 
-//pmove->basevelocity: the velocity of the surface, not of the player. added in
-//just before the move and pulled back out after
+//pmove->basevelocity: the velocity of the surface, not of the player. Added in
+//just before the move and pulled back out after, so the player's own velocity
+//never accumulates the surface's.
 F64		hl_base_velocity[3];
+
+//--- pusher-driven base velocity -------------------------------------------
+//
+// A rider on a func_train, func_plat, func_door or func_tracktrain must be
+// carried by the pusher's velocity through basevelocity, exactly as a conveyor
+// carries one. Teleporting the rider's origin by the pusher's delta instead
+// breaks three things at once:
+//
+//   - the move runs at the un-carried position, so friction and acceleration
+//     are computed relative to the world rather than to the deck;
+//   - the origin arrives after PM_CatagorizePosition has decided what the player
+//     is standing on, so the ground entity is a tick stale;
+//   - a duck completing on the same tick shifts the origin by 18 as well, and
+//     the two shifts are applied in the wrong order.
+//
+// HLEntity.ZC owns the pushers and compiles after this file, so it writes these
+// and HLPMPlatformBaseVelocity folds them in. Same hook pattern as
+// hl_surface_friction and hl_gravity_scale.
+//
+// Contract, per server tick, before HLPlayerMove runs:
+//
+//   hl_platform_active    TRUE when the player is standing on a pusher that is
+//                         moving or turning this tick. Cleared by the entity
+//                         layer every tick before the mover pass, the way
+//                         hl_surface_friction is, since stepping OFF a platform
+//                         produces no event to hang a restore on.
+//   hl_platform_velocity  the pusher's pev->velocity, world units per second.
+//   hl_platform_avel_z    the pusher's pev->avelocity[1], degrees per second.
+//                         Yaw only: a rider on a pitching or rolling brush is
+//                         not modelled, and neither is one in GoldSrc.
+//   hl_platform_pivot     the pusher's origin, the point avel_z turns about.
+//
+// The rider is then carried by v + omega x r with no origin teleport at all,
+// which is what SV_PushRotate computes for a passenger on a cornering tram.
+//
+// hl_platform_yaw_carry is written back by this file: the degrees of yaw the
+// rider was turned by this tick, for whoever owns the view angles to add. It is
+// a publication, not an input, and is overwritten every move.
+F64		hl_platform_velocity[3];
+F64		hl_platform_pivot[3];
+F64		hl_platform_avel_z		= 0.0;
+Bool	hl_platform_active		= FALSE;
+F64		hl_platform_yaw_carry	= 0.0;
+
+//--- pmove_t ---------------------------------------------------------------
+//
+// The fields of the engine's playermove_t that the PM_ functions share. Live for
+// the duration of one HLPlayerMove only.
+CHLMap *hl_pm_map;
+F64		hl_pm_org[3];			//pmove->origin
+F64		hl_pm_vel[3];			//pmove->velocity
+F64		hl_pm_wishdir[3];		//unit world direction of the command
+F64		hl_pm_move;			//command magnitude, the cmd.forwardmove analogue
+F64		hl_pm_view[3];			//pmove->angles
+Bool	hl_pm_have_view	= FALSE;
+F64		hl_pm_frametime	= 0.0;
+F64		hl_pm_maxspeed		= HLPHYS_MAXSPEED;
+I64		hl_pm_onground		= -1;	//pmove->onground, -1 airborne, 0 on something
+I64		hl_pm_waterlevel	= 0;
+I64		hl_pm_watertype	= HLCONTENTS_EMPTY;
+Bool	hl_pm_wj_extern	= FALSE;	//QuakeC's FL_WATERJUMP, alongside the timer
+Bool	hl_pm_jump_btn		= FALSE;	//cmd.buttons & IN_JUMP
+Bool	hl_pm_duck_btn		= FALSE;	//cmd.buttons & IN_DUCK
+Bool	hl_pm_on_ladder	= FALSE;	//movetype would be MOVETYPE_FLY this tick
 
 U0 HLMoveStateReset()
 {//globals aren't zeroed and a declaration initialiser on one is not honoured
@@ -876,6 +991,40 @@ U0 HLMoveStateReset()
 
 	hl_surface_friction		= 1.0;
 	HLVecSet(hl_base_velocity, 0.0, 0.0, 0.0);
+
+	HLVecSet(hl_platform_velocity, 0.0, 0.0, 0.0);
+	HLVecSet(hl_platform_pivot, 0.0, 0.0, 0.0);
+	hl_platform_avel_z		= 0.0;
+	hl_platform_active		= FALSE;
+	hl_platform_yaw_carry	= 0.0;
+
+	hl_ground_entity		= 0;
+	hl_ground_native		= -1;
+
+	hl_pm_map				= NULL;
+	HLVecSet(hl_pm_org, 0.0, 0.0, 0.0);
+	HLVecSet(hl_pm_vel, 0.0, 0.0, 0.0);
+	HLVecSet(hl_pm_wishdir, 0.0, 0.0, 0.0);
+	HLVecSet(hl_pm_view, 0.0, 0.0, 0.0);
+	hl_pm_move				= 0.0;
+	hl_pm_have_view			= FALSE;
+	hl_pm_frametime			= 0.0;
+	hl_pm_maxspeed			= HLPHYS_MAXSPEED;
+	hl_pm_onground			= -1;
+	hl_pm_waterlevel		= 0;
+	hl_pm_watertype			= HLCONTENTS_EMPTY;
+	hl_pm_wj_extern			= FALSE;
+	hl_pm_jump_btn			= FALSE;
+	hl_pm_duck_btn			= FALSE;
+	hl_pm_on_ladder			= FALSE;
+
+	hl_stair_nz_count		= 0;
+	hl_stair_nz[0]			= 0.0;
+	hl_stair_nz[1]			= 0.0;
+	hl_stair_nz[2]			= 0.0;
+	hl_stair_nz[3]			= 0.0;
+	hl_stair_last_nz		= 0.0;
+	hl_stair_last_frac		= 0.0;
 }
 
 U0 HLClipInit()
@@ -897,8 +1046,13 @@ U0 HLTracePlayer(CHLMap *map, F64 *start, F64 *end, CHLTrace *trace)
 		FALSE, trace);
 }
 
+U0 HLPMTrace(F64 *start, F64 *end, CHLTrace *trace)
+{//pmove->PM_PlayerTrace, against the hull pmove->usehull selects
+	HLTracePlayer(hl_pm_map, start, end, trace);
+}
+
 Bool HLDuckFits(CHLMap *map, F64 *origin)
-{//PM_TestPlayerPosition: does the current box fit here
+{//PM_TestPlayerPosition == -1: does the current box fit here
 	CHLTrace tr;
 
 	HLTracePlayer(map, origin, origin, &tr);
@@ -906,132 +1060,901 @@ Bool HLDuckFits(CHLMap *map, F64 *origin)
 	return ToBool(!tr.start_solid);
 }
 
-U0 HLDuckFixStuck(CHLMap *map, F64 *origin)
-{//PM_FixPlayerCrouchStuck(STUCK_MOVEUP). One unit at a time up to 36, then
- //give up and put the origin back.
-	F64 saved[3];
+U0 HLPMFixCrouchStuck(F64 dir)
+{//PM_FixPlayerCrouchStuck. One unit at a time up to 36, then give up and put
+ //the origin back. STUCK_MOVEUP is 1, STUCK_MOVEDOWN is -1.
+	F64 test[3];
 	I64 i;
 
-	if (HLDuckFits(map, origin))
+	if (HLDuckFits(hl_pm_map, hl_pm_org))
 		return;
 
-	HLVecCopy(origin, saved);
+	HLVecCopy(hl_pm_org, test);
 
 	for (i = 0; i < 36; i++)
 	{
-		origin[2] += 1.0;
+		hl_pm_org[2] += dir;
 
-		if (HLDuckFits(map, origin))
+		if (HLDuckFits(hl_pm_map, hl_pm_org))
 			return;
 	}
 
-	HLVecCopy(saved, origin);
+	HLVecCopy(test, hl_pm_org);
 }
 
-U0 HLUnDuck(CHLMap *map, F64 *origin, Bool on_ground)
-{//PM_UnDuck. The raised position is traced with the ducked hull first, then
- //with the standing one; either being solid keeps the player crouched.
-	F64 test[3];
+U0 HLCheckVelocity(F64 *velocity)
+{//PM_CheckVelocity: per axis, so a diagonal is not clamped harder
+	I64 i;
 
-	HLVecCopy(origin, test);
+	for (i = 0; i < 3; i++)
+	{
+		if (velocity[i] > HLPHYS_MAXVELOCITY)
+			velocity[i] = HLPHYS_MAXVELOCITY;
+		if (velocity[i] < -HLPHYS_MAXVELOCITY)
+			velocity[i] = -HLPHYS_MAXVELOCITY;
+	}
+}
 
-	if (on_ground)
-		test[2] += HLPHYS_DUCK_SHIFT;
+U0 HLPMCheckVelocity()
+{//PM_CheckVelocity on pmove->velocity
+	HLCheckVelocity(hl_pm_vel);
+}
 
-	//Still the small hull here: if the raised origin is inside geometry even at
-	//36 tall there is nothing to test with the tall box.
-	if (!HLDuckFits(map, test))
+Bool HLPMInWaterJump()
+{//pmove->waterjumptime as a predicate
+ //
+ //two sources: PM_CheckWaterJump's own timer, and QuakeC's FL_WATERJUMP, which
+ //the shell services and passes in. Either one owns the move outright.
+	if (hl_waterjump_time > 0.0)
+		return TRUE;
+
+	return hl_pm_wj_extern;
+}
+
+//PM_ClipVelocity's STOP_EPSILON. 0.1, not HLPHYS_EPSILON: HLClipVelocity in
+//HLPhys.ZC snaps at 1/32 for the AI's benefit and is left alone.
+#define HLPM_STOP_EPSILON	0.1
+
+//MAX_CLIP_PLANES. PM_FlyMove gives up after this many distinct planes.
+#define HLPHYS_MAXPLANES		5
+
+//PM_ClipVelocity / PM_FlyMove return bits
+#define HLBLOCK_FLOOR		1
+#define HLBLOCK_WALL			2
+
+I64 HLPMClipVelocity(F64 *in, F64 *normal, F64 *out, F64 overbounce)
+{//PM_ClipVelocity: slide off the impacting object, returning the blocked flags
+	F64 backoff;
+	F64 angle   = normal[2];
+	I64 blocked = 0;
+	I64 i;
+
+	//a positive z component is floor, exactly zero is a wall or step. Not a
+	//tolerance: the compiler leaves near-vertical bevels all over an expanded
+	//hull and treating those as walls steps up on every one
+	if (angle > 0.0)
+		blocked |= HLBLOCK_FLOOR;
+	if (HLIsZeroF(angle))
+		blocked |= HLBLOCK_WALL;
+
+	backoff = HLVecDot(in, normal) * overbounce;
+
+	for (i = 0; i < 3; i++)
+	{
+		out[i] = in[i] - normal[i] * backoff;
+
+		if (out[i] > -HLPM_STOP_EPSILON && out[i] < HLPM_STOP_EPSILON)
+			out[i] = 0.0;
+	}
+
+	return blocked;
+}
+
+U0 HLPMAddCorrectGravity()
+{//PM_AddCorrectGravity: half the tick's gravity before the move
+ //
+ //"yes, this 0.5 looks wrong, but it's not". Leapfrog integration, and the
+ //reason an HL jump arc does not match a quake one at identical constants.
+ //
+ //basevelocity[2] is spent here and zeroed: a lift carries the rider up by
+ //being added to the velocity outright, not by surviving into the slide move
+ //where the floor would clip it away.
+	if (HLPMInWaterJump())
 		return;
 
-	HLDuckSetHull(FALSE);
+	hl_pm_vel[2] -= hl_gravity_scale * HLPHYS_GRAVITY * 0.5 * hl_pm_frametime;
+	hl_pm_vel[2] += hl_base_velocity[2] * hl_pm_frametime;
+	hl_base_velocity[2] = 0.0;
 
-	if (!HLDuckFits(map, test))
+	HLPMCheckVelocity;
+}
+
+U0 HLPMFixupGravityVelocity()
+{//PM_FixupGravityVelocity: the other half of the tick's gravity, after the move
+	if (HLPMInWaterJump())
+		return;
+
+	hl_pm_vel[2] -= hl_gravity_scale * HLPHYS_GRAVITY * hl_pm_frametime * 0.5;
+
+	HLPMCheckVelocity;
+}
+
+//CONTENTS_CURRENT_* push. PM_CheckWater adds 50 * waterlevel along the leaf's
+//direction, so the deeper the player is the harder the current pulls.
+#define HLPM_CURRENT_SPEED	50.0
+
+U0 HLPMCurrentBaseVelocity(I64 contents)
+{//PM_CheckWater's current_table pass
+ //
+ //the leaf inside a current brush carries the push direction in place of
+ //CONTENTS_WATER, so the brush is passable and says which way it shoves. This is
+ //quake's mechanism and the one the map compiler still emits.
+ //
+ //HL's own conveyor path is absent: func_conveyor sets FL_CONVEYOR and the
+ //closed engine turns that flag into basevelocity from the entity's movedir
+ //times its speed. That is engine code, not pm_shared, and the flag is
+ //HLEntity.ZC's to set - it can drive hl_platform_velocity instead.
+	F64 speed;
+
+	if (!HLContentsCurrent(contents))
+		return;
+
+	speed = HLPM_CURRENT_SPEED * hl_pm_waterlevel;
+
+	if (contents == HLCONTENTS_CURRENT_0)
+		hl_base_velocity[0] += speed;
+	else if (contents == HLCONTENTS_CURRENT_90)
+		hl_base_velocity[1] += speed;
+	else if (contents == HLCONTENTS_CURRENT_180)
+		hl_base_velocity[0] -= speed;
+	else if (contents == HLCONTENTS_CURRENT_270)
+		hl_base_velocity[1] -= speed;
+	else if (contents == HLCONTENTS_CURRENT_UP)
+		hl_base_velocity[2] += speed;
+	else
+		hl_base_velocity[2] -= speed;	//CURRENT_DOWN, the only value left
+}
+
+Bool HLPMCheckWater()
+{//PM_CheckWater: set pmove->waterlevel and pmove->watertype
+ //
+ //hull aware, which is the point of running it here rather than taking the
+ //shell's number: the sample heights come from player_mins[usehull] and
+ //player_maxs[usehull], so a crouched player in ankle-deep water reads level 2
+ //where a standing one reads level 1.
+ //
+ //deviation: the SDK's liquid test is `cont <= CONTENTS_WATER && cont >
+ //CONTENTS_TRANSLUCENT`, a range that also catches CONTENTS_SKY, ORIGIN and
+ //CLIP. HLContentsLiquid names the three liquids and the six currents, which is
+ //the intent.
+	F64 point[3];
+	F64 height;
+	I64 contents;
+	I64 truecont;
+
+	hl_pm_waterlevel = 0;
+	hl_pm_watertype  = HLCONTENTS_EMPTY;
+
+	if (!hl_pm_map)
+		return FALSE;
+
+	//just above the feet, at the centre of the box in x and y
+	point[0] = hl_pm_org[0] + (hl_player_mins[0] + hl_player_maxs[0]) * 0.5;
+	point[1] = hl_pm_org[1] + (hl_player_mins[1] + hl_player_maxs[1]) * 0.5;
+	point[2] = hl_pm_org[2] + hl_player_mins[2] + 1.0;
+
+	truecont = HLPointContents(hl_pm_map, point);
+	contents = truecont;
+
+	if (!HLContentsLiquid(contents))
+		return FALSE;
+
+	hl_pm_watertype  = HLContentsWaterType(contents);
+	hl_pm_waterlevel = 1;
+
+	//the hull midpoint
+	height   = hl_player_mins[2] + hl_player_maxs[2];
+	point[2] = hl_pm_org[2] + height * 0.5;
+
+	contents = HLPointContents(hl_pm_map, point);
+
+	if (HLContentsLiquid(contents))
 	{
-		//Changing hulls put the player inside something. Stay ducked.
-		HLDuckSetHull(TRUE);
+		hl_pm_waterlevel = 2;
+
+		//the eye. view_ofs follows the duck, so a crouch under a low surface
+		//submerges the view without the box moving
+		point[2] = hl_pm_org[2] + hl_view_ofs_z;
+
+		contents = HLPointContents(hl_pm_map, point);
+		if (HLContentsLiquid(contents))
+			hl_pm_waterlevel = 3;
+	}
+
+	//"the deeper we are, the stronger the current", off the feet sample
+	HLPMCurrentBaseVelocity(truecont);
+
+	return ToBool(hl_pm_waterlevel > 1);
+}
+
+Bool HLPMInWater()
+{//PM_InWater
+	return ToBool(hl_pm_waterlevel > 1);
+}
+
+U0 HLPMCatagorizePosition()
+{//PM_CatagorizePosition: what the player is standing in, and on
+ //
+ //the ground is a two unit probe straight down, not a flag left behind by the
+ //slide move. Running it after every origin change - after the duck's 18 unit
+ //shift, after the move, after the water move - is what keeps the ground entity
+ //current, and a rider whose ground entity is a tick stale is a rider a pusher
+ //has already stopped carrying.
+	CHLTrace tr;
+	F64		point[3];
+
+	//"doing this before we move may introduce a potential latency in water
+	//detection, but doing it after can get us stuck on the bottom in water"
+	HLPMCheckWater;
+
+	point[0] = hl_pm_org[0];
+	point[1] = hl_pm_org[1];
+	point[2] = hl_pm_org[2] - 2.0;
+
+	hl_ground_entity = 0;
+	hl_ground_native = -1;
+
+	//"shooting up really fast. Definitely not on ground." This is what stops a
+	//jump being cancelled by its own ground probe on the tick it fires: a
+	//268 unit jump clears 180 comfortably.
+	if (hl_pm_vel[2] > 180.0)
+	{
+		hl_pm_onground = -1;
 		return;
 	}
 
-	hl_ducking      = FALSE;
-	hl_duck_pending = FALSE;
-	hl_view_ofs_z   = HLPHYS_VIEW_Z;
-	hl_duck_time    = 0.0;
+	hl_trace_native_ent = -1;
+	HLPMTrace(hl_pm_org, point, &tr);
 
-	HLVecCopy(test, origin);
+	if (tr.plane_normal[2] < 0.7)
+	{
+		hl_pm_onground = -1;	//too steep
+		return;
+	}
+
+	hl_pm_onground = 0;
+
+	//who is underneath. .groundentity carries the edict for SV_PushMove's
+	//benefit; hl_ground_native names the brush entity HLEntity.ZC owns, which
+	//has no edict at all
+	if (tr.ent > 0)
+		hl_ground_entity = tr.ent;
+
+	if (hl_trace_native_ent >= 0)
+		hl_ground_native = hl_trace_native_ent;
+
+	//standing on something ends a water jump
+	hl_waterjump_time = 0.0;
+	hl_pm_wj_extern   = FALSE;
+
+	//"if we could make the move, drop us down that 1 pixel". Skipped in water,
+	//where it would stick the player to the bottom
+	if (hl_pm_waterlevel < 2 && !tr.start_solid && !tr.all_solid)
+		HLVecCopy(tr.end_pos, hl_pm_org);
 }
 
-U0 HLDuckUpdate(CHLMap *map, F64 *origin, Bool duck_held, Bool on_ground,
-	F64 dt)
-{//PM_Duck, run before the move so the trace box is right for this tick.
-	F64  frac;
-	F64  more;
-	Bool pressed;
+I64 HLPMFlyMove()
+{//PM_FlyMove: sweep the player, sliding along whatever is hit
+ //
+ //every plane hit is remembered: clipping each surface as it arrives lets the
+ //second clip undo the first in a corner and grinds the velocity to nothing. so
+ //a direction paralleling all planes so far, else the crease of two, else three
+ //or more is a dead end and stopping is correct.
+ //
+ //this does not decide ground contact. PM_CatagorizePosition does, from its own
+ //probe, and the caller runs it afterwards.
+	CHLTrace	trace;
+	F64		planes[HLPHYS_MAXPLANES * 3];
+	F64		primal[3];
+	F64		original[3];
+	F64		new_vel[3];
+	F64		end[3];
+	F64		dir[3];
+	F64		time_left   = hl_pm_frametime;
+	F64		all_fraction = 0.0;
+	F64		d;
+	F64		bounce;
+	I64		numplanes = 0;
+	I64		blocked   = 0;
+	I64		bump;
+	I64		i;
+	I64		j;
+	Bool	ok;
+	Bool	found;
+	Bool	reflect;
 
-	//nButtonPressed: the press edge, not the held state. Re-arming the timer
-	//every tick the key is down would restart the transition forever.
-	pressed        = ToBool(duck_held && !hl_duck_held_last);
-	hl_duck_held_last = duck_held;
+	HLVecCopy(hl_pm_vel, primal);
+	HLVecCopy(hl_pm_vel, original);
 
-	if (!duck_held)
+	//numbumps is 4
+	for (bump = 0; bump < HLPHYS_MAXCLIP; bump++)
 	{
-		if (hl_ducking || hl_duck_pending)
-		{
-			hl_duck_pending = FALSE;
+		if (hl_pm_vel[0] == 0.0 && hl_pm_vel[1] == 0.0 && hl_pm_vel[2] == 0.0)
+			break;
 
-			if (hl_ducking)
-				HLUnDuck(map, origin, on_ground);
+		HLVecMA(hl_pm_org, time_left, hl_pm_vel, end);
+		HLPMTrace(hl_pm_org, end, &trace);
+
+		all_fraction += trace.fraction;
+
+		if (trace.all_solid)
+		{
+			//embedded in geometry, HLCheckStuck recovers
+			HLVecSet(hl_pm_vel, 0.0, 0.0, 0.0);
+			return HLBLOCK_FLOOR | HLBLOCK_WALL;
+		}
+
+		if (trace.fraction > 0.0)
+		{
+			//ground covered, the planes collected so far no longer constrain
+			HLVecCopy(trace.end_pos, hl_pm_org);
+			HLVecCopy(hl_pm_vel, original);
+			numplanes = 0;
+		}
+
+		if (trace.fraction == 1.0)
+			break;
+
+		//touch functions read the edict, so the position reached is pushed onto
+		//it first: the original moves through a pointer into the edict, this
+		//keeps the player origin in its own copy. PM_AddToTouched's job.
+		if (hl_move_pass > 0 && trace.ent >= 0)
+		{
+			for (i = 0; i < 3; i++)
+				HLPrSetFieldF(hl_move_pass, hl_fld_origin + i, hl_pm_org[i]);
+
+			HLImpact(hl_move_pass, trace.ent);
+		}
+
+		//0.7 is about 45 degrees: flatter than that is floor
+		if (trace.plane_normal[2] > 0.7)
+			blocked |= HLBLOCK_FLOOR;
+
+		//exactly vertical, as PM_FlyMove requires, not a tolerance. e1m1's hull
+		//has 117 near-vertical bevels the compiler added when expanding for the
+		//player box; the original slides along them and sets neither bit
+		if (HLIsZeroF(trace.plane_normal[2]))
+			blocked |= HLBLOCK_WALL;
+
+		//debug: normal of the last thing hit, and every surface touched. a bevel
+		//at 0.124 and a true wall at 0.000 look the same from outside and want
+		//opposite fixes
+		hl_stair_last_nz   = trace.plane_normal[2];
+		hl_stair_last_frac = trace.fraction;
+
+		if (hl_stair_nz_count < 4)
+		{
+			hl_stair_nz[hl_stair_nz_count] = trace.plane_normal[2];
+			hl_stair_nz_count++;
+		}
+
+		time_left -= time_left * trace.fraction;
+
+		if (numplanes >= HLPHYS_MAXPLANES)
+		{
+			HLVecSet(hl_pm_vel, 0.0, 0.0, 0.0);
+			break;
+		}
+
+		HLVecCopy(trace.plane_normal, &planes[numplanes * 3]);
+		numplanes++;
+
+		//"only give this a try for first impact plane because you can get
+		//yourself stuck in an acute corner by jumping in place". Airborne, or on
+		//a surface whose friction has been altered by func_friction, the first
+		//plane reflects rather than merely clipping: movevars->bounce is 1, so
+		//a slope with friction 1 behaves identically and only a slippery one
+		//actually bounces
+		reflect = FALSE;
+		if (numplanes == 1)
+		{
+			if (hl_pm_onground == -1 || hl_surface_friction != 1.0)
+				reflect = TRUE;
+		}
+
+		if (reflect)
+		{
+			if (planes[2] > 0.7)
+				bounce = 1.0;
 			else
-				hl_view_ofs_z = HLPHYS_VIEW_Z;
+				bounce = 1.0 + 1.0 * (1.0 - hl_surface_friction);
+
+			HLPMClipVelocity(original, planes, new_vel, bounce);
+
+			HLVecCopy(new_vel, hl_pm_vel);
+			HLVecCopy(new_vel, original);
+
+			goto qfm_next;
 		}
 
-		return;
-	}
+		//a slide direction that runs along every plane hit
+		found = FALSE;
+		i     = 0;
 
-	if (pressed && !hl_ducking)
-	{
-		//flDuckTime = 1000. The timer is a full second so a long jump still
-		//works; the transition itself finishes after TIME_TO_DUCK.
-		hl_duck_pending = TRUE;
-		hl_duck_time    = 0.0;
-	}
-
-	if (!hl_duck_pending)
-		return;
-
-	hl_duck_time += dt;
-
-	//Airborne, the crouch completes at once: this is what lets a ducked jump
-	//clear a gap the standing box cannot.
-	if (hl_duck_time >= HLPHYS_DUCK_TIME || !on_ground)
-	{
-		hl_ducking      = TRUE;
-		hl_duck_pending = FALSE;
-		hl_view_ofs_z   = HLPHYS_DUCK_VIEW_Z;
-
-		HLDuckSetHull(TRUE);
-
-		if (on_ground)
+		while (i < numplanes && !found)
 		{
-			//origin[i] -= (player_mins[1][i] - player_mins[0][i]). Only z
-			//differs between the hulls, by 18, so the feet stay put.
-			origin[2] -= HLPHYS_DUCK_SHIFT;
+			HLPMClipVelocity(original, &planes[i * 3], new_vel, 1.0);
 
-			HLDuckFixStuck(map, origin);
+			ok = TRUE;
+			for (j = 0; j < numplanes; j++)
+			{
+				if (j != i && HLVecDot(new_vel, &planes[j * 3]) < 0.0)
+					ok = FALSE;
+			}
+
+			if (ok)
+				found = TRUE;
+			else
+				i++;
 		}
 
+		if (found)
+			HLVecCopy(new_vel, hl_pm_vel);
+		else
+		{
+			if (numplanes != 2)
+			{
+				HLVecSet(hl_pm_vel, 0.0, 0.0, 0.0);
+				break;
+			}
+
+			//slide along the crease where the two planes meet
+			HLVecCross(planes, &planes[3], dir);
+			d = HLVecDot(dir, hl_pm_vel);
+			HLVecScale(dir, d, hl_pm_vel);
+		}
+
+		//sliding turned the move back on itself: stop, or tight corners fling
+		//the player backwards
+		if (HLVecDot(hl_pm_vel, primal) <= 0.0)
+		{
+			HLVecSet(hl_pm_vel, 0.0, 0.0, 0.0);
+			break;
+		}
+
+qfm_next:
+	}
+
+	//"don't stick": every bump was refused outright, so the move made no
+	//progress at all and the velocity is pointing into geometry
+	if (all_fraction == 0.0)
+		HLVecSet(hl_pm_vel, 0.0, 0.0, 0.0);
+
+	return blocked;
+}
+
+U0 HLPMAccelerate(F64 *wishdir, F64 wishspeed, F64 accel)
+{//PM_Accelerate: add speed along wishdir, never past wishspeed in that direction
+	F64 currentspeed;
+	F64 addspeed;
+	F64 accelspeed;
+
+	if (HLPMInWaterJump())
+		return;
+
+	currentspeed = HLVecDot(hl_pm_vel, wishdir);
+	addspeed     = wishspeed - currentspeed;
+
+	if (addspeed <= 0.0)
+		return;
+
+	//pmove->friction is in the step size, so a slippery surface accelerates as
+	//slowly as it decelerates
+	accelspeed = accel * hl_pm_frametime * wishspeed * hl_surface_friction;
+
+	if (accelspeed > addspeed)
+		accelspeed = addspeed;
+
+	HLVecMA(hl_pm_vel, accelspeed, wishdir, hl_pm_vel);
+}
+
+U0 HLPMAirAccelerate(F64 *wishdir, F64 wishspeed, F64 accel)
+{//PM_AirAccelerate
+ //
+ //the asymmetry is deliberate in the SDK: the 30 unit/s cap applies to the
+ //target (addspeed), but the step size still scales with the uncapped wishspeed.
+ //Moving sideways relative to velocity therefore keeps adding speed the cap
+ //never sees, which is airstrafing. Using the capped value in both places
+ //removes HL air movement.
+	F64 wishspd = wishspeed;
+	F64 currentspeed;
+	F64 addspeed;
+	F64 accelspeed;
+
+	if (HLPMInWaterJump())
+		return;
+
+	if (wishspd > HLPHYS_AIRSPEEDCAP)
+		wishspd = HLPHYS_AIRSPEEDCAP;
+
+	currentspeed = HLVecDot(hl_pm_vel, wishdir);
+	addspeed     = wishspd - currentspeed;
+
+	if (addspeed <= 0.0)
+		return;
+
+	accelspeed = accel * wishspeed * hl_pm_frametime * hl_surface_friction;
+
+	if (accelspeed > addspeed)
+		accelspeed = addspeed;
+
+	HLVecMA(hl_pm_vel, accelspeed, wishdir, hl_pm_vel);
+}
+
+U0 HLPMFriction()
+{//PM_Friction, the ground branch. The water branch is commented out in the SDK
+ //and stays that way here.
+ //
+ //control is floored at stopspeed so the stop stays crisp.
+	CHLTrace tr;
+	F64	start[3];
+	F64	stop[3];
+	F64	speed;
+	F64	friction;
+	F64	control;
+	F64	drop = 0.0;
+	F64	newspeed;
+
+	if (HLPMInWaterJump())
+		return;
+
+	speed = Sqrt(hl_pm_vel[0] * hl_pm_vel[0] + hl_pm_vel[1] * hl_pm_vel[1] +
+				 hl_pm_vel[2] * hl_pm_vel[2]);
+
+	if (speed < 0.1)
+		return;
+
+	if (hl_pm_onground != -1)
+	{
+		//--- edge friction ---
+		//probe 16 units ahead along the direction of travel and 34 down from the
+		//feet. nothing under it means the leading edge is over a drop, and
+		//movevars->edgefriction doubles friction there, which is what lets the
+		//player stop on the lip of a ledge instead of skating off.
+		//
+		//divided by the full 3D speed, as the original does, so a fast descent
+		//shortens the horizontal reach of the probe
+		start[0] = hl_pm_org[0] + hl_pm_vel[0] / speed * 16.0;
+		start[1] = hl_pm_org[1] + hl_pm_vel[1] / speed * 16.0;
+		start[2] = hl_pm_org[2] + hl_player_mins[2];
+
+		stop[0] = start[0];
+		stop[1] = start[1];
+		stop[2] = start[2] - 34.0;
+
+		HLPMTrace(start, stop, &tr);
+
+		friction = HLPHYS_FRICTION;
+		if (tr.fraction == 1.0)
+			friction *= HLPHYS_EDGEFRICTION;
+
+		//pmove->friction, the func_friction multiplier
+		friction *= hl_surface_friction;
+
+		if (speed < HLPHYS_STOPSPEED)
+			control = HLPHYS_STOPSPEED;
+		else
+			control = speed;
+
+		drop += control * friction * hl_pm_frametime;
+	}
+
+	newspeed = speed - drop;
+	if (newspeed < 0.0)
+		newspeed = 0.0;
+
+	newspeed /= speed;
+
+	hl_pm_vel[0] *= newspeed;
+	hl_pm_vel[1] *= newspeed;
+	hl_pm_vel[2] *= newspeed;
+}
+
+U0 HLPMFlatWish(F64 *wishvel, F64 *wishdir, F64 *_wishspeed)
+{//PM_WalkMove / PM_AirMove's opening: wishvel from the flattened view basis
+ //
+ //the SDK zeroes forward[2] and right[2], renormalises each, and builds
+ //wishvel = forward*forwardmove + right*sidemove. The shell hands over one unit
+ //direction and one magnitude instead, which is the same vector: flattening a
+ //normalised combination and renormalising gives the direction, and the
+ //magnitude is the command's.
+	F64 flat[3];
+	F64 wishspeed;
+
+	HLVecSet(flat, hl_pm_wishdir[0], hl_pm_wishdir[1], 0.0);
+	HLVecNormalize(flat);
+
+	HLVecScale(flat, hl_pm_move, wishvel);
+	wishvel[2] = 0.0;
+
+	HLVecCopy(wishvel, wishdir);
+	wishspeed = HLVecNormalize(wishdir);
+
+	//clamp to server defined max speed
+	if (wishspeed > hl_pm_maxspeed)
+	{
+		HLVecScale(wishvel, hl_pm_maxspeed / wishspeed, wishvel);
+		wishspeed = hl_pm_maxspeed;
+	}
+
+	if (_wishspeed)
+		*_wishspeed = wishspeed;
+}
+
+U0 HLPMWalkMove()
+{//PM_WalkMove
+ //
+ //the step-up is not a lift applied to a blocked move. Both moves are run in
+ //full - flat from the original position, and again from one stepsize up - and
+ //whichever travelled further horizontally is kept. A naive "hit a wall, rise,
+ //retry" picks the stepped result even when it went nowhere, which is what puts
+ //the player on top of things a step could never have reached.
+	CHLTrace	trace;
+	F64		wishvel[3];
+	F64		wishdir[3];
+	F64		dest[3];
+	F64		original[3];
+	F64		originalvel[3];
+	F64		down[3];
+	F64		downvel[3];
+	F64		up[3];
+	F64		wishspeed = 0.0;
+	F64		spd;
+	F64		downdist;
+	F64		updist;
+	I64		oldonground;
+	Bool	usedown;
+
+	HLPMFlatWish(wishvel, wishdir, &wishspeed);
+
+	//"set pmove velocity". The vertical component is discarded either side of
+	//the acceleration so a slope's residue cannot be steered
+	hl_pm_vel[2] = 0.0;
+	HLPMAccelerate(wishdir, wishspeed, HLPHYS_ACCEL);
+	hl_pm_vel[2] = 0.0;
+
+	//the surface's velocity, added immediately before the move
+	HLVecAdd(hl_pm_vel, hl_base_velocity, hl_pm_vel);
+
+	spd = HLVecLength(hl_pm_vel);
+	if (spd < 1.0)
+	{
+		HLVecSet(hl_pm_vel, 0.0, 0.0, 0.0);
 		return;
 	}
 
-	//Mid-transition the origin has not moved yet, so the eye has to travel the
-	//whole way down on its own: the target is VEC_DUCK_VIEW - fMore, which is
-	//below the ducked eye height, and the origin shift at the end makes up the
-	//difference. Lerping to VEC_DUCK_VIEW instead snaps the view up 18 units
-	//the instant the duck completes.
-	more = HLPHYS_DUCK_MINS_Z - HLPHYS_MINS_Z;
-	frac = HLDuckSpline(hl_duck_time / HLPHYS_DUCK_TIME);
+	oldonground = hl_pm_onground;
 
-	hl_view_ofs_z = (HLPHYS_DUCK_VIEW_Z - more) * frac +
-					HLPHYS_VIEW_Z * (1.0 - frac);
+	//--- first try moving directly to the next spot, at constant height ---
+	dest[0] = hl_pm_org[0] + hl_pm_vel[0] * hl_pm_frametime;
+	dest[1] = hl_pm_org[1] + hl_pm_vel[1] * hl_pm_frametime;
+	dest[2] = hl_pm_org[2];
+
+	HLPMTrace(hl_pm_org, dest, &trace);
+
+	if (trace.fraction == 1.0)
+	{
+		HLVecCopy(trace.end_pos, hl_pm_org);
+		return;
+	}
+
+	//"don't walk up stairs if not on ground". The water exemption is how a
+	//swimmer climbs out onto a ledge without jumping
+	if (oldonground == -1 && hl_pm_waterlevel == 0)
+		return;
+
+	//a water jump is scripted movement; a step on top of it fights it
+	if (HLPMInWaterJump())
+		return;
+
+	//--- try sliding forward both on ground and up one step, take the move that
+	//    goes farthest ---
+	HLVecCopy(hl_pm_org, original);
+	HLVecCopy(hl_pm_vel, originalvel);
+
+	//globals aren't zeroed; an unfilled slot prints as a real surface
+	hl_stair_nz_count = 0;
+	hl_stair_nz[0]    = 0.0;
+	hl_stair_nz[1]    = 0.0;
+	hl_stair_nz[2]    = 0.0;
+	hl_stair_nz[3]    = 0.0;
+
+	HLPMFlyMove;
+
+	HLVecCopy(hl_pm_org, down);
+	HLVecCopy(hl_pm_vel, downvel);
+
+	HLVecCopy(original, hl_pm_org);
+	HLVecCopy(originalvel, hl_pm_vel);
+
+	//start out up one stair height
+	HLVecCopy(hl_pm_org, dest);
+	dest[2] += HLPHYS_STEPSIZE;
+
+	HLPMTrace(hl_pm_org, dest, &trace);
+
+	if (!trace.start_solid && !trace.all_solid)
+		HLVecCopy(trace.end_pos, hl_pm_org);
+
+	HLPMFlyMove;
+
+	//now press back down the step height
+	HLVecCopy(hl_pm_org, dest);
+	dest[2] -= HLPHYS_STEPSIZE;
+
+	HLPMTrace(hl_pm_org, dest, &trace);
+
+	usedown = FALSE;
+
+	//"if we are not on the ground any more then use the original movement
+	//attempt": the raised move can end over a face too steep to stand on
+	if (trace.plane_normal[2] < 0.7)
+		usedown = TRUE;
+	else
+	{
+		if (!trace.start_solid && !trace.all_solid)
+			HLVecCopy(trace.end_pos, hl_pm_org);
+
+		HLVecCopy(hl_pm_org, up);
+
+		//decide which one went farther, in the horizontal plane only
+		downdist = (down[0] - original[0]) * (down[0] - original[0]) +
+				   (down[1] - original[1]) * (down[1] - original[1]);
+		updist   = (up[0] - original[0]) * (up[0] - original[0]) +
+				   (up[1] - original[1]) * (up[1] - original[1]);
+
+		if (downdist > updist)
+			usedown = TRUE;
+		else
+			hl_pm_vel[2] = downvel[2];	//keep the z the flat move ended with
+	}
+
+	if (hl_stair_log && hl_stair_reports < HLSTAIR_MAX_REPORTS)
+	{
+		hl_stair_reports++;
+
+		StrPrint(hl_stair_line,
+			"stair: dn(%5.2f,%5.2f) up(%5.2f,%5.2f) dz %4.1f n_z %4.2f %d\n",
+			down[0] - original[0], down[1] - original[1],
+			hl_pm_org[0] - original[0], hl_pm_org[1] - original[1],
+			hl_pm_org[2] - original[2], trace.plane_normal[2],
+			HLStairFlag(usedown));
+
+		HLLog(hl_stair_line);
+		HLLogFlush;
+	}
+
+	if (usedown)
+	{
+		HLVecCopy(down, hl_pm_org);
+		HLVecCopy(downvel, hl_pm_vel);
+	}
+}
+
+U0 HLPMAirMove()
+{//PM_AirMove
+	F64 wishvel[3];
+	F64 wishdir[3];
+	F64 wishspeed = 0.0;
+
+	HLPMFlatWish(wishvel, wishdir, &wishspeed);
+
+	HLPMAirAccelerate(wishdir, wishspeed, HLPHYS_AIRACCEL);
+
+	HLVecAdd(hl_pm_vel, hl_base_velocity, hl_pm_vel);
+
+	HLPMFlyMove;
+}
+
+U0 HLPMWaterMove()
+{//PM_WaterMove
+ //
+ //three numbers differ from quake: friction is movevars->friction scaled by
+ //pmove->friction rather than a fixed 4, the wish is cut to 0.8 rather than 0.7,
+ //and acceleration is measured against the post-friction speed.
+	CHLTrace	trace;
+	F64		wishvel[3];
+	F64		wishdir[3];
+	F64		temp[3];
+	F64		start[3];
+	F64		dest[3];
+	F64		wishspeed;
+	F64		speed;
+	F64		newspeed;
+	F64		addspeed;
+	F64		accelspeed;
+
+	//user intentions. The vertical component of the wish is kept while
+	//submerged, so looking up and pressing forward swims up
+	HLVecScale(hl_pm_wishdir, hl_pm_move, wishvel);
+
+	//"sinking after no other movement occurs": no input drifts towards the
+	//bottom rather than hovering, and drives the feet onto a platform so
+	//PM_CatagorizePosition can name it
+	if (hl_pm_move < 0.1)
+		wishvel[2] -= HLPHYS_WATERSINK;
+
+	HLVecCopy(wishvel, wishdir);
+	wishspeed = HLVecNormalize(wishdir);
+
+	if (wishspeed > hl_pm_maxspeed)
+	{
+		HLVecScale(wishvel, hl_pm_maxspeed / wishspeed, wishvel);
+		wishspeed = hl_pm_maxspeed;
+	}
+
+	//"slow us down a bit"
+	wishspeed *= HLPHYS_WATERSPEED;
+
+	//a current is dragged along with everything else rather than added on top of
+	//the result, so it is folded in before the water friction
+	HLVecAdd(hl_pm_vel, hl_base_velocity, hl_pm_vel);
+
+	//--- water friction ---
+	HLVecCopy(hl_pm_vel, temp);
+	speed    = HLVecNormalize(temp);
+	newspeed = 0.0;
+
+	if (speed > 0.0)
+	{
+		newspeed = speed - hl_pm_frametime * speed * HLPHYS_WATERFRICTION *
+			hl_surface_friction;
+
+		if (newspeed < 0.0)
+			newspeed = 0.0;
+
+		HLVecScale(hl_pm_vel, newspeed / speed, hl_pm_vel);
+	}
+
+	//--- water acceleration ---
+	//order matters: friction has already run, so the shortfall is measured
+	//against the post-friction speed
+	if (wishspeed < 0.1)
+		return;
+
+	addspeed = wishspeed - newspeed;
+
+	if (addspeed > 0.0)
+	{
+		HLVecNormalize(wishvel);
+
+		accelspeed = HLPHYS_ACCEL * wishspeed * hl_pm_frametime *
+			hl_surface_friction;
+
+		if (accelspeed > addspeed)
+			accelspeed = addspeed;
+
+		HLVecMA(hl_pm_vel, accelspeed, wishvel, hl_pm_vel);
+	}
+
+	//--- the move ---
+	//"assume it is a stair or a slope, so press down from stepheight above".
+	//A purely vertical probe onto the destination: nothing tests the horizontal
+	//path, which is how a submerged stair is climbed without a step retry. When
+	//the destination is not reachable that way, slide normally.
+	HLVecMA(hl_pm_org, hl_pm_frametime, hl_pm_vel, dest);
+	HLVecCopy(dest, start);
+	start[2] += HLPHYS_STEPSIZE + 1.0;
+
+	HLPMTrace(start, dest, &trace);
+
+	if (!trace.start_solid && !trace.all_solid)
+	{
+		HLVecCopy(trace.end_pos, hl_pm_org);
+		return;
+	}
+
+	HLPMFlyMove;
 }
 
 //--- func_ladder -----------------------------------------------------------
@@ -1108,13 +2031,11 @@ qlf_next:
 	return -1;
 }
 
-U0 HLLadderMove(CHLMap *map, I64 ent, F64 *origin, F64 *velocity, F64 *wishdir,
-	F64 *view_angles, Bool jump)
+U0 HLPMLadderMove(I64 ent)
 {//PM_LadderMove: steer along the plane of the ladder instead of into it
  //
  //pm_shared switches movetype to MOVETYPE_FLY for the tick, so the caller runs
- //no gravity, no friction, no step-up and no base velocity: the ladder owns the
- //velocity outright.
+ //no gravity, no friction and no step-up: the ladder owns the velocity outright.
 	CHLEntity	*e;
 	CHLTrace	 tr;
 	F64			 fwd[3];
@@ -1129,18 +2050,29 @@ U0 HLLadderMove(CHLMap *map, I64 ent, F64 *origin, F64 *velocity, F64 *wishdir,
 	F64			 tmp[3];
 	F64			 into[3];
 	F64			 lateral[3];
+	F64			 speed;
 	F64			 f_amt;
 	F64			 r_amt;
 	F64			 normal_amt;
 	I64			 j;
 	Bool		 on_floor;
 
-	if (ent < 0 || ent >= hl_num_entities || !view_angles)
+	if (ent < 0 || ent >= hl_num_entities || !hl_pm_have_view)
 		return;
 
 	e = &hl_entities[ent];
 
-	HLAngleVectors(view_angles, fwd, rgt, NULL);
+	HLAngleVectors(hl_pm_view, fwd, rgt, NULL);
+
+	//"they shouldn't be able to move faster than their maxspeed", then the duck
+	//multiplier on top. PM_Duck has already scaled the walk command; the ladder
+	//carries its own speed and scales it separately, as the SDK does
+	speed = HLPHYS_CLIMBSPEED;
+	if (speed > hl_pm_maxspeed)
+		speed = hl_pm_maxspeed;
+
+	if (hl_ducking)
+		speed *= HLPM_DUCK_MULT;
 
 	//pm_shared reads cmd.forwardmove and cmd.sidemove; there is no cmd here. the
 	//wish arrives flattened and normalised, so the forward and right amounts are
@@ -1154,22 +2086,22 @@ U0 HLLadderMove(CHLMap *map, I64 ent, F64 *origin, F64 *velocity, F64 *wishdir,
 	//deviation: a diagonal press gives 141/141 here where the SDK gives 200/200,
 	//because the caller normalised the pair. the SDK's is the usual diagonal
 	//speed bonus and nothing depends on it
-	f_amt = HLVecDot(wishdir, flat_f) * HLPHYS_CLIMBSPEED;
-	r_amt = HLVecDot(wishdir, flat_r) * HLPHYS_CLIMBSPEED;
+	f_amt = HLVecDot(hl_pm_wishdir, flat_f) * speed;
+	r_amt = HLVecDot(hl_pm_wishdir, flat_r) * speed;
 
 	//dismount: back to MOVETYPE_WALK and thrown along the full view forward, so
 	//looking away from a ladder and jumping gets off it
-	if (jump)
+	if (hl_pm_jump_btn)
 	{
-		HLVecScale(fwd, HLPHYS_LADDER_JUMP, velocity);
+		HLVecScale(fwd, HLPHYS_LADDER_JUMP, hl_pm_vel);
 		return;
 	}
 
 	//feet one unit down. standing on real floor changes what pushing away from
 	//the ladder means - see the last branch
-	HLVecCopy(origin, floor_pt);
+	HLVecCopy(hl_pm_org, floor_pt);
 	floor_pt[2] += hl_player_mins[2] - 1.0;
-	on_floor = ToBool(HLPointContents(map, floor_pt) == HLCONTENTS_SOLID);
+	on_floor = ToBool(HLPointContents(hl_pm_map, floor_pt) == HLCONTENTS_SOLID);
 
 	//a point trace from the player to a point inside the ladder brush, purely to
 	//get the normal of the face being climbed.
@@ -1180,16 +2112,17 @@ U0 HLLadderMove(CHLMap *map, I64 ent, F64 *origin, F64 *velocity, F64 *wishdir,
 	for (j = 0; j < 3; j++)
 		centre[j] = e->origin[j] + (e->mins[j] + e->maxs[j]) * 0.5;
 
-	//deviation: the SDK writes VectorMA(modelmins, 0.5, modelmaxs, ...), which is
-	//the centre only if the brush was built around the origin. HL brushes are
-	//built in place, so for any ladder away from 0 0 0 that point lands outside
-	//the brush and the trace misses it. the true centre is the intent.
+	//deviation: the SDK writes VectorAdd(modelmins, modelmaxs, c); VectorScale(c,
+	//0.5, c), which is the centre only if the brush was built around the origin.
+	//HL brushes are built in place, so for any ladder away from 0 0 0 that point
+	//lands outside the brush and the trace misses it. the true centre is the
+	//intent.
 	//
 	//the point hull's box-to-hull correction is zero, so the model offset is
 	//where the entity sits
 	HLVecCopy(e->origin, eofs);
 
-	HLTraceHull(map, e->brush_model, 0, eofs, origin, centre, &tr);
+	HLTraceHull(hl_pm_map, e->brush_model, 0, eofs, hl_pm_org, centre, &tr);
 
 	//never reached the brush: no face to climb along. pm_shared leaves the
 	//velocity untouched here too, and with gravity zeroed the player hangs
@@ -1204,7 +2137,7 @@ U0 HLLadderMove(CHLMap *map, I64 ent, F64 *origin, F64 *velocity, F64 *wishdir,
 	{
 		//no input clears the velocity, so a ladder holds the player in place
 		//instead of letting them slide back down
-		HLVecSet(velocity, 0.0, 0.0, 0.0);
+		HLVecSet(hl_pm_vel, 0.0, 0.0, 0.0);
 		return;
 	}
 
@@ -1223,7 +2156,7 @@ U0 HLLadderMove(CHLMap *map, I64 ent, F64 *origin, F64 *velocity, F64 *wishdir,
 	//instead of steering into it
 	if (HLVecNormalize(perp) < HLPHYS_EPSILON)
 	{
-		HLClipVelocity(wish, tr.plane_normal, HLPHYS_OVERCLIP, velocity);
+		HLClipVelocity(wish, tr.plane_normal, HLPHYS_OVERCLIP, hl_pm_vel);
 		return;
 	}
 
@@ -1236,781 +2169,13 @@ U0 HLLadderMove(CHLMap *map, I64 ent, F64 *origin, F64 *velocity, F64 *wishdir,
 	//normal_amt negative (the normal faces back at the player), so -normal_amt
 	//is positive and the player climbs: forward on a ladder is up
 	HLVecCross(tr.plane_normal, perp, tmp);
-	HLVecMA(lateral, -normal_amt, tmp, velocity);
+	HLVecMA(lateral, -normal_amt, tmp, hl_pm_vel);
 
 	//on the floor and pressing away from the ladder steps off it. without this
 	//the bottom of a ladder is a trap: the lateral velocity is always along the
 	//face, so there is no way to walk out
 	if (on_floor && normal_amt > 0.0)
-		HLVecMA(velocity, HLPHYS_CLIMBSPEED, tr.plane_normal, velocity);
-}
-
-//--- currents and conveyors ------------------------------------------------
-//
-// CONTENTS_CURRENT_0..CURRENT_DOWN, the quake mechanism and the one the map
-// compiler still emits: the leaf inside a current brush carries the push
-// direction in place of CONTENTS_SOLID, so the brush is passable and says which
-// way it shoves.
-//
-// HL's own conveyor path is absent. func_conveyor sets FL_CONVEYOR and the
-// closed engine turns that flag into basevelocity from the entity's movedir
-// times its speed - engine code, not pm_shared, and the flag is HLEntity.ZC's
-// to set. a func_conveyor built without current contents carries nothing here.
-
-U0 HLBaseVelocity(CHLMap *map, F64 *origin, Bool on_ground, I64 water_level,
-	F64 *out)
-{//pmove->basevelocity: the velocity of the surface, not of the player
-	F64 point[3];
-	F64 speed;
-	I64 contents;
-
-	HLVecSet(out, 0.0, 0.0, 0.0);
-
-	if (!HLMapValid(map, "HLBaseVelocity"))
-		return;
-
-	//sampled at the feet, one unit up, where HLWaterLevelGet samples: a current
-	//being stood in contains only the bottom of the box, and the origin is the
-	//box's midpoint
-	HLVecCopy(origin, point);
-	point[2] = origin[2] + hl_player_mins[2] + 1.0;
-
-	contents = HLPointContents(map, point);
-
-	if (!HLContentsCurrent(contents))
-		return;
-
-	speed = HLPHYS_CURRENT_SPEED;
-
-	//an ankle-deep current with ground under it is halved, as quake 2 does:
-	//otherwise a shallow stream shoves harder than the player can walk
-	if (water_level == 1 && on_ground)
-		speed *= 0.5;
-
-	if (contents == HLCONTENTS_CURRENT_0)
-		out[0] = speed;
-	else if (contents == HLCONTENTS_CURRENT_90)
-		out[1] = speed;
-	else if (contents == HLCONTENTS_CURRENT_180)
-		out[0] = -speed;
-	else if (contents == HLCONTENTS_CURRENT_270)
-		out[1] = -speed;
-	else if (contents == HLCONTENTS_CURRENT_UP)
-		out[2] = speed;
-	else
-		out[2] = -speed;		//CURRENT_DOWN, the only value left in the range
-}
-
-//clip planes before giving up on finding a way out
-#define HLPHYS_MAXPLANES		5
-
-//HLFlyMove return bits, same meaning as SV_FlyMove's
-#define HLBLOCK_FLOOR		1
-#define HLBLOCK_WALL		2
-
-I64 HLFlyMove(CHLMap *map, F64 *origin, F64 *velocity, F64 dt, Bool *_ground,
-	CHLTrace *_steptrace)
-{//SV_FlyMove: sweep the player, sliding along whatever is hit
- //
- //every plane hit is remembered: clipping each surface as it arrives lets the
- //second clip undo the first in a corner and grinds the velocity to nothing. so
- //a direction paralleling all planes so far, else the crease of two, else three
- //or more is a dead end and stopping is correct.
- //
- //ground contact is decided from the plane the move landed on, not by a separate
- //downward probe: the trace that stops the fall names the floor
-	CHLTrace	trace;
-	F64		planes[HLPHYS_MAXPLANES * 3];
-	F64		primal[3];
-	F64		original[3];
-	F64		new_vel[3];
-	F64		end[3];
-	F64		dir[3];
-	F64		time_left = dt;
-	F64		d;
-	I64		numplanes = 0;
-	I64		blocked   = 0;
-	I64		bump;
-	I64		i;
-	I64		j;
-	Bool	ok;
-	Bool	found;
-
-	HLVecCopy(velocity, primal);
-	HLVecCopy(velocity, original);
-
-	for (bump = 0; bump < HLPHYS_MAXCLIP; bump++)
-	{
-		if (velocity[0] == 0.0 && velocity[1] == 0.0 && velocity[2] == 0.0)
-			break;
-
-		HLVecMA(origin, time_left, velocity, end);
-		HLTracePlayer(map, origin, end, &trace);
-
-		if (trace.all_solid)
-		{
-			//embedded in geometry, HLCheckStuck recovers
-			HLVecSet(velocity, 0.0, 0.0, 0.0);
-			return HLBLOCK_FLOOR | HLBLOCK_WALL;
-		}
-
-		if (trace.fraction > 0.0)
-		{
-			//ground covered, the planes collected so far no longer constrain
-			HLVecCopy(trace.end_pos, origin);
-			HLVecCopy(velocity, original);
-			numplanes = 0;
-		}
-
-		if (trace.fraction == 1.0)
-			break;
-
-		//0.7 is about 45 degrees: flatter than that is floor
-		if (trace.plane_normal[2] > 0.7)
-		{
-			blocked |= HLBLOCK_FLOOR;
-
-			//ground only counts on SOLID_BSP: SV_FlyMove sets FL_ONGROUND only
-			//for the world or a brush entity, so nothing stands on a monster
-			if (trace.ent <= 0 ||
-				ToI64(HLPrFieldF(trace.ent, hl_fld_solid)) == HLSOLID_BSP_)
-			{
-				if (_ground)
-					*_ground = TRUE;
-
-			//.groundentity: SV_PushMove reads it to decide who rides a plat.
-			//world is edict 0 as far as QuakeC is concerned.
-				if (trace.ent > 0)
-					hl_ground_entity = trace.ent;
-				else
-					hl_ground_entity = 0;
-			}
-		}
-
-		//touch functions read the edict, so push the position reached onto it
-		//first: the original moves through a pointer into the edict, this keeps
-		//the player origin in its own copy
-		if (hl_move_pass > 0 && trace.ent >= 0)
-		{
-			for (i = 0; i < 3; i++)
-				HLPrSetFieldF(hl_move_pass, hl_fld_origin + i, origin[i]);
-
-			HLImpact(hl_move_pass, trace.ent);
-		}
-
-		//debug: normal of the last thing hit. the wall bit needs an exactly
-		//vertical plane, so near-vertical blockers leave no other record
-		hl_stair_last_nz   = trace.plane_normal[2];
-		hl_stair_last_frac = trace.fraction;
-
-		//every surface touched: a bevel at 0.124 and a true wall at 0.000 look
-		//the same from outside and want opposite fixes
-		if (hl_stair_nz_count < 4)
-		{
-			hl_stair_nz[hl_stair_nz_count] = trace.plane_normal[2];
-			hl_stair_nz_count++;
-		}
-
-		//exactly vertical, as SV_FlyMove requires, not a tolerance. e1m1's hull
-		//has 117 near-vertical bevels the compiler added when expanding for the
-		//player box; the original slides along them and sets neither bit. a
-		//tolerance here steps up on every one.
-		if (HLIsZeroF(trace.plane_normal[2]))
-		{
-			blocked |= HLBLOCK_WALL;
-
-			//wall friction needs the plane, the step retry needs the blocker
-			if (_steptrace)
-				MemCopy(_steptrace, &trace, sizeof(CHLTrace));
-		}
-
-		time_left -= time_left * trace.fraction;
-
-		if (numplanes >= HLPHYS_MAXPLANES)
-		{
-			HLVecSet(velocity, 0.0, 0.0, 0.0);
-			return HLBLOCK_FLOOR | HLBLOCK_WALL;
-		}
-
-		HLVecCopy(trace.plane_normal, &planes[numplanes * 3]);
-		numplanes++;
-
-		//a slide direction that runs along every plane hit
-		found = FALSE;
-		i     = 0;
-
-		while (i < numplanes && !found)
-		{
-			HLClipVelocity(original, &planes[i * 3], 1.0, new_vel);
-
-			ok = TRUE;
-			for (j = 0; j < numplanes; j++)
-			{
-				if (j != i && HLVecDot(new_vel, &planes[j * 3]) < 0.0)
-					ok = FALSE;
-			}
-
-			if (ok)
-				found = TRUE;
-			else
-				i++;
-		}
-
-		if (found)
-			HLVecCopy(new_vel, velocity);
-		else
-		{
-			if (numplanes != 2)
-			{
-				HLVecSet(velocity, 0.0, 0.0, 0.0);
-				return HLBLOCK_FLOOR | HLBLOCK_WALL;
-			}
-
-			//slide along the crease where the two planes meet
-			HLVecCross(planes, &planes[3], dir);
-			d = HLVecDot(dir, velocity);
-			HLVecScale(dir, d, velocity);
-		}
-
-		//sliding turned the move back on itself: stop, or tight corners fling
-		//the player backwards
-		if (HLVecDot(velocity, primal) <= 0.0)
-		{
-			HLVecSet(velocity, 0.0, 0.0, 0.0);
-			return blocked;
-		}
-	}
-
-	return blocked;
-}
-
-Bool HLSlideMove(CHLMap *map, F64 *origin, F64 *velocity, F64 dt)
-{//move and slide, discarding what was hit
-	return ToBool(HLFlyMove(map, origin, velocity, dt, NULL, NULL) != 0);
-}
-
-U0 HLPushMove(CHLMap *map, F64 *origin, F64 *push, CHLTrace *trace)
-{//SV_PushEntity minus the linking, which is unused here
-	F64 end[3];
-
-	HLVecAdd(origin, push, end);
-	HLTracePlayer(map, origin, end, trace);
-	HLVecCopy(trace->end_pos, origin);
-}
-
-U0 HLWallFriction(F64 *velocity, F64 *view_angles, F64 *normal)
-{//SV_WallFriction: bleed off speed when running at a wall face-on
- //
- //scaled by how directly the player faces the wall, not by impact: glancing
- //contact keeps its speed, head-on stops dead
-	F64 fwd[3];
-	F64 rgt[3];
-	F64 upv[3];
-	F64 into[3];
-	F64 side[3];
-	F64 d;
-	F64 i;
-
-	HLAngleVectors(view_angles, fwd, rgt, upv);
-
-	d = HLVecDot(normal, fwd) + 0.5;
-	if (d >= 0.0)
-		return;
-
-	//drop the component heading into the wall, scale what is left
-	i = HLVecDot(normal, velocity);
-	HLVecScale(normal, i, into);
-	HLVecSub(velocity, into, side);
-
-	velocity[0] = side[0] * (1.0 + d);
-	velocity[1] = side[1] * (1.0 + d);
-}
-
-I64 HLTryUnstick(CHLMap *map, F64 *origin, F64 *velocity, F64 *oldvel)
-{//SV_TryUnstick: nudge out of a seam the hulls will not let the player leave
- //
- //hulls are built from integer planes, so a step can make no progress. eight
- //2-unit axial shoves, each followed by a retry; the first that travels wins.
-	F64		oldorg[3];
-	F64		dir[3];
-	CHLTrace	tr;
-	F64		dx;
-	F64		dy;
-	I64		clip;
-	I64		i;
-
-	HLVecCopy(origin, oldorg);
-
-	for (i = 0; i < 8; i++)
-	{
-		HLVecSet(dir, 0.0, 0.0, 0.0);
-
-		switch (i)
-		{
-			case 0:	dir[0] =  2.0;					break;
-			case 1:	dir[1] =  2.0;					break;
-			case 2:	dir[0] = -2.0;					break;
-			case 3:	dir[1] = -2.0;					break;
-			case 4:	dir[0] =  2.0; dir[1] =  2.0;	break;
-			case 5:	dir[0] = -2.0; dir[1] =  2.0;	break;
-			case 6:	dir[0] =  2.0; dir[1] = -2.0;	break;
-			default: dir[0] = -2.0; dir[1] = -2.0;	break;
-		}
-
-		HLPushMove(map, origin, dir, &tr);
-
-		//retry the move that was refused
-		velocity[0] = oldvel[0];
-		velocity[1] = oldvel[1];
-		velocity[2] = 0.0;
-
-		clip = HLFlyMove(map, origin, velocity, 0.1, NULL, NULL);
-
-		dx = origin[0] - oldorg[0];
-		dy = origin[1] - oldorg[1];
-		if (dx < 0.0) dx = -dx;
-		if (dy < 0.0) dy = -dy;
-
-		if (dx > 4.0 || dy > 4.0)
-			return clip;
-
-		//no progress, back to the start and try the next direction
-		HLVecCopy(oldorg, origin);
-	}
-
-	HLVecSet(velocity, 0.0, 0.0, 0.0);
-	return HLBLOCK_FLOOR | HLBLOCK_WALL;
-}
-
-U0 HLWalkMove(CHLMap *map, F64 *origin, F64 *velocity, F64 dt, Bool old_ground,
-	Bool *_ground, F64 *view_angles, I64 water_level = 0,
-	Bool waterjump = FALSE)
-{//SV_WalkMove: walk, climbing steps where a step is what blocked the move
- //
- //the step-up is not speculative: it runs only when the flat move hit a wall and
- //the player was already on the ground, which stops wall climbing mid-jump.
- //
- //the stepped result is kept only if the move down lands on real floor. near a
- //wall-slope junction it can end up on a face too steep to stand on.
-	F64		oldorg[3];
-	F64		oldvel[3];
-	F64		nosteporg[3];
-	F64		nostepvel[3];
-	F64		upmove[3];
-	F64		downmove[3];
-	CHLTrace	downtrace;
-	CHLTrace	steptrace;
-	CHLTrace	tr;
-	F64		dx;
-	F64		dy;
-	I64		clip;
-	Bool	flat_ground = FALSE;
-	Bool	step_ground = FALSE;
-	Bool	obstructed;
-	F64		want_d;
-	F64		got_d;
-	U8		*verdict;
-
-	HLVecCopy(origin, oldorg);
-	HLVecCopy(velocity, oldvel);
-
-	//globals aren't zeroed; an unfilled slot prints as a real surface
-	hl_stair_nz_count = 0;
-	hl_stair_nz[0]    = 0.0;
-	hl_stair_nz[1]    = 0.0;
-	hl_stair_nz[2]    = 0.0;
-	hl_stair_nz[3]    = 0.0;
-
-	clip = HLFlyMove(map, origin, velocity, dt, &flat_ground, &steptrace);
-
-	//gravity means ordinary walking always ends at fraction 0 on a normal of 1,
-	//so distance asked against distance got is the only thing that separates
-	//blocked from walking
-	want_d = Sqrt(oldvel[0] * oldvel[0] + oldvel[1] * oldvel[1]) * dt;
-	got_d  = Sqrt((origin[0] - oldorg[0]) * (origin[0] - oldorg[0]) +
-				  (origin[1] - oldorg[1]) * (origin[1] - oldorg[1]));
-
-	obstructed = ToBool(want_d > 1.0 && got_d < want_d * 0.5);
-
-	//nothing wall-like stopped it, so there is no step to climb. still logged:
-	//from outside this looks identical to a step that failed
-	if ((clip & HLBLOCK_WALL) == 0)
-	{
-		if (hl_stair_log && obstructed &&
-			hl_stair_reports < HLSTAIR_MAX_REPORTS)
-		{
-			hl_stair_reports++;
-			StrPrint(hl_stair_line,
-				"stair: BLOCKED clip %d want %5.2f got %5.2f old %d "
-				"hit %d: %6.3f %6.3f %6.3f %6.3f\n",
-				clip, want_d, got_d, HLStairFlag(old_ground),
-				hl_stair_nz_count,
-				hl_stair_nz[0], hl_stair_nz[1], hl_stair_nz[2], hl_stair_nz[3]);
-			HLLog(hl_stair_line);
-			HLLogFlush;
-		}
-
-		if (_ground)
-			*_ground = flat_ground;
-		return;
-	}
-
-	//no stairs while airborne, unless in water. SV_WalkMove guards on
-	//!oldonground && waterlevel == 0, which is how a swimmer climbs out onto a
-	//ledge without jumping
-	if (!old_ground && water_level == 0)
-	{
-		if (hl_stair_log && obstructed &&
-			hl_stair_reports < HLSTAIR_MAX_REPORTS)
-		{
-			hl_stair_reports++;
-			HLLog("stair: BLOCKED but AIRBORNE - step refused\n");
-			HLLogFlush;
-		}
-
-		if (_ground)
-			*_ground = flat_ground;
-		return;
-	}
-
-	//FL_WATERJUMP is scripted movement; a step on top of it fights it
-	if (waterjump)
-	{
-		if (hl_stair_log && obstructed &&
-			hl_stair_reports < HLSTAIR_MAX_REPORTS)
-		{
-			hl_stair_reports++;
-			HLLog("stair: BLOCKED but WATERJUMP - step refused\n");
-			HLLogFlush;
-		}
-
-		if (_ground)
-			*_ground = flat_ground;
-		return;
-	}
-
-	//keep the un-stepped result so it can be restored
-	HLVecCopy(origin, nosteporg);
-	HLVecCopy(velocity, nostepvel);
-
-	//back to the start, lift by a step, retry horizontally
-	HLVecCopy(oldorg, origin);
-
-	HLVecSet(upmove, 0.0, 0.0, HLPHYS_STEPSIZE);
-	HLVecSet(downmove, 0.0, 0.0, -HLPHYS_STEPSIZE + oldvel[2] * dt);
-
-	HLPushMove(map, origin, upmove, &tr);
-
-	velocity[0] = oldvel[0];
-	velocity[1] = oldvel[1];
-	velocity[2] = 0.0;
-
-	clip = HLFlyMove(map, origin, velocity, dt, &step_ground, &steptrace);
-
-	//hull seams can eat the step even when a legal move exists two units away
-	if (clip)
-	{
-		dx = origin[0] - oldorg[0];
-		dy = origin[1] - oldorg[1];
-		if (dx < 0.0) dx = -dx;
-		if (dy < 0.0) dy = -dy;
-
-		if (dx < 0.03125 && dy < 0.03125)
-			clip = HLTryUnstick(map, origin, velocity, oldvel);
-	}
-
-	//extra friction for running at a wall head-on
-	if ((clip & HLBLOCK_WALL) && view_angles)
-		HLWallFriction(velocity, view_angles, steptrace.plane_normal);
-
-	//settle back down onto whatever is below
-	HLPushMove(map, origin, downmove, &downtrace);
-
-	//which rejection fired, and what the down-trace landed on; the normal is
-	//the decision
-	if (hl_stair_log && hl_stair_reports < HLSTAIR_MAX_REPORTS)
-	{
-		hl_stair_reports++;
-
-		if (downtrace.plane_normal[2] > 0.7)
-			verdict = "KEPT";
-		else
-			verdict = "REVERT";
-
-		StrPrint(hl_stair_line,
-			"stair: up %4.1f fwd(%5.2f,%5.2f) clip %d dn n_z %4.2f %s\n",
-			origin[2] - oldorg[2],
-			origin[0] - oldorg[0], origin[1] - oldorg[1],
-			clip, downtrace.plane_normal[2], verdict);
-
-		HLLog(hl_stair_line);
-		HLLogFlush;
-	}
-
-	if (downtrace.plane_normal[2] > 0.7)
-	{
-		if (_ground)
-			*_ground = TRUE;
-	}
-	else
-	{
-		//nothing worth standing on, discard the step
-		HLVecCopy(nosteporg, origin);
-		HLVecCopy(nostepvel, velocity);
-
-		if (_ground)
-			*_ground = flat_ground;
-	}
-}
-
-U0 HLAccelerate(F64 *velocity, F64 *wishdir, F64 wishspeed, F64 accel, F64 dt)
-{//add speed along wishdir, never past wishspeed in that direction
-	F64 current = HLVecDot(velocity, wishdir);
-	F64 add     = wishspeed - current;
-	F64 amount;
-
-	if (add <= 0.0)
-		return;
-
-	amount = accel * dt * wishspeed;
-	if (amount > add)
-		amount = add;
-
-	HLVecMA(velocity, amount, wishdir, velocity);
-}
-
-U0 HLAirAccelerate(F64 *velocity, F64 *wishdir, F64 wishspeed, F64 accel,
-	F64 dt)
-{//PM_AirAccelerate
- //
- //the asymmetry is deliberate in the SDK: the 30 unit/s cap applies to the
- //target (addspeed), but the step size still scales with the uncapped wishspeed.
- //Moving sideways relative to velocity therefore keeps adding speed the cap
- //never sees, which is airstrafing. Using the capped value in both places
- //removes HL air movement.
-	F64 wishspd = wishspeed;
-	F64 current;
-	F64 add;
-	F64 amount;
-
-	if (wishspd > HLPHYS_AIRSPEEDCAP)
-		wishspd = HLPHYS_AIRSPEEDCAP;
-
-	current = HLVecDot(velocity, wishdir);
-	add     = wishspd - current;
-
-	if (add <= 0.0)
-		return;
-
-	amount = accel * wishspeed * dt;
-	if (amount > add)
-		amount = add;
-
-	HLVecMA(velocity, amount, wishdir, velocity);
-}
-
-U0 HLCheckVelocity(F64 *velocity)
-{//PM_CheckVelocity: per axis, so a diagonal is not clamped harder
-	I64 i;
-
-	for (i = 0; i < 3; i++)
-	{
-		if (velocity[i] > HLPHYS_MAXVELOCITY)
-			velocity[i] = HLPHYS_MAXVELOCITY;
-		if (velocity[i] < -HLPHYS_MAXVELOCITY)
-			velocity[i] = -HLPHYS_MAXVELOCITY;
-	}
-}
-
-U0 HLPreventMegaBunny(F64 *velocity)
-{//PM_PreventMegaBunnyJumping: called on the jump, not every frame
-	F64 maxscaled = HLPHYS_BUNNY_FACTOR * HLPHYS_MAXSPEED;
-	F64 spd       = HLVecLength(velocity);
-	F64 fraction;
-
-	if (spd <= maxscaled)
-		return;
-
-	fraction = (maxscaled / spd) * HLPHYS_BUNNY_SCALE;
-
-	velocity[0] *= fraction;
-	velocity[1] *= fraction;
-	velocity[2] *= fraction;
-}
-
-U0 HLFriction(CHLMap *map, F64 *origin, F64 *velocity, F64 dt)
-{//PM_Friction, ground branch only; the caller runs it only when on ground.
- //control is floored at stopspeed so the stop stays crisp
-	CHLTrace tr;
-	F64 speed = Sqrt(velocity[0] * velocity[0] + velocity[1] * velocity[1] +
-					 velocity[2] * velocity[2]);
-	F64 start[3];
-	F64 stop[3];
-	F64 zbox[3];
-	F64 friction;
-	F64 control;
-	F64 drop;
-	F64 newspeed;
-
-	if (speed < 0.1)
-	{
-		velocity[0] = 0.0;
-		velocity[1] = 0.0;
-		return;
-	}
-
-	//--- edge friction ---
-	//probe 16 units ahead along the direction of travel and 34 down from the
-	//feet. nothing under it means the leading edge is over a drop, and
-	//movevars->edgefriction doubles friction there, which is what lets the
-	//player stop on the lip of a ledge instead of skating off. one trace a tick.
-	friction = HLPHYS_FRICTION;
-
-	//divided by the full 3D speed, as the original does, so a fast descent
-	//shortens the horizontal reach of the probe
-	start[0] = origin[0] + velocity[0] / speed * 16.0;
-	start[1] = origin[1] + velocity[1] / speed * 16.0;
-	start[2] = origin[2] + hl_player_mins[2];
-	stop[0]  = start[0];
-	stop[1]  = start[1];
-	stop[2]  = start[2] - 34.0;
-
-	//deviation: a point trace, as quake's SV_UserFriction does, not pm_shared's
-	//PM_PlayerTrace. the start is at foot height while the trace sweeps the box
-	//centre, so with the player hull the box begins 36 units into the floor,
-	//returns start_solid at fraction 1, and doubles friction on every surface
-	HLVecSet(zbox, 0.0, 0.0, 0.0);
-	HLTraceEntity(map, start, stop, zbox, zbox, hl_move_pass, FALSE, &tr);
-
-	if (tr.fraction == 1.0)
-		friction *= HLPHYS_EDGEFRICTION;
-
-	//pmove->friction; see hl_surface_friction, nothing sets it
-	friction *= hl_surface_friction;
-
-	if (speed < HLPHYS_STOPSPEED)
-		control = HLPHYS_STOPSPEED;
-	else
-		control = speed;
-
-	drop     = control * friction * dt;
-	newspeed = speed - drop;
-
-	if (newspeed < 0.0)
-		newspeed = 0.0;
-
-	newspeed /= speed;
-
-	velocity[0] *= newspeed;
-	velocity[1] *= newspeed;
-	velocity[2] *= newspeed;
-}
-
-U0 HLWaterMove(CHLMap *map, F64 *origin, F64 *velocity, F64 *wishdir,
-	F64 wishspeed, F64 dt, Bool *_ground, I64 water_level = 2)
-{//PM_WaterMove, not quake's SV_WaterMove
- //
- //three numbers differ from quake: friction is 1 per second rather than 4, it is
- //scaled by pmove->friction (the surface multiplier) and not by
- //movevars->friction, and the wish is cut to 0.8 rather than 0.7. acceleration
- //is measured against the post-friction speed.
- //
- //water_level only reaches the move at the bottom, which needs to know the
- //player is in liquid at all to allow a step
-	F64  wishvel[3];
-	F64  temp[3];
-	F64  wish;
-	F64  speed;
-	F64  newspeed;
-	F64  addspeed;
-	F64  accelspeed;
-	Bool on_ground;
-
-	//user intent. the caller keeps the vertical component of the wish while
-	//submerged, so looking up and pressing forward swims up
-	HLVecScale(wishdir, wishspeed, wishvel);
-
-	//"drift towards bottom": no input sinks rather than hovers, and drives the
-	//feet into a platform so it can be named as ground below
-	if (wishspeed < 1.0)
-		wishvel[2] -= HLPHYS_WATERSINK;
-
-	wish = HLVecLength(wishvel);
-	if (wish > HLPHYS_MAXSPEED)
-	{
-		HLVecScale(wishvel, HLPHYS_MAXSPEED / wish, wishvel);
-		wish = HLPHYS_MAXSPEED;
-	}
-
-	//"Slow us down a bit"
-	wish *= HLPHYS_WATERSPEED;
-
-	//--- water friction ---
-	HLVecCopy(velocity, temp);
-	speed    = HLVecNormalize(temp);
-	newspeed = 0.0;
-
-	if (speed > 0.0)
-	{
-		newspeed = speed - dt * speed * HLPHYS_WATERFRICTION *
-			hl_surface_friction;
-		if (newspeed < 0.0)
-			newspeed = 0.0;
-
-		HLVecScale(velocity, newspeed / speed, velocity);
-	}
-
-	//--- water acceleration ---
-	//order matters: friction has already run, so the shortfall is measured
-	//against the post-friction speed. accelerating first and bleeding it off
-	//afterwards gives a weaker swim
-	if (wish >= 0.1)
-	{
-		addspeed = wish - newspeed;
-
-		if (addspeed > 0.0)
-		{
-			HLVecNormalize(wishvel);
-
-			accelspeed = HLPHYS_ACCEL * wish * dt * hl_surface_friction;
-			if (accelspeed > addspeed)
-				accelspeed = addspeed;
-
-			HLVecMA(velocity, accelspeed, wishvel, velocity);
-		}
-	}
-
-	//--- the move ---
-	//
-	//deviation, the one place this does not follow PM_WaterMove. the SDK (and
-	//quake's SV_WaterMove before it) ends with "assume it is a stair or a slope,
-	//so press down from stepheight above": build the destination, probe straight
-	//down onto it from a step above, keep the result if the probe was not in
-	//solid. Two problems here:
-	//
-	//  - the probe is purely vertical, so nothing tests the horizontal path. any
-	//    wall thin enough that the far side is open at both heights is swum
-	//    straight through.
-	//  - it cannot name what it landed on, and resting on a brush entity has to
-	//    set ground + groundentity or SV_PushMove never treats the player as a
-	//    rider and a plat crushes them instead of carrying them.
-	//
-	//HLWalkMove does the same job: slide the real move, and if a wall stopped it,
-	//retry a step higher. its airborne guard is written `!old_ground &&
-	//water_level == 0` so a swimmer keeps the step retry, which is how submerged
-	//stairs are climbed and a pool is exited onto a ledge without jumping.
-	//
-	//cleared as SV_WalkMove clears FL_ONGROUND; the move restores it on contact
-	hl_ground_entity = 0;
-	on_ground        = FALSE;
-
-	//old_ground FALSE: floating, not standing. no view angles either: wall
-	//friction is a running-into-a-wall effect and does not belong in water
-	HLWalkMove(map, origin, velocity, dt, FALSE, &on_ground, NULL,
-		water_level, FALSE);
-
-	if (_ground)
-		*_ground = on_ground;
+		HLVecMA(hl_pm_vel, HLPHYS_CLIMBSPEED, tr.plane_normal, hl_pm_vel);
 }
 
 //item touch boxes are padded; the builtins need this too, so it lives here
@@ -2075,116 +2240,121 @@ U0 HLGameLinkEdict(I64 ent)
 // high to swim over: the engine takes the move away from the player for two
 // seconds and pushes them at the ledge while they rise.
 
-U0 HLCheckWaterJump(CHLMap *map, F64 *origin, F64 *velocity, F64 *view_angles)
-{//arm a water jump when the player is swimming into a near-vertical ledge
+U0 HLPMCheckWaterJump()
+{//PM_CheckWaterJump: arm a water jump when swimming into a near-vertical ledge
 	CHLTrace tr;
 	F64 flat_fwd[3];
 	F64 flat_vel[3];
 	F64 vec_start[3];
 	F64 vec_end[3];
-	F64 zbox[3];
+	F64 save_mins[3];
+	F64 save_maxs[3];
 	F64 push[3];
+	F64 top;
 	F64 curspeed;
 	F64 nz;
 
 	//already going
-	if (hl_waterjump_time > 0.0)
+	if (HLPMInWaterJump())
 		return;
 
 	//"only hop out if we are moving up": sinking this fast means the player has
 	//just jumped in, and popping them back out fights the input
-	if (velocity[2] < HLPHYS_WJ_SINKING)
+	if (hl_pm_vel[2] < HLPHYS_WJ_SINKING)
 		return;
 
 	//no view basis, no idea which way "at the ledge" is
-	if (!view_angles)
+	if (!hl_pm_have_view)
 		return;
 
-	HLAngleVectors(view_angles, flat_fwd, NULL, NULL);
+	HLAngleVectors(hl_pm_view, flat_fwd, NULL, NULL);
 	flat_fwd[2] = 0.0;
 	HLVecNormalize(flat_fwd);
 
-	HLVecSet(flat_vel, velocity[0], velocity[1], 0.0);
+	HLVecSet(flat_vel, hl_pm_vel[0], hl_pm_vel[1], 0.0);
 	curspeed = HLVecNormalize(flat_vel);
 
 	//"are we backing into water from steps or something?": moving away from where
 	//the player is looking is deliberate, so do not pop them forward
-	if (curspeed > 0.0 && HLVecDot(flat_vel, flat_fwd) < 0.0)
+	if (curspeed != 0.0 && HLVecDot(flat_vel, flat_fwd) < 0.0)
 		return;
 
-	//both probes use the point hull, as pm_shared switches usehull to do: the
+	//the top of the box has to be read before the hull is swapped, as the SDK
+	//reads player_maxs[savehull]
+	top = hl_player_maxs[2];
+
+	//both probes use the point hull, as pm_shared's usehull switch does: the
 	//question is whether a 24 unit reach is clear, not whether the body fits
-	HLVecSet(zbox, 0.0, 0.0, 0.0);
+	HLVecCopy(hl_player_mins, save_mins);
+	HLVecCopy(hl_player_maxs, save_maxs);
+	HLVecSet(hl_player_mins, 0.0, 0.0, 0.0);
+	HLVecSet(hl_player_maxs, 0.0, 0.0, 0.0);
 
 	//low probe, at chest height, looking for the wall
-	HLVecCopy(origin, vec_start);
+	HLVecCopy(hl_pm_org, vec_start);
 	vec_start[2] += HLPHYS_WJ_HEIGHT;
 	HLVecMA(vec_start, HLPHYS_WJ_FORWARD, flat_fwd, vec_end);
 
-	HLTraceEntity(map, vec_start, vec_end, zbox, zbox, hl_move_pass, FALSE,
-		&tr);
-
-	if (tr.fraction >= 1.0)
-		return;
+	HLPMTrace(vec_start, vec_end, &tr);
 
 	nz = tr.plane_normal[2];
 	if (nz < 0.0)
 		nz = -nz;
 
 	//near vertical only; anything the player can swim up needs no scripted jump
-	if (nz >= 0.1)
-		return;
+	if (tr.fraction < 1.0 && nz < 0.1)
+	{
+		//the push comes off the low probe's plane, so it is taken before the
+		//trace is reused. negative: the normal faces back at the player and the
+		//jump goes the other way, into the ledge
+		HLVecScale(tr.plane_normal, HLPHYS_WJ_PUSH, push);
 
-	//the push comes off the low probe's plane, so it is taken before the trace is
-	//reused below. negative: the normal faces back at the player and the jump
-	//goes the other way, into the ledge
-	HLVecScale(tr.plane_normal, HLPHYS_WJ_PUSH, push);
+		//high probe, at the top of the box: the ledge has to be clear up there
+		//or this is a wall and the jump ends inside it
+		vec_start[2] += top - HLPHYS_WJ_HEIGHT;
+		HLVecMA(vec_start, HLPHYS_WJ_FORWARD, flat_fwd, vec_end);
 
-	//high probe, at the top of the box: the ledge has to be clear up there or
-	//this is a wall and the jump ends inside it
-	vec_start[2] = origin[2] + hl_player_maxs[2];
-	HLVecMA(vec_start, HLPHYS_WJ_FORWARD, flat_fwd, vec_end);
+		HLPMTrace(vec_start, vec_end, &tr);
 
-	HLTraceEntity(map, vec_start, vec_end, zbox, zbox, hl_move_pass, FALSE,
-		&tr);
+		if (tr.fraction == 1.0)
+		{
+			hl_waterjump_time = HLPHYS_WJ_TIME;
+			HLVecCopy(push, hl_waterjump_dir);
+			hl_pm_vel[2] = HLPHYS_WJ_UP;
 
-	if (tr.fraction < 1.0)
-		return;
+			//oldbuttons |= IN_JUMP: the jump is scripted from here, so a held
+			//jump key must not fire again when it ends
+			hl_jump_held = TRUE;
+		}
+	}
 
-	hl_waterjump_time = HLPHYS_WJ_TIME;
-	HLVecCopy(push, hl_waterjump_dir);
-	velocity[2] = HLPHYS_WJ_UP;
-
-	//oldbuttons |= IN_JUMP: the jump is scripted from here, so a held jump key
-	//must not fire again when it ends
-	hl_jump_held = TRUE;
+	HLVecCopy(save_mins, hl_player_mins);
+	HLVecCopy(save_maxs, hl_player_maxs);
 }
 
-Bool HLWaterJumpService(F64 *velocity, I64 water_level, F64 dt)
+U0 HLPMWaterJump()
 {//PM_WaterJump: run the timer down and hold the horizontal push
+ //
+ //the external FL_WATERJUMP form has no timer of its own here: the shell decides
+ //when it ends and has already written movedir into the velocity, so only the
+ //native timer is serviced
 	if (hl_waterjump_time <= 0.0)
-		return FALSE;
+		return;
 
 	//the SDK clamps here because a save game can carry a nonsense value. kept for
 	//the same reason: a timer that never expires disables gravity
 	if (hl_waterjump_time > 10.0)
 		hl_waterjump_time = 10.0;
 
-	hl_waterjump_time -= dt;
+	hl_waterjump_time -= hl_pm_frametime;
 
-	//timed out, or cleared the water
-	if (hl_waterjump_time <= 0.0 || water_level == 0)
-	{
+	if (hl_waterjump_time < 0.0 || hl_pm_waterlevel == 0)
 		hl_waterjump_time = 0.0;
-		return FALSE;
-	}
 
 	//the horizontal velocity is replaced every tick, not accelerated, so the
 	//pop-out is identical every time
-	velocity[0] = hl_waterjump_dir[0];
-	velocity[1] = hl_waterjump_dir[1];
-
-	return TRUE;
+	hl_pm_vel[0] = hl_waterjump_dir[0];
+	hl_pm_vel[1] = hl_waterjump_dir[1];
 }
 
 //--- fall damage -----------------------------------------------------------
@@ -2194,7 +2364,7 @@ Bool HLWaterJumpService(F64 *velocity, I64 water_level, F64 dt)
 // PLAYER_MAX_SAFE_FALL_SPEED, asks the gamerules for FlPlayerFallDamage and
 // calls TakeDamage. see hl_fall_damage_pending for why it is only queued here.
 
-U0 HLCheckFalling(Bool on_ground, I64 water_level)
+U0 HLPMCheckFalling()
 {//end-of-move: settle up for a fall that has just landed
 	F64 fvol;
 
@@ -2202,22 +2372,17 @@ U0 HLCheckFalling(Bool on_ground, I64 water_level)
 	hl_fall_sound_vol = 0.0;
 	hl_fall_pain      = FALSE;
 
-	if (!on_ground)
-		return;
-
-	//water breaks a fall completely. pm_shared skips the sound in water and
-	//CBasePlayer::WaterMove zeroes the counter, so nothing is owed
-	if (water_level > 0)
-	{
-		hl_fall_velocity = 0.0;
-		return;
-	}
-
-	if (hl_fall_velocity >= HLPHYS_FALL_PUNCH)
+	if (hl_pm_onground != -1 && hl_fall_velocity >= HLPHYS_FALL_PUNCH)
 	{
 		fvol = 0.5;
 
-		if (hl_fall_velocity > HLPHYS_FALL_SAFE)
+		//water breaks a fall completely: the SDK's first branch is empty and
+		//leaves fvol set, but the sound is suppressed by the fvol test below in
+		//no version - it plays. Silence is the intent and CBasePlayer::WaterMove
+		//zeroes the counter, so nothing is owed
+		if (hl_pm_waterlevel > 0)
+			fvol = 0.0;
+		else if (hl_fall_velocity > HLPHYS_FALL_SAFE)
 		{
 			//player/pl_fallpain3.wav. the SDK randomises between pain2 and
 			//pain3 with a switch whose first case has no break, so case 0 falls
@@ -2236,86 +2401,529 @@ U0 HLCheckFalling(Bool on_ground, I64 water_level)
 			fvol = 0.85;
 
 		//the SDK's fourth branch, fvol = 0 below PLAYER_MIN_BOUNCE_SPEED (200),
-		//is omitted: it is unreachable, the outer test already demanding 350
+		//is unreachable: the outer test already demands 350
 
-		hl_fall_sound_vol = fvol;
+		if (fvol > 0.0)
+		{
+			//"play landing step right away"
+			hl_step_time = 0.0;
+			hl_fall_sound_vol = fvol;
 
-		//punchangle[2], a roll and not a pitch. the SDK clamps punchangle[0],
-		//a different axis; the clamp is applied to the axis written
-		hl_fall_punch_z = hl_fall_velocity * 0.013;
-		if (hl_fall_punch_z > 8.0)
-			hl_fall_punch_z = 8.0;
+			//punchangle[2], a roll and not a pitch. the SDK clamps punchangle[0],
+			//a different axis; the clamp is applied to the axis written
+			hl_fall_punch_z = hl_fall_velocity * 0.013;
+			if (hl_fall_punch_z > 8.0)
+				hl_fall_punch_z = 8.0;
+		}
 	}
 
-	hl_fall_velocity = 0.0;
+	if (hl_pm_onground != -1)
+		hl_fall_velocity = 0.0;
+}
+
+U0 HLPMUpdateStepSound()
+{//PM_UpdateStepSound: a step every flTimeStepSound, so the cadence tracks speed
+ //
+ //deviation: there is no materials.txt and no way to name the texture under the
+ //player, so PM_CatagorizeTextureType and the CHAR_TEX_* switch are absent and
+ //every dry surface reports STEP_CONCRETE. All the concrete cases carry the same
+ //volumes and intervals anyway - 0.2/400ms walking, 0.5/300ms running - so only
+ //vent, dirt and grate lose their distinct volume. The knee and feet water
+ //probes are kept: those change the sample set, not just its loudness.
+	F64		knee[3];
+	F64		feet[3];
+	F64		height;
+	F64		speed;
+	F64		velwalk;
+	F64		velrun;
+	F64		flduck;
+	F64		fvol;
+	I64		step;
+	Bool	walking;
+	Bool	moving;
+
+	if (hl_step_time > 0.0)
+		return;
+
+	speed = HLVecLength(hl_pm_vel);
+
+	//"UNDONE: need defined numbers for run, walk, crouch, crouch run velocities"
+	if (hl_ducking || hl_pm_on_ladder)
+	{
+		velwalk = 60.0;
+		velrun  = 80.0;
+		flduck  = 0.1;		//the SDK's 100ms
+	}
+	else
+	{
+		velwalk = 120.0;
+		velrun  = 210.0;
+		flduck  = 0.0;
+	}
+
+	moving = FALSE;
+	if (hl_pm_on_ladder || hl_pm_onground != -1)
+	{
+		//"if pmove->flTimeStepSound is zero, get the new sound right away - we
+		//just started moving in new level". The timer is zero here by the guard
+		//above, so speed alone gates it
+		if (speed > 0.0 && speed >= velwalk)
+			moving = TRUE;
+	}
+
+	if (!moving)
+		return;
+
+	walking = ToBool(speed < velrun);
+
+	HLVecCopy(hl_pm_org, knee);
+	HLVecCopy(hl_pm_org, feet);
+
+	height  = hl_player_maxs[2] - hl_player_mins[2];
+	knee[2] = hl_pm_org[2] - 0.3 * height;
+	feet[2] = hl_pm_org[2] - 0.5 * height;
+
+	if (hl_pm_on_ladder)
+	{
+		step         = HLPM_STEP_LADDER;
+		fvol         = 0.35;
+		hl_step_time = 0.35;
+	}
+	else if (HLPointContents(hl_pm_map, knee) == HLCONTENTS_WATER)
+	{
+		step         = HLPM_STEP_WADE;
+		fvol         = 0.65;
+		hl_step_time = 0.6;
+	}
+	else if (HLPointContents(hl_pm_map, feet) == HLCONTENTS_WATER)
+	{
+		step = HLPM_STEP_SLOSH;
+
+		if (walking)
+		{
+			fvol         = 0.2;
+			hl_step_time = 0.4;
+		}
+		else
+		{
+			fvol         = 0.5;
+			hl_step_time = 0.3;
+		}
+	}
+	else
+	{
+		step = HLPM_STEP_CONCRETE;
+
+		if (walking)
+		{
+			fvol         = 0.2;
+			hl_step_time = 0.4;
+		}
+		else
+		{
+			fvol         = 0.5;
+			hl_step_time = 0.3;
+		}
+	}
+
+	//"slower step time if ducking"
+	hl_step_time += flduck;
+
+	//"35% volume if ducking"
+	if (hl_ducking)
+		fvol *= 0.35;
+
+	//PM_PlayStepSound alternates left and right rather than choosing at random,
+	//so the cadence is regular. The shell drains hl_step_play.
+	hl_step_side = (hl_step_side + 1) & 3;
+	hl_step_kind = step;
+	hl_step_vol  = fvol;
+	hl_step_play = TRUE;
+}
+
+U0 HLPMUnDuck()
+{//PM_UnDuck
+ //
+ //the raised origin is traced with the ducked hull first, then with the standing
+ //one; either being solid keeps the player crouched. The position is
+ //recategorised afterwards because the origin moved 18 units, and the ground
+ //entity has to name what is under the new box or a pusher stops carrying.
+	CHLTrace	trace;
+	F64		new_origin[3];
+
+	HLVecCopy(hl_pm_org, new_origin);
+
+	//origin[i] += (player_mins[1][i] - player_mins[0][i]). Only z differs
+	//between the hulls, by 18, so the feet stay put
+	if (hl_pm_onground != -1)
+		new_origin[2] += HLPHYS_DUCK_SHIFT;
+
+	//still the small hull here: if the raised origin is inside geometry even at
+	//36 tall there is nothing to test with the tall box
+	HLPMTrace(new_origin, new_origin, &trace);
+
+	if (trace.start_solid)
+		return;
+
+	HLDuckSetHull(FALSE);
+
+	HLPMTrace(new_origin, new_origin, &trace);
+
+	if (trace.start_solid)
+	{
+		//"changing hulls stuck us into something": stay ducked with the duck
+		//hull until there is a clear spot
+		HLDuckSetHull(TRUE);
+		return;
+	}
+
+	hl_ducking      = FALSE;
+	hl_duck_pending = FALSE;
+	hl_view_ofs_z   = HLPHYS_VIEW_Z;
+	hl_duck_time    = 0.0;
+
+	HLVecCopy(new_origin, hl_pm_org);
+
+	//"recatagorize position since ducking can change origin"
+	HLPMCatagorizePosition;
+}
+
+U0 HLPMDuck()
+{//PM_Duck, run before the move so the trace box is right for this tick
+ //
+ //the duck multiplier belongs here, on the command, not on the normalised
+ //wishspeed PM_WalkMove derives from it: PM_WalkMove clamps the command's
+ //magnitude to maxspeed and only then measures the wish, so scaling afterwards
+ //applies the cut to an already-clamped number and comes out low.
+	F64		time;
+	F64		duck_fraction;
+	F64		more;
+	Bool	pressed;
+	Bool	want;
+
+	//nButtonPressed: the press edge, not the held state. Re-arming the timer
+	//every tick the key is down would restart the transition forever.
+	pressed           = ToBool(hl_pm_duck_btn && !hl_duck_held_last);
+	hl_duck_held_last = hl_pm_duck_btn;
+
+	//cmd.forwardmove/sidemove/upmove *= PLAYER_DUCKING_MULTIPLIER, while
+	//FL_DUCKING is already set. The cut therefore applies from the tick after
+	//the duck completes, not during the transition.
+	if (hl_ducking)
+		hl_pm_move *= HLPM_DUCK_MULT;
+
+	//(buttons & IN_DUCK) || bInDuck || (flags & FL_DUCKING)
+	want = ToBool(hl_pm_duck_btn || hl_duck_pending || hl_ducking);
+
+	if (!want)
+		return;
+
+	if (!hl_pm_duck_btn)
+	{
+		HLPMUnDuck;
+		return;
+	}
+
+	if (pressed && !hl_ducking)
+	{
+		//"use 1 second so super long jump will work". The timer is a full
+		//second; the transition itself finishes after TIME_TO_DUCK.
+		hl_duck_time    = HLPM_DUCK_TIMER;
+		hl_duck_pending = TRUE;
+	}
+
+	if (!hl_duck_pending)
+		return;
+
+	//time = max(0, 1 - flDuckTime/1000): seconds spent in the transition
+	time = HLPM_DUCK_TIMER - hl_duck_time;
+	if (time < 0.0)
+		time = 0.0;
+
+	//"finish ducking immediately if duck time is over or not on ground".
+	//onground is fresh here: PM_CatagorizePosition ran at the top of the move,
+	//so a player standing on a platform is not mistaken for an airborne one and
+	//sent through the branch that skips the origin shift.
+	if (hl_duck_time <= HLPM_DUCK_TIMER - HLPHYS_DUCK_TIME ||
+		hl_pm_onground == -1)
+	{
+		HLDuckSetHull(TRUE);
+		hl_view_ofs_z   = HLPHYS_DUCK_VIEW_Z;
+		hl_ducking      = TRUE;
+		hl_duck_pending = FALSE;
+
+		//"HACKHACK - Fudge for collision bug". Airborne the box shrinks around
+		//the origin and the feet rise 18 units, which is what lets a ducked
+		//jump clear a gap the standing box cannot.
+		if (hl_pm_onground != -1)
+		{
+			//origin[i] -= (player_mins[1][i] - player_mins[0][i]). Only z
+			//differs between the hulls, by 18, so the feet stay put.
+			hl_pm_org[2] -= HLPHYS_DUCK_SHIFT;
+
+			HLPMFixCrouchStuck(1.0);	//STUCK_MOVEUP
+
+			//"recatagorize position since ducking can change origin"
+			HLPMCatagorizePosition;
+		}
+
+		return;
+	}
+
+	//mid-transition the origin has not moved yet, so the eye has to travel the
+	//whole way down on its own: the target is VEC_DUCK_VIEW - fMore, which is
+	//below the ducked eye height, and the origin shift at the end makes up the
+	//difference. Lerping to VEC_DUCK_VIEW instead snaps the view up 18 units
+	//the instant the duck completes.
+	more          = HLPHYS_DUCK_MINS_Z - HLPHYS_MINS_Z;
+	duck_fraction = HLDuckSpline(time / HLPHYS_DUCK_TIME);
+
+	hl_view_ofs_z = (HLPHYS_DUCK_VIEW_Z - more) * duck_fraction +
+					HLPHYS_VIEW_Z * (1.0 - duck_fraction);
+}
+
+U0 HLPMCheckParameters()
+{//PM_CheckParamters, the clamp order the duck multiplier depends on
+ //
+ //the command triple is scaled down to maxspeed FIRST, and PM_Duck's 0.333 is
+ //applied to the result. clientmaxspeed is pev->maxspeed, which nothing in this
+ //tree sets, so pmove->maxspeed stays sv_maxspeed.
+ //
+ //not ported: PM_DropPunchAngle and the view angle assembly, which the shell
+ //owns (HLDropPunchAngle), and the FL_FROZEN / FL_ONTRAIN / dead cases, which
+ //the shell decides before it builds the wish.
+	F64 spd = hl_pm_move;
+
+	if (spd < 0.0)
+		spd = -spd;
+
+	if (spd != 0.0 && spd > hl_pm_maxspeed)
+		hl_pm_move *= hl_pm_maxspeed / spd;
+}
+
+U0 HLPMReduceTimers()
+{//PM_ReduceTimers
+ //
+ //flTimeStepSound, flDuckTime and flSwimTime, in seconds rather than the SDK's
+ //milliseconds. flSwimTime gates the swim sound, which this tree does not play.
+	if (hl_step_time > 0.0)
+	{
+		hl_step_time -= hl_pm_frametime;
+		if (hl_step_time < 0.0)
+			hl_step_time = 0.0;
+	}
+
+	if (hl_duck_time > 0.0)
+	{
+		hl_duck_time -= hl_pm_frametime;
+		if (hl_duck_time < 0.0)
+			hl_duck_time = 0.0;
+	}
+}
+
+U0 HLPreventMegaBunny()
+{//PM_PreventMegaBunnyJumping: called on the jump, not every frame
+	F64 maxscaled = HLPHYS_BUNNY_FACTOR * hl_pm_maxspeed;
+	F64 spd;
+	F64 fraction;
+
+	if (maxscaled <= 0.0)
+		return;
+
+	spd = HLVecLength(hl_pm_vel);
+
+	if (spd <= maxscaled)
+		return;
+
+	fraction = (maxscaled / spd) * HLPHYS_BUNNY_SCALE;
+
+	HLVecScale(hl_pm_vel, fraction, hl_pm_vel);
+}
+
+U0 HLPMJump()
+{//PM_Jump
+ //
+ //not ported: the TFC feign-death case, the super long jump module (no
+ //hl_items), and the swim sound. The ducked jump is: sqrt(2*800*45) either way,
+ //the longjump branch being the only thing that differs.
+	if (HLPMInWaterJump())
+	{
+		//"see if we are waterjumping. If so, decrement count and return."
+		hl_waterjump_time -= hl_pm_frametime;
+		if (hl_waterjump_time < 0.0)
+			hl_waterjump_time = 0.0;
+
+		return;
+	}
+
+	//"if we are in the water most of the way": swimming, not jumping
+	if (hl_pm_waterlevel >= 2)
+	{
+		hl_pm_onground = -1;
+
+		if (hl_pm_watertype == HLCONTENTS_WATER)
+			hl_pm_vel[2] = 100.0;
+		else if (hl_pm_watertype == HLCONTENTS_SLIME)
+			hl_pm_vel[2] = 80.0;
+		else
+			hl_pm_vel[2] = 50.0;
+
+		return;
+	}
+
+	//"no more effect": in air
+	if (hl_pm_onground == -1)
+	{
+		hl_jump_held = TRUE;
+		return;
+	}
+
+	//"don't pogo stick"
+	if (hl_jump_held)
+		return;
+
+	hl_pm_onground = -1;
+
+	//scale the whole velocity back before adding the jump, or each hop compounds
+	//the last without limit
+	HLPreventMegaBunny;
+
+	//sqrt(2 * 800 * 45), exactly enough to clear 45 units, ducked or not
+	hl_pm_vel[2] = HLPHYS_JUMP;
+
+	//"decay it for simulation": the jump is applied after PM_AddCorrectGravity
+	//has already taken its half, so the other half is taken here and the arc
+	//starts from the same place a mid-tick jump would
+	HLPMFixupGravityVelocity;
+
+	hl_jump_held = TRUE;
+}
+
+U0 HLPMPlatformBaseVelocity()
+{//pmove->basevelocity from the pusher under the player
+ //
+ //v + omega x r, evaluated at the rider's own position: a passenger standing off
+ //the axis of a turning tracktrain is carried around the corner by the same
+ //tangential velocity SV_PushRotate would have swung them through, and the
+ //carry happens inside the move rather than as a teleport applied after it.
+ //
+ //Yaw only. omega is about z, so omega x r is (-w*ry, w*rx, 0) with w in radians
+ //per second and r the offset from the pivot in the horizontal plane.
+	F64 w;
+	F64 rx;
+	F64 ry;
+
+	HLVecSet(hl_base_velocity, 0.0, 0.0, 0.0);
+	hl_platform_yaw_carry = 0.0;
+
+	if (!hl_platform_active)
+		return;
+
+	HLVecAdd(hl_base_velocity, hl_platform_velocity, hl_base_velocity);
+
+	if (!HLIsZeroF(hl_platform_avel_z))
+	{
+		w  = hl_platform_avel_z * HLDEG2RAD;
+		rx = hl_pm_org[0] - hl_platform_pivot[0];
+		ry = hl_pm_org[1] - hl_platform_pivot[1];
+
+		hl_base_velocity[0] -= w * ry;
+		hl_base_velocity[1] += w * rx;
+
+		//published for whoever owns the view: SV_PushRotate turns a rider's own
+		//angles by the pusher's delta as well as swinging their position
+		hl_platform_yaw_carry = hl_platform_avel_z * hl_pm_frametime;
+	}
 }
 
 U0 HLPlayerMove(CHLMap *map, F64 *origin, F64 *velocity, F64 *wishdir,
 	F64 wishspeed, Bool jump, F64 dt, Bool *_on_ground, I64 water_level,
 	Bool waterjump, F64 *view_angles = NULL, I64 mover = 0,
 	Bool duck = FALSE)
-{//one tick of player movement
+{//PM_PlayerMove: one tick of player movement, in the SDK's order
  //
- //mover is the edict being moved, as SV_FlyMove takes it: HLFlyMove writes the
+ //mover is the edict being moved, as SV_FlyMove takes it: PM_FlyMove writes the
  //position reached onto it before the touch functions run. A global would make a
  //remote client's move land on whichever edict moved last.
-	Bool on_ground;
-	Bool wj;
-	I64  saved_pass;
-	I64  ladder;
+ //
+ //water_level is the shell's number, computed with the standing hull. It seeds
+ //nothing: PM_CheckWater recomputes with the hull actually in use and is run
+ //again after every origin change, which is the only way a crouch under a low
+ //surface reads as submerged.
+	I64		saved_pass;
+	I64		ladder;
 
-	saved_pass  = hl_move_pass;
+	//no world, no traces. The shell calls this from the menu frame, where the
+	//map may not be loaded yet, and every probe below would log a failure
+	if (!map)
+		return;
+
+	saved_pass   = hl_move_pass;
 	hl_move_pass = mover;
 
-	//clamp to sv_maxspeed, as SV_AirMove does
-	if (wishspeed > HLPHYS_MAXSPEED)
-		wishspeed = HLPHYS_MAXSPEED;
+	//--- load pmove_t ---
+	hl_pm_map = map;
+	HLVecCopy(origin, hl_pm_org);
+	HLVecCopy(velocity, hl_pm_vel);
+	HLVecCopy(wishdir, hl_pm_wishdir);
 
-	//PM_Duck runs before the move: it may resize the trace box and shift the
-	//origin, and everything below has to see the result
-	on_ground = FALSE;
-	if (_on_ground)
-		on_ground = *_on_ground;
+	hl_pm_move      = wishspeed;
+	hl_pm_frametime = dt;
+	hl_pm_maxspeed  = HLPHYS_MAXSPEED;
+	hl_pm_jump_btn  = jump;
+	hl_pm_duck_btn  = duck;
+	hl_pm_wj_extern = waterjump;
+	hl_pm_waterlevel = water_level;
 
-	//PM_PlayerMove records the fall speed at the top of the tick, from the
-	//velocity the previous move left behind. It cannot be read after the move:
-	//WalkMove has zeroed the downward component by then and every landing would
-	//report zero.
-	if (!on_ground)
-		hl_fall_velocity = -velocity[2];
-
-	//PM_Duck scales forwardmove/sidemove/upmove by a third while FL_DUCKING is
-	//already set, after PM_CheckParameters has clamped them to sv_maxspeed. So
-	//the cut applies from the tick after the duck completes, not during it.
-	if (hl_ducking)
-		wishspeed *= 0.333;
-
-	HLDuckUpdate(map, origin, duck, on_ground, dt);
-
-	//the conveyor or current under the player. sampled here because the box the
-	//duck update chose decides where the feet are, and both the walking and the
-	//swimming path below want it
-	HLBaseVelocity(map, origin, on_ground, water_level, hl_base_velocity);
-
-	//--- func_ladder ---
-	//mounted purely by hull overlap, so it is retested every tick, and after
-	//PM_Duck because the box in use decides the overlap
-	ladder = -1;
+	hl_pm_have_view = FALSE;
 	if (view_angles)
-		ladder = HLLadderFind(map, origin);
+	{
+		HLVecCopy(view_angles, hl_pm_view);
+		hl_pm_have_view = TRUE;
+	}
+
+	//--- PM_CheckParamters, then the frame's timers ---
+	HLPMCheckParameters;
+	HLPMReduceTimers;
+
+	//the surface under the player, sampled before anything moves. Currents are
+	//added to this by PM_CheckWater inside PM_CatagorizePosition.
+	HLPMPlatformBaseVelocity;
+
+	//"now that we are unstuck, see where we are (waterlevel and type,
+	//pmove->onground)". HLCheckStuck is the shell's, run before the move.
+	HLPMCatagorizePosition;
+
+	//"if we are not on ground, store off how fast we are moving down". Read here
+	//and not after the move: WalkMove has zeroed the downward component by then
+	//and every landing would report zero.
+	if (hl_pm_onground == -1)
+		hl_fall_velocity = -hl_pm_vel[2];
+
+	//--- PM_Ladder ---
+	//mounted purely by hull overlap, so it is retested every tick
+	ladder = -1;
+	if (hl_pm_have_view)
+		ladder = HLLadderFind(map, hl_pm_org);
 
 	hl_ladder_ent = ladder;
 	hl_on_ladder  = ToBool(ladder >= 0);
 
+	//PM_UpdateStepSound reads movetype == MOVETYPE_FLY, which PM_LadderMove sets
+	//and this tick has not yet. hl_pm_on_ladder therefore still holds last
+	//tick's answer here, as the SDK's does.
+	HLPMUpdateStepSound;
+
+	HLPMDuck;
+
+	hl_pm_on_ladder = hl_on_ladder;
+
+	//--- MOVETYPE_FLY: the ladder owns the velocity outright ---
 	if (ladder >= 0)
 	{
-		//MOVETYPE_FLY for the tick: no gravity, no friction, no step-up and no
-		//base velocity. PM_LadderMove sets the velocity outright; all that
-		//remains is to move along it
-		HLVecSet(hl_base_velocity, 0.0, 0.0, 0.0);
+		HLPMLadderMove(ladder);
 
-		HLLadderMove(map, ladder, origin, velocity, wishdir, view_angles,
-			jump);
+		HLPMCheckWater;
 
 		hl_jump_held = jump;
 
@@ -2325,173 +2933,111 @@ U0 HLPlayerMove(CHLMap *map, F64 *origin, F64 *velocity, F64 *wishdir,
 		hl_fall_sound_vol = 0.0;
 		hl_fall_pain      = FALSE;
 
-		on_ground = FALSE;
-		HLFlyMove(map, origin, velocity, dt, &on_ground, NULL);
+		HLVecAdd(hl_pm_vel, hl_base_velocity, hl_pm_vel);
+		HLPMFlyMove;
+		HLVecSub(hl_pm_vel, hl_base_velocity, hl_pm_vel);
 
-		if (_on_ground)
-			*_on_ground = on_ground;
-
-		hl_move_pass = saved_pass;
-		return;
+		hl_pm_onground = -1;
+		goto qpm_done;
 	}
 
-	//--- water jump ---
-	//the parameter carries the QuakeC-driven flag (PlayerJump sets FL_WATERJUMP
-	//and HLPlayerWaterJump services it); hl_waterjump_time is the native
-	//PM_CheckWaterJump's own. either one owns the move outright.
-	wj = ToBool(waterjump);
-	if (HLWaterJumpService(velocity, water_level, dt))
-		wj = TRUE;
+	//--- MOVETYPE_WALK ---
+	if (!HLPMInWater())
+		HLPMAddCorrectGravity;
 
-	//during a water jump the engine stops interfering: no gravity, no friction,
-	//no ground check
-	if (wj)
+	//"if we are leaping out of the water, just update the counters"
+	if (HLPMInWaterJump())
 	{
-		//scripted movement, so the surface under the player has no say either
-		HLVecSet(hl_base_velocity, 0.0, 0.0, 0.0);
+		HLPMWaterJump;
+		HLPMFlyMove;
+		HLPMCheckWater;
 
-		HLSlideMove(map, origin, velocity, dt);
-
-		if (_on_ground)
-			*_on_ground = FALSE;
-
-		//restored on every exit; leaking it leaves the next HLCheckStuck tracing
-		//with a stale pass entity
-		hl_move_pass = saved_pass;
-		return;
+		hl_pm_onground = -1;
+		goto qpm_done;
 	}
 
-	//swimming: no gravity, but still detect standing on BSP. the original clears
-	//onground inside WalkMove and lets FlyMove set it again
-	if (water_level >= 2)
+	if (hl_pm_waterlevel >= 2)
 	{
 		//at the surface only. fully under there is no ledge in reach and
 		//PM_CheckWaterJump's low probe would be looking at the pool wall
-		if (water_level == 2)
-			HLCheckWaterJump(map, origin, velocity, view_angles);
+		if (hl_pm_waterlevel == 2)
+			HLPMCheckWaterJump;
 
 		//"if we are falling again, then we must not be trying to jump out of
 		//water any more"
-		if (velocity[2] < 0.0 && hl_waterjump_time > 0.0)
+		if (hl_pm_vel[2] < 0.0 && hl_waterjump_time > 0.0)
 			hl_waterjump_time = 0.0;
 
-		//a current in the water is carried as a conveyor is, which is what
-		//CONTENTS_CURRENT_* mostly exists for. PM_WaterMove folds basevelocity in
-		//before its own friction, so the current is dragged along with everything
-		//else rather than added on top of the result
-		HLVecAdd(velocity, hl_base_velocity, velocity);
+		if (jump)
+			HLPMJump;
+		else
+			hl_jump_held = FALSE;
 
-		HLWaterMove(map, origin, velocity, wishdir, wishspeed, dt, &on_ground,
-			water_level);
+		HLPMWaterMove;
 
-		HLVecSub(velocity, hl_base_velocity, velocity);
-		HLCheckVelocity(velocity);
+		HLVecSub(hl_pm_vel, hl_base_velocity, hl_pm_vel);
+
+		//"get a final position"
+		HLPMCatagorizePosition;
 
 		//water breaks the fall, so a dive owes nothing on touching bottom
 		hl_fall_velocity  = 0.0;
 		hl_fall_sound_vol = 0.0;
 		hl_fall_pain      = FALSE;
 
-		if (_on_ground)
-			*_on_ground = on_ground;
-
-		hl_move_pass = saved_pass;
-		return;
+		goto qpm_done;
 	}
 
-	//ground state comes from the previous move, as SV_ClientThink reads
-	//FL_ONGROUND. no downward probe: a 2-unit look-down finds floor at high frame
-	//rates and the jump never leaves the ground.
-
-	//PM_AddCorrectGravity: half the tick's gravity before the move and half
-	//after. Leapfrog integration, and the reason an HL jump arc does not match a
-	//quake one at identical constants.
-	velocity[2] -= HLPHYS_GRAVITY * hl_gravity_scale * 0.5 * dt;
-	HLCheckVelocity(velocity);
-
-	//user input first: friction and acceleration, per PM_WalkMove.
-	//
-	//base velocity was sampled above and is folded in after friction, not before.
-	//pm_shared: "friction is handled before we add in any base velocity. That
-	//way, if we are on a conveyor, we don't slow when standing still, relative to
-	//the conveyor"
-	if (on_ground)
-	{
-		HLFriction(map, origin, velocity, dt);
-		HLAccelerate(velocity, wishdir, wishspeed, HLPHYS_ACCEL, dt);
-
-		//only reached without the VM; otherwise PlayerJump owns this
-		if (jump && !hl_jump_held)
-		{
-			//scale the whole velocity back before adding the jump, or each hop
-			//compounds the last without limit
-			HLPreventMegaBunny(velocity);
-
-			velocity[2] = HLPHYS_JUMP;
-			on_ground   = FALSE;
-		}
-	}
+	//--- not underwater ---
+	if (jump)
+		HLPMJump;
 	else
+		hl_jump_held = FALSE;
+
+	//"friction is handled before we add in any base velocity. That way, if we
+	//are on a conveyor, we don't slow when standing still, relative to the
+	//conveyor."
+	if (hl_pm_onground != -1)
 	{
-		//capped-target acceleration; see HLAirAccelerate
-		HLAirAccelerate(velocity, wishdir, wishspeed, HLPHYS_AIRACCEL, dt);
+		hl_pm_vel[2] = 0.0;
+		HLPMFriction;
 	}
 
-	hl_jump_held = jump;
+	HLPMCheckVelocity;
 
-	//PM_WalkMove and PM_AirMove both fold base velocity in immediately before
-	//the move
-	HLVecAdd(velocity, hl_base_velocity, velocity);
+	if (hl_pm_onground != -1)
+		HLPMWalkMove;
+	else
+		HLPMAirMove;
 
-	//PM_UpdateStepSound: a step every STEP_LEFT/RIGHT of ground distance, not on
-	//a timer, so the cadence tracks speed. Only on the floor and moving; HL is
-	//silent in the air and standing still.
-	if (on_ground && !hl_on_ladder)
-	{
-		F64 gspeed;
+	//"set final flags": the ground entity is re-derived from where the move
+	//actually ended, so a rider who has just stepped onto a platform is riding
+	//it this tick and not next
+	HLPMCatagorizePosition;
 
-		gspeed = Sqrt(velocity[0] * velocity[0] + velocity[1] * velocity[1]);
-
-		if (gspeed > 100.0)
-		{
-			hl_step_dist += gspeed * dt;
-
-			//HL's stride is longer when running; one 105-unit threshold
-			//reads correctly at both speeds
-			if (hl_step_dist > 105.0)
-			{
-				hl_step_dist = 0.0;
-				hl_step_side = (hl_step_side + 1) & 3;
-				hl_step_play = TRUE;
-			}
-		}
-		else
-			hl_step_dist = 0.0;
-	}
-
-	HLWalkMove(map, origin, velocity, dt, on_ground, &on_ground, view_angles,
-		water_level, waterjump);
-
-	//PM_PlayerMove pulls it back out, so the player's own velocity never
+	//"now pull the base velocity back out", so the player's own velocity never
 	//accumulates the surface's: step off a conveyor and the carry stops
-	HLVecSub(velocity, hl_base_velocity, velocity);
-	HLCheckVelocity(velocity);
+	HLVecSub(hl_pm_vel, hl_base_velocity, hl_pm_vel);
+	HLPMCheckVelocity;
 
-	//PM_FixupGravityVelocity: the other half of the tick's gravity, after the
-	//move. skipped when the move ended on the floor, WalkMove having already
-	//zeroed the downward component there
-	if (!on_ground)
-	{
-		velocity[2] -= HLPHYS_GRAVITY * hl_gravity_scale * 0.5 * dt;
-		HLCheckVelocity(velocity);
-	}
+	if (!HLPMInWater())
+		HLPMFixupGravityVelocity;
 
-	//landing sound, screen punch, and the fall damage queued for whoever owns
-	//health. reads hl_fall_velocity, captured at the top of this function.
-	HLCheckFalling(on_ground, water_level);
+	//"if we are on ground, no downward velocity"
+	if (hl_pm_onground != -1)
+		hl_pm_vel[2] = 0.0;
+
+	HLPMCheckFalling;
+
+qpm_done:
+	//--- store pmove_t back ---
+	HLVecCopy(hl_pm_org, origin);
+	HLVecCopy(hl_pm_vel, velocity);
 
 	if (_on_ground)
-		*_on_ground = on_ground;
+		*_on_ground = ToBool(hl_pm_onground != -1);
 
+	//restored on every exit; leaking it leaves the next HLCheckStuck tracing
+	//with a stale pass entity
 	hl_move_pass = saved_pass;
 }

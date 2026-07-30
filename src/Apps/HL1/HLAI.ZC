@@ -374,9 +374,9 @@ U0 HLAISetSequence(CHLEntity *e, U8 *label, Bool loop)
 }
 
 U0 HLAIFireEvent(CHLEntity *e, I64 self, CHLStEvent *ev)
-{//One mstudioevent_t. Only the shared script events are interpreted: codes at
- //2000 and above are dispatched by the monster's own HandleAnimEvent, which
- //this port does not have, and codes below 1000 are client-side effects.
+{//One mstudioevent_t on an entity that is not a tracked monster - a prop or a
+ //scripted actor with no AI slot. Only the shared script events apply: a
+ //monster goes through HLAIMonAnimEvent instead, which handles the whole set.
 	if (!ev->options[0])
 		return;
 
@@ -641,7 +641,18 @@ U0 HLAIScriptEnd(I64 self)
 //     the relationship matrix - barney shoots aliens and ignores the player, a
 //     scientist runs from a zombie.
 //   - melee and ranged attacks gated on range, view cone, sight and refire
-//   - death: the die sequence plays and holds on its last frame
+//   - HandleAnimEvent, per monster: every attack lands on the mstudioevent_t
+//     the animator marked, so a zombie's swing connects on frame 10 of 36 and
+//     the follow-through can be walked out of, and the foley - body drops,
+//     claw swishes, burst fire, reloads - plays where the SDK plays it
+//   - squads (squadmonster.cpp): slots, OccupySlot/VacateSlot, SquadRecruit,
+//     SquadMakeEnemy, NoFriendlyFire and cover spacing, so a fireteam of
+//     grunts puts two men up and the rest in cover
+//   - hearing (soundent.cpp): a world sound list, the player's own footstep
+//     and weapon entry, and the investigate and take-cover-from-sound
+//     schedules that act on it
+//   - death: the die sequence plays and holds on its last frame, or the body
+//     gibs below -40 health
 //
 // Not implemented, and the consequence of each:
 //
@@ -658,20 +669,21 @@ U0 HLAIScriptEnd(I64 self)
 //     edicts and nothing traces a SLIDEBOX. Monsters walk through each other
 //     and through the player, so clearing solid on death is bookkeeping.
 //
-//   - No animation events (mstudioevent_t). The SDK lands a melee hit on an
-//     event embedded in the attack sequence; here the damage is applied when
-//     the attack sequence ends, with the range re-tested first, so stepping
-//     out of a swing avoids it. Ranged fire is one shot at the end of the
-//     sequence rather than a per-event burst.
+//   - No projectiles. The bullsquid's spit, the islave's hornet swarm, the
+//     agrunt's hornets, the controller's energy ball and every grenade are
+//     entities the SDK creates at an animation event and integrates; there is
+//     no runtime entity allocation here. Each is fired as a hitscan on the
+//     same event instead, at the same per-round damage, so the shot lands
+//     instantly rather than travelling.
 //
-//   - No sound or scent sensing (CSound, bits_COND_HEAR_SOUND). Gunfire does
-//     not draw a monster; a scientist panics only at what it can see.
+//   - No scent (bits_COND_SMELL, bits_COND_SMELL_FOOD). Sound sensing is
+//     implemented; the scent half of the same list is not, so a bullsquid
+//     hears a corpse drop but does not track one it never heard.
 //
-//   - No squads, cover selection, grenades, hitgroup-specific flinches,
-//     headcrab leap (LeapTouch needs a monster mover with velocity, which does
-//     not exist here - the crab walks up and bites), bullsquid spit, islave
-//     rake or hornets, hgrunt burst pattern, gibs, barnacle or scripted death
-//     poses.
+//   - No hitgroup-specific flinches, no headcrab leap (LeapTouch needs a
+//     monster mover with velocity, which does not exist here - the crab walks
+//     up and bites on the leap event), no grenades, no item drops, no node
+//     cover (lateral cover only), no scripted death poses.
 //
 //   - The player cannot hurt a monster. HLWeapon.ZC's hitscan has no monster
 //     damage path, so the death path below is reachable only through
@@ -3468,7 +3480,9 @@ Bool HLAIFindCover(I64 s, F64 *threat, Bool need_hidden, F64 *out)
 		{
 			//alternate either side of "away" rather than sweeping one way
 			//round: the SDK tries left then right at each distance
-			turn = (step + 1) / 2;
+			//arithmetic is F64 here, so the halving is truncated explicitly
+			//rather than relying on the assignment to do it
+			turn = ToI64(ToF64(step + 1) / 2.0);
 
 			if (step & 1)
 				ang = base + ToF64(turn) * (360.0 / ToF64(HLAI_COVER_STEPS));
@@ -3620,7 +3634,9 @@ Bool HLAIHullAttack(I64 s, F64 reach, F64 damage)
 
 	HLAIHurt(hl_ai_mon[s].enemy, hl_ai_mon[s].ent, damage);
 
-	//SpawnBlood at the point of contact, in the victim's m_bloodColor
+	//CBaseMonster::TraceAttack ends in SpawnBlood(vecSpot, BloodColor(),
+	//flDamage), which is UTIL_BloodDrips along the reverse of the attack
+	//direction, in the victim's own m_bloodColor
 	blood = HLBLOOD_RED;
 
 	if (!HLAITargetIsPlayer(hl_ai_mon[s].enemy))
@@ -3634,7 +3650,7 @@ Bool HLAIHullAttack(I64 s, F64 reach, F64 damage)
 	HLVecNormalize(d);
 	d[2] = 0.0;
 
-	HLPartBlood(eye, d, blood, damage);
+	HLFxBloodDrips(eye, d, blood, ToI64(damage), hl_ent_time);
 
 	return TRUE;
 }
@@ -3693,6 +3709,588 @@ U0 HLAIFireAttack(I64 s, Bool melee)
 	dmg = mi->range_dmg * ToF64(mi->range_bullets);
 
 	HLAIHurt(hl_ai_mon[s].enemy, hl_ai_mon[s].ent, dmg);
+}
+
+//--- animation events -------------------------------------------------------
+//
+// HandleAnimEvent. Every attack in HL lands on an mstudioevent_t embedded in
+// the attack sequence at the frame the claw or the muzzle actually reaches the
+// target, not at the end of the take: a zombie's swing connects on frame 10 of
+// 36 and the remaining 26 frames are the follow-through, which the enemy can
+// walk out of.
+//
+// Codes below 1000 are client-side effects. 1000..1999 are the shared script
+// events CBaseMonster::HandleAnimEvent interprets. 2000..2999 are shared
+// monster events - body drops and weapon swishes. Everything below 100 is
+// per-monster and means nothing without knowing which monster is playing it,
+// which is why the dispatch is on (kind, code).
+//
+// Placed here rather than beside HLAIEntityEvents at the top of the file
+// because it reaches the monster table, the damage path and the sound list,
+// none of which exist that early: ZealC is single-pass.
+
+//scriptevent.h. HLStudio.ZC names 1004/1005/1008 but its HLST_EV_SENTENCE_RND1
+//is 1010, which is SCRIPT_EVENT_NOT_DEAD; the group form is 1009.
+#define HLAI_EV_DEAD			1000
+#define HLAI_EV_NOINTERRUPT		1001
+#define HLAI_EV_CANINTERRUPT	1002
+#define HLAI_EV_FIREEVENT		1003
+#define HLAI_EV_SOUND			1004
+#define HLAI_EV_SENTENCE		1005
+#define HLAI_EV_INAIR			1006
+#define HLAI_EV_ENDANIMATION	1007
+#define HLAI_EV_SOUND_VOICE		1008
+#define HLAI_EV_SENTENCE_RND1	1009
+#define HLAI_EV_NOT_DEAD		1010
+
+//monsterevent.h
+#define HLAI_EV_BODYDROP_LIGHT	2001
+#define HLAI_EV_BODYDROP_HEAVY	2002
+#define HLAI_EV_SWISHSOUND		2010
+
+//CheckTraceHullAttack's reach for every humanoid claw in the SDK
+#define HLAI_HULL_REACH			70.0
+
+U0 HLAIShootOnce(I64 s)
+{//one round of a burst. CBaseMonster::FireBullets for a single bullet
+ //
+ //the SDK traces a bullet with a per-weapon cone and applies the damage where
+ //it lands. There is no hit-group table here, so a bullet that has line of
+ //sight to the enemy hits it for the row's per-bullet figure.
+	CHLEntity	*e = HLEntGet(hl_ai_mon[s].ent);
+	CHLMonInfo	*mi;
+	F64			 feet[3];
+	F64			 eye[3];
+	F64			 d[3];
+
+	if (!e || !hl_ai_mon[s].have_enemy || hl_ai_mon[s].kind < 0)
+		return;
+
+	mi = &hl_ai_mon_info[hl_ai_mon[s].kind];
+
+	//m_cAmmoLoaded, spent whether or not the round connects
+	if (mi->clip_size > 0 && hl_ai_mon[s].ammo > 0)
+		hl_ai_mon[s].ammo--;
+
+	if (!HLAITargetPos(hl_ai_mon[s].enemy, feet, eye))
+		return;
+
+	HLVecSub(feet, e->origin, d);
+
+	if (HLVecLength(d) > mi->range_max)
+		return;
+
+	if (!HLAIVisible(s, eye))
+		return;
+
+	HLAIHurt(hl_ai_mon[s].enemy, hl_ai_mon[s].ent, mi->range_dmg);
+}
+
+U0 HLAIClawFoley(I64 s, Bool hit)
+{//the hit and miss sounds every claw event plays. zombie.cpp's
+ //pAttackHitSounds / pAttackMissSounds, which islave.cpp reuses verbatim
+	if (hit)
+		HLAIMonSound(s, "zombie/claw_strike1.wav");
+	else
+		HLAIMonSound(s, "zombie/claw_miss1.wav");
+}
+
+U0 HLAIBodyDrop(I64 s, Bool heavy)
+{//MONSTER_EVENT_BODYDROP_LIGHT / _HEAVY. Both pick between the same two
+ //samples; the heavy form drops the pitch to 90, which this mixer path cannot
+ //express, so the two differ only in the volume
+	CHLEntity	*e = HLEntGet(hl_ai_mon[s].ent);
+	F64			 vol = 1.0;
+
+	if (!e)
+		return;
+
+	if (heavy)
+		vol = 1.0;
+	else
+		vol = 0.8;
+
+	if (HLPartRandI(2))
+		HLSndPlayAt("common/bodydrop3.wav", e->origin, vol, HLENT_SND_ATTEN,
+			0, HLENT_CHAN_BODY);
+	else
+		HLSndPlayAt("common/bodydrop4.wav", e->origin, vol, HLENT_SND_ATTEN,
+			0, HLENT_CHAN_BODY);
+
+	//a body hitting the floor is a world sound. CSoundEnt has no such call in
+	//the SDK, but bits_SOUND_CARCASS is what a bullsquid comes to eat
+	HLAIInsertSound(HLSOUND_CARCASS, e->origin, 256.0, 30.0);
+}
+
+Bool HLAISharedEvent(I64 s, CHLEntity *e, I64 self, I64 code, U8 *options)
+{//CBaseMonster::HandleAnimEvent, the base every monster falls through to.
+ //TRUE when the code was consumed.
+	if (code == HLAI_EV_DEAD)
+	{
+		//a scripted death take. The script's own actor dies at the frame the
+		//animator marked, not at the end of the sequence
+		if (hl_ai_mon[s].state == HLMSTATE_SCRIPT)
+			e->health = 0.0;
+
+		return TRUE;
+	}
+
+	if (code == HLAI_EV_NOT_DEAD)
+	{
+		//the other half of a life/death take: the actor gets up again
+		if (hl_ai_mon[s].state == HLMSTATE_SCRIPT)
+			e->health = e->max_health;
+
+		return TRUE;
+	}
+
+	//the payload-carrying codes only. An empty options field would play the
+	//missing-sound sample or fire an unnamed target
+	if (code == HLAI_EV_FIREEVENT || code == HLAI_EV_SOUND ||
+		code == HLAI_EV_SOUND_VOICE || code == HLAI_EV_SENTENCE ||
+		code == HLAI_EV_SENTENCE_RND1)
+	{
+		if (!options || !options[0])
+			return TRUE;
+	}
+
+	if (code == HLAI_EV_FIREEVENT)
+	{
+		HLEntFireTargetsNamed(options, self, hl_ent_player, HLUSE_TOGGLE, 0.0);
+		return TRUE;
+	}
+
+	if (code == HLAI_EV_SOUND)
+	{
+		HLSndPlayAt(options, e->origin, 1.0, HLENT_SND_ATTEN, self + 1,
+			HLENT_CHAN_BODY);
+		return TRUE;
+	}
+
+	if (code == HLAI_EV_SOUND_VOICE)
+	{
+		HLSndPlayAt(options, e->origin, 1.0, HLENT_SND_ATTEN, self + 1,
+			HLENT_CHAN_VOICE);
+		return TRUE;
+	}
+
+	if (code == HLAI_EV_SENTENCE)
+	{
+		HLAISentenceStart(options, e->origin);
+		return TRUE;
+	}
+
+	if (code == HLAI_EV_SENTENCE_RND1)
+	{
+		//SCRIPT_EVENT_SENTENCE_RND1 plays two times in three
+		if (HLPartRandI(3))
+			HLAISentenceStart(options, e->origin);
+
+		return TRUE;
+	}
+
+	if (code == HLAI_EV_BODYDROP_LIGHT)
+	{
+		HLAIBodyDrop(s, FALSE);
+		return TRUE;
+	}
+
+	if (code == HLAI_EV_BODYDROP_HEAVY)
+	{
+		HLAIBodyDrop(s, TRUE);
+		return TRUE;
+	}
+
+	if (code == HLAI_EV_SWISHSOUND)
+	{
+		//the note in monsters.cpp is that no monster may use this event unless
+		//its own precache carries the sample
+		HLAIMonSound(s, "zombie/claw_miss2.wav");
+		return TRUE;
+	}
+
+	//1001, 1002, 1006 and 1007 control a scripted_sequence's interruptibility
+	//and its exit animation. Scripts here are not interruptible and
+	//HLAIScriptEnd picks the exit take off m_iszIdle, so all four are no-ops
+	//rather than unhandled.
+	if (code == HLAI_EV_NOINTERRUPT || code == HLAI_EV_CANINTERRUPT ||
+		code == HLAI_EV_INAIR || code == HLAI_EV_ENDANIMATION)
+		return TRUE;
+
+	return FALSE;
+}
+
+U0 HLAIMonAnimEvent(I64 s, I64 self, I64 code, U8 *options)
+{//the per-monster HandleAnimEvent, dispatched on (class, code)
+ //
+ //a comparison chain on the kind rather than a switch: the bodies share almost
+ //everything and a switch on the outer key would repeat the melee call ten
+ //times over
+	CHLEntity	*e = HLEntGet(hl_ai_mon[s].ent);
+	CHLMonInfo	*mi;
+	I64			 kind;
+
+	if (!e || hl_ai_mon[s].kind < 0)
+		return;
+
+	kind = hl_ai_mon[s].kind;
+	mi   = &hl_ai_mon_info[kind];
+
+	//the shared codes first, as every HandleAnimEvent's default branch does -
+	//except that the base runs last there and first here, which only matters
+	//for a monster that reuses a shared number, and none do
+	if (code >= 1000)
+	{
+		HLAISharedEvent(s, e, self, code, options);
+		return;
+	}
+
+	//--- CZombie. attack1 carries ATTACK_RIGHT at frame 10 and ATTACK_LEFT at
+	//19, so one take lands two blows; attack2 carries ATTACK_BOTH
+	if (kind == HLMON_ZOMBIE)
+	{
+		if (code == 1 || code == 2)
+		{
+			HLAIClawFoley(s, HLAIHullAttack(s, HLAI_HULL_REACH,
+				mi->melee_dmg));
+
+			if (HLPartRandI(2))
+				HLAIMonSound(s, mi->snd_attack);
+
+			return;
+		}
+
+		if (code == 3)
+		{
+			HLAIClawFoley(s, HLAIHullAttack(s, HLAI_HULL_REACH,
+				mi->melee2_dmg));
+
+			if (HLPartRandI(2))
+				HLAIMonSound(s, mi->snd_attack);
+
+			return;
+		}
+
+		return;
+	}
+
+	//--- CHeadCrab. HC_AE_JUMPATTACK is the leap, which needs a monster mover
+	//with velocity and a touch callback. The bite is applied at the same
+	//frame instead, so the crab hurts on contact rather than never
+	if (kind == HLMON_HEADCRAB)
+	{
+		if (code == 2)
+		{
+			HLAIMonSound(s, mi->snd_attack);
+			HLAIHullAttack(s, mi->melee_range * 1.25, mi->melee_dmg);
+		}
+
+		return;
+	}
+
+	//--- CBullsquid
+	if (kind == HLMON_BULLSQUID)
+	{
+		//BSQUID_AE_SPIT. CSquidSpit is a projectile entity and is absent, so
+		//the event is the growl alone
+		if (code == 1)
+		{
+			HLAIMonSound(s, mi->snd_attack);
+			return;
+		}
+
+		if (code == 2)
+		{
+			HLAIHullAttack(s, HLAI_HULL_REACH, mi->melee_dmg);
+			return;
+		}
+
+		if (code == 4)
+		{
+			HLAIHullAttack(s, HLAI_HULL_REACH, mi->melee2_dmg);
+			return;
+		}
+
+		//3 blink and 5 hop are a skin change and a velocity shove
+		return;
+	}
+
+	//--- CHoundeye
+	if (kind == HLMON_HOUNDEYE)
+	{
+		//HOUND_AE_WARN and _STARTATTACK, the two beats before the blast
+		if (code == 1)
+		{
+			HLAIMonSound(s, mi->snd_alert);
+			return;
+		}
+
+		if (code == 2)
+		{
+			HLAIMonSound(s, "houndeye/he_attack1.wav");
+			return;
+		}
+
+		//HOUND_AE_THUMP: SonicAttack. The blast is radius damage with no
+		//falloff and no line of sight test, as UTIL_MonstersInSphere is
+		if (code == 3)
+		{
+			HLAIMonSound(s, mi->snd_attack);
+			HLAIBlastDamage(s, mi->blast_radius, mi->range_dmg);
+			HLAIAttackNoise(s);
+			return;
+		}
+
+		if (code == 4)
+		{
+			HLAIMonSound(s, "houndeye/he_pain3.wav");
+			return;
+		}
+
+		if (code == 5)
+		{
+			HLAIMonSound(s, "houndeye/he_pain1.wav");
+			return;
+		}
+
+		//6 hop back and 7 close eye are velocity and skin
+		return;
+	}
+
+	//--- CHGrunt. The three-round burst is three events in one take, which is
+	//why a grunt's fire is a burst and not one shot per schedule
+	if (kind == HLMON_HGRUNT)
+	{
+		if (code == 2)
+		{
+			HLAIMonSound(s, "hgrunt/gr_reload1.wav");
+			hl_ai_mon[s].ammo = mi->clip_size;
+			return;
+		}
+
+		if (code == 3)
+		{
+			//HGRUNT_AE_KICK
+			HLAIHullAttack(s, HLAI_HULL_REACH, mi->melee_dmg);
+			return;
+		}
+
+		if (code == 4)
+		{
+			//the first round of the burst is the one that makes the noise and
+			//puts a sound in the world list
+			HLAIShootOnce(s);
+
+			if (HLPartRandI(2))
+				HLAIMonSound(s, "hgrunt/gr_mgun1.wav");
+			else
+				HLAIMonSound(s, "hgrunt/gr_mgun2.wav");
+
+			HLAIAttackNoise(s);
+			return;
+		}
+
+		if (code == 5)
+		{
+			HLAIShootOnce(s);
+			return;
+		}
+
+		if (code == 6)
+		{
+			HLAIShootOnce(s);
+			return;
+		}
+
+		if (code == 10)
+		{
+			//HGRUNT_AE_CAUGHT_ENEMY: the squad is told the player is back
+			HLAISentenceStart("HG_ALERT", e->origin);
+			return;
+		}
+
+		//7, 8 and 9 are grenades and 11 drops the gun as an item; neither a
+		//grenade entity nor an item drop exists here
+		return;
+	}
+
+	//--- CISlave
+	if (kind == HLMON_ISLAVE)
+	{
+		if (code == 1)
+		{
+			HLAIClawFoley(s, HLAIHullAttack(s, HLAI_HULL_REACH,
+				mi->melee_dmg));
+			return;
+		}
+
+		if (code == 2)
+		{
+			//ISLAVE_AE_CLAWRAKE, sk_islave_dmg_clawrake1. No sequence in
+			//islave.mdl carries it, so this is reachable only from a model
+			//that does
+			HLAIClawFoley(s, HLAIHullAttack(s, HLAI_HULL_REACH, 25.0));
+			return;
+		}
+
+		if (code == 3)
+		{
+			//ISLAVE_AE_ZAP_POWERUP, once per beam. The arm beams are a
+			//temp-entity effect and are absent; the charge sound is not
+			HLAIMonSound(s, "debris/zap4.wav");
+			return;
+		}
+
+		if (code == 4)
+		{
+			//ISLAVE_AE_ZAP_SHOOT. The beam is a hitscan here
+			HLAIMonSound(s, "hassault/hw_shoot1.wav");
+			HLAIShootOnce(s);
+			HLAIAttackNoise(s);
+			return;
+		}
+
+		//5 clears the beams
+		return;
+	}
+
+	//--- CBarney
+	if (kind == HLMON_BARNEY)
+	{
+		if (code == 2)
+		{
+			//BARNEY_AE_DRAW: the pistol leaves the holster. The bodygroup
+			//change is HLDraw.ZC's business, so only the flag is set
+			hl_ai_mon[s].gun_drawn = TRUE;
+			return;
+		}
+
+		if (code == 3)
+		{
+			//BarneyFirePistol
+			HLAIMonSound(s, mi->snd_attack);
+			HLAIShootOnce(s);
+			HLAIAttackNoise(s);
+			return;
+		}
+
+		if (code == 4)
+		{
+			hl_ai_mon[s].gun_drawn = FALSE;
+			return;
+		}
+
+		return;
+	}
+
+	//--- CAGrunt. Five hornet events over one take; each is one round of the
+	//swarm, fired as a bullet for want of a projectile
+	if (kind == HLMON_AGRUNT)
+	{
+		if (code >= 1 && code <= 5)
+		{
+			HLAIMonSound(s, "agrunt/ag_fire1.wav");
+			HLAIShootOnce(s);
+			HLAIAttackNoise(s);
+			return;
+		}
+
+		if (code == 6 || code == 7 || code == 12 || code == 13)
+		{
+			//PUNCH, BITE and the two handed punches all land the same figure
+			HLAIClawFoley(s, HLAIHullAttack(s, mi->melee_range,
+				mi->melee_dmg));
+			return;
+		}
+
+		if (code == 10 || code == 11)
+		{
+			//AGRUNT_AE_LEFT_FOOT / _RIGHT_FOOT. A footstep is a world sound,
+			//which is how a bullsquid notices one walking past
+			HLAIMonSound(s, "player/pl_ladder2.wav");
+			HLAIInsertSound(HLSOUND_WORLD, e->origin, 128.0, 0.2);
+			return;
+		}
+
+		return;
+	}
+
+	//--- CController. Both attacks throw an entity - a homing energy ball and
+	//a head-mounted zap - so each shot event fires a bullet instead
+	if (kind == HLMON_CONTROLLER)
+	{
+		if (code == 2 || code == 3)
+		{
+			HLAIMonSound(s, mi->snd_attack);
+			HLAIShootOnce(s);
+			HLAIAttackNoise(s);
+			return;
+		}
+
+		//1 opens the head, 4 and 5 are the charge-up glows
+		return;
+	}
+
+	//--- CScientist. SCIENTIST_AE_HEAL and the needle events belong to the
+	//heal behaviour, which needs CTalkMonster's follow logic and is absent
+}
+
+U0 HLAIMonEvents(I64 s, I64 self, F64 cycle)
+{//StudioFrameAdvance's event dispatch for a monster
+ //
+ //the same walk HLAIEntityEvents does, routed to HandleAnimEvent instead of
+ //to the script-event subset. Duplicated rather than shared because the
+ //shared one is defined at the top of the file, hundreds of lines before the
+ //monster table exists, and this compiler has no forward declarations.
+	CHLEntity	*e = HLEntGet(hl_ai_mon[s].ent);
+	CHLStudio	*m;
+	CHLStSeq	*sq;
+	CHLStEvent	*ev;
+	F64			 frame_f;
+	I64			 frame;
+	I64			 last;
+	I64			 i;
+
+	if (!e || !e->studio)
+		return;
+
+	m = e->studio;
+
+	if (e->seq < 0 || e->seq >= m->num_seqs || !m->events)
+		return;
+
+	sq = &m->seqs[e->seq];
+
+	if (sq->num_events < 1)
+		return;
+
+	frame_f = cycle * ToF64(sq->num_frames - 1);
+	frame   = ToI64(frame_f);
+
+	if (frame < 0)
+		frame = 0;
+	if (frame > sq->num_frames - 1)
+		frame = sq->num_frames - 1;
+
+	last = e->anim_event_frame;
+
+	//a loop that wrapped, or a sequence just started, replays the list from
+	//the beginning rather than skipping to the new position
+	if (last < 0 || frame < last)
+		last = -1;
+
+	if (frame == last)
+		return;
+
+	for (i = 0; i < sq->num_events; i++)
+	{
+		ev = &m->events[sq->first_event + i];
+
+		if (ev->frame > last && ev->frame <= frame)
+			HLAIMonAnimEvent(s, self, ev->code, ev->options);
+	}
+
+	e->anim_event_frame = frame;
 }
 
 //--- tasks ------------------------------------------------------------------
@@ -4759,6 +5357,8 @@ U0 HLAIMonThink(I64 s, F64 dt)
  //time-based, so the cadence change is invisible.
 	CHLEntity	*e = HLEntGet(hl_ai_mon[s].ent);
 	CHLMonInfo	*mi;
+	F64			 gib_dir[3];
+	Bool		 human;
 
 	if (!e)
 		return;
@@ -4776,6 +5376,37 @@ U0 HLAIMonThink(I64 s, F64 dt)
 	{
 		hl_ai_mon[s].last_health = 0.0;
 		hl_ai_mon_kills++;
+
+		//a corpse is bits_SOUND_CARCASS for half a minute, which is what a
+		//bullsquid comes to eat. CSoundEnt's own carcass lifetime
+		HLAIInsertSound(HLSOUND_CARCASS, e->origin, 256.0, 30.0);
+
+		//CBaseMonster::Killed gibs below -40 health rather than playing a
+		//death take. HUMAN_GIB_COUNT for a human-shaped victim and
+		//ALIEN_GIB_COUNT for anything else, which is what decides the model
+		if (e->health < -40.0)
+		{
+			human = ToBool(mi->classify == HLCLASS_HUMAN_MILITARY ||
+				mi->classify == HLCLASS_HUMAN_PASSIVE ||
+				mi->classify == HLCLASS_PLAYER_ALLY);
+
+			//g_vecAttackDir is not tracked; the gibs are thrown straight up,
+			//which is what a victim killed by radius damage gets in the SDK
+			HLVecSet(gib_dir, 0.0, 0.0, 1.0);
+
+			if (human)
+				HLGibSpawnRandomGibs(e->absmin, e->size, gib_dir,
+					e->max_health, HLGIB_HUMAN_COUNT, TRUE, mi->blood,
+					hl_ent_time);
+			else
+				HLGibSpawnRandomGibs(e->absmin, e->size, gib_dir,
+					e->max_health, HLGIB_ALIEN_COUNT, FALSE, mi->blood,
+					hl_ent_time);
+
+			HLGibSpawnHeadGib(e->origin, e->origin, e->max_health, mi->blood,
+				hl_ent_time);
+		}
+
 		HLAISetState(s, HLMSTATE_DEAD);
 		HLAISetSchedule(s, HLSCHED_DIE);
 		return;
@@ -4991,27 +5622,175 @@ qamf_next:
 	}
 }
 
-U0 HLAIMonReport()
-{//dump AI state. Distinguishes "no monsters registered" from "registered and
- //idle", which look identical on screen
-	CHLEntity	*e;
-	I64			 i;
+//--- ReportAIState ----------------------------------------------------------
+//
+// CBaseMonster::ReportAIState, monsters.cpp, which impulse 103 reaches through
+// player.cpp. The names come out of comparison chains rather than U8* tables:
+// adjacent string literals concatenate and truncate at the first NUL on this
+// compiler, so a table of literals collapses to one entry.
 
-	"HLAI: %d monsters tracked, %d dead\n", hl_ai_mon_count, hl_ai_mon_kills;
+U8 *HLAIStateName(I64 state)
+{//pStateNames[] in ReportAIState. The SDK's array is in enum order, which is
+ //None Idle Combat Alert Hunt Prone Scripted Dead; MONSTERSTATE_ itself has
+ //Alert before Combat, so the SDK prints two of them wrongly. The names here
+ //follow the enum
+	if (state == HLMSTATE_IDLE)		return "Idle";
+	if (state == HLMSTATE_ALERT)	return "Alert";
+	if (state == HLMSTATE_COMBAT)	return "Combat";
+	if (state == HLMSTATE_SCRIPT)	return "Scripted";
+	if (state == HLMSTATE_DEAD)		return "Dead";
+
+	return "None";
+}
+
+U8 *HLAISchedName(I64 sched)
+{//the pName field of each Schedule_t in defaultai.cpp
+	if (sched == HLSCHED_IDLE_STAND)		return "IdleStand";
+	if (sched == HLSCHED_ALERT_STAND)		return "AlertStand";
+	if (sched == HLSCHED_ALERT_FACE)		return "AlertFace";
+	if (sched == HLSCHED_WAKE_ANGRY)		return "WakeAngry";
+	if (sched == HLSCHED_CHASE_ENEMY)		return "ChaseEnemy";
+	if (sched == HLSCHED_MELEE_ATTACK1)		return "MeleeAttack1";
+	if (sched == HLSCHED_RANGE_ATTACK1)		return "RangeAttack1";
+	if (sched == HLSCHED_TAKE_COVER)		return "TakeCoverFromEnemy";
+	if (sched == HLSCHED_SMALL_FLINCH)		return "SmallFlinch";
+	if (sched == HLSCHED_DIE)				return "Die";
+	if (sched == HLSCHED_IDLE_WALK)			return "IdleWalk";
+	if (sched == HLSCHED_ALERT_SM_FLINCH)	return "AlertSmallFlinch";
+	if (sched == HLSCHED_INVEST_SOUND)		return "InvestigateSound";
+	if (sched == HLSCHED_COMBAT_FACE)		return "CombatFace";
+	if (sched == HLSCHED_COMBAT_STAND)		return "CombatStand";
+	if (sched == HLSCHED_CHASE_FAILED)		return "ChaseEnemyFailed";
+	if (sched == HLSCHED_STANDOFF)			return "Standoff";
+	if (sched == HLSCHED_RELOAD)			return "Reload";
+	if (sched == HLSCHED_ARM_WEAPON)		return "ArmWeapon";
+	if (sched == HLSCHED_MELEE_ATTACK2)		return "MeleeAttack2";
+	if (sched == HLSCHED_RANGE_ATTACK2)		return "RangeAttack2";
+	if (sched == HLSCHED_SPECIAL_ATTACK1)	return "SpecialAttack1";
+	if (sched == HLSCHED_COVER_SOUND)		return "TakeCoverFromBestSound";
+	if (sched == HLSCHED_COVER_ORIGIN)		return "TakeCoverFromOrigin";
+	if (sched == HLSCHED_COWER)				return "Cower";
+	if (sched == HLSCHED_VICTORY_DANCE)		return "VictoryDance";
+	if (sched == HLSCHED_AMBUSH)			return "Ambush";
+	if (sched == HLSCHED_BARNACLE_GRAB)		return "BarnacleVictim";
+	if (sched == HLSCHED_BARNACLE_CHOMP)	return "BarnacleChomp";
+	if (sched == HLSCHED_FAIL)				return "Fail";
+
+	return "No Schedule";
+}
+
+U8 *HLAIActName(I64 act)
+{//activity_map[] in monsters.cpp, restricted to the activities this port has
+	if (act == HLACT_IDLE)			return "ACT_IDLE";
+	if (act == HLACT_WALK)			return "ACT_WALK";
+	if (act == HLACT_RUN)			return "ACT_RUN";
+	if (act == HLACT_MELEE)			return "ACT_MELEE_ATTACK1";
+	if (act == HLACT_MELEE2)		return "ACT_MELEE_ATTACK2";
+	if (act == HLACT_RANGE)			return "ACT_RANGE_ATTACK1";
+	if (act == HLACT_RANGE2)		return "ACT_RANGE_ATTACK2";
+	if (act == HLACT_DIE)			return "ACT_DIESIMPLE";
+	if (act == HLACT_FLINCH)		return "ACT_SMALL_FLINCH";
+	if (act == HLACT_RELOAD)		return "ACT_RELOAD";
+	if (act == HLACT_COMBAT_IDLE)	return "ACT_COMBAT_IDLE";
+	if (act == HLACT_SIGNAL)		return "ACT_SIGNAL1";
+	if (act == HLACT_THREAT)		return "ACT_THREAT_DISPLAY";
+	if (act == HLACT_VICTORY)		return "ACT_VICTORY_DANCE";
+	if (act == HLACT_COWER)			return "ACT_COWER";
+	if (act == HLACT_ARM)			return "ACT_ARM";
+	if (act == HLACT_EAT)			return "ACT_EAT";
+	if (act == HLACT_SPECIAL)		return "ACT_SPECIAL_ATTACK1";
+	if (act == HLACT_BARN_HIT)		return "ACT_BARNACLE_HIT";
+	if (act == HLACT_BARN_PULL)		return "ACT_BARNACLE_PULL";
+	if (act == HLACT_BARN_CHOMP)	return "ACT_BARNACLE_CHOMP";
+	if (act == HLACT_BARN_CHEW)		return "ACT_BARNACLE_CHEW";
+
+	return "ACT_INVALID";
+}
+
+U0 HLAIMonReportOne(I64 i)
+{//one monster, in the layout ReportAIState prints
+	CHLEntity	*e = HLEntGet(hl_ai_mon[i].ent);
+	I64			 slot;
+	I64			 task;
+
+	if (!e)
+		return;
+
+	"%s: ", e->classname;
+	"State: %s, ", HLAIStateName(hl_ai_mon[i].state);
+	"Activity %s, ", HLAIActName(hl_ai_mon[i].activity);
+
+	if (hl_ai_mon[i].sched > HLSCHED_NONE &&
+		hl_ai_mon[i].sched < HLSCHED_COUNT)
+	{
+		"Schedule %s, ", HLAISchedName(hl_ai_mon[i].sched);
+
+		if (hl_ai_mon[i].task < hl_ai_sched_len[hl_ai_mon[i].sched])
+		{
+			slot = hl_ai_mon[i].sched * HLAI_SCHED_TASKS + hl_ai_mon[i].task;
+			task = hl_ai_sched_task[slot];
+
+			"Task %d (#%d), ", task, hl_ai_mon[i].task;
+		}
+	}
+	else
+		"No Schedule, ";
+
+	if (hl_ai_mon[i].have_enemy)
+	{
+		if (HLAITargetIsPlayer(hl_ai_mon[i].enemy))
+			"\nEnemy is player";
+		else
+			"\nEnemy is %s", hl_entities[hl_ai_mon[i].enemy].classname;
+	}
+	else
+		"No enemy";
+
+	if (hl_ai_mon[i].have_goal && hl_ai_mon[i].move_speed > 0.0)
+		" Moving ";
+
+	//the squad line CSquadMonster adds to the report
+	if (!HLAIInSquad(i))
+		"not ";
+
+	"In Squad, ";
+
+	if (!HLAIIsLeader(i))
+		"not ";
+
+	"Leader.";
+
+	"\n";
+	"Yaw speed:%3.1f,Health: %3.1f\n",
+		hl_ai_mon_info[hl_ai_mon[i].kind].yaw_speed, e->health;
+
+	//not in the SDK's report: this port's own state, which has no other way
+	//out. Slots, ammo and the last sound heard are what a squad fight turns on
+	slot = HLAISquadLeader(i);
+
+	"  slot %d of %d, ammo %d, heard %d at %.0f %.0f %.0f\n",
+		hl_ai_mon[i].my_slot, hl_ai_mon[slot].squad_slots, hl_ai_mon[i].ammo,
+		hl_ai_mon[i].heard_type, hl_ai_mon[i].heard_pos[0],
+		hl_ai_mon[i].heard_pos[1], hl_ai_mon[i].heard_pos[2];
+}
+
+U0 HLAIMonReport()
+{//dump AI state for every monster. Distinguishes "no monsters registered" from
+ //"registered and idle", which look identical on screen
+	I64 i;
+	I64 live = 0;
+
+	for (i = 0; i < HLAI_WORLD_SOUNDS; i++)
+	{
+		if (hl_ai_snd[i].expire > hl_ent_time)
+			live++;
+	}
+
+	"HLAI: %d monsters tracked, %d dead, %d sounds in the world\n",
+		hl_ai_mon_count, hl_ai_mon_kills, live;
 
 	for (i = 0; i < hl_ai_mon_count; i++)
-	{
-		e = HLEntGet(hl_ai_mon[i].ent);
-
-		if (!e)
-			goto qamrp_next;
-
-		"  %-24s state %d sched %d task %d hp %6.1f enemy %d\n",
-			e->classname, hl_ai_mon[i].state, hl_ai_mon[i].sched,
-			hl_ai_mon[i].task, e->health, hl_ai_mon[i].enemy;
-
-qamrp_next:
-	}
+		HLAIMonReportOne(i);
 }
 
 //--- the frame --------------------------------------------------------------
@@ -5028,7 +5807,17 @@ U0 HLAIFrame(F64 dt)
 	if (!hl_entities)
 		return;
 
+	//before the event pass below, which indexes hl_ai_mon_of: on the first
+	//tick of a new map that table still describes the last one. Idempotent, so
+	//HLAIMonsterFrame calling it again at the end costs three comparisons.
+	HLAIMonSync;
+
 	HLAISentenceUpdate(hl_ent_time);
+
+	//CSoundEnt::Update: age the world sound list and re-post the player's own
+	//entry. Before the monster pass, so a monster hears this tick's footsteps
+	//rather than last tick's
+	HLAISoundFrame;
 
 	for (i = 0; i < hl_num_entities; i++)
 	{
@@ -5099,10 +5888,16 @@ U0 HLAIFrame(F64 dt)
 			e->anim_loop  = TRUE;
 		}
 
-		//Animation events for everything with a model, monsters included: the
-		//sequence is whatever the state machine or the script left running.
+		//Animation events. A tracked monster goes through HandleAnimEvent,
+		//which lands its attacks on the frame the animator marked; anything
+		//else gets the shared script events only.
 		if (e->studio)
-			HLAIEntityEvents(e, i, HLAIEntityCycle(e));
+		{
+			if (i < HLENT_MAX && hl_ai_mon_of[i] >= 0)
+				HLAIMonEvents(hl_ai_mon_of[i], i, HLAIEntityCycle(e));
+			else
+				HLAIEntityEvents(e, i, HLAIEntityCycle(e));
+		}
 
 qaif_next:
 	}
