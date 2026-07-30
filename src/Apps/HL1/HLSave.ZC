@@ -1,175 +1,1354 @@
-// HLSave.ZC - Host_Savegame_f / Host_Loadgame_f
+// HLSave.ZC - CSave / CRestore, SaveGameSlot and LoadGame
 //
-// A binary container, not id's text .sav: no ftos, no tokenizer, and
-// round-tripping physics state through decimal loses precision. Not
-// interchangeable with id's files.
+// A binary container, not the SDK's token-hashed field stream. HL writes
+// TYPEDESCRIPTION tables through CSave::WriteFields so a field can be added,
+// removed or reordered and old saves still load; that costs a token table, a
+// hash and a name per field. Here both ends are one compile, so the field order
+// below IS the schema and the version number is what rejects a mismatch.
 //
-// Holds everything the VM cannot rebuild:
-//   - the global pool
-//   - the entity field block and the free list
-//   - the string heap; map keys are appended to it at load and entity fields
-//     hold offsets into it
-//   - the precache lists, since .modelindex is an index into them
-//   - light styles, carried parms, engine-side player state
+// What is serialised is the native world in HLEnt.ZC / HLEntity.ZC, not a
+// QuakeC edict pool: there is no VM on this path and nothing here reads one.
 //
-// Load brings the map and bytecode up but does not run the spawn functions, then
-// overwrites the world.
+// The layout the SDK's own model maps onto:
+//
+//   entities     the whole hl_entities array, one record per slot, field by
+//                field. gEntvarsDescription plus the CBaseToggle/CBaseMonster
+//                state a mover or a script needs
+//   player       CBasePlayer's health, armour, suit and death machine
+//   weapons      the CBasePlayerItem inventory and its ammo counts
+//   move         pm_shared's ducking, ladder and water state
+//   globals      gGlobalState - the flags that outlive a level
+//   multimanager the CMultiManager firing schedules
+//   ai           CBaseMonster's schedule, task and enemy memory
+//   lightstyles  LIGHT_STYLE
+//   effects      the env_* screen state HL1.ZC drains
+//
+// Model pointers are never written. mdl/studio/spr are cache addresses and mean
+// nothing across a run, so the model NAME is written and the pointer re-resolved
+// by HLEntLoadModels on restore.
+//
+// Times are stored the way CSave::WriteTime does it: relative to the save's
+// clock, and rebased onto the restore's clock by CRestore's m_pdata->time add.
 
-// Version 2 appends a spawn parm block for every client slot as a trailer, past
-// everything version 1 wrote: CHLSaveHeader's size is baked into every v1 file on
-// disk, so growing the class would shift the body and misread them. A v1 file has
-// no trailer and loads as one client.
-#define HLSAVE_MAGIC			0x56535A51	//"QZSV" little-endian
-#define HLSAVE_VERSION		2
-#define HLSAVE_VERSION_MIN	1
+//"QZSV" little-endian. Version 3 is the native world; 1 and 2 described the
+//QuakeC edict pool, which no longer exists, so there is nothing to be
+//compatible with and they are rejected outright
+#define HLSAVE_MAGIC			0x56535A51
+#define HLSAVE_VERSION		3
+#define HLSAVE_VERSION_MIN	3
 
-//I64 slot count, I64 parms per slot, then per slot an I64 set flag and its parms.
-//The counts live in the trailer, not the frozen header
-#define HLSAVE_PARM_BYTES	(16 + HLSV_MAX_CLIENTS * (8 + HLPR_MAX_PARM_GLOBALS * 8))
+//"QZTR". The changelevel carry file, HL's .HL1/.HL2 equivalent
+#define HLSAVE_TR_MAGIC		0x52545A51
+#define HLSAVE_TR_VERSION	1
+
+//a time field that means "never", which is 0 in absolute form and cannot be
+//expressed as a delta. Any value below the guard reads back as 0
+#define HLSAVE_TIME_NEVER	-1.0e30
+#define HLSAVE_TIME_GUARD	-1.0e29
+
+//block tags. An unknown tag is skipped by its length, so a block can be added
+//without moving the ones already written
+#define HLSB_ENTITIES		1
+#define HLSB_PLAYER			2
+#define HLSB_WEAPONS			3
+#define HLSB_MOVE			4
+#define HLSB_GLOBALS			5
+#define HLSB_MM				6
+#define HLSB_AI				7
+#define HLSB_LIGHT			8
+#define HLSB_FX				9
+
+//the writer starts here and doubles. A map of four hundred entities lands
+//around a megabyte, so this is a handful of grows, not one per entity
+#define HLSAVE_BUF_START		65536
 
 class CHLSaveHeader
 {
 	U32	magic;
 	U32	version;
 	U8	mapname[96];
-	F64	game_time;
+	F64	game_time;		//the shell clock, hl_game_time
+	F64	ent_time;		//the entity clock, hl_ent_time - the time base
 	F64	origin[3];
 	F64	velocity[3];
 	F64	angles[3];
 	I64	on_ground;
 	I64	water_level;
 	I64	water_type;
-	I64	num_edicts;
-	I64	edict_stride;
-	I64	num_globals;
-	I64	strings_size;
-	I64	string_alloc;
-	I64	num_models;
-	I64	num_sounds;
-	F64	saved_parms[HLGAME_MAX_PARMS];
-	F64	saved_serverflags;
+	I64	num_entities;
+	I64	num_blocks;
+	I64	reserved[6];
 };
 
-U8 *HLSaveAppend(U8 *dst, U8 *src, I64 bytes)
-{//append and return the new write point
-	MemCopy(dst, src, bytes);
-	return dst + bytes;
-}
+//--- the write buffer -------------------------------------------------------
+//
+// CSaveRestoreBuffer's pBaseData/pCurrentData, except it grows. Global rather
+// than threaded through every writer: a field writer that took a cursor would
+// have to return it, and this compiler loses a store through a deep call.
 
-U0 HLSaveSpawnParms()
-{//SV_SaveSpawnparms: run SetChangeParms once per active client with self set to
- //that client's body, keeping what it leaves in parm1..parm16
- //
- //the same call the changelevel path makes, over every slot instead of the local
- //player alone. Without it a coop save carries one inventory and the other
- //players respawn empty
-	I64	fn;
-	I64	ofs;
-	I64	ent;
-	I64	i;
-	I64	j;
-	F64	value;
+U8	*hl_savew_buf	= NULL;
+I64	 hl_savew_cap	= 0;
+I64	 hl_savew_len	= 0;
+Bool hl_savew_err	= FALSE;
+F64	 hl_savew_base	= 0.0;		//the clock times are written relative to
 
-	fn = HLPrFindFunction("SetChangeParms");
-	if (fn <= 0)
-		return;
+U0 HLSaveWriterOpen()
+{//globals aren't zeroed, so every field is set here
+	hl_savew_buf = MAlloc(HLSAVE_BUF_START);
+	hl_savew_cap = HLSAVE_BUF_START;
+	hl_savew_len = 0;
+	hl_savew_err = FALSE;
 
-	for (i = 0; i < HLSV_MAX_CLIENTS; i++)
+	if (!hl_savew_buf)
 	{
-		if (!hl_sv_clients[i].active)
-			goto qsp_next;
-
-		ent = hl_sv_clients[i].edict;
-		if (ent < 1 || ent >= hl_pr_num_edicts || hl_pr_edict_free[ent])
-			goto qsp_next;
-
-		HLPrSetI(hl_ofs_self, HLPrEdictValue(ent));
-		HLPrExecute(fn);
-		hl_pr_error = FALSE;
-
-		for (j = 0; j < HLPR_MAX_PARM_GLOBALS; j++)
-		{
-			ofs = hl_ofs_parms[j];
-			if (ofs < 0)
-				goto qsp_next_parm;
-
-			//via a temp: this compiler computes the slot address before
-			//evaluating the call and can lose the store
-			value = HLPrGetF(ofs);
-			hl_client_parms[i * HLPR_MAX_PARM_GLOBALS + j] = value;
-
-qsp_next_parm:
-		}
-
-		hl_client_parms_set[i] = TRUE;
-
-qsp_next:
+		hl_savew_cap = 0;
+		hl_savew_err = TRUE;
 	}
 }
+
+U0 HLSaveWriterClose()
+{
+	if (hl_savew_buf)
+		Free(hl_savew_buf);
+
+	hl_savew_buf = NULL;
+	hl_savew_cap = 0;
+	hl_savew_len = 0;
+}
+
+U0 HLSaveNeed(I64 n)
+{//grow to hold n more bytes. Once the error flag is set nothing else is written
+	U8	*nb;
+	I64	 cap;
+
+	if (hl_savew_err)
+		return;
+
+	if (hl_savew_len + n <= hl_savew_cap)
+		return;
+
+	cap = hl_savew_cap;
+	if (cap < HLSAVE_BUF_START)
+		cap = HLSAVE_BUF_START;
+
+	while (cap < hl_savew_len + n)
+		cap = cap * 2;
+
+	nb = MAlloc(cap);
+	if (!nb)
+	{
+		hl_savew_err = TRUE;
+		return;
+	}
+
+	MemCopy(nb, hl_savew_buf, hl_savew_len);
+	Free(hl_savew_buf);
+
+	hl_savew_buf = nb;
+	hl_savew_cap = cap;
+}
+
+U0 HLSavePutBytes(U8 *src, I64 n)
+{
+	if (n < 1)
+		return;
+
+	HLSaveNeed(n);
+	if (hl_savew_err)
+		return;
+
+	MemCopy(hl_savew_buf + hl_savew_len, src, n);
+	hl_savew_len += n;
+}
+
+U0 HLSavePutI(I64 v)
+{//CSave::WriteInt
+	HLSaveNeed(8);
+	if (hl_savew_err)
+		return;
+
+	MemCopy(hl_savew_buf + hl_savew_len, &v, 8);
+	hl_savew_len += 8;
+}
+
+U0 HLSavePutF(F64 v)
+{//CSave::WriteFloat
+	HLSaveNeed(8);
+	if (hl_savew_err)
+		return;
+
+	MemCopy(hl_savew_buf + hl_savew_len, &v, 8);
+	hl_savew_len += 8;
+}
+
+U0 HLSavePutB(Bool b)
+{//a Bool is written by branching. ToI64 on one reinterprets the bytes after it
+	if (b)
+		HLSavePutI(1);
+	else
+		HLSavePutI(0);
+}
+
+U0 HLSavePutT(F64 t)
+{//CSave::WriteTime: the delta from the save's clock, so a restore onto a
+ //different clock rebases every schedule together
+	if (t == 0.0)
+	{
+		HLSavePutF(HLSAVE_TIME_NEVER);
+		return;
+	}
+
+	HLSavePutF(t - hl_savew_base);
+}
+
+U0 HLSavePutV(F64 *v)
+{//CSave::WriteVector
+	HLSavePutF(v[0]);
+	HLSavePutF(v[1]);
+	HLSavePutF(v[2]);
+}
+
+U0 HLSavePutStr(U8 *s)
+{//CSave::WriteString, length prefixed rather than NUL terminated: the reader
+ //then knows how far to skip when its own field is narrower
+	I64 n = 0;
+
+	if (s)
+		n = StrLen(s);
+
+	if (n > 255)
+		n = 255;
+
+	HLSavePutI(n);
+	HLSavePutBytes(s, n);
+}
+
+I64 HLSaveBlockBegin(I64 tag)
+{//tag, then a length slot patched by HLSaveBlockEnd. The offset is returned,
+ //not a pointer: the buffer moves when it grows
+	I64 ofs;
+
+	HLSavePutI(tag);
+	ofs = hl_savew_len;
+	HLSavePutI(0);
+
+	return ofs;
+}
+
+U0 HLSaveBlockEnd(I64 ofs)
+{
+	I64 n;
+
+	if (hl_savew_err || !hl_savew_buf)
+		return;
+
+	n = hl_savew_len - (ofs + 8);
+	MemCopy(hl_savew_buf + ofs, &n, 8);
+}
+
+//--- the read cursor --------------------------------------------------------
+
+U8	*hl_saver_p		= NULL;
+U8	*hl_saver_end	= NULL;
+Bool hl_saver_err	= FALSE;
+F64	 hl_saver_base	= 0.0;
+
+I64 HLSaveGetI()
+{
+	I64 v = 0;
+
+	if (hl_saver_err || hl_saver_p + 8 > hl_saver_end)
+	{
+		hl_saver_err = TRUE;
+		return 0;
+	}
+
+	MemCopy(&v, hl_saver_p, 8);
+	hl_saver_p += 8;
+
+	return v;
+}
+
+F64 HLSaveGetF()
+{
+	F64 v = 0.0;
+
+	if (hl_saver_err || hl_saver_p + 8 > hl_saver_end)
+	{
+		hl_saver_err = TRUE;
+		return 0.0;
+	}
+
+	MemCopy(&v, hl_saver_p, 8);
+	hl_saver_p += 8;
+
+	return v;
+}
+
+Bool HLSaveGetB()
+{//via a temp: the call is the argument to ToBool otherwise, and a no-argument
+ //call nested inside another is the shape this compiler is least reliable on
+	I64 v = HLSaveGetI;
+
+	return ToBool(v);
+}
+
+F64 HLSaveGetT()
+{//CRestore's FIELD_TIME: the stored delta plus the clock being restored onto
+	F64 v = HLSaveGetF;
+
+	if (v < HLSAVE_TIME_GUARD)
+		return 0.0;
+
+	return v + hl_saver_base;
+}
+
+U0 HLSaveGetV(F64 *out)
+{
+	out[0] = HLSaveGetF;
+	out[1] = HLSaveGetF;
+	out[2] = HLSaveGetF;
+}
+
+U0 HLSaveGetStr(U8 *dst, I64 cap)
+{//read a length prefixed string into a field of cap bytes. Anything longer in
+ //the file is consumed and truncated, not left to desynchronise the cursor
+	I64 n;
+	I64 k;
+
+	n = HLSaveGetI;
+
+	if (cap > 0)
+		dst[0] = 0;
+
+	if (hl_saver_err || n < 0 || hl_saver_p + n > hl_saver_end)
+	{
+		hl_saver_err = TRUE;
+		return;
+	}
+
+	k = n;
+	if (k > cap - 1)
+		k = cap - 1;
+
+	if (k > 0)
+		MemCopy(dst, hl_saver_p, k);
+
+	dst[k]      = 0;
+	hl_saver_p += n;
+}
+
+//--- entity records ---------------------------------------------------------
+//
+// gEntvarsDescription plus the CBaseToggle, CBaseAnimating and env_* state the
+// flattened struct carries. Every record is length prefixed so a record can be
+// skipped without losing the cursor, and so a later version can append fields.
+//
+// absmin/absmax/size are derived and rebuilt by HLEntSetAbsBox. mdl/studio/spr
+// are cache addresses and are re-resolved from model_name.
+
+U0 HLSaveWriteEntity(CHLEntity *e)
+{//CSave::WriteEntVars for one slot
+	HLSavePutStr(e->classname);
+	HLSavePutStr(e->model_name);
+	HLSavePutI(e->brush_model);
+	HLSavePutV(e->origin);
+	HLSavePutV(e->angles);
+	HLSavePutI(e->frame);
+	HLSavePutI(e->seq);
+	HLSavePutI(e->body);
+	HLSavePutI(e->skin);
+
+	HLSavePutStr(e->targetname);
+	HLSavePutStr(e->target);
+	HLSavePutStr(e->killtarget);
+	HLSavePutStr(e->master);
+	HLSavePutStr(e->message);
+	HLSavePutStr(e->netname);
+	HLSavePutI(e->spawnflags);
+
+	HLSavePutI(e->movetype);
+	HLSavePutI(e->solid);
+	HLSavePutV(e->velocity);
+	HLSavePutV(e->avelocity);
+	HLSavePutV(e->mins);
+	HLSavePutV(e->maxs);
+
+	HLSavePutF(e->speed);
+	HLSavePutF(e->wait);
+	HLSavePutF(e->delay);
+	HLSavePutF(e->lip);
+	HLSavePutF(e->height);
+	HLSavePutF(e->dmg);
+	HLSavePutF(e->damage);
+	HLSavePutF(e->health);
+	HLSavePutF(e->max_health);
+	HLSavePutI(e->takedamage);
+	HLSavePutI(e->toggle_state);
+	HLSavePutI(e->ent_class);
+
+	HLSavePutStr(e->ai_play);
+	HLSavePutStr(e->ai_idle);
+	HLSavePutStr(e->ai_entity);
+	HLSavePutI(e->ai_moveto);
+	HLSavePutF(e->ai_radius);
+
+	HLSavePutT(e->anim_start);
+	HLSavePutB(e->anim_loop);
+	HLSavePutB(e->anim_done);
+	HLSavePutI(e->anim_event_frame);
+	HLSavePutF(e->yaw_delta);
+
+	HLSavePutI(e->move_snd);
+	HLSavePutI(e->stop_snd);
+	HLSavePutI(e->snd_index);
+	HLSavePutF(e->volume);
+
+	HLSavePutV(e->position1);
+	HLSavePutV(e->position2);
+	HLSavePutV(e->angle1);
+	HLSavePutV(e->angle2);
+	HLSavePutV(e->finaldest);
+	HLSavePutV(e->finalangle);
+	HLSavePutV(e->move_dir);
+
+	HLSavePutI(e->think_fn);
+	HLSavePutT(e->next_think);
+	HLSavePutI(e->move_done);
+	HLSavePutI(e->touch_fn);
+	HLSavePutI(e->use_fn);
+	HLSavePutI(e->blocked_fn);
+
+	HLSavePutI(e->owner);
+	HLSavePutI(e->activator);
+	HLSavePutT(e->ltime);
+	HLSavePutT(e->pain_finished);
+
+	HLSavePutI(e->rendermode);
+	HLSavePutF(e->renderamt);
+	HLSavePutV(e->rendercolor);
+	HLSavePutI(e->renderfx);
+	HLSavePutI(e->effects);
+	HLSavePutI(e->style);
+
+	HLSavePutF(e->framerate);
+	HLSavePutF(e->scale);
+	HLSavePutB(e->visible);
+
+	HLSavePutStr(e->beam_start_name);
+	HLSavePutStr(e->beam_end_name);
+	HLSavePutI(e->beam_start);
+	HLSavePutI(e->beam_end);
+	HLSavePutF(e->beam_width);
+	HLSavePutF(e->beam_life);
+	HLSavePutF(e->beam_restrike);
+	HLSavePutB(e->beam_active);
+
+	HLSavePutI(e->density);
+	HLSavePutF(e->frequency);
+	HLSavePutI(e->blood_color);
+	HLSavePutF(e->blood_amount);
+
+	HLSavePutI(e->gib_count);
+	HLSavePutI(e->gib_left);
+	HLSavePutF(e->gib_velocity);
+	HLSavePutF(e->gib_variance);
+	HLSavePutF(e->gib_life);
+	HLSavePutStr(e->shoot_model);
+
+	HLSavePutF(e->hold_time);
+	HLSavePutF(e->fade_in);
+	HLSavePutF(e->fade_out);
+	HLSavePutF(e->text_x);
+	HLSavePutF(e->text_y);
+
+	HLSavePutF(e->radius);
+	HLSavePutF(e->amplitude);
+	HLSavePutF(e->duration);
+	HLSavePutF(e->magnitude);
+	HLSavePutF(e->max_delay);
+	HLSavePutF(e->modifier);
+	HLSavePutF(e->damp);
+	HLSavePutF(e->gravity);
+	HLSavePutI(e->roomtype);
+
+	HLSavePutF(e->distance);
+	HLSavePutB(e->moving_angular);
+	HLSavePutF(e->momentary_frac);
+	HLSavePutB(e->rotates);
+
+	HLSavePutF(e->charge);
+	HLSavePutT(e->charge_next);
+
+	HLSavePutStr(e->texture);
+	HLSavePutStr(e->next_map);
+	HLSavePutStr(e->landmark);
+	HLSavePutStr(e->global_state);
+	HLSavePutI(e->trigger_mode);
+	HLSavePutI(e->initial_state);
+
+	HLSavePutB(e->in_use);
+	HLSavePutB(e->spawned);
+}
+
+U0 HLSaveReadEntity(CHLEntity *e)
+{//CRestore::ReadEntVars for one slot. The model name is compared first: a
+ //model changed at runtime must drop the resolved pointers so HLEntLoadModels
+ //picks the new path up
+	U8 old_model[64];
+
+	HLSaveGetStr(e->classname, 64);
+
+	HLStrCopy(old_model, e->model_name, 64);
+	HLSaveGetStr(e->model_name, 64);
+
+	if (StrCompare(old_model, e->model_name))
+	{
+		e->mdl    = NULL;
+		e->studio = NULL;
+		e->spr    = NULL;
+	}
+
+	e->brush_model = HLSaveGetI;
+	HLSaveGetV(e->origin);
+	HLSaveGetV(e->angles);
+	e->frame = HLSaveGetI;
+	e->seq   = HLSaveGetI;
+	e->body  = HLSaveGetI;
+	e->skin  = HLSaveGetI;
+
+	HLSaveGetStr(e->targetname, 64);
+	HLSaveGetStr(e->target, 64);
+	HLSaveGetStr(e->killtarget, 64);
+	HLSaveGetStr(e->master, 64);
+	HLSaveGetStr(e->message, 128);
+	HLSaveGetStr(e->netname, 64);
+	e->spawnflags = HLSaveGetI;
+
+	e->movetype = HLSaveGetI;
+	e->solid    = HLSaveGetI;
+	HLSaveGetV(e->velocity);
+	HLSaveGetV(e->avelocity);
+	HLSaveGetV(e->mins);
+	HLSaveGetV(e->maxs);
+
+	e->speed        = HLSaveGetF;
+	e->wait         = HLSaveGetF;
+	e->delay        = HLSaveGetF;
+	e->lip          = HLSaveGetF;
+	e->height       = HLSaveGetF;
+	e->dmg          = HLSaveGetF;
+	e->damage       = HLSaveGetF;
+	e->health       = HLSaveGetF;
+	e->max_health   = HLSaveGetF;
+	e->takedamage   = HLSaveGetI;
+	e->toggle_state = HLSaveGetI;
+	e->ent_class    = HLSaveGetI;
+
+	HLSaveGetStr(e->ai_play, 64);
+	HLSaveGetStr(e->ai_idle, 64);
+	HLSaveGetStr(e->ai_entity, 64);
+	e->ai_moveto = HLSaveGetI;
+	e->ai_radius = HLSaveGetF;
+
+	e->anim_start       = HLSaveGetT;
+	e->anim_loop        = HLSaveGetB;
+	e->anim_done        = HLSaveGetB;
+	e->anim_event_frame = HLSaveGetI;
+	e->yaw_delta        = HLSaveGetF;
+
+	e->move_snd  = HLSaveGetI;
+	e->stop_snd  = HLSaveGetI;
+	e->snd_index = HLSaveGetI;
+	e->volume    = HLSaveGetF;
+
+	HLSaveGetV(e->position1);
+	HLSaveGetV(e->position2);
+	HLSaveGetV(e->angle1);
+	HLSaveGetV(e->angle2);
+	HLSaveGetV(e->finaldest);
+	HLSaveGetV(e->finalangle);
+	HLSaveGetV(e->move_dir);
+
+	e->think_fn   = HLSaveGetI;
+	e->next_think = HLSaveGetT;
+	e->move_done  = HLSaveGetI;
+	e->touch_fn   = HLSaveGetI;
+	e->use_fn     = HLSaveGetI;
+	e->blocked_fn = HLSaveGetI;
+
+	e->owner         = HLSaveGetI;
+	e->activator     = HLSaveGetI;
+	e->ltime         = HLSaveGetT;
+	e->pain_finished = HLSaveGetT;
+
+	e->rendermode = HLSaveGetI;
+	e->renderamt  = HLSaveGetF;
+	HLSaveGetV(e->rendercolor);
+	e->renderfx = HLSaveGetI;
+	e->effects  = HLSaveGetI;
+	e->style    = HLSaveGetI;
+
+	e->framerate = HLSaveGetF;
+	e->scale     = HLSaveGetF;
+	e->visible   = HLSaveGetB;
+
+	HLSaveGetStr(e->beam_start_name, 64);
+	HLSaveGetStr(e->beam_end_name, 64);
+	e->beam_start    = HLSaveGetI;
+	e->beam_end      = HLSaveGetI;
+	e->beam_width    = HLSaveGetF;
+	e->beam_life     = HLSaveGetF;
+	e->beam_restrike = HLSaveGetF;
+	e->beam_active   = HLSaveGetB;
+
+	e->density      = HLSaveGetI;
+	e->frequency    = HLSaveGetF;
+	e->blood_color  = HLSaveGetI;
+	e->blood_amount = HLSaveGetF;
+
+	e->gib_count    = HLSaveGetI;
+	e->gib_left     = HLSaveGetI;
+	e->gib_velocity = HLSaveGetF;
+	e->gib_variance = HLSaveGetF;
+	e->gib_life     = HLSaveGetF;
+	HLSaveGetStr(e->shoot_model, 64);
+
+	e->hold_time = HLSaveGetF;
+	e->fade_in   = HLSaveGetF;
+	e->fade_out  = HLSaveGetF;
+	e->text_x    = HLSaveGetF;
+	e->text_y    = HLSaveGetF;
+
+	e->radius    = HLSaveGetF;
+	e->amplitude = HLSaveGetF;
+	e->duration  = HLSaveGetF;
+	e->magnitude = HLSaveGetF;
+	e->max_delay = HLSaveGetF;
+	e->modifier  = HLSaveGetF;
+	e->damp      = HLSaveGetF;
+	e->gravity   = HLSaveGetF;
+	e->roomtype  = HLSaveGetI;
+
+	e->distance       = HLSaveGetF;
+	e->moving_angular = HLSaveGetB;
+	e->momentary_frac = HLSaveGetF;
+	e->rotates        = HLSaveGetB;
+
+	e->charge      = HLSaveGetF;
+	e->charge_next = HLSaveGetT;
+
+	HLSaveGetStr(e->texture, 64);
+	HLSaveGetStr(e->next_map, 64);
+	HLSaveGetStr(e->landmark, 64);
+	HLSaveGetStr(e->global_state, 64);
+	e->trigger_mode  = HLSaveGetI;
+	e->initial_state = HLSaveGetI;
+
+	e->in_use  = HLSaveGetB;
+	e->spawned = HLSaveGetB;
+}
+
+//--- blocks -----------------------------------------------------------------
+
+U0 HLSaveWriteEntities()
+{//the entity block: count, then one length prefixed record per slot
+	CHLEntity	*e;
+	I64			 blk;
+	I64			 rec;
+	I64			 n;
+	I64			 i;
+
+	blk = HLSaveBlockBegin(HLSB_ENTITIES);
+
+	HLSavePutI(hl_num_entities);
+
+	for (i = 0; i < hl_num_entities; i++)
+	{
+		e = &hl_entities[i];
+
+		rec = hl_savew_len;
+		HLSavePutI(0);
+
+		HLSaveWriteEntity(e);
+
+		if (!hl_savew_err)
+		{
+			n = hl_savew_len - (rec + 8);
+			MemCopy(hl_savew_buf + rec, &n, 8);
+		}
+	}
+
+	HLSaveBlockEnd(blk);
+}
+
+Bool HLSaveReadEntities()
+{//pour the saved slots over the freshly spawned ones
+ //
+ //index for index: the map file is the same, so HLEntParse produced the same
+ //array in the same order. A different count means a different map and the
+ //restore is refused rather than half applied
+	CHLEntity	*e;
+	U8			*rec_end;
+	I64			 count;
+	I64			 rec_len;
+	I64			 fixed = 0;
+	I64			 i;
+
+	count = HLSaveGetI;
+
+	if (hl_saver_err || count != hl_num_entities)
+	{
+		"HLSave: save has %d entities, the map has %d\n", count,
+			hl_num_entities;
+		return FALSE;
+	}
+
+	for (i = 0; i < count; i++)
+	{
+		rec_len = HLSaveGetI;
+
+		if (hl_saver_err || rec_len < 0 ||
+			hl_saver_p + rec_len > hl_saver_end)
+		{
+			"HLSave: entity record %d is malformed\n", i;
+			return FALSE;
+		}
+
+		rec_end = hl_saver_p + rec_len;
+
+		e = &hl_entities[i];
+		HLSaveReadEntity(e);
+
+		//SV_LinkEdict: absmin/absmax/size are derived, never stored
+		HLEntSetAbsBox(e);
+		fixed++;
+
+		//the record length is the authority over the field walk. A short read
+		//would leave the cursor behind and every later entity is then garbage
+		hl_saver_p   = rec_end;
+		hl_saver_err = FALSE;
+	}
+
+	//re-resolve mdl/studio/spr for anything whose model name changed. The pass
+	//skips a slot that still holds a pointer, so only those cleared above cost
+	//anything
+	HLEntLoadModels;
+
+	"HLSave: %d entities restored\n", fixed;
+	return TRUE;
+}
+
+U0 HLSaveWritePlayer()
+{//CBasePlayer::m_SaveData, minus the parts the shell owns
+	I64 blk = HLSaveBlockBegin(HLSB_PLAYER);
+
+	HLSavePutI(hl_ent_player);
+	HLSavePutF(hl_ent_player_health);
+	HLSavePutF(hl_ent_player_armor);
+	HLSavePutB(hl_ent_player_dead);
+	HLSavePutF(hl_ent_player_damage);
+
+	HLSavePutB(hl_ent_player_suit);
+	HLSavePutB(hl_ent_player_longjump);
+	HLSavePutB(hl_ent_godmode);
+	HLSavePutB(hl_ent_notarget);
+
+	HLSavePutI(hl_ent_deadflag);
+	HLSavePutT(hl_ent_death_time);
+	HLSavePutT(hl_ent_dead_time);
+	HLSavePutB(hl_ent_player_gibbed);
+	HLSavePutF(hl_ent_death_view_ofs);
+	HLSavePutF(hl_ent_death_roll);
+	HLSavePutB(hl_ent_input_locked);
+	HLSavePutB(hl_ent_respawn_pending);
+	HLSavePutV(hl_ent_respawn_org);
+	HLSavePutV(hl_ent_respawn_ang);
+	HLSavePutV(hl_ent_player_org);
+
+	HLSaveBlockEnd(blk);
+}
+
+U0 HLSaveReadPlayer()
+{
+	hl_ent_player        = HLSaveGetI;
+	hl_ent_player_health = HLSaveGetF;
+	hl_ent_player_armor  = HLSaveGetF;
+	hl_ent_player_dead   = HLSaveGetB;
+	hl_ent_player_damage = HLSaveGetF;
+
+	hl_ent_player_suit     = HLSaveGetB;
+	hl_ent_player_longjump = HLSaveGetB;
+	hl_ent_godmode         = HLSaveGetB;
+	hl_ent_notarget        = HLSaveGetB;
+
+	hl_ent_deadflag        = HLSaveGetI;
+	hl_ent_death_time      = HLSaveGetT;
+	hl_ent_dead_time       = HLSaveGetT;
+	hl_ent_player_gibbed   = HLSaveGetB;
+	hl_ent_death_view_ofs  = HLSaveGetF;
+	hl_ent_death_roll      = HLSaveGetF;
+	hl_ent_input_locked    = HLSaveGetB;
+	hl_ent_respawn_pending = HLSaveGetB;
+	HLSaveGetV(hl_ent_respawn_org);
+	HLSaveGetV(hl_ent_respawn_ang);
+	HLSaveGetV(hl_ent_player_org);
+
+	//the death button gate is an input edge, not state: a key held at save time
+	//must be pressed again
+	hl_ent_death_button  = FALSE;
+	hl_ent_suit_pending  = FALSE;
+	hl_ent_suit_group[0] = 0;
+}
+
+U0 HLSaveWriteWeapons()
+{//the CBasePlayerItem inventory. The counts lead so a build with more weapons
+ //can read a file written by one with fewer
+	I64 blk = HLSaveBlockBegin(HLSB_WEAPONS);
+	I64 i;
+
+	HLSavePutI(HLWPN_COUNT);
+	HLSavePutI(HLAMMO_COUNT);
+	HLSavePutI(HLWPN_SLOTS);
+
+	for (i = 0; i < HLWPN_COUNT; i++)
+	{
+		HLSavePutB(hl_wpn_have[i]);
+		HLSavePutI(hl_wpn_clip[i]);
+		HLSavePutT(hl_wpn_next[i]);
+	}
+
+	for (i = 0; i < HLAMMO_COUNT; i++)
+	{
+		HLSavePutI(hl_wpn_ammo[i]);
+		HLSavePutI(hl_wpn_ammo_max[i]);
+	}
+
+	HLSavePutI(hl_wpn_active);
+	HLSavePutT(hl_wpn_reload_done);
+	HLSavePutI(hl_wpn_reloading);
+
+	HLSavePutI(hl_wpn_vm_for);
+	HLSavePutI(hl_wpn_vm_seq);
+	HLSavePutF(hl_wpn_vm_cycle);
+	HLSavePutB(hl_wpn_vm_loop);
+	HLSavePutB(hl_wpn_vm_done);
+	HLSavePutI(hl_wpn_vm_ev_frame);
+
+	HLSavePutT(hl_wpn_last_time);
+	HLSavePutB(hl_wpn_spawned);
+	HLSavePutI(hl_wpn_picked);
+	HLSavePutI(hl_wpn_sel_slot);
+	HLSavePutT(hl_wpn_sel_until);
+
+	HLSaveBlockEnd(blk);
+}
+
+U0 HLSaveReadWeapons()
+{
+	I64	 nw;
+	I64	 na;
+	I64	 ns;
+	I64	 i;
+	I64	 clip;
+	I64	 amt;
+	I64	 amax;
+	F64	 next;
+	Bool have;
+
+	nw = HLSaveGetI;
+	na = HLSaveGetI;
+	ns = HLSaveGetI;		//slot count, read to keep the cursor aligned only
+
+	for (i = 0; i < nw; i++)
+	{
+		have = HLSaveGetB;
+		clip = HLSaveGetI;
+		next = HLSaveGetT;
+
+		if (i >= HLWPN_COUNT)
+			goto qsrw_next_wpn;
+
+		hl_wpn_have[i] = have;
+		hl_wpn_clip[i] = clip;
+		hl_wpn_next[i] = next;
+
+qsrw_next_wpn:
+	}
+
+	for (i = 0; i < na; i++)
+	{
+		amt  = HLSaveGetI;
+		amax = HLSaveGetI;
+
+		if (i >= HLAMMO_COUNT)
+			goto qsrw_next_ammo;
+
+		hl_wpn_ammo[i]     = amt;
+		hl_wpn_ammo_max[i] = amax;
+
+qsrw_next_ammo:
+	}
+
+	hl_wpn_active      = HLSaveGetI;
+	hl_wpn_reload_done = HLSaveGetT;
+	hl_wpn_reloading   = HLSaveGetI;
+
+	hl_wpn_vm_for      = HLSaveGetI;
+	hl_wpn_vm_seq      = HLSaveGetI;
+	hl_wpn_vm_cycle    = HLSaveGetF;
+	hl_wpn_vm_loop     = HLSaveGetB;
+	hl_wpn_vm_done     = HLSaveGetB;
+	hl_wpn_vm_ev_frame = HLSaveGetI;
+
+	hl_wpn_last_time = HLSaveGetT;
+	hl_wpn_spawned   = HLSaveGetB;
+	hl_wpn_picked    = HLSaveGetI;
+	hl_wpn_sel_slot  = HLSaveGetI;
+	hl_wpn_sel_until = HLSaveGetT;
+
+	//a file from a build with more weapons than this one can name a weapon that
+	//does not exist here
+	if (hl_wpn_active >= HLWPN_COUNT)
+		hl_wpn_active = HLWPN_NONE;
+	if (hl_wpn_reloading >= HLWPN_COUNT)
+		hl_wpn_reloading = HLWPN_NONE;
+
+	//every held flag is an input edge the shell re-reads; a key down at save
+	//time must not fire on the first restored frame
+	for (i = 0; i < HLWPN_SLOTS; i++)
+		hl_wpn_slot_held[i] = FALSE;
+
+	hl_wpn_next_held   = FALSE;
+	hl_wpn_prev_held   = FALSE;
+	hl_wpn_reload_held = FALSE;
+	hl_wpn_attack_held = FALSE;
+}
+
+U0 HLSaveWriteMove()
+{//pm_shared's player move state, which lives in HLClip.ZC
+	I64 blk = HLSaveBlockBegin(HLSB_MOVE);
+
+	HLSavePutB(hl_ducking);
+	HLSavePutB(hl_duck_pending);
+	HLSavePutB(hl_duck_held_last);
+	HLSavePutF(hl_duck_time);
+	HLSavePutF(hl_view_ofs_z);
+
+	HLSavePutB(hl_jump_held);
+	HLSavePutB(hl_on_ladder);
+	HLSavePutI(hl_ladder_ent);
+
+	HLSavePutF(hl_waterjump_time);
+	HLSavePutV(hl_waterjump_dir);
+
+	HLSavePutF(hl_fall_velocity);
+	HLSavePutF(hl_fall_damage_pending);
+
+	HLSavePutF(hl_gravity_scale);
+	HLSavePutF(hl_step_dist);
+	HLSavePutI(hl_step_side);
+	HLSavePutI(hl_ground_entity);
+
+	HLSaveBlockEnd(blk);
+}
+
+U0 HLSaveReadMove()
+{
+	hl_ducking        = HLSaveGetB;
+	hl_duck_pending   = HLSaveGetB;
+	hl_duck_held_last = HLSaveGetB;
+	hl_duck_time      = HLSaveGetF;
+	hl_view_ofs_z     = HLSaveGetF;
+
+	hl_jump_held  = HLSaveGetB;
+	hl_on_ladder  = HLSaveGetB;
+	hl_ladder_ent = HLSaveGetI;
+
+	hl_waterjump_time = HLSaveGetF;
+	HLSaveGetV(hl_waterjump_dir);
+
+	hl_fall_velocity       = HLSaveGetF;
+	hl_fall_damage_pending = HLSaveGetF;
+
+	hl_gravity_scale = HLSaveGetF;
+	hl_step_dist     = HLSaveGetF;
+	hl_step_side     = HLSaveGetI;
+	hl_ground_entity = HLSaveGetI;
+
+	//the trace box is a consequence of hl_ducking, so it is set rather than
+	//stored: a restore into the large hull while crouched clips into the roof
+	HLDuckSetHull(hl_ducking);
+
+	//the landing cues are one-frame requests; replaying them on the restore
+	//frame lands the player twice
+	hl_fall_sound_vol = 0.0;
+	hl_fall_pain      = FALSE;
+	hl_fall_punch_z   = 0.0;
+	hl_step_play      = FALSE;
+}
+
+U0 HLSaveWriteGlobals()
+{//CGlobalState::Save. The one block that must survive a level transition
+	I64 blk = HLSaveBlockBegin(HLSB_GLOBALS);
+	I64 i;
+
+	HLSavePutI(hl_ent_global_count);
+
+	for (i = 0; i < hl_ent_global_count; i++)
+	{
+		HLSavePutStr(hl_ent_globals[i].name);
+		HLSavePutI(hl_ent_globals[i].state);
+	}
+
+	HLSaveBlockEnd(blk);
+}
+
+U0 HLSaveReadGlobals()
+{//CGlobalState::Restore
+	U8	name[64];
+	I64	count;
+	I64	state;
+	I64	n = 0;
+	I64	i;
+
+	count = HLSaveGetI;
+
+	for (i = 0; i < count; i++)
+	{
+		HLSaveGetStr(name, 64);
+		state = HLSaveGetI;
+
+		if (hl_saver_err || n >= HLENT_GLOBAL_MAX)
+			goto qsrg_next;
+
+		HLStrCopy(hl_ent_globals[n].name, name, 64);
+		hl_ent_globals[n].state = state;
+		n++;
+
+qsrg_next:
+	}
+
+	hl_ent_global_count = n;
+}
+
+U0 HLSaveWriteMM()
+{//CMultiManager's m_flTargetDelay list and m_index
+	I64 blk = HLSaveBlockBegin(HLSB_MM);
+	I64 i;
+	I64 j;
+
+	HLSavePutI(hl_mm_count);
+	HLSavePutI(HLENT_MM_MAX);
+
+	for (i = 0; i < hl_mm_count; i++)
+	{
+		HLSavePutI(hl_mm[i].ent);
+		HLSavePutI(hl_mm[i].count);
+		HLSavePutI(hl_mm[i].fired);
+		HLSavePutT(hl_mm[i].started);
+
+		for (j = 0; j < HLENT_MM_MAX; j++)
+		{
+			HLSavePutStr(&hl_mm[i].name[j * 64]);
+			HLSavePutF(hl_mm[i].delay[j]);
+		}
+	}
+
+	HLSaveBlockEnd(blk);
+}
+
+U0 HLSaveReadMM()
+{
+	U8	name[64];
+	I64	count;
+	I64	slots;
+	I64	ent;
+	I64	n;
+	I64	fired;
+	I64	i;
+	I64	j;
+	F64	started;
+	F64	delay;
+
+	count = HLSaveGetI;
+	slots = HLSaveGetI;
+
+	if (count > 32)
+		count = 32;
+
+	hl_mm_count = 0;
+
+	for (i = 0; i < count; i++)
+	{
+		ent     = HLSaveGetI;
+		n       = HLSaveGetI;
+		fired   = HLSaveGetI;
+		started = HLSaveGetT;
+
+		if (hl_saver_err)
+			return;
+
+		hl_mm[i].ent     = ent;
+		hl_mm[i].count   = n;
+		hl_mm[i].fired   = fired;
+		hl_mm[i].started = started;
+
+		for (j = 0; j < slots; j++)
+		{
+			HLSaveGetStr(name, 64);
+			delay = HLSaveGetF;
+
+			if (j >= HLENT_MM_MAX)
+				goto qsrm_next_slot;
+
+			HLStrCopy(&hl_mm[i].name[j * 64], name, 64);
+			hl_mm[i].delay[j] = delay;
+
+qsrm_next_slot:
+		}
+
+		hl_mm_count = i + 1;
+	}
+}
+
+U0 HLSaveWriteAI()
+{//CBaseMonster's schedule, task and enemy memory, so a save taken mid-fight
+ //restores mid-fight instead of dropping every monster back to idle
+	I64 blk = HLSaveBlockBegin(HLSB_AI);
+	I64 i;
+
+	HLSavePutI(hl_ai_mon_count);
+	HLSavePutI(hl_ai_mon_kills);
+	HLSavePutB(hl_ai_mon_revive);
+
+	for (i = 0; i < hl_ai_mon_count; i++)
+	{
+		HLSavePutI(hl_ai_mon[i].ent);
+		HLSavePutI(hl_ai_mon[i].kind);
+		HLSavePutI(hl_ai_mon[i].state);
+
+		HLSavePutI(hl_ai_mon[i].sched);
+		HLSavePutI(hl_ai_mon[i].task);
+		HLSavePutI(hl_ai_mon[i].task_status);
+		HLSavePutT(hl_ai_mon[i].task_start);
+		HLSavePutB(hl_ai_mon[i].sched_done);
+
+		HLSavePutB(hl_ai_mon[i].have_enemy);
+		HLSavePutI(hl_ai_mon[i].enemy);
+		HLSavePutV(hl_ai_mon[i].enemy_pos);
+		HLSavePutT(hl_ai_mon[i].enemy_seen);
+
+		HLSavePutB(hl_ai_mon[i].have_goal);
+		HLSavePutB(hl_ai_mon[i].goal_is_enemy);
+		HLSavePutV(hl_ai_mon[i].goal);
+		HLSavePutF(hl_ai_mon[i].goal_tol);
+		HLSavePutF(hl_ai_mon[i].move_speed);
+		HLSavePutT(hl_ai_mon[i].path_start);
+		HLSavePutT(hl_ai_mon[i].stuck_since);
+
+		HLSavePutF(hl_ai_mon[i].ideal_yaw);
+		HLSavePutT(hl_ai_mon[i].next_attack);
+		HLSavePutT(hl_ai_mon[i].next_idle_snd);
+		HLSavePutT(hl_ai_mon[i].next_look);
+		HLSavePutF(hl_ai_mon[i].last_health);
+		HLSavePutB(hl_ai_mon[i].scripted);
+		HLSavePutB(hl_ai_mon[i].settled);
+	}
+
+	HLSaveBlockEnd(blk);
+}
+
+U0 HLSaveReadAI()
+{
+	I64 count;
+	I64 ent;
+	I64 i;
+
+	count            = HLSaveGetI;
+	hl_ai_mon_kills  = HLSaveGetI;
+	hl_ai_mon_revive = HLSaveGetB;
+
+	if (count > HLAI_MON_MAX)
+		count = HLAI_MON_MAX;
+
+	//the entity index to slot map is derived, so it is rebuilt rather than
+	//stored
+	for (i = 0; i < HLENT_MAX; i++)
+		hl_ai_mon_of[i] = -1;
+
+	for (i = 0; i < count; i++)
+	{
+		hl_ai_mon[i].ent   = HLSaveGetI;
+		hl_ai_mon[i].kind  = HLSaveGetI;
+		hl_ai_mon[i].state = HLSaveGetI;
+
+		hl_ai_mon[i].sched       = HLSaveGetI;
+		hl_ai_mon[i].task        = HLSaveGetI;
+		hl_ai_mon[i].task_status = HLSaveGetI;
+		hl_ai_mon[i].task_start  = HLSaveGetT;
+		hl_ai_mon[i].sched_done  = HLSaveGetB;
+
+		hl_ai_mon[i].have_enemy = HLSaveGetB;
+		hl_ai_mon[i].enemy      = HLSaveGetI;
+		HLSaveGetV(hl_ai_mon[i].enemy_pos);
+		hl_ai_mon[i].enemy_seen = HLSaveGetT;
+
+		hl_ai_mon[i].have_goal     = HLSaveGetB;
+		hl_ai_mon[i].goal_is_enemy = HLSaveGetB;
+		HLSaveGetV(hl_ai_mon[i].goal);
+		hl_ai_mon[i].goal_tol    = HLSaveGetF;
+		hl_ai_mon[i].move_speed  = HLSaveGetF;
+		hl_ai_mon[i].path_start  = HLSaveGetT;
+		hl_ai_mon[i].stuck_since = HLSaveGetT;
+
+		hl_ai_mon[i].ideal_yaw     = HLSaveGetF;
+		hl_ai_mon[i].next_attack   = HLSaveGetT;
+		hl_ai_mon[i].next_idle_snd = HLSaveGetT;
+		hl_ai_mon[i].next_look     = HLSaveGetT;
+		hl_ai_mon[i].last_health   = HLSaveGetF;
+		hl_ai_mon[i].scripted      = HLSaveGetB;
+		hl_ai_mon[i].settled       = HLSaveGetB;
+
+		if (hl_saver_err)
+			return;
+
+		ent = hl_ai_mon[i].ent;
+		if (ent >= 0 && ent < HLENT_MAX)
+			hl_ai_mon_of[ent] = i;
+	}
+
+	hl_ai_mon_count = count;
+
+	//HLAIMonSync re-registers whenever the table it last ran against differs.
+	//Left stale it throws every restored schedule away on the next frame
+	hl_ai_mon_base  = hl_entities;
+	hl_ai_mon_ents  = hl_num_entities;
+	hl_ai_mon_clock = hl_ent_time;
+}
+
+U0 HLSaveWriteLight()
+{//LIGHT_STYLE. A style string set by a trigger is not in the map
+	I64 blk = HLSaveBlockBegin(HLSB_LIGHT);
+
+	HLSavePutI(HLMAX_LIGHTSTYLES);
+	HLSavePutI(HLLIGHTSTYLE_LEN);
+	HLSavePutBytes(hl_lightstyle, HLMAX_LIGHTSTYLES * HLLIGHTSTYLE_LEN);
+
+	HLSaveBlockEnd(blk);
+}
+
+U0 HLSaveReadLight()
+{
+	I64 n;
+	I64 len;
+
+	n   = HLSaveGetI;
+	len = HLSaveGetI;
+
+	if (hl_saver_err || n != HLMAX_LIGHTSTYLES || len != HLLIGHTSTYLE_LEN)
+		return;
+
+	if (hl_saver_p + n * len > hl_saver_end)
+	{
+		hl_saver_err = TRUE;
+		return;
+	}
+
+	MemCopy(hl_lightstyle, hl_saver_p, n * len);
+	hl_saver_p += n * len;
+}
+
+U0 HLSaveWriteFX()
+{//the env_* screen state HL1.ZC drains, plus the two world settings
+ //trigger_gravity and env_sound leave behind
+	I64 blk = HLSaveBlockBegin(HLSB_FX);
+
+	HLSavePutF(hl_ent_gravity);
+	HLSavePutI(hl_ent_roomtype);
+
+	HLSavePutF(hl_ent_shake_amp);
+	HLSavePutF(hl_ent_shake_freq);
+	HLSavePutT(hl_ent_shake_until);
+
+	HLSavePutV(hl_ent_fade_color);
+	HLSavePutF(hl_ent_fade_alpha);
+	HLSavePutF(hl_ent_fade_duration);
+	HLSavePutF(hl_ent_fade_hold);
+	HLSavePutB(hl_ent_fade_in);
+
+	HLSavePutStr(hl_ent_changelevel);
+	HLSavePutStr(hl_ent_changelevel_landmark);
+
+	HLSaveBlockEnd(blk);
+}
+
+U0 HLSaveReadFX()
+{
+	hl_ent_gravity  = HLSaveGetF;
+	hl_ent_roomtype = HLSaveGetI;
+
+	hl_ent_shake_amp   = HLSaveGetF;
+	hl_ent_shake_freq  = HLSaveGetF;
+	hl_ent_shake_until = HLSaveGetT;
+
+	HLSaveGetV(hl_ent_fade_color);
+	hl_ent_fade_alpha    = HLSaveGetF;
+	hl_ent_fade_duration = HLSaveGetF;
+	hl_ent_fade_hold     = HLSaveGetF;
+	hl_ent_fade_in       = HLSaveGetB;
+
+	HLSaveGetStr(hl_ent_changelevel, 64);
+	HLSaveGetStr(hl_ent_changelevel_landmark, 64);
+
+	//the pending flags are requests the shell drains once. A save taken on the
+	//frame a trigger_changelevel fired would change level on load and never let
+	//the player see the restored map
+	hl_ent_changelevel_pending = FALSE;
+	hl_ent_shake_pending       = FALSE;
+	hl_ent_fade_pending        = FALSE;
+	hl_ent_teleport_pending    = FALSE;
+	hl_ent_push_pending        = FALSE;
+	hl_ent_spin_pending        = FALSE;
+	hl_ent_spin_yaw            = 0.0;
+}
+
+//--- write ------------------------------------------------------------------
 
 Bool HLSaveWrite(U8 *path, U8 *mapname, F64 game_time, F64 *origin,
 	F64 *velocity, F64 *angles, Bool on_ground, I64 water_level,
 	I64 water_type)
-{//Host_Savegame_f
-	CHLSaveHeader	 hdr;
-	U8				*buf;
-	U8				*p;
-	I64				 total;
-	I64				 edict_bytes;
-	I64				 ofs;
-	I64				 i;
-	I64				 j;
+{//SaveGameSlot
+	CHLSaveHeader	hdr;
+	I64				total;
+	I64				j;
 
-	//guards the counts the buffer size is computed from. A save against a torn
-	//down world sizes the buffer from stale counts and faults later, in Free
-	if (!hl_game_active || !hl_pr_edicts || !hl_pr_globals || !hl_pr_strings)
+	//a save against a torn down world would walk arrays that are no longer
+	//there
+	if (!hl_map || !hl_entities || hl_num_entities < 1)
 	{
-		"HLSave: no game in progress\n";
+		"HLSave: no world to save\n";
 		return FALSE;
 	}
-
-	if (hl_pr_num_edicts < 1 || hl_pr_edict_stride < 1 ||
-		hl_pr_num_globals < 1 || hl_pr_strings_size < 1)
-	{
-		"HLSave: world is not loaded\n";
-		return FALSE;
-	}
-
-	if (hl_intermission)
-	{
-		"HLSave: can't save in intermission\n";
-		return FALSE;
-	}
-
-	//Host_Savegame_f refuses deathmatch: there is nothing coherent to restore
-	//when the level is a scoreboard. Coop saves, and keeps every inventory
-	if (HLCvarGet("deathmatch") != 0.0)
-	{
-		"HLSave: can't save a deathmatch game\n";
-		return FALSE;
-	}
-
-	//every active client's parms are refreshed first; they are written below
-	HLSaveSpawnParms;
 
 	MemSet(&hdr, 0, sizeof(CHLSaveHeader));
 
-	hdr.magic        = HLSAVE_MAGIC;
-	hdr.version      = HLSAVE_VERSION;
+	hdr.magic     = HLSAVE_MAGIC;
+	hdr.version   = HLSAVE_VERSION;
 	HLStrCopy(hdr.mapname, mapname, 96);
-	hdr.game_time    = game_time;
-	//no ToI64() here: it is the F64->I64 intrinsic and would reinterpret the
-	//Bool's bits as a double
-	hdr.on_ground    = on_ground;
+	hdr.game_time = game_time;
+	hdr.ent_time  = hl_ent_time;
+
+	//no ToI64 here: it is the F64 to I64 intrinsic and would reinterpret the
+	//Bool's bits
+	hdr.on_ground = 0;
+	if (on_ground)
+		hdr.on_ground = 1;
+
 	hdr.water_level  = water_level;
 	hdr.water_type   = water_type;
-	hdr.num_edicts   = hl_pr_num_edicts;
-	hdr.edict_stride = hl_pr_edict_stride;
-	hdr.num_globals  = hl_pr_num_globals;
-	hdr.strings_size = hl_pr_strings_size;
-	hdr.string_alloc = hl_pr_string_alloc;
-	hdr.num_models   = hl_precache_model_count;
-	hdr.num_sounds   = hl_precache_sound_count;
+	hdr.num_entities = hl_num_entities;
+	hdr.num_blocks   = 9;
 
 	for (j = 0; j < 3; j++)
 	{
@@ -178,113 +1357,59 @@ Bool HLSaveWrite(U8 *path, U8 *mapname, F64 game_time, F64 *origin,
 		hdr.angles[j]   = angles[j];
 	}
 
-	for (j = 0; j < HLGAME_MAX_PARMS; j++)
-		hdr.saved_parms[j] = hl_saved_parms[j];
-	hdr.saved_serverflags = hl_saved_serverflags;
-
-	edict_bytes = hl_pr_num_edicts * hl_pr_edict_stride;
-
-	total = sizeof(CHLSaveHeader)
-		+ hl_pr_num_globals * 4
-		+ edict_bytes
-		+ hl_pr_num_edicts			//one free flag per edict
-		+ hl_pr_strings_size
-		+ HLMAX_LIGHTSTYLES * HLLIGHTSTYLE_LEN
-		+ (hl_precache_model_count + hl_precache_sound_count) * 8
-		+ HLSAVE_PARM_BYTES;
-
-	if (total < 1)
+	HLSaveWriterOpen;
+	if (hl_savew_err)
 	{
-		"HLSave: refusing a %d byte save\n", total;
+		"HLSave: out of memory\n";
+		HLSaveWriterClose;
 		return FALSE;
 	}
 
-	buf = MAlloc(total);
-	if (!buf)
+	hl_savew_base = hl_ent_time;
+
+	HLSavePutBytes(&hdr, sizeof(CHLSaveHeader));
+
+	HLSaveWriteEntities;
+	HLSaveWritePlayer;
+	HLSaveWriteWeapons;
+	HLSaveWriteMove;
+	HLSaveWriteGlobals;
+	HLSaveWriteMM;
+	HLSaveWriteAI;
+	HLSaveWriteLight;
+	HLSaveWriteFX;
+
+	if (hl_savew_err)
 	{
-		"HLSave: out of memory for %d bytes\n", total;
+		"HLSave: ran out of memory building the save\n";
+		HLSaveWriterClose;
 		return FALSE;
 	}
 
-	p = buf;
+	total = hl_savew_len;
 
-	p = HLSaveAppend(p, &hdr, sizeof(CHLSaveHeader));
-	p = HLSaveAppend(p, hl_pr_globals, hl_pr_num_globals * 4);
-	p = HLSaveAppend(p, hl_pr_edicts, edict_bytes);
-
-	//Bool is wider than a byte, so the free list is packed down
-	for (i = 0; i < hl_pr_num_edicts; i++)
-	{
-		if (hl_pr_edict_free[i])
-			p[0] = 1;
-		else
-			p[0] = 0;
-		p++;
-	}
-
-	p = HLSaveAppend(p, hl_pr_strings, hl_pr_strings_size);
-	p = HLSaveAppend(p, hl_lightstyle, HLMAX_LIGHTSTYLES * HLLIGHTSTYLE_LEN);
-
-	//precache names as offsets into the heap, not copies: the heap is already in
-	//this file, so an offset cannot drift from the entity string fields
-	for (i = 0; i < hl_precache_model_count; i++)
-	{
-		ofs = 0;
-		if (hl_precache_model[i])
-			ofs = hl_precache_model[i] - hl_pr_strings;
-		MemCopy(p, &ofs, 8);
-		p += 8;
-	}
-
-	for (i = 0; i < hl_precache_sound_count; i++)
-	{
-		ofs = 0;
-		if (hl_precache_sound[i])
-			ofs = hl_precache_sound[i] - hl_pr_strings;
-		MemCopy(p, &ofs, 8);
-		p += 8;
-	}
-
-	//--- version 2 trailer: per client spawn parms ---
-	ofs = HLSV_MAX_CLIENTS;
-	MemCopy(p, &ofs, 8);
-	p += 8;
-
-	ofs = HLPR_MAX_PARM_GLOBALS;
-	MemCopy(p, &ofs, 8);
-	p += 8;
-
-	for (i = 0; i < HLSV_MAX_CLIENTS; i++)
-	{
-		ofs = 0;
-		if (hl_client_parms_set[i])
-			ofs = 1;
-		MemCopy(p, &ofs, 8);
-		p += 8;
-
-		MemCopy(p, &hl_client_parms[i * HLPR_MAX_PARM_GLOBALS],
-			HLPR_MAX_PARM_GLOBALS * 8);
-		p += HLPR_MAX_PARM_GLOBALS * 8;
-	}
-
-	if (FileWrite(path, buf, total) < 1)
+	if (FileWrite(path, hl_savew_buf, total) < 1)
 	{
 		"HLSave: could not write %s\n", path;
-		Free(buf);
+		HLSaveWriterClose;
 		return FALSE;
 	}
 
-	Free(buf);
+	HLSaveWriterClose;
 
-	"HLSave: wrote %s (%d bytes, %d edicts)\n", path, total, hl_pr_num_edicts;
+	"HLSave: wrote %s (%d bytes, %d entities)\n", path, total,
+		hl_num_entities;
 	return TRUE;
 }
 
-//load is two halves; only the shell knows how to bring a map up
+//--- read -------------------------------------------------------------------
 //
-//HLSaveReadHeader reports which map is needed, the shell loads it, and
-//HLSaveRestore writes the saved state into the fresh world
-U8	*hl_save_buf		= NULL;
+// Load is two halves; only the shell knows how to bring a map up.
+//
+// HLSaveReadHeader reports which map is needed, the shell loads it and spawns
+// the native world, and HLSaveRestore pours the saved state over it.
+
+U8	*hl_save_buf	= NULL;
 I64	 hl_save_size	= 0;
 CHLSaveHeader hl_save_hdr;
 
@@ -300,7 +1425,9 @@ U0 HLSaveDiscard()
 
 Bool HLSaveReadHeader(U8 *path, U8 *_mapname)
 {//read the file and report the map it belongs to
-	I64 size = 0;
+	U32	magic	= 0;
+	U32	version	= 0;
+	I64	size	= 0;
 
 	HLSaveDiscard;
 
@@ -313,6 +1440,36 @@ Bool HLSaveReadHeader(U8 *path, U8 *_mapname)
 
 	hl_save_size = size;
 
+	//magic and version before the header size test: a file in the old format is
+	//shorter than the current header and must be reported as the wrong version,
+	//not as truncated
+	if (size < 8)
+	{
+		"HLSave: %s is truncated\n", path;
+		HLSaveDiscard;
+		return FALSE;
+	}
+
+	MemCopy(&magic, hl_save_buf, 4);
+	MemCopy(&version, hl_save_buf + 4, 4);
+
+	if (magic != HLSAVE_MAGIC)
+	{
+		"HLSave: %s is not a save file\n", path;
+		HLSaveDiscard;
+		return FALSE;
+	}
+
+	//versions 1 and 2 held a QuakeC edict pool. There is no VM left to pour one
+	//into, so they are rejected rather than converted
+	if (version < HLSAVE_VERSION_MIN || version > HLSAVE_VERSION)
+	{
+		"HLSave: %s is version %d, this build reads %d\n", path, version,
+			HLSAVE_VERSION;
+		HLSaveDiscard;
+		return FALSE;
+	}
+
 	if (size < sizeof(CHLSaveHeader))
 	{
 		"HLSave: %s is truncated\n", path;
@@ -322,161 +1479,100 @@ Bool HLSaveReadHeader(U8 *path, U8 *_mapname)
 
 	MemCopy(&hl_save_hdr, hl_save_buf, sizeof(CHLSaveHeader));
 
-	//a version 1 file is readable and stops after the precache lists. Only a
-	//foreign magic or a future version is rejected
-	if (hl_save_hdr.magic != HLSAVE_MAGIC ||
-		hl_save_hdr.version < HLSAVE_VERSION_MIN ||
-		hl_save_hdr.version > HLSAVE_VERSION)
-	{
-		"HLSave: %s is not a version %d..%d save\n", path,
-			HLSAVE_VERSION_MIN, HLSAVE_VERSION;
-		HLSaveDiscard;
-		return FALSE;
-	}
-
 	HLStrCopy(_mapname, hl_save_hdr.mapname, 96);
 	return TRUE;
 }
 
 Bool HLSaveRestore(F64 *_game_time, F64 *origin, F64 *velocity, F64 *angles,
 	Bool *_on_ground, I64 *_water_level, I64 *_water_type)
-{//Host_Loadgame_f second half: overwrite the fresh world
+{//LoadGame's second half: overwrite the freshly spawned world
+ //
+ //the entity block is the only one that fails the whole restore. Everything
+ //else is skipped on a short read, because a missing schedule is a worse frame
+ //and a missing entity block is the wrong map
 	CHLSaveHeader	*hdr = &hl_save_hdr;
-	U8				*p;
-	I64				 edict_bytes;
-	I64				 ofs;
-	I64				 i;
+	U8				*blk_end;
+	I64				 tag;
+	I64				 len;
 	I64				 j;
-	I64				 slots;
-	I64				 nparm;
-	I64				 flag;
-	I64				 remaining;
-	F64				 value;
+	Bool			 ok = TRUE;
 
 	if (!hl_save_buf)
 		return FALSE;
 
-	//layouts must match exactly or the field block is misread. They differ only
-	//when the bytecode changed under the save
-	if (hdr->edict_stride != hl_pr_edict_stride ||
-		hdr->num_globals != hl_pr_num_globals ||
-		hdr->strings_size != hl_pr_strings_size)
+	if (!hl_entities || hl_num_entities < 1)
 	{
-		"HLSave: save does not match this progs.dat\n";
+		"HLSave: no world is up to restore into\n";
 		HLSaveDiscard;
 		return FALSE;
 	}
 
-	if (hdr->num_edicts < 1 || hdr->num_edicts > hl_pr_max_edicts)
+	if (hdr->num_entities != hl_num_entities)
 	{
-		"HLSave: edict count out of range\n";
+		"HLSave: save is for a %d entity map, this one has %d\n",
+			hdr->num_entities, hl_num_entities;
 		HLSaveDiscard;
 		return FALSE;
 	}
 
-	edict_bytes = hdr->num_edicts * hdr->edict_stride;
-	p           = hl_save_buf + sizeof(CHLSaveHeader);
+	//the entity clock comes first: it is the base every stored time delta is
+	//rebased onto, so nothing may be read before it is set
+	hl_ent_time   = hdr->ent_time;
+	hl_saver_base = hdr->ent_time;
+	hl_saver_p    = hl_save_buf + sizeof(CHLSaveHeader);
+	hl_saver_end  = hl_save_buf + hl_save_size;
+	hl_saver_err  = FALSE;
 
-	MemCopy(hl_pr_globals, p, hdr->num_globals * 4);
-	p += hdr->num_globals * 4;
-
-	MemCopy(hl_pr_edicts, p, edict_bytes);
-	p += edict_bytes;
-
-	for (i = 0; i < hdr->num_edicts; i++)
+	while (hl_saver_p + 16 <= hl_saver_end)
 	{
-		hl_pr_edict_free[i] = ToBool(p[0]);
-		p++;
-	}
+		hl_saver_err = FALSE;
 
-	hl_pr_num_edicts = hdr->num_edicts;
+		tag = HLSaveGetI;
+		len = HLSaveGetI;
 
-	//entity string fields are offsets into this heap
-	MemCopy(hl_pr_strings, p, hdr->strings_size);
-	p += hdr->strings_size;
-	hl_pr_string_alloc = hdr->string_alloc;
-
-	MemCopy(hl_lightstyle, p, HLMAX_LIGHTSTYLES * HLLIGHTSTYLE_LEN);
-	p += HLMAX_LIGHTSTYLES * HLLIGHTSTYLE_LEN;
-
-	//rebuilt in index order: re-precaching by name returns the same indices, so
-	//every .modelindex still means what it did at save time
-	for (i = 0; i < hdr->num_models; i++)
-	{
-		MemCopy(&ofs, p, 8);
-		p += 8;
-
-		if (i > 0 && ofs > 0 && ofs < hl_pr_strings_size)
-			HLBiPrecacheModel(HLPrStr(ofs));
-	}
-
-	for (i = 0; i < hdr->num_sounds; i++)
-	{
-		MemCopy(&ofs, p, 8);
-		p += 8;
-
-		if (ofs > 0 && ofs < hl_pr_strings_size &&
-			hl_precache_sound_count < HLBI_MAX_PRECACHE)
+		if (hl_saver_err || len < 0 || hl_saver_p + len > hl_saver_end)
 		{
-			hl_precache_sound[hl_precache_sound_count] = HLPrStr(ofs);
-			hl_precache_sound_count++;
+			"HLSave: block %d is malformed, stopping there\n", tag;
+			goto qsr_done;
 		}
+
+		blk_end = hl_saver_p + len;
+
+		switch (tag)
+		{
+			case HLSB_ENTITIES:
+				ok = HLSaveReadEntities;
+				break;
+
+			case HLSB_PLAYER:	HLSaveReadPlayer;	break;
+			case HLSB_WEAPONS:	HLSaveReadWeapons;	break;
+			case HLSB_MOVE:		HLSaveReadMove;		break;
+			case HLSB_GLOBALS:	HLSaveReadGlobals;	break;
+			case HLSB_MM:		HLSaveReadMM;		break;
+			case HLSB_AI:		HLSaveReadAI;		break;
+			case HLSB_LIGHT:	HLSaveReadLight;	break;
+			case HLSB_FX:		HLSaveReadFX;		break;
+
+			//an unknown tag is a block this build does not have. Its length
+			//carries the cursor past it
+			default:
+				break;
+		}
+
+		if (!ok)
+			goto qsr_done;
+
+		//the block length is the authority over the field walk, the same rule
+		//the entity records use
+		hl_saver_p = blk_end;
 	}
 
-	for (j = 0; j < HLGAME_MAX_PARMS; j++)
-		hl_saved_parms[j] = hdr->saved_parms[j];
-	hl_saved_serverflags = hdr->saved_serverflags;
-	hl_have_saved_parms  = TRUE;
-
-	//--- per client spawn parms ---
-	//
-	//every slot is seeded from the header first. That is all a version 1 file
-	//has: slot 0 holds the player's kit and no other slot is set
-	for (i = 0; i < HLSV_MAX_CLIENTS; i++)
-		hl_client_parms_set[i] = FALSE;
-
-	for (j = 0; j < HLPR_MAX_PARM_GLOBALS; j++)
-		hl_client_parms[j] = hdr->saved_parms[j];
-	hl_client_parms_set[0] = TRUE;
-
-	remaining = hl_save_size - (p - hl_save_buf);
-
-	if (hdr->version >= 2 && remaining >= 16)
+qsr_done:
+	if (!ok)
 	{
-		//the counts live here, not in the header: the header is frozen at its
-		//version 1 size and a wider HLSV_MAX_CLIENTS must still read old files
-		MemCopy(&slots, p, 8);
-		p += 8;
-		MemCopy(&nparm, p, 8);
-		p += 8;
-		remaining -= 16;
-
-		if (slots >= 0 && nparm >= 0 &&
-			remaining >= slots * (8 + nparm * 8))
-		{
-			for (i = 0; i < slots; i++)
-			{
-				MemCopy(&flag, p, 8);
-				p += 8;
-
-				//every parm in the file is read, and those this build has
-				//room for are kept. A save from a bigger progs must not
-				//walk off the array
-				for (j = 0; j < nparm; j++)
-				{
-					MemCopy(&value, p, 8);
-					p += 8;
-
-					if (i < HLSV_MAX_CLIENTS && j < HLPR_MAX_PARM_GLOBALS)
-						hl_client_parms[i * HLPR_MAX_PARM_GLOBALS + j] = value;
-				}
-
-				if (i < HLSV_MAX_CLIENTS)
-					hl_client_parms_set[i] = ToBool(flag);
-			}
-		}
-		else
-			"HLSave: parm block is malformed, keeping one client\n";
+		"HLSave: restore failed\n";
+		HLSaveDiscard;
+		return FALSE;
 	}
 
 	for (j = 0; j < 3; j++)
@@ -491,16 +1587,216 @@ Bool HLSaveRestore(F64 *_game_time, F64 *origin, F64 *velocity, F64 *angles,
 	*_water_level = hdr->water_level;
 	*_water_type  = hdr->water_type;
 
-	//the VM clock must agree with the restored time, or every scheduled think
-	//fires at once, or never
-	HLPrSetF(hl_ofs_time, hdr->game_time);
 	hl_game_time = hdr->game_time;
+	hl_ent_time  = hdr->ent_time;
 
-	//absmin/absmax are derived, so they are rebuilt rather than restored
-	HLGameLinkAll;
-
-	"HLSave: restored %d edicts at t=%.1f\n", hl_pr_num_edicts, hdr->game_time;
+	"HLSave: restored %d entities at t=%.1f\n", hl_num_entities,
+		hdr->ent_time;
 
 	HLSaveDiscard;
+	return TRUE;
+}
+
+//--- level transitions ------------------------------------------------------
+//
+// CChangeLevel's .HL1/.HL2 files. HL writes the player and everything a
+// trigger_transition volume tagged into a per-map side file, then reads it back
+// on the far side and offsets every position by the difference between the two
+// info_landmark origins.
+//
+// Only the player travels here. Carrying tagged entities across means creating
+// entities in the destination map, and the entity table is parsed from the BSP
+// at a fixed count by HLEnt.ZC; growing it is that file's decision, not this
+// one's. What does cross is the whole player - health, armour, suit, the
+// inventory, the movement state and the global flags - placed relative to the
+// landmark exactly as CChangeLevel::ChangeLevelNow does it.
+
+class CHLSaveTrans
+{
+	U32	magic;
+	U32	version;
+	U8	nextmap[64];
+	U8	landmark[64];
+	F64	offset_org[3];		//player origin relative to the landmark
+	F64	angles[3];
+	I64	reserved[4];
+};
+
+I64 HLSaveFindLandmark(U8 *name, F64 *out)
+{//CChangeLevel's FindLandmark. -1 when the map has no matching one, in which
+ //case the player keeps the info_player_start it was given
+	CHLEntity	*e;
+	I64			 i;
+
+	HLVecSet(out, 0.0, 0.0, 0.0);
+
+	if (!name || !name[0] || !hl_entities)
+		return -1;
+
+	for (i = 0; i < hl_num_entities; i++)
+	{
+		e = &hl_entities[i];
+
+		if (StrCompare(e->classname, "info_landmark"))
+			goto qsfl_next;
+
+		if (StrCompare(e->targetname, name))
+			goto qsfl_next;
+
+		HLVecCopy(e->origin, out);
+		return i;
+
+qsfl_next:
+	}
+
+	return -1;
+}
+
+Bool HLSaveTransitionWrite(U8 *path, U8 *nextmap, U8 *landmark, F64 *origin,
+	F64 *angles)
+{//CChangeLevel::ChangeLevelNow's save side. Called before the destination map
+ //loads, while the source map's landmark is still findable
+	CHLSaveTrans	tr;
+	F64				lm[3];
+	I64				total;
+	I64				j;
+
+	MemSet(&tr, 0, sizeof(CHLSaveTrans));
+
+	tr.magic   = HLSAVE_TR_MAGIC;
+	tr.version = HLSAVE_TR_VERSION;
+	HLStrCopy(tr.nextmap, nextmap, 64);
+	HLStrCopy(tr.landmark, landmark, 64);
+
+	HLSaveFindLandmark(landmark, lm);
+
+	for (j = 0; j < 3; j++)
+	{
+		tr.offset_org[j] = origin[j] - lm[j];
+		tr.angles[j]     = angles[j];
+	}
+
+	HLSaveWriterOpen;
+	if (hl_savew_err)
+	{
+		"HLSave: out of memory for the transition file\n";
+		HLSaveWriterClose;
+		return FALSE;
+	}
+
+	//the same clock the level save uses, so a weapon cooldown scheduled in the
+	//source map rebases onto the destination's own zero
+	hl_savew_base = hl_ent_time;
+
+	HLSavePutBytes(&tr, sizeof(CHLSaveTrans));
+
+	HLSaveWritePlayer;
+	HLSaveWriteWeapons;
+	HLSaveWriteMove;
+	HLSaveWriteGlobals;
+
+	if (hl_savew_err)
+	{
+		HLSaveWriterClose;
+		return FALSE;
+	}
+
+	total = hl_savew_len;
+
+	if (FileWrite(path, hl_savew_buf, total) < 1)
+	{
+		"HLSave: could not write %s\n", path;
+		HLSaveWriterClose;
+		return FALSE;
+	}
+
+	HLSaveWriterClose;
+
+	"HLSave: transition to %s via %s (%d bytes)\n", nextmap, landmark, total;
+	return TRUE;
+}
+
+Bool HLSaveTransitionRestore(U8 *path, F64 *origin, F64 *angles)
+{//the read side. Called after the destination map is up and its entities have
+ //spawned, so the landmark can be found and the player placed against it
+	CHLSaveTrans	 tr;
+	U8				*buf;
+	U8				*blk_end;
+	F64				 lm[3];
+	I64				 size = 0;
+	I64				 tag;
+	I64				 len;
+	I64				 j;
+
+	buf = FileRead(path, &size);
+	if (!buf)
+		return FALSE;
+
+	if (size < sizeof(CHLSaveTrans))
+	{
+		Free(buf);
+		return FALSE;
+	}
+
+	MemCopy(&tr, buf, sizeof(CHLSaveTrans));
+
+	if (tr.magic != HLSAVE_TR_MAGIC || tr.version != HLSAVE_TR_VERSION)
+	{
+		"HLSave: %s is not a transition file\n", path;
+		Free(buf);
+		return FALSE;
+	}
+
+	//the destination clock is whatever HLEntSpawnAll left, so that is the base
+	//every carried time rebases onto
+	hl_saver_base = hl_ent_time;
+	hl_saver_p    = buf + sizeof(CHLSaveTrans);
+	hl_saver_end  = buf + size;
+	hl_saver_err  = FALSE;
+
+	while (hl_saver_p + 16 <= hl_saver_end)
+	{
+		hl_saver_err = FALSE;
+
+		tag = HLSaveGetI;
+		len = HLSaveGetI;
+
+		if (hl_saver_err || len < 0 || hl_saver_p + len > hl_saver_end)
+			goto qstr_done;
+
+		blk_end = hl_saver_p + len;
+
+		switch (tag)
+		{
+			case HLSB_PLAYER:	HLSaveReadPlayer;	break;
+			case HLSB_WEAPONS:	HLSaveReadWeapons;	break;
+			case HLSB_MOVE:		HLSaveReadMove;		break;
+			case HLSB_GLOBALS:	HLSaveReadGlobals;	break;
+
+			default:
+				break;
+		}
+
+		hl_saver_p = blk_end;
+	}
+
+qstr_done:
+	//hl_ent_player is an index into the source map's table and means nothing
+	//here; the destination's spawn pass already set it
+	hl_ent_player = 0;
+
+	if (HLSaveFindLandmark(tr.landmark, lm) >= 0)
+	{
+		for (j = 0; j < 3; j++)
+		{
+			origin[j] = lm[j] + tr.offset_org[j];
+			angles[j] = tr.angles[j];
+		}
+	}
+	else
+		"HLSave: %s has no landmark '%s', using the player start\n",
+			hl_map_name, tr.landmark;
+
+	Free(buf);
 	return TRUE;
 }

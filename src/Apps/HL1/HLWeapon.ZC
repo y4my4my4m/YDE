@@ -6,11 +6,20 @@
 // plus cl_dll/ammo.cpp for the bucket/selection UI.
 //
 // The SDK gives every weapon its own C++ class with a virtual PrimaryAttack.
-// Every weapon implemented here is hitscan and differs only in numbers, so it
-// is one table plus one fire routine instead. A weapon needing its own code
-// path (crossbow bolts, RPG rockets, gauss/egon beams, throwables) is absent
-// from the table: those need projectile entities, and the entity system has no
-// non-brush movers.
+// Here it is one table plus a fire-mode id per attack: hitscan weapons differ
+// only in numbers, and the rest select a branch of HLWeaponPrimary /
+// HLWeaponSecondary. The table carries both attacks, so SecondaryAttack is
+// data on the same row rather than a second class.
+//
+// PROJECTILES
+//
+// Everything that is not hitscan needs a moving damage carrier, which the
+// entity system cannot supply: hl_entities is sized to the parsed map and
+// cannot allocate at runtime. So this file owns its own fixed pool,
+// hl_proj[HLPROJ_MAX] - see the CHLProj block. It mirrors CGrenade
+// (dlls/ggrenade.cpp) for bounce/timer/contact grenades, CCrossbowBolt,
+// CRpgRocket, CTripmineGrenade, CSatchelCharge, CSqueakGrenade and CHornet.
+// A saturated pool drops the shot rather than growing.
 //
 // PER-FRAME CALL
 //
@@ -35,21 +44,45 @@
 // right, up) next to HLEntFrame and delete the hook install at the bottom of
 // this file.
 //
+// WEAPON FOLEY
+//
+// HL plays a weapon's reload foley from the VIEW MODEL's animation events, not
+// from the weapon class - HLWeaponVmEvents below fires code 5004. Dumping the
+// retail v_*.mdl set shows only three models carry 5004 at all:
+//
+//   v_9mmhandgun  reload f4 items/9mmclip2.wav, f23 items/9mmclip1.wav
+//   v_9mmar       reload f5 items/cliprelease1.wav, f24 items/clipinsert1.wav
+//   v_357         reload f70 weapons/357_reload1.wav
+//
+// Every other view model carries only 5001 muzzle flashes. So the event path
+// covers the glock, mp5 and python and nothing else, and the remaining foley
+// has to be emitted from this file the way the SDK's weapon classes do. That
+// is what CHLWeaponInfo.reload_snd and .pump are for: the shotgun's cocking
+// sound is CShotgun::ItemPostFrame's m_flPumpTime timer (weapons/scock1.wav),
+// and the crossbow's is CCrossbow::Reload (weapons/xbow_reload1.wav).
+//
 // NOT IMPLEMENTED
 //
-//   - secondary attack. every one that matters is a projectile (M203, satchel,
-//     bolt) or a beam, so there is nothing to share with the hitscan path.
-//   - shell-by-shell shotgun reload, and every other animation event. the
-//     studio layer decodes bones and sequences, not mstudioevent_t.
+//   - shell-by-shell shotgun reload. the reload is bulk; the pump sound and
+//     the reload foley are emitted on the SDK's timings anyway.
 //   - damage to monsters. there is no monster damage path to call.
 //   - decals. HLDraw has no decal layer, so a bullet leaves a puff and a
 //     ricochet and no mark.
 //   - autoaim. the sprites are in hud.txt; the SDK's is a full sight cone over
 //     the monster list, which does not exist.
-//   - the two-step selection menu (hud_fastswitch 0) - see HLWeaponSelectSlot.
 //   - item_healthkit / item_battery / item_suit. those belong to the item
 //     classes in HLEntity.ZC, not to the inventory.
 //   - inventory across a changelevel. HL carries it in the transition save.
+//   - beam and projectile VISUALS. HLDraw has no line primitive and no
+//     non-brush mover, so the egon and gauss beams and the grenade/satchel
+//     bodies are invisible. Their damage, ammo drain and timing are real. A
+//     rocket and a bolt get a particle trail, which is the only marker the
+//     particle layer can supply; nothing is faked with a stand-in sprite.
+//   - the zoom on the crossbow and python secondaries changes hl_wpn_zoom_fov
+//     but nothing applies it: the view fov lives in HL1.ZC, which compiles
+//     later and cannot be reached from here.
+//   - the RPG's laser_spot entity. the designator is traced live off the eye
+//     each frame instead - see hl_wpn_spot_on.
 
 //--- weapon ids -------------------------------------------------------------
 //
@@ -62,16 +95,23 @@
 #define HLWPN_GLOCK			1
 #define HLWPN_PYTHON			2
 #define HLWPN_MP5			3
-#define HLWPN_SHOTGUN		4
+#define HLWPN_CROSSBOW		4
+#define HLWPN_SHOTGUN		5
+#define HLWPN_RPG			6
+#define HLWPN_GAUSS			7
+#define HLWPN_EGON			8
+#define HLWPN_HORNETGUN		9
+#define HLWPN_HANDGRENADE	10
+#define HLWPN_TRIPMINE		11
+#define HLWPN_SATCHEL		12
+#define HLWPN_SNARK			13
 
-#define HLWPN_COUNT			5
+#define HLWPN_COUNT			14
 
 //--- ammo pools -------------------------------------------------------------
 //
-// m_rgAmmo in the SDK, indexed by an id the game registers by name. Only the
-// pools the weapons above draw from, plus the AR grenades: ammo_ARgrenades is
-// scattered through the early maps and a silently ignored pickup reads as a
-// bug.
+// m_rgAmmo in the SDK, indexed by an id the game registers by name. The full
+// set, in the order CBasePlayerItem::AmmoInfoArray ends up holding them.
 
 #define HLAMMO_NONE			-1
 
@@ -79,14 +119,118 @@
 #define HLAMMO_357			1
 #define HLAMMO_BUCKSHOT		2
 #define HLAMMO_ARGRENADE		3
+#define HLAMMO_BOLT			4
+#define HLAMMO_ROCKET		5
+#define HLAMMO_URANIUM		6
+#define HLAMMO_HANDGRENADE	7
+#define HLAMMO_SATCHEL		8
+#define HLAMMO_TRIPMINE		9
+#define HLAMMO_SNARK			10
+#define HLAMMO_HORNET		11
 
-#define HLAMMO_COUNT			4
+#define HLAMMO_COUNT			12
 
 //weapon slots. MAX_WEAPON_SLOTS in the SDK, one per number key
 #define HLWPN_SLOTS			5
 
 //no clip: the weapon fires straight out of the pool (gauss, egon)
 #define HLWPN_NOCLIP			-1
+
+//--- fire modes -------------------------------------------------------------
+//
+// One id per PrimaryAttack/SecondaryAttack body in the SDK. The table stores
+// one for each trigger and HLWeaponPrimary/HLWeaponSecondary branch on it.
+
+#define HLFIRE_NONE			0
+#define HLFIRE_MELEE			1	//CCrowbar::Swing
+#define HLFIRE_BULLET		2	//FireBulletsPlayer
+#define HLFIRE_SHOTGUN2		3	//CShotgun::SecondaryAttack, both barrels
+#define HLFIRE_BOLT			4	//CCrossbow::FireBolt
+#define HLFIRE_ROCKET		5	//CRpg::PrimaryAttack
+#define HLFIRE_M203			6	//CMP5::SecondaryAttack
+#define HLFIRE_GRENADE		7	//CHandGrenade, prime on press throw on release
+#define HLFIRE_SATCHEL		8	//CSatchel::Throw
+#define HLFIRE_SATCHEL_FIRE	9	//CSatchel::SecondaryAttack, the radio
+#define HLFIRE_TRIPMINE		10	//CTripmine::PrimaryAttack
+#define HLFIRE_SNARK			11	//CSqueak::PrimaryAttack
+#define HLFIRE_HORNET		12	//CHgun::PrimaryAttack, FIREMODE_TRACK
+#define HLFIRE_HORNET_FAST	13	//CHgun::SecondaryAttack, FIREMODE_FAST
+#define HLFIRE_GAUSS			14	//CGauss::PrimaryAttack
+#define HLFIRE_GAUSS_CHARGE	15	//CGauss::SecondaryAttack, held
+#define HLFIRE_EGON_WIDE		16	//CEgon::PrimaryAttack, FIRE_WIDE
+#define HLFIRE_EGON_NARROW	17	//CEgon::SecondaryAttack, FIRE_NARROW
+#define HLFIRE_ZOOM			18	//CCrossbow / CPython SecondaryAttack
+#define HLFIRE_SPOT			19	//CRpg::SecondaryAttack, the designator
+
+//--- projectiles ------------------------------------------------------------
+//
+// The pool the header describes. Sized for the worst case a player can put in
+// the air at once: five satchels plus five tripmines plus a bag of snarks and
+// grenades still fits, and a saturated pool drops the newest shot.
+
+#define HLPROJ_MAX			64
+
+#define HLPRJ_FREE			0
+#define HLPRJ_BOLT			1	//CCrossbowBolt
+#define HLPRJ_STUCK			2	//a spent bolt standing in a wall
+#define HLPRJ_ROCKET			3	//CRpgRocket
+#define HLPRJ_CONTACT		4	//CGrenade::ShootContact
+#define HLPRJ_TIMED			5	//CGrenade::ShootTimed
+#define HLPRJ_SATCHEL		6	//CSatchelCharge
+#define HLPRJ_TRIPMINE		7	//CTripmineGrenade
+#define HLPRJ_SNARK			8	//CSqueakGrenade
+#define HLPRJ_HORNET			9	//CHornet
+
+//BOLT_AIR_VELOCITY, dlls/crossbow.cpp
+#define HLPRJ_BOLT_SPEED		2000.0
+
+//CCrossbowBolt::BoltTouch leaves a bolt in architecture for ten seconds
+#define HLPRJ_BOLT_STICK		10.0
+
+//SQUEEK_DETONATE_DELAY, dlls/squeakgrenade.cpp
+#define HLPRJ_SNARK_LIFE		15.0
+
+//CHornet dies on its own five seconds out
+#define HLPRJ_HORNET_LIFE	5.0
+
+//CTripmineGrenade::Spawn: 2.5s to power up when placed by a player, and a
+//128 unit beam
+#define HLPRJ_MINE_ARM		2.5
+#define HLPRJ_MINE_BEAM		128.0
+
+//velocity below which a bounced grenade is considered at rest, from the
+//vecTestVelocity test in CGrenade::BounceTouch
+#define HLPRJ_REST_SPEED		60.0
+
+class CHLProj
+{
+	I64	 kind;			//HLPRJ_*, HLPRJ_FREE for an empty slot
+	F64	 org[3];
+	F64	 vel[3];
+
+	//bolt flight direction, or the surface normal a tripmine is stuck to
+	F64	 dir[3];
+
+	F64	 gravity;		//pev->gravity, a multiplier on sv_gravity
+	F64	 friction;		//pev->friction, the bounce backoff
+	F64	 damage;		//pev->dmg
+
+	F64	 die;			//absolute detonate/remove time, 0 = never
+	F64	 arm;			//rocket ignite time, tripmine powerup time
+	F64	 next_hurt;		//m_flNextAttack, BounceTouch's contact debounce
+	F64	 next_hop;		//CSqueakGrenade::HuntThink cadence
+	F64	 beam_len;		//tripmine beam length at the moment it armed
+
+	Bool bounce;		//MOVETYPE_BOUNCE rather than MOVETYPE_FLY
+	Bool on_ground;
+	Bool armed;
+
+	I64	 owner;			//entity index that fired it, -1 for none
+};
+
+CHLProj	hl_proj[HLPROJ_MAX];
+I64		hl_proj_live	= 0;	//slots in use, for HLWeaponReport
+I64		hl_proj_dropped	= 0;	//shots the pool could not hold
 
 //CBasePlayerItem::Touch's pickup box - UTIL_SetSize(-16,-16,0)..(16,16,16).
 //items are not linked into the world by the spawn pass (weapon_* and ammo_*
@@ -133,7 +277,8 @@ class CHLWeaponInfo
 	I64	xhair_row;
 
 	//sequence labels, not indices: v_crowbar has attack1miss where v_357 has
-	//fire1 and v_9mmar has deploy where the rest have draw
+	//fire1 and v_9mmar has deploy where the rest have draw. every label here
+	//was read out of the retail v_*.mdl seqdesc table, not guessed
 	U8	seq_idle[24];
 	U8	seq_fire[24];
 	U8	seq_reload[24];
@@ -142,6 +287,28 @@ class CHLWeaponInfo
 	//empty for melee: HLWeaponMelee picks its sound from the outcome, hit or
 	//miss, the way CCrowbar::Swing does
 	U8	fire_snd[64];
+
+	//--- the second trigger, and the foley the view model does not carry ---
+
+	I64	fire_mode;		//HLFIRE_*, which PrimaryAttack body this is
+	I64	sec_mode;		//HLFIRE_*, HLFIRE_NONE for a weapon with one trigger
+	I64	sec_ammo;		//pool the secondary drains, HLAMMO_NONE to reuse ammo
+	F64	sec_damage;
+	I64	sec_bullets;
+	F64	sec_spread;
+	F64	sec_rate;		//m_flNextSecondaryAttack step
+
+	//seconds after a shot before weapons/scock1.wav plays, 0 for a weapon
+	//that does not pump. CShotgun::ItemPostFrame's m_flPumpTime
+	F64	pump;
+	F64	sec_pump;
+
+	//played at the start of a reload for a model with no 5004 event - see the
+	//WEAPON FOLEY note in the header. empty when the model covers it
+	U8	reload_snd[64];
+
+	U8	seq_fire2[24];	//the secondary's animation
+	U8	sec_snd[64];
 };
 
 CHLWeaponInfo	hl_wpn_info[HLWPN_COUNT];
@@ -154,9 +321,51 @@ F64		hl_wpn_next[HLWPN_COUNT];		//m_flNextPrimaryAttack, absolute
 I64		hl_wpn_ammo[HLAMMO_COUNT];
 I64		hl_wpn_ammo_max[HLAMMO_COUNT];
 
+I64		hl_wpn_next2[HLWPN_COUNT];		//m_flNextSecondaryAttack, absolute
+
 I64		hl_wpn_active		= HLWPN_NONE;
 F64		hl_wpn_reload_done	= 0.0;		//0 = not reloading
 I64		hl_wpn_reloading	= HLWPN_NONE;
+
+//--- per weapon attack state ------------------------------------------------
+//
+// The members the SDK keeps on the weapon object. One copy each: only the
+// active weapon can be mid-attack, and switching away cancels it, which is
+// what CBasePlayerWeapon::Holster does.
+
+//CShotgun::m_flPumpTime - absolute time weapons/scock1.wav is due, 0 = idle
+F64		hl_wpn_pump_time	= 0.0;
+
+//CHandGrenade::m_flStartThrow - when the pin was pulled, 0 = not primed
+F64		hl_wpn_gren_start	= 0.0;
+
+//CSatchel::m_chargeReady - 0 none out, 1 radio live, 2 just detonated
+I64		hl_wpn_satchel_ready = 0;
+
+//CGauss: m_fInAttack 0 off / 1 spinup / 2 spinning, and the charge clocks
+I64		hl_wpn_gauss_state	= 0;
+F64		hl_wpn_gauss_start	= 0.0;	//m_flStartCharge
+F64		hl_wpn_gauss_burn	= 0.0;	//m_flNextAmmoBurn
+F64		hl_wpn_gauss_full	= 0.0;	//m_flAmmoStartCharge
+Bool	hl_wpn_gauss_primary = FALSE;	//m_fPrimaryFire
+
+//CEgon: m_fireState, m_fireMode and the two clocks
+Bool	hl_wpn_egon_on		= FALSE;
+I64		hl_wpn_egon_mode	= HLFIRE_EGON_WIDE;
+F64		hl_wpn_egon_pulse	= 0.0;	//pev->dmgtime
+F64		hl_wpn_egon_ammo	= 0.0;	//m_flAmmoUseTime
+
+//CHgun::m_iFirePhase, the eight point rosette the fast mode fires around
+I64		hl_wpn_hornet_phase	= 0;
+
+//CRpg::m_fSpotActive and the point the designator is resting on
+Bool	hl_wpn_spot_on		= FALSE;
+F64		hl_wpn_spot_pos[3];
+Bool	hl_wpn_spot_valid	= FALSE;
+
+//CCrossbow::m_fInZoom / CPython::m_fInZoom. nothing applies this - see the
+//header - but the state is real so a weapon switch can clear it
+I64		hl_wpn_zoom_fov		= 0;
 
 //--- view model -------------------------------------------------------------
 

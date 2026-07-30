@@ -15,6 +15,26 @@
 #define HLSND_RATE			48000		//mixer output rate
 #define HLSND_CLIP_DIST		1000.0		//attenuation reaches silence here
 
+//common/const.h. Attenuation is a multiplier on distance, so a larger value is
+//a smaller audible radius: ATTN_IDLE is heard at half the range of ATTN_NORM
+#define HLATTN_NONE			0.0		//heard everywhere, no falloff
+#define HLATTN_NORM			0.8
+#define HLATTN_IDLE			2.0
+#define HLATTN_STATIC		1.25
+
+//common/const.h. Pitch is a percentage of the recorded rate
+#define HLPITCH_NORM		100
+#define HLPITCH_LOW			95
+#define HLPITCH_HIGH		120
+
+//common/const.h channel numbers. CHAN_AUTO never replaces an existing sound
+#define HLCHAN_AUTO			0
+#define HLCHAN_WEAPON		1
+#define HLCHAN_VOICE		2
+#define HLCHAN_ITEM			3
+#define HLCHAN_BODY			4
+#define HLCHAN_STATIC		6
+
 //diagnostics for the silent-output case
 #define HLSND_MAX_REPORTS	64
 I64 hl_snd_reports	= 0;
@@ -27,6 +47,11 @@ class CHLSound
 	U32	*frames;		//stereo L16 | R16 << 16, at the file's own rate
 	I64	 count;
 	I64	 rate;			//rate of the stored data, not the mixer's
+
+	//frame the "cue " chunk marks as the loop point, 0 when the file has none.
+	//HL restarts a looping sample here, not at frame 0, so the attack is heard
+	//once and the sustain repeats
+	I64	 loop_start;
 };
 
 CHLSound	 hl_snd_cache[HLSND_MAX_CACHE];
@@ -101,6 +126,10 @@ U0 HLSndSpatialize(CHLSndChan *ch, I64 *_l, I64 *_r)
 	if (ch->entnum == hl_snd_viewent && hl_snd_viewent != 0)
 	{
 		*_l = ToI64(vol * ToF64(AUDIO_VOL_UNITY));
+
+		if (*_l > AUDIO_VOL_UNITY)
+			*_l = AUDIO_VOL_UNITY;
+
 		*_r = *_l;
 		return;
 	}
@@ -115,9 +144,14 @@ U0 HLSndSpatialize(CHLSndChan *ch, I64 *_l, I64 *_r)
 		dir[2] /= dist;
 	}
 
+	//dist_mult is attenuation / sound_nominal_clip_dist, so ATTN_NONE gives 0
+	//and the sound never fades, ATTN_IDLE 2.0 is silent past 500 units and
+	//ATTN_NORM 0.8 past 1250
 	dist = dist * ch->dist_mult;
 	dot  = HLVecDot(hl_snd_right, dir);
 
+	//SND_Spatialize pans by doubling the near ear rather than cutting the far
+	//one, so a centred sound is unattenuated
 	rscale = 1.0 + dot;
 	lscale = 1.0 - dot;
 
@@ -126,6 +160,11 @@ U0 HLSndSpatialize(CHLSndChan *ch, I64 *_l, I64 *_r)
 
 	if (*_l < 0)	*_l = 0;
 	if (*_r < 0)	*_r = 0;
+
+	//the doubled near ear runs to 2x unity. The mixer clamps, but clamping here
+	//too keeps the value the channel reports honest
+	if (*_l > AUDIO_VOL_UNITY)	*_l = AUDIO_VOL_UNITY;
+	if (*_r > AUDIO_VOL_UNITY)	*_r = AUDIO_VOL_UNITY;
 }
 
 I64 HLSndPickChannel(I64 entnum, I64 entchannel)
@@ -171,6 +210,280 @@ qsp_next:
 	return first_to_die;
 }
 
+//--- room reverb ------------------------------------------------------------
+//
+// env_sound. CEnvSound::Think picks the nearest visible env_sound to the player
+// and sends its roomtype to the client; the reverb itself lives in the closed
+// engine, so only the entity half is in the SDK. HLEntity.ZC does that half and
+// publishes hl_ent_roomtype, which is handed here.
+//
+// The mixer has no filter chain and is not this file's to change, so the room is
+// built out of what a voice pool can do: each dry sound is followed by two or
+// three quieter delayed copies of itself. That is an early-reflection tap
+// pattern, the front half of a reverb, and it is what carries the impression of
+// room size.
+//
+// The roomtype numbering is the env_sound "Room type" list: 0 off, then triples
+// of small/medium/large - 1 generic, 4 metallic, 7 tunnel, 10 chamber,
+// 13 bright, 16 water, 19 concrete, 22 outside, 25 cavern - and 28..30 weirdo.
+
+I64 hl_snd_roomtype;
+
+//taps are fire and forget voices with no channel. Cut off well below the pool
+//so a reverberant room can never starve gunfire of a voice
+#define HLSND_MAX_ECHOES		32
+#define HLSND_ECHO_VOICE_LIMIT	32		//of AUDIO_MAX_SFX_VOICES
+
+class CHLSndEcho
+{
+	U32	*frames;		//borrowed from the cache, which never evicts
+	I64	 count;
+	I64	 rate;
+	I64	 vol_l;
+	I64	 vol_r;
+	F64	 when;			//seconds, tS
+	Bool used;
+};
+
+CHLSndEcho	hl_snd_echo[HLSND_MAX_ECHOES];
+
+U0 HLSndEchoClear()
+{
+	I64 i;
+
+	for (i = 0; i < HLSND_MAX_ECHOES; i++)
+	{
+		hl_snd_echo[i].used   = FALSE;
+		hl_snd_echo[i].frames = NULL;
+		hl_snd_echo[i].count  = 0;
+		hl_snd_echo[i].rate   = HLSND_RATE;
+		hl_snd_echo[i].vol_l  = 0;
+		hl_snd_echo[i].vol_r  = 0;
+		hl_snd_echo[i].when   = 0.0;
+	}
+}
+
+Bool HLSndRoomParams(I64 rt, I64 *_taps, F64 *_delay, F64 *_decay, F64 *_wet)
+{//tap count, spacing, per-tap falloff and send level for one roomtype.
+ //FALSE when the room is dry
+	I64 family;
+	I64 size;
+
+	*_taps  = 0;
+	*_delay = 0.0;
+	*_decay = 0.0;
+	*_wet   = 0.0;
+
+	if (rt <= 0 || rt > 30)
+		return FALSE;
+
+	if (rt >= 28)
+	{
+		//the three "weirdo" rooms are not a size triple
+		if (rt == 28)
+		{
+			*_taps = 3;	*_delay = 0.25;	*_decay = 0.80;	*_wet = 0.45;
+		}
+		else if (rt == 29)
+		{
+			*_taps = 2;	*_delay = 0.50;	*_decay = 0.70;	*_wet = 0.40;
+		}
+		else
+		{
+			*_taps = 3;	*_delay = 0.02;	*_decay = 0.90;	*_wet = 0.50;
+		}
+
+		return TRUE;
+	}
+
+	family = (rt - 1) / 3;
+	size   = (rt - 1) % 3;
+
+	//small, medium, large. Spacing is the room's dimension expressed as the
+	//time a reflection takes to come back
+	if (size == 0)
+		*_delay = 0.035;
+	else if (size == 1)
+		*_delay = 0.075;
+	else
+		*_delay = 0.140;
+
+	if (family == 0)			//generic
+	{
+		*_taps = 2;	*_decay = 0.50;	*_wet = 0.22;
+	}
+	else if (family == 1)		//metallic
+	{
+		*_taps = 3;	*_decay = 0.65;	*_wet = 0.30;
+	}
+	else if (family == 2)		//tunnel
+	{
+		*_taps = 3;	*_decay = 0.60;	*_wet = 0.35;
+	}
+	else if (family == 3)		//chamber
+	{
+		*_taps = 3;	*_decay = 0.70;	*_wet = 0.30;
+	}
+	else if (family == 4)		//bright
+	{
+		*_taps = 3;	*_decay = 0.75;	*_wet = 0.35;
+	}
+	else if (family == 5)		//water
+	{
+		//a muffled room: the taps are close and die fast
+		*_taps  = 2;	*_decay = 0.45;	*_wet = 0.40;
+		*_delay = *_delay * 0.6;
+	}
+	else if (family == 6)		//concrete
+	{
+		*_taps = 3;	*_decay = 0.60;	*_wet = 0.28;
+	}
+	else if (family == 7)		//outside
+	{
+		//open air has no early reflections, only a distant slap
+		*_taps  = 2;	*_decay = 0.35;	*_wet = 0.20;
+		*_delay = *_delay * 3.0;
+	}
+	else						//cavern
+	{
+		*_taps  = 3;	*_decay = 0.75;	*_wet = 0.40;
+		*_delay = *_delay * 2.0;
+	}
+
+	return TRUE;
+}
+
+U0 HLSndEchoPush(U32 *frames, I64 count, I64 rate, I64 vol_l, I64 vol_r,
+	F64 now)
+{//queue the reflections of one dry sound. No mixer support for a start delay,
+ //so each tap is a whole voice fired later
+	I64 taps;
+	I64 slot;
+	I64 i;
+	I64 t;
+	F64 delay;
+	F64 decay;
+	F64 wet;
+	F64 gain;
+
+	if (!frames || count < 1)
+		return;
+
+	if (!HLSndRoomParams(hl_snd_roomtype, &taps, &delay, &decay, &wet))
+		return;
+
+	//a room must never cost the dry mix a voice
+	if (AudioSFXVoicesActive >= HLSND_ECHO_VOICE_LIMIT)
+		return;
+
+	gain = wet;
+
+	for (t = 1; t <= taps; t++)
+	{
+		slot = -1;
+
+		for (i = 0; i < HLSND_MAX_ECHOES; i++)
+		{
+			if (!hl_snd_echo[i].used)
+			{
+				slot = i;
+				break;
+			}
+		}
+
+		//the queue is full: the room is already dense, drop the rest
+		if (slot < 0)
+			return;
+
+		hl_snd_echo[slot].frames = frames;
+		hl_snd_echo[slot].count  = count;
+		hl_snd_echo[slot].rate   = rate;
+		hl_snd_echo[slot].vol_l  = ToI64(ToF64(vol_l) * gain);
+		hl_snd_echo[slot].vol_r  = ToI64(ToF64(vol_r) * gain);
+		hl_snd_echo[slot].when   = now + delay * ToF64(t);
+		hl_snd_echo[slot].used   = TRUE;
+
+		//below one part in 256 the tap is inaudible and the rest are quieter
+		if (hl_snd_echo[slot].vol_l < 2 && hl_snd_echo[slot].vol_r < 2)
+		{
+			hl_snd_echo[slot].used = FALSE;
+			return;
+		}
+
+		gain = gain * decay;
+	}
+}
+
+U0 HLSndEchoRun(F64 now)
+{//fire the taps that have come due
+	I64 i;
+
+	for (i = 0; i < HLSND_MAX_ECHOES; i++)
+	{
+		if (!hl_snd_echo[i].used || now < hl_snd_echo[i].when)
+			goto qer_next;
+
+		hl_snd_echo[i].used = FALSE;
+
+		//a stale tap left by a level change would play into the new map
+		if (now > hl_snd_echo[i].when + 1.0)
+			goto qer_next;
+
+		if (AudioSFXVoicesActive < HLSND_ECHO_VOICE_LIMIT)
+			AudioSFXPlayRef(hl_snd_echo[i].frames, hl_snd_echo[i].count,
+				hl_snd_echo[i].rate, hl_snd_echo[i].vol_l,
+				hl_snd_echo[i].vol_r);
+
+qer_next:
+	}
+}
+
+U0 HLSndRoomtypeSet(I64 rt)
+{//SVC_ROOMTYPE. HLEntity.ZC calls this with hl_ent_roomtype once the nearest
+ //visible env_sound changes
+	if (rt < 0 || rt > 30)
+		rt = 0;
+
+	hl_snd_roomtype = rt;
+}
+
+//--- deferred tables --------------------------------------------------------
+//
+// materials.txt, sentences.txt, the modulation presets and the speaker list are
+// all built after the game directory is known, which is later than HLSndInit.
+// Their guard flags live here so HLSndInit can clear them: globals are not
+// zeroed, and a guard that starts life TRUE means the table is never built.
+
+Bool hl_snd_mat_ready;		//materials.txt parsed
+Bool hl_snd_sent_ready;		//sentences.txt parsed
+Bool hl_snd_dpv_ready;		//modulation presets filled
+Bool hl_snd_spk_ready;		//speaker list usable
+Bool hl_snd_sq_ready;		//sentence request queue usable
+Bool hl_snd_amb_ready;		//ambient_generic table usable
+
+F64  hl_snd_step_time;		//pmove->flTimeStepSound, as an absolute time
+Bool hl_snd_step_left;		//pmove->iStepLeft
+I64  hl_snd_step_skip;		//PM_PlayStepSound's iSkipStep, wading only
+F64  hl_snd_talk_wait;		//CTalkMonster::g_talkWaitTime
+
+U0 HLSndTablesReset()
+{//run from HLSndInit, before any of the tables below exist
+	hl_snd_mat_ready  = FALSE;
+	hl_snd_sent_ready = FALSE;
+	hl_snd_dpv_ready  = FALSE;
+	hl_snd_spk_ready  = FALSE;
+	hl_snd_sq_ready   = FALSE;
+	hl_snd_amb_ready  = FALSE;
+
+	hl_snd_step_time  = 0.0;
+	hl_snd_step_left  = FALSE;
+	hl_snd_step_skip  = 0;
+	hl_snd_talk_wait  = 0.0;
+
+	hl_snd_roomtype   = 0;
+	HLSndEchoClear;
+}
+
 U0 HLSndUpdate()
 {//S_Update: re-aim every live channel. A long sound tracks the listener
 	CHLSndChan *ch;
@@ -193,6 +506,10 @@ U0 HLSndUpdate()
 
 qsu_next:
 	}
+
+	//the room's delayed taps are due on a wall clock, not a frame count: a
+	//frame hitch must not stretch the reflections with it
+	HLSndEchoRun(tS);
 }
 
 //--- leaf ambients ----------------------------------------------------------
@@ -257,7 +574,7 @@ U0 HLSndInit()
 	HLVecSet(hl_snd_right, 0.0, 1.0, 0.0);
 	HLSndChannelsClear;
 	HLSndLeafAmbientInit;
-
+	HLSndTablesReset;
 }
 
 U0 HLSndFree()
@@ -283,7 +600,8 @@ U0 HLSndFree()
 	hl_snd_bytes        = 0;
 }
 
-I64 HLSndDecodeWav(U8 *raw, I64 size, U32 **_frames, I64 *_rate)
+I64 HLSndDecodeWav(U8 *raw, I64 size, U32 **_frames, I64 *_rate,
+	I64 *_loop = NULL)
 {//RIFF/WAVE -> stereo frames at the file's own rate. Returns the frame count,
  //or 0. Walks the chunk list; some files carry extra chunks before the data
  //
@@ -298,6 +616,8 @@ I64 HLSndDecodeWav(U8 *raw, I64 size, U32 **_frames, I64 *_rate)
 	I64	 rate     = 11025;
 	I64	 bits     = 8;
 	I64	 dsize    = 0;
+	I64	 ncue;
+	I64	 loop     = 0;
 	I64	 in_count;
 	I64	 out_count;
 	I64	 i;
@@ -307,6 +627,9 @@ I64 HLSndDecodeWav(U8 *raw, I64 size, U32 **_frames, I64 *_rate)
 	U32	*out;
 
 	*_frames = NULL;
+
+	if (_loop)
+		*_loop = 0;
 
 	if (size < 44 || MemCompare(raw, "RIFF", 4) || MemCompare(raw + 8, "WAVE", 4))
 		return 0;
@@ -332,6 +655,20 @@ I64 HLSndDecodeWav(U8 *raw, I64 size, U32 **_frames, I64 *_rate)
 		{
 			data  = p + 8;
 			dsize = chunk;
+		}
+		else if (!MemCompare(p, "cue ", 4) && chunk >= 28)
+		{
+			//GetWavinfo reads the loop point out of the cue list. The body is
+			//dwCuePoints then 24 byte points of dwName, dwPosition, fccChunk,
+			//dwChunkStart, dwBlockStart, dwSampleOffset.
+			//
+			//Quake takes dwSampleOffset (body + 24). That field is zero in 135
+			//of the 136 cued files shipped here while dwPosition carries the
+			//mark, so dwPosition is what is read
+			ncue = HLRdU32(p + 8);
+
+			if (ncue > 0)
+				loop = HLRdU32(p + 16);
 		}
 
 		//word aligned; an odd size carries a pad byte
@@ -384,6 +721,13 @@ I64 HLSndDecodeWav(U8 *raw, I64 size, U32 **_frames, I64 *_rate)
 	if (_rate)
 		*_rate = rate;
 
+	//a mark past the end would loop an empty span
+	if (loop < 0 || loop >= out_count)
+		loop = 0;
+
+	if (_loop)
+		*_loop = loop;
+
 	return out_count;
 }
 
@@ -395,6 +739,7 @@ CHLSound *HLSndLoad(U8 *name)
 	I64		 size   = 0;
 	I64		 count;
 	I64		 rate;
+	I64		 loop   = 0;
 	U32		*frames = NULL;
 	I64		 i;
 
@@ -430,15 +775,16 @@ CHLSound *HLSndLoad(U8 *name)
 	raw = HLFileData(path, &size);
 	rate = HLSND_RATE;
 	if (raw)
-		count = HLSndDecodeWav(raw, size, &frames, &rate);
+		count = HLSndDecodeWav(raw, size, &frames, &rate, &loop);
 	else
 		count = 0;
 
 	s = &hl_snd_cache[hl_snd_count];
 	HLStrCopy(s->name, name, 64);
-	s->frames = frames;
-	s->count  = count;
-	s->rate   = rate;
+	s->frames     = frames;
+	s->count      = count;
+	s->rate       = rate;
+	s->loop_start = loop;
 	hl_snd_count++;
 
 	if (frames)
@@ -524,8 +870,13 @@ U0 HLSndLeafAmbients(CHLMap *map, I64 leaf_num, F64 level, F64 fade, F64 now)
 			goto qla_next;
 
 		//S_UpdateAmbientSounds channels are permanent: one short sample held
-		//indefinitely, not replayed. Restarting clicks and resets phase
-		hl_ambient_voice[i] = AudioSFXPlayRef(snd->frames, snd->count,
+		//indefinitely, not replayed. Restarting clicks and resets phase.
+		//
+		//Started at the "cue " mark when the file carries one, so the wrap at
+		//the end of the buffer lands on the loop point the sample was authored
+		//for instead of on its attack
+		hl_ambient_voice[i] = AudioSFXPlayRef(snd->frames + snd->loop_start,
+								snd->count - snd->loop_start,
 								snd->rate, vol, vol, TRUE);
 
 qla_next:
@@ -681,9 +1032,14 @@ U0 HLMusicUpdate(F64 now)
 }
 
 U0 HLSndPlayAt(U8 *name, F64 *origin, F64 volume, F64 attenuation,
-	I64 entnum = 0, I64 entchannel = 0)
+	I64 entnum = 0, I64 entchannel = 0, I64 pitch = HLPITCH_NORM,
+	Bool loop = FALSE)
 {//S_StartSound. entnum/entchannel pick the channel and what it replaces. 0/0 is
- //CHAN_AUTO from the world and overrides nothing
+ //CHAN_AUTO from the world and overrides nothing.
+ //
+ //EMIT_SOUND_DYN's pitch is a percentage of the recorded rate, which is what
+ //the mixer's per-voice resample step already is: playing an 11025Hz sample as
+ //though it were 11576Hz is a pitch of 105
 	CHLSound		*s;
 	CHLSndChan	*ch;
 	I64			 chan;
@@ -691,6 +1047,9 @@ U0 HLSndPlayAt(U8 *name, F64 *origin, F64 volume, F64 attenuation,
 	I64			 vol_r;
 	F64			 gain;
 	I64			 stream;
+	I64			 rate;
+	I64			 first;
+	I64			 count;
 
 	if (!hl_snd_enabled || !name || !name[0])
 		return;
@@ -717,6 +1076,27 @@ U0 HLSndPlayAt(U8 *name, F64 *origin, F64 volume, F64 attenuation,
 	gain = volume;
 	if (gain > 1.0)
 		gain = 1.0;
+
+	if (pitch < 1)
+		pitch = 1;
+	if (pitch > 255)
+		pitch = 255;
+
+	rate = s->rate * pitch / HLPITCH_NORM;
+	if (rate < 1)
+		rate = 1;
+
+	first = 0;
+	count = s->count;
+
+	//the mixer wraps the whole span it is handed, so a looping voice is given
+	//the sample from its cue mark on. The attack ahead of the mark is dropped
+	//rather than repeated, which is the click the cue point exists to avoid
+	if (loop && s->loop_start > 0 && s->loop_start < s->count)
+	{
+		first = s->loop_start;
+		count = s->count - s->loop_start;
+	}
 
 	chan = HLSndPickChannel(entnum, entchannel);
 	if (chan < 0)
@@ -755,8 +1135,14 @@ U0 HLSndPlayAt(U8 *name, F64 *origin, F64 volume, F64 attenuation,
 	//than baked into a scratch copy: baking costs a full PCM copy per play and
 	//passes one sound at a time through the shared buffer. The cache never
 	//evicts, and HLSndFree stops every voice before releasing frames
-	stream = AudioSFXPlayRef(s->frames, s->count, s->rate, vol_l, vol_r);
+	stream = AudioSFXPlayRef(s->frames + first, count, rate, vol_l, vol_r,
+				loop);
 	ch->voice = stream;
+
+	//the room's reflections follow the dry sound. Sent after the voice is taken
+	//so a full pool costs the taps and not the sound itself
+	if (stream >= 0 && !loop)
+		HLSndEchoPush(s->frames + first, count, rate, vol_l, vol_r, tS);
 
 	//dropped, not queued, when every voice is busy
 	if (stream < 0)
@@ -789,6 +1175,41 @@ U0 HLSndPlayAt(U8 *name, F64 *origin, F64 volume, F64 attenuation,
 //the nearest few and the rest read as silence
 #define HLSND_AMBIENT_VOICES	12
 
+// CAmbientGeneric's dynpitchvol_t. The keys are on ambient_generic entities all
+// over the shipped maps: a preset number, or spinup/spindown ramps on pitch,
+// fadein/fadeout ramps on volume, and an LFO modulating either.
+//
+// Field order and units follow the struct exactly, because InitModulationParms
+// loads a preset by assigning the whole struct and then fixes the ramp fields up
+// in place. The ramps are counters in 8.8 fixed point stepped at 5hz.
+
+class CHLDpvPreset
+{
+	I64	pitchrun;
+	I64	pitchstart;
+	I64	spinup;
+	I64	spindown;
+	I64	volrun;
+	I64	volstart;
+	I64	fadein;
+	I64	fadeout;
+	I64	lfotype;
+	I64	lforate;
+	I64	lfomodpitch;
+	I64	lfomodvol;
+	I64	cspinup;
+};
+
+//rgdpvpreset
+#define HLSND_DPV_PRESETS	27
+
+//lfotype. dlls/sound.cpp LFO_SQUARE 1, LFO_TRIANGLE 2, LFO_RANDOM 3
+#define HLLFO_SQUARE		1
+#define HLLFO_TRIANGLE		2
+#define HLLFO_RANDOM		3
+
+CHLDpvPreset	hl_snd_dpv[HLSND_DPV_PRESETS];
+
 class CHLAmbient
 {
 	F64	 origin[3];
@@ -797,13 +1218,154 @@ class CHLAmbient
 	F64	 attenuation;
 	F64	 next_time;		//earliest re-trigger
 	F64	 duration;
+
+	//m_fActive / m_fLooping
+	Bool active;
+	Bool looping;
+
+	//m_dpv. Absent from the entity's keys, the whole block stays inert and
+	//volume above is used as it was
+	Bool dyn;
+	I64	 preset;
+	I64	 pitchrun;
+	I64	 pitchstart;
+	I64	 spinup;
+	I64	 spindown;
+	I64	 volrun;
+	I64	 volstart;
+	I64	 fadein;
+	I64	 fadeout;
+	I64	 lfotype;
+	I64	 lforate;
+	I64	 lfomodpitch;
+	I64	 lfomodvol;
+	I64	 cspinup;
+	I64	 cspincount;
+
+	//running state
+	I64	 pitch;
+	I64	 vol;
+	I64	 pitchfrac;
+	I64	 volfrac;
+	I64	 spinupsav;
+	I64	 spindownsav;
+	I64	 fadeinsav;
+	I64	 fadeoutsav;
+	I64	 lfofrac;
+	I64	 lfomult;
+	F64	 ramp_next;		//RampThink runs at 5hz
 };
 
 CHLAmbient	hl_ambient[HLSND_MAX_AMBIENT];
 I64			hl_ambient_count = 0;
 
+U0 HLSndDpvRow(I64 n, I64 pitchrun, I64 pitchstart, I64 spinup, I64 spindown,
+	I64 volrun, I64 volstart, I64 fadein, I64 fadeout, I64 lfotype, I64 lforate,
+	I64 lfomodpitch, I64 lfomodvol, I64 cspinup)
+{//one row of rgdpvpreset. Written as calls rather than a table initialiser:
+ //declaration initialisers on globals do not run
+	CHLDpvPreset *d;
+
+	if (n < 1 || n > HLSND_DPV_PRESETS)
+		return;
+
+	d = &hl_snd_dpv[n - 1];
+
+	d->pitchrun    = pitchrun;
+	d->pitchstart  = pitchstart;
+	d->spinup      = spinup;
+	d->spindown    = spindown;
+	d->volrun      = volrun;
+	d->volstart    = volstart;
+	d->fadein      = fadein;
+	d->fadeout     = fadeout;
+	d->lfotype     = lfotype;
+	d->lforate     = lforate;
+	d->lfomodpitch = lfomodpitch;
+	d->lfomodvol   = lfomodvol;
+	d->cspinup     = cspinup;
+}
+
+U0 HLSndDpvInit()
+{//rgdpvpreset, dlls/sound.cpp. Columns are
+ //pitch pstart spinup spindwn volrun volstrt fadein fadeout lfotype lforate
+ //modptch modvol cspnup
+	if (hl_snd_dpv_ready)
+		return;
+
+	hl_snd_dpv_ready = TRUE;
+
+	HLSndDpvRow(1,	255,  75, 95, 95, 10, 1, 50, 95, 0,   0,   0,   0, 0);
+	HLSndDpvRow(2,	255,  85, 70, 88, 10, 1, 20, 88, 0,   0,   0,   0, 0);
+	HLSndDpvRow(3,	255, 100, 50, 75, 10, 1, 10, 75, 0,   0,   0,   0, 0);
+	HLSndDpvRow(4,	100, 100,  0,  0, 10, 1, 90, 90, 0,   0,   0,   0, 0);
+	HLSndDpvRow(5,	100, 100,  0,  0, 10, 1, 80, 80, 0,   0,   0,   0, 0);
+	HLSndDpvRow(6,	100, 100,  0,  0, 10, 1, 50, 70, 0,   0,   0,   0, 0);
+	HLSndDpvRow(7,	100, 100,  0,  0,  5, 1, 40, 50, 1,  50,   0,  10, 0);
+	HLSndDpvRow(8,	100, 100,  0,  0,  5, 1, 40, 50, 1, 150,   0,  10, 0);
+	HLSndDpvRow(9,	100, 100,  0,  0,  5, 1, 40, 50, 1, 750,   0,  10, 0);
+	HLSndDpvRow(10,	128, 100, 50, 75, 10, 1, 30, 40, 2,   8,  20,   0, 0);
+	HLSndDpvRow(11,	128, 100, 50, 75, 10, 1, 30, 40, 2,  25,  20,   0, 0);
+	HLSndDpvRow(12,	128, 100, 50, 75, 10, 1, 30, 40, 2,  70,  20,   0, 0);
+	HLSndDpvRow(13,	 50,  50,  0,  0, 10, 1, 20, 50, 0,   0,   0,   0, 0);
+	HLSndDpvRow(14,	 70,  70,  0,  0, 10, 1, 20, 50, 0,   0,   0,   0, 0);
+	HLSndDpvRow(15,	 90,  90,  0,  0, 10, 1, 20, 50, 0,   0,   0,   0, 0);
+	HLSndDpvRow(16,	120, 120,  0,  0, 10, 1, 20, 50, 0,   0,   0,   0, 0);
+	HLSndDpvRow(17,	180, 180,  0,  0, 10, 1, 20, 50, 0,   0,   0,   0, 0);
+	HLSndDpvRow(18,	255, 255,  0,  0, 10, 1, 20, 50, 0,   0,   0,   0, 0);
+	HLSndDpvRow(19,	200,  75, 90, 90, 10, 1, 50, 90, 2, 100,  20,   0, 0);
+	HLSndDpvRow(20,	255,  75, 97, 90, 10, 1, 50, 90, 1,  40,  50,   0, 0);
+	HLSndDpvRow(21,	100, 100,  0,  0, 10, 1, 30, 50, 3,  15,  20,   0, 0);
+	HLSndDpvRow(22,	160, 160,  0,  0, 10, 1, 50, 50, 3, 500,  25,   0, 0);
+	HLSndDpvRow(23,	255,  75, 88,  0, 10, 1, 40,  0, 0,   0,   0,   0, 5);
+	HLSndDpvRow(24,	200,  20, 95, 70, 10, 1, 70, 70, 3,  20,  50,   0, 0);
+	HLSndDpvRow(25,	180, 100, 50, 60, 10, 1, 40, 60, 2,  90, 100, 100, 0);
+	HLSndDpvRow(26,	 60,  60,  0,  0, 10, 1, 40, 70, 3,  80,  20,  50, 0);
+	HLSndDpvRow(27,	128,  90, 10, 10, 10, 1, 20, 40, 1,   5,  10,  20, 0);
+}
+
 U0 HLSndAmbientClear()
-{
+{//stop and forget every ambient_generic source.
+ //
+ //A source holds no voice of its own - it is re-triggered on a timer through
+ //the dynamic channels - but the instance it last started is still playing on
+ //one of them, and a map change that only zeroes the count leaves that voice
+ //running under the next map. Each source's channel is silenced first.
+ //
+ //HLSndStop is declared further down and cannot be reached from here, so the
+ //channel table is walked directly
+	I64 i;
+	I64 j;
+
+	//the count is a global and holds junk until this runs once. Walking it
+	//before that reads past the table
+	if (!hl_snd_amb_ready)
+	{
+		hl_snd_amb_ready = TRUE;
+		hl_ambient_count = 0;
+		return;
+	}
+
+	for (i = 0; i < HLSND_DYNAMIC_CHANNELS; i++)
+	{
+		//ambient sources take entnums below zero and channel 1
+		if (hl_snd_chan[i].entnum >= 0 || hl_snd_chan[i].entchannel != 1)
+			goto qsac_next;
+
+		if (hl_snd_chan[i].voice >= 0)
+			AudioSFXStop(hl_snd_chan[i].voice);
+
+		hl_snd_chan[i].voice      = -1;
+		hl_snd_chan[i].entnum     = 0;
+		hl_snd_chan[i].entchannel = 0;
+		hl_snd_chan[i].master_vol = 0.0;
+
+qsac_next:
+	}
+
+	for (j = 0; j < hl_ambient_count; j++)
+		hl_ambient[j].active = FALSE;
+
 	hl_ambient_count = 0;
 }
 
@@ -811,6 +1373,9 @@ U0 HLSndAmbientAdd(F64 *origin, U8 *name, F64 volume, F64 attenuation)
 {//one call per ambient entity at map load
 	CHLAmbient	*a;
 	CHLSound		*snd;
+
+	if (!hl_snd_amb_ready)
+		HLSndAmbientClear;
 
 	if (hl_ambient_count >= HLSND_MAX_AMBIENT || !name || !name[0])
 		return;
@@ -832,7 +1397,467 @@ U0 HLSndAmbientAdd(F64 *origin, U8 *name, F64 volume, F64 attenuation)
 	if (a->duration < 0.25)
 		a->duration = 0.25;
 
+	//no modulation keys: the whole m_dpv block stays inert and pitch is normal
+	a->active      = TRUE;
+	a->looping     = TRUE;
+	a->dyn         = FALSE;
+	a->pitch       = HLPITCH_NORM;
+	a->vol         = 100;
+	a->preset      = 0;
+	a->pitchrun    = HLPITCH_NORM;
+	a->pitchstart  = HLPITCH_NORM;
+	a->spinup      = 0;
+	a->spindown    = 0;
+	a->volrun      = 100;
+	a->volstart    = 0;
+	a->fadein      = 0;
+	a->fadeout     = 0;
+	a->lfotype     = 0;
+	a->lforate     = 0;
+	a->lfomodpitch = 0;
+	a->lfomodvol   = 0;
+	a->cspinup     = 0;
+	a->cspincount  = 1;
+	a->pitchfrac   = 0;
+	a->volfrac     = 0;
+	a->spinupsav   = 0;
+	a->spindownsav = 0;
+	a->fadeinsav   = 0;
+	a->fadeoutsav  = 0;
+	a->lfofrac     = 0;
+	a->lfomult     = 0;
+	a->ramp_next   = 0.0;
+
 	hl_ambient_count++;
+}
+
+I64 HLSndAmbientAddEx(F64 *origin, U8 *name, F64 attenuation, I64 preset,
+	I64 health, I64 pitch, I64 pitchstart, I64 spinup, I64 spindown,
+	I64 volstart, I64 fadein, I64 fadeout, I64 lfotype, I64 lforate,
+	I64 lfomodpitch, I64 lfomodvol, I64 cspinup, Bool start_silent,
+	Bool looping)
+{//CAmbientGeneric::KeyValue plus InitModulationParms. Keys arrive raw, exactly
+ //as the map wrote them, and the fixups the KeyValue routine applies are done
+ //here so the entity layer stays a plain key copy.
+ //
+ //health is pev->health, the "volume" key: volrun is health * 10, 0 - 100.
+ //Returns the slot, or -1
+	CHLAmbient	*a;
+	I64		 slot;
+	I64		 pitchinc;
+	F64		 vol0;
+
+	HLSndDpvInit;
+
+	//volume is set below from the modulation block, so a placeholder goes in
+	HLSndAmbientAdd(origin, name, 1.0, attenuation);
+
+	slot = hl_ambient_count - 1;
+	if (slot < 0)
+		return -1;
+
+	a = &hl_ambient[slot];
+
+	a->dyn     = TRUE;
+	a->looping = looping;
+	a->preset  = preset;
+
+	//KeyValue clamps and rescales
+	if (pitch > 255)		pitch = 255;
+	if (pitch < 0)			pitch = 0;
+	if (pitchstart > 255)	pitchstart = 255;
+	if (pitchstart < 0)		pitchstart = 0;
+
+	if (spinup > 100)		spinup = 100;
+	if (spinup < 0)			spinup = 0;
+	if (spinup > 0)			spinup = (101 - spinup) * 64;
+
+	if (spindown > 100)		spindown = 100;
+	if (spindown < 0)		spindown = 0;
+	if (spindown > 0)		spindown = (101 - spindown) * 64;
+
+	if (volstart > 10)		volstart = 10;
+	if (volstart < 0)		volstart = 0;
+	volstart = volstart * 10;
+
+	if (fadein > 100)		fadein = 100;
+	if (fadein < 0)			fadein = 0;
+	if (fadein > 0)			fadein = (101 - fadein) * 64;
+
+	if (fadeout > 100)		fadeout = 100;
+	if (fadeout < 0)		fadeout = 0;
+	if (fadeout > 0)		fadeout = (101 - fadeout) * 64;
+
+	//an out of range lfotype is a triangle, not silence
+	if (lfotype > 4)		lfotype = HLLFO_TRIANGLE;
+	if (lfotype < 0)		lfotype = 0;
+
+	if (lforate > 1000)		lforate = 1000;
+	if (lforate < 0)		lforate = 0;
+	lforate = lforate * 256;
+
+	if (lfomodpitch > 100)	lfomodpitch = 100;
+	if (lfomodpitch < 0)	lfomodpitch = 0;
+	if (lfomodvol > 100)	lfomodvol = 100;
+	if (lfomodvol < 0)		lfomodvol = 0;
+	if (cspinup > 100)		cspinup = 100;
+	if (cspinup < 0)		cspinup = 0;
+
+	a->pitchrun    = pitch;
+	a->pitchstart  = pitchstart;
+	a->spinup      = spinup;
+	a->spinupsav   = spinup;
+	a->spindown    = spindown;
+	a->spindownsav = spindown;
+	a->volstart    = volstart;
+	a->fadein      = fadein;
+	a->fadeinsav   = fadein;
+	a->fadeout     = fadeout;
+	a->fadeoutsav  = fadeout;
+	a->lfotype     = lfotype;
+	a->lforate     = lforate;
+	a->lfomodpitch = lfomodpitch;
+	a->lfomodvol   = lfomodvol;
+	a->cspinup     = cspinup;
+
+	//--- InitModulationParms ---
+
+	a->volrun = health * 10;
+	if (a->volrun > 100)	a->volrun = 100;
+	if (a->volrun < 0)		a->volrun = 0;
+
+	if (a->preset != 0 && a->preset <= HLSND_DPV_PRESETS)
+	{
+		//a preset replaces the whole block, then the same fixups run over it
+		a->pitchrun    = hl_snd_dpv[a->preset - 1].pitchrun;
+		a->pitchstart  = hl_snd_dpv[a->preset - 1].pitchstart;
+		a->spinup      = hl_snd_dpv[a->preset - 1].spinup;
+		a->spindown    = hl_snd_dpv[a->preset - 1].spindown;
+		a->volrun      = hl_snd_dpv[a->preset - 1].volrun;
+		a->volstart    = hl_snd_dpv[a->preset - 1].volstart;
+		a->fadein      = hl_snd_dpv[a->preset - 1].fadein;
+		a->fadeout     = hl_snd_dpv[a->preset - 1].fadeout;
+		a->lfotype     = hl_snd_dpv[a->preset - 1].lfotype;
+		a->lforate     = hl_snd_dpv[a->preset - 1].lforate;
+		a->lfomodpitch = hl_snd_dpv[a->preset - 1].lfomodpitch;
+		a->lfomodvol   = hl_snd_dpv[a->preset - 1].lfomodvol;
+		a->cspinup     = hl_snd_dpv[a->preset - 1].cspinup;
+
+		if (a->spindown > 0)
+			a->spindown = (101 - a->spindown) * 64;
+		if (a->spinup > 0)
+			a->spinup = (101 - a->spinup) * 64;
+
+		a->volstart = a->volstart * 10;
+		a->volrun   = a->volrun * 10;
+
+		if (a->fadein > 0)
+			a->fadein = (101 - a->fadein) * 64;
+		if (a->fadeout > 0)
+			a->fadeout = (101 - a->fadeout) * 64;
+
+		a->lforate = a->lforate * 256;
+
+		a->fadeinsav   = a->fadein;
+		a->fadeoutsav  = a->fadeout;
+		a->spinupsav   = a->spinup;
+		a->spindownsav = a->spindown;
+	}
+
+	a->fadein  = a->fadeinsav;
+	a->fadeout = 0;
+
+	if (a->fadein)
+		a->vol = a->volstart;
+	else
+		a->vol = a->volrun;
+
+	a->spinup   = a->spinupsav;
+	a->spindown = 0;
+
+	if (a->spinup)
+		a->pitch = a->pitchstart;
+	else
+		a->pitch = a->pitchrun;
+
+	if (a->pitch == 0)
+		a->pitch = HLPITCH_NORM;
+
+	a->pitchfrac = a->pitch << 8;
+	a->volfrac   = a->vol << 8;
+
+	a->lfofrac = 0;
+	if (a->lforate < 0)
+		a->lforate = -a->lforate;
+
+	a->cspincount = 1;
+
+	if (a->cspinup)
+	{
+		pitchinc = (255 - a->pitchstart) / a->cspinup;
+
+		a->pitchrun = a->pitchstart + pitchinc;
+		if (a->pitchrun > 255)
+			a->pitchrun = 255;
+	}
+
+	//a pitch of exactly PITCH_NORM is the wire's "no pitch" value, so a sound
+	//that intends to shift later must never start on it
+	if ((a->spinupsav || a->spindownsav || (a->lfotype && a->lfomodpitch)) &&
+		a->pitch == HLPITCH_NORM)
+		a->pitch = HLPITCH_NORM + 1;
+
+	vol0 = ToF64(a->vol) * 0.01;
+	if (vol0 > 1.0)
+		vol0 = 1.0;
+
+	a->volume = vol0;
+
+	//AMBIENT_SOUND_START_SILENT waits for a trigger, and a non-looping ambient
+	//is never marked active by Precache
+	a->active = looping && !start_silent;
+
+	return slot;
+}
+
+U0 HLSndAmbientRamp(F64 now)
+{//CAmbientGeneric::RampThink, run for every source at 5hz. Ramps pitch and
+ //volume through their envelopes and modulates both with the LFO
+	CHLAmbient	*a;
+	I64		 i;
+	I64		 pitch;
+	I64		 vol;
+	I64		 pos;
+
+	for (i = 0; i < hl_ambient_count; i++)
+	{
+		a = &hl_ambient[i];
+
+		if (!a->dyn || !a->active)
+			goto qar_next;
+
+		//no ramps and no lfo: RampThink returns without rescheduling
+		if (!a->spinup && !a->spindown && !a->fadein && !a->fadeout &&
+			!a->lfotype)
+			goto qar_next;
+
+		if (now < a->ramp_next)
+			goto qar_next;
+
+		a->ramp_next = now + 0.2;
+
+		pitch = a->pitch;
+		vol   = a->vol;
+
+		//--- pitch envelope ---
+		if (a->spinup || a->spindown)
+		{
+			if (a->spinup > 0)
+				a->pitchfrac += a->spinup;
+			else if (a->spindown > 0)
+				a->pitchfrac -= a->spindown;
+
+			pitch = a->pitchfrac >> 8;
+
+			if (pitch > a->pitchrun)
+			{
+				pitch = a->pitchrun;
+				a->spinup = 0;
+			}
+
+			if (pitch < a->pitchstart)
+			{
+				//spun all the way down: the sound stops and stays stopped
+				a->pitch  = a->pitchstart;
+				a->spindown = 0;
+				a->active = FALSE;
+				goto qar_next;
+			}
+
+			if (pitch > 255)	pitch = 255;
+			if (pitch < 1)		pitch = 1;
+
+			a->pitch = pitch;
+		}
+
+		//--- amplitude envelope ---
+		if (a->fadein || a->fadeout)
+		{
+			if (a->fadein > 0)
+				a->volfrac += a->fadein;
+			else if (a->fadeout > 0)
+				a->volfrac -= a->fadeout;
+
+			vol = a->volfrac >> 8;
+
+			if (vol > a->volrun)
+			{
+				vol = a->volrun;
+				a->fadein = 0;
+			}
+
+			if (vol < a->volstart)
+			{
+				a->vol     = a->volstart;
+				a->fadeout = 0;
+				a->active  = FALSE;
+				goto qar_next;
+			}
+
+			if (vol > 100)	vol = 100;
+			if (vol < 1)	vol = 1;
+
+			a->vol = vol;
+		}
+
+		//--- pitch/amplitude LFO ---
+		if (a->lfotype)
+		{
+			//lfofrac/255 is a triangle from 0 to 255 and back
+			if (a->lfofrac > 0x6FFFFFFF)
+				a->lfofrac = 0;
+
+			a->lfofrac += a->lforate;
+			pos = a->lfofrac >> 8;
+
+			if (a->lfofrac < 0)
+			{
+				a->lfofrac = 0;
+				if (a->lforate < 0)
+					a->lforate = -a->lforate;
+				pos = 0;
+			}
+			else if (pos > 255)
+			{
+				pos        = 255;
+				a->lfofrac = 255 << 8;
+				if (a->lforate > 0)
+					a->lforate = -a->lforate;
+			}
+
+			if (a->lfotype == HLLFO_SQUARE)
+			{
+				if (pos < 128)
+					a->lfomult = 255;
+				else
+					a->lfomult = 0;
+			}
+			else if (a->lfotype == HLLFO_RANDOM)
+			{
+				if (pos == 255)
+					a->lfomult = HLPartRandI(256);
+			}
+			else
+				a->lfomult = pos;
+
+			if (a->lfomodpitch)
+			{
+				pitch += (a->lfomult - 128) * a->lfomodpitch / 100;
+
+				if (pitch > 255)	pitch = 255;
+				if (pitch < 1)		pitch = 1;
+			}
+
+			if (a->lfomodvol)
+			{
+				vol += (a->lfomult - 128) * a->lfomodvol / 100;
+
+				if (vol > 100)	vol = 100;
+				if (vol < 0)	vol = 0;
+			}
+		}
+
+		//the LFO's output is not written back into m_dpv: it modulates the
+		//value sent this round only, around the envelope's own level
+		a->pitch  = pitch;
+		a->volume = ToF64(vol) * 0.01;
+
+qar_next:
+	}
+}
+
+U0 HLSndAmbientToggle(I64 slot, Bool on, F64 now)
+{//CAmbientGeneric::ToggleUse. A looping source tracks whether it is playing; a
+ //one-shot is retriggered and never marked active
+	CHLAmbient *a;
+
+	if (slot < 0 || slot >= hl_ambient_count)
+		return;
+
+	a = &hl_ambient[slot];
+
+	if (!on)
+	{
+		a->active = FALSE;
+		return;
+	}
+
+	//a restart runs the fadein and spinup envelopes again from their saved
+	//values, which is what makes a machine audibly wind up
+	a->fadein  = a->fadeinsav;
+	a->fadeout = 0;
+
+	if (a->fadein)
+		a->vol = a->volstart;
+	else
+		a->vol = a->volrun;
+
+	a->spinup   = a->spinupsav;
+	a->spindown = 0;
+
+	if (a->spinup)
+		a->pitch = a->pitchstart;
+	else
+		a->pitch = a->pitchrun;
+
+	if (a->pitch == 0)
+		a->pitch = HLPITCH_NORM;
+
+	a->pitchfrac = a->pitch << 8;
+	a->volfrac   = a->vol << 8;
+	a->ramp_next = now;
+	a->next_time = 0.0;
+
+	if (a->dyn)
+		a->volume = ToF64(a->vol) * 0.01;
+
+	//cspinup: each trigger steps the running pitch one notch higher
+	if (a->cspinup)
+	{
+		a->cspincount++;
+
+		if (a->cspincount > a->cspinup)
+			a->cspincount = a->cspinup;
+
+		a->pitchrun = a->pitchstart +
+			(255 - a->pitchstart) * a->cspincount / a->cspinup;
+
+		if (a->pitchrun > 255)
+			a->pitchrun = 255;
+	}
+
+	a->active = a->looping;
+
+	//a one-shot still has to sound once
+	if (!a->looping)
+		a->next_time = 0.0;
+}
+
+U0 HLSndAmbientSetPitch(I64 slot, F64 fraction)
+{//ToggleUse with USE_SET: a momentary button drives pitch directly
+	if (slot < 0 || slot >= hl_ambient_count)
+		return;
+
+	if (fraction > 1.0)
+		fraction = 1.0;
+	if (fraction < 0.0)
+		fraction = 0.01;
+
+	hl_ambient[slot].pitch     = ToI64(fraction * 255.0);
+	hl_ambient[slot].pitchfrac = hl_ambient[slot].pitch << 8;
+
+	if (hl_ambient[slot].pitch < 1)
+		hl_ambient[slot].pitch = 1;
 }
 
 I64 HLSndAmbientFind(U8 *name, F64 *origin)
@@ -892,6 +1917,10 @@ U0 HLSndAmbientUpdate(F64 time)
 	I64			 i;
 	Bool		 used[HLSND_MAX_AMBIENT];
 
+	//the pitch and volume envelopes step here, once per frame, and gate their
+	//own 5hz rate internally
+	HLSndAmbientRamp(time);
+
 	for (i = 0; i < hl_ambient_count; i++)
 		used[i] = FALSE;
 
@@ -905,7 +1934,8 @@ U0 HLSndAmbientUpdate(F64 time)
 		{
 			a = &hl_ambient[i];
 
-			if (used[i] || time < a->next_time)
+			//a source spun down, faded out or switched off holds no voice
+			if (used[i] || !a->active || time < a->next_time)
 				goto qa_next;
 
 			gain = a->volume;
@@ -936,7 +1966,11 @@ qa_next:
 		//each source has its own entnum on a fixed channel, so a re-trigger
 		//replaces its own previous instance instead of stacking
 		HLSndPlayAt(a->name, a->origin, a->volume, a->attenuation,
-			-(best + 1), 1);
+			-(best + 1), 1, a->pitch);
+
+		//a non-looping ambient_generic sounds once per trigger
+		if (!a->looping)
+			a->active = FALSE;
 	}
 }
 
@@ -981,4 +2015,1152 @@ U0 HLMusicApplyVolume()
 
 	vol = ToI64(hl_music_volume * hl_snd_master * ToF64(AUDIO_VOL_UNITY));
 	AudioSFXVoiceVolSet(hl_music_voice, vol, vol);
+}
+
+//--- surface materials ------------------------------------------------------
+//
+// PM_InitTextureTypes / PM_FindTextureType. sound/materials.txt tags each world
+// texture with a material letter; the letter picks which set of footstep samples
+// the player's feet make. Untagged textures are concrete, which is most of them.
+
+//CTEXTURESMAX
+#define HLSND_MAX_MATERIALS	512
+//CBTEXTURENAMEMAX is 13 including the terminator: only 12 characters compare
+#define HLSND_MATNAME		12
+
+//pm_materials.h
+#define HLTEX_CONCRETE		'C'
+#define HLTEX_METAL			'M'
+#define HLTEX_DIRT			'D'
+#define HLTEX_VENT			'V'
+#define HLTEX_GRATE			'G'
+#define HLTEX_TILE			'T'
+#define HLTEX_SLOSH			'S'
+#define HLTEX_WOOD			'W'
+#define HLTEX_COMPUTER		'P'
+#define HLTEX_GLASS			'Y'
+#define HLTEX_FLESH			'F'
+#define HLTEX_SNOW			'N'
+
+class CHLMaterial
+{
+	U8	name[16];
+	U8	type;
+};
+
+CHLMaterial	hl_snd_mat[HLSND_MAX_MATERIALS];
+I64			hl_snd_mat_count;
+
+Bool HLSndIsSpace(I64 c)
+{
+	return c == ' ' || c == '\t' || c == '\r' || c == '\n';
+}
+
+Bool HLSndIsAlpha(I64 c)
+{
+	return (c >= 'a' && c <= 'z') || (c >= 'A' && c <= 'Z');
+}
+
+Bool HLSndIsDigit(I64 c)
+{
+	return c >= '0' && c <= '9';
+}
+
+U0 HLSndMaterialsInit()
+{//PM_InitTextureTypes. One line per texture: a material letter, whitespace,
+ //then the texture name. Comment lines start with / and are skipped, as is any
+ //line whose first non-blank character is not a letter
+	U8	*d;
+	U8	*line;
+	I64	 size = 0;
+	I64	 pos  = 0;
+	I64	 i;
+	I64	 j;
+	I64	 n;
+	U8	 buf[256];
+
+	if (hl_snd_mat_ready)
+		return;
+
+	//marked done even when the file is missing: a per-step retry would re-read
+	//the pak on every footstep
+	hl_snd_mat_ready = TRUE;
+	hl_snd_mat_count = 0;
+
+	d = HLFileLoad("sound/materials.txt", &size);
+	if (!d)
+	{
+		HLLog("snd: sound/materials.txt missing - all steps concrete\n");
+		return;
+	}
+
+	while (pos < size && hl_snd_mat_count < HLSND_MAX_MATERIALS)
+	{
+		//one line into buf
+		n = 0;
+
+		while (pos < size && d[pos] != '\n')
+		{
+			if (n < 255)
+			{
+				buf[n] = d[pos];
+				n++;
+			}
+			pos++;
+		}
+
+		buf[n] = 0;
+		pos++;
+
+		i = 0;
+		while (buf[i] && HLSndIsSpace(buf[i]))
+			i++;
+
+		if (!buf[i] || !HLSndIsAlpha(buf[i]))
+			goto qsmi_next;
+
+		//the letter, then the name
+		line = &buf[i];
+		i++;
+
+		while (buf[i] && HLSndIsSpace(buf[i]))
+			i++;
+
+		if (!buf[i])
+			goto qsmi_next;
+
+		j = i;
+		while (buf[j] && !HLSndIsSpace(buf[j]))
+			j++;
+
+		buf[j] = 0;
+
+		hl_snd_mat[hl_snd_mat_count].type = ToUpper(line[0]);
+		HLStrCopy(hl_snd_mat[hl_snd_mat_count].name, &buf[i], 16);
+		hl_snd_mat_count++;
+
+qsmi_next:
+	}
+
+	Free(d);
+
+	StrPrint(hl_snd_line, "snd: %d tagged textures\n", hl_snd_mat_count);
+	HLLog(hl_snd_line);
+}
+
+I64 HLSndMaterialFor(U8 *name)
+{//PM_FindTextureType. Linear rather than the SDK's binary search over a sorted
+ //table: 400 entries are walked a few times a second at most, and the sort
+ //pass PM_SortTextures exists only to make the search possible
+	I64 i;
+
+	HLSndMaterialsInit;
+
+	if (!name || !name[0])
+		return HLTEX_CONCRETE;
+
+	for (i = 0; i < hl_snd_mat_count; i++)
+	{
+		if (!StrNICompare(name, hl_snd_mat[i].name, HLSND_MATNAME))
+			return hl_snd_mat[i].type;
+	}
+
+	//an untagged texture is concrete
+	return HLTEX_CONCRETE;
+}
+
+I64 HLSndSurfAtPoint(CHLMap *map, I64 node_num, F64 *start, F64 *end)
+{//the face a segment crosses, or -1. SurfaceAtPoint: descend the render tree,
+ //and at the node the segment straddles test the split point against each of
+ //that node's faces in texture space.
+ //
+ //The surface extents HLBSPCalcSurfaceExtents already derives are the bounds
+ //the engine tests against, so no polygon clip is needed
+	CHLNode		*n;
+	CHLPlane		*pl;
+	CHLFace		*f;
+	CHLTexInfo	*ti;
+	F64			 mid[3];
+	F64			 front;
+	F64			 back;
+	F64			 frac;
+	F64			 ds;
+	F64			 dt;
+	I64			 i;
+	I64			 side;
+	I64			 r;
+
+	//a negative child is a leaf, which carries no faces
+	if (node_num < 0 || node_num >= map->num_nodes)
+		return -1;
+
+	n  = &map->nodes[node_num];
+
+	if (n->plane_num < 0 || n->plane_num >= map->num_planes)
+		return -1;
+
+	pl = &map->planes[n->plane_num];
+
+	front = HLVecDot(start, pl->normal) - pl->dist;
+	back  = HLVecDot(end, pl->normal) - pl->dist;
+
+	if (front < 0.0)
+		side = 1;
+	else
+		side = 0;
+
+	//wholly on one side, no face on this node can be crossed
+	if ((front < 0.0) == (back < 0.0))
+		return HLSndSurfAtPoint(map, n->children[side], start, end);
+
+	if (front == back)
+		return -1;
+
+	frac = front / (front - back);
+
+	mid[0] = start[0] + frac * (end[0] - start[0]);
+	mid[1] = start[1] + frac * (end[1] - start[1]);
+	mid[2] = start[2] + frac * (end[2] - start[2]);
+
+	//the near side is searched first: the first surface along the segment wins
+	r = HLSndSurfAtPoint(map, n->children[side], start, mid);
+	if (r >= 0)
+		return r;
+
+	for (i = 0; i < n->num_faces; i++)
+	{
+		f = &map->faces[n->first_face + i];
+
+		if (f->tex_info < 0 || f->tex_info >= map->num_texinfo)
+			goto qssp_next;
+
+		ti = &map->texinfo[f->tex_info];
+
+		//sky and nodraw have no material
+		if (ti->flags & HLTEX_SPECIAL)
+			goto qssp_next;
+
+		ds = mid[0] * ti->vecs[0] + mid[1] * ti->vecs[1] +
+			 mid[2] * ti->vecs[2] + ti->vecs[3];
+		dt = mid[0] * ti->vecs[4] + mid[1] * ti->vecs[5] +
+			 mid[2] * ti->vecs[6] + ti->vecs[7];
+
+		if (ds < f->mins_s || dt < f->mins_t)
+			goto qssp_next;
+
+		ds -= f->mins_s;
+		dt -= f->mins_t;
+
+		if (ds > ToF64(f->extent_s) || dt > ToF64(f->extent_t))
+			goto qssp_next;
+
+		return n->first_face + i;
+
+qssp_next:
+	}
+
+	return HLSndSurfAtPoint(map, n->children[1 - side], mid, end);
+}
+
+U8 *HLSndTextureUnder(CHLMap *map, F64 *origin)
+{//PM_TraceTexture from the player's origin straight down. NULL when the trace
+ //finds no surface
+	CHLFace		*f;
+	CHLTexInfo	*ti;
+	F64			 start[3];
+	F64			 end[3];
+	I64			 face;
+
+	if (!HLMapValid(map, "HLSndTextureUnder"))
+		return NULL;
+
+	if (!map->nodes || !map->faces || !map->textures || map->num_models < 1)
+		return NULL;
+
+	HLVecCopy(origin, start);
+	HLVecCopy(origin, end);
+
+	//PM_CatagorizeTextureType's reach
+	end[2] -= 64.0;
+
+	face = HLSndSurfAtPoint(map, map->models[0].head_node[0], start, end);
+	if (face < 0 || face >= map->num_faces)
+		return NULL;
+
+	f  = &map->faces[face];
+	ti = &map->texinfo[f->tex_info];
+
+	if (ti->miptex < 0 || ti->miptex >= map->num_textures)
+		return NULL;
+
+	return map->textures[ti->miptex].name;
+}
+
+I64 HLSndMaterialAt(CHLMap *map, F64 *origin)
+{//PM_CatagorizeTextureType: the material letter of the surface underfoot
+	U8 *name = HLSndTextureUnder(map, origin);
+
+	if (!name)
+		return HLTEX_CONCRETE;
+
+	//render intent is encoded in the leading characters of the name and is not
+	//part of what materials.txt tags
+	if (name[0] == '-' || name[0] == '+')
+		name += 2;
+
+	//the opening brace above is a character literal, the masked-texture prefix.
+	//Its closing partner '}' is not a prefix and is never stripped
+	if (name[0] == '{' || name[0] == '!' || name[0] == '~' || name[0] == ' ')
+		name++;
+
+	return HLSndMaterialFor(name);
+}
+
+//--- footsteps --------------------------------------------------------------
+//
+// PM_PlayStepSound / PM_MapTextureTypeStepType / PM_UpdateStepSound.
+
+#define HLSTEP_CONCRETE		0
+#define HLSTEP_METAL		1
+#define HLSTEP_DIRT			2
+#define HLSTEP_VENT			3
+#define HLSTEP_GRATE		4
+#define HLSTEP_TILE			5
+#define HLSTEP_SLOSH		6
+#define HLSTEP_WADE			7
+#define HLSTEP_LADDER		8
+
+I64 HLSndStepForMaterial(I64 mat)
+{//PM_MapTextureTypeStepType. Wood, computer, glass, flesh and snow are tagged
+ //in materials.txt but have no step set of their own and fall through
+	if (mat == HLTEX_METAL)		return HLSTEP_METAL;
+	if (mat == HLTEX_DIRT)		return HLSTEP_DIRT;
+	if (mat == HLTEX_VENT)		return HLSTEP_VENT;
+	if (mat == HLTEX_GRATE)		return HLSTEP_GRATE;
+	if (mat == HLTEX_TILE)		return HLSTEP_TILE;
+	if (mat == HLTEX_SLOSH)		return HLSTEP_SLOSH;
+
+	return HLSTEP_CONCRETE;
+}
+
+U8 *HLSndStepPrefix(I64 step)
+{//the sample family for a step type. A comparison chain, not a table: adjacent
+ //string literals concatenate and a literal table collapses to one entry
+	if (step == HLSTEP_METAL)	return "pl_metal";
+	if (step == HLSTEP_DIRT)	return "pl_dirt";
+	if (step == HLSTEP_VENT)	return "pl_duct";
+	if (step == HLSTEP_GRATE)	return "pl_grate";
+	if (step == HLSTEP_TILE)	return "pl_tile";
+	if (step == HLSTEP_SLOSH)	return "pl_slosh";
+	if (step == HLSTEP_WADE)	return "pl_wade";
+	if (step == HLSTEP_LADDER)	return "pl_ladder";
+
+	return "pl_step";
+}
+
+U0 HLSndPlayStepSound(I64 step, F64 fvol, F64 *origin, I64 entnum = 0)
+{//PM_PlayStepSound. Four samples per set, two per foot, alternating
+	U8	*prefix;
+	U8	 name[64];
+	I64	 irand;
+	I64	 num;
+
+	hl_snd_step_left = !hl_snd_step_left;
+
+	//wading plays on one step in four, so the player does not sound like a
+	//paddle wheel
+	if (step == HLSTEP_WADE)
+	{
+		if (hl_snd_step_skip == 0)
+		{
+			hl_snd_step_skip++;
+			return;
+		}
+
+		hl_snd_step_skip++;
+
+		if (hl_snd_step_skip == 4)
+			hl_snd_step_skip = 0;
+	}
+
+	irand = HLPartRandI(2);
+
+	//0,1 right foot, 2,3 left
+	if (hl_snd_step_left)
+		irand += 2;
+
+	//one step in five on tile is the fifth sample
+	if (step == HLSTEP_TILE && !HLPartRandI(5))
+		irand = 4;
+
+	prefix = HLSndStepPrefix(step);
+
+	//the samples are numbered 1,3 for the right foot and 2,4 for the left, so
+	//the pairs are not consecutive
+	if (step == HLSTEP_WADE)
+		num = irand + 1;
+	else if (irand == 0)
+		num = 1;
+	else if (irand == 1)
+		num = 3;
+	else if (irand == 2)
+		num = 2;
+	else if (irand == 3)
+		num = 4;
+	else
+		num = 5;
+
+	StrPrint(name, "player/%s%d.wav", prefix, num);
+
+	HLSndPlayAt(name, origin, fvol, HLATTN_NORM, entnum, HLCHAN_BODY);
+}
+
+U0 HLSndFootstep(CHLMap *map, F64 *origin, F64 speed, Bool ducking,
+	Bool ladder, I64 waterlevel, F64 now, I64 entnum = 0)
+{//PM_UpdateStepSound. Called every frame while the player is on the ground or
+ //on a ladder; the step rate is its own timer, not the animation's.
+ //
+ //waterlevel is the usual 0 dry, 1 feet, 2 waist, 3 eyes: the SDK point-tests
+ //the knee and the feet separately, and those two tests are the same two steps
+	F64	 velrun;
+	F64	 fvol;
+	I64	 step;
+	I64	 mat;
+	Bool walking;
+
+	if (now < hl_snd_step_time)
+		return;
+
+	//ducking and climbing both cross into a run at much lower speeds
+	if (ducking || ladder)
+		velrun = 80.0;
+	else
+		velrun = 210.0;
+
+	if (speed <= 0.0)
+		return;
+
+	//PM_UpdateStepSound gates on "speed >= velwalk or the step timer is
+	//expired", but PM_ReduceTimers clamps that timer at zero and the routine
+	//returns while it is above zero, so the second half is always true where
+	//the gate is reached. velwalk rejects nothing and is not reproduced here
+	walking = speed < velrun;
+
+	if (ladder)
+	{
+		step = HLSTEP_LADDER;
+		fvol = 0.35;
+		hl_snd_step_time = now + 0.35;
+	}
+	else if (waterlevel >= 2)
+	{
+		step = HLSTEP_WADE;
+		fvol = 0.65;
+		hl_snd_step_time = now + 0.6;
+	}
+	else if (waterlevel == 1)
+	{
+		step = HLSTEP_SLOSH;
+
+		if (walking)
+		{
+			fvol = 0.2;
+			hl_snd_step_time = now + 0.4;
+		}
+		else
+		{
+			fvol = 0.5;
+			hl_snd_step_time = now + 0.3;
+		}
+	}
+	else
+	{
+		mat  = HLSndMaterialAt(map, origin);
+		step = HLSndStepForMaterial(mat);
+
+		//dirt and ventilation duct are the two sets that are not mixed at the
+		//common level
+		if (mat == HLTEX_DIRT)
+		{
+			if (walking)
+				fvol = 0.25;
+			else
+				fvol = 0.55;
+		}
+		else if (mat == HLTEX_VENT)
+		{
+			if (walking)
+				fvol = 0.4;
+			else
+				fvol = 0.7;
+		}
+		else
+		{
+			if (walking)
+				fvol = 0.2;
+			else
+				fvol = 0.5;
+		}
+
+		if (walking)
+			hl_snd_step_time = now + 0.4;
+		else
+			hl_snd_step_time = now + 0.3;
+	}
+
+	HLSndPlayStepSound(step, fvol, origin, entnum);
+}
+
+//--- sentence groups --------------------------------------------------------
+//
+// SENTENCEG_Init and friends. sound/sentences.txt names about a thousand
+// sentences; those whose names differ only in a trailing number form a group,
+// so HG_ALERT0..HG_ALERT6 is one group named HG_ALERT. A request for the group
+// picks one of its members without repeating until the group is exhausted.
+//
+// This layer resolves names only. Playing a sentence means playing its words in
+// order with their per-word pitch and timing modifiers, which HLAI.ZC does, and
+// HLAI.ZC compiles later than this file and cannot be called from here. The
+// picked sentence is handed back through a queue that HLAI.ZC drains.
+
+//CVOXFILESENTENCEMAX is 2048; the shipped file holds around a thousand
+#define HLSND_MAX_SENTENCES	1400
+//CBSENTENCENAME_MAX
+#define HLSND_SENTNAME		16
+#define HLSND_MAX_SENTGROUPS	200
+//CSENTENCE_LRU_MAX
+#define HLSND_LRU_MAX		32
+#define HLSND_LRU_EMPTY		0xFF
+
+//one flat block at a fixed stride rather than an array of pointers: a table of
+//string literals collapses to a single entry
+U8	hl_snd_sentname[HLSND_MAX_SENTENCES * HLSND_SENTNAME];
+I64	hl_snd_sent_count;
+
+class CHLSentGroup
+{
+	U8	name[HLSND_SENTNAME];
+	I64	count;
+	U8	lru[HLSND_LRU_MAX];
+};
+
+CHLSentGroup	hl_snd_sentg[HLSND_MAX_SENTGROUPS];
+I64				hl_snd_sentg_count;
+
+U0 HLSndLRUInit(U8 *lru, I64 count)
+{//USENTENCEG_InitLRU: 0..count-1 in a random order. Drawing from the front of
+ //this and blanking as it goes is what stops a group repeating itself
+	I64 i;
+	I64 j;
+	I64 k;
+	U8	temp;
+
+	if (count > HLSND_LRU_MAX)
+		count = HLSND_LRU_MAX;
+
+	for (i = 0; i < count; i++)
+		lru[i] = i;
+
+	for (i = 0; i < count * 4; i++)
+	{
+		j = HLPartRandI(count);
+		k = HLPartRandI(count);
+
+		temp   = lru[j];
+		lru[j] = lru[k];
+		lru[k] = temp;
+	}
+}
+
+U0 HLSndSentencesInit()
+{//SENTENCEG_Init. Every name goes into the flat table; a name whose trailing
+ //digits are stripped and which then differs from the previous one opens a new
+ //group, and one that matches extends it. The file is already in group order
+	CHLSentGroup	*g;
+	U8			*d;
+	I64			 size = 0;
+	I64			 pos  = 0;
+	I64			 i;
+	I64			 j;
+	I64			 n;
+	U8			 buf[512];
+	U8			 group[HLSND_SENTNAME];
+
+	if (hl_snd_sent_ready)
+		return;
+
+	hl_snd_sent_ready  = TRUE;
+	hl_snd_sent_count  = 0;
+	hl_snd_sentg_count = 0;
+	group[0]           = 0;
+
+	d = HLFileLoad("sound/sentences.txt", &size);
+	if (!d)
+	{
+		HLLog("snd: sound/sentences.txt missing - no sentence groups\n");
+		return;
+	}
+
+	while (pos < size && hl_snd_sent_count < HLSND_MAX_SENTENCES)
+	{
+		n = 0;
+
+		while (pos < size && d[pos] != '\n')
+		{
+			if (n < 511)
+			{
+				buf[n] = d[pos];
+				n++;
+			}
+			pos++;
+		}
+
+		buf[n] = 0;
+		pos++;
+
+		i = 0;
+		while (buf[i] && buf[i] == ' ')
+			i++;
+
+		//comments and blank lines
+		if (!buf[i] || buf[i] == '/' || !HLSndIsAlpha(buf[i]))
+			goto qssi_next;
+
+		j = i;
+		while (buf[j] && buf[j] != ' ')
+			j++;
+
+		//a name with no words after it is not a sentence
+		if (!buf[j])
+			goto qssi_next;
+
+		buf[j] = 0;
+
+		HLStrCopy(&hl_snd_sentname[hl_snd_sent_count * HLSND_SENTNAME],
+			&buf[i], HLSND_SENTNAME);
+		hl_snd_sent_count++;
+
+		//strip the trailing number to get the group name
+		j--;
+		if (j <= i)
+			goto qssi_next;
+
+		if (!HLSndIsDigit(buf[j]))
+			goto qssi_next;
+
+		while (j > i && HLSndIsDigit(buf[j]))
+			j--;
+
+		if (j <= i)
+			goto qssi_next;
+
+		buf[j + 1] = 0;
+
+		if (StrCompare(group, &buf[i]))
+		{
+			if (hl_snd_sentg_count >= HLSND_MAX_SENTGROUPS)
+			{
+				HLLog("snd: too many sentence groups\n");
+				break;
+			}
+
+			g = &hl_snd_sentg[hl_snd_sentg_count];
+			HLStrCopy(g->name, &buf[i], HLSND_SENTNAME);
+			g->count = 1;
+			hl_snd_sentg_count++;
+
+			HLStrCopy(group, &buf[i], HLSND_SENTNAME);
+		}
+		else if (hl_snd_sentg_count > 0)
+			hl_snd_sentg[hl_snd_sentg_count - 1].count++;
+
+qssi_next:
+	}
+
+	Free(d);
+
+	for (i = 0; i < hl_snd_sentg_count; i++)
+		HLSndLRUInit(hl_snd_sentg[i].lru, hl_snd_sentg[i].count);
+
+	StrPrint(hl_snd_line, "snd: %d sentences in %d groups\n",
+		hl_snd_sent_count, hl_snd_sentg_count);
+	HLLog(hl_snd_line);
+}
+
+I64 HLSndSentenceLookup(U8 *sample)
+{//SENTENCEG_Lookup: "!NAME" to the sentence's index in the flat table, or -1.
+ //The leading ! is what marks a sample name as a sentence rather than a wav
+	I64 i;
+
+	HLSndSentencesInit;
+
+	if (!sample || sample[0] != '!')
+		return -1;
+
+	for (i = 0; i < hl_snd_sent_count; i++)
+	{
+		if (!StrICompare(&hl_snd_sentname[i * HLSND_SENTNAME], sample + 1))
+			return i;
+	}
+
+	return -1;
+}
+
+U8 *HLSndSentenceName(I64 index)
+{//the name at a table index, or NULL
+	HLSndSentencesInit;
+
+	if (index < 0 || index >= hl_snd_sent_count)
+		return NULL;
+
+	return &hl_snd_sentname[index * HLSND_SENTNAME];
+}
+
+I64 HLSndSentenceGroupIndex(U8 *groupname)
+{//SENTENCEG_GetIndex. A leading ! is accepted so a caller can pass an entity
+ //key through without stripping it first
+	I64 i;
+
+	HLSndSentencesInit;
+
+	if (!groupname || !groupname[0])
+		return -1;
+
+	if (groupname[0] == '!')
+		groupname++;
+
+	for (i = 0; i < hl_snd_sentg_count; i++)
+	{
+		if (!StrCompare(hl_snd_sentg[i].name, groupname))
+			return i;
+	}
+
+	return -1;
+}
+
+I64 HLSndSentencePick(I64 grp, U8 *out)
+{//USENTENCEG_Pick: the least recently used member of a group, written to out as
+ //"!NAMEn". Returns its ordinal within the group, or -1
+	CHLSentGroup	*g;
+	I64			 i;
+	I64			 ipick;
+	I64			 count;
+	Bool		 found = FALSE;
+
+	if (grp < 0 || grp >= hl_snd_sentg_count)
+		return -1;
+
+	g     = &hl_snd_sentg[grp];
+	count = g->count;
+
+	if (count < 1)
+		return -1;
+
+	if (count > HLSND_LRU_MAX)
+		count = HLSND_LRU_MAX;
+
+	ipick = -1;
+
+	for (i = 0; i < count; i++)
+	{
+		if (g->lru[i] != HLSND_LRU_EMPTY)
+		{
+			ipick    = g->lru[i];
+			g->lru[i] = HLSND_LRU_EMPTY;
+			found    = TRUE;
+			break;
+		}
+	}
+
+	//the group is used up: reshuffle and draw again. One retry only, where the
+	//SDK loops - a freshly seeded list always has an entry
+	if (!found)
+	{
+		HLSndLRUInit(g->lru, count);
+
+		for (i = 0; i < count; i++)
+		{
+			if (g->lru[i] != HLSND_LRU_EMPTY)
+			{
+				ipick     = g->lru[i];
+				g->lru[i] = HLSND_LRU_EMPTY;
+				found     = TRUE;
+				break;
+			}
+		}
+	}
+
+	if (!found)
+		return -1;
+
+	StrPrint(out, "!%s%d", g->name, ipick);
+
+	return ipick;
+}
+
+//--- sentence requests ------------------------------------------------------
+//
+// EMIT_SOUND_DYN routes a sample name starting with ! through the sentence
+// system. The word scheduler is in HLAI.ZC, later in the include order, so a
+// request is parked here and drained from there.
+
+#define HLSND_MAX_SENTQ		8
+
+class CHLSentReq
+{
+	U8	name[48];		//"!NAME", the sentence, not the group
+	F64	origin[3];
+	F64	volume;
+	F64	attenuation;
+	I64	pitch;
+	I64	entnum;
+};
+
+CHLSentReq	hl_snd_sentq[HLSND_MAX_SENTQ];
+I64			hl_snd_sentq_head;
+I64			hl_snd_sentq_tail;
+
+U0 HLSndSentQueueEnsure()
+{//the indices are globals and hold junk until this runs
+	if (hl_snd_sq_ready)
+		return;
+
+	hl_snd_sq_ready   = TRUE;
+	hl_snd_sentq_head = 0;
+	hl_snd_sentq_tail = 0;
+}
+
+U0 HLSndSentQueueClear()
+{
+	HLSndSentQueueEnsure;
+
+	hl_snd_sentq_head = 0;
+	hl_snd_sentq_tail = 0;
+}
+
+U0 HLSndSentenceQueue(U8 *name, F64 *origin, F64 volume, F64 attenuation,
+	I64 pitch = HLPITCH_NORM, I64 entnum = 0)
+{//park one "!NAME" for the speech layer
+	CHLSentReq	*q;
+	I64			 next;
+
+	HLSndSentQueueEnsure;
+
+	if (!name || name[0] != '!')
+		return;
+
+	next = (hl_snd_sentq_tail + 1) % HLSND_MAX_SENTQ;
+
+	//full: the oldest request is still the one worth keeping, so the new one is
+	//dropped rather than overwriting a line already being spoken
+	if (next == hl_snd_sentq_head)
+		return;
+
+	q = &hl_snd_sentq[hl_snd_sentq_tail];
+
+	HLStrCopy(q->name, name, 48);
+	q->volume      = volume;
+	q->attenuation = attenuation;
+	q->pitch       = pitch;
+	q->entnum      = entnum;
+
+	if (origin)
+		HLVecCopy(origin, q->origin);
+	else
+		HLVecCopy(hl_snd_listener, q->origin);
+
+	hl_snd_sentq_tail = next;
+}
+
+Bool HLSndSentenceNext(CHLSentReq *out)
+{//drain one request. FALSE when the queue is empty
+	HLSndSentQueueEnsure;
+
+	if (hl_snd_sentq_head == hl_snd_sentq_tail)
+		return FALSE;
+
+	MemCopy(out, &hl_snd_sentq[hl_snd_sentq_head], sizeof(CHLSentReq));
+
+	hl_snd_sentq_head = (hl_snd_sentq_head + 1) % HLSND_MAX_SENTQ;
+
+	return TRUE;
+}
+
+I64 HLSndSentencePlayRndSz(U8 *groupname, F64 *origin, F64 volume,
+	F64 attenuation, I64 pitch = HLPITCH_NORM, I64 entnum = 0)
+{//SENTENCEG_PlayRndSz. Returns the ordinal picked, or -1 for no such group
+	I64	grp;
+	I64	ipick;
+	U8	name[48];
+
+	grp = HLSndSentenceGroupIndex(groupname);
+	if (grp < 0)
+	{
+		if (hl_snd_reports < HLSND_MAX_REPORTS)
+		{
+			hl_snd_reports++;
+			StrPrint(hl_snd_line, "snd: no such sentence group %s\n",
+				groupname);
+			HLLog(hl_snd_line);
+		}
+		return -1;
+	}
+
+	name[0] = 0;
+	ipick   = HLSndSentencePick(grp, name);
+
+	if (ipick >= 0 && name[0])
+		HLSndSentenceQueue(name, origin, volume, attenuation, pitch, entnum);
+
+	return ipick;
+}
+
+U0 HLSndEmitDyn(U8 *sample, F64 *origin, F64 volume, F64 attenuation,
+	I64 entnum = 0, I64 entchannel = 0, I64 pitch = HLPITCH_NORM)
+{//EMIT_SOUND_DYN: a sample name beginning with ! is a sentence and goes to the
+ //speech layer, anything else is a wav and is played here
+	if (!sample || !sample[0])
+		return;
+
+	if (sample[0] == '!')
+	{
+		if (HLSndSentenceLookup(sample) >= 0)
+			HLSndSentenceQueue(sample, origin, volume, attenuation, pitch,
+				entnum);
+		return;
+	}
+
+	HLSndPlayAt(sample, origin, volume, attenuation, entnum, entchannel,
+		pitch);
+}
+
+//--- speaker ----------------------------------------------------------------
+//
+// CSpeaker. The public address announcer: every few minutes it picks a line at
+// random from a sentence group and reads it over the facility's speakers. The
+// preset numbers select the group for a chapter of the game.
+
+#define HLSND_MAX_SPEAKERS	16
+
+//ANNOUNCE_MINUTES_MIN 0.25, ANNOUNCE_MINUTES_MAX 2.25
+#define HLSND_ANNOUNCE_MIN	15.0
+#define HLSND_ANNOUNCE_MAX	135.0
+
+class CHLSpeaker
+{
+	F64	 origin[3];
+	U8	 message[64];	//a group name, or "!NAME" for a single line
+	I64	 preset;
+	F64	 health;		//pev->health, the volume key
+	F64	 next;			//pev->nextthink, 0 when no announcement is pending
+	I64	 entnum;
+	Bool active;
+};
+
+CHLSpeaker	hl_snd_spk[HLSND_MAX_SPEAKERS];
+I64			hl_snd_spk_count;
+
+F64 HLSndRandF(F64 lo, F64 hi)
+{//RANDOM_FLOAT
+	return lo + (hi - lo) * (HLPartRand(0.5) + 0.5);
+}
+
+U0 HLSndSpeakerClear()
+{
+	hl_snd_spk_ready = TRUE;
+	hl_snd_spk_count = 0;
+}
+
+U8 *HLSndSpeakerPreset(I64 preset)
+{//CSpeaker::SpeakerThink's preset table. One group per chapter
+	if (preset == 1)	return "C1A0_";
+	if (preset == 2)	return "C1A1_";
+	if (preset == 3)	return "C1A2_";
+	if (preset == 4)	return "C1A3_";
+	if (preset == 5)	return "C1A4_";
+	if (preset == 6)	return "C2A1_";
+	if (preset == 7)	return "C2A2_";
+	if (preset == 8)	return "C2A3_";
+	if (preset == 9)	return "C2A4_";
+	if (preset == 10)	return "C2A5_";
+	if (preset == 11)	return "C3A1_";
+	if (preset == 12)	return "C3A2_";
+
+	return NULL;
+}
+
+I64 HLSndSpeakerAdd(F64 *origin, U8 *message, I64 preset, F64 health,
+	Bool start_silent, F64 now, I64 entnum = 0)
+{//CSpeaker::Spawn plus Precache. Returns the slot, or -1
+	CHLSpeaker *s;
+
+	if (!hl_snd_spk_ready)
+		HLSndSpeakerClear;
+
+	if (hl_snd_spk_count >= HLSND_MAX_SPEAKERS)
+		return -1;
+
+	//a speaker with neither a preset nor a message has nothing to say and is
+	//removed on its first think
+	if (!preset && (!message || !message[0]))
+		return -1;
+
+	s = &hl_snd_spk[hl_snd_spk_count];
+
+	HLVecCopy(origin, s->origin);
+
+	if (message)
+		HLStrCopy(s->message, message, 64);
+	else
+		s->message[0] = 0;
+
+	s->preset = preset;
+	s->health = health;
+	s->entnum = entnum;
+	s->active = TRUE;
+
+	//the first announcement lands 5 to 15 seconds in, so several speakers in
+	//one map do not all fire together
+	if (start_silent)
+		s->next = 0.0;
+	else
+		s->next = now + HLSndRandF(5.0, 15.0);
+
+	hl_snd_spk_count++;
+
+	return hl_snd_spk_count - 1;
+}
+
+U0 HLSndSpeakerToggle(I64 slot, F64 now)
+{//CSpeaker::ToggleUse: cancel a pending announcement, or start one
+	if (!hl_snd_spk_ready || slot < 0 || slot >= hl_snd_spk_count)
+		return;
+
+	if (hl_snd_spk[slot].next > 0.0)
+		hl_snd_spk[slot].next = 0.0;
+	else
+		hl_snd_spk[slot].next = now + 0.1;
+}
+
+U0 HLSndSpeakerUpdate(F64 now)
+{//CSpeaker::SpeakerThink for every speaker in the map
+	CHLSpeaker	*s;
+	U8			*msg;
+	I64			 i;
+	F64			 volume;
+
+	if (!hl_snd_spk_ready)
+	{
+		HLSndSpeakerClear;
+		return;
+	}
+
+	for (i = 0; i < hl_snd_spk_count; i++)
+	{
+		s = &hl_snd_spk[i];
+
+		if (!s->active || s->next <= 0.0 || now < s->next)
+			goto qssu_next;
+
+		//a talking monster holds the floor: two voices at once is unreadable
+		if (now <= hl_snd_talk_wait)
+		{
+			s->next = hl_snd_talk_wait + HLSndRandF(5.0, 10.0);
+			goto qssu_next;
+		}
+
+		msg = HLSndSpeakerPreset(s->preset);
+		if (!msg)
+			msg = s->message;
+
+		if (!msg || !msg[0])
+			goto qssu_next;
+
+		volume = s->health * 0.1;
+
+		//attenuation 0.3 is wider than ATTN_NORM: an announcement carries down
+		//a corridor
+		if (msg[0] == '!')
+		{
+			//a single line, spoken once, then the speaker goes quiet
+			HLSndSentenceQueue(msg, s->origin, volume, 0.3, HLPITCH_NORM,
+				s->entnum);
+			s->next = 0.0;
+			goto qssu_next;
+		}
+
+		if (HLSndSentencePlayRndSz(msg, s->origin, volume, 0.3, HLPITCH_NORM,
+				s->entnum) < 0)
+		{
+			//a bad group name would otherwise retry every frame
+			s->active = FALSE;
+			goto qssu_next;
+		}
+
+		s->next = now + HLSndRandF(HLSND_ANNOUNCE_MIN, HLSND_ANNOUNCE_MAX);
+
+		//g_talkWaitTime: nothing else speaks for five seconds
+		hl_snd_talk_wait = now + 5.0;
+
+qssu_next:
+	}
+}
+
+U0 HLSndTalkWaitSet(F64 until)
+{//CTalkMonster::g_talkWaitTime. The speech layer sets this while a monster is
+ //mid-line so the announcer holds off
+	if (until > hl_snd_talk_wait)
+		hl_snd_talk_wait = until;
+}
+
+//--- teardown ---------------------------------------------------------------
+
+U0 HLSndStopAll()
+{//S_StopAllSounds. Every voice this file holds is released and every table it
+ //keeps is emptied.
+ //
+ //A looping voice never ends on its own: AudioSFXPlayRef with loop set runs
+ //until it is stopped by handle. Anything that took one and then lost its owner
+ //- a map change, a return to the menu - keeps playing into whatever comes
+ //next. The leaf ambients are permanent loops by design and are exactly that
+ //case, so the wind of the last map is still blowing under the menu.
+ //
+ //Stopping a handle whose voice has already been recycled is harmless, because
+ //the handle carries a serial the mixer checks, but the handle is still cleared
+ //afterwards: a second stop of a stale handle would otherwise be aimed at
+ //whichever voice has since taken the slot
+	I64 i;
+
+	for (i = 0; i < HLSND_DYNAMIC_CHANNELS; i++)
+	{
+		if (hl_snd_chan[i].voice >= 0)
+			AudioSFXStop(hl_snd_chan[i].voice);
+	}
+
+	HLSndChannelsClear;
+
+	for (i = 0; i < HLNUM_AMBIENTS; i++)
+	{
+		if (hl_ambient_voice[i] >= 0)
+			AudioSFXStop(hl_ambient_voice[i]);
+
+		hl_ambient_voice[i] = -1;
+		hl_ambient_vol[i]   = 0.0;
+		hl_ambient_ends[i]  = 0.0;
+	}
+
+	//the fade runs off a stored timestamp; a stale one makes the first frame of
+	//the next map see a huge delta and slam to full level
+	hl_ambient_last = 0.0;
+
+	HLSndAmbientClear;
+	HLSndEchoClear;
+	HLSndSentQueueClear;
+	HLSndSpeakerClear;
+	HLMusicFree;
+
+	hl_snd_roomtype  = 0;
+	hl_snd_step_time = 0.0;
+	hl_snd_step_skip = 0;
+	hl_snd_talk_wait = 0.0;
 }
