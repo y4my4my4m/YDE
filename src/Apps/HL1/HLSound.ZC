@@ -27,19 +27,31 @@
 #define HLPITCH_LOW			95
 #define HLPITCH_HIGH		120
 
-//common/const.h channel numbers. CHAN_AUTO never replaces an existing sound
+//common/const.h:615-624. CHAN_AUTO never replaces an existing sound.
+//
+//HLENT_CHAN_MOVE 1 and HLENT_CHAN_USE 2 in HLEntity.ZC are a separate mover
+//enum that happens to share this range. They are not CHAN_ values and must not
+//be compared against one
 #define HLCHAN_AUTO			0
 #define HLCHAN_WEAPON		1
 #define HLCHAN_VOICE		2
 #define HLCHAN_ITEM			3
 #define HLCHAN_BODY			4
-#define HLCHAN_STATIC		6
+#define HLCHAN_STREAM		5		//allocated from the static or dynamic area
+#define HLCHAN_STATIC		6		//allocated from the static area
+#define HLCHAN_NETWORKVOICE_BASE	7	//7..500 reserved for network voice
+#define HLCHAN_NETWORKVOICE_END		500
+#define HLCHAN_BOT			501
 
 //diagnostics for the silent-output case
 #define HLSND_MAX_REPORTS	64
 I64 hl_snd_reports	= 0;
 I64 hl_snd_silent	= 0;
 U8  hl_snd_line[160];
+
+//per-second voice census to the log. Type HLSndDebug(TRUE); at the prompt
+Bool hl_snd_debug;
+F64  hl_snd_debug_next;
 
 class CHLSound
 {
@@ -59,8 +71,21 @@ I64		 hl_snd_count	= 0;
 I64		 hl_snd_bytes	= 0;
 Bool	 hl_snd_enabled	= TRUE;
 
-//quake's own volume 0..1. The AC97 master is the system's and applies on top
-F64		 hl_snd_master	= 0.8;
+//the "volume" cvar, 0..1. The AC97 master is the system's and applies on top.
+//
+//GAIN STAGING. AC97OutputMix sums every voice and hard-clips the sum
+//(AC97.ZC:469). There is no limiter and no master bus, so N voices at gain g
+//clip once N*g exceeds 1. The pool is 48 voices. Nothing below this line can
+//change that; the only lever this file has is what it asks for per voice.
+F64		 hl_snd_master	= 0.7;
+
+//"suitvolume". EMIT_SOUND_SUIT reads it and stays silent below 0.05
+//(dlls/sound.cpp:1434, :1438)
+F64		 hl_snd_suitvol	= 0.25;
+
+//"room_off". Non-zero disables the roomtype DSP entirely
+Bool	 hl_snd_room_off	= FALSE;
+
 I64		 hl_snd_played	= 0;
 I64		 hl_snd_dropped	= 0;
 
@@ -270,36 +295,97 @@ U0 HLSndSpatialize(CHLSndChan *ch, I64 *_l, I64 *_r)
 	if (*_r > AUDIO_VOL_UNITY)	*_r = AUDIO_VOL_UNITY;
 }
 
+F64 HLSndChanLifeLeft(CHLSndChan *ch)
+{//seconds of ch's sample still to play. A free or finished channel gives a
+ //negative value, which is what makes it win the least-life-left search
+	F64 len;
+
+	if (ch->voice < 0 || !AudioSFXPlaying(ch->voice))
+		return -1.0;
+
+	if (ch->pcm_rate <= 0 || ch->pcm_count <= 0)
+		return 0.0;
+
+	len = ToF64(ch->pcm_count) / ToF64(ch->pcm_rate);
+
+	return ch->start_time + len - tS;
+}
+
 I64 HLSndPickChannel(I64 entnum, I64 entchannel)
-{//the channel this sound takes, stealing one when none is free
-	I64 i;
-	I64 first_to_die = -1;
+{//SND_PickChannel. Two passes, in this order:
+ //
+ //  1. the whole table is searched for a channel this entity already holds on
+ //     this entchannel; that one is replaced. CHAN_AUTO (0) is exempt and
+ //     always takes a fresh slot, so overlapping world sounds stack.
+ //  2. otherwise the channel with the least playback left is taken, skipping
+ //     any the view entity owns.
+ //
+ //The search must not stop at the first free slot. Stopping there means a
+ //second shot from the same weapon lands on a free channel while the first is
+ //still running, and repeat fire stacks into one loud smear instead of
+ //replacing itself - which is the whole reason entchannel exists.
+	CHLSndChan	*ch;
+	F64			 life;
+	F64			 life_left;
+	I64			 i;
+	I64			 first_to_die = -1;
 
-	for (i = 0; i < HLSND_DYNAMIC_CHANNELS; i++)
+	if (entchannel != 0)
 	{
-		//channel 0 is CHAN_AUTO, never overrides
-		if (entchannel != 0 && hl_snd_chan[i].entnum == entnum &&
-			(hl_snd_chan[i].entchannel == entchannel || entchannel == -1))
+		for (i = 0; i < HLSND_DYNAMIC_CHANNELS; i++)
 		{
-			first_to_die = i;
-			break;
-		}
+			ch = &hl_snd_chan[i];
 
-		//free slots first
-		if (!AudioSFXPlaying(hl_snd_chan[i].voice))
+			if (ch->entnum != entnum)
+				goto qsp_match_next;
+
+			//entchannel -1 is "any channel of this entity"
+			if (ch->entchannel == entchannel || entchannel == -1)
+			{
+				first_to_die = i;
+				break;
+			}
+
+qsp_match_next:
+		}
+	}
+
+	if (first_to_die < 0)
+	{
+		//larger than any life left a real sample can report
+		life_left = 1000000.0;
+
+		for (i = 0; i < HLSND_DYNAMIC_CHANNELS; i++)
 		{
-			first_to_die = i;
-			break;
-		}
+			ch = &hl_snd_chan[i];
 
-		//the player's own channel is never stolen for another entity
-		if (hl_snd_chan[i].entnum == hl_snd_viewent && entnum != hl_snd_viewent)
-			goto qsp_next;
+			//the view entity's own sounds are never stolen for another entity
+			if (ch->entnum == hl_snd_viewent && entnum != hl_snd_viewent &&
+				AudioSFXPlaying(ch->voice))
+				goto qsp_next;
 
-		if (first_to_die < 0)
-			first_to_die = i;
+			//a held CHAN_STATIC loop - a machine, a train, the egon hum - runs
+			//until its owner stops it. Stealing one leaves a machine that is
+			//visibly running and silent, with no event left to restart it.
+			//
+			//The engine keeps static sounds in their own channel area, out of
+			//the dynamic pool entirely; that pool split is engine-side and not
+			//in the SDK checkout. One pool with static entries pinned is the
+			//closest this layer gets
+			if (ch->entchannel == HLCHAN_STATIC && entchannel != HLCHAN_STATIC &&
+				AudioSFXPlaying(ch->voice))
+				goto qsp_next;
+
+			life = HLSndChanLifeLeft(ch);
+
+			if (life < life_left)
+			{
+				life_left    = life;
+				first_to_die = i;
+			}
 
 qsp_next:
+		}
 	}
 
 	if (first_to_die < 0)
@@ -329,13 +415,27 @@ qsp_next:
 // The roomtype numbering is the env_sound "Room type" list: 0 off, then triples
 // of small/medium/large - 1 generic, 4 metallic, 7 tunnel, 10 chamber,
 // 13 bright, 16 water, 19 concrete, 22 outside, 25 cavern - and 28..30 weirdo.
+//
+// Only "0 is off" is citable: dlls/sound.cpp:840 reads the roomtype key and
+// world.cpp:489 clears room_type to 0. The grouping above comes from the
+// level editor's choice list, and the DSP each number selects is inside the
+// engine, which is not in the SDK checkout. Every tap count, spacing, decay and
+// send level below is therefore chosen by ear, not transcribed.
 
 I64 hl_snd_roomtype;
 
-//taps are fire and forget voices with no channel. Cut off well below the pool
-//so a reverberant room can never starve gunfire of a voice
+//taps are fire and forget voices with no channel. Cut off below the pool so a
+//reverberant room can never starve gunfire of a voice
 #define HLSND_MAX_ECHOES		32
-#define HLSND_ECHO_VOICE_LIMIT	32		//of AUDIO_MAX_SFX_VOICES
+//8 of AUDIO_MAX_SFX_VOICES held back for the dry mix. 16 dynamic channels, 12
+//ambient sources, 4 leaf ambients and the music track already reach 33
+#define HLSND_ECHO_VOICE_LIMIT	(AUDIO_MAX_SFX_VOICES - 8)
+
+//A tap is a whole second copy of the sample, not a delay line: the mixer has no
+//delay path. On a transient that reads as an early reflection. On anything with
+//sustain the copy beats against the dry signal and reads as flanging, so only
+//short sounds are sent.
+#define HLSND_ECHO_MAX_LEN		1.5		//seconds
 
 class CHLSndEcho
 {
@@ -472,11 +572,21 @@ U0 HLSndEchoPush(U32 *frames, I64 count, I64 rate, I64 vol_l, I64 vol_r,
 	if (!frames || count < 1)
 		return;
 
+	if (hl_snd_room_off)
+		return;
+
+	if (rate > 0 && ToF64(count) / ToF64(rate) > HLSND_ECHO_MAX_LEN)
+		return;
+
 	if (!HLSndRoomParams(hl_snd_roomtype, &taps, &delay, &decay, &wet))
 		return;
 
-	//a room must never cost the dry mix a voice
-	if (AudioSFXVoicesActive >= HLSND_ECHO_VOICE_LIMIT)
+	//a room must never cost the dry mix a voice.
+	//
+	//PARENTHESISE: a no-argument call written bare yields the function's
+	//address, which is far above any limit, so this test was unconditionally
+	//true and no tap was ever queued. The reverb made no sound at all
+	if (AudioSFXVoicesActive() >= HLSND_ECHO_VOICE_LIMIT)
 		return;
 
 	gain = wet;
@@ -532,7 +642,8 @@ U0 HLSndEchoRun(F64 now)
 		if (now > hl_snd_echo[i].when + 1.0)
 			goto qer_next;
 
-		if (AudioSFXVoicesActive < HLSND_ECHO_VOICE_LIMIT)
+		//parens: see HLSndEchoPush
+		if (AudioSFXVoicesActive() < HLSND_ECHO_VOICE_LIMIT)
 			AudioSFXPlayRef(hl_snd_echo[i].frames, hl_snd_echo[i].count,
 				hl_snd_echo[i].rate, hl_snd_echo[i].vol_l,
 				hl_snd_echo[i].vol_r);
@@ -542,12 +653,19 @@ qer_next:
 }
 
 U0 HLSndRoomtypeSet(I64 rt)
-{//SVC_ROOMTYPE. HLEntity.ZC calls this with hl_ent_roomtype once the nearest
- //visible env_sound changes
+{//the "room_type" cvar, dlls/world.cpp:489. HLEntity.ZC calls this with
+ //hl_ent_roomtype once the nearest visible env_sound changes
 	if (rt < 0 || rt > 30)
 		rt = 0;
 
+	if (rt == hl_snd_roomtype)
+		return;
+
 	hl_snd_roomtype = rt;
+
+	//taps queued under the old room carry its spacing and gain. Firing them
+	//after the change stacks two rooms for as long as the longest delay
+	HLSndEchoClear;
 }
 
 //--- deferred tables --------------------------------------------------------
@@ -666,13 +784,18 @@ U0 HLSndInit()
  //globals are not zeroed either, and this table is walked and freed
 	I64 i;
 
-	hl_snd_master = 0.8;
+	hl_snd_master  = 0.7;
+	hl_snd_suitvol = 0.25;
+	hl_snd_room_off = FALSE;
 
 	//same reason: a garbage hl_snd_enabled silences the game outright, and a
 	//garbage report counter either floods the log or suppresses it entirely
 	hl_snd_enabled = TRUE;
 	hl_snd_reports = 0;
 	hl_snd_silent  = 0;
+
+	hl_snd_debug      = FALSE;
+	hl_snd_debug_next = 0.0;
 
 	for (i = 0; i < HLSND_MAX_CACHE; i++)
 	{
@@ -1200,9 +1323,15 @@ U0 HLSndPlayAt(U8 *name, F64 *origin, F64 volume, F64 attenuation,
 	if (!s || !s->frames || s->count < 1)
 		return;
 
+	//volume is a 0..1 fraction. A map key read on the wrong scale arrives here
+	//as 10, and left alone it saturates every ear at every distance: the
+	//spatialised value only falls under unity past the last few units of the
+	//attenuation radius, so the sound plays flat out and then cuts
 	gain = volume;
 	if (gain > 1.0)
 		gain = 1.0;
+	if (gain < 0.0)
+		gain = 0.0;
 
 	if (pitch < 1)
 		pitch = 1;

@@ -98,14 +98,23 @@ I64  hl_sp_row       = 0;
 Bool hl_menu_save_req = FALSE;	//polled by the main loop, it owns save/load
 Bool hl_menu_load_req = FALSE;
 
-//CBasePlayer's flashlight, impulse 100. EF_DIMLIGHT is a projected spot in
-//the retail client and this renderer has none, so the beam is a dlight parked
-//ahead of the eye and refreshed once a frame. m_iFlashBattery drains and
+//CBasePlayer's flashlight, impulse 100. EF_DIMLIGHT is a projected spot in the
+//retail client; software mode resolves it to a dynamic light at the point the
+//view ray strikes, which is what this places. m_iFlashBattery drains and
 //recharges on the SDK's two clocks.
-#define HLFLASH_DRAIN	1.2		//FLASH_DRAIN_TIME, seconds per unit spent
-#define HLFLASH_CHARGE	0.2		//FLASH_CHARGE_TIME, seconds per unit regained
-#define HLFLASH_RADIUS	220.0	//dlight radius, no SDK counterpart
-#define HLFLASH_AHEAD	72.0	//how far down the view ray the beam lands
+//
+//The beam constants are not in the checkout - the flashlight is drawn by the
+//closed client, and engine/ here is headers only - so they are matched by eye
+//against the retail beam rather than cited. Radius grows with the distance to
+//the impact and the colour falls off over the same span: a wall at arm's
+//length is a tight bright pool, a far one a wide dim one.
+#define HLFLASH_DRAIN		1.2		//FLASH_DRAIN_TIME, seconds per unit spent
+#define HLFLASH_CHARGE		0.2		//FLASH_CHARGE_TIME, seconds per unit regained
+#define HLFLASH_RANGE		1600.0	//trace length, world units
+#define HLFLASH_BACKOFF		4.0		//lift off the impact plane, world units
+#define HLFLASH_RAD_NEAR	110.0	//dlight radius at the eye
+#define HLFLASH_RAD_FAR		260.0	//dlight radius at HLFLASH_RANGE
+#define HLFLASH_DIM_FAR		0.35	//colour scale at HLFLASH_RANGE
 
 Bool hl_flash_on		= FALSE;
 I64  hl_flash_battery	= 100;
@@ -3208,17 +3217,27 @@ U0 HLConReportFlag(U8 *name, Bool on)
 Bool HLConAimBasis(F64 *eye, F64 *fwd)
 {//the eye and forward vector FindEntityForward traces along.
  //
- //hl_angles and hl_view belong to the shell, which compiles after this file,
- //so the eye is taken from the sound listener - HLSndListener is handed
- //hl_view every frame - and the heading from listener_right. AngleVectors'
- //right is roll free, right = (sin yaw, -cos yaw, 0), so forward at zero
- //pitch is (-right[1], right[0], 0). Pitch is the one thing lost: the probe
- //runs level with the eye rather than up or down the view ray.
+ //hl_angles and hl_view belong to the shell, which compiles after this file.
+ //HLDrawSetView records the basis it built for the world pass, pitch included,
+ //and that is the ray the player is looking down.
+ //
+ //Before the first world frame there is none, and the fallback is the sound
+ //listener: HLSndListener is handed hl_view every frame, and AngleVectors'
+ //right is roll free, right = (sin yaw, -cos yaw, 0), so forward at zero pitch
+ //is (-right[1], right[0], 0). The fallback carries no pitch.
 	if (!hl_world_active || !hl_map || !hl_entities)
 		return FALSE;
 
-	HLVecCopy(hl_snd_listener, eye);
-	HLVecSet(fwd, -hl_snd_right[1], hl_snd_right[0], 0.0);
+	if (hl_view_basis)
+	{
+		HLVecCopy(hl_view_org, eye);
+		HLVecCopy(hl_view_fwd, fwd);
+	}
+	else
+	{
+		HLVecCopy(hl_snd_listener, eye);
+		HLVecSet(fwd, -hl_snd_right[1], hl_snd_right[0], 0.0);
+	}
 
 	if (HLVecNormalize(fwd) <= 0.0)
 		return FALSE;
@@ -3394,12 +3413,19 @@ U0 HLConFlashlightFrame()
  //FLASH_DRAIN_TIME while lit, regain one every FLASH_CHARGE_TIME while off,
  //and cut out when the cell is empty.
  //
- //The beam itself is a dlight re-added each frame. It is placed down the view
- //ray at eye height rather than projected onto whatever is ahead - see
- //HLConAimBasis for why there is no pitch here.
-	F64 eye[3];
-	F64 fwd[3];
-	F64 pos[3];
+ //The beam itself is a dlight re-added each frame, sited where the view ray
+ //meets the world.
+	CHLTrace	tr;
+	F64			eye[3];
+	F64			fwd[3];
+	F64			end[3];
+	F64			pos[3];
+	F64			zero[3];
+	F64			dist;
+	F64			t;
+	F64			rad;
+	F64			scale;
+	I64			j;
 
 	if (!hl_world_active)
 		return;
@@ -3428,14 +3454,43 @@ U0 HLConFlashlightFrame()
 		}
 	}
 
+	//HLConAimBasis has already established hl_map
 	if (!HLConAimBasis(eye, fwd))
 		return;
 
-	HLVecMA(eye, HLFLASH_AHEAD, fwd, pos);
+	HLVecMA(eye, HLFLASH_RANGE, fwd, end);
+	HLVecSet(zero, 0.0, 0.0, 0.0);
 
-	//life is one frame's worth: the light is re-added below every frame, and a
-	//longer one would trail behind the player
-	HLDlightAdd(pos, HLFLASH_RADIUS, 0.1, 0.0, tS, 255, 250, 220);
+	//model 0 hull 0: the world's point hull. Brush entities are left out
+	//because R_MarkLights descends the world tree alone, so a door carries no
+	//dlight to land on; the beam passes through one and lights the wall behind.
+	HLTraceHull(hl_map, 0, 0, zero, eye, end, &tr);
+
+	HLVecCopy(tr.end_pos, pos);
+	dist = HLFLASH_RANGE * tr.fraction;
+
+	//end_pos lies in the impact plane, where rounding can put the light on the
+	//solid side and R_MarkLights descends away from the room it lights. The
+	//trace normal faces the eye, so this lifts into the open.
+	if (tr.hit)
+	{
+		for (j = 0; j < 3; j++)
+			pos[j] += tr.plane_normal[j] * HLFLASH_BACKOFF;
+	}
+
+	t = dist / HLFLASH_RANGE;
+	if (t < 0.0)
+		t = 0.0;
+	if (t > 1.0)
+		t = 1.0;
+
+	rad   = HLFLASH_RAD_NEAR + (HLFLASH_RAD_FAR - HLFLASH_RAD_NEAR) * t;
+	scale = 1.0 + (HLFLASH_DIM_FAR - 1.0) * t;
+
+	//life is one frame's worth: the light is re-added every frame, and a longer
+	//one would trail behind the player
+	HLDlightAdd(pos, rad, 0.1, 0.0, tS,
+		ToI64(255.0 * scale), ToI64(250.0 * scale), ToI64(220.0 * scale));
 }
 
 U0 HLConTrackLastItem()
@@ -7875,7 +7930,10 @@ U0 HLPsPreview(CHLCanvas *c)
 	//test and eat the model.
 	HLVecSet(veye, 0.0, 0.0, 0.0);
 	HLVecSet(vang, 0.0, 0.0, 0.0);
-	HLDrawSetView(c, veye, vang, 90.0);
+
+	//record off: this camera is the preview's, and the flashlight reads the
+	//recorded basis as the player's view ray
+	HLDrawSetView(c, veye, vang, 90.0, FALSE);
 
 	MemSet(c->depth, 0, c->width * c->height * sizeof(F64));
 
