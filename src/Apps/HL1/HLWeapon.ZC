@@ -1,0 +1,1516 @@
+// HLWeapon.ZC - player inventory, weapons, firing and single-player gamerules
+//
+// Ported from the SDK's dlls/ - weapons.cpp (CBasePlayerWeapon, FireBullets),
+// crowbar.cpp, glock.cpp, python.cpp, mp5.cpp, shotgun.cpp, items.cpp
+// (CBasePlayerItem::Touch, CBasePlayerAmmo) and singleplay_gamerules.cpp -
+// plus cl_dll/ammo.cpp for the bucket/selection UI.
+//
+// The SDK gives every weapon its own C++ class with virtual PrimaryAttack.
+// Every weapon implemented here is hitscan and differs only in numbers, so
+// it is one table plus one fire routine instead. A weapon that needs its own
+// code path (crossbow bolts, RPG rockets, gauss/egon beams, the throwables)
+// is NOT in the table: they all need projectile entities, and the entity
+// system has no non-brush movers yet.
+//
+// WHERE THE PER-FRAME CALL COMES FROM
+//
+// HL1.ZC owns the frame loop and is not editable from here, so the tick is
+// driven off hl_hud_weapon_hook - the one hook HLHud.ZC owns that HL1.ZC
+// already calls once per rendered frame, through HLHudDraw. It is the same
+// backward-call idiom HLProgs.ZC uses for hl_pr_builtin_call: a single-pass
+// compiler cannot let HLHud.ZC name anything in this file, so this file
+// installs itself into a pointer HLHud.ZC declared.
+//
+// That also decides where the player state comes from. hl_origin and
+// hl_angles live in HL1.ZC, which compiles later, so the view comes out of
+// CHLCanvas instead - it carries the eye and the view basis for the frame
+// being drawn, which is exactly what a weapon needs.
+//
+// The clock is hl_ent_time, the server clock HLEntFrame advances, NOT the
+// render clock: refire delays are game time in the SDK and have to survive a
+// framerate change. One consequence: with the QuakeC VM live HLGameFrame owns
+// the clock and hl_ent_time stands still, so weapons are frozen on that path.
+// That is correct - the VM path is Quake's, and it has its own weapons.
+//
+// If HL1.ZC ever wants to drive this properly, HLWeaponFrame(dt, map, eye,
+// forward, right, up) next to HLEntFrame is the call, and the hook install at
+// the bottom of this file is the line to delete.
+//
+// DELIBERATELY NOT HERE
+//
+//   - secondary attack. every one that matters is a projectile (M203, satchel,
+//     bolt) or a beam, so there is nothing to share with the hitscan path.
+//   - shell-by-shell shotgun reload, and every other animation EVENT. the
+//     studio layer decodes bones and sequences, not mstudioevent_t.
+//   - damage to monsters. there is no monster damage path to call.
+//   - decals. HLDraw has no decal layer, so a bullet leaves a puff and a
+//     ricochet and no mark.
+//   - autoaim. the sprites are in hud.txt and the SDK's is a full sight cone
+//     over the monster list, which does not exist yet.
+//   - the two-step selection menu (hud_fastswitch 0) - see HLWeaponSelectSlot.
+//   - item_healthkit / item_battery / item_suit. those belong to the item
+//     classes in HLEntity.ZC, not to the inventory.
+//   - inventory across a changelevel. HL carries it in the transition save.
+
+//--- weapon ids -------------------------------------------------------------
+//
+// Order is the SDK's WEAPON_* order for the ones implemented. -1 is "empty
+// handed", which is what HL single player actually starts as.
+
+#define HLWPN_NONE			-1
+
+#define HLWPN_CROWBAR		0
+#define HLWPN_GLOCK			1
+#define HLWPN_PYTHON			2
+#define HLWPN_MP5			3
+#define HLWPN_SHOTGUN		4
+
+#define HLWPN_COUNT			5
+
+//--- ammo pools -------------------------------------------------------------
+//
+// m_rgAmmo in the SDK, indexed by an id the game registers by name. Only the
+// pools the weapons above draw from, plus the AR grenades, because
+// ammo_ARgrenades is scattered through the early maps and silently ignoring a
+// pickup reads as a bug.
+
+#define HLAMMO_NONE			-1
+
+#define HLAMMO_9MM			0
+#define HLAMMO_357			1
+#define HLAMMO_BUCKSHOT		2
+#define HLAMMO_ARGRENADE		3
+
+#define HLAMMO_COUNT			4
+
+//weapon slots. MAX_WEAPON_SLOTS in the SDK, one per number key
+#define HLWPN_SLOTS			5
+
+//no clip: the weapon fires straight out of the pool (gauss, egon)
+#define HLWPN_NOCLIP			-1
+
+//CBasePlayerItem::Touch's pickup box - UTIL_SetSize(-16,-16,0)..(16,16,16).
+//items are not linked into the world by the spawn pass (weapon_* and ammo_*
+//are not classes HLEntSpawnOne knows), so absmin/absmax are zero and the box
+//has to be rebuilt here from the origin
+#define HLWPN_ITEM_HALF		16.0
+#define HLWPN_ITEM_TOP		16.0
+
+//how long the bucket UI stays up after the last selection key. the SDK fades
+//it out on a timer too, though on a longer one
+#define HLWPN_SEL_TIME		1.5
+
+//flat lighting for the view model. HL1.ZC has HLVM_LIGHT for the alias
+//viewgun and this is the same idea - a view model is never lit by the world
+//in the software renderer, it would go black indoors
+#define HLWPN_VM_LIGHT		176
+
+//a stall must not fast-forward every refire timer at once
+#define HLWPN_MAX_DT			0.25
+
+class CHLWeaponInfo
+{
+	U8	classname[32];		//weapon_* entity classname, and the pickup key
+	U8	hud_name[32];		//hud.txt has "d_<hud_name>" for every weapon
+	U8	view_model[64];		//models/v_*.mdl
+
+	I64	slot;				//iSlot from GetItemInfo, 0..4
+	I64	pos;				//iPosition inside the bucket
+
+	I64	ammo;				//HLAMMO_*, HLAMMO_NONE for the crowbar
+	I64	max_clip;			//HLWPN_NOCLIP to fire from the pool
+	I64	give;				//m_iDefaultAmmo, granted with the weapon itself
+
+	F64	damage;				//gSkillData.plrDmg*, per bullet
+	I64	bullets;			//pellets per shot
+	F64	spread;				//VECTOR_CONE_* , a tangent not an angle
+	F64	rate;				//m_flNextPrimaryAttack step
+	F64	range;				//hitscan length
+	F64	reload_time;		//0 for a weapon with no clip to fill
+
+	//the crosshairs sheet is a grid of cells; every weapon_*.txt names one
+	//cell for "crosshair". -1 means the weapon has none (melee)
+	I64	xhair_col;
+	I64	xhair_row;
+
+	//sequence LABELS, not indices: v_crowbar has attack1miss where v_357 has
+	//fire1 and v_9mmar has deploy where the rest have draw
+	U8	seq_idle[24];
+	U8	seq_fire[24];
+	U8	seq_reload[24];
+	U8	seq_draw[24];
+
+	//empty for melee: HLWeaponMelee picks its sound from the outcome, hit or
+	//miss, the way CCrowbar::Swing does
+	U8	fire_snd[64];
+};
+
+CHLWeaponInfo	hl_wpn_info[HLWPN_COUNT];
+
+//--- inventory --------------------------------------------------------------
+
+Bool	hl_wpn_have[HLWPN_COUNT];
+I64		hl_wpn_clip[HLWPN_COUNT];
+F64		hl_wpn_next[HLWPN_COUNT];		//m_flNextPrimaryAttack, absolute
+I64		hl_wpn_ammo[HLAMMO_COUNT];
+I64		hl_wpn_ammo_max[HLAMMO_COUNT];
+
+I64		hl_wpn_active		= HLWPN_NONE;
+F64		hl_wpn_reload_done	= 0.0;		//0 = not reloading
+I64		hl_wpn_reloading	= HLWPN_NONE;
+
+//--- view model -------------------------------------------------------------
+
+CHLStudio	*hl_wpn_vm			= NULL;
+I64			 hl_wpn_vm_for		= HLWPN_NONE;	//which weapon hl_wpn_vm is
+I64			 hl_wpn_vm_seq		= 0;
+F64			 hl_wpn_vm_cycle	= 0.0;
+Bool		 hl_wpn_vm_loop		= TRUE;
+Bool		 hl_wpn_vm_done		= FALSE;
+
+//--- input edges ------------------------------------------------------------
+//
+// The number keys are read here rather than taken from HL1.ZC's impulse
+// system: hl_bind_key lives in HLMenu.ZC and the impulses are consumed by the
+// QuakeC path, which this replaces.
+
+Bool	hl_wpn_slot_held[HLWPN_SLOTS];
+Bool	hl_wpn_next_held	= FALSE;
+Bool	hl_wpn_prev_held	= FALSE;
+Bool	hl_wpn_reload_held	= FALSE;
+Bool	hl_wpn_attack_held	= FALSE;
+
+//--- selection UI -----------------------------------------------------------
+
+I64		hl_wpn_sel_slot		= -1;		//bucket open in the UI, -1 closed
+F64		hl_wpn_sel_until	= 0.0;
+
+//--- bookkeeping ------------------------------------------------------------
+
+F64		hl_wpn_last_time	= 0.0;		//hl_ent_time at the previous tick
+Bool	hl_wpn_spawned		= FALSE;
+I64		hl_wpn_xhair_sheet	= -1;
+I64		hl_wpn_xhair_res	= 0;		//which hl_hud_res that sheet is for
+I64		hl_wpn_picked		= 0;		//pickups this level, for HLTest
+
+U0 HLWeaponSetInfo(I64 id, U8 *classname, U8 *hud_name, U8 *view_model,
+	I64 slot, I64 pos, I64 ammo, I64 max_clip, I64 give,
+	F64 damage, I64 bullets, F64 spread, F64 rate, F64 range, F64 reload_time,
+	I64 xcol, I64 xrow,
+	U8 *idle, U8 *fire, U8 *reload, U8 *draw, U8 *fire_snd)
+{//one row of the table. a setter rather than a brace initialiser because a
+ //global's initialiser is not reliable on this compiler
+	CHLWeaponInfo *w;
+
+	if (id < 0 || id >= HLWPN_COUNT)
+		return;
+
+	w = &hl_wpn_info[id];
+
+	HLStrCopy(w->classname, classname, 32);
+	HLStrCopy(w->hud_name, hud_name, 32);
+	HLStrCopy(w->view_model, view_model, 64);
+
+	w->slot        = slot;
+	w->pos         = pos;
+	w->ammo        = ammo;
+	w->max_clip    = max_clip;
+	w->give        = give;
+	w->damage      = damage;
+	w->bullets     = bullets;
+	w->spread      = spread;
+	w->rate        = rate;
+	w->range       = range;
+	w->reload_time = reload_time;
+	w->xhair_col   = xcol;
+	w->xhair_row   = xrow;
+
+	HLStrCopy(w->seq_idle, idle, 24);
+	HLStrCopy(w->seq_fire, fire, 24);
+	HLStrCopy(w->seq_reload, reload, 24);
+	HLStrCopy(w->seq_draw, draw, 24);
+	HLStrCopy(w->fire_snd, fire_snd, 64);
+}
+
+U0 HLWeaponInit()
+{//globals aren't zeroed - see the note in HLPak.ZC
+ //
+ //damage figures are gSkillData at skill 1 (skill.cfg sk_plr_*1): crowbar 10,
+ //9mm 8, 357 40, buckshot 5. spreads are the VECTOR_CONE_* constants the
+ //attack functions pass to FireBulletsPlayer, which are tangents:
+ //
+ //    VECTOR_CONE_3DEGREES  0.05234    VECTOR_CONE_10DEGREES 0.08716
+ //
+ //ranges are the last argument of FireBulletsPlayer - 2048 for the shotgun,
+ //8192 for everything else, and 32 units of TraceLine for the crowbar
+	I64 i;
+
+	for (i = 0; i < HLWPN_COUNT; i++)
+	{
+		hl_wpn_have[i] = FALSE;
+		hl_wpn_clip[i] = 0;
+		hl_wpn_next[i] = 0.0;
+	}
+
+	for (i = 0; i < HLAMMO_COUNT; i++)
+		hl_wpn_ammo[i] = 0;
+
+	//*_MAX_CARRY from weapons.h
+	hl_wpn_ammo_max[HLAMMO_9MM]       = 250;
+	hl_wpn_ammo_max[HLAMMO_357]       = 36;
+	hl_wpn_ammo_max[HLAMMO_BUCKSHOT]  = 125;
+	hl_wpn_ammo_max[HLAMMO_ARGRENADE] = 10;
+
+	for (i = 0; i < HLWPN_SLOTS; i++)
+		hl_wpn_slot_held[i] = FALSE;
+
+	hl_wpn_active      = HLWPN_NONE;
+	hl_wpn_reload_done = 0.0;
+	hl_wpn_reloading   = HLWPN_NONE;
+
+	hl_wpn_vm       = NULL;
+	hl_wpn_vm_for   = HLWPN_NONE;
+	hl_wpn_vm_seq   = 0;
+	hl_wpn_vm_cycle = 0.0;
+	hl_wpn_vm_loop  = TRUE;
+	hl_wpn_vm_done  = FALSE;
+
+	hl_wpn_next_held   = FALSE;
+	hl_wpn_prev_held   = FALSE;
+	hl_wpn_reload_held = FALSE;
+	hl_wpn_attack_held = FALSE;
+
+	hl_wpn_sel_slot  = -1;
+	hl_wpn_sel_until = 0.0;
+
+	hl_wpn_last_time   = 0.0;
+	hl_wpn_spawned     = FALSE;
+	hl_wpn_xhair_sheet = -1;
+	hl_wpn_xhair_res   = 0;
+	hl_wpn_picked      = 0;
+
+	//CROWBAR: swings, never fires. attack1miss is the swing that hits nothing;
+	//attack1 is the one with the impact, and the crowbar model is the only one
+	//that ships both
+	HLWeaponSetInfo(HLWPN_CROWBAR, "weapon_crowbar", "crowbar",
+		"models/v_crowbar.mdl", 0, 0,
+		HLAMMO_NONE, HLWPN_NOCLIP, 0,
+		10.0, 1, 0.0, 0.5, 32.0, 0.0,
+		-1, -1,
+		"idle1", "attack1miss", "", "draw", "");
+
+	//GLOCK: GlockFire(0.01, 0.3, TRUE) for the primary
+	HLWeaponSetInfo(HLWPN_GLOCK, "weapon_9mmhandgun", "9mmhandgun",
+		"models/v_9mmhandgun.mdl", 1, 0,
+		HLAMMO_9MM, 17, 17,
+		8.0, 1, 0.01, 0.3, 8192.0, 1.5,
+		1, 0,
+		"idle1", "shoot", "reload", "draw", "weapons/pl_gun3.wav");
+
+	//PYTHON: no cone in single player - the deathmatch branch is the one that
+	//spreads it
+	HLWeaponSetInfo(HLWPN_PYTHON, "weapon_357", "357",
+		"models/v_357.mdl", 1, 1,
+		HLAMMO_357, 6, 6,
+		40.0, 1, 0.0, 0.75, 8192.0, 2.0,
+		2, 0,
+		"idle1", "fire1", "reload", "draw", "weapons/357_shot1.wav");
+
+	//MP5: VECTOR_CONE_6DEGREES, 0.1 refire. the M203 secondary is not here -
+	//it launches a grenade entity
+	HLWeaponSetInfo(HLWPN_MP5, "weapon_9mmAR", "9mmAR",
+		"models/v_9mmar.mdl", 2, 0,
+		HLAMMO_9MM, 50, 25,
+		8.0, 1, 0.05234, 0.1, 8192.0, 1.5,
+		0, 2,
+		"idle1", "shoot", "reload", "deploy", "weapons/hks1.wav");
+
+	//SHOTGUN: six pellets at VECTOR_CONE_10DEGREES out to 2048. the SDK
+	//reloads this one shell at a time; here it is a single bulk reload
+	HLWeaponSetInfo(HLWPN_SHOTGUN, "weapon_shotgun", "shotgun",
+		"models/v_shotgun.mdl", 2, 1,
+		HLAMMO_BUCKSHOT, 8, 12,
+		5.0, 6, 0.08716, 0.75, 2048.0, 2.5,
+		2, 1,
+		"sm_idle", "shoot", "reload", "draw", "weapons/sbarrel1.wav");
+}
+
+//top-level, so the state is sane before any frame
+HLWeaponInit;
+
+//--- inventory queries ------------------------------------------------------
+
+I64 HLWeaponPool(I64 id)
+{//rounds in the pool the weapon draws from, 0 for the crowbar
+	CHLWeaponInfo *w;
+
+	if (id < 0 || id >= HLWPN_COUNT)
+		return 0;
+
+	w = &hl_wpn_info[id];
+
+	if (w->ammo == HLAMMO_NONE)
+		return 0;
+
+	return hl_wpn_ammo[w->ammo];
+}
+
+Bool HLWeaponCanFire(I64 id)
+{//whether pulling the trigger would do anything, ignoring the refire timer
+	CHLWeaponInfo *w;
+
+	if (id < 0 || id >= HLWPN_COUNT || !hl_wpn_have[id])
+		return FALSE;
+
+	w = &hl_wpn_info[id];
+
+	//melee never runs dry
+	if (w->ammo == HLAMMO_NONE)
+		return TRUE;
+
+	if (w->max_clip == HLWPN_NOCLIP)
+		return ToBool(hl_wpn_ammo[w->ammo] > 0);
+
+	return ToBool(hl_wpn_clip[id] > 0);
+}
+
+I64 HLWeaponFindByClass(U8 *classname)
+{//weapon_* classname to id, -1 if it is not one of ours
+	I64 i;
+
+	for (i = 0; i < HLWPN_COUNT; i++)
+	{
+		if (!StrICompare(hl_wpn_info[i].classname, classname))
+			return i;
+	}
+
+	return -1;
+}
+
+//--- view model -------------------------------------------------------------
+
+I64 HLWeaponSeqFind(CHLStudio *m, U8 *label)
+{//sequence index by label, -1 when the model has no such sequence
+	I64 i;
+
+	if (!m || !label || !label[0])
+		return -1;
+
+	for (i = 0; i < m->num_seqs; i++)
+	{
+		if (!StrICompare(m->seqs[i].label, label))
+			return i;
+	}
+
+	return -1;
+}
+
+U0 HLWeaponVmAnim(U8 *label, Bool loop)
+{//SendWeaponAnim. an unknown label falls back to sequence 0 rather than
+ //leaving the gun on whatever it was playing - a missing label is a data
+ //problem and a frozen gun hides it
+	I64 seq;
+
+	if (!hl_wpn_vm)
+		return;
+
+	seq = HLWeaponSeqFind(hl_wpn_vm, label);
+
+	if (seq < 0)
+		seq = 0;
+
+	hl_wpn_vm_seq   = seq;
+	hl_wpn_vm_cycle = 0.0;
+	hl_wpn_vm_loop  = loop;
+	hl_wpn_vm_done  = FALSE;
+}
+
+U0 HLWeaponSetActive(I64 id)
+{//CBasePlayer::SelectItem - holster the old, deploy the new
+	CHLWeaponInfo *w;
+
+	if (id < 0 || id >= HLWPN_COUNT || !hl_wpn_have[id])
+		return;
+
+	hl_wpn_active    = id;
+	hl_wpn_reloading = HLWPN_NONE;
+
+	w = &hl_wpn_info[id];
+
+	//the studio cache owns the model, so re-selecting a weapon costs a lookup
+	//and no load
+	if (hl_wpn_vm_for != id)
+	{
+		hl_wpn_vm     = HLStudioCacheGet(w->view_model);
+		hl_wpn_vm_for = id;
+	}
+
+	HLWeaponVmAnim(w->seq_draw, FALSE);
+
+	//Deploy() sets m_flNextPrimaryAttack from the draw animation, so a weapon
+	//cannot be fired the instant it appears
+	hl_wpn_next[id] = hl_ent_time + 0.5;
+}
+
+//--- giving -----------------------------------------------------------------
+
+Bool HLWeaponGiveAmmo(I64 type, I64 count)
+{//CBasePlayer::GiveAmmo. FALSE when the pool is already full, which is what
+ //makes an ammo box stay in the world instead of vanishing for nothing
+	I64 room;
+
+	if (type < 0 || type >= HLAMMO_COUNT || count <= 0)
+		return FALSE;
+
+	room = hl_wpn_ammo_max[type] - hl_wpn_ammo[type];
+
+	if (room <= 0)
+		return FALSE;
+
+	if (count > room)
+		count = room;
+
+	hl_wpn_ammo[type] += count;
+
+	return TRUE;
+}
+
+Bool HLWeaponGive(I64 id)
+{//CBasePlayer::AddPlayerItem. a duplicate weapon is not a failed pickup - the
+ //SDK keeps the ammo and drops the duplicate - so this returns TRUE either way
+ //as long as SOMETHING was taken
+	CHLWeaponInfo	*w;
+	Bool			 took = FALSE;
+
+	if (id < 0 || id >= HLWPN_COUNT)
+		return FALSE;
+
+	w = &hl_wpn_info[id];
+
+	if (!hl_wpn_have[id])
+	{
+		hl_wpn_have[id] = TRUE;
+		hl_wpn_next[id] = 0.0;
+
+		//a fresh weapon arrives with a full clip out of m_iDefaultAmmo, and
+		//the rest of the default goes to the pool
+		if (w->max_clip == HLWPN_NOCLIP)
+			hl_wpn_clip[id] = 0;
+		else
+		{
+			hl_wpn_clip[id] = w->give;
+
+			if (hl_wpn_clip[id] > w->max_clip)
+				hl_wpn_clip[id] = w->max_clip;
+		}
+
+		took = TRUE;
+
+		if (w->give > hl_wpn_clip[id] && w->ammo != HLAMMO_NONE)
+			HLWeaponGiveAmmo(w->ammo, w->give - hl_wpn_clip[id]);
+
+		//empty handed until now: HL puts the first weapon you find in your
+		//hands rather than leaving you holding nothing
+		if (hl_wpn_active == HLWPN_NONE)
+			HLWeaponSetActive(id);
+	}
+	else if (w->ammo != HLAMMO_NONE && w->give > 0)
+	{
+		//already owned: the duplicate is worth its default ammo
+		took = HLWeaponGiveAmmo(w->ammo, w->give);
+	}
+
+	return took;
+}
+
+//--- gamerules --------------------------------------------------------------
+//
+// CHalfLifeRules, the single player set. Almost all of it is "no": no
+// respawning items, no team play, no weapon stay, no ammo scaling.
+//
+// CHalfLifeRules::PlayerSpawn does NOT hand out a weapon - the crowbar and
+// glock on spawn are the MULTIPLAYER rule. You start Half-Life empty handed
+// and that is deliberate.
+
+U0 HLWeaponPlayerSpawn()
+{//health 100, armour 0, nothing in hand
+	I64 i;
+
+	for (i = 0; i < HLWPN_COUNT; i++)
+	{
+		hl_wpn_have[i] = FALSE;
+		hl_wpn_clip[i] = 0;
+		hl_wpn_next[i] = 0.0;
+	}
+
+	for (i = 0; i < HLAMMO_COUNT; i++)
+		hl_wpn_ammo[i] = 0;
+
+	hl_wpn_active      = HLWPN_NONE;
+	hl_wpn_reloading   = HLWPN_NONE;
+	hl_wpn_reload_done = 0.0;
+	hl_wpn_sel_slot    = -1;
+	hl_wpn_picked      = 0;
+
+	hl_wpn_vm     = NULL;
+	hl_wpn_vm_for = HLWPN_NONE;
+
+	//health and armour are HLEntity.ZC's, and its reset already sets exactly
+	//the numbers CHalfLifeRules wants - 100 and 0. Calling it rather than
+	//assigning keeps one owner for those two fields.
+	HLEntPlayerReset;
+
+	//NOTE: inventory does not survive a changelevel. HL carries it across in
+	//the transition save, and there is no level transition state yet.
+}
+
+//--- pickups ----------------------------------------------------------------
+
+I64 HLWeaponAmmoForClass(U8 *classname, I64 *_count)
+{//ammo_* classname to (pool, rounds). AMMO_*_GIVE from weapons.h
+ //
+ //a chain rather than a table for the same reason HLEntModelForClass is one -
+ //see the note there
+	*_count = 0;
+
+	//AMMO_GLOCKCLIP_GIVE is GLOCK_MAX_CLIP
+	if (!StrICompare(classname, "ammo_9mmclip"))
+	{
+		*_count = 17;
+		return HLAMMO_9MM;
+	}
+
+	if (!StrICompare(classname, "ammo_glockclip"))
+	{
+		*_count = 17;
+		return HLAMMO_9MM;
+	}
+
+	//AMMO_CHAINBOX_GIVE - the big box, and ammo_mp5clip is an alias of the
+	//9mm clip in the SDK's LINK_ENTITY_TO_CLASS list
+	if (!StrICompare(classname, "ammo_9mmbox"))
+	{
+		*_count = 200;
+		return HLAMMO_9MM;
+	}
+
+	if (!StrICompare(classname, "ammo_9mmAR") ||
+		!StrICompare(classname, "ammo_mp5clip"))
+	{
+		*_count = 50;
+		return HLAMMO_9MM;
+	}
+
+	//AMMO_BUCKSHOTBOX_GIVE
+	if (!StrICompare(classname, "ammo_buckshot"))
+	{
+		*_count = 12;
+		return HLAMMO_BUCKSHOT;
+	}
+
+	//AMMO_357BOX_GIVE is PYTHON_MAX_CLIP
+	if (!StrICompare(classname, "ammo_357"))
+	{
+		*_count = 6;
+		return HLAMMO_357;
+	}
+
+	//AMMO_M203BOX_GIVE. nothing fires these yet - the M203 needs a grenade
+	//entity - but the pool exists so the pickup is not a silent no-op
+	if (!StrICompare(classname, "ammo_ARgrenades") ||
+		!StrICompare(classname, "ammo_mp5grenades"))
+	{
+		*_count = 2;
+		return HLAMMO_ARGRENADE;
+	}
+
+	return HLAMMO_NONE;
+}
+
+U0 HLWeaponPickups(CHLMap *map, F64 *player_org)
+{//CBasePlayerItem::Touch, driven from the player box rather than from the
+ //engine's touch list: weapon_* and ammo_* are not classes HLEntSpawnOne
+ //knows, so they are never linked as solid and HLEntTouchPlayer skips them
+	CHLEntity	*e;
+	F64			 pmins[3];
+	F64			 pmaxs[3];
+	F64			 imins[3];
+	F64			 imaxs[3];
+	I64			 i;
+	I64			 id;
+	I64			 type;
+	I64			 count = 0;
+	Bool		 took;
+
+	if (!hl_entities || !map || !player_org)
+		return;
+
+	for (i = 0; i < 3; i++)
+	{
+		pmins[i] = player_org[i] + hl_player_mins[i];
+		pmaxs[i] = player_org[i] + hl_player_maxs[i];
+	}
+
+	for (i = 0; i < hl_num_entities; i++)
+	{
+		e = &hl_entities[i];
+
+		if (!e->in_use || e->brush_model >= 0)
+			goto qwp_next;
+
+		//"weapon_" / "ammo_" prefix first, so the two StrICompare chains below
+		//are only walked for entities that could match at all
+		id   = -1;
+		type = HLAMMO_NONE;
+
+		if (!StrNICompare(e->classname, "weapon_", 7))
+			id = HLWeaponFindByClass(e->classname);
+		else if (!StrNICompare(e->classname, "ammo_", 5))
+			type = HLWeaponAmmoForClass(e->classname, &count);
+
+		if (id < 0 && type == HLAMMO_NONE)
+			goto qwp_next;
+
+		//UTIL_SetSize(-16,-16,0)..(16,16,16), rebuilt from the origin
+		imins[0] = e->origin[0] - HLWPN_ITEM_HALF;
+		imins[1] = e->origin[1] - HLWPN_ITEM_HALF;
+		imins[2] = e->origin[2];
+		imaxs[0] = e->origin[0] + HLWPN_ITEM_HALF;
+		imaxs[1] = e->origin[1] + HLWPN_ITEM_HALF;
+		imaxs[2] = e->origin[2] + HLWPN_ITEM_TOP;
+
+		if (pmaxs[0] < imins[0] || pmins[0] > imaxs[0])
+			goto qwp_next;
+		if (pmaxs[1] < imins[1] || pmins[1] > imaxs[1])
+			goto qwp_next;
+		if (pmaxs[2] < imins[2] || pmins[2] > imaxs[2])
+			goto qwp_next;
+
+		took = FALSE;
+
+		if (id >= 0)
+		{
+			took = HLWeaponGive(id);
+
+			if (took)
+				HLSndPlayAt("items/gunpickup2.wav", e->origin, 1.0,
+					HLENT_SND_ATTEN);
+		}
+		else
+		{
+			took = HLWeaponGiveAmmo(type, count);
+
+			if (took)
+				HLSndPlayAt("items/9mmclip1.wav", e->origin, 1.0,
+					HLENT_SND_ATTEN);
+		}
+
+		//a full pool leaves the box in the world for later, which is the SDK's
+		//behaviour and not an oversight
+		if (!took)
+			goto qwp_next;
+
+		hl_wpn_picked++;
+
+		//CHalfLifeRules::FlItemRespawnTime returns -1 in single player, so a
+		//taken item is gone for good. HLM_REMOVE is queued rather than done
+		//here because the entity list is being walked
+		HLEntQueueCall(i, HLM_REMOVE, hl_ent_player, HLUSE_TOGGLE, 0.0);
+
+		//the item's own target fires on pickup, the way a scripted pickup
+		//trigger expects
+		if (e->target[0])
+			HLEntUseTargets(i, hl_ent_player, HLUSE_TOGGLE, 0.0);
+
+qwp_next:
+	}
+
+	HLEntDrainCalls();
+}
+
+//--- firing -----------------------------------------------------------------
+
+U0 HLWeaponBulletImpact(CHLTrace *tr)
+{//the visible half of a bullet hit. no decals: HLDraw has no decal layer, and
+ //a puff plus a ricochet is what reads as "that surface was hit"
+	U8	*snd;
+	I64	 pick;
+
+	//the puff comes OFF the surface, so the plane normal is the direction
+	HLPartEffect(tr->end_pos, tr->plane_normal, 0, 8, tS);
+
+	//TE_GUNSHOTDECAL's ricochet, one of five
+	pick = HLPartRandI(5);
+
+	if (pick == 0)
+		snd = "weapons/ric1.wav";
+	else if (pick == 1)
+		snd = "weapons/ric2.wav";
+	else if (pick == 2)
+		snd = "weapons/ric3.wav";
+	else if (pick == 3)
+		snd = "weapons/ric4.wav";
+	else
+		snd = "weapons/ric5.wav";
+
+	HLSndPlayAt(snd, tr->end_pos, 0.8, HLENT_SND_ATTEN);
+}
+
+U0 HLWeaponFireBullets(CHLMap *map, F64 *src, F64 *forward, F64 *right,
+	F64 *up, I64 count, F64 spread, F64 damage, F64 range)
+{//FireBulletsPlayer. every shot is a hull trace with a zero-size box, and the
+ //spread is applied in the VIEW plane - the cone is around the aim vector, not
+ //around a world axis
+	CHLTrace	tr;
+	F64			 dir[3];
+	F64			 end[3];
+	F64			 zero[3];
+	F64			 x;
+	F64			 y;
+	I64			 i;
+	I64			 hit;
+
+	HLVecSet(zero, 0.0, 0.0, 0.0);
+
+	for (i = 0; i < count; i++)
+	{
+		//UTIL_SharedRandomFloat pairs, then dir = forward + x*spread*right +
+		//y*spread*up
+		x = 0.0;
+		y = 0.0;
+
+		if (spread > 0.0)
+		{
+			x = HLPartRand(1.0) * spread;
+			y = HLPartRand(1.0) * spread;
+		}
+
+		HLVecCopy(forward, dir);
+		HLVecMA(dir, x, right, dir);
+		HLVecMA(dir, y, up, dir);
+		HLVecNormalize(dir);
+
+		HLVecMA(src, range, dir, end);
+
+		HLTraceEntity(map, src, end, zero, zero, hl_move_pass, FALSE, &tr);
+
+		if (tr.fraction >= 1.0 || tr.all_solid)
+			goto qwfb_next;
+
+		//hl_trace_native_ent is the native entity the trace settled on, set by
+		//HLClipToNativeBrushes inside HLTraceEntity. -1 is the world
+		hit = hl_trace_native_ent;
+
+		if (hit >= 0)
+			HLEntTakeDamage(hit, hl_ent_player, damage);
+
+		HLWeaponBulletImpact(&tr);
+
+qwfb_next:
+	}
+}
+
+U0 HLWeaponMelee(CHLMap *map, F64 *src, F64 *forward, F64 damage, F64 range)
+{//CCrowbar::Swing. one TraceLine, and the sound says whether it connected
+	CHLTrace	tr;
+	F64			 end[3];
+	F64			 zero[3];
+	I64			 hit;
+
+	HLVecSet(zero, 0.0, 0.0, 0.0);
+	HLVecMA(src, range, forward, end);
+
+	HLTraceEntity(map, src, end, zero, zero, hl_move_pass, FALSE, &tr);
+
+	if (tr.fraction >= 1.0 || tr.all_solid)
+	{
+		HLSndPlayAt("weapons/cbar_miss1.wav", src, 1.0, HLENT_SND_ATTEN);
+		return;
+	}
+
+	hit = hl_trace_native_ent;
+
+	if (hit >= 0)
+		HLEntTakeDamage(hit, hl_ent_player, damage);
+
+	//cbar_hitbod* is the flesh variant. nothing here has flesh yet - monsters
+	//have no damage path - so every hit is the world hit
+	if (HLPartRandI(2) == 0)
+		HLSndPlayAt("weapons/cbar_hit1.wav", tr.end_pos, 1.0, HLENT_SND_ATTEN);
+	else
+		HLSndPlayAt("weapons/cbar_hit2.wav", tr.end_pos, 1.0, HLENT_SND_ATTEN);
+}
+
+U0 HLWeaponAttack(CHLMap *map, F64 *eye, F64 *forward, F64 *right, F64 *up,
+	Bool edge)
+{//CBasePlayerWeapon::ItemPostFrame's +attack branch. edge is TRUE only on the
+ //frame the trigger went down, which is all the empty click needs
+	CHLWeaponInfo	*w;
+	I64				 id = hl_wpn_active;
+
+	if (id < 0 || !map)
+		return;
+
+	//a reload in progress swallows the trigger
+	if (hl_wpn_reloading == id)
+		return;
+
+	if (hl_ent_time < hl_wpn_next[id])
+		return;
+
+	w = &hl_wpn_info[id];
+
+	if (!HLWeaponCanFire(id))
+	{
+		//PlayEmptySound. only on the trigger edge - the SDK gates it on
+		//m_fFireOnEmpty and a held trigger would otherwise machine gun the
+		//click
+		if (edge)
+			HLSndPlayAt("weapons/357_cock1.wav", eye, 0.8, 0.0);
+
+		hl_wpn_next[id] = hl_ent_time + 0.2;
+		return;
+	}
+
+	hl_wpn_next[id] = hl_ent_time + w->rate;
+
+	HLWeaponVmAnim(w->seq_fire, FALSE);
+
+	if (w->ammo == HLAMMO_NONE)
+	{
+		HLWeaponMelee(map, eye, forward, w->damage, w->range);
+		return;
+	}
+
+	//the round leaves the clip, or the pool for a clipless weapon
+	if (w->max_clip == HLWPN_NOCLIP)
+		hl_wpn_ammo[w->ammo]--;
+	else
+		hl_wpn_clip[id]--;
+
+	HLSndPlayAt(w->fire_snd, eye, 1.0, 0.0);
+
+	HLWeaponFireBullets(map, eye, forward, right, up, w->bullets, w->spread,
+		w->damage, w->range);
+}
+
+U0 HLWeaponStartReload()
+{//DefaultReload. bulk, not shell by shell - the shotgun's incremental reload
+ //needs animation events, which the studio layer does not decode yet
+	CHLWeaponInfo	*w;
+	I64				 id = hl_wpn_active;
+	I64				 room;
+	I64				 have;
+
+	if (id < 0 || hl_wpn_reloading == id)
+		return;
+
+	w = &hl_wpn_info[id];
+
+	if (w->ammo == HLAMMO_NONE || w->max_clip == HLWPN_NOCLIP)
+		return;
+
+	room = w->max_clip - hl_wpn_clip[id];
+	have = hl_wpn_ammo[w->ammo];
+
+	if (room <= 0 || have <= 0)
+		return;
+
+	hl_wpn_reloading   = id;
+	hl_wpn_reload_done = hl_ent_time + w->reload_time;
+
+	//the clip is not filled until the animation finishes, so a reload
+	//interrupted by a weapon switch loses nothing
+	HLWeaponVmAnim(w->seq_reload, FALSE);
+
+	hl_wpn_next[id] = hl_wpn_reload_done;
+}
+
+U0 HLWeaponFinishReload()
+{
+	CHLWeaponInfo	*w;
+	I64				 id = hl_wpn_reloading;
+	I64				 room;
+
+	hl_wpn_reloading = HLWPN_NONE;
+
+	if (id < 0)
+		return;
+
+	w = &hl_wpn_info[id];
+
+	room = w->max_clip - hl_wpn_clip[id];
+
+	if (room > hl_wpn_ammo[w->ammo])
+		room = hl_wpn_ammo[w->ammo];
+
+	if (room <= 0)
+		return;
+
+	hl_wpn_clip[id]      += room;
+	hl_wpn_ammo[w->ammo] -= room;
+}
+
+//--- switching --------------------------------------------------------------
+
+I64 HLWeaponInSlot(I64 slot, I64 pos)
+{//the weapon at a bucket position, -1 if nothing is defined there
+	I64 i;
+
+	for (i = 0; i < HLWPN_COUNT; i++)
+	{
+		if (hl_wpn_info[i].slot == slot && hl_wpn_info[i].pos == pos)
+			return i;
+	}
+
+	return -1;
+}
+
+U0 HLWeaponSelectSlot(I64 slot)
+{//SlotInput with hud_fastswitch 1: the key picks the next OWNED weapon in the
+ //bucket and switches straight to it, cycling on a repeat press
+ //
+ //the two-step version (open the bucket, confirm with +attack) is not here -
+ //it needs the trigger to mean "confirm" while the menu is up, and losing a
+ //shot to a mistimed number key is worse than losing the menu
+	I64 start = -1;
+	I64 pos;
+	I64 id;
+	I64 n;
+
+	if (slot < 0 || slot >= HLWPN_SLOTS)
+		return;
+
+	//show the bucket even if the press changes nothing, so an empty slot is
+	//visibly empty rather than silent
+	hl_wpn_sel_slot  = slot;
+	hl_wpn_sel_until = hl_ent_time + HLWPN_SEL_TIME;
+
+	if (hl_wpn_active >= 0 && hl_wpn_info[hl_wpn_active].slot == slot)
+		start = hl_wpn_info[hl_wpn_active].pos;
+
+	//HLWPN_COUNT is the modulus because no bucket can hold more entries than
+	//there are weapons - it is an upper bound on iPosition, not a slot count
+	for (n = 1; n <= HLWPN_COUNT; n++)
+	{
+		pos = (start + n) % HLWPN_COUNT;
+		id  = HLWeaponInSlot(slot, pos);
+
+		if (id >= 0 && hl_wpn_have[id] && id != hl_wpn_active)
+		{
+			HLWeaponSetActive(id);
+			return;
+		}
+	}
+}
+
+U0 HLWeaponCycle(I64 step)
+{//impulse 10 / 12 - next and previous, over the flat id order, skipping what
+ //is not owned
+	I64 n;
+	I64 id;
+
+	if (hl_wpn_active < 0)
+		id = 0;
+	else
+		id = hl_wpn_active;
+
+	for (n = 1; n <= HLWPN_COUNT; n++)
+	{
+		id = id + step;
+
+		//ZealC's % on a negative left operand is not the wrap we want
+		while (id < 0)
+			id += HLWPN_COUNT;
+
+		id = id % HLWPN_COUNT;
+
+		if (hl_wpn_have[id] && id != hl_wpn_active)
+		{
+			HLWeaponSetActive(id);
+
+			hl_wpn_sel_slot  = hl_wpn_info[id].slot;
+			hl_wpn_sel_until = hl_ent_time + HLWPN_SEL_TIME;
+			return;
+		}
+	}
+}
+
+//--- input ------------------------------------------------------------------
+
+U0 HLWeaponInput(CHLMap *map, F64 *eye, F64 *forward, F64 *right, F64 *up)
+{//keys and the mouse, all edge triggered except the trigger itself
+ //
+ //the number keys are read straight off the keyboard rather than through
+ //hl_bind_key: that table lives in HLMenu.ZC, which compiles after this file.
+ //the wheel is HL1.ZC's - it clears mouse_hard.raw_data every frame before
+ //this runs - so next/prev are on q and z instead
+	I64	 i;
+	Bool now;
+
+	for (i = 0; i < HLWPN_SLOTS; i++)
+	{
+		now = ToBool(Bt(kbd.down_bitmap, Char2ScanCode('1' + i)));
+
+		if (now && !hl_wpn_slot_held[i])
+			HLWeaponSelectSlot(i);
+
+		hl_wpn_slot_held[i] = now;
+	}
+
+	now = ToBool(Bt(kbd.down_bitmap, Char2ScanCode('q')));
+	if (now && !hl_wpn_next_held)
+		HLWeaponCycle(1);
+	hl_wpn_next_held = now;
+
+	now = ToBool(Bt(kbd.down_bitmap, Char2ScanCode('z')));
+	if (now && !hl_wpn_prev_held)
+		HLWeaponCycle(-1);
+	hl_wpn_prev_held = now;
+
+	now = ToBool(Bt(kbd.down_bitmap, Char2ScanCode('r')));
+	if (now && !hl_wpn_reload_held)
+		HLWeaponStartReload;
+	hl_wpn_reload_held = now;
+
+	//raw_bttns OR bttns, the same pair HL1.ZC uses: a PS/2 mouse sends nothing
+	//while a button is held still, so raw_bttns alone drops a held trigger
+	now = ToBool(mouse_hard.raw_bttns[0] || mouse_hard.bttns[0]);
+
+	//held IS fire for every automatic weapon in HL; the refire timer is what
+	//makes the semi-automatics semi-automatic
+	if (now)
+		HLWeaponAttack(map, eye, forward, right, up,
+			ToBool(!hl_wpn_attack_held));
+
+	hl_wpn_attack_held = now;
+}
+
+//--- the frame --------------------------------------------------------------
+
+U0 HLWeaponFrame(F64 dt, CHLMap *map = NULL, F64 *eye = NULL,
+	F64 *forward = NULL, F64 *right = NULL, F64 *up = NULL)
+{//one tick of weapon state: pickups, input, refire timers, reload, view model
+ //
+ //eye is the camera, not the feet - the pickup box is rebuilt from it using
+ //hl_view_ofs_z, the same offset the duck code moves the view by.
+ //
+ //the aim basis is passed in rather than derived from angles. HLVecToAngles is
+ //NOT the inverse of HLAngleVectors here - it returns pitch unnegated, on
+ //purpose, so the studio transform's own inversion comes out right - and
+ //round-tripping the view through it would mirror the aim vertically. the
+ //canvas already carries the basis HLDrawSetView built with HLAngleVectors.
+	CHLStSeq	*sq;
+	F64			 feet[3];
+	F64			 span;
+
+	if (dt < 0.0)
+		dt = 0.0;
+
+	if (dt > HLWPN_MAX_DT)
+		dt = HLWPN_MAX_DT;
+
+	if (hl_wpn_reloading >= 0 && hl_ent_time >= hl_wpn_reload_done)
+		HLWeaponFinishReload;
+
+	if (hl_wpn_sel_slot >= 0 && hl_ent_time >= hl_wpn_sel_until)
+		hl_wpn_sel_slot = -1;
+
+	if (map && eye && forward && right && up)
+	{
+		HLVecCopy(eye, feet);
+		feet[2] -= hl_view_ofs_z;
+
+		HLWeaponPickups(map, feet);
+		HLWeaponInput(map, eye, forward, right, up);
+	}
+
+	//--- view model animation ---
+	//
+	//StudioFrameAdvance: cycle is 0..1 over the sequence, so the step is
+	//dt*fps/numframes. a one-shot holds on its last frame and then falls back
+	//to the idle, which is what m_flTimeWeaponIdle does in the SDK
+	if (!hl_wpn_vm || hl_wpn_vm_seq < 0 || hl_wpn_vm_seq >= hl_wpn_vm->num_seqs)
+		return;
+
+	sq = &hl_wpn_vm->seqs[hl_wpn_vm_seq];
+
+	span = ToF64(sq->num_frames);
+
+	if (span < 2.0)
+		span = 2.0;
+
+	hl_wpn_vm_cycle += dt * sq->fps / (span - 1.0);
+
+	if (hl_wpn_vm_cycle < 1.0)
+		return;
+
+	if (hl_wpn_vm_loop)
+	{
+		//subtract rather than ToI64: ToI64 would be right here but a plain
+		//wrap needs no conversion at all and cannot be the one that bites
+		while (hl_wpn_vm_cycle >= 1.0)
+			hl_wpn_vm_cycle -= 1.0;
+
+		return;
+	}
+
+	hl_wpn_vm_cycle = 1.0;
+
+	if (hl_wpn_vm_done)
+		return;
+
+	hl_wpn_vm_done = TRUE;
+
+	if (hl_wpn_active >= 0)
+		HLWeaponVmAnim(hl_wpn_info[hl_wpn_active].seq_idle, TRUE);
+}
+
+I64 HLWeaponAmmo()
+{//rounds in the active weapon's clip, -1 when no weapon is held. the HUD
+ //reads this rather than reaching into the inventory
+	CHLWeaponInfo *w;
+
+	if (hl_wpn_active < 0)
+		return -1;
+
+	w = &hl_wpn_info[hl_wpn_active];
+
+	//a melee weapon has no readout at all - CHudAmmo hides the number rather
+	//than showing a zero
+	if (w->ammo == HLAMMO_NONE)
+		return -1;
+
+	if (w->max_clip == HLWPN_NOCLIP)
+		return hl_wpn_ammo[w->ammo];
+
+	return hl_wpn_clip[hl_wpn_active];
+}
+
+I64 HLWeaponReserve()
+{//what is left in the pool behind the clip, -1 when there is no pool
+	CHLWeaponInfo *w;
+
+	if (hl_wpn_active < 0)
+		return -1;
+
+	w = &hl_wpn_info[hl_wpn_active];
+
+	if (w->ammo == HLAMMO_NONE || w->max_clip == HLWPN_NOCLIP)
+		return -1;
+
+	return hl_wpn_ammo[w->ammo];
+}
+
+//--- drawing ----------------------------------------------------------------
+
+U0 HLWeaponDrawViewModel(CHLCanvas *c)
+{//the first-person weapon
+ //
+ //GoldSrc draws the view model as an ordinary studio entity sitting AT the
+ //refdef view origin with the view angles - v_*.mdl geometry is authored
+ //already offset from that origin - so this is the normal transform, not a
+ //screen-locked special case like HLMdlDrawView.
+ //
+ //It does mean the gun is depth tested against the world and pokes through a
+ //wall you stand against. The real engine solves that with a separate depth
+ //range for the view model; there is one 1/z buffer here, so it does not.
+	F64 ang[3];
+
+	if (!c || !hl_wpn_vm || hl_wpn_active < 0)
+		return;
+
+	//HLVecToAngles then the studio transform is the pair this tree already
+	//uses to point a model along a direction vector: vectoangles leaves pitch
+	//unnegated and HLStudioDraw inverts it, so the two compose. See the note in
+	//HLVecToAngles - negating here as well is the bug it warns about.
+	HLVecToAngles(c->forward, ang);
+
+	HLStudioDraw(c, hl_wpn_vm, c->origin, ang, hl_wpn_vm_seq, hl_wpn_vm_cycle,
+		0.0, 0, 0, HLWPN_VM_LIGHT);
+}
+
+I64 HLWeaponXhairUnit()
+{//the crosshairs sheet is a grid of square cells, one resolution per sheet
+	if (hl_hud_res >= 2560)
+		return 72;
+
+	if (hl_hud_res >= 1280)
+		return 48;
+
+	//320 and 640 share sprites/crosshairs.spr at 24 - see any weapon_*.txt
+	return 24;
+}
+
+U0 HLWeaponDrawCrosshair(CHLCanvas *c)
+{//the aiming reticle
+ //
+ //hud.txt has no crosshair: "cross" is the HEALTH cross that sits next to the
+ //number. every weapon names its own reticle in sprites/weapon_<name>.txt as
+ //a cell of the shared crosshairs sheet, and the cells are what the table
+ //above stores. The crowbar has no crosshair row at all, and correctly shows
+ //nothing.
+	CHLWeaponInfo	*w;
+	U8				*sheet;
+	I64				 unit;
+	I64				 x;
+	I64				 y;
+
+	if (!c || hl_wpn_active < 0)
+		return;
+
+	w = &hl_wpn_info[hl_wpn_active];
+
+	if (w->xhair_col < 0 || w->xhair_row < 0)
+		return;
+
+	//loaded once, and again after a resolution change swaps the row set
+	if (hl_wpn_xhair_sheet < 0 || hl_wpn_xhair_res != hl_hud_res)
+	{
+		if (hl_hud_res >= 2560)
+			sheet = "2560crosshairs";
+		else if (hl_hud_res >= 1280)
+			sheet = "1280crosshairs";
+		else
+			sheet = "crosshairs";
+
+		hl_wpn_xhair_sheet = HLHudSheet(sheet);
+		hl_wpn_xhair_res   = hl_hud_res;
+	}
+
+	if (hl_wpn_xhair_sheet < 0)
+		return;
+
+	unit = HLWeaponXhairUnit;
+
+	//centred on the VIEW centre, not the canvas centre: the status bar shifts
+	//the view rect up and the crosshair has to follow it
+	x = ToI64(c->center_x) - unit / 2;
+	y = ToI64(c->center_y) - unit / 2;
+
+	HLSprDrawRect(c, hl_hud_sheet[hl_wpn_xhair_sheet], 0, x, y,
+		w->xhair_col * unit, w->xhair_row * unit, unit, unit,
+		HLHUD_R, HLHUD_G, HLHUD_B);
+}
+
+U0 HLWeaponDrawSelection(CHLCanvas *c)
+{//CHudAmmo's weapon menu: the bucket row, and the open bucket's contents
+ //
+ //hud.txt ships bucket0..bucket5 but the SDK only has MAX_WEAPON_SLOTS (5)
+ //buckets, so bucket5 goes unused here.
+ //
+ //The weapon glyph is hud.txt's "d_<name>" death-notice icon rather than the
+ //"weapon"/"weapon_s" art, which lives in sprites/weapon_<name>.txt. At 2560
+ //those are one .spr file per weapon per state and the sheet table would not
+ //hold them; the d_ icons are the same shape and already loaded.
+	U8	name[HLHUD_NAME_MAX];
+	I64	bucket[HLWPN_SLOTS];
+	I64	sel;
+	I64	idx;
+	I64	x0;
+	I64	y0;
+	I64	bw = 20;
+	I64	bh = 20;
+	I64	sel_w = 0;
+	I64	sel_h = 0;
+	I64	step;
+	I64	gap;
+	I64	slot;
+	I64	pos;
+	I64	id;
+	I64	x;
+	I64	y;
+	I64	row;
+	I64	r, g, b;
+
+	if (!c || hl_wpn_sel_slot < 0)
+		return;
+
+	for (slot = 0; slot < HLWPN_SLOTS; slot++)
+	{
+		StrPrint(name, "bucket%d", slot);
+		bucket[slot] = HLHudFind(name);
+	}
+
+	if (bucket[0] >= 0)
+	{
+		bw = hl_hud_entry[bucket[0]].w;
+		bh = hl_hud_entry[bucket[0]].h;
+	}
+
+	sel = HLHudFind("selection");
+
+	if (sel >= 0)
+	{
+		sel_w = hl_hud_entry[sel].w;
+		sel_h = hl_hud_entry[sel].h;
+	}
+
+	gap = bh / 4;
+	if (gap < 2)
+		gap = 2;
+
+	//the selection panel is the WIDE weapon box - 170x45 against a 20x20 bucket
+	//at 640 - so the row pitch is its height, not the bucket's, or the panels
+	//stack on top of each other
+	step = sel_h + gap;
+	if (step < bh + gap)
+		step = bh + gap;
+
+	x0 = bh;
+	y0 = bh;
+
+	//--- the bucket row ---
+	for (slot = 0; slot < HLWPN_SLOTS; slot++)
+	{
+		x = x0 + slot * (bw + gap);
+
+		//the open bucket is lit, the rest are dimmed - the SDK does this with
+		//two alpha levels on the same sprite
+		if (slot == hl_wpn_sel_slot)
+		{
+			r = HLHUD_R;
+			g = HLHUD_G;
+			b = HLHUD_B;
+		}
+		else
+		{
+			r = 96;
+			g = 64;
+			b = 0;
+		}
+
+		if (bucket[slot] >= 0)
+			HLHudDrawElement(c, bucket[slot], x, y0, r, g, b);
+	}
+
+	//--- the open bucket ---
+	x   = x0 + hl_wpn_sel_slot * (bw + gap);
+	row = 0;
+
+	for (pos = 0; pos < HLWPN_COUNT; pos++)
+	{
+		id = HLWeaponInSlot(hl_wpn_sel_slot, pos);
+
+		if (id < 0 || !hl_wpn_have[id])
+			goto qwds_next;
+
+		y = y0 + bh + gap + row * step;
+
+		//held weapon bright, owned-but-dry dimmed. HL greys a weapon with no
+		//ammo so the menu tells you not to switch to it
+		if (id == hl_wpn_active)
+		{
+			r = HLHUD_R;
+			g = HLHUD_G;
+			b = HLHUD_B;
+		}
+		else if (HLWeaponCanFire(id) || HLWeaponPool(id) > 0)
+		{
+			r = 160;
+			g = 100;
+			b = 0;
+		}
+		else
+		{
+			r = 80;
+			g = 80;
+			b = 80;
+		}
+
+		if (sel >= 0)
+			HLHudDrawElement(c, sel, x, y, r / 3, g / 3, b / 3);
+
+		StrPrint(name, "d_%s", hl_wpn_info[id].hud_name);
+		idx = HLHudFind(name);
+
+		if (idx >= 0)
+		{
+			//centred in the panel when there is one, otherwise just inset
+			if (sel_w > hl_hud_entry[idx].w)
+				HLHudDrawElement(c, idx,
+					x + (sel_w - hl_hud_entry[idx].w) / 2,
+					y + (sel_h - hl_hud_entry[idx].h) / 2, r, g, b);
+			else
+				HLHudDrawElement(c, idx, x + gap, y + gap, r, g, b);
+		}
+
+		row++;
+
+qwds_next:
+	}
+}
+
+U0 HLWeaponHudHook(CHLCanvas *c)
+{//installed into hl_hud_weapon_hook, so HLHudDraw calls this once per frame -
+ //see the header. tick first, then draw, so the numbers the HUD prints below
+ //are this frame's and not last frame's
+	F64 dt;
+
+	if (!c)
+		return;
+
+	//no world, no weapons. HL1.ZC draws the HUD on the no-world path too, and a
+	//trace into a half-loaded map is a fault, so this needs a spawned entity
+	//list as well as a map. the NULL test comes first on purpose: HLMapValid
+	//logs, and burning its eight-report budget every frame at the menu would
+	//hide the corruption it exists to catch
+	if (!hl_map || !hl_entities || hl_num_entities <= 0)
+		return;
+
+	if (!HLMapValid(hl_map, "HLWeaponHudHook"))
+		return;
+
+	//HLEntSpawnAll zeroes the entity clock on every map load, so a clock that
+	//went BACKWARDS is a new level and the inventory is reset
+	if (!hl_wpn_spawned || hl_ent_time < hl_wpn_last_time)
+	{
+		HLWeaponPlayerSpawn;
+		hl_wpn_spawned   = TRUE;
+		hl_wpn_last_time = hl_ent_time;
+		return;
+	}
+
+	dt = hl_ent_time - hl_wpn_last_time;
+	hl_wpn_last_time = hl_ent_time;
+
+	//the canvas basis IS the aim basis - HLDrawSetView built it with
+	//HLAngleVectors off the same view angles the player is holding
+	HLWeaponFrame(dt, hl_map, c->origin, c->forward, c->right, c->up);
+
+	//the gun under the reticle, both under whatever HLHudDraw prints next
+	HLWeaponDrawViewModel(c);
+	HLWeaponDrawCrosshair(c);
+	HLWeaponDrawSelection(c);
+
+	//the HUD's own mirror of the ammo counts. HLHud.ZC compiles first and
+	//cannot call anything here, so the numbers are pushed to it
+	hl_hud_ammo    = HLWeaponAmmo;
+	hl_hud_reserve = HLWeaponReserve;
+}
+
+//top-level: the hook is the only thing that makes any of the above run, and
+//HLHudInit (which clears it) has already run by the time this file compiles
+hl_hud_weapon_hook = &HLWeaponHudHook;
+
+U0 HLWeaponReport()
+{//what is in the inventory, for the console and HLTest
+	I64 i;
+
+	"HLWeapon: active %d, %d pickups this level\n", hl_wpn_active,
+		hl_wpn_picked;
+
+	for (i = 0; i < HLWPN_COUNT; i++)
+	{
+		if (!hl_wpn_have[i])
+			goto qwr_next;
+
+		"  %s clip %d\n", hl_wpn_info[i].classname, hl_wpn_clip[i];
+
+qwr_next:
+	}
+
+	"  9mm %d  357 %d  buckshot %d  ARgrenade %d\n",
+		hl_wpn_ammo[HLAMMO_9MM], hl_wpn_ammo[HLAMMO_357],
+		hl_wpn_ammo[HLAMMO_BUCKSHOT], hl_wpn_ammo[HLAMMO_ARGRENADE];
+}

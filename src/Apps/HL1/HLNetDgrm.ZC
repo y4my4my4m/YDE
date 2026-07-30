@@ -843,3 +843,216 @@ I64 HLNetDgrmRecv(CHLMsg *out, U32 *from_ip)
 	ret = HLNetDgrmProcess(s, buf, got, out);
 	return ret;
 }
+
+//============================================================================
+// PROTOCOL 48: netchan fragment buffers
+//============================================================================
+//
+// protocol 15 (everything above this line) splits a reliable message into
+// MAX_DATAGRAM chunks and sends them STOP AND WAIT: chunk, ACK, chunk, ACK,
+// EOM. one message in flight, one stream, and the sequence number is the whole
+// of the state. it works and it is slow - a 30kB signon at 60ms RTT takes over
+// a second of pure waiting.
+//
+// protocol 48 does not work that way. one netchan carries SEVERAL INDEPENDENT
+// STREAMS, each fragmented on its own:
+//
+//   FRAG_NORMAL_STREAM  ordinary reliable game data
+//   FRAG_FILE_STREAM    an in-band file transfer (a custom decal, a map)
+//
+// so a 2MB map download does not stall the signon behind it - the two streams
+// interleave in the same packets and reassemble separately. that is the reason
+// for the split, and it is why a fragment carries a stream index at all.
+//
+// the header, per packet:
+//
+//   long sequence      bit 31 = this packet is reliable
+//                      bit 30 = it carries fragments
+//   long sequence_ack  bit 31 = acknowledging their reliable
+//                      bit 30 = acknowledging their fragments
+//   then, if the fragment bit is set, for EACH stream that has a fragment here:
+//     long  fragid    (id in the high 16 bits, fragment count in the low 16)
+//     short offset    into the reassembled message
+//     short size
+//
+// WHAT IS IMPLEMENTED HERE: the reassembly buffers and the fragid split. that
+// part is self contained and testable without a peer.
+//
+// WHAT IS NOT: the header itself is not parsed and none of this is wired into
+// HLNetDgrmRecv, which still speaks NETFLAG_* above. two reasons, in order:
+// the exact placement of the per-stream present bits in the sequence word is
+// the one field of the netchan header I could not confirm, and the NETFLAG
+// transport underneath is known-working against Ironwail. swapping it out
+// blind would break a working link to gain an unverified one. the transport
+// port is a separate job from the protocol port.
+
+#define HLNET48_MAX_STREAMS		2
+#define HLFRAG_NORMAL_STREAM	0
+#define HLFRAG_FILE_STREAM		1
+
+//connectionless and split-packet markers, read as a little-endian long in the
+//first four bytes. an ordinary netchan packet has neither - its first long is a
+//sequence number, and sequence numbers never reach 0xFFFFFFFE
+#define HLNET48_FLAG_QUERY			0xFFFFFFFF
+#define HLNET48_FLAG_SPLITPACKET	0xFFFFFFFE
+
+//bit 31/30 of the sequence and ack words
+#define HLNET48_SEQ_RELIABLE	0x80000000
+#define HLNET48_SEQ_FRAGMENT	0x40000000
+#define HLNET48_SEQ_MASK		0x3FFFFFFF
+
+I64 HLFragId(U32 fragid)
+{//FRAG_GETID - which multi-fragment message this belongs to
+	return (fragid >> 16) & 0xFFFF;
+}
+
+I64 HLFragCount(U32 fragid)
+{//FRAG_GETCOUNT - how many fragments the whole message is in
+	return fragid & 0xFFFF;
+}
+
+U32 HLFragMakeId(I64 id, I64 count)
+{
+	return ((id & 0xFFFF) << 16) | (count & 0xFFFF);
+}
+
+class CHLFragBuf
+{
+	Bool	active;			//a message is part-assembled here
+	I64		id;				//which message, from FRAG_GETID
+	I64		total;			//fragments expected, from FRAG_GETCOUNT
+	I64		got;			//fragments copied in
+	I64		len;			//highest offset+size seen, the assembled length
+	U8		data[HLNET_MAX_MSG];
+	//one bit per fragment received, so a duplicate is not counted twice - a
+	//resent fragment is normal and counting it would complete the message early
+	U8		seen[64];		//512 fragments, well past what MAX_MSG can need
+};
+
+//one reassembly slot per stream per peer. the client has one netchan, the
+//server one per slot - same shape as hl_net_socks above.
+CHLFragBuf	hl_frag_sv[HLSV_MAX_CLIENTS * HLNET48_MAX_STREAMS];
+CHLFragBuf	hl_frag_cl[HLNET48_MAX_STREAMS];
+
+U0 HLFragBufClear(CHLFragBuf *b)
+{
+	if (!b)
+		return;
+
+	b->active = FALSE;
+	b->id     = 0;
+	b->total  = 0;
+	b->got    = 0;
+	b->len    = 0;
+	MemSet(b->seen, 0, 64);
+}
+
+U0 HLFragInit()
+{//globals aren't zeroed, and a stale .active makes the first real fragment look
+ //like the continuation of a message from the last map
+	I64 i;
+
+	for (i = 0; i < HLSV_MAX_CLIENTS * HLNET48_MAX_STREAMS; i++)
+		HLFragBufClear(&hl_frag_sv[i]);
+
+	for (i = 0; i < HLNET48_MAX_STREAMS; i++)
+		HLFragBufClear(&hl_frag_cl[i]);
+}
+
+HLFragInit;
+
+CHLFragBuf *HLFragBufFor(I64 slot, I64 stream)
+{//slot HLNET_CLIENT_SLOT is the guest's own netchan
+	if (stream < 0 || stream >= HLNET48_MAX_STREAMS)
+		return NULL;
+
+	if (slot == HLNET_CLIENT_SLOT)
+		return &hl_frag_cl[stream];
+
+	if (slot < 0 || slot >= HLSV_MAX_CLIENTS)
+		return NULL;
+
+	return &hl_frag_sv[slot * HLNET48_MAX_STREAMS + stream];
+}
+
+I64 HLFragAdd(I64 slot, I64 stream, U32 fragid, I64 offset, U8 *data, I64 size)
+{//copy one fragment in. returns the assembled length once every fragment has
+ //arrived, 0 while incomplete, -1 on a fragment that cannot belong here.
+ //
+ //offset is into the REASSEMBLED message and is carried explicitly rather than
+ //derived from the fragment number, so fragments may arrive in any order and a
+ //resend costs nothing.
+	CHLFragBuf	*b;
+	I64			 id;
+	I64			 total;
+	I64			 num;
+
+	b = HLFragBufFor(slot, stream);
+	if (!b || !data || size < 1 || offset < 0)
+		return -1;
+
+	id    = HLFragId(fragid);
+	total = HLFragCount(fragid);
+
+	if (total < 1 || total > 512)
+		return -1;
+
+	if (offset + size > HLNET_MAX_MSG)
+		return -1;
+
+	//a different id means the previous message was abandoned - a peer that gave
+	//up mid-transfer, or a map change. start over rather than blending the two
+	if (!b->active || b->id != id)
+	{
+		HLFragBufClear(b);
+		b->active = TRUE;
+		b->id     = id;
+		b->total  = total;
+	}
+
+	if (b->total != total)
+		return -1;
+
+	//WHICH fragment this is, for the duplicate test. the header does not say -
+	//only the byte offset - so it is derived, and that is only sound while every
+	//fragment but the last is the same size, which is how the sender builds them
+	num = 0;
+	if (size > 0)
+		num = offset / size;
+
+	if (num < 0 || num >= 512)
+		return -1;
+
+	MemCopy(b->data + offset, data, size);
+
+	if (offset + size > b->len)
+		b->len = offset + size;
+
+	if (!(b->seen[num >> 3] & (1 << (num & 7))))
+	{
+		b->seen[num >> 3] = b->seen[num >> 3] | (1 << (num & 7));
+		b->got++;
+	}
+
+	if (b->got < b->total)
+		return 0;
+
+	return b->len;
+}
+
+Bool HLFragTake(I64 slot, I64 stream, CHLMsg *out)
+{//move a completed reassembly into a message buffer and free the slot
+	CHLFragBuf *b;
+
+	b = HLFragBufFor(slot, stream);
+	if (!b || !out || !b->active || b->got < b->total || b->len < 1)
+		return FALSE;
+
+	HLMsgClear(out);
+	MemCopy(out->data, b->data, b->len);
+	out->len = b->len;
+
+	HLFragBufClear(b);
+
+	return TRUE;
+}

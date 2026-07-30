@@ -47,6 +47,21 @@ Working, inherited from the Quake port and re-pointed at HL formats:
   auto-hop, and a full duck state machine that swaps to hull 3. Duck is bound
   to `c` by default.
 
+- **HUD** — `HLHud.ZC`, driven by `sprites/hud.txt` (one row per element per
+  resolution; the largest set that fits the canvas wins). Health, suit charge
+  and ammo. HL HUD sheets are SPR v2 with texFormat ADDITIVE, so they blend
+  rather than draw opaque - drawn opaque every number gets a black box.
+- **Console/HUD font** — HL's `gfx.wad` stores `CONCHARS` as a WAD3 `qfont_t`
+  with variable-width glyphs, not Quake's fixed 8x8 atlas. Decoded, with a
+  fallback to the kernel font when a Quake-format `gfx.wad` or none is present.
+- **Damage** — `HLEntTakeDamage`, HL's armour ratio (the suit soaks 80% at two
+  points of charge per point absorbed), `func_breakable`, `trigger_hurt`
+  (metered per half second, negative `dmg` heals), `trigger_push`,
+  `trigger_teleport`.
+- **Scripted sequences and speech** — `HLAI.ZC`. `sentences.txt` parsed and
+  played word by word, timed off each sample's real duration.
+  `scripted_sequence` places its actor and runs a named sequence, then fires
+  its target. Per-entity animation state, so a one-shot holds its last frame.
 - **Sound** — door and button sound tables (HL stores these as integers the
   game code resolves, not as paths), `ambient_generic` loops, and the
   `movesnd`/`stopsnd`/`sounds`/`volume` keys.
@@ -63,18 +78,50 @@ chrome skins, attachments, four-way blends, and per-vertex lighting from the
 model normals — everything is currently flat-lit from `HLLightPoint` at the
 entity origin.
 
-Not done yet, in the order they are being done:
+Also in, from this pass:
 
-1. The rest of the brush entities. `func_plat` and `func_tracktrain` are in;
-   rotating brushes need `HLDrawBrushModel` to take angles first, and nothing
-   rotates until it does. Then momentary doors, breakables, and the damage
-   system they need, plus blocked/crush handling on pushers.
-2. SPR v2 sprites (per-sprite palette, render modes).
-   Console and HUD text needs HL's `qfont_t` decoded out of `gfx.wad` -
-   until then text falls back to the kernel 8x8 font and looks chunky.
-3. Weapons, gamerules, HUD.
-4. Monster AI: schedules, tasks, `scripted_sequence`, sentences.
-5. Protocol 48 netcode. **Last** — single player runs in-process without it.
+- **Weapons and inventory** — `HLWeapon.ZC`. One table rather than the SDK's
+  per-weapon classes, because every weapon in scope is hitscan and differs
+  only in numbers. Ammo pools with carry caps, pickup, bucket switching,
+  reload, first-person view model, hitscan with the real `VECTOR_CONE_*`
+  tangents and `gSkillData` values. Damage goes through `HLEntTakeDamage`, so
+  shooting a breakable breaks it.
+- **Ladders, water and falling** — `PM_Ladder` plane decomposition,
+  `PM_WaterMove` (HL's, not Quake's), `PM_CheckWaterJump`, `PM_CheckFalling`
+  damage and sound tiers, conveyor base velocity.
+- **Protocol 48** — delta compression complete and driven by `valve/delta.lst`
+  (all seven tables), the real opcode table, resource lists, user messages.
+
+## Deliberately NOT done, with the reason
+
+Each of these was considered and left out on purpose. None is an oversight.
+
+- **Combat AI.** Real HL monsters run schedules of tasks over a node graph with
+  relationship tables. Faking it gives monsters that twitch convincingly and
+  behave senselessly — worse than idle animation, and harder to replace later
+  than to write properly.
+- **`m_fMoveTo` WALK/RUN** places the actor at the mark instead of pathing to
+  it, because pathing needs that node graph. It arrives in the right place
+  without the walk cycle, which at least lets the script complete and release
+  whatever it was gating.
+- **Rotating brushes** need `HLDrawBrushModel` to take angles *and*
+  `HLTraceHull` to trace a rotated hull. Neither exists. A brush that renders
+  unrotated while colliding rotated is worse than one that does not move.
+- **`svc_packetentities`.** The field encoding is finished; the frame header
+  around it is not. The entity-number encoding is one bit wide in places and
+  off by one bit every entity decodes as garbage at a plausible-looking
+  origin — which is much harder to notice than nothing decoding at all.
+- **Fragment buffers** are structured but not wired: the per-stream present
+  bits in the sequence word could not be confirmed, and the NETFLAG transport
+  underneath is known to work.
+- **The protocol 48 write side** exists but is never called. Flipping the
+  server is one atomic change — writer, reader and baseline capture together —
+  and half of it is worse than none.
+- **Studio gaps**: sequence groups (`<name>NN.mdl`), chrome skins, attachments,
+  four-way blends, per-vertex lighting from model normals. Everything is
+  flat-lit from `HLLightPoint` at the entity origin.
+- **Per-surface friction** — the `hl_surface_friction` hook is exposed;
+  filling it needs `materials.txt`.
 
 `HLProgs.ZC`/`HLBuiltin.ZC` are the QuakeC VM carried over by the fork. They
 are dead weight now and will be deleted once nothing calls them.

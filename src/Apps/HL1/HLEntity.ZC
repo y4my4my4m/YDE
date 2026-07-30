@@ -61,6 +61,14 @@
 #define HLM_LIGHT_USE		50
 #define HLM_WALL_USE			51
 
+#define HLM_SCRIPT_USE		59	//handled in HLAI.ZC - see HLScriptUse
+
+#define HLM_BREAK_USE		60	//damaged into breaking by a use, not a hit
+#define HLM_BREAK_DIE		61	//health reached zero
+#define HLM_HURT_TOUCH		62
+#define HLM_PUSH_TOUCH		63
+#define HLM_TELEPORT_TOUCH	64
+
 //how long a "toggle" trigger stays untouchable after firing
 #define HLENT_TRIGGER_DEBOUNCE	0.2
 
@@ -102,6 +110,80 @@ I64	hl_ent_spawned  = 0;
 //the player, as an entity the movers can push and triggers can fire on.
 //index -1 until a map is up
 I64	hl_ent_player   = -1;
+
+//--- player state, native side ---------------------------------------------
+//
+// With a VM the player is an edict and HLPlayer.ZC reads its fields. Without
+// one there is no edict, so the small amount of player state the entity world
+// actually touches lives here.
+//
+// Effects a trigger wants to apply to the player are PENDING rather than
+// applied: the trigger runs inside the entity pass, and the shell owns
+// hl_origin and hl_velocity. Writing them from here would fight the move that
+// is already in progress this tick.
+
+F64		hl_ent_player_health	= 100.0;
+F64		hl_ent_player_armor		= 0.0;
+Bool	hl_ent_player_dead		= FALSE;
+
+F64		hl_ent_teleport_to[3];
+Bool	hl_ent_teleport_pending	= FALSE;
+
+F64		hl_ent_push_vel[3];
+Bool	hl_ent_push_pending		= FALSE;
+
+//damage the player has taken this tick, applied and cleared by the shell
+F64		hl_ent_player_damage	= 0.0;
+
+U0 HLEntPlayerReset()
+{//globals aren't zeroed and a declaration initialiser on one is unreliable
+	hl_ent_player_health   = 100.0;
+	hl_ent_player_armor    = 0.0;
+	hl_ent_player_dead     = FALSE;
+	hl_ent_player_damage   = 0.0;
+	hl_ent_teleport_pending = FALSE;
+	hl_ent_push_pending    = FALSE;
+
+	HLVecSet(hl_ent_teleport_to, 0.0, 0.0, 0.0);
+	HLVecSet(hl_ent_push_vel, 0.0, 0.0, 0.0);
+}
+
+HLEntPlayerReset;
+
+U0 HLEntHurtPlayer(F64 damage)
+{//ArmorRatio: the suit soaks 80% of incoming damage while charge remains,
+ //at 2 points of charge per point absorbed
+	F64 absorbed;
+	F64 to_armor;
+
+	if (damage <= 0.0 || hl_ent_player_dead)
+		return;
+
+	if (hl_ent_player_armor > 0.0)
+	{
+		absorbed = damage * 0.8;
+		to_armor = absorbed * 0.5;
+
+		if (to_armor > hl_ent_player_armor)
+		{
+			//the suit runs out partway through, so only part is soaked
+			to_armor = hl_ent_player_armor;
+			absorbed = to_armor * 2.0;
+		}
+
+		hl_ent_player_armor -= to_armor;
+		damage -= absorbed;
+	}
+
+	hl_ent_player_damage += damage;
+	hl_ent_player_health -= damage;
+
+	if (hl_ent_player_health <= 0.0)
+	{
+		hl_ent_player_health = 0.0;
+		hl_ent_player_dead   = TRUE;
+	}
+}
 
 //--- helpers ----------------------------------------------------------------
 
@@ -975,6 +1057,142 @@ U0 HLLightUse(I64 self, I64 use_type)
 	}
 }
 
+//--- damage -----------------------------------------------------------------
+//
+// CBaseEntity::TakeDamage, reduced to what the brush entities need. Monsters
+// and the player go through their own paths.
+
+#define HLDMG_TAKE_NO		0
+#define HLDMG_TAKE_YES		1
+#define HLDMG_TAKE_AIM		2	//only a direct hit, not splash
+
+U0 HLEntTakeDamage(I64 self, I64 attacker, F64 damage)
+{//health down, and the Killed path once it runs out
+	CHLEntity *e = HLEntGet(self);
+
+	if (!e || damage <= 0.0)
+		return;
+
+	if (e->takedamage == HLDMG_TAKE_NO)
+		return;
+
+	e->health -= damage;
+
+	if (e->health > 0.0)
+		return;
+
+	//dead. the break is queued rather than run here so a chain of breakables
+	//taking splash damage cannot recurse
+	e->health    = 0.0;
+	e->activator = attacker;
+
+	HLEntQueueCall(self, HLM_BREAK_DIE, attacker, HLUSE_TOGGLE, 0.0);
+}
+
+U0 HLBreakableDie(I64 self)
+{//CBreakable::Die - fire the target, then stop existing
+ //
+ //no gibs and no material sound yet: both need the model/sound tables keyed
+ //off the "material" key, and neither changes whether the brush is gone
+	CHLEntity *e = HLEntGet(self);
+
+	if (!e)
+		return;
+
+	HLEntSound(e, HLEntDoorStopSound(e->stop_snd), HLENT_CHAN_MOVE);
+
+	HLEntUseTargets(self, e->activator, HLUSE_TOGGLE, 0.0);
+
+	e->in_use     = FALSE;
+	e->solid      = HLSOLID_NOT;
+	e->think_fn   = HLM_NONE;
+	e->next_think = 0.0;
+}
+
+//--- trigger effects --------------------------------------------------------
+//
+// These all spawned and fired their targets already; what was missing is the
+// effect on whatever touched them.
+
+U0 HLHurtTouch(I64 self, I64 other)
+{//trigger_hurt. dmg is per HALF SECOND in HL, not per touch - the trigger
+ //re-touches every frame the player stands in it, so the rate has to be
+ //metered or it kills instantly
+	CHLEntity *e = HLEntGet(self);
+
+	if (!e)
+		return;
+
+	if (!HLEntMasterAllows(e))
+		return;
+
+	if (e->pain_finished > hl_ent_time)
+		return;
+
+	e->pain_finished = hl_ent_time + 0.5;
+
+	//a negative dmg heals, which is how the healing pools are built
+	if (e->dmg < 0.0)
+	{
+		hl_ent_player_health -= e->dmg;
+
+		if (hl_ent_player_health > 100.0)
+			hl_ent_player_health = 100.0;
+	}
+	else
+		HLEntHurtPlayer(e->dmg);
+
+	HLEntUseTargets(self, other, HLUSE_TOGGLE, 0.0);
+}
+
+U0 HLPushTouch(I64 self)
+{//trigger_push. speed along the movedir, added to the toucher's velocity
+ //rather than replacing it, so a conveyor and a jump compose
+	CHLEntity *e = HLEntGet(self);
+	F64		   speed;
+	I64		   i;
+
+	if (!e)
+		return;
+
+	speed = e->speed;
+	if (speed == 0.0)
+		speed = 100.0;
+
+	for (i = 0; i < 3; i++)
+		hl_ent_push_vel[i] = e->move_dir[i] * speed;
+
+	hl_ent_push_pending = TRUE;
+}
+
+U0 HLTeleportTouch(I64 self)
+{//trigger_teleport. the destination is an info_teleport_destination named by
+ //the trigger's target, so this consumes the target rather than firing it
+	CHLEntity	*e = HLEntGet(self);
+	CHLEntity	*dst;
+	I64			 t;
+
+	if (!e)
+		return;
+
+	if (!HLEntMasterAllows(e))
+		return;
+
+	t = HLEntFindByTargetname(e->target, 0);
+	if (t < 0)
+		return;
+
+	dst = &hl_entities[t];
+
+	HLVecCopy(dst->origin, hl_ent_teleport_to);
+
+	//HL drops the player to the destination's feet plus one unit of clearance
+	hl_ent_teleport_to[2] -= HLPHYS_MINS_Z;
+	hl_ent_teleport_to[2] += 1.0;
+
+	hl_ent_teleport_pending = TRUE;
+}
+
 //--- the dispatcher ---------------------------------------------------------
 //
 // what a virtual call would be. defined last so every implementation above is
@@ -1052,6 +1270,31 @@ U0 HLEntCallMethod(I64 self, I64 method, I64 activator = -1,
 		case HLM_MULTI_MANAGER_TICK: HLMMTick(self);				break;
 
 		case HLM_LIGHT_USE:			HLLightUse(self, use_type);		break;
+
+		case HLM_SCRIPT_USE:
+			//scripted_sequence lives in HLAI.ZC, which compiles AFTER this
+			//file and cannot be called from here. record the request; HLAIFrame
+			//picks it up on the next tick
+			//
+			//GOING_DOWN is the "start requested" state, chosen because a script
+			//has no physical up and down to confuse it with
+			if (e->toggle_state == HLTS_AT_BOTTOM)
+			{
+				e->activator    = activator;
+				e->toggle_state = HLTS_GOING_DOWN;
+			}
+			break;
+
+		case HLM_BREAK_DIE:			HLBreakableDie(self);			break;
+		case HLM_HURT_TOUCH:		HLHurtTouch(self, activator);	break;
+		case HLM_PUSH_TOUCH:		HLPushTouch(self);				break;
+		case HLM_TELEPORT_TOUCH:	HLTeleportTouch(self);			break;
+
+		case HLM_BREAK_USE:
+			//a breakable fired rather than shot dies outright - that is how
+			//SF_BREAK_TRIGGER_ONLY glass is broken by a script
+			HLEntQueueCall(self, HLM_BREAK_DIE, activator, use_type, 0.0);
+			break;
 
 		case HLM_WALL_USE:
 			//func_wall toggles its texture frame, which is how the SDK does
@@ -1291,14 +1534,40 @@ I64 HLEntSpawnOne(CHLMap *map, I64 i)
 		return 1;
 	}
 
-	if (!StrCompare(e->classname, "trigger_multiple") ||
-		!StrCompare(e->classname, "trigger_hurt") ||
-		!StrCompare(e->classname, "trigger_push") ||
-		!StrCompare(e->classname, "trigger_teleport"))
+	if (!StrCompare(e->classname, "trigger_multiple"))
 	{
-		//hurt, push and teleport share the touch plumbing; only their touch
-		//EFFECT is missing, and firing their target is still correct
 		HLEntSpawnTrigger(map, e, FALSE);
+		return 1;
+	}
+
+	if (!StrCompare(e->classname, "trigger_hurt"))
+	{
+		HLEntSpawnTrigger(map, e, FALSE);
+		e->touch_fn = HLM_HURT_TOUCH;
+
+		if (e->dmg == 0.0)
+			e->dmg = 10.0;
+
+		return 1;
+	}
+
+	if (!StrCompare(e->classname, "trigger_push"))
+	{
+		HLEntSpawnTrigger(map, e, FALSE);
+		HLEntSetMoveDir(e);
+		e->touch_fn = HLM_PUSH_TOUCH;
+		return 1;
+	}
+
+	if (!StrCompare(e->classname, "trigger_teleport"))
+	{
+		HLEntSpawnTrigger(map, e, FALSE);
+		e->touch_fn = HLM_TELEPORT_TOUCH;
+
+		//the target names the destination and is CONSUMED by the teleport, so
+		//the generic use path must not also fire it
+		e->use_fn = HLM_NONE;
+
 		return 1;
 	}
 
@@ -1346,15 +1615,40 @@ I64 HLEntSpawnOne(CHLMap *map, I64 i)
 	}
 
 	//--- static brushwork ---
+	if (!StrCompare(e->classname, "func_breakable") ||
+		!StrCompare(e->classname, "func_pushable"))
+	{
+		HLEntSetBrushSize(map, e);
+
+		e->movetype   = HLMOVETYPE_PUSH;
+		e->solid      = HLSOLID_BSP;
+		e->ent_class  = HLC_WALL;
+		e->takedamage = HLDMG_TAKE_YES;
+
+		if (e->health <= 0.0)
+			e->health = 1.0;
+
+		//SF_BREAK_TRIGGER_ONLY. such a brush ignores damage entirely and only
+		//goes when a script says so
+		if (e->spawnflags & 1)
+		{
+			e->takedamage = HLDMG_TAKE_NO;
+			e->use_fn     = HLM_BREAK_USE;
+		}
+		else
+			e->use_fn = HLM_BREAK_USE;
+
+		return 1;
+	}
+
 	if (!StrCompare(e->classname, "func_wall") ||
-		!StrCompare(e->classname, "func_breakable") ||
-		!StrCompare(e->classname, "func_pushable") ||
 		!StrCompare(e->classname, "func_wall_toggle"))
 	{
 		HLEntSetBrushSize(map, e);
-		e->movetype = HLMOVETYPE_PUSH;
-		e->solid    = HLSOLID_BSP;
-		e->use_fn   = HLM_WALL_USE;
+		e->movetype  = HLMOVETYPE_PUSH;
+		e->solid     = HLSOLID_BSP;
+		e->ent_class = HLC_WALL;
+		e->use_fn    = HLM_WALL_USE;
 		return 1;
 	}
 
@@ -1366,6 +1660,40 @@ I64 HLEntSpawnOne(CHLMap *map, I64 i)
 		HLEntSetBrushSize(map, e);
 		e->movetype = HLMOVETYPE_NONE;
 		e->solid    = HLSOLID_NOT;
+		return 1;
+	}
+
+	//--- scripts and actors ---
+	if (!StrCompare(e->classname, "scripted_sequence") ||
+		!StrCompare(e->classname, "aiscripted_sequence"))
+	{
+		e->movetype     = HLMOVETYPE_NONE;
+		e->solid        = HLSOLID_NOT;
+		e->ent_class    = HLC_SCRIPT;
+		e->use_fn       = HLM_SCRIPT_USE;
+		e->toggle_state = HLTS_AT_BOTTOM;
+		e->owner        = -1;
+
+		//a script nothing can name runs as soon as the map does - that is how
+		//the ambient staging in HL1's opening rooms is built
+		if (!e->targetname[0])
+			e->toggle_state = HLTS_GOING_DOWN;
+
+		return 1;
+	}
+
+	//monsters are recognised so they get a class tag and stop counting as
+	//unknown. their models were already resolved by HLEntLoadModels
+	if (!StrNICompare(e->classname, "monster_", 8))
+	{
+		e->movetype   = HLMOVETYPE_STEP;
+		e->solid      = HLSOLID_SLIDEBOX;
+		e->ent_class  = HLC_MONSTER;
+		e->takedamage = HLDMG_TAKE_YES;
+
+		if (e->health <= 0.0)
+			e->health = 20.0;
+
 		return 1;
 	}
 
@@ -1429,6 +1757,15 @@ I64 HLEntSpawnOne(CHLMap *map, I64 i)
 	}
 
 	//worldspawn and the player starts carry no behaviour
+	if (!StrCompare(e->classname, "info_teleport_destination") ||
+		!StrCompare(e->classname, "info_landmark"))
+	{
+		//pure data - a named point a teleport or changelevel reads
+		e->movetype = HLMOVETYPE_NONE;
+		e->solid    = HLSOLID_NOT;
+		return 1;
+	}
+
 	if (!StrCompare(e->classname, "worldspawn") ||
 		!StrCompare(e->classname, "info_player_start") ||
 		!StrCompare(e->classname, "info_player_deathmatch") ||
@@ -1593,6 +1930,9 @@ I64 HLEntSpawnAll(CHLMap *map)
 	//map's must go first or they accumulate
 	HLSndAmbientClear;
 
+	//a fresh map means full health and no stale pending effect
+	HLEntPlayerReset;
+
 	HLEntParseMultiManagers(map);
 
 	for (i = 0; i < hl_num_entities; i++)
@@ -1705,6 +2045,10 @@ U0 HLEntFrame(CHLMap *map, F64 dt, F64 *player_org)
 		return;
 
 	hl_ent_time += dt;
+
+	//pending effects are per tick: a trigger the player has left must stop
+	//pushing, and a stale teleport must not fire twice
+	hl_ent_push_pending = FALSE;
 
 	//--- movers ---
 	for (i = 0; i < hl_num_entities; i++)
