@@ -164,11 +164,17 @@ U0 HLNetSockClear(CHLNetSock *s)
 	MemSet(s->pending_msg, 0, HLNET_PENDING_DEPTH * HLNET_MAX_MSG);
 }
 
+//The protocol 48 state is declared far below and ZealC has no forward
+//references, so HLNetDgrmInit cannot clear it. It raises this instead and
+//HLNetSv drains it on the first 48 call after a connection boundary.
+Bool	hl_net48_reset_req = FALSE;
+
 U0 HLNetDgrmInit()
 {
 	I64 i;
 
-	hl_dgrm_rx_logged = 0;
+	hl_dgrm_rx_logged  = 0;
+	hl_net48_reset_req = TRUE;
 
 	for (i = 0; i < HLSV_MAX_CLIENTS; i++)
 		HLNetSockClear(&hl_net_socks[i]);
@@ -805,7 +811,7 @@ I64 HLNetDgrmProcess(CHLNetSock *s, U8 *buf, I64 len, CHLMsg *out)
 //
 // the header, per packet:
 //
-//   long sequence      bit 31 = this packet is reliable
+//   long sequence      bit 31 = the sender's reliable toggle
 //                      bit 30 = it carries fragments
 //   long sequence_ack  bit 31 = acknowledging their reliable
 //                      bit 30 = acknowledging their fragments
@@ -1029,18 +1035,17 @@ Bool HLFragTake(I64 slot, I64 stream, CHLMsg *out)
 // The exchange, client first:
 //
 //   -> getchallenge
-//   <- challenge <n>
+//   <- A<n>
 //   -> connect <protocol> <n> "<protinfo>" "<userinfo>"
-//   <- connection
+//   <- B
 //
 // after which both ends speak the netchan header and nothing is connectionless
 // again for the life of the session.
 //
-// Divergence from the real engine, stated because it is not verifiable here:
-// GoldSrc answers with single character opcodes rather than words - S2C_CHALLENGE
-// 'A' and S2C_CONNECTION 'B' - packed against the value with no separator. This
-// port writes the word forms and its reader accepts both, so reaching a real
-// server needs the writer changed and not the parser.
+// The server replies are single character opcodes packed against the value with
+// no separator - S2C_CHALLENGE 'A', S2C_CONNECTION 'B' - which is inferred, not
+// citable. The reader also accepts the word forms "challenge <n>" and
+// "connection", so a peer written against either spelling still connects.
 
 #define HLNET48_PROTOCOL		48
 #define HLNET48_OOB_MAX			1400	//one datagram; no IP fragmentation here
@@ -1390,6 +1395,112 @@ Bool HLNet48ChalCheck(U32 ip, I64 value)
 
 #define HLNET48_FRAG_SIZE	1024	//fragment body; header plus this fits the MTU
 
+//--- the outgoing reliable buffer -------------------------------------------
+//
+// The reliable bit is a one-bit toggle, so a channel holds at most one
+// unacknowledged reliable message. It stays here until the peer echoes the
+// toggle back in bit 31 of its acknowledge word, and goes out again on every
+// resend window until then. Messages offered while one is outstanding queue
+// behind it in arrival order.
+//
+// Deviation, inferred rather than cited: GoldSrc appends the held reliable
+// payload to the next outgoing packet, so a resend costs no datagram of its own.
+// This resends it as a separate packet on a timer. The bytes of any one packet
+// are the same either way; only the packing differs.
+
+#define HLNET48_REL_DEPTH	4
+#define HLNET48_REL_RESEND	1.0		//seconds of silence before a resend
+
+class CHLNet48Rel
+{
+	Bool	pending;		//data holds an unacknowledged message
+	I64		len;
+	I64		seq;			//outgoing_sequence of that message's last packet
+	I64		toggle;			//reliable_sequence value it was sent with
+	F64		last_send;
+	U8		data[HLNET_MAX_MSG];
+	I64		queue_count;
+	I64		queue_head;
+	I64		queue_tail;
+	I64		queue_len[HLNET48_REL_DEPTH];
+	//flat: entry i at queue_data + i * HLNET_MAX_MSG. no 2D class arrays
+	U8		queue_data[HLNET48_REL_DEPTH * HLNET_MAX_MSG];
+};
+
+CHLNet48Rel	hl_net48_rel_sv[HLSV_MAX_CLIENTS];
+CHLNet48Rel	hl_net48_rel_cl;
+
+Bool	hl_net48_rel_full_logged = FALSE;
+
+U0 HLNet48RelClear(CHLNet48Rel *r)
+{
+	if (!r)
+		return;
+
+	r->pending     = FALSE;
+	r->len         = 0;
+	r->seq         = 0;
+	r->toggle      = 0;
+	r->last_send   = 0.0;
+	r->queue_count = 0;
+	r->queue_head  = 0;
+	r->queue_tail  = 0;
+	MemSet(r->queue_len, 0, HLNET48_REL_DEPTH * sizeof(I64));
+}
+
+CHLNet48Rel *HLNet48RelFor(I64 slot)
+{
+	if (slot == HLNET_CLIENT_SLOT)
+		return &hl_net48_rel_cl;
+
+	if (slot < 0 || slot >= HLSV_MAX_CLIENTS)
+		return NULL;
+
+	return &hl_net48_rel_sv[slot];
+}
+
+U0 HLNet48RelInit()
+{//globals aren't zeroed; a stale .pending resends last session's message
+	I64 i;
+
+	hl_net48_rel_full_logged = FALSE;
+
+	for (i = 0; i < HLSV_MAX_CLIENTS; i++)
+		HLNet48RelClear(&hl_net48_rel_sv[i]);
+
+	HLNet48RelClear(&hl_net48_rel_cl);
+}
+
+HLNet48RelInit;
+
+Bool HLNet48RelEnqueue(CHLNet48Rel *r, U8 *data, I64 len)
+{//park a message behind the one in flight. a full queue drops it: truncating or
+ //overwriting desyncs the reader, which is worse
+	I64 idx;
+
+	if (!r || !data || len < 1 || len > HLNET_MAX_MSG)
+		return FALSE;
+
+	if (r->queue_count >= HLNET48_REL_DEPTH)
+	{
+		if (!hl_net48_rel_full_logged)
+		{
+			HLLog("net48: reliable queue full, drop\n");
+			HLLogFlush;
+			hl_net48_rel_full_logged = TRUE;
+		}
+		return FALSE;
+	}
+
+	idx = r->queue_head;
+	MemCopy(r->queue_data + idx * HLNET_MAX_MSG, data, len);
+	r->queue_len[idx] = len;
+	r->queue_head = (r->queue_head + 1) % HLNET48_REL_DEPTH;
+	r->queue_count++;
+
+	return TRUE;
+}
+
 class CHLNet48Chan
 {
 	Bool	active;
@@ -1462,11 +1573,17 @@ I64 HLNet48SlotByIP(U32 ip)
 
 U0 HLNet48ChanSetup(I64 slot, U32 ip, I64 port)
 {//Netchan_Setup - open a channel on a slot the connect handshake just settled
-	CHLNet48Chan *c;
+	CHLNet48Chan	*c;
+	CHLNet48Rel		*r;
 
 	c = HLNet48ChanFor(slot);
 	if (!c || !ip)
 		return;
+
+	//the toggle restarts at 0, so anything held from a previous session on this
+	//slot would be acknowledged by the wrong bit
+	r = HLNet48RelFor(slot);
+	HLNet48RelClear(r);
 
 	HLNet48ChanClear(c);
 	c->active        = TRUE;
@@ -1479,7 +1596,7 @@ U0 HLNet48ChanSetup(I64 slot, U32 ip, I64 port)
 
 //--- the netchan header -----------------------------------------------------
 //
-//   long sequence      bit 31 this packet is reliable
+//   long sequence      bit 31 the sender's reliable toggle
 //                      bit 30 fragment descriptors follow
 //   long acknowledge   bit 31 acknowledging their reliable
 //                      bit 30 acknowledging their fragments
@@ -1492,9 +1609,13 @@ U0 HLNet48ChanSetup(I64 slot, U32 ip, I64 port)
 //
 // The per-stream present byte is inferred; it is not in the SDK. It cannot live
 // in the sequence word: only bits 30 and 31 are stripped before the sequence is
-// used, so any lower bit would be part of the number. The reliable bit is a
-// toggle in the Quake 2 lineage - the receiver flips its own copy whenever a
-// reliable packet arrives - and that is what HLNet48Process does.
+// used, so any lower bit would be part of the number.
+//
+// Bit 31 is the sender's reliable toggle in the Quake 2 lineage. It rides every
+// packet, not only the ones carrying reliable data, and the receiver latches it
+// rather than flipping a counter of its own: latching makes a resend of the same
+// message idempotent, where flipping desynchronises the two counters the first
+// time a reliable message is sent twice.
 //
 // No qport field. Quake 2 puts one on every client to server packet so a NAT
 // rebinding does not lose the connection; whether GoldSrc kept it is not
@@ -1669,13 +1790,13 @@ q48ph_next:
 	return TRUE;
 }
 
-Bool HLNet48Transmit(I64 slot, U8 *data, I64 len, Bool reliable)
-{//Netchan_Transmit. one packet when the payload fits, otherwise a burst of
- //normal-stream fragments.
+Bool HLNet48SendRaw(I64 slot, U8 *data, I64 len)
+{//the packet writer half of Netchan_Transmit: one packet when the payload fits,
+ //otherwise a burst of normal-stream fragments. every fragment but the last is
+ //HLNET48_FRAG_SIZE bytes.
  //
- //every fragment but the last is HLNET48_FRAG_SIZE bytes. no retransmit queue:
- //the reliable bit is carried and the toggle flipped, and a lost reliable
- //message is not resent. that queue belongs with the entity stream work
+ //the reliable toggle is read here, never advanced: HLNet48Transmit owns it, so
+ //a resend carries the value the first send did
 	CHLNet48Chan	*c;
 	U8				 pkt[HLNET48_OOB_MAX];
 	I64				 hdr;
@@ -1689,11 +1810,16 @@ Bool HLNet48Transmit(I64 slot, U8 *data, I64 len, Bool reliable)
 	if (!c || !c->active || !c->ip || !data || len < 1)
 		return FALSE;
 
-	if (reliable)
-		c->reliable_sequence = 1 - c->reliable_sequence;
-
 	HLNet48HdrClear(&hl_net48_thdr);
-	hl_net48_thdr.reliable = reliable;
+	//bit 31 of the sequence republishes our own toggle on every packet, reliable
+	//or not, rather than flagging that this packet carries reliable data. the
+	//peer latches it, so a resend of the same message is idempotent - under a
+	//flip-on-receipt reading a resend desynchronises the two counters and the
+	//acknowledgement never matches again.
+	//
+	//`reliable` therefore does not reach the wire here; the caller has already
+	//advanced the toggle for a new message
+	hl_net48_thdr.reliable = ToBool(c->reliable_sequence);
 	hl_net48_thdr.rel_ack  = ToBool(c->incoming_reliable_sequence);
 	hl_net48_thdr.ack      = c->incoming_sequence;
 	if (hl_net48_thdr.ack < 0)
@@ -1745,6 +1871,124 @@ Bool HLNet48Transmit(I64 slot, U8 *data, I64 len, Bool reliable)
 	}
 
 	return ok;
+}
+
+Bool HLNet48Transmit(I64 slot, U8 *data, I64 len, Bool reliable)
+{//Netchan_Transmit. unreliable goes straight out; reliable is held for resend
+ //until the peer acknowledges it, and queues behind anything already held
+	CHLNet48Chan	*c;
+	CHLNet48Rel		*r;
+	Bool			 ok;
+
+	c = HLNet48ChanFor(slot);
+	r = HLNet48RelFor(slot);
+	if (!c || !r || !c->active || !c->ip || !data || len < 1)
+		return FALSE;
+
+	if (!reliable)
+		return HLNet48SendRaw(slot, data, len);
+
+	if (len > HLNET_MAX_MSG)
+		return FALSE;
+
+	if (r->pending)
+		return HLNet48RelEnqueue(r, data, len);
+
+	//the toggle advances once per distinct message
+	c->reliable_sequence = 1 - c->reliable_sequence;
+
+	MemCopy(r->data, data, len);
+	r->len       = len;
+	r->pending   = TRUE;
+	r->toggle    = c->reliable_sequence;
+	r->last_send = tS;
+
+	ok     = HLNet48SendRaw(slot, r->data, r->len);
+	//the last packet of the burst; an acknowledge at or above it covers all of it
+	r->seq = c->outgoing_sequence - 1;
+
+	return ok;
+}
+
+U0 HLNet48RelResend(I64 slot)
+{//put the held message out again. the toggle is restored rather than advanced:
+ //to the peer a resend must be the same message, not a new one
+	CHLNet48Chan	*c;
+	CHLNet48Rel		*r;
+
+	c = HLNet48ChanFor(slot);
+	r = HLNet48RelFor(slot);
+	if (!c || !r || !c->active || !r->pending || r->len < 1)
+		return;
+
+	c->reliable_sequence = r->toggle;
+	r->last_send         = tS;
+
+	HLNet48SendRaw(slot, r->data, r->len);
+	r->seq = c->outgoing_sequence - 1;
+}
+
+U0 HLNet48RelAck(I64 slot, I64 ack_seq, Bool rel_ack)
+{//the peer's acknowledge word. Netchan_Transmit frees the held message when the
+ //echoed reliable bit matches the toggle it went out with and the acknowledged
+ //sequence has reached it. the next queued message then goes out at once
+	CHLNet48Chan	*c;
+	CHLNet48Rel		*r;
+	I64				 got;
+	I64				 idx;
+
+	c = HLNet48ChanFor(slot);
+	r = HLNet48RelFor(slot);
+	if (!c || !r || !r->pending)
+		return;
+
+	if (ack_seq < r->seq)
+		return;
+
+	got = 0;
+	if (rel_ack)
+		got = 1;
+
+	if (got != r->toggle)
+		return;
+
+	r->pending = FALSE;
+	r->len     = 0;
+
+	if (r->queue_count < 1)
+		return;
+
+	idx = r->queue_tail;
+	r->queue_tail = (r->queue_tail + 1) % HLNET48_REL_DEPTH;
+	r->queue_count--;
+
+	MemCopy(r->data, r->queue_data + idx * HLNET_MAX_MSG, r->queue_len[idx]);
+	r->len       = r->queue_len[idx];
+	r->pending   = TRUE;
+	r->last_send = tS;
+
+	c->reliable_sequence = 1 - c->reliable_sequence;
+	r->toggle            = c->reliable_sequence;
+
+	HLNet48SendRaw(slot, r->data, r->len);
+	r->seq = c->outgoing_sequence - 1;
+}
+
+U0 HLNet48Tick(F64 now)
+{//resend every held reliable message that has gone unacknowledged for a window.
+ //without this a dropped signon message stalls the session with no recovery
+	I64 i;
+
+	if (hl_net48_cl.active && hl_net48_rel_cl.pending &&
+		now - hl_net48_rel_cl.last_send > HLNET48_REL_RESEND)
+		HLNet48RelResend(HLNET_CLIENT_SLOT);
+
+	for (i = 0; i < HLSV_MAX_CLIENTS; i++)
+	{
+		if (hl_net48_sv[i].active && hl_net48_rel_sv[i].pending &&
+			now - hl_net48_rel_sv[i].last_send > HLNET48_REL_RESEND)
+			HLNet48RelResend(i);
+	}
 }
 
 //--- the handshake, client side ---------------------------------------------
@@ -1848,7 +2092,8 @@ Bool HLNet48ServerAcceptConnect(I64 slot)
 	HLNet48ChanSetup(slot, hl_net48_conn_ip, hl_net48_conn_port);
 	hl_net48_active = TRUE;
 
-	return HLNet48SendOOB(hl_net48_conn_ip, hl_net48_conn_port, "connection");
+	//S2C_CONNECTION 'B', the letter alone
+	return HLNet48SendOOB(hl_net48_conn_ip, hl_net48_conn_port, "B");
 }
 
 //--- connectionless dispatch ------------------------------------------------
@@ -1892,7 +2137,8 @@ I64 HLNet48HandleOOB(U8 *data, I64 len, U32 ip, I64 port)
 		if (!StrICompare(t0, "getchallenge"))
 		{
 			chal = HLNet48ChalIssue(ip);
-			StrPrint(reply, "challenge %d", chal);
+			//S2C_CHALLENGE 'A', value packed against it with no separator
+			StrPrint(reply, "A%d", chal);
 			HLNet48SendOOB(ip, port, reply);
 			return 0;
 		}
@@ -1937,8 +2183,8 @@ I64 HLNet48HandleOOB(U8 *data, I64 len, U32 ip, I64 port)
 		return 0;
 	}
 
-	//client. the word form is what this port sends; the leading letter forms are
-	//accepted so a real server only needs the writer changed
+	//client. the letter forms are what a GoldSrc server sends and what this port
+	//writes; the word forms stay accepted for a peer spelling them out
 	chal = 0;
 	if (!StrICompare(t0, "challenge") && ntok > 1)
 		chal = Str2I64(t1);
@@ -2014,12 +2260,18 @@ I64 HLNet48Process(I64 slot, U8 *buf, I64 len, CHLMsg *out)
 	c->incoming_acknowledged = hl_net48_hdr.ack;
 	c->last_received         = tS;
 
+	//frees the held reliable message, or starts the next queued one
+	HLNet48RelAck(slot, hl_net48_hdr.ack, hl_net48_hdr.rel_ack);
+
 	//NAT and ephemeral source ports: track the peer, as the NETFLAG path does
 	if (hl_udp_from_port >= 1)
 		c->port = hl_udp_from_port;
 
+	//latched, not flipped: bit 31 is the sender's toggle, so a resend of the same
+	//message leaves this unchanged and the acknowledgement stays correct
+	c->incoming_reliable_sequence = 0;
 	if (hl_net48_hdr.reliable)
-		c->incoming_reliable_sequence = 1 - c->incoming_reliable_sequence;
+		c->incoming_reliable_sequence = 1;
 
 	payload = len - hl_net48_hdr.hdr_len;
 	if (payload < 0)
@@ -2075,6 +2327,7 @@ U0 HLNet48Init()
 	I64 i;
 
 	HLNet48ChalInit;
+	HLNet48RelInit;
 
 	for (i = 0; i < HLSV_MAX_CLIENTS; i++)
 		HLNet48ChanClear(&hl_net48_sv[i]);
@@ -2099,7 +2352,8 @@ U0 HLNet48Init()
 	hl_net48_conn_userinfo[0] = 0;
 	hl_net48_conn_protinfo[0] = 0;
 
-	hl_net48_line[0] = 0;
+	hl_net48_line[0]   = 0;
+	hl_net48_reset_req = FALSE;
 }
 
 HLNet48Init;
@@ -2311,6 +2565,64 @@ U0 HLNet48SelfTest()
 	taken = HLFragAdd(HLNET_CLIENT_SLOT, HLFRAG_NORMAL_STREAM, fid, 2048, body, 1);
 	HLNet48TestI("short last fragment", taken, 2049);
 
+	//reply opcodes. S2C_CHALLENGE packs the value against the letter, so the
+	//whole reply is one token and the value starts at byte 1
+	StrPrint(line, "A%d", 1234567);
+	n = HLNet48Tokenize(line, tok, HLNET48_TOKENS_MAX, HLNET48_TOKEN_LEN);
+	HLNet48TestI("challenge reply tokens", n, 1);
+	HLNet48TestS("challenge reply", tok, "A1234567");
+	HLNet48TestI("challenge reply value", Str2I64(tok + 1), 1234567);
+
+	n = HLNet48Tokenize("B", tok, HLNET48_TOKENS_MAX, HLNET48_TOKEN_LEN);
+	HLNet48TestI("connection reply tokens", n, 1);
+	HLNet48TestS("connection reply", tok, "B");
+
+	//retransmit queue. no peer and no socket: the sends fail at the UDP layer
+	//and the channel state advances regardless, which is what is under test
+	HLNet48Init;
+	HLNet48ChanSetup(HLNET_CLIENT_SLOT, 0x0100000A, HLNET_PORT_DEFAULT);
+
+	HLNet48Transmit(HLNET_CLIENT_SLOT, body, 8, TRUE);
+	HLNet48TestI("reliable held", hl_net48_rel_cl.pending, TRUE);
+	HLNet48TestI("reliable toggle set", hl_net48_cl.reliable_sequence, 1);
+	n = hl_net48_cl.outgoing_sequence;
+
+	//the wrong echoed toggle is not an acknowledgement
+	HLNet48RelAck(HLNET_CLIENT_SLOT, hl_net48_rel_cl.seq, FALSE);
+	HLNet48TestI("wrong toggle not an ack", hl_net48_rel_cl.pending, TRUE);
+
+	//an acknowledge behind the message is not one either
+	HLNet48RelAck(HLNET_CLIENT_SLOT, hl_net48_rel_cl.seq - 1, TRUE);
+	HLNet48TestI("stale ack ignored", hl_net48_rel_cl.pending, TRUE);
+
+	//silence past the window puts the same message out again under a new
+	//sequence and the toggle it first carried
+	hl_net48_rel_cl.last_send = tS - 2.0 * HLNET48_REL_RESEND;
+	HLNet48Tick(tS);
+	HLNet48TestI("resent", ToBool(hl_net48_cl.outgoing_sequence > n), TRUE);
+	HLNet48TestI("resend keeps toggle", hl_net48_cl.reliable_sequence, 1);
+	HLNet48TestI("still held", hl_net48_rel_cl.pending, TRUE);
+
+	//a second reliable queues rather than displacing the first
+	HLNet48Transmit(HLNET_CLIENT_SLOT, body + 8, 8, TRUE);
+	HLNet48TestI("second queued", hl_net48_rel_cl.queue_count, 1);
+	HLNet48TestI("queueing does not toggle", hl_net48_cl.reliable_sequence, 1);
+
+	//the matching toggle frees it and releases the queued message
+	HLNet48RelAck(HLNET_CLIENT_SLOT, hl_net48_rel_cl.seq, TRUE);
+	HLNet48TestI("queue drained", hl_net48_rel_cl.queue_count, 0);
+	HLNet48TestI("queued now held", hl_net48_rel_cl.pending, TRUE);
+	HLNet48TestI("queued toggles", hl_net48_cl.reliable_sequence, 0);
+
+	HLNet48RelAck(HLNET_CLIENT_SLOT, hl_net48_rel_cl.seq, FALSE);
+	HLNet48TestI("nothing outstanding", hl_net48_rel_cl.pending, FALSE);
+
+	//an acknowledged channel stops resending
+	n = hl_net48_cl.outgoing_sequence;
+	hl_net48_rel_cl.last_send = tS - 2.0 * HLNET48_REL_RESEND;
+	HLNet48Tick(tS);
+	HLNet48TestI("no resend after ack", hl_net48_cl.outgoing_sequence, n);
+
 	HLFragInit;
 	HLNet48Init;
 
@@ -2374,15 +2686,14 @@ I64 HLNetDgrmRecv(CHLMsg *out, U32 *from_ip)
 	if (HLNet48IsOOB(buf, got))
 		return HLNet48HandleOOB(buf, got, ip, hl_udp_from_port);
 
-	//an established 48 session has no NETFLAG header at all. hl_net48_active is
-	//set only by a completed 48 handshake, so a 15 session never reaches here
+	//an established 48 session has no NETFLAG header at all. the address owning a
+	//netchan is what selects the framing, not hl_net48_active: a listen server
+	//holding both a 48 client and a 15 client must read each on its own framing
 	if (hl_net48_active)
 	{
 		slot48 = HLNet48SlotByIP(ip);
-		if (slot48 == HLNET48_NO_SLOT)
-			return 0;
-
-		return HLNet48Process(slot48, buf, got, out);
+		if (slot48 != HLNET48_NO_SLOT)
+			return HLNet48Process(slot48, buf, got, out);
 	}
 
 	word    = HLNetReadBigLong(buf);
