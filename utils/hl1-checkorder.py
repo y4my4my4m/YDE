@@ -302,6 +302,33 @@ def main():
                       % (name, ln, sym))
                 undef_sym += 1
 
+    # duplicate global declarations across files
+    #
+    # ZealC binds each reference to the most recent declaration, so a name
+    # declared in two files is TWO variables: writers in later files miss
+    # readers in earlier ones. hl_map_name was declared in HLBSP.ZC and again
+    # as HLMenu.ZC's chapter list; the shell wrote the menu's copy and the AI
+    # read HLBSP's, which held junk - the node graph never loaded once.
+    decl_re = re.compile(r'^(?:U0|I8|U8|I16|U16|I32|U32|I64|U64|F64|Bool|'
+                         r'C[A-Za-z0-9_]+)\s*\(?\**\s*(hl_[a-z0-9_]+)')
+    decl_where = {}
+    dup_globals = 0
+    for name in order:
+        if name not in lines:
+            continue
+        for ln, line in enumerate(lines[name], 1):
+            m = decl_re.match(line)
+            if not m:
+                continue
+            g = m.group(1)
+            if g in decl_where and decl_where[g][0] != name:
+                print('  %s:%d re-declares %s, first declared %s:%d - '
+                      'two variables, split readers and writers'
+                      % (name, ln, g, decl_where[g][0], decl_where[g][1]))
+                dup_globals += 1
+            elif g not in decl_where:
+                decl_where[g] = (name, ln)
+
     if os.environ.get('HL1_ADVISORY') and advisory:
         print('advisory - globals with an unreassigned initialiser:')
         for a in advisory:
@@ -309,10 +336,10 @@ def main():
 
     print('order violations: %d, nested class declarations: %d, '
           'continue statements: %d, undefined calls: %d, '
-          'undefined symbols: %d '
+          'undefined symbols: %d, duplicate globals: %d '
           '(%d advisory, set HL1_ADVISORY=1 to list)'
-          % (bad, nested, conts, undef, undef_sym, len(advisory)))
-    return 1 if (bad or nested or conts or undef or undef_sym) else 0
+          % (bad, nested, conts, undef, undef_sym, dup_globals, len(advisory)))
+    return 1 if (bad or nested or conts or undef or undef_sym or dup_globals) else 0
 
 
 if __name__ == '__main__':
