@@ -240,16 +240,79 @@ def main():
                       % (name, ln, sym))
                 undef += 1
 
+    # undefined constants and globals
+    #
+    # A deletion pass that removes a #define or a global while a consumer
+    # survives leaves every counter above at 0 - the undefined-call check only
+    # matches an identifier followed by "(". HLBEAM_LIGHT went that way.
+    all_macros = set()
+    mac_any_re = re.compile(r'^\s*#define\s+([A-Za-z_][A-Za-z0-9_]*)')
+    # plain globals and the U0 (*name)(args) function-pointer hook form
+    glob_re = re.compile(r'^\s*(?:extern\s+|public\s+)*'
+                         r'(?:U0|I8|U8|I16|U16|I32|U32|I64|U64|F64|Bool|'
+                         r'C[A-Za-z0-9_]+)\s*\(?\**\s*([a-z_][A-Za-z0-9_]*)')
+    declared_syms = set()
+
+    for name in order:
+        if name not in lines:
+            continue
+        for line in lines[name]:
+            m = mac_any_re.match(line)
+            if m:
+                all_macros.add(m.group(1))
+            m = glob_re.match(line)
+            if m:
+                declared_syms.add(m.group(1))
+
+    # locals and parameters are declared with leading whitespace, which the
+    # global pattern above rejects, so collect them separately and forgive them
+    local_re = re.compile(r'^\s+(?:U0|I8|U8|I16|U16|I32|U32|I64|U64|F64|Bool|'
+                          r'C[A-Za-z0-9_]+)\s*\**\s*([a-z_][A-Za-z0-9_]*)')
+    for name in order:
+        if name not in lines:
+            continue
+        for line in lines[name]:
+            m = local_re.match(line)
+            if m:
+                declared_syms.add(m.group(1))
+
+    const_use_re = re.compile(r'\b(HL[A-Z][A-Z0-9_]*)\b(?!\s*\()')
+    glob_use_re = re.compile(r'\b(hl_[a-z0-9_]+)\b')
+
+    undef_sym = 0
+    for name in order:
+        if name not in lines:
+            continue
+        for ln, line in enumerate(lines[name], 1):
+            code = line.split('//', 1)[0]
+            if code.lstrip().startswith('#define'):
+                continue
+            for m in const_use_re.finditer(code):
+                sym = m.group(1)
+                if sym in all_macros or sym in defined:
+                    continue
+                print('  %s:%d uses %s, which is #defined nowhere'
+                      % (name, ln, sym))
+                undef_sym += 1
+            for m in glob_use_re.finditer(code):
+                sym = m.group(1)
+                if sym in declared_syms or sym in all_macros:
+                    continue
+                print('  %s:%d uses %s, which is declared nowhere'
+                      % (name, ln, sym))
+                undef_sym += 1
+
     if os.environ.get('HL1_ADVISORY') and advisory:
         print('advisory - globals with an unreassigned initialiser:')
         for a in advisory:
             print(a)
 
     print('order violations: %d, nested class declarations: %d, '
-          'continue statements: %d, undefined calls: %d '
+          'continue statements: %d, undefined calls: %d, '
+          'undefined symbols: %d '
           '(%d advisory, set HL1_ADVISORY=1 to list)'
-          % (bad, nested, conts, undef, len(advisory)))
-    return 1 if (bad or nested or conts or undef) else 0
+          % (bad, nested, conts, undef, undef_sym, len(advisory)))
+    return 1 if (bad or nested or conts or undef or undef_sym) else 0
 
 
 if __name__ == '__main__':
