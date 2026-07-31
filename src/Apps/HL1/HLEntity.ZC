@@ -482,6 +482,46 @@ U8		hl_ent_changelevel[64];
 U8		hl_ent_changelevel_landmark[64];
 Bool	hl_ent_changelevel_pending	= FALSE;
 
+//--- changelevel capture ----------------------------------------------------
+//
+// `cllog 1` records the touch path against every trigger_changelevel in the
+// map, written to ::/Apps/HL1/CLLOG.TXT. Armed and flushed on the cvar edge,
+// the way ridelog is.
+//
+// One record per tick while the player box is within HLCL_NEAR of the volume,
+// plus one every HLCL_BEAT ticks otherwise, so a car that never arrives is
+// still tracked. c0a0's volume is a 24 unit slab at x -2280..-2256 and the
+// tram crosses it at 300 units/s: the near band is what makes the crossing
+// legible, the beat is what shows where the car went instead.
+//
+// A ring is not needed. The near band is entered once per map and the beat is
+// decimated, so HLCL_LINES covers minutes.
+#define HLCL_LINES	768
+#define HLCL_WIDTH	192
+#define HLCL_NEAR	512.0	//units, per axis, from the volume's box
+#define HLCL_BEAT	64		//ticks between out-of-band records
+
+U8	   *hl_cl_buf		= NULL;	//HLCL_LINES * HLCL_WIDTH, live while armed
+Bool	hl_cl_log		= FALSE;
+I64		hl_cl_lines		= 0;
+I64		hl_cl_ticks		= 0;
+
+//furthest point HLChangeLevelTouch reached, and how many times it was
+//dispatched. 0 is "never entered".
+//  1 entity gone     2 master denied   3 no map key
+//  4 already pending 5 posted
+I64		hl_cl_stage		= 0;
+I64		hl_cl_touches	= 0;
+
+//globals are not zeroed and the declaration initialisers above do not run. The
+//buffer pointer is freed on the disarm edge, so it has to start NULL
+hl_cl_buf		= NULL;
+hl_cl_log		= FALSE;
+hl_cl_lines		= 0;
+hl_cl_ticks		= 0;
+hl_cl_stage		= 0;
+hl_cl_touches	= 0;
+
 //trigger_autosave. SERVER_COMMAND("autosave\n") in the SDK; here a request the
 //shell drains, for the same reason the changelevel one is: HLSave.ZC and the
 //slot path both compile after this file
@@ -2786,6 +2826,44 @@ U0 HLCameraUse(I64 self, I64 activator, I64 use_type)
 #define HLSF_DOOR_USE_ONLY		256
 #define HLSF_DOOR_TOUCH_OPENS	0		//the default when USE_ONLY is clear
 
+//--- func_platrot -----------------------------------------------------------
+//
+// CFuncPlatRot turns as it travels. The turn is not a move of its own: the
+// linear half schedules the arrival and the angular half is an avelocity held
+// for exactly that span, plats.cpp:569 and :591.
+//
+// The port's plat runs on the door mover, and the two disagree on which end is
+// which. CFuncPlat rests at m_vecPosition1 in TS_AT_TOP and descends to
+// m_vecPosition2; HLEntSpawnPlat rests at position1 in HLTS_AT_BOTTOM and the
+// door's "go up" carries it to position2. So the port's up is the SDK's down:
+//
+//   HLDoorGoUp   -> position2, physically down -> CFuncPlatRot::GoDown -> angle1
+//   HLDoorGoDown -> position1, physically up   -> CFuncPlatRot::GoUp   -> angle2
+//
+// angle1 is m_start, angle2 is m_end. func_door_rotating owns the same pair,
+// and no entity is both.
+
+U0 HLPlatRotMove(CHLEntity *e, F64 *dest)
+{//CFuncPlatRot::RotMove, plats.cpp:608. time is the span SUB_CalcMove just
+ //scheduled for the linear half
+ //
+ //The SDK's short-travel branch also pushes nextthink out by a second. Not
+ //reproduced: that think is the linear arrival here, and delaying it strands
+ //the plat between its two positions. HLENT_MIN_MOVE_TIME already floors the
+ //span, so the residual is applied over one tick instead
+	F64 delta[3];
+	F64 time;
+
+	HLVecSub(dest, e->angles, delta);
+
+	time = e->next_think - hl_ent_time;
+
+	if (time >= 0.1)
+		HLVecScale(delta, 1.0 / time, e->avelocity);
+	else
+		HLVecCopy(delta, e->avelocity);
+}
+
 U0 HLDoorGoUp(I64 self, I64 activator)
 {
 	CHLEntity *e = HLEntGet(self);
@@ -2804,6 +2882,11 @@ U0 HLDoorGoUp(I64 self, I64 activator)
 	HLEntSound(self, e, HLEntDoorMoveSound(e->move_snd), HLCHAN_STATIC);
 
 	HLEntCalcMove(e, e->position2, e->speed, HLM_DOOR_HIT_TOP);
+
+	//after the linear call: the angular rate is the residual over the span it
+	//scheduled
+	if (e->ent_class == HLC_PLAT && e->rotates)
+		HLPlatRotMove(e, e->angle1);
 }
 
 U0 HLDoorGoDown(I64 self)
@@ -2819,6 +2902,9 @@ U0 HLDoorGoDown(I64 self)
 	HLEntSound(self, e, HLEntDoorMoveSound(e->move_snd), HLCHAN_STATIC);
 
 	HLEntCalcMove(e, e->position1, e->speed, HLM_DOOR_HIT_BOTTOM);
+
+	if (e->ent_class == HLC_PLAT && e->rotates)
+		HLPlatRotMove(e, e->angle2);
 }
 
 U0 HLDoorHitTop(I64 self)
@@ -2830,6 +2916,17 @@ U0 HLDoorHitTop(I64 self)
 
 	HLVecSet(e->velocity, 0.0, 0.0, 0.0);
 	e->toggle_state = HLTS_AT_TOP;
+
+	//CFuncPlatRot::HitBottom, plats.cpp:579 - the port's top is the SDK's
+	//bottom, see the note above HLPlatRotMove. The angle is snapped, not
+	//integrated to: the linear arrival is scheduled and the angular one would
+	//otherwise land a tick either side of it
+	if (e->ent_class == HLC_PLAT && e->rotates)
+	{
+		HLVecSet(e->avelocity, 0.0, 0.0, 0.0);
+		HLVecCopy(e->angle1, e->angles);
+		HLEntSetAbsBox(e);
+	}
 
 	//CHAN_STATIC, doors.cpp:619
 	HLEntSound(self, e, HLEntDoorStopSound(e->stop_snd), HLCHAN_STATIC);
@@ -2857,6 +2954,14 @@ U0 HLDoorHitBottom(I64 self)
 
 	HLVecSet(e->velocity, 0.0, 0.0, 0.0);
 	e->toggle_state = HLTS_AT_BOTTOM;
+
+	//CFuncPlatRot::HitTop, plats.cpp:599
+	if (e->ent_class == HLC_PLAT && e->rotates)
+	{
+		HLVecSet(e->avelocity, 0.0, 0.0, 0.0);
+		HLVecCopy(e->angle2, e->angles);
+		HLEntSetAbsBox(e);
+	}
 
 	//CHAN_STATIC, doors.cpp:619
 	HLEntSound(self, e, HLEntDoorStopSound(e->stop_snd), HLCHAN_STATIC);
@@ -7745,17 +7850,30 @@ U0 HLChangeLevelTouch(I64 self)
 	I64			 lm;
 	I64			 ride;
 
+	//cllog: every gate below is a stage, so a touch that fires and does nothing
+	//is told apart from one that never fires
+	hl_cl_touches++;
+	hl_cl_stage = 1;
+
 	if (!e)
 		return;
+
+	hl_cl_stage = 2;
 
 	if (!HLEntMasterAllows(e))
 		return;
 
+	hl_cl_stage = 3;
+
 	if (!e->next_map[0])
 		return;
 
+	hl_cl_stage = 4;
+
 	if (hl_ent_changelevel_pending)
 		return;
+
+	hl_cl_stage = 5;
 
 	HLStrCopy(hl_ent_changelevel, e->next_map, 64);
 	HLStrCopy(hl_ent_changelevel_landmark, e->landmark, 64);
@@ -8293,11 +8411,49 @@ U0 HLEntSpawnTrain(CHLMap *map, CHLEntity *e, I64 cls)
 	HLEntSetAbsBox(e);
 }
 
-U0 HLEntSpawnPlat(CHLMap *map, CHLEntity *e)
+#define HLSF_TRACK_STARTBOTTOM	8	//plats.cpp:1607
+
+U0 HLEntSetupRotation(CHLEntity *e, I64 self)
+{//CFuncPlatRot::SetupRotation, plats.cpp:544
+ //
+ //"rotation" is the travel in degrees about the axis the door spawnflags pick.
+ //A named plat is built at m_end, which is where it rests; both c1a0b's and
+ //c1a0c's elevator carry rotation 90 and a targetname, so the brush stands a
+ //quarter turn off its authored angles for the whole map.
+ //
+ //Not HLEntSpawnRotBrush: that is HLMOVETYPE_PUSH plus a speed default and a
+ //backwards bit, none of which a plat wants.
+ //
+ //angle1 and angle2 are kept raw, as the SDK's Vector arithmetic does. The
+ //mover pass folds e->angles into [0, 360) while a plat travels, so a rotation
+ //past a full turn - c4a1e's 360, -360 and 720 platforms - takes the residual
+ //the short way round instead of spinning. Both resting states are still
+ //exact: HLDoorHitTop and HLDoorHitBottom snap to these two triples.
+	if (HLIsZeroF(e->rot_amount))
+		return;
+
+	HLEntAxisDir(e, HLSF_DOOR_ROTATE_Z, HLSF_DOOR_ROTATE_X);
+
+	HLVecCopy(e->angles, e->angle1);								//m_start
+	HLVecMA(e->angle1, e->rot_amount, e->move_dir, e->angle2);		//m_end
+
+	if (e->targetname[0])
+		HLVecCopy(e->angle2, e->angles);
+
+	//the brush is drawn and traced at an orientation now, so both sides have to
+	//be told. HLEntSetAbsBox reads e->rotates and switches to the
+	//orientation-independent radius
+	e->rotates = TRUE;
+	HLClipSetRotating(self, TRUE);
+
+	HLEntSetAbsBox(e);
+}
+
+U0 HLEntSpawnPlat(CHLMap *map, CHLEntity *e, I64 self, Bool rot = FALSE)
 {//func_plat - a lift between two heights on the Z axis
  //
  //CFuncPlat derives the travel from the brush height when "height" is absent,
- //and rests at the top
+ //and rests at the top. rot is func_platrot, which turns through the travel
 	HLEntSetBrushSize(map, e);
 
 	e->movetype   = HLMOVETYPE_PUSH;
@@ -8327,6 +8483,10 @@ U0 HLEntSpawnPlat(CHLMap *map, CHLEntity *e)
 		e->wait = 3.0;
 
 	HLEntSetAbsBox(e);
+
+	//CFuncPlatRot::Spawn - CFuncPlat::Spawn first, then the rotation
+	if (rot)
+		HLEntSetupRotation(e, self);
 }
 
 U0 HLEntSpawnTrigger(CHLMap *map, CHLEntity *e, Bool once)
@@ -8984,10 +9144,15 @@ I64 HLEntSpawnOne(CHLMap *map, I64 i)
 		return 1;
 	}
 
-	if (!StrCompare(e->classname, "func_plat") ||
-		!StrCompare(e->classname, "func_platrot"))
+	if (!StrCompare(e->classname, "func_plat"))
 	{
-		HLEntSpawnPlat(map, e);
+		HLEntSpawnPlat(map, e, i);
+		return 1;
+	}
+
+	if (!StrCompare(e->classname, "func_platrot"))
+	{
+		HLEntSpawnPlat(map, e, i, TRUE);
 		return 1;
 	}
 
@@ -9835,11 +10000,37 @@ I64 HLEntSpawnOne(CHLMap *map, I64 i)
 	if (!StrCompare(e->classname, "weaponbox") ||
 		!StrCompare(e->classname, "info_bigmomma") ||
 		!StrCompare(e->classname, "func_guntarget") ||
-		!StrCompare(e->classname, "func_traincontrols") ||
-		!StrCompare(e->classname, "func_trackchange") ||
+		!StrCompare(e->classname, "func_traincontrols"))
+	{
+		HLEntSpawnInert(map, e);
+		return 1;
+	}
+
+	//The track lift. It carries a tracktrain between two path_tracks and turns
+	//it to face the new one; neither half is implemented, so the brush stands
+	//still. Its resting orientation is not optional though: CFuncTrackChange::
+	//Spawn runs SetupRotation and then sets pev->angles = m_end (plats.cpp:1845)
+	//before it ever moves, so a lift built with rotation -90 - c0a0b's
+	//"goingdown", the one the intro tram descends on - is a quarter turn off
+	//its authored angles from the moment the map loads.
+	if (!StrCompare(e->classname, "func_trackchange") ||
 		!StrCompare(e->classname, "func_trackautochange"))
 	{
 		HLEntSpawnInert(map, e);
+		HLEntSetupRotation(e, i);
+
+		//SF_TRACK_STARTBOTTOM, plats.cpp:1838: built at the bottom track rather
+		//than the top, which is m_start and origin less "height".
+		//SetupRotation left it at m_end
+		if (e->spawnflags & HLSF_TRACK_STARTBOTTOM)
+		{
+			if (e->rotates)
+				HLVecCopy(e->angle1, e->angles);
+
+			e->origin[2] -= e->height;
+			HLEntSetAbsBox(e);
+		}
+
 		return 1;
 	}
 
@@ -10559,6 +10750,10 @@ I64 HLEntSpawnAll(CHLMap *map)
 	if (HLCvarIndex("ridelog") < 0)
 		HLCvarDefine("ridelog", 0.0);
 
+	//the changelevel capture, on the same terms
+	if (HLCvarIndex("cllog") < 0)
+		HLCvarDefine("cllog", 0.0);
+
 	//Trace the opening seconds. Bounded by count and by game time, so it costs
 	//nothing after the level has settled.
 	HLEntTraceReset;
@@ -10842,6 +11037,215 @@ U0 HLEntRideLogTick(F64 *player_org)
 		HLRideLogFlush;
 
 	hl_ride_probe_calls = 0;
+}
+
+//--- changelevel capture ----------------------------------------------------
+//
+// See the hl_cl_* block near the top of this file for what the record is for.
+// Placed here because the overlap test is HLEntBoxOverlap's, which is defined
+// just above, and the record is emitted from HLEntTouchPlayer, which is below.
+
+U0 HLClLogFree()
+{
+	if (hl_cl_buf)
+		Free(hl_cl_buf);
+
+	hl_cl_buf   = NULL;
+	hl_cl_log   = FALSE;
+	hl_cl_lines = 0;
+	hl_cl_ticks = 0;
+}
+
+U0 HLClLogArm()
+{
+	HLClLogFree;
+
+	hl_cl_buf = CAlloc(HLCL_LINES * HLCL_WIDTH);
+
+	hl_cl_stage   = 0;
+	hl_cl_touches = 0;
+
+	hl_cl_log = ToBool(hl_cl_buf != NULL);
+}
+
+U0 HLClLogPut(U8 *s)
+{//linear, not a ring: the interesting tick is the first one in the near band,
+ //not the last one before the buffer fills
+	if (!hl_cl_buf || hl_cl_lines >= HLCL_LINES)
+		return;
+
+	HLStrCopy(hl_cl_buf + hl_cl_lines * HLCL_WIDTH, s, HLCL_WIDTH);
+	hl_cl_lines++;
+}
+
+U0 HLClLogFlush()
+{//oldest record first, one write. The whole file is rewritten each time:
+ //records are decimated, so this runs at a rate a redraw would not notice
+	U8	*out;
+	U8	*slot;
+	I64	 len;
+	I64	 n;
+	I64	 i;
+
+	if (!hl_cl_buf || !hl_disk_writes || hl_cl_lines <= 0)
+		return;
+
+	//the slack is the legend below, which runs to about 700 bytes
+	out = CAlloc(hl_cl_lines * (HLCL_WIDTH + 1) + 2048);
+
+	if (!out)
+		return;
+
+	StrPrint(out,
+		"cllog. trigger_changelevel touch path, oldest first.\n"
+		"  N T       tick index, hl_ent_time\n"
+		"  e u s t   entity slot, in_use, solid (1 is TRIGGER), touch_fn\n"
+		"  ov        player box overlaps the volume this tick\n"
+		"  st        HLChangeLevelTouch's furthest stage: 0 never entered,\n"
+		"            1 entity gone, 2 master denied, 3 no map key,\n"
+		"            4 already pending, 5 posted\n"
+		"  tc        HLChangeLevelTouch dispatches so far\n"
+		"  pend      hl_ent_changelevel_pending\n"
+		"  p         player origin\n"
+		"  b         volume absmin then absmax\n"
+		"  T gn      first live tracktrain origin, hl_ground_native\n\n");
+
+	len = StrLen(out);
+
+	for (i = 0; i < hl_cl_lines; i++)
+	{
+		slot = hl_cl_buf + i * HLCL_WIDTH;
+		n    = StrLen(slot);
+
+		MemCopy(out + len, slot, n);
+		len += n;
+
+		out[len] = '\n';
+		len++;
+	}
+
+	out[len] = 0;
+
+	FileWrite("::/Apps/HL1/CLLOG.TXT", out, len);
+	Free(out);
+}
+
+U0 HLClLogTick(F64 *player_org)
+{//one record per changelevel volume, emitted after the touch pass
+ //
+ //The volume is found by its touch method rather than by in_use, so a
+ //retired one still appears. Both box tests are HLEntTouchPlayer's own: the
+ //record states what that pass decided, not an approximation of it.
+	CHLEntity	*e;
+	U8			 line[HLCL_WIDTH];
+	U8			 part[HLCL_WIDTH];
+	F64			 pmins[3];
+	F64			 pmaxs[3];
+	F64			 nmins[3];
+	F64			 nmaxs[3];
+	F64			 torg[3];
+	I64			 i;
+	I64			 j;
+	I64			 ov;
+	I64			 pend;
+	I64			 use;
+	Bool		 band;
+	Bool		 beat;
+	Bool		 want;
+
+	want = ToBool(HLCvarGet("cllog") != 0.0);
+
+	if (want != hl_cl_log)
+	{
+		if (want)
+			HLClLogArm;
+		else
+		{
+			HLClLogFlush;
+			HLClLogFree;
+		}
+	}
+
+	if (!hl_cl_log || !player_org || !hl_entities)
+		return;
+
+	hl_cl_ticks++;
+
+	beat = ToBool(hl_cl_ticks % HLCL_BEAT == 0);
+
+	//the first live tracktrain. A car that parks short of the volume is the
+	//other half of the answer, so its origin travels with every record
+	HLVecSet(torg, 0.0, 0.0, 0.0);
+
+	for (i = 0; i < hl_num_entities; i++)
+	{
+		if (hl_entities[i].in_use &&
+			hl_entities[i].ent_class == HLC_TRACKTRAIN)
+		{
+			HLVecCopy(hl_entities[i].origin, torg);
+			break;
+		}
+	}
+
+	for (j = 0; j < 3; j++)
+	{
+		pmins[j] = player_org[j] + hl_player_mins[j];
+		pmaxs[j] = player_org[j] + hl_player_maxs[j];
+
+		nmins[j] = pmins[j] - HLCL_NEAR;
+		nmaxs[j] = pmaxs[j] + HLCL_NEAR;
+	}
+
+	pend = 0;
+	if (hl_ent_changelevel_pending)
+		pend = 1;
+
+	for (i = 0; i < hl_num_entities; i++)
+	{
+		e = &hl_entities[i];
+
+		if (e->touch_fn != HLM_CHANGELEVEL_TOUCH)
+			goto qcl_next;
+
+		band = HLEntBoxOverlap(e, nmins, nmaxs);
+
+		if (!band && !beat)
+			goto qcl_next;
+
+		ov = 0;
+		if (HLEntBoxOverlap(e, pmins, pmaxs))
+			ov = 1;
+
+		use = 0;
+		if (e->in_use)
+			use = 1;
+
+		StrPrint(line,
+			"%5d %7.2f e%3d u%1d s%1d t%3d ov%1d st%1d tc%3d pend%1d",
+			hl_cl_ticks, hl_ent_time, i, use, e->solid, e->touch_fn,
+			ov, hl_cl_stage, hl_cl_touches, pend);
+
+		StrPrint(part, " |p%8.1f%8.1f%8.1f |b%8.1f%8.1f%8.1f",
+			player_org[0], player_org[1], player_org[2],
+			e->absmin[0], e->absmin[1], e->absmin[2]);
+
+		HLStrCopy(line + StrLen(line), part, HLCL_WIDTH - StrLen(line));
+
+		StrPrint(part, "%8.1f%8.1f%8.1f |T%8.1f%8.1f%8.1f gn%4d",
+			e->absmax[0], e->absmax[1], e->absmax[2],
+			torg[0], torg[1], torg[2], hl_ground_native);
+
+		HLStrCopy(line + StrLen(line), part, HLCL_WIDTH - StrLen(line));
+
+		HLClLogPut(line);
+
+qcl_next:
+	}
+
+	//Bounded staleness. Also on the pending edge: the shell tears the world
+	//down on the next frame and the tick that posted must already be on disk
+	if (pend || hl_cl_ticks % HLCL_BEAT == 0)
+		HLClLogFlush;
 }
 
 U0 HLEntPushPlayer(F64 *move, F64 *player_org)
@@ -11676,6 +12080,10 @@ qetp_next:
 	}
 
 	HLEntDrainCalls();
+
+	//after the drain: the record wants this tick's HLChangeLevelTouch stage,
+	//and the queued call runs inside it
+	HLClLogTick(player_org);
 }
 
 I64 HLEntUseInFront(F64 *player_org, F64 *forward, Bool held = FALSE)
