@@ -148,6 +148,7 @@
 #define HLM_ENDSECTION			138	//CTriggerEndSection, triggers.cpp:2004/:2035
 #define HLM_BEVERAGE_USE			139	//CEnvBeverage::Use, effects.cpp:2161
 #define HLM_SODA_THINK			140	//CItemSoda::CanThink, effects.cpp:2235
+#define HLM_AUTOSAVE_TOUCH		141	//CTriggerSave::SaveTouch, triggers.cpp:1977
 
 //how long a "toggle" trigger stays untouchable after firing
 #define HLENT_TRIGGER_DEBOUNCE	0.2
@@ -481,6 +482,11 @@ U8		hl_ent_changelevel[64];
 U8		hl_ent_changelevel_landmark[64];
 Bool	hl_ent_changelevel_pending	= FALSE;
 
+//trigger_autosave. SERVER_COMMAND("autosave\n") in the SDK; here a request the
+//shell drains, for the same reason the changelevel one is: HLSave.ZC and the
+//slot path both compile after this file
+Bool	hl_ent_autosave_pending		= FALSE;
+
 //player view angles at the start of this tick's entity pass, the twin of
 //hl_ent_player_org. Pitch is the engine's sign - down is positive - because
 //that is what the shell holds and what SF_CAMERA_PLAYER_POSITION negates
@@ -611,6 +617,7 @@ U0 HLEntPlayerReset()
 
 	hl_ent_changelevel[0]      = 0;
 	hl_ent_changelevel_pending = FALSE;
+	hl_ent_autosave_pending    = FALSE;
 
 	HLVecSet(hl_ent_player_ang, 0.0, 0.0, 0.0);
 	HLVecSet(hl_ent_cam_org, 0.0, 0.0, 0.0);
@@ -7783,6 +7790,27 @@ U0 HLChangeLevelTouch(I64 self)
 	e->solid  = HLSOLID_NOT;
 }
 
+U0 HLAutoSaveTouch(I64 self)
+{//CTriggerSave::SaveTouch, triggers.cpp:1977
+ //
+ //Only the player touches this port's triggers, so the IsPlayer test has no
+ //counterpart. The volume takes itself out of use on the first touch, as the
+ //SDK's SetTouch(NULL)/UTIL_Remove does: the request sits until the shell's
+ //loop drains it and a brush trigger re-touches on every tick until then
+	CHLEntity *e = HLEntGet(self);
+
+	if (!e)
+		return;
+
+	if (!HLEntMasterAllows(e))
+		return;
+
+	e->in_use = FALSE;
+	e->solid  = HLSOLID_NOT;
+
+	hl_ent_autosave_pending = TRUE;
+}
+
 //--- the dispatcher ---------------------------------------------------------
 //
 // The virtual call. Defined last, so every implementation above is visible;
@@ -8054,6 +8082,7 @@ U0 HLEntCallMethod(I64 self, I64 method, I64 activator = -1,
 		case HLM_GRAVITY_TOUCH:		HLGravityTouch(self);			break;
 		case HLM_CHANGELEVEL_TOUCH:	HLChangeLevelTouch(self);		break;
 		case HLM_CHANGELEVEL_USE:	HLChangeLevelTouch(self);		break;
+		case HLM_AUTOSAVE_TOUCH:	HLAutoSaveTouch(self);			break;
 
 		default:
 			break;
@@ -9862,12 +9891,26 @@ I64 HLEntSpawnOne(CHLMap *map, I64 i)
 		return 1;
 	}
 
-	//the brush volumes among these are all hidden by their own Spawn: the three
-	//triggers through CBaseTrigger::InitTrigger, trigger_transition by having
-	//its modelindex cleared. The point entities carry no model, so the flag
-	//costs them nothing
-	if (!StrCompare(e->classname, "trigger_autosave") ||
-		!StrCompare(e->classname, "trigger_transition"))
+	//CTriggerSave::Spawn, triggers.cpp:1965. InitTrigger and a touch, and the
+	//touch removes the volume, so it is spawned fire-once
+	if (!StrCompare(e->classname, "trigger_autosave"))
+	{
+		HLEntSpawnTrigger(map, e, TRUE);
+
+		e->touch_fn = HLM_AUTOSAVE_TOUCH;
+
+		//no CTriggerSave::Use. A save volume answers being walked into and
+		//nothing else
+		e->use_fn = HLM_NONE;
+
+		return 1;
+	}
+
+	//trigger_transition marks which entities cross a changelevel. Its volume is
+	//read by the transition writer, not by a touch, so the entity itself does
+	//nothing at runtime; CTriggerTransition::Spawn clears its modelindex, which
+	//is what the NODRAW here stands in for
+	if (!StrCompare(e->classname, "trigger_transition"))
 	{
 		HLEntSpawnInert(map, e, TRUE);
 		return 1;
@@ -10850,35 +10893,82 @@ Bool HLEntBoxInBrush(CHLMap *map, I64 self, F64 *borg, F64 *bang, F64 *org,
 	return tr.start_solid;
 }
 
+F64 HLEntYawStep(F64 newyaw, F64 oldyaw)
+{//signed yaw a pusher turned through this tick, degrees in (-180, 180]
+ //
+ //Both angles are folded into [0, 360) by the mover pass, so the raw difference
+ //wraps at the seam; the fold below is what makes 359 -> 1 a +2 step and not
+ //-358
+	F64 d;
+
+	d = HLAngleNorm(newyaw - oldyaw);
+
+	if (d > 180.0)
+		d -= 360.0;
+
+	return d;
+}
+
+U0 HLEntRotateAboutZ(F64 *pivot, F64 dyaw, F64 *p, F64 *out)
+{//p rotated dyaw degrees about the vertical through pivot. SV_PushRotate's
+ //rider displacement, yaw only: a brush mover's pitch and roll do not move a
+ //rider's footprint, and only yaw feeds hl_platform_yaw_carry
+ //
+ //out may alias p
+	F64 a;
+	F64 s;
+	F64 c;
+	F64 dx;
+	F64 dy;
+
+	a = dyaw * HLDEG2RAD;
+	s = Sin(a);
+	c = Cos(a);
+
+	dx = p[0] - pivot[0];
+	dy = p[1] - pivot[1];
+
+	out[2] = p[2];
+	out[0] = pivot[0] + dx * c - dy * s;
+	out[1] = pivot[1] + dx * s + dy * c;
+}
+
 //HLEntPushPlayer's answer
 #define HLPUSHP_CLEAR		0	//the pusher's new position does not reach them
 #define HLPUSHP_MOVED		1	//displaced by the pusher's delta
 #define HLPUSHP_STUCK		2	//inside it and nowhere to go
 
-I64 HLEntPushPlayer(CHLMap *map, I64 self, CHLEntity *e, F64 *move,
-	F64 *player_org)
-{//SV_PushMove's displacement half, for the player.
+I64 HLEntPushPlayer(CHLMap *map, I64 self, CHLEntity *e, F64 *oldorg,
+	F64 *oldang, F64 *player_org)
+{//SV_PushMove and SV_PushRotate's displacement half, for the player.
  //
- //The pusher has already stepped. Anything its new position now occupies is
- //moved by the same delta and re-tested; only a box that is still solid after
- //that counts as blocking.
+ //The pusher has already stepped, from (oldorg, oldang) to (e->origin,
+ //e->angles). Anything its new position occupies is carried by the rigid
+ //transform between those two placements and re-tested; only a box that is
+ //still solid after that counts as blocking.
+ //
+ //The transform is the pusher's own: the rider's offset from the pusher origin
+ //is rotated by the tick's yaw step and re-planted on the new origin. With no
+ //rotation that reduces to player_org + (e->origin - oldorg), which is
+ //SV_PushMove's translation.
  //
  //Base velocity cannot stand in for this. The carry runs later in the tick,
  //inside the player's own move, and a box that is already inside a wall
  //resolves outward the wrong way - which is how a moving tram's rear wall swept
  //through the player and left them outside the car, while a stationary one was
- //solid and could not be left at all.
+ //solid and could not be left at all. On a curve the same wall sweeps through
+ //an arc of radius |r|, which for a 288-long car reaches far past the player's
+ //hull; translation alone leaves that box unresolved.
  //
  //A rider standing on the deck is above the brush, not inside it, and is not
  //displaced: the carry keeps that motion smooth.
- //
- //Linear only. A pusher that is turning banks yaw_delta and carries riders
- //through hl_platform_avel_z; a player swept into a rotating brush is left to
- //the blocked method, which is what reverses a door.
 	CHLTrace	tr;
 	F64			want[3];
+	F64			rel[3];
+	F64			pivot[3];
 	F64			pmins[3];
 	F64			pmaxs[3];
+	F64			dyaw;
 	I64			j;
 
 	if (!player_org || hl_ent_player < 0 || hl_ent_player_health <= 0.0)
@@ -10899,12 +10989,32 @@ I64 HLEntPushPlayer(CHLMap *map, I64 self, CHLEntity *e, F64 *move,
 		hl_player_mins, hl_player_maxs))
 		return HLPUSHP_CLEAR;
 
+	//hl_brush_rotates gates the arc, not the angles: an entity whose clip is not
+	//registered rotating traces against an axial hull, so its brushwork did not
+	//turn under the player however its angles read
+	dyaw = 0.0;
+	if (hl_brush_rotates[self])
+		dyaw = HLEntYawStep(e->angles[1], oldang[1]);
+
+	//rel is the offset from the PRE-step origin, so the rotation is taken about
+	//the pusher's own axis rather than about a point that has already moved
 	for (j = 0; j < 3; j++)
-		want[j] = player_org[j] + move[j];
+		rel[j] = player_org[j] - oldorg[j];
+
+	//rel is already relative, so the rotation is about zero and the new origin
+	//is added after
+	if (!HLIsZeroF(dyaw))
+	{
+		HLVecSet(pivot, 0.0, 0.0, 0.0);
+		HLEntRotateAboutZ(pivot, dyaw, rel, rel);
+	}
+
+	for (j = 0; j < 3; j++)
+		want[j] = e->origin[j] + rel[j];
 
 	//relative to the pusher this is where they stood before the step, which was
-	//clear. Still inside means the pusher turned, or something else put them
-	//there
+	//clear. Still inside means the geometry deformed under them, or something
+	//else put them there
 	if (HLEntBoxInBrush(map, self, e->origin, e->angles, want,
 		hl_player_mins, hl_player_maxs))
 		return HLPUSHP_STUCK;
@@ -11248,6 +11358,27 @@ qef_next_voice:
 
 		rides = FALSE;
 
+		//riders are decided against the pre-step position, as SV_PushMove does.
+		//
+		//A pusher that only turns qualifies a rider by the ground clause alone.
+		//HLEntPlayerRides' other clause is a box overlap, and a rotating brush's
+		//bounds are the orientation-independent radius: a fan's box reaches the
+		//floor under it, and admitting that would hand the w x r carry to
+		//anyone standing near one
+		if (player_org && hl_ent_player >= 0 &&
+			(linear || hl_ground_native == i))
+			rides = HLEntPlayerRides(i, e, player_org);
+
+		//ride trace: sampled here, ahead of the yaw_delta consume below
+		if (hl_ride_log && e->ent_class == HLC_TRACKTRAIN)
+		{
+			hl_ride_rides     = 0;
+			hl_ride_yaw_delta = e->yaw_delta;
+
+			if (rides)
+				hl_ride_rides = 1;
+		}
+
 		//An angular-only step rebuilds nothing: a rotating brush's bounds are
 		//the orientation-independent radius (see HLEntSetAbsBox), and a
 		//non-rotating entity changing angles is a train's bookkeeping.
@@ -11257,72 +11388,65 @@ qef_next_voice:
 			move[1] = e->velocity[1] * dt;
 			move[2] = e->velocity[2] * dt;
 
-			//riders are decided against the pre-step position, as SV_PushMove
-			//does
-			if (player_org && hl_ent_player >= 0)
-				rides = HLEntPlayerRides(i, e, player_org);
-
-			//ride trace: sampled here, ahead of the yaw_delta consume below
-			if (hl_ride_log && e->ent_class == HLC_TRACKTRAIN)
-			{
-				hl_ride_rides     = 0;
-				hl_ride_yaw_delta = e->yaw_delta;
-
-				if (rides)
-					hl_ride_rides = 1;
-			}
-
 			e->origin[0] += move[0];
 			e->origin[1] += move[1];
 			e->origin[2] += move[2];
 
 			HLEntSetAbsBox(e);
-
-			//SV_PushMove displaces what the pusher has swept into before it
-			//decides anything is blocking. player_org is the shell's hl_origin
-			//and HLEntFrame runs ahead of the player's move, so the write
-			//lands this tick.
-			pushed = HLEntPushPlayer(map, i, e, move, player_org);
-
-			//Inside it and nowhere to go. The rider exemption below is for a
-			//box being carried, not a box being crushed, so the block test has
-			//to see this one.
-			if (pushed == HLPUSHP_STUCK)
-				rides = FALSE;
-
-			if (rides)
-			{
-				//The rider is carried by base velocity, not by writing its
-				//origin. pm_shared adds basevelocity before the move and
-				//subtracts it after, so the carry is clipped by the world like
-				//any other motion and cannot fight the duck's 18-unit origin
-				//shift.
-				hl_platform_active = TRUE;
-
-				hl_platform_velocity[0] = e->velocity[0];
-				hl_platform_velocity[1] = e->velocity[1];
-				hl_platform_velocity[2] = e->velocity[2];
-
-				HLVecCopy(e->origin, hl_platform_pivot);
-
-				//SV_PushRotate's angular term, as a rate:
-				//HLPMPlatformBaseVelocity evaluates v + w x r at the rider's
-				//own position.
-				//
-				//Both sources are summed. avelocity is the continuous one a
-				//tracktrain and every rotating brush turn on; yaw_delta is the
-				//banked discrete step a mover that repositions its angles
-				//without an angular velocity leaves behind.
-				hl_platform_avel_z = e->avelocity[1];
-
-				if (dt > 0.0)
-					hl_platform_avel_z += e->yaw_delta / dt;
-			}
-
-			//Consumed whether or not anyone was riding: a banked delta would
-			//otherwise be applied to whoever stepped on next.
-			e->yaw_delta = 0.0;
 		}
+
+		//SV_PushMove and SV_PushRotate displace what the pusher has swept into
+		//before either decides anything is blocking. player_org is the shell's
+		//hl_origin and HLEntFrame runs ahead of the player's move, so the write
+		//lands this tick.
+		//
+		//oldorg/oldang are the pre-step placement, which is the rigid transform
+		//the rider is carried by. A turn is included, so a tram's rear wall
+		//sweeping through an arc resolves here rather than at the blocked
+		//method.
+		pushed = HLEntPushPlayer(map, i, e, oldorg, oldang, player_org);
+
+		//Inside it and nowhere to go. The rider exemption below is for a box
+		//being carried, not a box being crushed, so the block test has to see
+		//this one.
+		if (pushed == HLPUSHP_STUCK)
+			rides = FALSE;
+
+		if (rides)
+		{
+			//The rider is carried by base velocity, not by writing its origin.
+			//pm_shared adds basevelocity before the move and subtracts it
+			//after, so the carry is clipped by the world like any other motion
+			//and cannot fight the duck's 18-unit origin shift.
+			hl_platform_active = TRUE;
+
+			hl_platform_velocity[0] = e->velocity[0];
+			hl_platform_velocity[1] = e->velocity[1];
+			hl_platform_velocity[2] = e->velocity[2];
+
+			HLVecCopy(e->origin, hl_platform_pivot);
+
+			//SV_PushRotate's angular term, as a rate:
+			//HLPMPlatformBaseVelocity evaluates v + w x r at the rider's own
+			//position.
+			//
+			//Both sources are summed. avelocity is the continuous one a
+			//tracktrain and every rotating brush turn on; yaw_delta is the
+			//banked discrete step a mover that repositions its angles without
+			//an angular velocity leaves behind.
+			//
+			//hl_platform_yaw_carry is derived from this in HLClip.ZC during the
+			//player's own move, which runs after this pass in the same tick: the
+			//view spin and the body displacement land on the same edge.
+			hl_platform_avel_z = e->avelocity[1];
+
+			if (dt > 0.0)
+				hl_platform_avel_z += e->yaw_delta / dt;
+		}
+
+		//Consumed whether or not anyone was riding: a banked delta would
+		//otherwise be applied to whoever stepped on next.
+		e->yaw_delta = 0.0;
 
 		//A swinging door blocks too, so this is outside the linear branch. The
 		//blocked method may reverse this mover and its group; a peer later in
