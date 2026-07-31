@@ -370,6 +370,24 @@ I64	hl_light_clamped	= 0;
 I64 hl_dlight_frame	= 0;
 I64 hl_ambient_light	= 0;		//r_refdef.ambientlight
 
+//dlight origins in the space of the brush entity currently being drawn.
+//
+//A BSP submodel's faces, planes and texinfo all stay in the space the brush was
+//authored in; the entity's origin and angles are applied at draw time. So the
+//light is carried into that space rather than the geometry pushed into the
+//world, which is what R_DrawBrushModel does. Off during the world pass, where
+//the two spaces are the same.
+F64	hl_dlight_mspace[HLMAX_DLIGHTS * 3];
+Bool	hl_dlight_mspace_on	= FALSE;
+
+F64 *HLDlightOrigin(I64 i)
+{//the origin to light and to key the surface cache with
+	if (hl_dlight_mspace_on)
+		return &hl_dlight_mspace[i * 3];
+
+	return hl_dlight[i].origin;
+}
+
 //lightstyle the last R_LightPoint sample landed on, -1 when no lit face was
 //found. A cache of the sample has to know which style animates it - see
 //HLEntLightPoint
@@ -393,6 +411,7 @@ U0 HLLightInit()
 	hl_dlight_any  = FALSE;
 	hl_dlight_count = 0;
 	hl_dlight_frame = 0;
+	hl_dlight_mspace_on = FALSE;
 	hl_ambient_light = 0;
 	hl_light_last  = 0.0;
 	hl_light_time  = 0.0;
@@ -643,11 +662,92 @@ qpd_next:
 	}
 }
 
+//scratch light, in the space of the submodel being marked. A global: a
+//class-typed declaration inside a nested block faults on this compiler
+CHLDlight hl_dlight_scratch;
+
+U0 HLMarkLightsModel(CHLMap *map, CHLModel *bm, F64 *origin, F64 *xform)
+{//R_DrawBrushModel's dlight pass, gl_rsurf.c. A submodel's faces hang off its
+ //own head_node, and the world descent from node 0 never reaches them, so
+ //without this no dynamic light lands on a door, a platform or a tram.
+ //
+ //origin is the entity's world position and xform its model->world 3x4, either
+ //may be NULL. Both spaces coincide for a brush that has neither.
+ //
+ //Fills hl_dlight_mspace for every live light, not only the ones that mark:
+ //HLLightAddDynamic and HLSurfLightKey index it by light number off
+ //f->dlight_bits, which can carry a mark this call declined to make
+	F64	 lmins[3];
+	F64	 lmaxs[3];
+	F64	 d;
+	F64	 near_d;
+	I64	 i;
+	I64	 j;
+	Bool descend;
+
+	if (!hl_r_dynamic || !map || !bm)
+		return;
+
+	//head_node[0] of models[0] is the world root, which HLPushDlights already
+	//walked; descending it once per brush entity is the whole world tree each
+	//time. The origins are still needed - the world's own faces carry marks
+	descend = ToBool(bm != &map->models[0] &&
+		bm->head_node[0] >= 0 && bm->head_node[0] < map->num_nodes);
+
+	//the submodel's own extent, in its own space
+	HLVecCopy(bm->mins, lmins);
+	HLVecCopy(bm->maxs, lmaxs);
+
+	for (i = 0; i < hl_dlight_count && i < HLMAX_DLIGHTS; i++)
+	{
+		if (xform)
+			HLMatTransformInv(hl_dlight[i].origin, xform,
+				&hl_dlight_mspace[i * 3]);
+		else if (origin)
+			HLVecSub(hl_dlight[i].origin, origin, &hl_dlight_mspace[i * 3]);
+		else
+			HLVecCopy(hl_dlight[i].origin, &hl_dlight_mspace[i * 3]);
+
+		if (!descend)
+			goto qmlm_next;
+
+		if (hl_dlight[i].die <= hl_light_time || hl_dlight[i].radius <= 0.0)
+			goto qmlm_next;
+
+		//sphere against the box, before any node descent: most brush entities
+		//in a map are nowhere near the flashlight
+		near_d = 0.0;
+
+		for (j = 0; j < 3; j++)
+		{
+			d = 0.0;
+
+			if (hl_dlight_mspace[i * 3 + j] < lmins[j])
+				d = lmins[j] - hl_dlight_mspace[i * 3 + j];
+			else if (hl_dlight_mspace[i * 3 + j] > lmaxs[j])
+				d = hl_dlight_mspace[i * 3 + j] - lmaxs[j];
+
+			near_d += d * d;
+		}
+
+		if (near_d >= hl_dlight[i].radius * hl_dlight[i].radius)
+			goto qmlm_next;
+
+		MemCopy(&hl_dlight_scratch, &hl_dlight[i], sizeof(CHLDlight));
+		HLVecCopy(&hl_dlight_mspace[i * 3], hl_dlight_scratch.origin);
+
+		HLMarkLights(map, &hl_dlight_scratch, 1 << i, bm->head_node[0]);
+
+qmlm_next:
+	}
+}
+
 U0 HLLightAddDynamic(CHLMap *map, CHLFace *f, I64 lm_w, I64 lm_h, F64 time)
 {//R_AddDynamicLights - fold every light touching this face into the acc
 	CHLDlight	*d;
 	CHLPlane		*plane;
 	CHLTexInfo	*ti;
+	F64			*dorg;
 	F64			 impact[3];
 	F64			 local_s;
 	F64			 local_t;
@@ -685,8 +785,11 @@ U0 HLLightAddDynamic(CHLMap *map, CHLFace *f, I64 lm_w, I64 lm_h, F64 time)
 		if (d->die <= time || d->radius <= 0.0)
 			goto qad_next;
 
+		//the face's plane and texinfo are in the brush's own space
+		dorg = HLDlightOrigin(lnum);
+
 		//distance off the plane - a back side face has its normal flipped
-		dist = HLVecDot(d->origin, plane->normal) - plane->dist;
+		dist = HLVecDot(dorg, plane->normal) - plane->dist;
 		if (f->side)
 			dist = -dist;
 
@@ -706,9 +809,9 @@ U0 HLLightAddDynamic(CHLMap *map, CHLFace *f, I64 lm_w, I64 lm_h, F64 time)
 		for (j = 0; j < 3; j++)
 		{
 			if (f->side)
-				impact[j] = d->origin[j] + plane->normal[j] * dist;
+				impact[j] = dorg[j] + plane->normal[j] * dist;
 			else
-				impact[j] = d->origin[j] - plane->normal[j] * dist;
+				impact[j] = dorg[j] - plane->normal[j] * dist;
 		}
 
 		local_s = HLVecDot(impact, &ti->vecs[0]) + ti->vecs[3] - f->mins_s;
@@ -1709,6 +1812,7 @@ I64 HLTexWrap(I64 v, I64 n)
 I64 HLSurfLightKey(CHLFace *f)
 {//any change here means rebuild
 	CHLDlight	*d;
+	F64			*o;
 	I64			 key = 0;
 	I64			 j;
 
@@ -1741,13 +1845,18 @@ I64 HLSurfLightKey(CHLFace *f)
 			if (!(f->dlight_bits & (1 << j)))
 				goto qslk_next;
 
-			d   = &hl_dlight[j];
+			d = &hl_dlight[j];
+
+			//model space on a brush entity, so a tram moving under a fixed
+			//light rebuilds and a stationary door under one does not
+			o = HLDlightOrigin(j);
+
 			key = key * 31 +
-				ToI64(d->origin[0] / HLDLIGHT_KEY_QUANT);
+				ToI64(o[0] / HLDLIGHT_KEY_QUANT);
 			key = key * 31 +
-				ToI64(d->origin[1] / HLDLIGHT_KEY_QUANT);
+				ToI64(o[1] / HLDLIGHT_KEY_QUANT);
 			key = key * 31 +
-				ToI64(d->origin[2] / HLDLIGHT_KEY_QUANT);
+				ToI64(o[2] / HLDLIGHT_KEY_QUANT);
 			key = key * 31 +
 				ToI64(d->radius / HLDLIGHT_KEY_QUANT);
 			key = key * 31 + d->color[0];
@@ -3244,6 +3353,14 @@ U0 HLDrawBrushModel(CHLCanvas *c, CHLMap *map, I64 model_index,
 
 	m = &map->models[model_index];
 
+	//R_DrawBrushModel marks dlights against the submodel's own nodes. The world
+	//descent in HLPushDlights starts at node 0 and cannot reach these faces, so
+	//this is the whole of a mover's dynamic lighting. hl_dlight_mspace_on stays
+	//up for the face loop: HLLightAddDynamic and HLSurfLightKey both read the
+	//model-space origins it left behind
+	HLMarkLightsModel(map, m, origin, xform);
+	hl_dlight_mspace_on = hl_r_dynamic;
+
 	//no face culling: a rotated submodel has no world-space face plane to test
 	//against
 	for (i = 0; i < m->num_faces; i++)
@@ -3252,6 +3369,8 @@ U0 HLDrawBrushModel(CHLCanvas *c, CHLMap *map, I64 model_index,
 			HLDrawFace(c, map, m->first_face + i, ofs, ent_frame, xform,
 				blend, amt);
 	}
+
+	hl_dlight_mspace_on = FALSE;
 }
 
 U0 HLDrawFadeScreen(CHLCanvas *c)
