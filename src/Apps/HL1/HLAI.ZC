@@ -9,9 +9,9 @@
 // and the frame function here does the work.
 //
 // Second half of the file: monster state machine, task/schedule interpreter,
-// sensing through the CLASS_* relationship matrix, attacks and death. There is
-// no node graph in this tree, so movement is straight at the goal with a wall
-// slide and a monster will not go round a corner.
+// sensing through the CLASS_* relationship matrix, attacks and death.
+// Movement is straight at the goal, then a triangulated detour, then the map's
+// node graph loaded from maps/graphs/<map>.nod.
 
 //--- sentences --------------------------------------------------------------
 //
@@ -766,11 +766,10 @@ F64 HLAIEntityCycle(CHLEntity *e)
 //Move() answers a failed local move with TaskFail (monsters.cpp:1917 and
 //:1925). In MONSTERSTATE_SCRIPT that reselects SCHED_AISCRIPT, which hands back
 //slWalkToScript (defaultai.cpp:1076), so the SDK restarts the walk and retries
-//for as long as the map runs - it has a node graph to route around whatever
-//stopped it. There is none here, so a straight line the mover cannot walk
-//stalls every script sharing the group's DelayStart count. Retrying for this
-//long and then planting keeps the level moving; every plant is a routing
-//failure and prints under scriptlog.
+//for as long as the map runs. The node graph covers most of what used to stall
+//here; a mark off the graph, or on a map with no .nod, still cannot be walked
+//to. Retrying for this long and then planting keeps the level moving; every
+//plant is a routing failure and prints under scriptlog.
 #define HLAI_CINE_WALK_GIVEUP	6.0
 
 //--- combat AI --------------------------------------------------------------
@@ -807,13 +806,15 @@ F64 HLAIEntityCycle(CHLEntity *e)
 //
 // Not implemented, and the consequence of each:
 //
-//   - No node graph. HL routes every monster move through the map's info_node
-//     network (nodes.cpp, CGraph::FindShortestPath) built by a separate
-//     compile step; this tree has neither the graph nor the .nod files.
-//     Movement here is straight at the goal with one wall-slide retry and a
-//     floor probe that refuses a step off a ledge. A monster will not go round
-//     a corner: it grinds along the wall between it and its enemy until the
-//     enemy steps into the open. The slide is not routing.
+//   - The node graph is loaded, not built, and the route is acquired lazily.
+//     CBaseMonster::BuildRoute lays the whole route at task start and
+//     TASK_GET_PATH_TO_* fails when no route exists (monsters.cpp:751); here
+//     the path tasks only record the goal and the mover asks for nodes at the
+//     point BuildRoute would - after a straight line and a triangulated
+//     detour have both failed. The consequence is that a monster commits to
+//     an unreachable goal for one lookahead interval before the route search
+//     runs, rather than choosing a different schedule outright.
+//     disposal.bsp ships no .nod and falls back to straight-line movement.
 //
 //   - No FL_MONSTERCLIP. SOLID_SLIDEBOX entities clip each other and the
 //     player through HLEntClipToSlideboxes, but func_monsterclip brushes are
@@ -1437,6 +1438,665 @@ F64	hl_ai_grunt_buckshot;
 //food on another z-plane is ignored, roach.cpp:262
 #define HLRCH_FOOD_Z			3.0
 
+//--- node graph, dlls/nodes.cpp ---------------------------------------------
+//
+// CGraph. GoldSrc collects the map's info_node and info_node_air entities at
+// first load, links them with hull-by-hull sweeps, computes the routing
+// tables and writes maps/graphs/<map>.nod. The file is loaded here and never
+// built: valve/maps/graphs ships one for every shipped map that carries nodes
+// except disposal.bsp, and building it would reproduce the file already on
+// disk from an O(n^2) sweep over every node pair.
+//
+// Measured over the 125 shipped maps: 5301 info_node and 261 info_node_air,
+// most in c2a3d.bsp at 239. The 95 shipped .nod files carry 5554 nodes, which
+// is the entity total less disposal.bsp's 8 - graph and entity counts agree
+// map for map. Largest link pool is c2a3d.bsp at 2408.
+//
+// Rebuilding rather than loading was rejected on two counts. The graph needs
+// the whole move stack - LinkVisibleNodes traces four hulls across every node
+// pair and RejectInlineLinks then walks the survivors - and the result would
+// have to be cached back to disk to be affordable, which the shipped read-only
+// game tree does not invite. CheckNODFile compares the .bsp and .nod
+// modification times to decide whether the cache is stale; both files here are
+// retail and immutable, so the comparison has no work to do and is not ported.
+//
+// File layout, GRAPH_VERSION 16, a 32 bit x86 struct dump. Offsets verified
+// against the shipped files: predicted and actual lengths agree for all 95.
+//
+//   0        I32    version, 16
+//   4        8396   CGraph, of which +24 m_cNodes, +28 m_cLinks,
+//                   +32 m_nRouteInfo, +8384 m_nHashLinks
+//   8400     88*n   CNode
+//   ...      24*l   CLink
+//   ...      16*n   DIST_INFO, m_nRouteInfo bytes, 2*m_nHashLinks bytes
+//
+//   CNode   0 origin[3] f32, 12 originPeek[3] f32, 24 Region[3] u8,
+//           28 afNodeInfo, 32 cNumLinks, 36 iFirstLink,
+//           40 pNextBestNode[4][2], 72 flClosestSoFar, 76 iPreviousNode,
+//           80 sHintType i16, 82 sHintActivity i16, 84 flHintYaw f32
+//   CLink   0 iSrcNode, 4 iDestNode, 8 pLinkEnt, 12 modelname[4] not NUL
+//           terminated, 16 afLinkInfo, 20 flWeight f32
+//
+// The trailing three blocks are read past. DIST_INFO and the region tables
+// make FindNearestNode constant time and the compressed routing table makes
+// NextNodeInRoute constant time; both are 1998 budget decisions. At 239 nodes
+// a linear scan and a Dijkstra over the same link weights answer identically.
+// pLinkEnt is a saved 32 bit pointer and is meaningful only as nonzero, which
+// is how FSetGraphPointers reads it.
+
+#define HLNODE_MAX				256		//239 in c2a3d.bsp, the largest shipped
+#define HLLINK_MAX				2560	//2408 in c2a3d.bsp
+#define HLNODE_VERSION			16		//GRAPH_VERSION, nodes.h:107
+#define HLNODE_HDR				8400	//4 + sizeof(CGraph)
+#define HLNODE_STRIDE			88		//sizeof(CNode)
+#define HLLINK_STRIDE			24		//sizeof(CLink)
+
+//bits_NODE_*, nodes.h:26-28
+#define HLNODE_LAND				1
+#define HLNODE_AIR				2
+#define HLNODE_WATER			4
+
+//bits_LINK_*, nodes.h:65-68
+#define HLLINK_SMALL			1
+#define HLLINK_HUMAN			2
+#define HLLINK_LARGE			4
+#define HLLINK_FLY				8
+
+//NODE_*_HULL, nodes.h:71-74
+#define HLHULL_SMALL			0
+#define HLHULL_HUMAN			1
+#define HLHULL_LARGE			2
+#define HLHULL_FLY				3
+
+//bits_CAP_*, cbase.h:590-593. Only the door group is read here
+#define HLCAP_USE				0x0040
+#define HLCAP_AUTO_DOORS		0x0100
+#define HLCAP_OPEN_DOORS		0x0200
+#define HLCAP_DOORS_GROUP		0x0340
+
+//SF_DOOR_NO_AUTO_RETURN, doors.h:24. HLSF_DOOR_USE_ONLY is HLEntity.ZC:2833
+#define HLAI_SF_DOOR_NO_RETURN	32
+
+//MAX_PATH_SIZE, cbase.h:29
+#define HLNODE_PATH_MAX			10
+
+//how close a node waypoint counts as reached. MONSTER_CUT_CORNER_DIST,
+//monsters.cpp:37, "8 means the monster's bounding box is contained within the
+//box of the node in WC"
+#define HLAI_NODE_TOL			8.0
+
+//how far the goal may drift before the route to it is discarded, world units
+#define HLAI_NODE_SLOP			128.0
+
+//floor under repeated route builds for one monster, seconds. A build is a
+//nearest-node search per endpoint plus a Dijkstra
+#define HLAI_NODE_REROUTE		0.5
+
+F64		hl_ai_node_org[HLNODE_MAX * 3];
+F64		hl_ai_node_peek[HLNODE_MAX * 3];
+I64		hl_ai_node_info[HLNODE_MAX];
+I64		hl_ai_node_nlink[HLNODE_MAX];
+I64		hl_ai_node_link0[HLNODE_MAX];
+
+I64		hl_ai_link_dest[HLLINK_MAX];
+I64		hl_ai_link_flags[HLLINK_MAX];
+F64		hl_ai_link_weight[HLLINK_MAX];
+
+//entity index of the brush that blocks this link, -1 for none. The file
+//carries a dead pointer and four characters of the brush model name;
+//HLAIGraphBind resolves the name the way FSetGraphPointers does
+I64		hl_ai_link_ent[HLLINK_MAX];
+U8		hl_ai_link_model[HLLINK_MAX * 5];
+
+I64		hl_ai_node_count  = 0;
+I64		hl_ai_link_count  = 0;
+Bool	hl_ai_graph_ready = FALSE;
+
+//the map hl_ai_graph_ready describes. A load failure leaves this set and the
+//flag clear, so a map with no graph is probed once rather than every tick
+U8		hl_ai_graph_map[96];
+
+//Dijkstra scratch. m_flClosestSoFar and m_iPreviousNode live in CNode in the
+//SDK; a loaded graph is read only here, so they are parallel arrays
+F64		hl_ai_node_dist[HLNODE_MAX];
+I64		hl_ai_node_prev[HLNODE_MAX];
+Bool	hl_ai_node_done[HLNODE_MAX];
+
+//per-route tracing into HL1LOG.TXT. No console binding; set it from HLTest or
+//the prompt
+Bool	hl_ai_graph_log = FALSE;
+
+U0 HLAIGraphReset()
+{//globals aren't zeroed and a declaration initialiser on one is unreliable
+	hl_ai_node_count   = 0;
+	hl_ai_link_count   = 0;
+	hl_ai_graph_ready  = FALSE;
+	hl_ai_graph_map[0] = 0;
+}
+
+HLAIGraphReset;
+
+U0 HLAIGraphBaseName(U8 *in, U8 *out)
+{//"maps/c1a0.bsp", "c1a0.bsp" and "c1a0" all reduce to "c1a0". hl_map_name
+ //holds whatever the caller of HLLoadMap passed, which is any of the three
+	I64 start = 0;
+	I64 end;
+	I64 i;
+	I64 n;
+
+	n = StrLen(in);
+
+	for (i = 0; i < n; i++)
+	{
+		if (in[i] == '/' || in[i] == '\\')
+			start = i + 1;
+	}
+
+	end = n;
+
+	if (end - start > 4)
+	{
+		if (in[end - 4] == '.')
+			end -= 4;
+	}
+
+	n = end - start;
+
+	if (n > 90)
+		n = 90;
+
+	for (i = 0; i < n; i++)
+		out[i] = in[start + i];
+
+	out[n] = 0;
+}
+
+Bool HLAIGraphLoad(U8 *base)
+{//CGraph::FLoadGraph, nodes.cpp:2317, reading only the node and link blocks
+	U8	*d;
+	U8	*p;
+	U8	 path[160];
+	U8	 line[160];
+	I64	 size = 0;
+	I64	 n;
+	I64	 l;
+	I64	 i;
+	I64	 j;
+	I64	 lbase;
+	I64	 off;
+	I64	 dest;
+
+	hl_ai_node_count = 0;
+	hl_ai_link_count = 0;
+
+	StrPrint(path, "maps/graphs/%s.nod", base);
+
+	d = HLFileLoad(path, &size);
+
+	if (!d)
+		return FALSE;
+
+	if (size < HLNODE_HDR + HLNODE_STRIDE)
+		goto qgl_bad;
+
+	if (HLRdI32(d) != HLNODE_VERSION)
+	{
+		StrPrint(line, "nodegraph: %s version %d, want %d\n", path,
+			HLRdI32(d), HLNODE_VERSION);
+		HLLog(line);
+		goto qgl_bad;
+	}
+
+	n = HLRdI32(d + 4 + 24);
+	l = HLRdI32(d + 4 + 28);
+
+	if (n <= 0 || l < 0)
+		goto qgl_bad;
+
+	lbase = HLNODE_HDR + HLNODE_STRIDE * n;
+
+	if (size < lbase + HLLINK_STRIDE * l)
+		goto qgl_bad;
+
+	//a map past the measured maxima loads its first HLNODE_MAX nodes and the
+	//links that fall inside them; a truncated graph routes worse than a full
+	//one and better than none
+	if (n > HLNODE_MAX)
+	{
+		StrPrint(line, "nodegraph: %s has %d nodes, capped at %d\n", path, n,
+			HLNODE_MAX);
+		HLLog(line);
+		n = HLNODE_MAX;
+	}
+
+	if (l > HLLINK_MAX)
+	{
+		StrPrint(line, "nodegraph: %s has %d links, capped at %d\n", path, l,
+			HLLINK_MAX);
+		HLLog(line);
+		l = HLLINK_MAX;
+	}
+
+	for (i = 0; i < n; i++)
+	{
+		p = d + HLNODE_HDR + HLNODE_STRIDE * i;
+
+		hl_ai_node_org[i * 3]      = HLRdF32(p);
+		hl_ai_node_org[i * 3 + 1]  = HLRdF32(p + 4);
+		hl_ai_node_org[i * 3 + 2]  = HLRdF32(p + 8);
+
+		hl_ai_node_peek[i * 3]     = HLRdF32(p + 12);
+		hl_ai_node_peek[i * 3 + 1] = HLRdF32(p + 16);
+		hl_ai_node_peek[i * 3 + 2] = HLRdF32(p + 20);
+
+		hl_ai_node_info[i]  = HLRdI32(p + 28);
+		hl_ai_node_nlink[i] = HLRdI32(p + 32);
+		hl_ai_node_link0[i] = HLRdI32(p + 36);
+	}
+
+	for (i = 0; i < l; i++)
+	{
+		p = d + lbase + HLLINK_STRIDE * i;
+
+		dest = HLRdI32(p + 4);
+
+		//a link into a node the cap dropped is dead; point it at itself so the
+		//search never leaves the loaded set
+		if (dest < 0 || dest >= n)
+			dest = HLRdI32(p);
+
+		if (dest < 0 || dest >= n)
+			dest = 0;
+
+		hl_ai_link_dest[i]   = dest;
+		hl_ai_link_flags[i]  = HLRdI32(p + 16);
+		hl_ai_link_weight[i] = HLRdF32(p + 20);
+
+		//nonzero pLinkEnt is the SDK's own "this link had a blocker when the
+		//graph was written", nodes.cpp:2574
+		if (HLRdU32(p + 8))
+			hl_ai_link_ent[i] = -2;
+		else
+			hl_ai_link_ent[i] = -1;
+
+		for (j = 0; j < 4; j++)
+			hl_ai_link_model[i * 5 + j] = p[12 + j];
+
+		hl_ai_link_model[i * 5 + 4] = 0;
+	}
+
+	//clamp the per-node link windows to what was loaded
+	for (i = 0; i < n; i++)
+	{
+		off = hl_ai_node_link0[i];
+
+		if (off < 0 || off >= l)
+		{
+			hl_ai_node_link0[i] = 0;
+			hl_ai_node_nlink[i] = 0;
+		}
+		else if (off + hl_ai_node_nlink[i] > l)
+			hl_ai_node_nlink[i] = l - off;
+	}
+
+	hl_ai_node_count = n;
+	hl_ai_link_count = l;
+
+	Free(d);
+
+	return TRUE;
+
+qgl_bad:
+	Free(d);
+
+	return FALSE;
+}
+
+U0 HLAIGraphBind()
+{//CGraph::FSetGraphPointers, nodes.cpp:2563. Resolve the four saved characters
+ //of each blocker's brush model name to an entity index.
+ //
+ //FL_GRAPHED is not set on the resolved entity: nothing here disables a link
+ //when its door is destroyed, so the flag has no reader.
+	CHLEntity	*e;
+	U8			 line[128];
+	I64			 i;
+	I64			 j;
+	I64			 miss = 0;
+
+	for (i = 0; i < hl_ai_link_count; i++)
+	{
+		if (hl_ai_link_ent[i] != -2)
+			goto qgb_next;
+
+		hl_ai_link_ent[i] = -1;
+
+		for (j = 0; j < hl_num_entities; j++)
+		{
+			e = HLEntGet(j);
+
+			if (!e)
+				goto qgb_next_ent;
+
+			//the saved name is at most four characters and the compare is
+			//exact, as FIND_ENTITY_BY_STRING's is against name[5]
+			if (!StrCompare(e->model_name, hl_ai_link_model + i * 5))
+			{
+				hl_ai_link_ent[i] = j;
+				goto qgb_next;
+			}
+
+qgb_next_ent:
+		}
+
+		//"Could not find model", nodes.cpp:2587: the brush was removed from
+		//the world after the graph was written
+		miss++;
+
+qgb_next:
+	}
+
+	if (miss && hl_ai_graph_log)
+	{
+		StrPrint(line, "nodegraph: %d link blockers unresolved\n", miss);
+		HLLog(line);
+	}
+}
+
+Bool HLAIGraphEnsure()
+{//load the graph for the map that is up, once. Registration order between the
+ //map loader and this file is not fixed, so the map name is the key
+	U8	base[96];
+	U8	line[160];
+
+	if (!StrCompare(hl_ai_graph_map, hl_map_name))
+		return hl_ai_graph_ready;
+
+	HLAIGraphReset;
+	HLStrCopy(hl_ai_graph_map, hl_map_name, 96);
+
+	if (!hl_map_name[0])
+		return FALSE;
+
+	HLAIGraphBaseName(hl_map_name, base);
+
+	if (!HLAIGraphLoad(base))
+	{
+		StrPrint(line, "nodegraph: %s has no graph, straight-line movement\n",
+			base);
+		HLLog(line);
+		return FALSE;
+	}
+
+	HLAIGraphBind;
+
+	hl_ai_graph_ready = TRUE;
+
+	StrPrint(line, "nodegraph: %s, %d nodes %d links\n", base,
+		hl_ai_node_count, hl_ai_link_count);
+	HLLog(line);
+
+	return TRUE;
+}
+
+Bool HLAILinkOpen(I64 link, I64 caps)
+{//CGraph::HandleLinkEnt with queryType NODEGRAPH_STATIC, nodes.cpp:1102.
+ //FindShortestPath is the only caller and always asks statically: "can this
+ //ever be handled", not "is it open now".
+ //
+ //Under STATIC the func_breakable arm returns TRUE unconditionally and the
+ //manual-door arm's NOMONSTERS test is bypassed, so the door cases collapse to
+ //"can open doors, or the door is parked open and stays that way".
+	CHLEntity	*e;
+	I64			 ent;
+
+	if (link < 0 || link >= hl_ai_link_count)
+		return FALSE;
+
+	ent = hl_ai_link_ent[link];
+
+	//no blocker recorded, or its brush is gone. "dead path ent", :1114,
+	//returns TRUE
+	if (ent < 0)
+		return TRUE;
+
+	e = HLEntGet(ent);
+
+	if (!e)
+		return TRUE;
+
+	if (!StrCompare(e->classname, "func_door") ||
+		!StrCompare(e->classname, "func_door_rotating"))
+	{
+		if (caps & HLCAP_OPEN_DOORS)
+			return TRUE;
+
+		//parked at the top with no auto return: it will still be open when the
+		//monster arrives
+		if (e->toggle_state == HLTS_AT_TOP &&
+			e->spawnflags & HLAI_SF_DOOR_NO_RETURN)
+			return TRUE;
+
+		return FALSE;
+	}
+
+	if (!StrCompare(e->classname, "func_breakable"))
+		return TRUE;
+
+	//"Unhandled Ent in Path", nodes.cpp:1166
+	return FALSE;
+}
+
+I64 HLAIFindNearestNode(F64 *org, I64 want_types)
+{//CGraph::FindNearestNode, nodes.cpp:869, plus CheckNode at :821. -1 is none.
+ //
+ //Deviation: the SDK narrows the search with m_RangeStart/m_RangeEnd over 256
+ //regions per axis and short-circuits on a hash of the query point. Both are
+ //skipped; the scan is linear over at most 239 nodes and applies the same two
+ //tests, nearest by distance to m_vecOriginPeek among those the point can
+ //trace to.
+	CHLTrace	tr;
+	F64			d[3];
+	F64			peek[3];
+	F64			zero[3];
+	F64			dist;
+	F64			best = 999999.0;
+	I64			near = -1;
+	I64			i;
+
+	if (!hl_ai_graph_ready || !hl_map)
+		return -1;
+
+	HLVecSet(zero, 0.0, 0.0, 0.0);
+
+	for (i = 0; i < hl_ai_node_count; i++)
+	{
+		if (!(hl_ai_node_info[i] & want_types))
+			goto qfnn_next;
+
+		peek[0] = hl_ai_node_peek[i * 3];
+		peek[1] = hl_ai_node_peek[i * 3 + 1];
+		peek[2] = hl_ai_node_peek[i * 3 + 2];
+
+		HLVecSub(org, peek, d);
+
+		dist = HLVecLength(d);
+
+		if (dist >= best)
+			goto qfnn_next;
+
+		//ignore_monsters: a body standing on a node must not hide it
+		HLTraceEntity(hl_map, org, peek, zero, zero, 0, TRUE, &tr);
+
+		if (tr.fraction < 1.0)
+			goto qfnn_next;
+
+		near = i;
+		best = dist;
+
+qfnn_next:
+	}
+
+	return near;
+}
+
+I64 HLAIFindShortestPath(I64 *path, I64 start, I64 dest, I64 hull, I64 caps)
+{//CGraph::FindShortestPath, nodes.cpp:1183. Node count written to path, 0 for
+ //no route.
+ //
+ //Deviation: the SDK takes the precomputed route when m_fRoutingComplete,
+ //walking NextNodeInRoute through the compressed table, and falls back to this
+ //search otherwise. The table is not loaded, so the search always runs. It is
+ //the same graph and the same weights, so the answer is the same route.
+ //
+ //Deviation: CQueuePriority is a binary heap capped at MAX_STACK_NODES, 100.
+ //Here the open set is a scan for the smallest unfinished distance, O(n^2) on
+ //at most 239 nodes, which removes the cap - the SDK's heap silently drops
+ //insertions past 100.
+	F64	weight;
+	F64	reach;
+	F64	best;
+	I64	hull_mask;
+	I64	at;
+	I64	link;
+	I64	to;
+	I64	i;
+	I64	count;
+	I64	total;
+
+	if (!hl_ai_graph_ready)
+		return 0;
+
+	if (start < 0 || start >= hl_ai_node_count)
+		return 0;
+
+	if (dest < 0 || dest >= hl_ai_node_count)
+		return 0;
+
+	if (start == dest)
+	{
+		path[0] = start;
+		path[1] = dest;
+		return 2;
+	}
+
+	hull_mask = HLLINK_HUMAN;
+
+	if (hull == HLHULL_SMALL)
+		hull_mask = HLLINK_SMALL;
+	else if (hull == HLHULL_LARGE)
+		hull_mask = HLLINK_LARGE;
+	else if (hull == HLHULL_FLY)
+		hull_mask = HLLINK_FLY;
+
+	for (i = 0; i < hl_ai_node_count; i++)
+	{
+		hl_ai_node_dist[i] = -1.0;
+		hl_ai_node_prev[i] = start;
+		hl_ai_node_done[i] = FALSE;
+	}
+
+	hl_ai_node_dist[start] = 0.0;
+
+	while (TRUE)
+	{
+		at   = -1;
+		best = 0.0;
+
+		for (i = 0; i < hl_ai_node_count; i++)
+		{
+			if (hl_ai_node_done[i])
+				goto qfsp_next_open;
+
+			if (hl_ai_node_dist[i] < -0.5)
+				goto qfsp_next_open;
+
+			if (at < 0 || hl_ai_node_dist[i] < best)
+			{
+				at   = i;
+				best = hl_ai_node_dist[i];
+			}
+
+qfsp_next_open:
+		}
+
+		if (at < 0)
+			goto qfsp_walked;
+
+		//straight line weights, so the first pop of the destination is final
+		if (at == dest)
+			goto qfsp_walked;
+
+		hl_ai_node_done[at] = TRUE;
+
+		for (i = 0; i < hl_ai_node_nlink[at]; i++)
+		{
+			link = hl_ai_node_link0[at] + i;
+
+			if (link < 0 || link >= hl_ai_link_count)
+				goto qfsp_next_link;
+
+			//"monster is too large to walk this connection", :1296
+			if ((hl_ai_link_flags[link] & hull_mask) != hull_mask)
+				goto qfsp_next_link;
+
+			if (!HLAILinkOpen(link, caps))
+				goto qfsp_next_link;
+
+			to     = hl_ai_link_dest[link];
+			weight = hl_ai_link_weight[link];
+			reach  = best + weight;
+
+			if (hl_ai_node_dist[to] < -0.5 ||
+				reach < hl_ai_node_dist[to] - 0.001)
+			{
+				hl_ai_node_dist[to] = reach;
+				hl_ai_node_prev[to] = at;
+			}
+
+qfsp_next_link:
+		}
+	}
+
+qfsp_walked:
+	if (hl_ai_node_dist[dest] < -0.5)
+		return 0;
+
+	//length the predecessor chain
+	total = 1;
+	at    = dest;
+
+	while (at != start)
+	{
+		at = hl_ai_node_prev[at];
+		total++;
+
+		if (total > hl_ai_node_count)
+			return 0;
+	}
+
+	count = total;
+
+	if (count > HLNODE_PATH_MAX)
+		count = HLNODE_PATH_MAX;
+
+	//keep the head of the chain, the leg nearest the monster: step back over
+	//the tail the cap drops, then fill forwards from the source. The SDK caps
+	//iNumPathNodes while walking out from the source and reaches the same set
+	at = dest;
+
+	for (i = 0; i < total - count; i++)
+		at = hl_ai_node_prev[at];
+
+	for (i = count - 1; i >= 0; i--)
+	{
+		path[i] = at;
+		at      = hl_ai_node_prev[at];
+	}
+
+	return count;
+}
+
 class CHLMonInfo
 {
 	U8	classname[32];		//monster_* entity classname
@@ -1563,11 +2223,24 @@ class CHLMonState
 	F64		stuck_since;
 
 	//FTriangulate's apex, monsters.cpp:1901-1903. m_Route holds ROUTE_SIZE
-	//waypoints and InsertWaypoint pushes the apex in front of the goal; with no
-	//node graph the route is never longer than one detour plus the goal, so it
-	//is one slot rather than an array.
+	//waypoints and InsertWaypoint pushes the apex in front of the goal. The
+	//apex is one slot; the node route below is the rest of m_Route.
 	Bool	have_detour;
 	F64		detour[3];
+
+	//FGetNodeRoute's iPath, monsters.cpp:2790. Node indices into the loaded
+	//graph, walked in order and then the goal itself, which is what
+	//FGetNodeRoute appends past the last node it copied. route_len 0 is no
+	//route and the mover heads straight at the goal.
+	I64		route_len;
+	I64		route_at;
+	I64		route_node[HLNODE_PATH_MAX];
+
+	//the goal the route was built for, and when. A goal that has moved further
+	//than HLAI_NODE_SLOP invalidates the route: TASK_GET_PATH_TO_ENEMY re-aims
+	//at the enemy every tick and the nodes behind it go stale with it
+	F64		route_for[3];
+	F64		route_time;
 
 	//next CheckLocalMove lookahead, on CBaseMonster::MonsterThink's own 0.1s
 	//cadence. The lookahead walks 200 units in 16-unit hops and each hop is
@@ -3157,6 +3830,233 @@ U0 HLAIMonTableInit()
 	HLAIMonHull(HLMON_GENERIC, 16.0, 72.0, 52.0);
 }
 
+//--- node routing, per monster ----------------------------------------------
+
+I64 HLAIMonCaps(I64 kind)
+{//m_afCapability, set in each Spawn(). Only the door group is read by the node
+ //search, so only that is carried.
+ //
+ //barney.cpp:424, hgrunt.cpp:997, islave.cpp:540 and zombie.cpp:284 set
+ //bits_CAP_DOORS_GROUP; scientist.cpp:687 spells the same three bits out.
+ //agrunt.cpp:589, houndeye.cpp:346 and the rows with no assignment at all -
+ //headcrab, bullsquid, controller, cockroach, generic - carry none, so an
+ //alien is routed only through doorways that are already open.
+	if (kind == HLMON_BARNEY || kind == HLMON_HGRUNT ||
+		kind == HLMON_ISLAVE || kind == HLMON_ZOMBIE ||
+		kind == HLMON_SCIENTIST)
+		return HLCAP_DOORS_GROUP;
+
+	return 0;
+}
+
+I64 HLAIMonHullIndex(I64 kind)
+{//CGraph::HullIndex, nodes.cpp:442. Keyed on mins x, which is what the SDK
+ //compares: -12 headcrab, -16 VEC_HUMAN_HULL_MIN, -32 the big aliens. The
+ //cockroach's -1 matches nothing and takes the SDK's own fallback.
+	CHLMonInfo *mi;
+
+	if (kind < 0 || kind >= HLMON_COUNT)
+		return HLHULL_HUMAN;
+
+	mi = &hl_ai_mon_info[kind];
+
+	if (mi->flies)
+		return HLHULL_FLY;
+
+	if (mi->mins[0] > -12.5 && mi->mins[0] < -11.5)
+		return HLHULL_SMALL;
+
+	if (mi->mins[0] > -32.5 && mi->mins[0] < -31.5)
+		return HLHULL_LARGE;
+
+	return HLHULL_HUMAN;
+}
+
+I64 HLAIMonNodeType(I64 kind)
+{//CGraph::NodeType, nodes.cpp:459. Water level is not tracked per monster, so
+ //a flier takes air nodes and everything else land nodes; no shipped ground
+ //monster here swims.
+	if (kind >= 0 && kind < HLMON_COUNT)
+	{
+		if (hl_ai_mon_info[kind].flies)
+			return HLNODE_AIR;
+	}
+
+	return HLNODE_LAND;
+}
+
+U0 HLAIRouteClear(I64 s)
+{//RouteNew's node half, monsters.cpp:617.
+ //
+ //route_time is not touched: it is the rate limiter on the search itself and
+ //belongs to the monster, not to the route. Clearing it here would let a
+ //chase, which discards its route whenever the enemy moves, rebuild every
+ //think.
+	hl_ai_mon[s].route_len = 0;
+	hl_ai_mon[s].route_at  = 0;
+
+	HLVecSet(hl_ai_mon[s].route_for, 0.0, 0.0, 0.0);
+}
+
+Bool HLAINodeRoute(I64 s, F64 *dest)
+{//CBaseMonster::FGetNodeRoute, monsters.cpp:2790. Nearest node to the monster,
+ //nearest node to the destination, shortest path between them.
+ //
+ //The goal itself is not stored in route_node: HLAIWayPoint falls through to
+ //the goal once the nodes run out, which is what FGetNodeRoute's trailing
+ //bits_MF_IS_GOAL waypoint does.
+	CHLEntity	*e = HLEntGet(hl_ai_mon[s].ent);
+	U8			 line[160];
+	I64			 path[HLNODE_PATH_MAX];
+	I64			 types;
+	I64			 src_node;
+	I64			 dst_node;
+	I64			 found;
+	I64			 i;
+
+	if (!e)
+		return FALSE;
+
+	//parenthesised: a bare no-arg name yields its address in an expression
+	if (!HLAIGraphEnsure())
+		return FALSE;
+
+	//a build is two linear node scans with a trace each plus a Dijkstra. On a
+	//chase the goal moves every tick and the schedule would rebuild every tick.
+	//A stamp ahead of the clock is a map change: hl_ent_time restarts at zero.
+	//
+	//Tested before the route is discarded: a throttled call must leave the
+	//route it was asked to replace intact
+	if (hl_ai_mon[s].route_time > 0.0 &&
+		hl_ent_time >= hl_ai_mon[s].route_time &&
+		hl_ent_time - hl_ai_mon[s].route_time < HLAI_NODE_REROUTE)
+		return FALSE;
+
+	hl_ai_mon[s].route_time = hl_ent_time;
+
+	HLAIRouteClear(s);
+
+	types    = HLAIMonNodeType(hl_ai_mon[s].kind);
+	src_node = HLAIFindNearestNode(e->origin, types);
+
+	if (src_node < 0)
+		return FALSE;
+
+	dst_node = HLAIFindNearestNode(dest, types);
+
+	if (dst_node < 0)
+		return FALSE;
+
+	found = HLAIFindShortestPath(path, src_node, dst_node,
+		HLAIMonHullIndex(hl_ai_mon[s].kind),
+		HLAIMonCaps(hl_ai_mon[s].kind));
+
+	if (found <= 0)
+	{
+		if (hl_ai_graph_log)
+		{
+			StrPrint(line, "nodegraph: no path %d to %d for slot %d\n",
+				src_node, dst_node, s);
+			HLLog(line);
+		}
+
+		return FALSE;
+	}
+
+	for (i = 0; i < found; i++)
+		hl_ai_mon[s].route_node[i] = path[i];
+
+	hl_ai_mon[s].route_len = found;
+
+	//RouteNew, monsters.cpp:617: a new route supersedes the apex the old one
+	//was detouring around
+	hl_ai_mon[s].have_detour = FALSE;
+
+	//the node under the monster is the one it is standing on; walking to it
+	//first is a step backwards down the route
+	if (found > 1)
+		hl_ai_mon[s].route_at = 1;
+	else
+		hl_ai_mon[s].route_at = 0;
+
+	HLVecCopy(dest, hl_ai_mon[s].route_for);
+
+	if (hl_ai_graph_log)
+	{
+		StrPrint(line, "nodegraph: slot %d routed %d nodes, %d to %d\n", s,
+			found, src_node, dst_node);
+		HLLog(line);
+	}
+
+	return TRUE;
+}
+
+Bool HLAIRouteStale(I64 s)
+{//the route was built to route_for and the goal has moved off it. A chase
+ //re-aims at the enemy every tick, so without this the nodes lead to where
+ //the enemy was when the schedule started
+	F64 d[3];
+
+	if (hl_ai_mon[s].route_len <= 0)
+		return FALSE;
+
+	HLVecSub(hl_ai_mon[s].goal, hl_ai_mon[s].route_for, d);
+
+	return ToBool(HLVecLength(d) > HLAI_NODE_SLOP);
+}
+
+U0 HLAIWayPoint(I64 s, F64 *way, F64 *_tol)
+{//the point the mover is currently steering at, and how close counts as
+ //reached. m_Route[m_iRouteIndex], in precedence order: the triangulated apex,
+ //then the node route, then the goal
+	I64 node;
+
+	if (hl_ai_mon[s].have_detour)
+	{
+		HLVecCopy(hl_ai_mon[s].detour, way);
+		*_tol = HLAI_NODE_TOL;
+		return;
+	}
+
+	if (hl_ai_mon[s].route_len > 0 &&
+		hl_ai_mon[s].route_at < hl_ai_mon[s].route_len)
+	{
+		node = hl_ai_mon[s].route_node[hl_ai_mon[s].route_at];
+
+		if (node >= 0 && node < hl_ai_node_count)
+		{
+			way[0] = hl_ai_node_org[node * 3];
+			way[1] = hl_ai_node_org[node * 3 + 1];
+			way[2] = hl_ai_node_org[node * 3 + 2];
+
+			*_tol = HLAI_NODE_TOL;
+			return;
+		}
+	}
+
+	HLVecCopy(hl_ai_mon[s].goal, way);
+	*_tol = hl_ai_mon[s].goal_tol;
+}
+
+Bool HLAIAdvanceWay(I64 s)
+{//AdvanceRoute, monsters.cpp:768. FALSE when the goal itself was the waypoint
+ //that was reached, which is the end of the move
+	if (hl_ai_mon[s].have_detour)
+	{
+		hl_ai_mon[s].have_detour = FALSE;
+		return TRUE;
+	}
+
+	if (hl_ai_mon[s].route_len > 0 &&
+		hl_ai_mon[s].route_at < hl_ai_mon[s].route_len)
+	{
+		hl_ai_mon[s].route_at++;
+		return TRUE;
+	}
+
+	return FALSE;
+}
+
 U0 HLAIMonInit()
 {//globals aren't zeroed and a declaration initialiser on one is unreliable
 	I64 i;
@@ -3181,6 +4081,9 @@ U0 HLAIMonInit()
 		hl_ai_mon[i].path_start    = 0.0;
 		hl_ai_mon[i].stuck_since   = 0.0;
 		hl_ai_mon[i].have_detour   = FALSE;
+		hl_ai_mon[i].route_len     = 0;
+		hl_ai_mon[i].route_at      = 0;
+		hl_ai_mon[i].route_time    = 0.0;
 		hl_ai_mon[i].next_move_check = 0.0;
 		hl_ai_mon[i].ideal_yaw     = 0.0;
 		hl_ai_mon[i].next_attack   = 0.0;
@@ -3238,6 +4141,7 @@ U0 HLAIMonInit()
 		HLVecSet(hl_ai_mon[i].tur_goal, 0.0, 0.0, 0.0);
 
 		HLVecSet(hl_ai_mon[i].enemy_pos, 0.0, 0.0, 0.0);
+		HLVecSet(hl_ai_mon[i].route_for, 0.0, 0.0, 0.0);
 		HLVecSet(hl_ai_mon[i].goal, 0.0, 0.0, 0.0);
 		HLVecSet(hl_ai_mon[i].lastpos, 0.0, 0.0, 0.0);
 		HLVecSet(hl_ai_mon[i].heard_pos, 0.0, 0.0, 0.0);
@@ -3431,6 +4335,9 @@ U0 HLAIMonReset(I64 s)
 	hl_ai_mon[s].path_start    = 0.0;
 	hl_ai_mon[s].stuck_since   = 0.0;
 	hl_ai_mon[s].have_detour   = FALSE;
+	hl_ai_mon[s].route_len     = 0;
+	hl_ai_mon[s].route_at      = 0;
+	hl_ai_mon[s].route_time    = 0.0;
 	hl_ai_mon[s].next_move_check = 0.0;
 	hl_ai_mon[s].next_attack   = 0.0;
 	hl_ai_mon[s].next_look     = 0.0;
@@ -5231,50 +6138,48 @@ I64 HLAIMoveStep(I64 s, F64 speed, F64 dt)
 	F64			 sub;
 	F64			 moved;
 	I64			 local;
+	I64			 guard;
 
 	if (!e || !hl_map || !hl_ai_mon[s].have_goal)
 		return HLAI_MOVE_BLOCKED;
 
-	//m_Route reduced to the goal plus at most one detour. FTriangulate's apex
-	//is inserted in front of the goal, monsters.cpp:1901-1903
-	tol = hl_ai_mon[s].goal_tol;
+	//m_Route: the triangulated apex, then the node route, then the goal.
+	//FTriangulate's apex is inserted in front of the rest, monsters.cpp:
+	//1901-1903, and an apex or node is left behind at MONSTER_CUT_CORNER_DIST
+	//rather than at the task's own tolerance - which is 128 units for a
+	//follow, wide enough to skip the whole detour. monsters.cpp:37 and
+	//:1968-1977
+	//
+	//a route built for a goal that has since moved leads nowhere useful
+	if (HLAIRouteStale(s))
+		HLAIRouteClear(s);
 
-	if (hl_ai_mon[s].have_detour)
+	//AdvanceRoute, monsters.cpp:768: waypoints already behind the monster are
+	//consumed before the step is taken, however many of them there are
+	guard = 0;
+
+	while (TRUE)
 	{
-		HLVecCopy(hl_ai_mon[s].detour, way);
-
-		//an apex is a waypoint, not the destination, so it is left behind at
-		//MONSTER_CUT_CORNER_DIST rather than at the task's own tolerance -
-		//which is 128 units for a follow, wide enough to skip the detour
-		//entirely. monsters.cpp:37 and :1968-1977
-		tol = 8.0;
-	}
-	else
-		HLVecCopy(hl_ai_mon[s].goal, way);
-
-	HLVecSub(way, e->origin, dir);
-	dir[2] = 0.0;
-
-	dist = HLVecNormalize(dir);
-
-	if (dist <= tol)
-	{
-		if (!hl_ai_mon[s].have_detour)
-			return HLAI_MOVE_ARRIVED;
-
-		//AdvanceRoute: the apex is behind us, aim at the goal again this tick
-		hl_ai_mon[s].have_detour = FALSE;
-
-		HLVecCopy(hl_ai_mon[s].goal, way);
+		HLAIWayPoint(s, way, &tol);
 
 		HLVecSub(way, e->origin, dir);
 		dir[2] = 0.0;
 
 		dist = HLVecNormalize(dir);
 
-		if (dist <= hl_ai_mon[s].goal_tol)
+		if (dist > tol)
+			goto qms_have_way;
+
+		if (!HLAIAdvanceWay(s))
+			return HLAI_MOVE_ARRIVED;
+
+		guard++;
+
+		if (guard > HLNODE_PATH_MAX + 2)
 			return HLAI_MOVE_ARRIVED;
 	}
+
+qms_have_way:
 
 	ground = HLAIGroundSpeed(s, speed);
 
@@ -5302,13 +6207,13 @@ I64 HLAIMoveStep(I64 s, F64 speed, F64 dt)
 
 		if (local != HLAI_LM_VALID)
 		{
-			//nothing further to try: the SDK falls back to the node graph here
-			//and there is none
+			//BuildRoute's order, monsters.cpp:751-790: straight line, then
+			//triangulate around the obstruction, then last ditch the nodes
 			if (local == HLAI_LM_NOTRI)
-				return HLAI_MOVE_BLOCKED;
+				goto qms_try_nodes;
 
 			if (!HLAITriangulate(s, e->origin, way, hit, apex))
-				return HLAI_MOVE_BLOCKED;
+				goto qms_try_nodes;
 
 			hl_ai_mon[s].have_detour = TRUE;
 			HLVecCopy(apex, hl_ai_mon[s].detour);
@@ -5320,6 +6225,27 @@ I64 HLAIMoveStep(I64 s, F64 speed, F64 dt)
 
 			if (dist <= 0.0)
 				return HLAI_MOVE_BLOCKED;
+
+			goto qms_routed;
+
+qms_try_nodes:
+			//already on a node route and the leg to the next node is blocked:
+			//rebuilding is the only move left, and HLAINodeRoute's own
+			//interval keeps that from running every think
+			if (!HLAINodeRoute(s, hl_ai_mon[s].goal))
+				return HLAI_MOVE_BLOCKED;
+
+			HLAIWayPoint(s, way, &tol);
+
+			HLVecSub(way, e->origin, dir);
+			dir[2] = 0.0;
+
+			dist = HLVecNormalize(dir);
+
+			if (dist <= 0.0)
+				return HLAI_MOVE_BLOCKED;
+
+qms_routed:
 		}
 	}
 
@@ -6687,6 +7613,92 @@ I64 HLAIActToSDK(I64 act)
 	return -1;
 }
 
+I64 HLAISpreadLabel(I64 kind, CHLStudio *m, I64 act, I64 seq)
+{//A label-table hit that landed on a take sharing its activity with others.
+ //
+ //HLAIResolveActivity asks LookupActivity first and reaches the label table
+ //only when the model tags no take with the number HLAIActToSDK gave. Where
+ //the model files the take under a different activity, that number is the
+ //port's name for the behaviour rather than the animator's, and the weighted
+ //spread LookupActivity would have applied is lost. Measured over the 13
+ //monster models with a label table, five slots of 105 land here:
+ //
+ //   headcrab MELEE      jump, jump_variation1, jump_variation2   act 28 w2/1/1
+ //   houndeye COMBAT_IDLE madidle, madidle2, madidle3             act 47 w2/3/1
+ //   zombie   MELEE2     attack1, attack2                         act 30 w5/1
+ //   agrunt   MELEE2     mattack2, mattack3                       act 30 w1/1
+ //   agrunt   RANGE2     hornetattack, quickshoot, longshoot       act 28 w1/1/1
+ //
+ //The last three must not spread: the port separates MELEE from MELEE2 and
+ //RANGE from RANGE2 by naming the take, because the model files both under one
+ //activity, and spreading would make the two slots indistinguishable. The test
+ //for that is whether another slot of this monster names a take carrying the
+ //same activity.
+ //
+ //Weighting matches LookupActivity's running reservoir, animation.cpp:84-109.
+	U8	*label;
+	I64	 activity;
+	I64	 weight_total = 0;
+	I64	 count        = 0;
+	I64	 pick         = seq;
+	I64	 other;
+	I64	 a;
+	I64	 i;
+
+	if (!m || seq < 0 || seq >= m->num_seqs)
+		return seq;
+
+	activity = m->seqs[seq].activity;
+
+	if (activity <= 0)
+		return seq;
+
+	for (i = 0; i < m->num_seqs; i++)
+	{
+		if (m->seqs[i].activity == activity)
+			count++;
+	}
+
+	if (count < 2)
+		return seq;
+
+	//another slot claims one of these takes by name: the split is deliberate
+	for (a = 0; a < HLACT_COUNT; a++)
+	{
+		if (a == act)
+			goto qsl_next_act;
+
+		label = HLAIMonSeqOf(kind, a);
+
+		if (!label)
+			goto qsl_next_act;
+
+		other = HLStudioSeqByName(m, label);
+
+		if (other >= 0 && other < m->num_seqs &&
+			m->seqs[other].activity == activity)
+			return seq;
+
+qsl_next_act:
+	}
+
+	for (i = 0; i < m->num_seqs; i++)
+	{
+		if (m->seqs[i].activity != activity)
+			goto qsl_next_seq;
+
+		weight_total += m->seqs[i].act_weight;
+
+		if (!weight_total ||
+			(RandU32 % weight_total) < m->seqs[i].act_weight)
+			pick = i;
+
+qsl_next_seq:
+	}
+
+	return pick;
+}
+
 I64 HLAIResolveActivity(I64 s, I64 act)
 {//::LookupActivity first, the label table second. -1 when the model has
  //neither.
@@ -6745,7 +7757,12 @@ I64 HLAIResolveActivity(I64 s, I64 act)
 	if (!label)
 		return -1;
 
-	return HLStudioSeqByName(e->studio, label);
+	seq = HLStudioSeqByName(e->studio, label);
+
+	if (seq < 0)
+		return -1;
+
+	return HLAISpreadLabel(hl_ai_mon[s].kind, e->studio, act, seq);
 }
 
 U0 HLAISetActivity(I64 s, I64 act)
@@ -6940,6 +7957,7 @@ U0 HLAIStartTask(I64 s, I64 task, F64 data)
 			hl_ai_mon[s].move_speed    = 0.0;
 			hl_ai_mon[s].stuck_since   = 0.0;
 			hl_ai_mon[s].have_detour   = FALSE;
+			HLAIRouteClear(s);
 			HLAITaskComplete(s);
 			break;
 
@@ -6966,6 +7984,7 @@ U0 HLAIStartTask(I64 s, I64 task, F64 data)
 			hl_ai_mon[s].path_start    = hl_ent_time;
 			hl_ai_mon[s].stuck_since   = 0.0;
 			hl_ai_mon[s].have_detour   = FALSE;
+			HLAIRouteClear(s);
 
 			//stop short of the enemy rather than inside it: melee reach if it
 			//has one, otherwise 48 units
@@ -7004,6 +8023,7 @@ U0 HLAIStartTask(I64 s, I64 task, F64 data)
 			hl_ai_mon[s].path_start    = hl_ent_time;
 			hl_ai_mon[s].stuck_since   = 0.0;
 			hl_ai_mon[s].have_detour   = FALSE;
+			HLAIRouteClear(s);
 			HLAITaskComplete(s);
 			break;
 
@@ -7128,6 +8148,7 @@ U0 HLAIStartTask(I64 s, I64 task, F64 data)
 			hl_ai_mon[s].path_start    = hl_ent_time;
 			hl_ai_mon[s].stuck_since   = 0.0;
 			hl_ai_mon[s].have_detour   = FALSE;
+			HLAIRouteClear(s);
 			hl_ai_mon[s].in_cover      = TRUE;
 			HLAITaskComplete(s);
 			break;
@@ -7153,6 +8174,7 @@ U0 HLAIStartTask(I64 s, I64 task, F64 data)
 			hl_ai_mon[s].path_start    = hl_ent_time;
 			hl_ai_mon[s].stuck_since   = 0.0;
 			hl_ai_mon[s].have_detour   = FALSE;
+			HLAIRouteClear(s);
 			hl_ai_mon[s].in_cover      = TRUE;
 			HLAITaskComplete(s);
 			break;
@@ -7174,6 +8196,7 @@ U0 HLAIStartTask(I64 s, I64 task, F64 data)
 			hl_ai_mon[s].path_start    = hl_ent_time;
 			hl_ai_mon[s].stuck_since   = 0.0;
 			hl_ai_mon[s].have_detour   = FALSE;
+			HLAIRouteClear(s);
 			HLAITaskComplete(s);
 			break;
 
@@ -7192,6 +8215,7 @@ U0 HLAIStartTask(I64 s, I64 task, F64 data)
 			hl_ai_mon[s].path_start    = hl_ent_time;
 			hl_ai_mon[s].stuck_since   = 0.0;
 			hl_ai_mon[s].have_detour   = FALSE;
+			HLAIRouteClear(s);
 
 			//the facing task that follows turns toward the noise
 			hl_ai_mon[s].ideal_yaw =
@@ -7220,6 +8244,7 @@ U0 HLAIStartTask(I64 s, I64 task, F64 data)
 			hl_ai_mon[s].path_start    = hl_ent_time;
 			hl_ai_mon[s].stuck_since   = 0.0;
 			hl_ai_mon[s].have_detour   = FALSE;
+			HLAIRouteClear(s);
 			HLAITaskComplete(s);
 			break;
 
@@ -7378,6 +8403,7 @@ U0 HLAIStartTask(I64 s, I64 task, F64 data)
 			hl_ai_mon[s].path_start    = hl_ent_time;
 			hl_ai_mon[s].stuck_since   = 0.0;
 			hl_ai_mon[s].have_detour   = FALSE;
+			HLAIRouteClear(s);
 			hl_ai_mon[s].move_speed    = mi->walk_speed;
 
 			HLAISetActivity(s, HLACT_WALK);
@@ -7700,6 +8726,7 @@ U0 HLAIRunTask(I64 s, I64 task, F64 data, F64 dt)
 				hl_ai_mon[s].path_start  = hl_ent_time;
 				hl_ai_mon[s].stuck_since = 0.0;
 				hl_ai_mon[s].have_detour = FALSE;
+				HLAIRouteClear(s);
 			}
 
 			HLVecSub(hl_ai_mon[s].goal, e->origin, tdiff);
@@ -8226,6 +9253,7 @@ U0 HLAICinePossess(I64 self)
 		//a monster that was already grinding on geometry reports blocked on the
 		//script's first mover call and is planted on the mark instead of walking
 		hl_ai_mon[s].have_detour     = FALSE;
+		HLAIRouteClear(s);
 		hl_ai_mon[s].stuck_since     = 0.0;
 		hl_ai_mon[s].next_move_check = 0.0;
 
@@ -8313,6 +9341,22 @@ U0 HLAICineBeginPlay(I64 self)
 
 	actor = HLEntGet(t);
 	s     = hl_ai_mon_of[t];
+
+	//StartTask(TASK_PLAY_SCRIPT), schedule.cpp:1266-1271. The take owns the
+	//actor's origin for its duration, so the engine must not: MOVETYPE_FLY
+	//takes SV_Physics_Step's gravity and ground friction off it, and the
+	//FL_ONGROUND clear that follows stops the ground snap re-applying them.
+	//CineCleanup puts m_saved_movetype back, scripted.cpp:805, which
+	//HLAICineRelease already does from hl_ai_cine[self].movetype.
+	//
+	//Bookkeeping in this port rather than behaviour: no physics pass reads a
+	//monster's movetype here - the only readers of the field are the PUSH
+	//tests in HLEntity.ZC:12515 and :13141 - and there is no entity flags
+	//word, so the ClearBits(pev->flags, FL_ONGROUND) half has nothing to
+	//clear. 282 of the 512 scripted_sequence and aiscripted_sequence entities
+	//in valve/maps carry an m_iszPlay and reach this path.
+	if (actor)
+		actor->movetype = HLMOVETYPE_FLY;
 
 	//the end is scheduled off the sequence duration rather than watched on the
 	//renderer's cycle: the renderer does not run for an off-screen actor and
@@ -8411,6 +9455,7 @@ U0 HLAICineActorTick(I64 s, F64 dt)
 			//Reproduced by dropping the detour and the stuck timer and letting
 			//this block run again next tick.
 			hl_ai_mon[s].have_detour     = FALSE;
+			HLAIRouteClear(s);
 			hl_ai_mon[s].stuck_since     = 0.0;
 			hl_ai_mon[s].next_move_check = 0.0;
 
@@ -11310,6 +12355,7 @@ U0 HLAIRoachDest(I64 s, I64 mode)
 	hl_ai_mon[s].goal_is_enemy = FALSE;
 	hl_ai_mon[s].goal_tol      = 8.0;
 	hl_ai_mon[s].have_detour   = FALSE;
+	HLAIRouteClear(s);
 	hl_ai_mon[s].stuck_since   = 0.0;
 
 	//"every once in a while, a roach will play a skitter sound",
@@ -12503,6 +13549,11 @@ U0 HLAIMonsterFrame(F64 dt)
 	//read once per frame, not once per script tick: the trace is turned on with
 	//a level already running
 	hl_ai_script_log = ToBool(HLCvarGet("scriptlog") != 0.0);
+	hl_ai_graph_log  = ToBool(HLCvarGet("nodegraph") != 0.0);
+
+	//load the map's node graph here rather than on the first route request, so
+	//HLAIMonReport describes the map that is up. A no-op once the name matches
+	HLAIGraphEnsure();
 
 	if (!hl_ai_mon_count || !hl_map)
 		return;
@@ -12749,6 +13800,12 @@ U0 HLAIMonReport()
 
 	"HLAI: %d monsters tracked, %d dead, %d sounds in the world\n",
 		hl_ai_mon_count, hl_ai_mon_kills, live;
+
+	if (hl_ai_graph_ready)
+		"HLAI: node graph %s, %d nodes %d links\n", hl_ai_graph_map,
+			hl_ai_node_count, hl_ai_link_count;
+	else
+		"HLAI: no node graph for %s\n", hl_ai_graph_map;
 
 	for (i = 0; i < hl_ai_mon_count; i++)
 		HLAIMonReportOne(i);
