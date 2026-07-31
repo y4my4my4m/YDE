@@ -1192,6 +1192,20 @@ F64 HLAIEntityCycle(CHLEntity *e)
 //floor. 18 is HL's step height.
 #define HLAI_STEP_HEIGHT		18.0
 
+//DROP_TO_FLOOR's reach, pr_cmds.c: end[2] = origin[2] - 256. Distinct from
+//the step probe above - a mapper hangs a monster whatever height suits the
+//room and the engine settles it from there.
+#define HLAI_DROP_DIST			256.0
+
+//scientist.mdl's seated envelope, measured over sitlookleft, sitlookright,
+//sitscared, sitting2 and sitting3: the takes place the feet 35.07 below the
+//origin and the crown 22.48 above it, where every standing take of the same
+//model runs 0 to 71. UTIL_SetSize(-14,-14,0)-(14,14,36), scientist.cpp:1244,
+//describes a box that sits entirely above the seated model, so dropping on it
+//buries the figure. These are the numbers the drop uses instead.
+#define HLAI_SIT_MINZ			-35.07
+#define HLAI_SIT_MAXZ			22.48
+
 //a path task gives up after this long, or after this long making no progress
 #define HLAI_PATH_TIMEOUT		20.0
 #define HLAI_STUCK_TIME			0.8
@@ -1806,6 +1820,10 @@ class CHLTalkState
 	I64		talk_target;	//m_hTalkTarget
 	I64		follow;			//m_hTargetEnt, the follow leader
 	Bool	inited;			//TalkInit has run for this row
+
+	//CSittingScientist::Spawn's DROP_TO_FLOOR, scientist.cpp:1273. This class
+	//takes no AI slot, so hl_ai_mon[].settled cannot carry it
+	Bool	settled;
 };
 
 CHLTalkState	hl_ai_talk[HLENT_MAX];
@@ -1830,6 +1848,7 @@ U0 HLAITalkResetRow(I64 i)
 	hl_ai_talk[i].talk_target  = HLTLK_NOBODY;
 	hl_ai_talk[i].follow       = HLTLK_NOBODY;
 	hl_ai_talk[i].inited       = FALSE;
+	hl_ai_talk[i].settled      = FALSE;
 }
 
 //--- the world sound list ---------------------------------------------------
@@ -3532,10 +3551,12 @@ U0 HLAIMonRegisterAll()
  //gSkillData unconditionally and ignores the key.
 	CHLEntity	*e;
 	CHLMonInfo	*mi;
+	U8			*label;
 	F64			 aim[3];
 	I64			 i;
 	I64			 kind;
 	I64			 s;
+	I64			 seq;
 	I64			 w;
 
 	//HLConCvarCommand rejects a name that is not in the table, so the script
@@ -3627,7 +3648,63 @@ U0 HLAIMonRegisterAll()
 		//the parts of Spawn() the shared entity struct can carry
 		HLVecCopy(mi->mins, e->mins);
 		HLVecCopy(mi->maxs, e->maxs);
+
+		//CGenericMonster::Spawn, genericmonster.cpp:110-112: player.mdl and
+		//holo.mdl take the centred VEC_HULL, every other model the standing
+		//VEC_HUMAN_HULL. Both are authored around their middle - holo.mdl's
+		//takes run -36.5 to 37.5 and player.mdl's -36.1 to 37.2, against 0 to
+		//72 for every other studio monster - so on the standing hull the floor
+		//drop plants their waist on the ground. 33 of the 82 monster_generic in
+		//valve/maps wear holo.mdl.
+		//
+		//studiohdr_t::name at offset 8, which is the path studiomdl compiled
+		//from, not the mapper's key
+		if (kind == HLMON_GENERIC &&
+			(StrIMatch("holo.mdl", e->studio->name) ||
+			 StrIMatch("player.mdl", e->studio->name)))
+		{
+			HLVecSet(e->mins, -16.0, -16.0, -36.0);
+			HLVecSet(e->maxs, 16.0, 16.0, 36.0);
+		}
+
 		HLEntSetAbsBox(e);
+
+		//SetActivity(ACT_IDLE). HLEntSpawnOne leaves pev->sequence at 0 and
+		//sequence 0 is a walk take in scientist.mdl, hgrunt.mdl and
+		//bullsquid.mdl, an attack in controller.mdl and a run in roach.mdl, so
+		//a monster held on it walks or fires on the spot until some schedule
+		//first sets an activity. HLMON_GENERIC never runs one: HLAIMonThink
+		//returns above the state machine for that row, and 36 of the 82
+		//instances in valve/maps wear holo.mdl, scientist.mdl or barney.mdl,
+		//whose sequence 0 is a walk.
+		//
+		//HLAIResolveActivity is defined further down and ZealC is single-pass,
+		//so its two steps are repeated here: LookupActivity on ACT_IDLE, then
+		//the label table for the models that tag nothing.
+		seq = HLStudioLookupActivity(e->studio, 1);
+
+		if (seq < 0)
+		{
+			label = HLAIMonSeqOf(kind, HLACT_IDLE);
+
+			if (label)
+				seq = HLStudioSeqByName(e->studio, label);
+		}
+
+		//a model with neither keeps sequence 0: a ribcage carries one pose
+		if (seq >= 0)
+		{
+			e->seq              = seq;
+			e->anim_loop        = TRUE;
+			e->anim_done        = FALSE;
+			e->anim_event_frame = -1;
+			e->anim_start       = hl_ent_time;
+
+			//m_Activity is already HLACT_IDLE out of HLAIMonReset; recording
+			//the take with it is what keeps the first HLAISetActivity(IDLE)
+			//from re-rolling the weighted pick and restarting the cycle
+			hl_ai_mon[s].act_seq = seq;
+		}
 
 		e->health     = mi->health;
 		e->max_health = mi->health;
@@ -4728,6 +4805,44 @@ Bool HLAIDropToFloor(CHLEntity *e, F64 *pos, F64 *out)
 
 	//no floor inside a step and a fall of one more step: a ledge
 	if (tr.fraction >= 1.0)
+		return FALSE;
+
+	HLVecCopy(tr.end_pos, out);
+
+	return TRUE;
+}
+
+Bool HLAIDropToFloorHard(CHLEntity *e, F64 *mins, F64 *maxs, F64 *out)
+{//DROP_TO_FLOOR, pr_cmds.c PF_droptofloor, as CBaseMonster::MonsterInit runs
+ //it at monsters.cpp:2087. Raise one unit, sweep the box 256 straight down,
+ //take the endpoint.
+ //
+ //HLAIDropToFloor above is CheckLocalMove's ledge probe: it steps up 18 and
+ //falls 54, so it settles nothing the mapper hung higher than 36. 145 of the
+ //1313 ground monster instances in valve/maps sit further off their floor than
+ //that and stayed in the air.
+ //
+ //FALSE is the engine's 0 return - embedded at the start, or no floor inside
+ //the reach - and leaves the caller's position alone.
+ //
+ //mins and maxs are passed rather than read off the entity: the seated
+ //scientist traces against its pose, not against its clip box.
+	CHLTrace	tr;
+	F64			 start[3];
+	F64			 end[3];
+
+	if (!e || !hl_map)
+		return FALSE;
+
+	HLVecCopy(e->origin, start);
+	start[2] += 1.0;
+
+	HLVecCopy(start, end);
+	end[2] -= HLAI_DROP_DIST;
+
+	HLTraceEntity(hl_map, start, end, mins, maxs, 0, TRUE, &tr);
+
+	if (tr.all_solid || tr.start_solid || tr.fraction >= 1.0)
 		return FALSE;
 
 	HLVecCopy(tr.end_pos, out);
@@ -7898,7 +8013,7 @@ U0 HLAICineRelease(I64 self)
 	//is no bone query outside the renderer here, so only the drop is done.
 	if (!(script->spawnflags & HLAI_SF_NOSCRIPTMOVEMENT))
 	{
-		if (HLAIDropToFloor(actor, actor->origin, floor))
+		if (HLAIDropToFloorHard(actor, actor->mins, actor->maxs, floor))
 			HLVecCopy(floor, actor->origin);
 
 		HLEntSetAbsBox(actor);
@@ -7994,7 +8109,7 @@ U0 HLAICinePossess(I64 self)
 			hl_ai_mon[s].settled = TRUE;
 
 			if (!hl_ai_mon_info[hl_ai_mon[s].kind].flies &&
-				HLAIDropToFloor(actor, actor->origin, floor))
+				HLAIDropToFloorHard(actor, actor->mins, actor->maxs, floor))
 			{
 				HLVecCopy(floor, actor->origin);
 				HLEntSetAbsBox(actor);
@@ -8057,7 +8172,12 @@ U0 HLAICinePossess(I64 self)
 		else
 			HLAICineLog(self, "possess", left, 0.0);
 
-		if (script->ai_moveto != HLAI_MOVE_NONE)
+		//pev->angles.y is snapped in case 4 alone, scripted.cpp:371. 0 keeps the
+		//facing the mapper gave the actor; 5 is slFaceScript, TASK_FACE_SCRIPT
+		//setting ideal_yaw and TASK_FACE_IDEAL turning onto it at yaw_speed,
+		//which the HLSS_WAIT branch runs each tick. Snapping all of them spun
+		//355 of the 512 scripts in valve/maps on the frame they were possessed.
+		if (script->ai_moveto == HLAI_MOVE_INSTANT)
 			actor->angles[1] = HLAngleNorm(script->angles[1]);
 
 		//m_startTime = time + 1E6 on a teleport: a placed actor holds its idle
@@ -8066,8 +8186,17 @@ U0 HLAICinePossess(I64 self)
 			hl_ai_cine[self].start = HLAI_CINE_NEVER;
 	}
 
+	//TASK_FACE_SCRIPT, schedule.cpp:1293. Every script schedule but slWaitScript
+	//carries it, so the mark's yaw is the goal for 1, 2 and 5 and the actor's
+	//own facing is the goal for 0 and for the already-snapped 4.
 	if (s >= 0)
-		hl_ai_mon[s].ideal_yaw = actor->angles[1];
+	{
+		if (script->ai_moveto == HLAI_MOVE_NONE ||
+			script->ai_moveto == HLAI_MOVE_INSTANT)
+			hl_ai_mon[s].ideal_yaw = actor->angles[1];
+		else
+			hl_ai_mon[s].ideal_yaw = HLAngleNorm(script->angles[1]);
+	}
 
 	//m_iszIdle poses the actor now. The play take waits for the cue.
 	if (script->ai_idle[0])
@@ -9689,6 +9818,9 @@ U0 HLAISitScientistThink(I64 ent)
  //and no fighting: it sits, turns its head and speaks.
 	CHLEntity	*e = HLEntGet(ent);
 	F64			 point[3];
+	F64			 sitmins[3];
+	F64			 sitmaxs[3];
+	F64			 floor[3];
 	F64			 yaw;
 	I64			 roll;
 	I64			 who;
@@ -9701,6 +9833,37 @@ U0 HLAISitScientistThink(I64 ent)
 		return;
 
 	HLAITalkEnsure(ent);
+
+	//--- settle on the seat ---
+	//
+	//CSittingScientist::Spawn's DROP_TO_FLOOR, scientist.cpp:1273, done on the
+	//first think for the reason the monster settle is: HLEntity.ZC compiles
+	//first and cannot reach the trace.
+	//
+	//Deviation: the drop runs against the seated envelope, not against
+	//UTIL_SetSize's (-14,-14,0)-(14,14,36). Sequences 71 to 75 of
+	//scientist.mdl carry the model from 35.07 below the origin to 22.48 above
+	//it - the seated takes were authored in a different space from every
+	//standing take, which run 0 to 71 - so the SDK's box describes air above
+	//the figure's head and dropping on it drives the model through the floor.
+	//The shipped placements agree: the nine instances in valve/maps stand 41
+	//to 89 units clear of the floor beneath them, which is the seated model's
+	//own height plus the seat.
+	//
+	//e->mins and e->maxs are left alone; they are the class's clip box.
+	if (ent < HLENT_MAX && !hl_ai_talk[ent].settled)
+	{
+		hl_ai_talk[ent].settled = TRUE;
+
+		HLVecSet(sitmins, e->mins[0], e->mins[1], HLAI_SIT_MINZ);
+		HLVecSet(sitmaxs, e->maxs[0], e->maxs[1], HLAI_SIT_MAXZ);
+
+		if (HLAIDropToFloorHard(e, sitmins, sitmaxs, floor))
+		{
+			HLVecCopy(floor, e->origin);
+			HLEntSetAbsBox(e);
+		}
+	}
 
 	//eye contact is per tick; the rest is the SDK's own 0.1s think.
 	//
@@ -10274,7 +10437,10 @@ U0 HLAIRadiusDamage(F64 *src, F64 damage, F64 radius, I64 attacker,
 		HLTraceEntity(hl_map, from, spot, zero, zero, hl_move_pass, FALSE,
 			&tr);
 
-		if (tr.fraction < 1.0 && tr.ent != i)
+		//tr.ent is the progs edict a trace ended on and stays -1 with no VM;
+		//a native entity's index arrives in hl_trace_native_ent. Comparing
+		//tr.ent made every solid entity shield itself from the blast
+		if (tr.fraction < 1.0 && hl_trace_native_ent != i)
 			goto qard_next;
 
 		hurt = damage - dist * falloff;
@@ -11924,13 +12090,16 @@ U0 HLAIMonThink(I64 s, F64 dt)
 	//
 	//DROP_TO_FLOOR, as every CBaseMonster::Spawn does. Mappers place monsters a
 	//few units clear of the ground and nothing integrates gravity for a STEP
-	//entity here, so without this they hover for the whole level.
+	//entity here, so without this they hover for the whole level. The reach is
+	//256 units: measured over valve/maps, 145 ground instances stand further
+	//than 36 above their floor, which is all the step probe could cross.
 	if (!hl_ai_mon[s].settled)
 	{
 		hl_ai_mon[s].settled = TRUE;
 
 		//a MOVETYPE_FLY monster holds the height the mapper put it at
-		if (!mi->flies && HLAIDropToFloor(e, e->origin, e->origin))
+		if (!mi->flies &&
+			HLAIDropToFloorHard(e, e->mins, e->maxs, e->origin))
 			HLEntSetAbsBox(e);
 	}
 
