@@ -208,8 +208,8 @@ Grouped by what it would take, largest first.
   is flat-lit from `HLLightPoint` at the entity origin.
 - **Sprite and particle effects.** No gibs, no explosion sprites, no smoke, no
   glow/halo pass, no `env_sprite` animation.
-- **Detail textures**, water reflection, and the skybox is drawn by direction
-  rather than from the six `gfx/env` sides.
+- **Detail textures** and water reflection. The skybox draws the six `gfx/env`
+  faces; `day` and `dawn` ship none and fall back to `sv_skycolor`.
 
 ### Gameplay detail
 

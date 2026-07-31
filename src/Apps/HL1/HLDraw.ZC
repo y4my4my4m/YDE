@@ -17,6 +17,7 @@ Bool hl_r_drawentities = TRUE;
 Bool hl_r_drawsprites = TRUE;
 Bool hl_r_lightpoint  = TRUE;
 Bool hl_r_beams       = TRUE;
+Bool hl_r_drawsky     = TRUE;
 
 hl_r_decals       = TRUE;
 hl_r_dynamic      = TRUE;
@@ -24,6 +25,7 @@ hl_r_drawentities = TRUE;
 hl_r_drawsprites  = TRUE;
 hl_r_lightpoint   = TRUE;
 hl_r_beams        = TRUE;
+hl_r_drawsky      = TRUE;
 
 #define HLSCR_W			320
 #define HLSCR_H			240
@@ -1544,7 +1546,22 @@ I64 HLTextureAnimation(CHLMap *map, I64 miptex, I64 frame, F64 time)
 // with u = (s+1)/2 and v = (1-t)/2 across the image, v growing down the rows.
 // Checked against the shipped desert set: under this mapping every shared edge
 // of every face pair agrees to a mean per-channel error of 7 to 22 of 255,
-// against 67 to 85 for any other pairing, reversal or flip.
+// against 67 to 85 for any other pairing, reversal or flip. Sampling a great
+// circle in each coordinate plane, all twelve face crossings hold to a mean
+// per-channel jump of 2.0 to 4.8.
+//
+// Shipped data: 19 complete TGA sets under valve/gfx/env, 256x256, type 2
+// uncompressed 24bpp, bottom-left origin. 53 of the 125 maps set skyname over
+// 15 distinct values; "day" and "dawn", one map each, name no shipped set and
+// fall through to the solid colour. The other 72 maps take HLSKY_DEFAULT, and
+// only 49 maps carry a "sky" texture at all.
+//
+// The rest of movevars_t's sky fields (pm_movevars.h:37-42) come from
+// light_environment, not worldspawn: "_light" through qrad's gamma curve is
+// sv_skycolor_r/g/b (dlls/lights.cpp:150-177) and the entity's aim forward is
+// sv_skyvec_x/y/z (dlls/lights.cpp:186-197). 112 maps carry the entity.
+// skycolor is what a missing face draws; skyvec is parsed and unused - there
+// is no directional pass to feed it.
 
 #define HLSKY_FACES		6
 #define HLSKY_RT			0
@@ -1563,6 +1580,14 @@ I64	 hl_sky_h[HLSKY_FACES];
 U8	 hl_sky_name[64];			//loaded set, empty when none
 U32	 hl_sky_solid	= 0;			//sv_skycolor, drawn where a face is missing
 Bool hl_sky_ready	= FALSE;
+I64	 hl_sky_loaded	= 0;			//faces of the set that decoded, 0..6
+
+//movevars_t sky fields, pm_movevars.h:37-42. skycolor comes from
+//light_environment's "_light" (dlls/lights.cpp:150-177), skyvec from that
+//entity's aim forward (dlls/lights.cpp:186-197)
+F64	 hl_sky_vec[3];				//sv_skyvec_x/y/z, unit
+Bool hl_sky_color_set	= FALSE;	//a light_environment supplied skycolor
+Bool hl_sky_vec_set		= FALSE;
 
 //the map the loaded set belongs to. HLLoadMap frees the old CHLMap before
 //allocating the new one and the allocator reuses the address, so the pointer
@@ -1602,6 +1627,7 @@ U0 HLSkyFree()
 	}
 
 	hl_sky_ready   = FALSE;
+	hl_sky_loaded  = 0;
 	hl_sky_name[0] = 0;
 }
 
@@ -1617,10 +1643,17 @@ U0 HLSkyInit()
 	}
 
 	hl_sky_ready       = FALSE;
+	hl_sky_loaded      = 0;
 	hl_sky_name[0]     = 0;
 	hl_sky_solid       = 0;
 	hl_sky_map         = NULL;
 	hl_sky_map_name[0] = 0;
+
+	hl_sky_color_set = FALSE;
+	hl_sky_vec_set   = FALSE;
+	hl_sky_vec[0]    = 0.0;
+	hl_sky_vec[1]    = 0.0;
+	hl_sky_vec[2]    = -1.0;
 }
 
 //--- surface cache ----------------------------------------------------------
@@ -2763,10 +2796,27 @@ U0 HLSkyLoad(U8 *name)
 			ok++;
 	}
 
+	hl_sky_loaded = ok;
+
 	if (ok > 0)
 		hl_sky_ready = TRUE;
 	else
 		hl_sky_name[0] = 0;
+
+	//a set with no files at all is a data problem, not a map with no sky:
+	//worldspawn asked for it by name. say so once per map
+	if (ok == HLSKY_FACES)
+	{
+		"HLSky: %s, six faces\n", name;
+	}
+	else if (ok > 0)
+	{
+		"HLSky: %s, %d of 6 faces, rest solid\n", name, ok;
+	}
+	else
+	{
+		"HLSky: gfx/env/%s* not found, solid sky\n", name;
+	}
 }
 
 U0 HLSkySetColor(I64 r, I64 g, I64 b)
@@ -2774,50 +2824,294 @@ U0 HLSkySetColor(I64 r, I64 g, I64 b)
 	hl_sky_solid = (ClampI64(r, 0, 255) << 16) |
 				   (ClampI64(g, 0, 255) << 8) |
 					ClampI64(b, 0, 255);
+
+	hl_sky_color_set = TRUE;
 }
 
-U0 HLSkyNameFromMap(CHLMap *map, U8 *out, I64 max)
-{//worldspawn's "skyname" value out of the entity lump. empty when absent
+U0 HLSkyMeanColor()
+{//mean of the loaded faces, for a set that arrived without a light_environment
+ //
+ //every 32nd texel of every face: 256x256x6 is 393216 texels and the mean of
+ //12288 of them is within a unit of the full sum on the shipped sets
+	I64 r = 0;
+	I64 g = 0;
+	I64 b = 0;
+	I64 n = 0;
+	I64 face;
+	I64 i;
+	I64 total;
+	U32 *p;
+	U32 c;
+
+	for (face = 0; face < HLSKY_FACES; face++)
+	{
+		p = hl_sky_pix[face];
+		if (!p)
+			goto qsmc_next;
+
+		total = hl_sky_w[face] * hl_sky_h[face];
+
+		for (i = 0; i < total; i += 32)
+		{
+			c  = p[i];
+			r += (c >> 16) & 0xFF;
+			g += (c >> 8) & 0xFF;
+			b += c & 0xFF;
+			n++;
+		}
+
+qsmc_next:
+	}
+
+	if (n < 1)
+		return;
+
+	hl_sky_solid = ((r / n) << 16) | ((g / n) << 8) | (b / n);
+}
+
+I64 HLSkyTokens(U8 *s, F64 *out, I64 max)
+{//whitespace separated decimals, returns how many were found
+	U8	tok[64];
+	I64	i = 0;
+	I64	n = 0;
+	I64	k;
+
+	while (s[i] && n < max)
+	{
+		while (s[i] == ' ' || s[i] == '\t')
+			i++;
+
+		k = 0;
+		while (s[i] && s[i] != ' ' && s[i] != '\t' && k < 63)
+		{
+			tok[k] = s[i];
+			k++;
+			i++;
+		}
+		tok[k] = 0;
+
+		if (k < 1)
+			break;
+
+		out[n] = HLAtoF(tok);
+		n++;
+	}
+
+	return n;
+}
+
+U0 HLSkyLightColor(U8 *val)
+{//CEnvLight::KeyValue "_light", dlls/lights.cpp:150-177.
+ //
+ //One token is a grey level; four scale the triple by v/255. The result then
+ //takes qrad's direct/ambient/gamma curve, pow(c/114,0.6)*264, which is what
+ //reaches sv_skycolor_r/g/b - not the raw key
+	F64	v[4];
+	F64	r;
+	F64	g;
+	F64	b;
+	F64	s;
+	I64	n;
+
+	n = HLSkyTokens(val, v, 4);
+
+	if (n < 1)
+		return;
+
+	r = v[0];
+	g = r;
+	b = r;
+
+	if (n >= 3)
+	{
+		g = v[1];
+		b = v[2];
+	}
+
+	if (n >= 4)
+	{
+		s  = v[3] / 255.0;
+		r *= s;
+		g *= s;
+		b *= s;
+	}
+
+	//<= rather than <: "0 0 0 255" is a shipped value and HLAtoF returns a
+	//negative zero for "-0", which SYS_POW takes down the log path
+	if (r <= 0.0)	r = 0.0;
+	if (g <= 0.0)	g = 0.0;
+	if (b <= 0.0)	b = 0.0;
+
+	r = Pow(r / 114.0, 0.6) * 264.0;
+	g = Pow(g / 114.0, 0.6) * 264.0;
+	b = Pow(b / 114.0, 0.6) * 264.0;
+
+	HLSkySetColor(ToI64(r), ToI64(g), ToI64(b));
+}
+
+U0 HLSkySetVec(F64 pitch, F64 yaw, F64 roll)
+{//CEnvLight::Spawn, dlls/lights.cpp:186-197. UTIL_MakeAimVectors negates pitch
+ //before AngleVectors (dlls/util.cpp:602-608), so the stored angle and the
+ //aim direction differ in sign on x
+	F64 ang[3];
+
+	ang[0] = -pitch;
+	ang[1] = yaw;
+	ang[2] = roll;
+
+	HLAngleVectors(ang, hl_sky_vec, NULL, NULL);
+
+	hl_sky_vec_set = TRUE;
+}
+
+U0 HLSkyMoveVars(CHLMap *map, U8 *out_name, I64 max)
+{//the movevars_t sky fields out of the entity lump: skyname from worldspawn
+ //(dlls/world.cpp:674-677), skycolor and skyvec from light_environment
+ //(dlls/lights.cpp:150-197).
+ //
+ //Blocks are scanned whole rather than by key name alone: "classname" is the
+ //LAST key in a shipped block, so the class is known only at the closing brace
+ //and every key of interest has to be held until then.
+ //
+ //Of the 125 shipped maps 53 set skyname and 112 carry a light_environment;
+ //110 of those spell "_light" as four tokens and 2 as one
 	U8	*e;
+	U8	 key[64];
+	U8	 val[160];
+	U8	 cls[64];
+	U8	 light[160];
+	F64	 ang[3];
+	F64	 tmp[3];
 	I64	 n;
 	I64	 i;
-	I64	 j;
 	I64	 k;
+	Bool have_light;
+	Bool have_pitch;
 
-	out[0] = 0;
+	out_name[0] = 0;
+
+	hl_sky_color_set = FALSE;
+	hl_sky_vec_set   = FALSE;
 
 	if (!map || !map->entities || map->entities_size < 12)
 		return;
 
 	e = map->entities;
 	n = map->entities_size;
+	i = 0;
 
-	//the key is quoted, seven characters between the quotes
-	for (i = 0; i + 9 < n; i++)
+	while (i < n && e[i])
 	{
-		if (e[i] != '"' || e[i + 8] != '"')
-			goto qsn_next;
-		if (StrNICompare(&e[i + 1], "skyname", 7))
-			goto qsn_next;
-
-		j = i + 9;
-
-		while (j < n && e[j] != '"')
-			j++;
-		j++;
-
-		k = 0;
-		while (j < n && k < max - 1 && e[j] != '"')
+		if (e[i] != '{')
 		{
-			out[k] = e[j];
-			k++;
-			j++;
+			i++;
+			goto qsm_next_block;
 		}
 
-		out[k] = 0;
-		return;
+		i++;
 
-qsn_next:
+		cls[0]     = 0;
+		light[0]   = 0;
+		have_light = FALSE;
+		have_pitch = FALSE;
+		ang[0]     = 0.0;
+		ang[1]     = 0.0;
+		ang[2]     = 0.0;
+
+		while (i < n && e[i] && e[i] != '}')
+		{
+			if (e[i] != '"')
+			{
+				i++;
+				goto qsm_next_key;
+			}
+
+			i++;
+			k = 0;
+			while (i < n && e[i] && e[i] != '"')
+			{
+				if (k < 63)
+				{
+					key[k] = e[i];
+					k++;
+				}
+				i++;
+			}
+			key[k] = 0;
+			i++;
+
+			while (i < n && e[i] && e[i] != '"')
+				i++;
+			i++;
+
+			k = 0;
+			while (i < n && e[i] && e[i] != '"')
+			{
+				if (k < 159)
+				{
+					val[k] = e[i];
+					k++;
+				}
+				i++;
+			}
+			val[k] = 0;
+			i++;
+
+			if (!StrCompare(key, "classname"))
+				HLStrCopy(cls, val, 64);
+			else if (!StrCompare(key, "skyname"))
+				HLStrCopy(out_name, val, max);
+			else if (!StrCompare(key, "_light"))
+			{
+				HLStrCopy(light, val, 160);
+				have_light = TRUE;
+			}
+			else if (!StrCompare(key, "pitch"))
+			{
+				//CLight::KeyValue, dlls/lights.cpp:66. overrides angles[0]
+				ang[0]     = HLAtoF(val);
+				have_pitch = TRUE;
+			}
+			else if (!StrCompare(key, "angle"))
+			{
+				//the engine's own key: yaw only
+				ang[1] = HLAtoF(val);
+			}
+			else if (!StrCompare(key, "angles"))
+			{
+				//"pitch" wins whichever order the two arrive in
+				HLParseVec(val, tmp);
+
+				if (!have_pitch)
+					ang[0] = tmp[0];
+
+				ang[1] = tmp[1];
+				ang[2] = tmp[2];
+			}
+
+qsm_next_key:
+		}
+
+		if (i < n && e[i] == '}')
+			i++;
+
+		if (!StrCompare(cls, "light_environment"))
+		{
+			if (have_light)
+				HLSkyLightColor(light);
+
+			HLSkySetVec(ang[0], ang[1], ang[2]);
+		}
+
+qsm_next_block:
+	}
+
+	//straight down, the pitch -75 to -90 the shipped maps cluster around
+	if (!hl_sky_vec_set)
+	{
+		hl_sky_vec[0] = 0.0;
+		hl_sky_vec[1] = 0.0;
+		hl_sky_vec[2] = -1.0;
 	}
 }
 
@@ -2846,12 +3140,24 @@ U0 HLSkyCheckMap(CHLMap *map)
 	hl_sky_map = map;
 	HLStrCopy(hl_sky_map_name, hl_map_name, 96);
 
-	HLSkyNameFromMap(map, name, 64);
+	//colour before the faces: a set that loads nothing falls back on it, and
+	//the mean below only runs when no light_environment gave one
+	HLSkyMoveVars(map, name, 64);
 
 	if (!name[0])
 		HLStrCopy(name, HLSKY_DEFAULT, 64);
 
 	HLSkyLoad(name);
+
+	//"day" and "dawn" are named by one shipped map each and ship no gfx/env
+	//files; those fall through to the solid colour
+	if (hl_sky_color_set)
+		return;
+
+	if (hl_sky_loaded > 0)
+		HLSkyMeanColor;
+	else
+		hl_sky_solid = 0;	//no set, no light_environment: not the last map's
 }
 
 U0 HLSkyRay(F64 *d, I64 *_face, F64 *_u, F64 *_v)
@@ -3004,6 +3310,29 @@ U0 HLDrawSkySpan(CHLCanvas *c, I64 y, I64 x1, I64 x2, F64 iz1, F64 iz2)
 
 	hl_rs_sky_px += x2 - x1;
 
+	row  = c->pixels + y * c->width;
+	zrow = c->depth + y * c->width;
+	iz   = iz1;
+
+	//no set loaded, or the pass is off: sv_skycolor with no ray at all. every
+	//texel would resolve to this value anyway
+	if (!hl_sky_ready || !hl_r_drawsky)
+	{
+		for (x = x1; x < x2; x++)
+		{
+			if (iz > zrow[x])
+			{
+				row[x]  = hl_sky_solid;
+				zrow[x] = 0.0;
+			}
+
+			iz += d_iz;
+		}
+
+		c->spans_drawn++;
+		return;
+	}
+
 	//ray through the first pixel, and the per-pixel step along it
 	sxf = (ToF64(x1) - c->center_x) / c->x_scale;
 	syf = (c->center_y - ToF64(y)) / c->y_scale;
@@ -3014,10 +3343,7 @@ U0 HLDrawSkySpan(CHLCanvas *c, I64 y, I64 x1, I64 x2, F64 iz1, F64 iz2)
 		step[i] = c->right[i] / c->x_scale;
 	}
 
-	row  = c->pixels + y * c->width;
-	zrow = c->depth + y * c->width;
-	iz   = iz1;
-	x    = x1;
+	x = x1;
 
 	HLSkyRay(dir, &f0, &u0, &v0);
 
