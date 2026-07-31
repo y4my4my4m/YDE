@@ -1810,6 +1810,23 @@ F64 HLDeltaReadField(CHLMsg *m, CHLDeltaField *f, U8 *str, I64 str_max,
 //in any structure cannot be expressed
 #define HLDELTA_MAX_MASK	8
 
+Bool HLDeltaAnyChange(CHLDelta *d, F64 *from, F64 *to, U8 *from_str, U8 *to_str)
+{//whether HLDeltaWrite would set any mask bit. an entity with an empty delta is
+ //left out of a packet entities frame entirely rather than costing a header
+	I64 i;
+
+	if (!d)
+		return FALSE;
+
+	for (i = 0; i < d->count && i < HLDELTA_MAX_MASK * 8; i++)
+	{
+		if (HLDeltaFieldDiffers(&d->f[i], from, to, from_str, to_str))
+			return TRUE;
+	}
+
+	return FALSE;
+}
+
 U0 HLDeltaWrite(CHLMsg *m, CHLDelta *d, F64 *from, F64 *to, U8 *from_str,
 	U8 *to_str, F64 timebase)
 {//DELTA_WriteDelta. the change mask is variable length: 3 bits say how many mask
@@ -1936,6 +1953,7 @@ class CHLEntState48
 {
 	F64	 v[HLDELTA_MAX_SLOTS];	//indexed by HLES_*
 	Bool player;		//which table describes it: entity_state_player_t if set
+	Bool custom;		//custom_entity_state_t instead: beams, entityType ENTITY_BEAM
 	Bool active;		//the server has described it at least once
 	F64	 msgtime;		//server time of the frame that last carried it
 };
@@ -1958,6 +1976,7 @@ U0 HLState48Clear(CHLEntState48 *e)
 		e->v[i] = 0.0;
 
 	e->player  = FALSE;
+	e->custom  = FALSE;
 	e->active  = FALSE;
 	e->msgtime = 0.0;
 }
@@ -2001,10 +2020,18 @@ U0 HLNetStates48Clear()
 HLNetStates48Clear;
 
 CHLDelta *HLDeltaForEnt(CHLEntState48 *e)
-{//an entity is described by entity_state_player_t or entity_state_t and nothing in
- //the message says which: the client decides from the entity number (1..maxclients
- //are players). wrong choice decodes every field after origin at the wrong width
-	if (e && e->player)
+{//an entity is described by entity_state_player_t, custom_entity_state_t or
+ //entity_state_t. the custom bit travels in the entity header; nothing in the
+ //message distinguishes the other two, so the client decides from the entity
+ //number (1..maxclients are players). wrong choice decodes every field after
+ //origin at the wrong width
+	if (!e)
+		return &hl_delta_entity;
+
+	if (e->custom)
+		return &hl_delta_custom;
+
+	if (e->player)
 		return &hl_delta_player;
 
 	return &hl_delta_entity;
@@ -2037,9 +2064,801 @@ Bool HLDeltaReadEntState(CHLMsg *m, CHLEntState48 *from, CHLEntState48 *to,
 			to->v[i] = from->v[i];
 
 		to->player = from->player;
+		to->custom = from->custom;
 	}
 
 	return HLDeltaRead(m, HLDeltaForEnt(to), to->v, NULL, 0, timebase);
+}
+
+//============================================================================
+// Protocol 48: the entity stream
+//============================================================================
+//
+// svc_packetentities, svc_deltapacketentities and svc_spawnbaseline share one
+// per-entity framing.
+//
+// INFERRED, all of it. The engine is not in the SDK checkout: there is no
+// netchan, no delta compression and no packet entities writer to read. The field
+// payload comes from valve/delta.lst and the field set from
+// common/entity_state.h; the framing below is derived from the Quake and Quake 2
+// lineage and is proved only against this file's own reader. No GoldSrc peer has
+// seen it.
+//
+// Frame header, byte aligned, before the bit stream opens:
+//
+//   svc_packetentities        byte 40, word entity count
+//   svc_deltapacketentities   byte 41, word entity count, byte delta sequence
+//   svc_spawnbaseline         byte 22
+//
+// The delta sequence names the frame this one is measured against - the last
+// frame the client acknowledged. The word count is advisory: the reader takes
+// the entity list from the stream and only compares.
+//
+// Entity header, in the bit stream, one per entity, entity numbers strictly
+// ascending:
+//
+//   1 bit    number form
+//              1 -> 6 bits offset, number = previous number + offset
+//              0 -> 11 bits absolute number, 0..2047
+//   1 bit    removed
+//   if not removed:
+//     1 bit  custom          (custom_entity_state_t, a beam)
+//     if full:
+//       1 bit  instanced baseline index present
+//       6 bits instanced baseline index
+//   delta payload, HLDeltaWrite against the entity's previous state
+//
+// Two number forms because most of a frame is a dense ascending run: entity n+1
+// after entity n costs 7 bits instead of 12. The offset is 6 bits and the writer
+// uses it for 1..62 only, falling back to the absolute form for wider gaps.
+//
+// Offset 63 is reserved as the end of block marker, and is the terminator the
+// baseline block uses: a baseline stream starts at entity 0, so an all-zero
+// sentinel would be indistinguishable from worldspawn's own baseline.
+//
+// The packet entities blocks end with 16 zero bits instead. Entity 0 never
+// appears in a frame - the world is the BSP, it is never delta'd - so absolute
+// form number 0 is free there, and 16 bits rather than 12 covers the removal,
+// custom and baseline bits that follow, so a reader that decodes the header
+// before testing it still lands on number 0. Both terminators are accepted on
+// read; the writer refuses entity 0 in a packet entities frame rather than emit
+// something the 16-bit sentinel would swallow.
+//
+// The removal bit carries no payload. An entity present in the previous frame
+// and absent from this one is removed explicitly; an entity present in both and
+// unchanged is not mentioned at all and is carried forward by the reader. That
+// asymmetry is what makes an idle frame cost 2 bytes.
+
+#define HLPE_OFF_BITS	6
+#define HLPE_NUM_BITS	11
+#define HLPE_OFF_MAX	62		//widest gap the offset form expresses
+#define HLPE_OFF_END	63		//reserved: end of block
+#define HLPE_MAX_NUM	2048	//1 << HLPE_NUM_BITS
+
+//entities in one frame. the engine's own cap is higher; a frame past this is
+//refused rather than silently trimmed
+#define HLPE_MAX_ENTS	256
+
+//frames kept for delta reference, indexed by sequence number. a client
+//acknowledges a frame several packets after receiving it, so the sender needs
+//the older one still intact. power of two: the index is a mask
+#define HLPE_FRAMES		8
+#define HLPE_FRAME_MASK	7
+
+class CHLFrame48
+{
+	I64				seq;		//netchan sequence this frame travelled under
+	Bool			valid;
+	F64				msgtime;	//server time the frame describes
+	I64				count;
+	I64				num[HLPE_MAX_ENTS];		//ascending
+	CHLEntState48	ent[HLPE_MAX_ENTS];
+};
+
+//hl_pe_cl is the client's reconstruction history, hl_pe_sv what the server sent.
+//one server ring, so one remote client: a second would need its own history and
+//its own acknowledged sequence.
+CHLFrame48		hl_pe_cl[HLPE_FRAMES];
+CHLFrame48		hl_pe_sv[HLPE_FRAMES];
+CHLEntState48	hl_pe_zero;
+
+//scratch for the two readers. file scope, not locals: a class sized declaration
+//inside a function is 500 bytes of stack per call and ZealC faults on one in a
+//nested block
+CHLEntState48	hl_pe_tmp;
+CHLEntState48	hl_pe_scratch;
+
+//a frame is decoded here and copied into the ring afterwards: the slot a new
+//sequence lands in can be the slot its delta reference occupies
+CHLFrame48		hl_pe_stage;
+
+//entity numbers 1..hl_net48_players are player slots and take
+//entity_state_player_t. set from svc_serverinfo on the client and from
+//hl_sv_maxclients on the server; zero means no slot is a player
+I64	hl_net48_players = 0;
+
+U0 HLState48Copy(CHLEntState48 *dst, CHLEntState48 *src)
+{
+	if (!dst || !src)
+		return;
+
+	MemCopy(dst, src, sizeof(CHLEntState48));
+}
+
+U0 HLPEFrameClear(CHLFrame48 *f)
+{
+	if (!f)
+		return;
+
+	f->seq     = -1;
+	f->valid   = FALSE;
+	f->msgtime = 0.0;
+	f->count   = 0;
+}
+
+U0 HLPEFramesClear()
+{//globals aren't zeroed
+	I64 i;
+
+	for (i = 0; i < HLPE_FRAMES; i++)
+	{
+		HLPEFrameClear(&hl_pe_cl[i]);
+		HLPEFrameClear(&hl_pe_sv[i]);
+	}
+
+	HLPEFrameClear(&hl_pe_stage);
+	HLState48Clear(&hl_pe_zero);
+	HLState48Clear(&hl_pe_tmp);
+	HLState48Clear(&hl_pe_scratch);
+	hl_net48_players = 0;
+}
+
+HLPEFramesClear;
+
+CHLFrame48 *HLPEFrameSlot(CHLFrame48 *ring, I64 seq)
+{//the slot a sequence lands in, whatever is in it now
+	if (!ring)
+		return NULL;
+
+	return &ring[seq & HLPE_FRAME_MASK];
+}
+
+CHLFrame48 *HLPEFrameByLowByte(CHLFrame48 *ring, I64 low)
+{//svc_deltapacketentities names its reference frame with a byte, not the whole
+ //sequence. the ring is 8 deep, so at most one live frame carries a given low
+ //byte and the truncation is recoverable
+	I64 i;
+
+	if (!ring)
+		return NULL;
+
+	for (i = 0; i < HLPE_FRAMES; i++)
+	{
+		if (ring[i].valid && (ring[i].seq & 0xFF) == (low & 0xFF))
+			return &ring[i];
+	}
+
+	return NULL;
+}
+
+U0 HLPEFrameCopy(CHLFrame48 *dst, CHLFrame48 *src)
+{//only the occupied entries: the tail of ent[] is 100KB of nothing
+	I64 i;
+
+	if (!dst || !src)
+		return;
+
+	dst->seq     = src->seq;
+	dst->valid   = src->valid;
+	dst->msgtime = src->msgtime;
+	dst->count   = src->count;
+
+	for (i = 0; i < src->count; i++)
+	{
+		dst->num[i] = src->num[i];
+		HLState48Copy(&dst->ent[i], &src->ent[i]);
+	}
+}
+
+CHLEntState48 *HLPEBaseline(I64 num)
+{//svc_spawnbaseline fills hl_net_bl48. numbers past the table decode against
+ //zero: the number is still 11 bits on the wire, the table is not that wide
+	if (num < 0 || num >= HLNET_MAX_ENTS)
+		return &hl_pe_zero;
+
+	return &hl_net_bl48[num];
+}
+
+Bool HLPEIsPlayer(I64 num)
+{
+	if (hl_net48_players < 1)
+		return FALSE;
+
+	return ToBool(num >= 1 && num <= hl_net48_players);
+}
+
+Bool HLPEFrameAppend(CHLFrame48 *f, I64 num, CHLEntState48 *e)
+{
+	if (!f || !e || f->count >= HLPE_MAX_ENTS)
+		return FALSE;
+
+	f->num[f->count] = num;
+	HLState48Copy(&f->ent[f->count], e);
+	f->count++;
+
+	return TRUE;
+}
+
+U0 HLPEWriteHeader(CHLMsg *m, I64 num, I64 *numbase, Bool remove, Bool custom,
+	Bool full)
+{//numbase carries the previous entity number and is advanced here
+	I64 off;
+
+	if (!m || !numbase)
+		return;
+
+	off = num - *numbase;
+
+	if (off >= 1 && off <= HLPE_OFF_MAX)
+	{
+		HLBitWriteBits(m, 1, 1);
+		HLBitWriteBits(m, off, HLPE_OFF_BITS);
+	}
+	else
+	{
+		HLBitWriteBits(m, 0, 1);
+		HLBitWriteBits(m, num, HLPE_NUM_BITS);
+	}
+
+	*numbase = num;
+
+	if (remove)
+	{
+		HLBitWriteBits(m, 1, 1);
+		return;
+	}
+
+	HLBitWriteBits(m, 0, 1);
+
+	if (custom)
+		HLBitWriteBits(m, 1, 1);
+	else
+		HLBitWriteBits(m, 0, 1);
+
+	//instanced baselines are a signon-time table of shared starting states an
+	//entity can name instead of its own. none are built here, so the presence
+	//bit is always clear and the 6 bit index never follows
+	if (full)
+		HLBitWriteBits(m, 0, 1);
+}
+
+U0 HLPEWriteEnd(CHLMsg *m, Bool zero_end)
+{
+	if (!m)
+		return;
+
+	if (zero_end)
+	{
+		HLBitWriteBits(m, 0, 16);
+		return;
+	}
+
+	HLBitWriteBits(m, 1, 1);
+	HLBitWriteBits(m, HLPE_OFF_END, HLPE_OFF_BITS);
+}
+
+I64 HLPEReadHeader(CHLMsg *m, I64 *numbase, I64 *_num, Bool *_remove,
+	Bool *_custom, Bool full, Bool zero_end)
+{//1 a header was decoded, 0 end of block, -1 malformed
+	I64	 form;
+	I64	 off;
+	I64	 num;
+	I64	 save;
+	I64	 peek;
+	Bool rem;
+
+	if (!m || !numbase || !_num || !_remove || !_custom)
+		return -1;
+
+	*_num    = 0;
+	*_remove = FALSE;
+	*_custom = FALSE;
+
+	if (zero_end)
+	{
+		//peek: 16 zero bits end the block, anything else is a header and the
+		//cursor goes back
+		save = m->rbit;
+		peek = HLBitReadBits(m, 16);
+		m->rbit = save;
+
+		if (m->badread)
+			return -1;
+
+		if (!peek)
+		{
+			HLBitReadBits(m, 16);
+			return 0;
+		}
+	}
+
+	form = HLBitReadBits(m, 1);
+
+	if (form)
+	{
+		off = HLBitReadBits(m, HLPE_OFF_BITS);
+
+		if (m->badread)
+			return -1;
+
+		if (off == HLPE_OFF_END)
+			return 0;
+
+		num = *numbase + off;
+	}
+	else
+	{
+		num = HLBitReadBits(m, HLPE_NUM_BITS);
+
+		if (m->badread)
+			return -1;
+	}
+
+	if (num < 0 || num >= HLPE_MAX_NUM)
+		return -1;
+
+	*numbase = num;
+	*_num    = num;
+
+	rem = ToBool(HLBitReadBits(m, 1) != 0);
+	*_remove = rem;
+
+	if (!rem)
+	{
+		*_custom = ToBool(HLBitReadBits(m, 1) != 0);
+
+		if (full)
+		{
+			//presence bit, then the index. nothing here emits one, but the
+			//width has to be consumed or every bit after it is misaligned
+			if (HLBitReadBits(m, 1))
+				HLBitReadBits(m, 6);
+		}
+	}
+
+	if (m->badread)
+		return -1;
+
+	return 1;
+}
+
+Bool HLNetWritePacketEntities(CHLMsg *m, CHLFrame48 *from, CHLFrame48 *to,
+	I64 delta_seq, F64 timebase)
+{//SV_EmitPacketEntities. from NULL writes svc_packetentities, every entity
+ //measured against its signon baseline; otherwise svc_deltapacketentities,
+ //measured against the named frame.
+ //
+ //the two lists are walked together in ascending number order, which is what
+ //makes a removal free to detect: an old number with no new number beside it
+	I64				oldi;
+	I64				newi;
+	I64				numbase;
+	I64				newnum;
+	I64				oldnum;
+	Bool			full;
+	CHLEntState48	*base;
+	CHLEntState48	*cur;
+
+	if (!m || !to)
+		return FALSE;
+
+	full = ToBool(from == NULL);
+
+	//entity 0 collides with the all-zero terminator, in either form and from
+	//either list: a removal names a number out of the old frame
+	if (to->count > 0 && to->num[0] == 0)
+	{
+		HLLog("net: entity 0 in a packet entities frame\n");
+		HLLogFlush;
+		return FALSE;
+	}
+
+	if (!full && from->count > 0 && from->num[0] == 0)
+	{
+		HLLog("net: entity 0 in the reference frame\n");
+		HLLogFlush;
+		return FALSE;
+	}
+
+	if (full)
+		HLMsgWriteByte(m, HLSVC_PACKETENTITIES);
+	else
+		HLMsgWriteByte(m, HLSVC_DELTAPACKETENTITIES);
+
+	HLMsgWriteShort(m, to->count);
+
+	if (!full)
+		HLMsgWriteByte(m, delta_seq & 0xFF);
+
+	HLBitWriteStart(m);
+
+	oldi    = 0;
+	newi    = 0;
+	numbase = 0;
+
+	while (TRUE)
+	{
+		//a number past every real one, so the shorter list runs out first
+		newnum = HLPE_MAX_NUM;
+		oldnum = HLPE_MAX_NUM;
+
+		if (newi < to->count)
+			newnum = to->num[newi];
+
+		if (!full && oldi < from->count)
+			oldnum = from->num[oldi];
+
+		if (newnum >= HLPE_MAX_NUM && oldnum >= HLPE_MAX_NUM)
+			break;
+
+		if (newnum == oldnum)
+		{
+			//in both frames: only the changed fields, and nothing at all when
+			//none changed
+			base = &from->ent[oldi];
+			cur  = &to->ent[newi];
+
+			if (HLDeltaAnyChange(HLDeltaForEnt(cur), base->v, cur->v, NULL,
+				NULL))
+			{
+				HLPEWriteHeader(m, newnum, &numbase, FALSE, cur->custom, full);
+				HLDeltaWrite(m, HLDeltaForEnt(cur), base->v, cur->v, NULL, NULL,
+					timebase);
+			}
+
+			oldi++;
+			newi++;
+		}
+		else if (newnum < oldnum)
+		{
+			//new this frame: measured against the baseline, and forced out even
+			//when it matches it, or the client never learns the entity exists
+			cur  = &to->ent[newi];
+			base = HLPEBaseline(newnum);
+
+			HLPEWriteHeader(m, newnum, &numbase, FALSE, cur->custom, full);
+			HLDeltaWrite(m, HLDeltaForEnt(cur), base->v, cur->v, NULL, NULL,
+				timebase);
+
+			newi++;
+		}
+		else
+		{
+			HLPEWriteHeader(m, oldnum, &numbase, TRUE, FALSE, full);
+			oldi++;
+		}
+
+		if (m->overflowed)
+			return FALSE;
+	}
+
+	HLPEWriteEnd(m, TRUE);
+	HLBitWriteEnd(m);
+
+	return ToBool(!m->overflowed);
+}
+
+Bool HLNetReadPacketEntities(CHLMsg *m, CHLFrame48 *from, CHLFrame48 *to,
+	Bool full, F64 timebase)
+{//CL_ParsePacketEntities. the opcode byte is already consumed.
+ //
+ //from is the frame this delta is measured against, NULL for svc_packetentities.
+ //an entity in from that this frame never names is unchanged and is carried
+ //forward here; only an explicit removal drops one
+	I64				oldi;
+	I64				numbase;
+	I64				num;
+	I64				prev;
+	I64				declared;
+	I64				r;
+	Bool			remove;
+	Bool			custom;
+	CHLEntState48	*base;
+	CHLEntState48	*tmp;
+
+	if (!m || !to)
+		return FALSE;
+
+	tmp = &hl_pe_tmp;
+
+	declared = HLMsgReadShort(m);
+
+	if (!full)
+		HLMsgReadByte(m);			//delta sequence, resolved by the caller
+
+	if (m->badread)
+		return FALSE;
+
+	to->count = 0;
+	oldi      = 0;
+	numbase   = 0;
+	prev      = -1;
+
+	HLBitReadStart(m);
+
+	while (TRUE)
+	{
+		r = HLPEReadHeader(m, &numbase, &num, &remove, &custom, full, TRUE);
+
+		if (r < 0)
+			return FALSE;
+
+		if (!r)
+			break;
+
+		//strictly ascending. the parallel walk below depends on it, and a
+		//repeat or a step backwards means the stream is misaligned
+		if (num <= prev)
+		{
+			HLLog("net: packet entities out of order\n");
+			HLLogFlush;
+			return FALSE;
+		}
+
+		prev = num;
+
+		if (from)
+		{
+			while (oldi < from->count && from->num[oldi] < num)
+			{
+				if (!HLPEFrameAppend(to, from->num[oldi], &from->ent[oldi]))
+					return FALSE;
+
+				oldi++;
+			}
+		}
+
+		base = NULL;
+
+		if (from && oldi < from->count && from->num[oldi] == num)
+		{
+			base = &from->ent[oldi];
+			oldi++;
+		}
+
+		if (!base)
+			base = HLPEBaseline(num);
+
+		if (remove)
+			goto qpe_next;
+
+		HLState48Copy(tmp, base);
+		tmp->custom  = custom;
+		tmp->player  = HLPEIsPlayer(num);
+		tmp->active  = TRUE;
+		tmp->msgtime = timebase;
+
+		if (!HLDeltaRead(m, HLDeltaForEnt(tmp), tmp->v, NULL, 0, timebase))
+			return FALSE;
+
+		if (!HLPEFrameAppend(to, num, tmp))
+			return FALSE;
+
+qpe_next:
+	}
+
+	if (from)
+	{
+		while (oldi < from->count)
+		{
+			if (!HLPEFrameAppend(to, from->num[oldi], &from->ent[oldi]))
+				return FALSE;
+
+			oldi++;
+		}
+	}
+
+	HLBitReadEnd(m);
+
+	to->msgtime = timebase;
+
+	//the word count leads the bit stream and cannot be trusted over it: log the
+	//disagreement and keep the list the stream produced
+	if (declared != to->count)
+	{
+		HLLog("net: packet entities count disagrees with the stream\n");
+		HLLogFlush;
+	}
+
+	return ToBool(!m->badread);
+}
+
+U0 HLPEFrameToEntTable(CHLFrame48 *f)
+{//a frame is a list ordered by entity number; the renderer wants a table indexed
+ //by it. active is cleared first, so an entity that left the frame stops being
+ //drawn without anything having to name it
+	I64 i;
+	I64 num;
+
+	for (i = 0; i < HLNET_MAX_ENTS; i++)
+		hl_net_cl48[i].active = FALSE;
+
+	if (!f)
+		return;
+
+	for (i = 0; i < f->count; i++)
+	{
+		num = f->num[i];
+
+		if (num < 0 || num >= HLNET_MAX_ENTS)
+			goto qpt_next;
+
+		HLState48Copy(&hl_net_cl48[num], &f->ent[i]);
+
+qpt_next:
+	}
+}
+
+Bool HLNetParsePacketEntities48(CHLMsg *m, Bool is_delta, I64 seq, F64 timebase)
+{//CL_ParsePacketEntities' caller side: pick the reference frame, decode, publish.
+ //
+ //seq is the netchan sequence the packet arrived under and becomes this frame's
+ //name. the opcode byte is already consumed.
+	CHLFrame48	*from;
+	CHLFrame48	*slot;
+	I64			 dseq;
+
+	if (!m)
+		return FALSE;
+
+	from = NULL;
+
+	if (is_delta)
+	{
+		//the reference frame has to be chosen before the payload is read, and
+		//the byte naming it sits after the 16 bit entity count. peeked rather
+		//than read: HLNetReadPacketEntities consumes the whole frame header
+		if (m->read + 3 > m->len)
+		{
+			m->badread = TRUE;
+			return FALSE;
+		}
+
+		dseq = m->data[m->read + 2];
+		from = HLPEFrameByLowByte(hl_pe_cl, dseq);
+
+		//the reference has aged out of the ring. every field in the payload is
+		//an offset from a state that no longer exists, so nothing here is
+		//recoverable and the client must ask for a full update
+		if (!from)
+		{
+			HLLog("net: delta packet entities against a frame that is gone\n");
+			HLLogFlush;
+			return FALSE;
+		}
+	}
+
+	HLPEFrameClear(&hl_pe_stage);
+
+	if (!HLNetReadPacketEntities(m, from, &hl_pe_stage, ToBool(!is_delta),
+		timebase))
+		return FALSE;
+
+	hl_pe_stage.seq   = seq;
+	hl_pe_stage.valid = TRUE;
+
+	slot = HLPEFrameSlot(hl_pe_cl, seq);
+	HLPEFrameCopy(slot, &hl_pe_stage);
+	HLPEFrameToEntTable(slot);
+
+	return TRUE;
+}
+
+Bool HLNetWriteSpawnBaseline(CHLMsg *m, CHLEntState48 *tbl, I64 count,
+	F64 timebase)
+{//SV_CreateBaseline. every active entry, measured against zero, entity 0 first.
+ //the reserved offset terminates: entity 0 has a baseline, so an all-zero
+ //sentinel is not available here
+	I64	i;
+	I64	numbase;
+
+	if (!m || !tbl)
+		return FALSE;
+
+	if (count > HLNET_MAX_ENTS)
+		count = HLNET_MAX_ENTS;
+
+	HLMsgWriteByte(m, HLSVC_SPAWNBASELINE);
+	HLBitWriteStart(m);
+
+	numbase = 0;
+
+	for (i = 0; i < count; i++)
+	{
+		if (!tbl[i].active)
+			goto qbl_next;
+
+		HLPEWriteHeader(m, i, &numbase, FALSE, tbl[i].custom, FALSE);
+		HLDeltaWrite(m, HLDeltaForEnt(&tbl[i]), hl_pe_zero.v, tbl[i].v, NULL,
+			NULL, timebase);
+
+		if (m->overflowed)
+			return FALSE;
+
+qbl_next:
+	}
+
+	HLPEWriteEnd(m, FALSE);
+	HLBitWriteEnd(m);
+
+	return ToBool(!m->overflowed);
+}
+
+Bool HLNetReadSpawnBaseline(CHLMsg *m, F64 timebase)
+{//CL_ParseBaseline. fills hl_net_bl48 in place; the opcode byte is already
+ //consumed. numbers past the table are decoded and discarded, because skipping
+ //a delta payload without decoding it is not possible
+	I64				numbase;
+	I64				num;
+	I64				prev;
+	I64				r;
+	Bool			remove;
+	Bool			custom;
+	CHLEntState48	*e;
+
+	if (!m)
+		return FALSE;
+
+	numbase = 0;
+	prev    = -1;
+
+	HLBitReadStart(m);
+
+	while (TRUE)
+	{
+		r = HLPEReadHeader(m, &numbase, &num, &remove, &custom, FALSE, FALSE);
+
+		if (r < 0)
+			return FALSE;
+
+		if (!r)
+			break;
+
+		if (num <= prev)
+		{
+			HLLog("net: spawnbaseline out of order\n");
+			HLLogFlush;
+			return FALSE;
+		}
+
+		prev = num;
+
+		//a removal has no meaning in the baseline block
+		if (remove)
+		{
+			HLLog("net: removal bit in spawnbaseline\n");
+			HLLogFlush;
+			return FALSE;
+		}
+
+		if (num < HLNET_MAX_ENTS)
+			e = &hl_net_bl48[num];
+		else
+			e = &hl_pe_scratch;
+
+		HLState48Clear(e);
+		e->custom  = custom;
+		e->player  = HLPEIsPlayer(num);
+		e->active  = TRUE;
+		e->msgtime = timebase;
+
+		if (!HLDeltaRead(m, HLDeltaForEnt(e), e->v, NULL, 0, timebase))
+			return FALSE;
+	}
+
+	HLBitReadEnd(m);
+
+	return ToBool(!m->badread);
 }
 
 //============================================================================
