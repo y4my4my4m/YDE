@@ -1,0 +1,735 @@
+// D1Mpq.ZC - MPQ v1 archive reader
+//
+// header: 'MPQ' 0x1A, U32 header_size, U32 archive_size, U16 version,
+// U16 block_size_shift, U32 hash_off, U32 block_off, U32 hash_count,
+// U32 block_count. sector = 512 << block_size_shift (DIABDAT: 4096).
+//
+// hash and block tables are encrypted with the Storm cipher, keys
+// "(hash table)" / "(block table)" hashed as type 3. hash entry: name_a,
+// name_b, locale+platform, block_index. block entry: offset, packed size,
+// unpacked size, flags. every DIABDAT file is encrypted (key = uppercased
+// basename, type 3), 1752 of 2910 also PKWARE-imploded per sector.
+//
+// explode transcribed from PKWARE DCL (devilution 3rdParty/PKWare
+// explode.cpp). each sector is an independent stream, dictionary <= 4KB.
+//
+// whole archive stays resident - ZealOS FileRead has no seek. reads hand
+// back fresh CAlloc buffers; the resident copy is never written.
+//
+// differential reference: utils/mpqtool.py extracts the same files on the
+// host; sizes and contents must match byte for byte.
+
+#define D1MPQ_IMPLODE		0x00000100
+#define D1MPQ_COMPRESS		0x00000200
+#define D1MPQ_ENCRYPTED		0x00010000
+#define D1MPQ_FIX_KEY		0x00020000
+#define D1MPQ_EXISTS		0x80000000
+
+//--- Storm cipher ----------------------------------------------------------
+
+U32	 d1_crypt[0x500];
+Bool d1_crypt_ready = FALSE;
+
+U0 D1CryptInit()
+{
+	I64 seed = 0x00100001;
+	I64 i;
+	I64 j;
+	I64 idx;
+	I64 t1;
+
+	for (i = 0; i < 0x100; i++)
+	{
+		idx = i;
+		for (j = 0; j < 5; j++)
+		{
+			seed = (seed * 125 + 3) % 0x2AAAAB;
+			t1   = (seed & 0xFFFF) << 16;
+			seed = (seed * 125 + 3) % 0x2AAAAB;
+			d1_crypt[idx] = t1 | (seed & 0xFFFF);
+			idx += 0x100;
+		}
+	}
+	d1_crypt_ready = TRUE;
+}
+
+//hash types: 0 = table slot, 1 = name check A, 2 = name check B, 3 = file key
+U32 D1HashStr(U8 *s, I64 htype)
+{
+	I64 seed1 = 0x7FED7FED;
+	I64 seed2 = 0xEEEEEEEE;
+	I64 ch;
+	I64 i = 0;
+
+	if (!d1_crypt_ready)
+		D1CryptInit;
+
+	while (s[i])
+	{
+		ch = s[i];
+		if (ch == '/')
+			ch = '\\';
+		if (ch >= 'a' && ch <= 'z')
+			ch -= 0x20;
+
+		seed1 = (d1_crypt[(htype << 8) + ch] ^ (seed1 + seed2)) & 0xFFFFFFFF;
+		seed2 = (ch + seed1 + seed2 + (seed2 << 5) + 3) & 0xFFFFFFFF;
+		i++;
+	}
+
+	return seed1;
+}
+
+U0 D1Decrypt(U32 *v, I64 count, I64 key)
+{//in place, U32 stream
+	I64 seed = 0xEEEEEEEE;
+	I64 i;
+	I64 w;
+	I64 nk;
+
+	for (i = 0; i < count; i++)
+	{
+		seed = (seed + d1_crypt[0x400 + (key & 0xFF)]) & 0xFFFFFFFF;
+		w    = (v[i] ^ (key + seed)) & 0xFFFFFFFF;
+		v[i] = w;
+
+		nk   = ((((~key) & 0xFFFFFFFF) << 0x15) + 0x11111111) & 0xFFFFFFFF;
+		key  = (nk | (key >> 0x0B)) & 0xFFFFFFFF;
+		seed = (w + seed + (seed << 5) + 3) & 0xFFFFFFFF;
+	}
+}
+
+//--- PKWARE DCL explode ----------------------------------------------------
+
+U8 d1_dist_bits[64] = {
+	2,4,4,5,5,5,5,6,6,6,6,6,6,6,6,6,
+	6,6,6,6,6,6,7,7,7,7,7,7,7,7,7,7,
+	7,7,7,7,7,7,7,7,7,7,7,7,7,7,7,7,
+	8,8,8,8,8,8,8,8,8,8,8,8,8,8,8,8};
+
+U8 d1_dist_code[64] = {
+	0x03,0x0D,0x05,0x19,0x09,0x11,0x01,0x3E,0x1E,0x2E,0x0E,0x36,0x16,0x26,0x06,0x3A,
+	0x1A,0x2A,0x0A,0x32,0x12,0x22,0x42,0x02,0x7C,0x3C,0x5C,0x1C,0x6C,0x2C,0x4C,0x0C,
+	0x74,0x34,0x54,0x14,0x64,0x24,0x44,0x04,0x78,0x38,0x58,0x18,0x68,0x28,0x48,0x08,
+	0xF0,0x70,0xB0,0x30,0xD0,0x50,0x90,0x10,0xE0,0x60,0xA0,0x20,0xC0,0x40,0x80,0x00};
+
+U8 d1_ex_len_bits[16] = {0,0,0,0,0,0,0,0,1,2,3,4,5,6,7,8};
+
+U16 d1_len_base[16] = {
+	0x0000,0x0001,0x0002,0x0003,0x0004,0x0005,0x0006,0x0007,
+	0x0008,0x000A,0x000E,0x0016,0x0026,0x0046,0x0086,0x0106};
+
+U8 d1_len_bits[16] = {3,2,3,3,4,4,4,5,5,5,5,6,6,6,7,7};
+
+U8 d1_len_code[16] = {
+	0x05,0x03,0x01,0x06,0x0A,0x02,0x0C,0x14,0x04,0x18,0x08,0x30,0x10,0x20,0x40,0x00};
+
+U8 d1_ch_bits_asc[256] = {
+	0x0B,0x0C,0x0C,0x0C,0x0C,0x0C,0x0C,0x0C,0x0C,0x08,0x07,0x0C,0x0C,0x07,0x0C,0x0C,
+	0x0C,0x0C,0x0C,0x0C,0x0C,0x0C,0x0C,0x0C,0x0C,0x0C,0x0D,0x0C,0x0C,0x0C,0x0C,0x0C,
+	0x04,0x0A,0x08,0x0C,0x0A,0x0C,0x0A,0x08,0x07,0x07,0x08,0x09,0x07,0x06,0x07,0x08,
+	0x07,0x06,0x07,0x07,0x07,0x07,0x08,0x07,0x07,0x08,0x08,0x0C,0x0B,0x07,0x09,0x0B,
+	0x0C,0x06,0x07,0x06,0x06,0x05,0x07,0x08,0x08,0x06,0x0B,0x09,0x06,0x07,0x06,0x06,
+	0x07,0x0B,0x06,0x06,0x06,0x07,0x09,0x08,0x09,0x09,0x0B,0x08,0x0B,0x09,0x0C,0x08,
+	0x0C,0x05,0x06,0x06,0x06,0x05,0x06,0x06,0x06,0x05,0x0B,0x07,0x05,0x06,0x05,0x05,
+	0x06,0x0A,0x05,0x05,0x05,0x05,0x08,0x07,0x08,0x08,0x0A,0x0B,0x0B,0x0C,0x0C,0x0C,
+	0x0D,0x0D,0x0D,0x0D,0x0D,0x0D,0x0D,0x0D,0x0D,0x0D,0x0D,0x0D,0x0D,0x0D,0x0D,0x0D,
+	0x0D,0x0D,0x0D,0x0D,0x0D,0x0D,0x0D,0x0D,0x0D,0x0D,0x0D,0x0D,0x0D,0x0D,0x0D,0x0D,
+	0x0D,0x0D,0x0D,0x0D,0x0D,0x0D,0x0D,0x0D,0x0D,0x0D,0x0D,0x0D,0x0D,0x0D,0x0D,0x0D,
+	0x0C,0x0C,0x0C,0x0C,0x0C,0x0C,0x0C,0x0C,0x0C,0x0C,0x0C,0x0C,0x0C,0x0C,0x0C,0x0C,
+	0x0C,0x0C,0x0C,0x0C,0x0C,0x0C,0x0C,0x0C,0x0C,0x0C,0x0C,0x0C,0x0C,0x0C,0x0C,0x0C,
+	0x0C,0x0C,0x0C,0x0C,0x0C,0x0C,0x0C,0x0C,0x0C,0x0C,0x0C,0x0C,0x0C,0x0C,0x0C,0x0C,
+	0x0D,0x0C,0x0D,0x0D,0x0D,0x0C,0x0D,0x0D,0x0D,0x0C,0x0D,0x0D,0x0D,0x0D,0x0C,0x0D,
+	0x0D,0x0D,0x0C,0x0C,0x0C,0x0D,0x0D,0x0D,0x0D,0x0D,0x0D,0x0D,0x0D,0x0D,0x0D,0x0D};
+
+U16 d1_ch_code_asc[256] = {
+	0x0490,0x0FE0,0x07E0,0x0BE0,0x03E0,0x0DE0,0x05E0,0x09E0,
+	0x01E0,0x00B8,0x0062,0x0EE0,0x06E0,0x0022,0x0AE0,0x02E0,
+	0x0CE0,0x04E0,0x08E0,0x00E0,0x0F60,0x0760,0x0B60,0x0360,
+	0x0D60,0x0560,0x1240,0x0960,0x0160,0x0E60,0x0660,0x0A60,
+	0x000F,0x0250,0x0038,0x0260,0x0050,0x0C60,0x0390,0x00D8,
+	0x0042,0x0002,0x0058,0x01B0,0x007C,0x0029,0x003C,0x0098,
+	0x005C,0x0009,0x001C,0x006C,0x002C,0x004C,0x0018,0x000C,
+	0x0074,0x00E8,0x0068,0x0460,0x0090,0x0034,0x00B0,0x0710,
+	0x0860,0x0031,0x0054,0x0011,0x0021,0x0017,0x0014,0x00A8,
+	0x0028,0x0001,0x0310,0x0130,0x003E,0x0064,0x001E,0x002E,
+	0x0024,0x0510,0x000E,0x0036,0x0016,0x0044,0x0030,0x00C8,
+	0x01D0,0x00D0,0x0110,0x0048,0x0610,0x0150,0x0060,0x0088,
+	0x0FA0,0x0007,0x0026,0x0006,0x003A,0x001B,0x001A,0x002A,
+	0x000A,0x000B,0x0210,0x0004,0x0013,0x0032,0x0003,0x001D,
+	0x0012,0x0190,0x000D,0x0015,0x0005,0x0019,0x0008,0x0078,
+	0x00F0,0x0070,0x0290,0x0410,0x0010,0x07A0,0x0BA0,0x03A0,
+	0x0240,0x1C40,0x0C40,0x1440,0x0440,0x1840,0x0840,0x1040,
+	0x0040,0x1F80,0x0F80,0x1780,0x0780,0x1B80,0x0B80,0x1380,
+	0x0380,0x1D80,0x0D80,0x1580,0x0580,0x1980,0x0980,0x1180,
+	0x0180,0x1E80,0x0E80,0x1680,0x0680,0x1A80,0x0A80,0x1280,
+	0x0280,0x1C80,0x0C80,0x1480,0x0480,0x1880,0x0880,0x1080,
+	0x0080,0x1F00,0x0F00,0x1700,0x0700,0x1B00,0x0B00,0x1300,
+	0x0DA0,0x05A0,0x09A0,0x01A0,0x0EA0,0x06A0,0x0AA0,0x02A0,
+	0x0CA0,0x04A0,0x08A0,0x00A0,0x0F20,0x0720,0x0B20,0x0320,
+	0x0D20,0x0520,0x0920,0x0120,0x0E20,0x0620,0x0A20,0x0220,
+	0x0C20,0x0420,0x0820,0x0020,0x0FC0,0x07C0,0x0BC0,0x03C0,
+	0x0DC0,0x05C0,0x09C0,0x01C0,0x0EC0,0x06C0,0x0AC0,0x02C0,
+	0x0CC0,0x04C0,0x08C0,0x00C0,0x0F40,0x0740,0x0B40,0x0340,
+	0x0300,0x0D40,0x1D00,0x0D00,0x1500,0x0540,0x0500,0x1900,
+	0x0900,0x0940,0x1100,0x0100,0x1E00,0x0E00,0x0140,0x1600,
+	0x0600,0x1A00,0x0E40,0x0640,0x0A40,0x0A00,0x1200,0x0200,
+	0x1C00,0x0C00,0x1400,0x0400,0x1800,0x0800,0x1000,0x0000};
+
+//generated decode tables
+U8	 d1_length_codes[0x100];
+U8	 d1_dist_pos_codes[0x100];
+U8	 d1_asc_bits[0x100];		//mutated copy of d1_ch_bits_asc
+U8	 d1_offs_2C34[0x100];
+U8	 d1_offs_2D34[0x100];
+U8	 d1_offs_2E34[0x80];
+U8	 d1_offs_2EB4[0x100];
+Bool d1_explode_ready = FALSE;
+
+U0 D1GenDecodeTab(U8 *positions, U8 *starts, U8 *bits, I64 elements)
+{//GenDecodeTabs: mark which symbol owns each low-byte pattern
+	I64 i;
+	I64 idx;
+	I64 step;
+
+	for (i = 0; i < elements; i++)
+	{
+		step = 1 << bits[i];
+		idx  = starts[i];
+		while (idx < 0x100)
+		{
+			positions[idx] = i;
+			idx += step;
+		}
+	}
+}
+
+U0 D1ExplodeInit()
+{//GenAscTabs + the two fixed decode tables
+	I64 count;
+	I64 code;
+	I64 bits;
+	I64 add;
+	I64 acc;
+
+	D1GenDecodeTab(d1_length_codes, d1_len_code, d1_len_bits, 16);
+	D1GenDecodeTab(d1_dist_pos_codes, d1_dist_code, d1_dist_bits, 64);
+
+	MemCopy(d1_asc_bits, d1_ch_bits_asc, 0x100);
+	MemSet(d1_offs_2C34, 0, 0x100);
+	MemSet(d1_offs_2D34, 0, 0x100);
+	MemSet(d1_offs_2E34, 0, 0x80);
+	MemSet(d1_offs_2EB4, 0, 0x100);
+
+	for (count = 0xFF; count >= 0; count--)
+	{
+		code = d1_ch_code_asc[count];
+		bits = d1_asc_bits[count];
+
+		if (bits <= 8)
+		{
+			add = 1 << bits;
+			acc = code;
+			while (acc < 0x100)
+			{
+				d1_offs_2C34[acc] = count;
+				acc += add;
+			}
+		}
+		else
+		{
+			acc = code & 0xFF;
+			if (acc)
+			{
+				d1_offs_2C34[acc] = 0xFF;
+				if (code & 0x3F)
+				{
+					bits -= 4;
+					d1_asc_bits[count] = bits;
+					add = 1 << bits;
+					acc = code >> 4;
+					while (acc < 0x100)
+					{
+						d1_offs_2D34[acc] = count;
+						acc += add;
+					}
+				}
+				else
+				{
+					bits -= 6;
+					d1_asc_bits[count] = bits;
+					add = 1 << bits;
+					acc = code >> 6;
+					while (acc < 0x80)
+					{
+						d1_offs_2E34[acc] = count;
+						acc += add;
+					}
+				}
+			}
+			else
+			{
+				bits -= 8;
+				d1_asc_bits[count] = bits;
+				add = 1 << bits;
+				acc = code >> 8;
+				while (acc < 0x100)
+				{
+					d1_offs_2EB4[acc] = count;
+					acc += add;
+				}
+			}
+		}
+	}
+	d1_explode_ready = TRUE;
+}
+
+class CD1Bits
+{//LSB-first bit stream over one sector
+	U8	*data;
+	I64	 len;
+	I64	 pos;
+	I64	 buf;
+	I64	 n;
+};
+
+U0 D1BitsFill(CD1Bits *b)
+{
+	while (b->n <= 24 && b->pos < b->len)
+	{
+		b->buf |= b->data[b->pos] << b->n;
+		b->pos++;
+		b->n += 8;
+	}
+}
+
+I64 D1BitsPeek8(CD1Bits *b)
+{
+	D1BitsFill(b);
+	return b->buf & 0xFF;
+}
+
+Bool D1BitsWaste(CD1Bits *b, I64 nbits)
+{//FALSE = out of input, WasteBits' STREAM_END
+	D1BitsFill(b);
+	if (nbits > b->n)
+		return FALSE;
+	b->buf >>= nbits;
+	b->n   -= nbits;
+	return TRUE;
+}
+
+I64 D1DecodeLit(CD1Bits *b, I64 ctype)
+{//< 0x100 literal byte; >= 0x100 repetition of (v - 0xFE) bytes;
+ //0x305 end of stream; 0x306 corrupt
+	I64 lc;
+	I64 exb;
+	I64 extra;
+	I64 v;
+
+	if (D1BitsPeek8(b) & 1)
+	{
+		if (!D1BitsWaste(b, 1))
+			return 0x306;
+
+		lc = d1_length_codes[D1BitsPeek8(b)];
+		if (!D1BitsWaste(b, d1_len_bits[lc]))
+			return 0x306;
+
+		exb = d1_ex_len_bits[lc];
+		if (exb)
+		{
+			extra = b->buf & ((1 << exb) - 1);
+			if (!D1BitsWaste(b, exb))
+			{
+				if (lc + extra != 0x10E)
+					return 0x306;
+			}
+			lc = d1_len_base[lc] + extra;
+		}
+		return lc + 0x100;
+	}
+
+	if (!D1BitsWaste(b, 1))
+		return 0x306;
+
+	if (ctype == 0)
+	{//binary: 8 raw bits
+		v = D1BitsPeek8(b);
+		if (!D1BitsWaste(b, 8))
+			return 0x306;
+		return v;
+	}
+
+	//ascii: huffman coded literal
+	if (D1BitsPeek8(b))
+	{
+		v = d1_offs_2C34[D1BitsPeek8(b)];
+		if (v == 0xFF)
+		{
+			if (D1BitsPeek8(b) & 0x3F)
+			{
+				if (!D1BitsWaste(b, 4))
+					return 0x306;
+				v = d1_offs_2D34[D1BitsPeek8(b)];
+			}
+			else
+			{
+				if (!D1BitsWaste(b, 6))
+					return 0x306;
+				v = d1_offs_2E34[D1BitsPeek8(b) & 0x7F];
+			}
+		}
+	}
+	else
+	{
+		if (!D1BitsWaste(b, 8))
+			return 0x306;
+		v = d1_offs_2EB4[D1BitsPeek8(b)];
+	}
+
+	if (!D1BitsWaste(b, d1_asc_bits[v]))
+		return 0x306;
+
+	return v;
+}
+
+I64 D1DecodeDist(CD1Bits *b, I64 rep_length, I64 dsize_bits, I64 dsize_mask)
+{//0 = corrupt
+	I64 dp = d1_dist_pos_codes[D1BitsPeek8(b)];
+	I64 dist;
+
+	if (!D1BitsWaste(b, d1_dist_bits[dp]))
+		return 0;
+
+	if (rep_length == 2)
+	{
+		dist = (dp << 2) | (b->buf & 0x03);
+		if (!D1BitsWaste(b, 2))
+			return 0;
+	}
+	else
+	{
+		dist = (dp << dsize_bits) | (b->buf & dsize_mask);
+		if (!D1BitsWaste(b, dsize_bits))
+			return 0;
+	}
+
+	return dist + 1;
+}
+
+I64 D1Explode(U8 *src, I64 src_len, U8 *dst, I64 dst_max)
+{//one DCL stream -> dst. returns bytes produced, -1 on corrupt data
+	CD1Bits	bits;
+	I64		ctype;
+	I64		dsize_bits;
+	I64		dsize_mask;
+	I64		out = 0;
+	I64		lit;
+	I64		rep;
+	I64		dist;
+
+	if (!d1_explode_ready)
+		D1ExplodeInit;
+
+	if (src_len < 4)
+		return -1;
+
+	ctype      = src[0];
+	dsize_bits = src[1];
+	if (dsize_bits < 4 || dsize_bits > 6)
+		return -1;
+	if (ctype != 0 && ctype != 1)
+		return -1;
+	dsize_mask = (1 << dsize_bits) - 1;
+
+	bits.data = src;
+	bits.len  = src_len;
+	bits.pos  = 2;
+	bits.buf  = 0;
+	bits.n    = 0;
+
+	while (TRUE)
+	{
+		lit = D1DecodeLit(&bits, ctype);
+		if (lit >= 0x305)
+		{
+			if (lit == 0x306)
+				return -1;
+			break;
+		}
+		if (lit >= 0x100)
+		{
+			rep  = lit - 0xFE;
+			dist = D1DecodeDist(&bits, rep, dsize_bits, dsize_mask);
+			if (dist == 0 || dist > out)
+				return -1;
+			if (out + rep > dst_max)
+				return -1;
+			while (rep > 0)
+			{
+				dst[out] = dst[out - dist];
+				out++;
+				rep--;
+			}
+		}
+		else
+		{
+			if (out >= dst_max)
+				return -1;
+			dst[out] = lit;
+			out++;
+		}
+	}
+
+	return out;
+}
+
+//--- archive ---------------------------------------------------------------
+
+class CD1Mpq
+{
+	U8	*data;			//whole file, resident
+	I64	 size;
+	I64	 sector_size;
+	I64	 hash_off;
+	I64	 block_off;
+	I64	 hash_count;
+	I64	 block_count;
+	U32	*hash;			//decrypted copy, 4 U32 per entry
+	U32	*block;			//decrypted copy, 4 U32 per entry
+};
+
+CD1Mpq	d1_mpq;
+Bool	d1_mpq_ready = FALSE;
+
+Bool D1MpqMount(U8 *filename)
+{
+	U8	*d;
+	I64	 size = 0;
+	I64	 n;
+
+	if (!d1_crypt_ready)
+		D1CryptInit;
+	if (!d1_explode_ready)
+		D1ExplodeInit;
+
+	d1_mpq_ready  = FALSE;
+	d1_mpq.data   = NULL;
+	d1_mpq.hash   = NULL;
+	d1_mpq.block  = NULL;
+
+	d = FileRead(filename, &size);
+	if (!d)
+	{
+		"D1Mpq: cannot read %s\n", filename;
+		return FALSE;
+	}
+	if (size < 32 || d[0] != 'M' || d[1] != 'P' || d[2] != 'Q' || d[3] != 0x1A)
+	{
+		"D1Mpq: %s is not an MPQ\n", filename;
+		Free(d);
+		return FALSE;
+	}
+
+	d1_mpq.data        = d;
+	d1_mpq.size        = size;
+	d1_mpq.sector_size = 512 << D1RdU16(d + 14);
+	d1_mpq.hash_off    = D1RdU32(d + 16);
+	d1_mpq.block_off   = D1RdU32(d + 20);
+	d1_mpq.hash_count  = D1RdU32(d + 24);
+	d1_mpq.block_count = D1RdU32(d + 28);
+
+	if (d1_mpq.hash_off + d1_mpq.hash_count * 16 > size ||
+		d1_mpq.block_off + d1_mpq.block_count * 16 > size)
+	{
+		"D1Mpq: table offsets out of range\n";
+		Free(d);
+		d1_mpq.data = NULL;
+		return FALSE;
+	}
+
+	n = d1_mpq.hash_count * 4;
+	d1_mpq.hash = CAlloc(n * 4);
+	MemCopy(d1_mpq.hash, d + d1_mpq.hash_off, n * 4);
+	D1Decrypt(d1_mpq.hash, n, D1HashStr("(hash table)", 3));
+
+	n = d1_mpq.block_count * 4;
+	d1_mpq.block = CAlloc(n * 4);
+	MemCopy(d1_mpq.block, d + d1_mpq.block_off, n * 4);
+	D1Decrypt(d1_mpq.block, n, D1HashStr("(block table)", 3));
+
+	d1_mpq_ready = TRUE;
+	return TRUE;
+}
+
+I64 D1MpqFind(U8 *name)
+{//block table index, -1 if absent
+	I64 mask;
+	I64 start;
+	I64 na;
+	I64 nb;
+	I64 i;
+	I64 bidx;
+
+	if (!d1_mpq_ready)
+		return -1;
+
+	mask  = d1_mpq.hash_count - 1;
+	start = D1HashStr(name, 0) & mask;
+	na    = D1HashStr(name, 1);
+	nb    = D1HashStr(name, 2);
+	i     = start;
+
+	while (TRUE)
+	{
+		bidx = d1_mpq.hash[i * 4 + 3];
+		if (bidx == 0xFFFFFFFF)
+			return -1;
+		if (bidx != 0xFFFFFFFE &&
+			d1_mpq.hash[i * 4] == na && d1_mpq.hash[i * 4 + 1] == nb)
+			return bidx;
+		i = (i + 1) & mask;
+		if (i == start)
+			return -1;
+	}
+}
+
+Bool D1MpqExists(U8 *name)
+{
+	return D1MpqFind(name) >= 0;
+}
+
+U8 *D1MpqRead(U8 *name, I64 *size_out)
+{//whole file -> fresh CAlloc buffer. NULL on missing or corrupt.
+	I64	 bidx;
+	I64	 offset;
+	I64	 packed;
+	I64	 unpacked;
+	I64	 flags;
+	I64	 key = 0;
+	I64	 nsect;
+	I64	 s;
+	I64	 so;
+	I64	 se;
+	I64	 expect;
+	I64	 got;
+	I64	 n;
+	U8	*base;
+	U8	*raw;
+	U8	*out;
+	U32	*offs;
+	U8	*sec;
+	I64	 i;
+
+	if (size_out)
+		*size_out = 0;
+
+	bidx = D1MpqFind(name);
+	if (bidx < 0 || bidx >= d1_mpq.block_count)
+		return NULL;
+
+	offset   = d1_mpq.block[bidx * 4];
+	packed   = d1_mpq.block[bidx * 4 + 1];
+	unpacked = d1_mpq.block[bidx * 4 + 2];
+	flags    = d1_mpq.block[bidx * 4 + 3];
+
+	if (!(flags & D1MPQ_EXISTS))
+		return NULL;
+	if (offset + packed > d1_mpq.size)
+		return NULL;
+
+	if (flags & D1MPQ_ENCRYPTED)
+	{//key from uppercased basename
+		base = name;
+		i    = 0;
+		while (name[i])
+		{
+			if (name[i] == '\\' || name[i] == '/')
+				base = name + i + 1;
+			i++;
+		}
+		key = D1HashStr(base, 3);
+		if (flags & D1MPQ_FIX_KEY)
+			key = ((key + offset) ^ unpacked) & 0xFFFFFFFF;
+	}
+
+	raw = d1_mpq.data + offset;
+	out = CAlloc(unpacked + 8);
+
+	if (!(flags & (D1MPQ_IMPLODE | D1MPQ_COMPRESS)))
+	{//stored flat, possibly encrypted
+		MemCopy(out, raw, unpacked);
+		if (flags & D1MPQ_ENCRYPTED)
+			D1Decrypt(out, unpacked / 4, key);
+		if (size_out)
+			*size_out = unpacked;
+		return out;
+	}
+
+	//sector based: (nsect + 1) U32 offsets relative to the block start
+	nsect = (unpacked + d1_mpq.sector_size - 1) / d1_mpq.sector_size;
+	n     = (nsect + 1) * 4;
+	offs  = CAlloc(n);
+	MemCopy(offs, raw, n);
+	if (flags & D1MPQ_ENCRYPTED)
+		D1Decrypt(offs, nsect + 1, (key - 1) & 0xFFFFFFFF);
+
+	//decrypt each sector into a bounce buffer, explode when smaller than raw
+	sec = CAlloc(d1_mpq.sector_size + 16);
+	for (s = 0; s < nsect; s++)
+	{
+		so = offs[s];
+		se = offs[s + 1];
+		if (se < so || se > packed)
+		{
+			"D1Mpq: %s sector %d bad offsets\n", name, s;
+			Free(sec);
+			Free(offs);
+			Free(out);
+			return NULL;
+		}
+
+		expect = unpacked - s * d1_mpq.sector_size;
+		if (expect > d1_mpq.sector_size)
+			expect = d1_mpq.sector_size;
+
+		MemCopy(sec, raw + so, se - so);
+		if (flags & D1MPQ_ENCRYPTED)
+			D1Decrypt(sec, (se - so) / 4, (key + s) & 0xFFFFFFFF);
+
+		if (se - so < expect)
+		{
+			got = D1Explode(sec, se - so, out + s * d1_mpq.sector_size, expect);
+			if (got != expect)
+			{
+				"D1Mpq: %s sector %d explode %d want %d\n", name, s, got, expect;
+				Free(sec);
+				Free(offs);
+				Free(out);
+				return NULL;
+			}
+		}
+		else
+			MemCopy(out + s * d1_mpq.sector_size, sec, expect);
+	}
+	Free(sec);
+	Free(offs);
+
+	if (size_out)
+		*size_out = unpacked;
+
+	return out;
+}
+
+U8 *D1MpqReadOrDie(U8 *name, I64 *size_out)
+{//missing data files are a setup error worth stopping on
+	U8 *p = D1MpqRead(name, size_out);
+
+	if (!p)
+	{
+		"D1Mpq: MISSING %s\n", name;
+		throw('D1MPQ');
+	}
+	return p;
+}
