@@ -23,9 +23,11 @@ the same structure as the Quake and HL1 ports.
 Controls: left-click walks / attacks / picks up / opens / talks;
 right-click casts the selected spell; `i` inventory, `c` character,
 `s` spellbook, `q` quest log, TAB automap (`=`/`-` zoom it), `z`
-toggles 2x world zoom, the mouse wheel steps 15 levels from 1.00x to
-4.00x, `w` cycles resolution 640x480 / 800x600 / 1024x768 / 1280x720 /
-1280x960, SHIFT-click stands ground, 1-8 drink from the belt. Every control-panel button works. Arrows/ENTER or the mouse drive the menus; ESC backs out
+toggles 2x world zoom, the mouse wheel steps 19 levels from the
+per-resolution floor (0.50x at 640x480) to 4.00x, `w` cycles resolution
+640x480 / 800x600 / 1024x768 / 1280x720 / 1280x960, SHIFT-click stands
+ground, holding left-click renews the walk, ESC opens the in-game menu
+(Save / Options / New Game / Load / Quit), 1-8 drink from the belt. Every control-panel button works. Arrows/ENTER or the mouse drive the menus; ESC backs out
 and autosaves.
 
 ## What works
@@ -112,8 +114,11 @@ and autosaves.
   Wirt peek fee.
 - Towner dialog: 171 lines from textdat alltext - greeting, rotating
   gossip and per-quest topics gated on the deepest level reached - in
-  the TextBox.CEL frame, word wrapped with click/SPACE paging, each
-  spoken by its own voice line resolved through effects.cpp sgSFX.
+  the TextBox.CEL frame, the MedTextS quest font scrolling upward at
+  each line's txtspd per minitext.cpp, each line spoken by its own
+  voice resolved through effects.cpp sgSFX. Store and dialog panels
+  draw half-transparent with retail text colors; hovered actors get
+  their CelBlitOutline halo (monsters red, towners silver).
 - Save/load: 3 slots, own compact format, checksummed; persists the
   character, inventory, position and all 17 level seeds so dungeons
   regenerate identically, plus per-item prefix/suffix/unique/identified
@@ -172,10 +177,15 @@ pinned, frames eyeballed as PNG) and in-VM by D1Test.
 
 ## Deviations
 
-- Resolution does not persist across a restart: options are plain
-  globals with no settings file.
+- Options persist in ::/Apps/Diablo1/OPTIONS.INI - KEY=VALUE text,
+  hand-editable, unknown keys skipped (diablo.ini precedent). Loaded at
+  include time; the shell saves on leaving the options screen and on
+  exit.
 - devilutionX's zoom is a Bool, 1x or 2x (GraphicsOptions.zoom,
-  scrollrt.cpp Zoom). The 15-step fractional ladder is a port addition.
+  scrollrt.cpp Zoom). The 19-step fractional ladder and sub-1x zoom-out
+  are port additions.
+- The in-game menu's Quit Diablo autosaves and returns to the main menu;
+  retail exits the program.
 - Only Healing casts in town, per spelldat sTownSpell; retail's other
   town spells (Identify, town-cast utility) are outside the roster.
 - Lighting falloff is plain radial, not the original crawl tables. No
