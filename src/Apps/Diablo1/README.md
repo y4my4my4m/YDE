@@ -26,15 +26,37 @@ game / menu / app.
   sector reads. Whole archive stays resident (FileRead has no seek);
   every DIABDAT file is encrypted, 1752 of 2910 also imploded.
 - CEL / CL2 / PCX decode, clipped and unclipped frames, CL2 direction
-  groups, the smaltext font, palettes and fades.
+  groups, TRN recoloring, the smaltext font, palettes and fades.
 - Town: TIL/MIN/SOL loading, the four sector DUNs assembled per
-  town.cpp T_Pass3, all six dungeon-tile encodings, painter-order world
-  render, click-to-walk warrior with BFS pathing over SOL flags.
-- Title screen, main menu, cut screens.
+  town.cpp T_Pass3, eight NPCs at their towners.cpp spots with stand
+  anims and hover names.
+- All 16 dungeon levels: faithful drlg_l1 (cathedral), drlg_l2
+  (catacombs: recursive room subdivision + wandering halls + the 3x3
+  pattern table), drlg_l3 (caves: organic growth, river, lava pools) and
+  drlg_l4 (hell: mirrored quadrants) on the exact Borland RNG. Stairs
+  travel town -> L1 ... -> L16; level 15 descends through the pentagram.
+  Theme rooms and quest set pieces are absent, so layouts diverge from
+  retail seeds but are deterministic in ours.
+- Lighting: MakeLightTable ramp shading, radial falloff around the
+  player, applied to tiles and actors.
+- Monsters: 32 types over the full depth (zombies, fallen, skeletons,
+  scavengers, hidden, goat clans, overlords and more), machine-generated
+  from their monstdat rows with TRN recolors. Melee chase AI plus archers
+  (skeleton/goat bows) that keep distance and shoot.
+- Missiles: arrows and firebolts with wall/target collision; right-click
+  casts Firebolt for 6 mana.
+- Combat: to-hit rolls both ways, hit flash, XP with level-ups (real
+  ExpLvlsTbl thresholds), player death and town respawn.
+- Objects and loot: barrels shatter, chests open, monsters drop gold and
+  potions; click to pick up, keys 1-8 drink from the belt.
+- Control panel with live HP and mana orbs, belt contents, gold and
+  character level readout.
+- Title screen, main menu, cut screens on every level change.
 
-The data layer and renderer are verified on the host by a transpile rig
-(scratchpad d1_transpile.py; extraction compared byte-for-byte against
-utils/mpqtool.py, frames eyeballed as PNG) and in-VM by D1Test.
+The data layer, generator, renderer, lighting, and combat are verified on
+the host by a transpile rig (scratchpad d1_transpile.py; extraction
+compared byte-for-byte against utils/mpqtool.py, dungeon layout checksum
+pinned, frames eyeballed as PNG) and in-VM by D1Test.
 
 ## File map
 
@@ -43,12 +65,24 @@ utils/mpqtool.py, frames eyeballed as PNG) and in-VM by D1Test.
 | D1Fmt.ZC | LE byte readers | - |
 | D1Mpq.ZC | MPQ reader | Storm / PKWare explode.cpp |
 | D1Pal.ZC | palette, fades | palette.cpp |
+| D1Rnd.ZC | Borland LCG | engine.cpp SetRndSeed/random_ |
 | D1Draw.ZC | 8bpp canvas, window blit | dx.cpp/scrollrt blit |
+| D1Lvl.ZC | dPiece/micros/SOL, town, grids | gendung.cpp, town.cpp |
+| D1Light.ZC | shade tables, light grid | lighting.cpp |
 | D1Cel.ZC | CEL/CL2/PCX, small font | engine.cpp, control.cpp tables |
 | D1Menu.ZC | title/menu/cut screens | DiabloUI (simplified) |
-| D1Lvl.ZC | dPiece/micros/SOL, town | gendung.cpp, town.cpp |
+| D1Drlg1.ZC | cathedral generation | drlg_l1.cpp |
+| D1Drlg2.ZC (+T) | catacombs generation | drlg_l2.cpp |
+| D1Drlg3.ZC (+T) | caves generation | drlg_l3.cpp |
+| D1Drlg4.ZC (+T) | hell generation | drlg_l4.cpp |
 | D1Render.ZC | tile encodings, world walk | _render.cpp, scrollrt.cpp |
-| D1Play.ZC | player anim, walking, BFS | player.cpp, path.cpp |
+| D1Mon.ZC (+D1MonT) | monsters, AI, combat | monster.cpp, monstdat.cpp |
+| D1Mis.ZC | arrows, firebolt | missiles.cpp |
+| D1Item.ZC | gold, potions, belt | items.cpp (reduced) |
+| D1Obj.ZC | barrels, chests | objects.cpp (reduced) |
+| D1Towner.ZC | town NPCs | towners.cpp |
+| D1Play.ZC | player, melee, warps, BFS | player.cpp, path.cpp, trigs.cpp |
+| D1Panel.ZC | control panel, orbs | control.cpp |
 | D1Test.ZC | self check | - |
 | Diablo1.ZC | shell, input, game loop | diablo.cpp |
 
@@ -57,13 +91,21 @@ utils/mpqtool.py, frames eyeballed as PNG) and in-VM by D1Test.
 - Menu text is the in-game small font drawn as bright silhouettes; the
   DiabloUI artfonts (font16/font42 + .bin kerning) are not loaded yet.
 - Pathing is BFS, not the original A*; same walkability rules.
-- No lighting, transparency, audio, towners, monsters, items, spells,
-  quests, dungeon generation, or multiplayer yet. Town only.
+- Monster AI is chase + melee or kite + shoot; per-type quirks (fallen
+  flight, scavenger corpse eating, gargoyle stone form, charges) are not
+  modeled, and those types are absent from the roster.
+- Lighting falloff is plain radial, not the original crawl tables; no
+  wall-transparency (dTransVal) pass. Missiles draw over walls.
+- Items are gold and potions only; no bases/affixes/inventory grid.
+  Doors render open and never close. Firebolt is the one spell.
+- No audio, quests, saves, Diablo boss, or multiplayer.
 
 ## Roadmap
 
-drlg_l1 cathedral generation, towners with talk, the control panel,
-inventory, monsters + AI, items, spells, save games, sound through AC97.
+sound through AC97 (SFX + music), functional doors, full item system
+(bases + affixes + inventory grid), spellbook, per-type AI quirks,
+quests, Diablo and the level-16 quad set piece, towner dialog, saves,
+the original A* and crawl-table lighting.
 
 ## License
 
