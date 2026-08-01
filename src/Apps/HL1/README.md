@@ -1,9 +1,9 @@
 # Half-Life for ZealOS
 
 GoldSrc-compatible engine in ZealC. Forked from the Quake port
-(`src/Apps/Quake`); independent of it — every symbol is `HL*`/`hl_*`.
+(`src/Apps/Quake`); independent of it - every symbol is `HL*`/`hl_*`.
 
-Valve's SDK (`valvesoftware/halflife`) is the game code only — `dlls/`,
+Valve's SDK (`valvesoftware/halflife`) is the game code only - `dlls/`,
 `cl_dll/`, `pm_shared/`. The engine is not public.
 
 | Layer | Source |
@@ -14,53 +14,55 @@ Valve's SDK (`valvesoftware/halflife`) is the game code only — `dlls/`,
 Port rule: SDK behaviour is followed to the line, cited by file:line in the
 comments. Deviations are deliberate and marked.
 
+### THIS HAS ONLY BEEN TESTED WITH THE 25th ANNIVERSARY EDITION OF HALF-LIFE.
+
 ## Engine
 
-- **BSP v30** — BSP29 geometry, external textures, RGB lightmaps, four clip
+- **BSP v30** - BSP29 geometry, external textures, RGB lightmaps, four clip
   hulls, HL contents codes.
-- **WAD3** — archives named in worldspawn's `wad` key. Per-miptex 256-colour
+- **WAD3** - archives named in worldspawn's `wad` key. Per-miptex 256-colour
   palettes; the renderer composites in RGB, no shared colormap.
-- **Truecolor canvas** — `0x00RRGGBB`. Gamma and damage/water tint applied in
+- **Truecolor canvas** - `0x00RRGGBB`. Gamma and damage/water tint applied in
   the blit.
-- **Studio MDL v10** — bones, RLE channels, slerp, blends, bodygroups, skin
+- **Studio MDL v10** - bones, RLE channels, slerp, blends, bodygroups, skin
   families, embedded or `<name>T.mdl` textures. Software rasterised through
   the world span loop.
-- **SPR v2** — own palette, ADDITIVE and INDEXALPHA.
-- **Mip selection** — texels per screen pixel via texinfo vector length, as
+- **SPR v2** - own palette, ADDITIVE and INDEXALPHA.
+- **Mip selection** - texels per screen pixel via texinfo vector length, as
   Quake `mipadjust`. Distance alone costs one to two levels on HL's texture
   scales.
-- **Sound** — 48 mixer voices (`AUDIO_MAX_SFX_VOICES`, `src/System/AC97.ZC`),
+- **Sound** - 48 mixer voices (`AUDIO_MAX_SFX_VOICES`, `src/System/AC97.ZC`),
   twelve ambient loops, sixteen dynamic channels, reverb by room type,
   `sentences.txt` word scheduler, distance-cadenced footsteps.
-- **CD audio** — `trigger_cdaudio` tracks map to the shipped
+- **CD audio** - `trigger_cdaudio` tracks map to the shipped
   `media/<composition>.mp3` by Valve's CD table. Decoded by the ZealAmp
   MPEG-1 Layer III decoder, sliced on the game task, one pass per trigger.
-- **Console/HUD font** — WAD3 `qfont_t` variable-width glyphs; kernel-font
+- **Console/HUD font** - WAD3 `qfont_t` variable-width glyphs; kernel-font
   fallback without `gfx.wad`.
 
 ## Game
 
-- **Movement** — pm_shared: airstrafe cap, bunnyhop scaling, `PM_Duck` to the
+- **Movement** - pm_shared: airstrafe cap, bunnyhop scaling, `PM_Duck` to the
   letter, ladders, water, waterjump, fall damage, conveyors. Duck `c`,
   use `e`.
-- **Entities** — native, no QuakeC. All 125 shipped maps spawn every
+- **Entities** - native, no QuakeC. All 125 shipped maps spawn every
   classname. Doors, buttons, trains, tracktrains with path-fire, triggers,
   multi_manager/multisource, breakables, pushables, chargers, pickups
   (world_items included), momentary brushes, env_* effects, game_text,
   changelevels with player carry.
-- **Weapons** — hitscan table with real `VECTOR_CONE_*` and `gSkillData`;
+- **Weapons** - hitscan table with real `VECTOR_CONE_*` and `gSkillData`;
   projectiles: grenades, MP5 M203, RPG, crossbow, satchel, tripmine, snark,
   hornet, egon.
-- **AI** — schedule/task interpreter, node-graph routing from the shipped
+- **AI** - schedule/task interpreter, node-graph routing from the shipped
   `.nod` files (maps without one run straight-line), scripted_sequence and
   scripted_sentence, per-monster HandleAnimEvent, monstermaker, talk
   monsters with follow.
-- **Save/load** — native entity serialisation, eight slots, field census
+- **Save/load** - native entity serialisation, eight slots, field census
   checked by `utils/hl1-savefields.py`.
-- **Menu** — built from shipped `resource/` files: GameMenu.res, .res dialog
+- **Menu** - built from shipped `resource/` files: GameMenu.res, .res dialog
   layouts, ClientScheme colours, TGA backdrop tiles. Keyboard navigation
   only.
-- **Skill** — all `sk_` constants from `valve/skill.cfg`.
+- **Skill** - all `sk_` constants from `valve/skill.cfg`.
 
 ## Not done
 
@@ -69,7 +71,7 @@ comments. Deviations are deliberate and marked.
 - Present buffer for the frame; fades can flicker.
 - Squad AI: hgrunts fight as individuals.
 - Monster-vs-monster collision: traces clip `SOLID_BSP` only.
-- `func_tracktrain` hull does not rotate with the car; no driveables.
+- `func_tracktrain` hull issues remain; no driveables.
 - VGUI mouse input; menus are keyboard-only.
 - Sequence groups (`<name>NN.mdl`), chrome, per-vertex model lighting.
 
@@ -80,7 +82,7 @@ Not redistributable; no shareware exists. Retail `valve/` goes under:
     src/Apps/HL1/valve/
 
 Loose files first, then pak; gamedir before `valve`; case folded both ways.
-A pak is optional — no engine path needs one. Minimum for a map on screen:
+A pak is optional - no engine path needs one. Minimum for a map on screen:
 
 | File | Why |
 |---|---|
@@ -110,7 +112,7 @@ ones: `nodegraph`, `ridelog`, `cllog`, `scriptlog`, `cdmp3`.
 ## Build order
 
 `RunLib.ZC` compiles the engine; `Run.ZC` includes the shell. Two `ExeFile`
-passes — one pass over the whole tree faults nondeterministically.
+passes - one pass over the whole tree faults nondeterministically.
 
 ZealC is single-pass: symbols resolve only backwards, across files and within
 them. `RunLib.ZC` documents the include order.
