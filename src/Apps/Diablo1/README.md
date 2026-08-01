@@ -22,9 +22,10 @@ the same structure as the Quake and HL1 ports.
 
 Controls: left-click walks / attacks / picks up / opens / talks;
 right-click casts the selected spell; `i` inventory, `c` character,
-`s` spellbook, `q` quest log, TAB automap (`=`/`-` zoom it), `z` world
-zoom (also mouse wheel), `w` cycles canvas width 640/800/1024/1280,
-1-8 drink from the belt. Every control-panel button works. Arrows/ENTER or the mouse drive the menus; ESC backs out
+`s` spellbook, `q` quest log, TAB automap (`=`/`-` zoom it), `z`
+toggles 2x world zoom, the mouse wheel steps 15 levels from 1.00x to
+4.00x, `w` cycles canvas width 640/800/1024/1280, SHIFT-click stands
+ground, 1-8 drink from the belt. Every control-panel button works. Arrows/ENTER or the mouse drive the menus; ESC backs out
 and autosaves.
 
 ## What works
@@ -79,7 +80,8 @@ and autosaves.
   compositing), clickable buttons, belt chips, gold/level readout,
   monster health bar on hover.
 - Real DiabloUI front end: flaming logo, gold artfont items, focus
-  pentagrams, mouse-driven menu, options screen (zoom, town jog, SFX,
+  pentagrams, mouse-driven menu, options screen (resolution,
+  fullscreen, fit to screen, integer scaling, zoom, town jog, SFX,
   music). Title screen and cut screens on every level change.
 - Single Player flow: character select over 3 save slots, class
   selection (Warrior/Rogue/Sorcerer with their real starting stats and
@@ -173,6 +175,10 @@ pinned, frames eyeballed as PNG) and in-VM by D1Test.
 - Canvas height is fixed at 480; only the width varies. The 640-wide UI
   art is centered rather than stretched. Width does not persist across a
   restart: options are plain globals with no settings file.
+- devilutionX's zoom is a Bool, 1x or 2x (GraphicsOptions.zoom,
+  scrollrt.cpp Zoom). The 15-step fractional ladder is a port addition.
+- Only Healing casts in town, per spelldat sTownSpell; retail's other
+  town spells (Identify, town-cast utility) are outside the roster.
 - Lighting falloff is plain radial, not the original crawl tables. No
   wall-transparency (dTransVal) pass; missiles draw over walls.
 - Nova's book level is the Hellfire row's 14. Retail's is -1, staff only.
