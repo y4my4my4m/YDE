@@ -24,8 +24,8 @@ Controls: left-click walks / attacks / picks up / opens / talks;
 right-click casts the selected spell; `i` inventory, `c` character,
 `s` spellbook, `q` quest log, TAB automap (`=`/`-` zoom it), `z`
 toggles 2x world zoom, the mouse wheel steps 15 levels from 1.00x to
-4.00x, `w` cycles canvas width 640/800/1024/1280, SHIFT-click stands
-ground, 1-8 drink from the belt. Every control-panel button works. Arrows/ENTER or the mouse drive the menus; ESC backs out
+4.00x, `w` cycles resolution 640x480 / 800x600 / 1024x768 / 1280x720 /
+1280x960, SHIFT-click stands ground, 1-8 drink from the belt. Every control-panel button works. Arrows/ENTER or the mouse drive the menus; ESC backs out
 and autosaves.
 
 ## What works
@@ -121,8 +121,8 @@ and autosaves.
   state and spell levels. Autosaves on level change and on exit. Format
   version 3; versions 1 and 2 still load with documented defaults.
 - devilutionX-style QOL: town jog, 2x zoom ('z' and the mouse wheel),
-  widescreen at 640/800/1024/1280 ('w' or the options menu), hover HP
-  bar, click feedback sounds.
+  a resizable canvas with five modes to 1280x960 ('w' or the options
+  menu), hover HP bar, click feedback sounds.
 
 The data layer, generator, renderer, lighting, and combat are verified on
 the host by a transpile rig (scratchpad d1_transpile.py; extraction
@@ -172,9 +172,8 @@ pinned, frames eyeballed as PNG) and in-VM by D1Test.
 
 ## Deviations
 
-- Canvas height is fixed at 480; only the width varies. The 640-wide UI
-  art is centered rather than stretched. Width does not persist across a
-  restart: options are plain globals with no settings file.
+- Resolution does not persist across a restart: options are plain
+  globals with no settings file.
 - devilutionX's zoom is a Bool, 1x or 2x (GraphicsOptions.zoom,
   scrollrt.cpp Zoom). The 15-step fractional ladder is a port addition.
 - Only Healing casts in town, per spelldat sTownSpell; retail's other
