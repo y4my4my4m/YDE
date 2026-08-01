@@ -82,9 +82,12 @@ and autosaves.
   compositing), clickable buttons, belt chips, gold/level readout,
   monster health bar on hover.
 - Real DiabloUI front end: flaming logo, gold artfont items, focus
-  pentagrams, mouse-driven menu, options screen (resolution,
-  fullscreen, fit to screen, integer scaling, zoom, town jog, SFX,
-  music). Title screen and cut screens on every level change.
+  pentagrams, mouse-driven menus, and a sectioned scrollable options
+  list (AUDIO / GRAPHICS / GAME) shared with the in-game menu: sound
+  and music toggles and volume sliders, resolution, fullscreen, fit to
+  screen, integer scaling, zoom, gamma, town jog. The gmenu skin draws
+  retail optbar/option.cel sliders. Title screen and cut screens on
+  every level change.
 - Single Player flow: character select over 3 save slots, class
   selection (Warrior/Rogue/Sorcerer with their real starting stats and
   hero portraits), name entry, delete-with-confirm.
@@ -102,7 +105,10 @@ and autosaves.
   set-piece bosses The Butcher, the Skeleton King and the Warlord of
   Blood on their real stat rows; killing one completes its quest.
 - Magic items: 83 prefixes and 95 suffixes generated from itemdat, rolled
-  per GetItemPower ("Vicious Long Battle Bow of the moon").
+  per GetItemPower ("Vicious Long Battle Bow of the moon"); magnitudes
+  roll once at creation per SaveItemPower and persist on the item, and
+  identified items list their PrintItemPower lines in the info box.
+  Unique powers list there too (DrawUniqueInfo's side box is absent).
 - Unique items: 15 from UniqueItemList, rolled through CheckUnique with
   the UniqueItemFlag once-only bitmap; their powers feed damage, AC and
   attributes through the same getters combat already uses.
@@ -111,7 +117,10 @@ and autosaves.
   Griswold's repair priced by AddStoreHoldRepair.
 - Town shops: Griswold, Adria, Wirt, Pepin, Cain with generated stock,
   buy/sell, repair, Cain's flat 100-gold identify, and the authentic
-  Wirt peek fee.
+  Wirt peek fee. Every towner opens menu-first with its greeting voice;
+  "Talk to" is the S_StartTalk topic menu - random gossip from the
+  towner's range plus level-gated quest rows - and hovering a stock or
+  service row fills the panel info box.
 - Towner dialog: 171 lines from textdat alltext - greeting, rotating
   gossip and per-quest topics gated on the deepest level reached - in
   the TextBox.CEL frame, the MedTextS quest font scrolling upward at
@@ -122,9 +131,10 @@ and autosaves.
 - Save/load: 3 slots, own compact format, checksummed; persists the
   character, inventory, position and all 17 level seeds so dungeons
   regenerate identically, plus per-item prefix/suffix/unique/identified
-  state, durability and staff charges, the unique-drop bitmap, quest
-  state and spell levels. Autosaves on level change and on exit. Format
-  version 3; versions 1 and 2 still load with documented defaults.
+  state, durability, staff charges and per-item affix rolls, the
+  unique-drop bitmap, quest state and spell levels. Autosaves on level
+  change and on exit. Format version 4; versions 1-3 still load with
+  documented defaults.
 - devilutionX-style QOL: town jog, 2x zoom ('z' and the mouse wheel),
   a resizable canvas with five modes to 1280x960 ('w' or the options
   menu), hover HP bar, click feedback sounds.
@@ -178,9 +188,11 @@ pinned, frames eyeballed as PNG) and in-VM by D1Test.
 ## Deviations
 
 - Options persist in ::/Apps/Diablo1/OPTIONS.INI - KEY=VALUE text,
-  hand-editable, unknown keys skipped (diablo.ini precedent). Loaded at
-  include time; the shell saves on leaving the options screen and on
-  exit.
+  hand-editable, unknown keys skipped (diablo.ini precedent), including
+  SFXVOL/MUSVOL (0-256, linear rather than retail's log centibels) and
+  GAMMA (30-100, retail ApplyGamma pow curve - low values brighten).
+  Loaded at include time; the shell saves on leaving the options screen
+  and on exit.
 - devilutionX's zoom is a Bool, 1x or 2x (GraphicsOptions.zoom,
   scrollrt.cpp Zoom). The 19-step fractional ladder and sub-1x zoom-out
   are port additions.
