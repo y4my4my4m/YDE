@@ -163,6 +163,7 @@ pinned, frames eyeballed as PNG) and in-VM by D1Test.
 | D1Drlg4.ZC (+T) | hell generation | drlg_l4.cpp |
 | D1Render.ZC | tile encodings, world walk | _render.cpp, scrollrt.cpp |
 | D1Mon.ZC (+D1MonT) | monsters, per-type AI, combat | monster.cpp, monstdat.cpp |
+| D1Net.ZC | LAN lockstep transport + session | nthread.cpp, msg.cpp, multi.cpp |
 | D1Mis.ZC | missiles | missiles.cpp |
 | D1Item.ZC (+D1ItmT) | base items, drops, belt | items.cpp, itemdat.cpp |
 | D1Affix.ZC (+D1AffT) | prefixes and suffixes | itemdat.cpp PL_Prefix/Suffix |
@@ -216,12 +217,16 @@ pinned, frames eyeballed as PNG) and in-VM by D1Test.
 - Level 13 keeps its down stairs, which DRLG_L4's Q_WARLORD branch omits.
 - L3ANVIL is a miniset upstream, not a DUN, and is not implemented, so
   level 10 carries no set piece.
-- Music plays one pass and stops. No multiplayer.
+- Music plays one pass and stops.
+- Multiplayer: lockstep transport and peer sim are in tree
+  (`D1Net.ZC`, `D1Peer*` in `D1Play.ZC`); Host/Join menu and character-
+  pack hooks are not wired yet. Prove determinism with
+  `D1TestLockstep;`. LAN entry is `ExeFile("::/Apps/Diablo1/RunNet");`.
 
 ## Roadmap
 
 remaining gaps: crawl-table lighting and the dTransVal pass, set levels,
-multiplayer.
+multiplayer Host/Join UI and character-pack wire-up.
 
 ## License
 
