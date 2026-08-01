@@ -61,10 +61,13 @@ and autosaves.
   ExpLvlsTbl thresholds), player death and town respawn.
 - Objects and loot: barrels shatter, chests open, monsters drop gold and
   potions; click to pick up, keys 1-8 drink from the belt.
-- Items: 69 base items generated from itemdat rows (weapons, armor,
-  shields, helms, six potion kinds, gold); level-fit monster drops;
-  the Inv.CEL inventory screen with a 10x4 grid and equip slots; weapon
-  damage and armor AC feed combat.
+- Items: 74 base items generated from itemdat rows (weapons, armor,
+  shields, helms, five staves, six potion kinds, gold); level-fit
+  monster drops; the Inv.CEL inventory screen with a 10x4 grid and
+  equip slots; weapon damage and armor AC feed combat.
+- Staves carry a GetStaffSpell roll and charges; casting from one bills
+  the staff, the panel icon tints orange (RSPLTYPE_CHARGES), and Adria
+  stocks them. A spent staff stays spent: recharging is absent.
 - Objects: barrels, chests, and functional doors (exact objects.cpp
   piece-swap tables for cathedral and catacombs).
 - A* pathfinding (path.cpp) with BFS fallback past its 24-step cap.
@@ -112,8 +115,9 @@ and autosaves.
 - Save/load: 3 slots, own compact format, checksummed; persists the
   character, inventory, position and all 17 level seeds so dungeons
   regenerate identically, plus per-item prefix/suffix/unique/identified
-  state and durability, the unique-drop bitmap, quest state and spell
-  levels. Autosaves on level change and on exit.
+  state, durability and staff charges, the unique-drop bitmap, quest
+  state and spell levels. Autosaves on level change and on exit. Format
+  version 3; versions 1 and 2 still load with documented defaults.
 - devilutionX-style QOL: town jog, 2x zoom ('z' and the mouse wheel),
   widescreen at 640/800/1024/1280 ('w' or the options menu), hover HP
   bar, click feedback sounds.
