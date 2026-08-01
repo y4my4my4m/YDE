@@ -1275,94 +1275,84 @@ U0 HLMusicFree()
 	hl_music_track   = 0;
 }
 
-//MP3 decode runs in its own task: the PDMP3 decoder is pure F64 ZealC and a
-//3MB track takes minutes under emulation. Inline, that froze the game at the
-//first trigger_cdaudio. Single writer: the task fills the pend_ fields and
-//sets state LAST; HLMusicUpdate adopts on state 2.
+//MP3 music decodes INLINE on the game task, a few frames per tick, through
+//the same MP3Stream API ZealAmp plays with. No spawned task: a decode task on
+//core 2 triple-faulted the machine at spawn, and music has no realtime need.
+//Whole-track decode takes a few seconds of gameplay; the voice starts at the
+//end of the stream.
 #define HLMUSIC_PEND_IDLE		0
 #define HLMUSIC_PEND_DECODING	1
 #define HLMUSIC_PEND_READY		2
-#define HLMUSIC_PEND_FAILED		3
+
+//MP3 frames per game tick. 8 frames = 9216 samples, ~0.2s of audio; a 60s
+//track lands in ~5s of play
+#define HLMUSIC_SLICE_FRAMES	8
 
 U8		*hl_music_pend_raw;
 I64		 hl_music_pend_size;
 I64		 hl_music_pend_track;
 U8		 hl_music_pend_name[32];
 U32		*hl_music_pend_frames;
-I64		 hl_music_pend_count;
+I64		 hl_music_pend_count;	//write cursor, in U32 frames
+I64		 hl_music_pend_cap;
 I64		 hl_music_pend_rate;
 I64		 hl_music_pend_state;
-CTask	*hl_music_pend_owner;	//game task; the frame buffer outlives the decode task
-
-//crash localisation. The task bumps the stage; the game task logs transitions.
-//1 task entered, 2 decode returned, 3 frames packed
-I64		 hl_music_pend_stage;
-I64		 hl_music_stage_seen;
 
 //cdmp3 0 disables the MP3 branch entirely; isolates the decoder from a crash
 Bool	 hl_music_mp3_on;
 
-U0 HLMusicDecodeTask()
-{//owns hl_music_pend_raw until it finishes; frees it either way
-	I16	*pcm;
-	U32	*frames;
-	I64	 mp3_frames;
-	I64	 mp3_rate;
-	I64	 mp3_ch;
-	I64	 i;
-	I64	 l;
-	I64	 r;
+U0 HLMusicPendFree()
+{//abandon an in-flight stream decode
+	if (hl_music_pend_raw)
+		Free(hl_music_pend_raw);
+	if (hl_music_pend_frames)
+		Free(hl_music_pend_frames);
+	hl_music_pend_raw    = NULL;
+	hl_music_pend_frames = NULL;
+	hl_music_pend_count  = 0;
+	hl_music_pend_cap    = 0;
+	hl_music_pend_state  = HLMUSIC_PEND_IDLE;
+}
 
-	hl_music_pend_stage = 1;
+U0 HLMusicDecodeSlice()
+{//HLMUSIC_SLICE_FRAMES MP3 frames into the pend buffer; READY at stream end
+	I64 n, i, k, s, l, gr, produced = 0;
 
-	pcm = MP3Decode(hl_music_pend_raw, hl_music_pend_size, &mp3_frames,
-		&mp3_rate, &mp3_ch);
-
-	Free(hl_music_pend_raw);
-	hl_music_pend_raw = NULL;
-
-	hl_music_pend_stage = 2;
-
-	if (!pcm || mp3_frames <= 0)
+	while (produced < HLMUSIC_SLICE_FRAMES)
 	{
-		hl_music_pend_state = HLMUSIC_PEND_FAILED;
-		return;
+		if (hl_music_pend_count + 1152 > hl_music_pend_cap)
+			break;	//estimate exhausted; play what fits
+
+		n = MP3StreamFrame();
+		if (n < 1)
+			break;	//end of stream
+
+		//mp3_out holds left in the high half of each U32; the mixer voice
+		//reads left from the low. Mono carries the sample in the low half
+		k = hl_music_pend_count;
+		for (gr = 0; gr < 2; gr++)
+			for (i = 0; i < 576; i++)
+			{
+				s = mp3_out[gr][i];
+				if (mp3_stream_channels == 2)
+					hl_music_pend_frames[k] = (s >> 16 & 0xFFFF) | ((s & 0xFFFF) << 16);
+				else
+				{
+					l = s & 0xFFFF;
+					hl_music_pend_frames[k] = l | (l << 16);
+				}
+				k++;
+			}
+		hl_music_pend_count = k;
+		produced++;
 	}
 
-	if (mp3_frames > HLMUSIC_MAX_BYTES / sizeof(U32))
-		mp3_frames = HLMUSIC_MAX_BYTES / sizeof(U32);
-
-	//on the game task's heap: this task's heap is freed when it exits
-	frames = MAlloc(mp3_frames * sizeof(U32), hl_music_pend_owner);
-
-	//interleaved I16 to the mixer's U32 frame: left low, right high, mono
-	//duplicated
-	for (i = 0; i < mp3_frames; i++)
-	{
-		if (mp3_ch == 2)
-		{
-			l = pcm[i * 2];
-			r = pcm[i * 2 + 1];
-		}
-		else
-		{
-			l = pcm[i];
-			r = l;
-		}
-
-		frames[i] = (l & 0xFFFF) | ((r & 0xFFFF) << 16);
+	if (produced < HLMUSIC_SLICE_FRAMES)
+	{//stream done (or buffer full): the compressed source is finished with
+		Free(hl_music_pend_raw);
+		hl_music_pend_raw   = NULL;
+		hl_music_pend_state = HLMUSIC_PEND_READY;
 	}
-
-	Free(pcm);
-
-	hl_music_pend_stage = 3;
-
-	hl_music_pend_frames = frames;
-	hl_music_pend_count  = mp3_frames;
-	hl_music_pend_rate   = mp3_rate;
-
-	//last write: the reader keys on it
-	hl_music_pend_state = HLMUSIC_PEND_READY;
 }
 
 U8 *HLMusicTrackName(I64 track)
@@ -1409,6 +1399,7 @@ Bool HLMusicLoad(I64 track)
 	I64	 rate  = HLSND_RATE;
 	U32	*frames = NULL;
 	I64	 count;
+	I64	 est;
 
 	HLMusicFree;
 
@@ -1435,9 +1426,9 @@ Bool HLMusicLoad(I64 track)
 			raw = FileRead(path, &size);
 	}
 
-	//the shipped soundtrack itself, through the ZealAmp decoder. Decode runs
-	//in a spawned task; the game loop continues and HLMusicUpdate starts the
-	//voice when the task finishes. Returns FALSE: nothing is playing yet
+	//the shipped soundtrack itself, streamed through the ZealAmp decoder.
+	//HLMusicUpdate decodes a slice per tick and starts the voice at stream
+	//end. Returns FALSE: nothing is playing yet
 	if (!raw && name && hl_music_mp3_on)
 	{
 		StrPrint(path, "%s/valve/media/%s.mp3", hl_game_root, name);
@@ -1447,31 +1438,44 @@ Bool HLMusicLoad(I64 track)
 
 		if (raw)
 		{
-			if (hl_music_pend_state == HLMUSIC_PEND_DECODING)
-			{//one decode at a time; the raw buffer belongs to the task
+			HLMusicPendFree;
+
+			//one frame proves the stream and yields format + bitrate
+			MP3StreamInit(raw, size);
+			if (MP3StreamFrame() < 1)
+			{
 				Free(raw);
+				StrPrint(hl_music_status, "%s.mp3 undecodable", name);
 				return FALSE;
 			}
 
-			hl_music_pend_raw   = raw;
-			hl_music_pend_size  = size;
-			hl_music_pend_track = track;
-			hl_music_pend_owner = Fs;
+			//ZAMp3Open's sizing: duration from the mean bitrate, +8s of
+			//margin for VBR
+			est = (size * 8 / MaxI64(1, mp3_bitrates[mp3_h_bitrate_index]) + 8)
+				* mp3_stream_rate;
+			if (est > HLMUSIC_MAX_BYTES / sizeof(U32))
+				est = HLMUSIC_MAX_BYTES / sizeof(U32);
+
+			hl_music_pend_raw    = raw;
+			hl_music_pend_size   = size;
+			hl_music_pend_track  = track;
+			hl_music_pend_rate   = mp3_stream_rate;
+			hl_music_pend_cap    = est;
+			hl_music_pend_count  = 0;
+			hl_music_pend_frames = MAlloc(est * sizeof(U32));
 			HLStrCopy(hl_music_pend_name, name, 32);
 
+			//the probe frame is discarded; restart the stream clean
+			MP3StreamInit(raw, size);
+
 			hl_music_pend_state = HLMUSIC_PEND_DECODING;
-			hl_music_pend_stage = 0;
-			hl_music_stage_seen = 0;
 
 			StrPrint(hl_music_status, "decoding %s.mp3", name);
 
-			StrPrint(path, "music: decode spawn %s %d bytes\n", name, size);
+			StrPrint(path, "music: stream start %s %d bytes %dHz ch%d\n",
+				name, size, mp3_stream_rate, mp3_stream_channels);
 			HLLog(path);
 			HLLogFlush;
-
-			//core 2, same as ZealAmp: scheduling is cooperative per core and
-			//the decoder never Yields. On the game's core this blocks anyway
-			Spawn(&HLMusicDecodeTask, NULL, "HL1 MP3 Decode", 2);
 
 			return FALSE;
 		}
@@ -1516,9 +1520,9 @@ U0 HLMusicReset()
 
 	hl_music_pend_raw    = NULL;
 	hl_music_pend_frames = NULL;
+	hl_music_pend_count  = 0;
+	hl_music_pend_cap    = 0;
 	hl_music_pend_state  = HLMUSIC_PEND_IDLE;
-	hl_music_pend_stage  = 0;
-	hl_music_stage_seen  = 0;
 	hl_music_mp3_on      = TRUE;
 }
 
@@ -1566,13 +1570,8 @@ U0 HLMusicUpdate(F64 now)
  //runs early and stacks copies, or late and leaves a gap
 	U8 buf[96];
 
-	if (hl_music_pend_stage != hl_music_stage_seen)
-	{//decode task progress, logged from this task so the log has one writer
-		hl_music_stage_seen = hl_music_pend_stage;
-		StrPrint(buf, "music: decode stage %d\n", hl_music_stage_seen);
-		HLLog(buf);
-		HLLogFlush;
-	}
+	if (hl_music_pend_state == HLMUSIC_PEND_DECODING)
+		HLMusicDecodeSlice;
 
 	if (hl_music_pend_state == HLMUSIC_PEND_READY)
 	{//background decode finished: adopt and start. HLMusicFree first, so a
@@ -1597,15 +1596,6 @@ U0 HLMusicUpdate(F64 now)
 
 		HLMusicStart(now);
 		return;
-	}
-
-	if (hl_music_pend_state == HLMUSIC_PEND_FAILED)
-	{
-		StrPrint(hl_music_status, "%s.mp3 undecodable", hl_music_pend_name);
-		hl_music_pend_state = HLMUSIC_PEND_IDLE;
-
-		HLLog("music: decode failed\n");
-		HLLogFlush;
 	}
 
 	if (!hl_music_playing || !hl_music_frames)
