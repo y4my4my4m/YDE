@@ -39,16 +39,21 @@ and autosaves.
   pattern table), drlg_l3 (caves: organic growth, river, lava pools) and
   drlg_l4 (hell: mirrored quadrants) on the exact Borland RNG. Stairs
   travel town -> L1 ... -> L16; level 15 descends through the pentagram.
-  Theme rooms and quest set pieces are absent, so layouts diverge from
-  retail seeds but are deterministic in ours.
+  Quest set pieces are stamped from their retail DUNs (rnd6, SKngDO,
+  Banner2, Blood1, Bonestr2, Blind2, Warlord and the four level-16 diab
+  quads). Theme rooms are absent, so layouts diverge from retail seeds
+  but are deterministic in ours.
 - Lighting: MakeLightTable ramp shading, radial falloff around the
   player, applied to tiles and actors.
-- Monsters: 32 types over the full depth (zombies, fallen, skeletons,
-  scavengers, hidden, goat clans, overlords and more), machine-generated
-  from their monstdat rows with TRN recolors. Melee chase AI plus archers
-  (skeleton/goat bows) that keep distance and shoot.
-- Missiles: arrows and firebolts with wall/target collision; right-click
-  casts Firebolt for 6 mana.
+- Monsters: 80 types over the full depth, machine-generated from their
+  monstdat rows with TRN recolors, carrying mAi, class and magic
+  resistance. Per-type AI mirroring the MAI_ routines: fallen rally and
+  rout, scavenger corpse eating, gargoyle stone form, rhino charges,
+  sneak fade, erratic bats, and magma/acid/succubus/storm casters firing
+  their own missiles. Immunity and resistance apply per school.
+- Missiles: 11 types (arrows, firebolt, fireball, holy bolt, elemental,
+  inferno, charged bolt, acid, blood star, lightning) with wall and
+  target collision.
 - Combat: to-hit rolls both ways, hit flash, XP with level-ups (real
   ExpLvlsTbl thresholds), player death and town respawn.
 - Objects and loot: barrels shatter, chests open, monsters drop gold and
@@ -77,22 +82,35 @@ and autosaves.
   and CreatePlayer HP/mana derivations; class-correct player sprites.
 - Character sheet at the real DrawChr coordinates, with working
   attribute-point spending on level up.
-- Spells: Firebolt, Healing, Lightning, Flash, Fire Wall, Chain
-  Lightning with authentic mana costs and damage formulas, plus the
-  spellbook with its four pages.
+- Spells: 19 from spelldat with their real mana costs, book levels and
+  GetDamageAmt formulas, including Town Portal, Stone Curse, Mana
+  Shield, Teleport, Phasing, Nova, Fireball, Bone Spirit and Blood
+  Star; the spellbook lays its four pages out per SpellPages.
 - Automap from the .AMP tables: real isometric wall/door/stairs line
   work, explored-tile tracking, four zoom steps.
-- Quest log: 13 level-triggered quests on the Quest.CEL panel.
+- Quest log: 13 level-triggered quests on the Quest.CEL panel, with the
+  set-piece bosses The Butcher, the Skeleton King and the Warlord of
+  Blood on their real stat rows; killing one completes its quest.
 - Magic items: 83 prefixes and 95 suffixes generated from itemdat, rolled
   per GetItemPower ("Vicious Long Battle Bow of the moon").
+- Unique items: 15 from UniqueItemList, rolled through CheckUnique with
+  the UniqueItemFlag once-only bitmap; their powers feed damage, AC and
+  attributes through the same getters combat already uses.
+- Items drop unidentified and wear out: durability rolled per
+  ItemRndDur, WeaponDur and ArmorDur decrements, breakage, and
+  Griswold's repair priced by AddStoreHoldRepair.
 - Town shops: Griswold, Adria, Wirt, Pepin, Cain with generated stock,
-  buy/sell, and the authentic Wirt peek fee.
+  buy/sell, repair, Cain's flat 100-gold identify, and the authentic
+  Wirt peek fee.
+- Towner dialog: 171 lines from textdat alltext - greeting, rotating
+  gossip and per-quest topics gated on the deepest level reached - in
+  the TextBox.CEL frame, word wrapped with click/SPACE paging.
 - Save/load: 3 slots, own compact format, checksummed; persists the
   character, inventory, position and all 17 level seeds so dungeons
   regenerate identically. Autosaves on level change and on exit.
-- devilutionX-style QOL: town jog, 2x zoom ('z'), hover HP bar, click
-  feedback sounds. Widescreen needs a variable-width canvas and is not
-  in yet.
+- devilutionX-style QOL: town jog, 2x zoom ('z' and the mouse wheel),
+  hover HP bar, click feedback sounds. Widescreen needs a
+  variable-width canvas and is not in yet.
 
 The data layer, generator, renderer, lighting, and combat are verified on
 the host by a transpile rig (scratchpad d1_transpile.py; extraction
@@ -117,36 +135,49 @@ pinned, frames eyeballed as PNG) and in-VM by D1Test.
 | D1Drlg3.ZC (+T) | caves generation | drlg_l3.cpp |
 | D1Drlg4.ZC (+T) | hell generation | drlg_l4.cpp |
 | D1Render.ZC | tile encodings, world walk | _render.cpp, scrollrt.cpp |
-| D1Mon.ZC (+D1MonT) | monsters, AI, combat | monster.cpp, monstdat.cpp |
-| D1Mis.ZC | arrows, firebolt | missiles.cpp |
-| D1Item.ZC | gold, potions, belt | items.cpp (reduced) |
-| D1Obj.ZC | barrels, chests | objects.cpp (reduced) |
-| D1Towner.ZC | town NPCs | towners.cpp |
-| D1Play.ZC | player, melee, warps, BFS | player.cpp, path.cpp, trigs.cpp |
+| D1Mon.ZC (+D1MonT) | monsters, per-type AI, combat | monster.cpp, monstdat.cpp |
+| D1Mis.ZC | missiles | missiles.cpp |
+| D1Item.ZC (+D1ItmT) | base items, drops, belt | items.cpp, itemdat.cpp |
+| D1Affix.ZC (+D1AffT) | prefixes and suffixes | itemdat.cpp PL_Prefix/Suffix |
+| D1UnqT.ZC | unique items | itemdat.cpp UniqueItemList |
+| D1Inv.ZC | inventory grid, equip slots | inv.cpp |
+| D1Obj.ZC | barrels, chests, doors | objects.cpp |
+| D1Towner.ZC (+D1TwnT) | town NPCs, dialog | towners.cpp, textdat.cpp |
+| D1Store.ZC | town stores | stores.cpp (reduced) |
+| D1Play.ZC | player, melee, warps | player.cpp, trigs.cpp |
+| D1Path.ZC | pathfinding | path.cpp FindPath |
+| D1Char.ZC / D1CharUI.ZC | classes, stats, CHAR screen | player.cpp, control.cpp DrawChr |
+| D1Spell.ZC | spells, spellbook | spelldat.cpp, control.cpp |
+| D1Quest.ZC | quest log, set-piece bosses | quests.cpp |
+| D1Auto.ZC | automap | automap.cpp |
+| D1Save.ZC | character save slots | loadsave.cpp (own format) |
+| D1Sel.ZC | single player front end | DiabloUI select/create |
+| D1Snd.ZC | WAV decode, SFX voices, music | sound.cpp |
+| D1UI.ZC | screen-panel registry | - |
 | D1Panel.ZC | control panel, orbs | control.cpp |
 | D1Test.ZC | self check | - |
 | Diablo1.ZC | shell, input, game loop | diablo.cpp |
 
 ## Deviations
 
-- Menu text is the in-game small font drawn as bright silhouettes; the
-  DiabloUI artfonts (font16/font42 + .bin kerning) are not loaded yet.
-- Pathing is BFS, not the original A*; same walkability rules.
-- Monster AI is chase + melee or kite + shoot; per-type quirks (fallen
-  flight, scavenger corpse eating, gargoyle stone form, charges) are not
-  modeled, and those types are absent from the roster.
-- Lighting falloff is plain radial, not the original crawl tables; no
-  wall-transparency (dTransVal) pass. Missiles draw over walls.
-- Items are gold and potions only; no bases/affixes/inventory grid.
-  Doors render open and never close. Firebolt is the one spell.
-- No audio, quests, saves, Diablo boss, or multiplayer.
+- Canvas is fixed 640x480. Widescreen is absent; zoom scales the whole
+  canvas rather than widening the view.
+- Lighting falloff is plain radial, not the original crawl tables. No
+  wall-transparency (dTransVal) pass; missiles draw over walls.
+- Nova's book level is the Hellfire row's 14. Retail's is -1, staff only.
+- The Skeleton King stands in the SKngDO room; the port has no set
+  levels, so his own level is not built.
+- AI_CLEAVER, AI_SKELKING and AI_WARLORD are unimplemented; all three
+  bosses reduce to the skeleton melee AI.
+- Level 13 keeps its down stairs, which DRLG_L4's Q_WARLORD branch omits.
+- L3ANVIL is a miniset upstream, not a DUN, and is not implemented, so
+  level 10 carries no set piece.
+- Music plays one pass and stops. No multiplayer.
 
 ## Roadmap
 
-remaining gaps: quest set-pieces and their unique bosses, the level-16
-Diablo quad room, unique/set items, item identification and repair as
-real mechanics, the remaining ~30 spells, monster special abilities,
-towner dialog trees, widescreen (variable-width canvas), multiplayer.
+remaining gaps: widescreen (variable-width canvas), crawl-table lighting
+and the dTransVal pass, set levels, multiplayer.
 
 ## License
 
