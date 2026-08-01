@@ -673,6 +673,10 @@ U0 D1PlayTick()
 	d1_view_yoff = d1_plr_yoff;
 }
 
+//remote peer sprites. The drawer is defined at the end of this file, after
+//the peer table it reads; a pointer bridges the single-pass include order.
+U0 (*d1_peer_draw_cb)(I64 x, I64 y, I64 sx, I64 sy) = NULL;
+
 U0 D1PlayCellCb(I64 x, I64 y, I64 sx, I64 sy)
 {//sprite pass, in under-to-over order: corpses+monsters, towners, player
 	U8	*grp;
@@ -687,6 +691,8 @@ U0 D1PlayCellCb(I64 x, I64 y, I64 sx, I64 sy)
 	D1MonDrawCell(x, y, sx, sy);
 	if (d1_currlevel == 0)
 		D1TownerDrawCell(x, y, sx, sy);
+	if (d1_peer_draw_cb)
+		(*d1_peer_draw_cb)(x, y, sx, sy);
 
 	if (x != d1_plr_x || y != d1_plr_y)
 		return;
@@ -830,4 +836,507 @@ U0 D1PlacePlayer(I64 x, I64 y)
 	d1_path_len = 0;
 	d1_path_pos = 0;
 	d1_plr_target = -1;
+}
+
+//--- multiplayer peer simulation -------------------------------------------
+//
+// devilution runs peer-to-peer lockstep: every machine executes the same
+// commands for turn N and arrives at the same world. Here every peer,
+// including the local one, moves through D1PeerTick over the same command
+// stream, so the local player is not a special case - what draws on this
+// machine for turn N is what the other machine computed for turn N.
+//
+// peers are executed in slot order, 0 first, on every machine. That order is
+// what fixes the sequence D1Rnd is consumed in.
+//
+// deviations from retail, all forced by what this port carries:
+//   - peers share one loaded level: any peer taking stairs warps all of them.
+//     Retail keeps a level per player and streams deltas (msg.cpp DeltaLoad).
+//   - a ground item is removed on every peer when one walks over it. Whether
+//     it fits in the taker's pack is local knowledge and cannot gate a shared
+//     world edit; an item that does not fit is lost.
+//   - spells, missiles and the mana shield are off in a session. Their code
+//     is outside this file's reach, so their rolls cannot be brought into the
+//     shared RNG window.
+
+//per-class gfx sets for remote peers, loaded on demand. The local player
+//keeps d1_plr_gfx; sharing one cache per class costs nothing extra when two
+//peers pick the same class.
+U8	*d1_cls_gfx[D1_NCLASS * 7];
+Bool d1_cls_gfx_ok[D1_NCLASS];
+
+U0 D1PeerGfxClear()
+{//globals are not zeroed
+	I64 i;
+
+	for (i = 0; i < D1_NCLASS * 7; i++)
+		d1_cls_gfx[i] = NULL;
+	for (i = 0; i < D1_NCLASS; i++)
+		d1_cls_gfx_ok[i] = FALSE;
+}
+
+U8 *D1ClsGfxName(U8 *dst, I64 cls, U8 *wep, U8 *suffix)
+{//D1PlrGfxNameW against an explicit class rather than the local one
+	StrPrint(dst, "PlrGFX\\%s\\%sl%s\\%sl%s%s.cl2",
+		d1_cls_dir[cls], d1_cls_code[cls], wep,
+		d1_cls_code[cls], wep, suffix);
+	return dst;
+}
+
+Bool D1PeerGfxLoad(I64 cls)
+{
+	I64	 size = 0;
+	U8	 path[64];
+	I64	 b;
+
+	if (cls < 0 || cls >= D1_NCLASS)
+		return FALSE;
+	if (d1_cls_gfx_ok[cls])
+		return TRUE;
+
+	b = cls * 7;
+	d1_cls_gfx[b + D1PG_ST] = D1MpqRead(D1ClsGfxName(path, cls, "s", "st"),
+		&size);
+	d1_cls_gfx[b + D1PG_WL] = D1MpqRead(D1ClsGfxName(path, cls, "s", "wl"),
+		&size);
+	d1_cls_gfx[b + D1PG_AS] = D1MpqRead(D1ClsGfxName(path, cls, "s", "as"),
+		&size);
+	d1_cls_gfx[b + D1PG_AW] = D1MpqRead(D1ClsGfxName(path, cls, "s", "aw"),
+		&size);
+	d1_cls_gfx[b + D1PG_AT] = D1MpqRead(D1ClsGfxName(path, cls, "s", "at"),
+		&size);
+	d1_cls_gfx[b + D1PG_HT] = D1MpqRead(D1ClsGfxName(path, cls, "s", "ht"),
+		&size);
+	//DT ships only under the unarmed weapon code, as LoadPlrGFX's
+	//_pgfxnum reset before PFILE_DEATH records
+	d1_cls_gfx[b + D1PG_DT] = D1MpqRead(D1ClsGfxName(path, cls, "n", "dt"),
+		&size);
+
+	if (!d1_cls_gfx[b + D1PG_ST])
+		return FALSE;
+	d1_cls_gfx_ok[cls] = TRUE;
+	return TRUE;
+}
+
+Bool D1PeerAtTile(I64 x, I64 y)
+{//any live peer standing on or stepping into this tile
+	I64 i;
+
+	if (!d1_net_on)
+		return ToBool(x == d1_plr_tile_x && y == d1_plr_tile_y);
+	for (i = 0; i < D1_MAXPEER; i++)
+	{
+		if (d1_peers[i].used && !d1_peers[i].dead &&
+			d1_peers[i].x == x && d1_peers[i].y == y)
+			return TRUE;
+	}
+	return FALSE;
+}
+
+U0 D1PeerPathFind(I64 pi, I64 tx, I64 ty, Bool adjacent_ok)
+{//the shared A*/BFS, copied into the peer's own queue. Both are pure
+ //functions of the grid, so every machine gets the same steps.
+	CD1Peer *p = &d1_peers[pi];
+	I64 i;
+
+	p->pathlen = 0;
+	p->pathpos = 0;
+	if (!D1PathFind(p->x, p->y, tx, ty, adjacent_ok))
+		return;
+	if (d1_path_len > D1NET_PATHMAX)
+		d1_path_len = D1NET_PATHMAX;
+	for (i = 0; i < d1_path_len; i++)
+		p->path[i] = d1_path[i];
+	p->pathlen = d1_path_len;
+	p->pathpos = 0;
+}
+
+U0 D1PeerAttackRoll(I64 pi, I64 mi)
+{//D1PlayerAttackRoll against the stats shipped in the peer record, so the
+ //roll and its RNG draw are identical on every machine
+	CD1Peer *p = &d1_peers[pi];
+	I64 chance;
+	I64 dmg;
+
+	if (mi < 0 || mi >= d1_nmons)
+		return;
+	chance = 50 + p->dex / 2 + p->lvl - d1_montypes[d1_mons[mi].type].ac;
+	if (chance < 20)
+		chance = 20;
+	if (D1Rnd(100) < chance)
+	{
+		dmg = p->dmin + D1Rnd(p->dmax - p->dmin + 1) +
+			(p->str * p->lvl) / 100;
+		d1_mon_hurt_by = pi;
+		D1MonHurt(mi, dmg << 6);
+		d1_mon_hurt_by = -1;
+		if (p->local)
+			D1DurWeaponHit;			//local equipment only, draws no RNG
+	}
+}
+
+U0 D1PeerPickup(I64 pi, I64 x, I64 y)
+{//the world edit happens on every machine; the pack only on the owner's
+	CD1Peer *p = &d1_peers[pi];
+	I64 ii;
+
+	if (p->local)
+	{
+		D1ItemPickup(x, y);
+		//lost when the pack is full: the removal below is unconditional
+	}
+	ii = d1_ditem[x + y * D1_MAXDUN];
+	if (ii)
+	{
+		d1_items[ii - 1].active = FALSE;
+		d1_ditem[x + y * D1_MAXDUN] = 0;
+	}
+}
+
+U0 D1PeerApplyCmd(I64 pi, I64 cmd, I64 a, I64 b, I64 c)
+{//one turn's input for one peer. msg.cpp's ParseCmd dispatch reduced.
+	CD1Peer *p = &d1_peers[pi];
+
+	no_warn c;
+	if (p->dead)
+		return;
+
+	if (cmd == D1NC_WALK)
+	{
+		p->target = -1;
+		D1PeerPathFind(pi, a, b, FALSE);
+	}
+	else if (cmd == D1NC_ATTACK)
+	{
+		if (a >= 0 && a < d1_nmons)
+		{
+			p->target = a;
+			D1PeerPathFind(pi, d1_mons[a].x, d1_mons[a].y, TRUE);
+		}
+	}
+	else if (cmd == D1NC_STAND)
+	{//SHIFT-click: swing toward the tile without pathing to it
+		p->target  = -1;
+		p->pathlen = 0;
+		p->pathpos = 0;
+		if (p->mode == D1PM_STAND)
+		{
+			p->dir     = D1GetDir(a - p->x, b - p->y);
+			p->mode    = D1PM_ATTACK;
+			p->frame   = 1;
+			p->animcnt = 0;
+		}
+	}
+	else if (cmd == D1NC_PICKUP)
+		D1PeerPickup(pi, a, b);
+	else if (cmd == D1NC_OPEN)
+	{
+		p->dir = D1GetDir(a - p->x, b - p->y);
+		D1ObjOperate(a, b, d1_currlevel);
+	}
+	else if (cmd == D1NC_BELT)
+	{//the misc code travels with the command: what sits in another peer's
+	 //belt is not known here, and the potion roll must still be drawn
+		I64 hp_max = p->maxhp;
+		I64 mn_max = p->maxmana;
+		I64 heal   = 0;
+		I64 mana   = 0;
+
+		if (b == D1IM_HEAL || b == D1IM_REJUV)
+			heal = hp_max / 2 + D1Rnd(hp_max / 4 + 1);
+		if (b == D1IM_MANA || b == D1IM_REJUV)
+			mana = mn_max / 2 + D1Rnd(mn_max / 4 + 1);
+		if (b == D1IM_FULLHEAL || b == D1IM_FULLREJUV)
+			heal = hp_max;
+		if (b == D1IM_FULLMANA || b == D1IM_FULLREJUV)
+			mana = mn_max;
+
+		p->hp += heal;
+		if (p->hp > hp_max)
+			p->hp = hp_max;
+		p->mana += mana;
+		if (p->mana > mn_max)
+			p->mana = mn_max;
+		if (p->local)
+		{
+			d1_plr_hp   = p->hp;
+			d1_plr_mana = p->mana;
+			if (a >= 0 && a < 8)
+				d1_belt[a] = 0;
+		}
+	}
+	else if (cmd == D1NC_WARP)
+	{//one level is loaded for the whole session; the shell performs it
+		d1_warp_to    = a;
+		d1_warp_entry = b;
+	}
+}
+
+U0 D1PeerTick(I64 pi)
+{//D1PlayTick's motion, per peer. No local state is read here.
+	CD1Peer *p = &d1_peers[pi];
+	I64	 dir;
+	I64	 nf;
+	I64	 dx;
+	I64	 dy;
+	U8	*grp;
+	I64	 b;
+
+	if (!p->used)
+		return;
+
+	b   = p->cls * 7;
+	grp = NULL;
+
+	if (p->dead)
+		return;
+
+	//queued path
+	if (p->mode == D1PM_STAND && p->pathpos < p->pathlen)
+	{
+		dir = p->path[p->pathpos];
+		if (D1StepOk(p->x, p->y, dir) &&
+			!D1PeerAtTile(p->x + d1_dir_dx[dir], p->y + d1_dir_dy[dir]))
+		{
+			p->pathpos++;
+			p->dir     = dir;
+			p->mode    = D1PM_WALK;
+			p->step    = 0;
+			p->frame   = 1;
+			p->animcnt = 0;
+			p->xoff    = 0;
+			p->yoff    = 0;
+		}
+		else
+		{
+			p->pathlen = 0;
+			p->pathpos = 0;
+		}
+	}
+
+	//fight the target once the path is spent
+	if (p->mode == D1PM_STAND && p->target >= 0)
+	{
+		if (D1MonAtTile(d1_mons[p->target].x, d1_mons[p->target].y) !=
+			p->target)
+			p->target = -1;
+		else
+		{
+			dx = d1_mons[p->target].x - p->x;
+			dy = d1_mons[p->target].y - p->y;
+			if (dx >= -1 && dx <= 1 && dy >= -1 && dy <= 1)
+			{
+				p->dir     = D1GetDir(dx, dy);
+				p->mode    = D1PM_ATTACK;
+				p->frame   = 1;
+				p->animcnt = 0;
+			}
+			else if (p->pathpos >= p->pathlen)
+				D1PeerPathFind(pi, d1_mons[p->target].x, d1_mons[p->target].y,
+					TRUE);
+		}
+	}
+
+	if (p->mode == D1PM_ATTACK)
+	{
+		nf = 16;
+		if (d1_cls_gfx_ok[p->cls] && d1_cls_gfx[b + D1PG_AT])
+			nf = D1CelNFrames(D1Cl2Dir(d1_cls_gfx[b + D1PG_AT], p->dir));
+		p->frame++;
+		if (p->frame == D1_PLR_AFNUM && p->target >= 0)
+		{
+			dx = d1_mons[p->target].x - p->x;
+			dy = d1_mons[p->target].y - p->y;
+			if (dx >= -1 && dx <= 1 && dy >= -1 && dy <= 1)
+				D1PeerAttackRoll(pi, p->target);
+		}
+		if (p->frame > nf)
+		{
+			p->mode    = D1PM_STAND;
+			p->frame   = 1;
+			p->animcnt = 0;
+		}
+	}
+	else if (p->mode == D1PM_WALK)
+	{
+		p->step++;
+		p->xoff = (32 * (d1_dir_dx[p->dir] - d1_dir_dy[p->dir]) * p->step) /
+			D1_WALK_TICKS;
+		p->yoff = (16 * (d1_dir_dx[p->dir] + d1_dir_dy[p->dir]) * p->step) /
+			D1_WALK_TICKS;
+		if (d1_cls_gfx_ok[p->cls])
+		{
+			if (d1_currlevel == 0)
+				grp = d1_cls_gfx[b + D1PG_WL];
+			else
+				grp = d1_cls_gfx[b + D1PG_AW];
+		}
+		if (grp)
+		{
+			nf = D1CelNFrames(D1Cl2Dir(grp, p->dir));
+			p->frame = 1 + (p->step * nf / D1_WALK_TICKS) % nf;
+		}
+		if (p->step >= D1_WALK_TICKS)
+		{
+			p->x      += d1_dir_dx[p->dir];
+			p->y      += d1_dir_dy[p->dir];
+			p->xoff    = 0;
+			p->yoff    = 0;
+			p->mode    = D1PM_STAND;
+			p->frame   = 1;
+			p->animcnt = 0;
+			p->step    = 0;
+			if (d1_ditem[p->x + p->y * D1_MAXDUN])
+				D1PeerPickup(pi, p->x, p->y);
+		}
+	}
+	else
+	{//stand cycle, StartStand's delay 3
+		if (d1_cls_gfx_ok[p->cls])
+		{
+			if (d1_currlevel == 0)
+				grp = d1_cls_gfx[b + D1PG_ST];
+			else
+				grp = d1_cls_gfx[b + D1PG_AS];
+		}
+		if (grp)
+		{
+			nf = D1CelNFrames(D1Cl2Dir(grp, p->dir));
+			p->animcnt++;
+			if (p->animcnt > D1_STAND_DELAY)
+			{
+				p->animcnt = 0;
+				p->frame++;
+				if (p->frame > nf)
+					p->frame = 1;
+			}
+		}
+	}
+}
+
+U0 D1PeerTickAll()
+{//slot order, on every machine. This is the order D1Rnd is consumed in.
+	I64 i;
+
+	for (i = 0; i < D1_MAXPEER; i++)
+	{
+		if (d1_peers[i].used)
+			D1PeerTick(i);
+	}
+}
+
+U0 D1PeerFromLocal()
+{//push the local character into its slot. Called before the session goes
+ //live and after anything that changes a combat input: level up, equipment.
+	CD1Peer *p = &d1_peers[d1_net_self];
+
+	p->used    = TRUE;
+	p->local   = TRUE;
+	p->cls     = d1_plr_class;
+	p->lvl     = d1_plr_lvl;
+	p->str     = d1_plr_str;
+	p->dex     = d1_plr_dex;
+	p->ac      = D1InvAC();
+	p->dmin    = D1InvDmgMin();
+	p->dmax    = D1InvDmgMax();
+	p->hp      = d1_plr_hp;
+	p->maxhp   = d1_plr_maxhp;
+	p->mana    = d1_plr_mana;
+	p->maxmana = d1_plr_maxmana;
+	p->dlvl    = d1_currlevel;
+	p->dead    = d1_plr_dead;
+	D1StrCopy(p->name, d1_plr_name, 32);
+}
+
+U0 D1PeerPlaceLocal()
+{//the simulated position starts where the shell dropped the player
+	CD1Peer *p = &d1_peers[d1_net_self];
+
+	p->x       = d1_plr_x;
+	p->y       = d1_plr_y;
+	p->dir     = d1_plr_dir;
+	p->mode    = D1PM_STAND;
+	p->frame   = 1;
+	p->animcnt = 0;
+	p->step    = 0;
+	p->xoff    = 0;
+	p->yoff    = 0;
+	p->target  = -1;
+	p->pathlen = 0;
+	p->pathpos = 0;
+}
+
+U0 D1PeerToLocal()
+{//pull the simulated position back out. The player globals stay the single
+ //source the renderer, the automap and the panel read.
+	CD1Peer *p = &d1_peers[d1_net_self];
+
+	d1_plr_x      = p->x;
+	d1_plr_y      = p->y;
+	d1_plr_tile_x = p->x;
+	d1_plr_tile_y = p->y;
+	d1_plr_dir    = p->dir;
+	d1_plr_mode   = p->mode;
+	d1_plr_frame  = p->frame;
+	d1_plr_animcnt = p->animcnt;
+	d1_plr_xoff   = p->xoff;
+	d1_plr_yoff   = p->yoff;
+	d1_plr_target = p->target;
+	d1_plr_hp     = p->hp;
+	d1_plr_dead   = p->dead;
+	d1_view_x     = p->x;
+	d1_view_y     = p->y;
+	d1_view_xoff  = p->xoff;
+	d1_view_yoff  = p->yoff;
+}
+
+U0 D1PeerDrawCell(I64 x, I64 y, I64 sx, I64 sy)
+{//remote peers only; the local one still draws through D1PlayCellCb
+	CD1Peer *p;
+	U8	*grp;
+	I64	 i;
+	I64	 f;
+	I64	 b;
+
+	if (!d1_net_on)
+		return;
+	for (i = 0; i < D1_MAXPEER; i++)
+	{
+		p = &d1_peers[i];
+		if (p->used && !p->local && p->x == x && p->y == y &&
+			d1_cls_gfx_ok[p->cls])
+		{
+			b   = p->cls * 7;
+			grp = d1_cls_gfx[b + D1PG_AS];
+			if (d1_currlevel == 0)
+				grp = d1_cls_gfx[b + D1PG_ST];
+			if (p->mode == D1PM_WALK)
+			{
+				grp = d1_cls_gfx[b + D1PG_AW];
+				if (d1_currlevel == 0)
+					grp = d1_cls_gfx[b + D1PG_WL];
+			}
+			else if (p->mode == D1PM_ATTACK)
+				grp = d1_cls_gfx[b + D1PG_AT];
+			else if (p->mode == D1PM_DEATH)
+				grp = d1_cls_gfx[b + D1PG_DT];
+			if (!grp)
+				return;
+			grp = D1Cl2Dir(grp, p->dir);
+			f   = p->frame;
+			if (f > D1CelNFrames(grp))
+				f = 1;
+			//96 wide, centered over the 64 wide tile, feet on the cell base
+			D1Cl2Draw(sx - 16 + p->xoff, sy + p->yoff, grp, f, 96);
+			D1TextDrawSolid(sx + 32 - D1TextWidth(p->name) / 2, sy - 44,
+				p->name, D1PalBrightest());
+		}
+	}
+}
+
+U0 D1PeerInit()
+{//globals are not zeroed, and the draw hook cannot be installed at its
+ //definition: D1PlayCellCb compiles first
+	D1PeerGfxClear;
+	d1_peer_draw_cb = &D1PeerDrawCell;
 }
