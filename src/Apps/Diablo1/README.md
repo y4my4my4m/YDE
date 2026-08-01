@@ -17,8 +17,10 @@ the same structure as the Quake and HL1 ports.
    `D1Test;` afterwards runs the data-layer self check (extraction byte
    sums, frame counts, town assembly).
 
-Controls: mouse click walks. Arrows + ENTER drive the menu, ESC leaves
-game / menu / app.
+Controls: left-click walks / attacks / picks up / opens; right-click
+casts Firebolt (6 mana); 'i' inventory; 'z' zoom; 1-8 drink from the
+belt; panel buttons are clickable; arrows/ENTER or the mouse drive the
+menu; ESC backs out.
 
 ## What works
 
@@ -49,9 +51,26 @@ game / menu / app.
   ExpLvlsTbl thresholds), player death and town respawn.
 - Objects and loot: barrels shatter, chests open, monsters drop gold and
   potions; click to pick up, keys 1-8 drink from the belt.
-- Control panel with live HP and mana orbs, belt contents, gold and
-  character level readout.
-- Title screen, main menu, cut screens on every level change.
+- Items: 69 base items generated from itemdat rows (weapons, armor,
+  shields, helms, six potion kinds, gold); level-fit monster drops;
+  the Inv.CEL inventory screen with a 10x4 grid and equip slots; weapon
+  damage and armor AC feed combat.
+- Objects: barrels, chests, and functional doors (exact objects.cpp
+  piece-swap tables for cathedral and catacombs).
+- A* pathfinding (path.cpp) with BFS fallback past its 24-step cap.
+- Audio through the native AC97 mixer: WAV decode + 48kHz resample,
+  8-voice SFX pool, looped music per level band, monster voices,
+  menu/combat/item sounds. Options toggles for SFX and music.
+- The Dark Lord waits on level 16; killing him wins the game.
+- Control panel with live HP and mana orbs (authentic P8Bulbs drain
+  compositing), clickable buttons, belt chips, gold/level readout,
+  monster health bar on hover.
+- Real DiabloUI front end: flaming logo, gold artfont items, focus
+  pentagrams, mouse-driven menu, options screen (zoom, town jog, SFX,
+  music). Title screen and cut screens on every level change.
+- devilutionX-style QOL: town jog, 2x zoom ('z'), hover HP bar, click
+  feedback sounds. Widescreen needs a variable-width canvas and is not
+  in yet.
 
 The data layer, generator, renderer, lighting, and combat are verified on
 the host by a transpile rig (scratchpad d1_transpile.py; extraction
@@ -102,10 +121,10 @@ pinned, frames eyeballed as PNG) and in-VM by D1Test.
 
 ## Roadmap
 
-sound through AC97 (SFX + music), functional doors, full item system
-(bases + affixes + inventory grid), spellbook, per-type AI quirks,
-quests, Diablo and the level-16 quad set piece, towner dialog, saves,
-the original A* and crawl-table lighting.
+item affixes + unique/magic items, spellbook + more spells, quests,
+the level-16 Diablo quad set piece, towner dialog trees, saves,
+widescreen (variable-width canvas), crawl-table lighting, per-type AI
+quirks (fallen flight, gargoyle stone form, charges).
 
 ## License
 
