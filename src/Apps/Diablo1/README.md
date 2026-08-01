@@ -17,10 +17,12 @@ the same structure as the Quake and HL1 ports.
    `D1Test;` afterwards runs the data-layer self check (extraction byte
    sums, frame counts, town assembly).
 
-Controls: left-click walks / attacks / picks up / opens; right-click
-casts Firebolt (6 mana); 'i' inventory; 'z' zoom; 1-8 drink from the
-belt; panel buttons are clickable; arrows/ENTER or the mouse drive the
-menu; ESC backs out.
+Controls: left-click walks / attacks / picks up / opens / talks;
+right-click casts the selected spell; `i` inventory, `c` character,
+`s` spellbook, `q` quest log, TAB automap (`=`/`-` zoom it), `z` world
+zoom (also mouse wheel), 1-8 drink from the belt. Every control-panel
+button works. Arrows/ENTER or the mouse drive the menus; ESC backs out
+and autosaves.
 
 ## What works
 
@@ -68,6 +70,26 @@ menu; ESC backs out.
 - Real DiabloUI front end: flaming logo, gold artfont items, focus
   pentagrams, mouse-driven menu, options screen (zoom, town jog, SFX,
   music). Title screen and cut screens on every level change.
+- Single Player flow: character select over 3 save slots, class
+  selection (Warrior/Rogue/Sorcerer with their real starting stats and
+  hero portraits), name entry, delete-with-confirm.
+- All three classes with the authentic player.cpp attribute tables, caps
+  and CreatePlayer HP/mana derivations; class-correct player sprites.
+- Character sheet at the real DrawChr coordinates, with working
+  attribute-point spending on level up.
+- Spells: Firebolt, Healing, Lightning, Flash, Fire Wall, Chain
+  Lightning with authentic mana costs and damage formulas, plus the
+  spellbook with its four pages.
+- Automap from the .AMP tables: real isometric wall/door/stairs line
+  work, explored-tile tracking, four zoom steps.
+- Quest log: 13 level-triggered quests on the Quest.CEL panel.
+- Magic items: 83 prefixes and 95 suffixes generated from itemdat, rolled
+  per GetItemPower ("Vicious Long Battle Bow of the moon").
+- Town shops: Griswold, Adria, Wirt, Pepin, Cain with generated stock,
+  buy/sell, and the authentic Wirt peek fee.
+- Save/load: 3 slots, own compact format, checksummed; persists the
+  character, inventory, position and all 17 level seeds so dungeons
+  regenerate identically. Autosaves on level change and on exit.
 - devilutionX-style QOL: town jog, 2x zoom ('z'), hover HP bar, click
   feedback sounds. Widescreen needs a variable-width canvas and is not
   in yet.
@@ -121,10 +143,10 @@ pinned, frames eyeballed as PNG) and in-VM by D1Test.
 
 ## Roadmap
 
-item affixes + unique/magic items, spellbook + more spells, quests,
-the level-16 Diablo quad set piece, towner dialog trees, saves,
-widescreen (variable-width canvas), crawl-table lighting, per-type AI
-quirks (fallen flight, gargoyle stone form, charges).
+remaining gaps: quest set-pieces and their unique bosses, the level-16
+Diablo quad room, unique/set items, item identification and repair as
+real mechanics, the remaining ~30 spells, monster special abilities,
+towner dialog trees, widescreen (variable-width canvas), multiplayer.
 
 ## License
 
