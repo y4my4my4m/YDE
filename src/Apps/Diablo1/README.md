@@ -15,13 +15,16 @@ the same structure as the Quake and HL1 ports.
        ExeFile("::/Apps/Diablo1/Run");
 
    `D1Test;` afterwards runs the data-layer self check (extraction byte
-   sums, frame counts, town assembly).
+   sums, frame counts, town assembly). `D1TestAudio;` checks the playback
+   path - voice allocation, pool oversubscription, music track switching,
+   and buffer stability while a voice is reading. It is audible and takes
+   about 20 seconds.
 
 Controls: left-click walks / attacks / picks up / opens / talks;
 right-click casts the selected spell; `i` inventory, `c` character,
 `s` spellbook, `q` quest log, TAB automap (`=`/`-` zoom it), `z` world
-zoom (also mouse wheel), 1-8 drink from the belt. Every control-panel
-button works. Arrows/ENTER or the mouse drive the menus; ESC backs out
+zoom (also mouse wheel), `w` cycles canvas width 640/800/1024/1280,
+1-8 drink from the belt. Every control-panel button works. Arrows/ENTER or the mouse drive the menus; ESC backs out
 and autosaves.
 
 ## What works
@@ -104,13 +107,16 @@ and autosaves.
   Wirt peek fee.
 - Towner dialog: 171 lines from textdat alltext - greeting, rotating
   gossip and per-quest topics gated on the deepest level reached - in
-  the TextBox.CEL frame, word wrapped with click/SPACE paging.
+  the TextBox.CEL frame, word wrapped with click/SPACE paging, each
+  spoken by its own voice line resolved through effects.cpp sgSFX.
 - Save/load: 3 slots, own compact format, checksummed; persists the
   character, inventory, position and all 17 level seeds so dungeons
-  regenerate identically. Autosaves on level change and on exit.
+  regenerate identically, plus per-item prefix/suffix/unique/identified
+  state and durability, the unique-drop bitmap, quest state and spell
+  levels. Autosaves on level change and on exit.
 - devilutionX-style QOL: town jog, 2x zoom ('z' and the mouse wheel),
-  hover HP bar, click feedback sounds. Widescreen needs a
-  variable-width canvas and is not in yet.
+  widescreen at 640/800/1024/1280 ('w' or the options menu), hover HP
+  bar, click feedback sounds.
 
 The data layer, generator, renderer, lighting, and combat are verified on
 the host by a transpile rig (scratchpad d1_transpile.py; extraction
@@ -160,8 +166,9 @@ pinned, frames eyeballed as PNG) and in-VM by D1Test.
 
 ## Deviations
 
-- Canvas is fixed 640x480. Widescreen is absent; zoom scales the whole
-  canvas rather than widening the view.
+- Canvas height is fixed at 480; only the width varies. The 640-wide UI
+  art is centered rather than stretched. Width does not persist across a
+  restart: options are plain globals with no settings file.
 - Lighting falloff is plain radial, not the original crawl tables. No
   wall-transparency (dTransVal) pass; missiles draw over walls.
 - Nova's book level is the Hellfire row's 14. Retail's is -1, staff only.
@@ -169,6 +176,12 @@ pinned, frames eyeballed as PNG) and in-VM by D1Test.
   levels, so his own level is not built.
 - AI_CLEAVER, AI_SKELKING and AI_WARLORD are unimplemented; all three
   bosses reduce to the skeleton melee AI.
+- The hovered name floats over the actor. Retail puts it in the panel
+  info box at panel-relative 177,434; the port's gold/level line holds
+  that slot.
+- towners.cpp AnimOrder frame-sequence tables are absent. Six of the
+  eight towners play a hand-authored sequence upstream; here they cycle
+  their frames linearly at the correct per-towner rate.
 - Level 13 keeps its down stairs, which DRLG_L4's Q_WARLORD branch omits.
 - L3ANVIL is a miniset upstream, not a DUN, and is not implemented, so
   level 10 carries no set piece.
@@ -176,8 +189,8 @@ pinned, frames eyeballed as PNG) and in-VM by D1Test.
 
 ## Roadmap
 
-remaining gaps: widescreen (variable-width canvas), crawl-table lighting
-and the dTransVal pass, set levels, multiplayer.
+remaining gaps: crawl-table lighting and the dTransVal pass, set levels,
+multiplayer.
 
 ## License
 

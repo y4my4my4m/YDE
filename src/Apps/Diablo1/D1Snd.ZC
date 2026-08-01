@@ -26,6 +26,7 @@
 #define D1SND_PATH		80
 #define D1SND_SFX_VOL	256		//AUDIO_VOL_UNITY
 #define D1SND_MUS_VOL	100		//music sits under the sfx, as sound.cpp
+#define D1SND_FEED_CHUNK 2048	//frames pushed per feeder wake, ~43ms
 
 class CD1SndCache
 {
@@ -49,11 +50,24 @@ Bool d1snd_ready = FALSE;
 Bool d1snd_on	 = FALSE;	//AC97 device present
 I64	 d1snd_stamp = 0;
 
-U32	*d1snd_mus_frames = NULL;	//native rate, owned here
+U32	*d1snd_mus_frames = NULL;	//48kHz stereo, owned here
 I64	 d1snd_mus_count  = 0;
 I64	 d1snd_mus_rate   = 0;
-I64	 d1snd_mus_handle = -1;
+I64	 d1snd_mus_handle = -1;		//unused; music runs on a stream, not a voice
 U8	 d1snd_mus_path[D1SND_PATH];
+
+//music rides an output stream fed by its own task, the path ZealAmp uses.
+//a voice random-accesses its whole buffer once per output sample; a stream
+//is a sequential fifo the mixer drains, and only the fifo has to keep up.
+I64	 d1snd_mus_stream = -1;
+I64	 d1snd_mus_pos    = 0;		//frame index into d1snd_mus_frames
+Bool d1snd_mus_feed   = FALSE;	//feeder is allowed to touch the PCM
+Bool d1snd_mus_busy   = FALSE;	//feeder is inside the PCM right now
+Bool d1snd_mus_spawn  = FALSE;	//feeder task exists
+
+//D1Store owns a one-shot voice channel for towner speech; it compiles later,
+//so teardown reaches it through this hook rather than by name
+U0 (*d1snd_vox_stop)() = NULL;
 
 //private LCG for sfx variant picks; the game RNG stream stays untouched
 //(upstream random_(164,2) does perturb it - deviation, determinism kept)
@@ -307,6 +321,9 @@ U0 D1SndInitState()
 	d1snd_mus_rate    = 0;
 	d1snd_mus_handle  = -1;
 	d1snd_mus_path[0] = 0;
+	d1snd_mus_pos     = 0;
+	d1snd_mus_feed    = FALSE;
+	d1snd_mus_busy    = FALSE;
 	d1snd_ready       = TRUE;
 }
 
@@ -498,8 +515,60 @@ U0 D1SndPlayMon(U8 *gfx_fmt, U8 letter)
 
 //--- music ------------------------------------------------------------------
 
+U0 D1SndMusicTask()
+{//tops the stream fifo up every ms, wrapping at the end of the track.
+ //mirrors ZealAmp's feeder loop. d1snd_mus_feed gates access to the PCM;
+ //d1snd_mus_busy reports whether this task is inside it right now, so a
+ //stop can wait the pointer out instead of freeing under the feeder.
+	I64 i;
+
+	while (TRUE)
+	{
+		if (d1snd_mus_feed && d1snd_mus_frames && d1snd_mus_stream >= 0 &&
+			d1snd_mus_count > 0)
+		{
+			d1snd_mus_busy = TRUE;
+			//re-read the gate after claiming: a stop between the test and
+			//the claim would otherwise free the buffer under this loop
+			if (d1snd_mus_feed)
+			{
+				i = 0;
+				while (i < D1SND_FEED_CHUNK && d1snd_mus_feed)
+				{
+					if (!AudioStreamPush(d1snd_mus_stream,
+						d1snd_mus_frames[d1snd_mus_pos]))
+						i = D1SND_FEED_CHUNK;	//fifo full
+					else
+					{
+						d1snd_mus_pos++;
+						if (d1snd_mus_pos >= d1snd_mus_count)
+							d1snd_mus_pos = 0;
+						i++;
+					}
+				}
+			}
+			d1snd_mus_busy = FALSE;
+		}
+		Sleep(1);
+	}
+}
+
 U0 D1SndMusicStop()
 {
+	I64 i;
+
+	//close the gate, then wait for the feeder to leave the buffer
+	d1snd_mus_feed = FALSE;
+	for (i = 0; i < 64; i++)
+	{
+		if (!d1snd_mus_busy)
+			i = 64;
+		else
+			Sleep(2);
+	}
+	if (d1snd_mus_stream >= 0)
+		AudioStreamStop(d1snd_mus_stream);
+
 	if (d1snd_mus_handle >= 0)
 	{
 		D1SndHwStop(d1snd_mus_handle);
@@ -514,6 +583,7 @@ U0 D1SndMusicStop()
 	}
 	d1snd_mus_count   = 0;
 	d1snd_mus_rate    = 0;
+	d1snd_mus_pos     = 0;
 	d1snd_mus_path[0] = 0;
 }
 
@@ -554,8 +624,18 @@ U0 D1SndMusic(U8 *path)
 		d1snd_mus_rate = D1SND_RATE;
 	}
 	D1StrCopy(d1snd_mus_path, path, D1SND_PATH);
-	d1snd_mus_handle = D1SndHwPlay(d1snd_mus_frames, d1snd_mus_count,
-		d1snd_mus_rate, D1SND_MUS_VOL, TRUE);
+
+	if (d1snd_mus_stream < 0)
+		d1snd_mus_stream = AudioStreamOpen();
+	if (d1snd_mus_stream < 0)
+		return;					//no free stream; track stays silent
+	if (!d1snd_mus_spawn)
+	{
+		Spawn(&D1SndMusicTask, , "D1 Music", 1);
+		d1snd_mus_spawn = TRUE;
+	}
+	d1snd_mus_pos  = 0;
+	d1snd_mus_feed = TRUE;
 }
 
 U0 D1SndMusicForLevel(I64 level)
@@ -586,15 +666,10 @@ U0 D1SndStopAll()
 		d1snd_voice[i].handle    = -1;
 		d1snd_voice[i].cache_idx = -1;
 	}
-	if (d1snd_mus_frames)
-	{
-		Free(d1snd_mus_frames);
-		d1snd_mus_frames = NULL;
-	}
-	d1snd_mus_count   = 0;
-	d1snd_mus_rate    = 0;
-	d1snd_mus_handle  = -1;
-	d1snd_mus_path[0] = 0;
+	//through the stop, not a bare Free: the feeder task holds the pointer
+	D1SndMusicStop;
+	if (d1snd_vox_stop)
+		(*d1snd_vox_stop)();
 }
 
 U0 D1SndFree()
