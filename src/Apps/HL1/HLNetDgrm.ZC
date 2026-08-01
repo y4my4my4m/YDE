@@ -1,0 +1,3356 @@
+// HLNetDgrm.ZC - WinQuake net_dgrm framing over UDP.
+//
+// Loopback stays raw CHLMsg (HLNet.ZC). UDP peers get 8-byte BE headers
+// (DATA/UNREL/ACK) or 4-byte CTL. Reliable is stop-and-wait with EOM chunks.
+// CTL CCREQ/CCREP lives here; server slot alloc is in HLNetSv.
+//
+// The GoldSrc protocol 48 transport is the second half of this file: the
+// connectionless handshake, the netchan header and the fragment buffers. Both
+// framings share one socket and one bound port. HLNetDgrmRecv, at the end, is
+// the only ingress and selects between them on hl_net48_active.
+
+//here so this file sits between HLNetUdp and HLNetSv in Run.ZC
+//
+//compile-time ceiling, sizes the slot tables. 16 is NetQuake's MAX_SCOREBOARD,
+//and it is the peer's limit, not a width in this framing: every client-indexed
+//field on the wire is a byte (svc_updatename/frags/colors slot, the maxclients
+//byte in svc_serverinfo, .colormap in an entity update), and no per-client
+//bitmask exists here. A protocol 15 client rejects maxclients > MAX_SCOREBOARD
+//at svc_serverinfo, and Sys_Errors on a colormap above it - see the quoted
+//CL_ParseUpdate guard at HLNetSv.ZC HLSvApplyClientColors.
+//
+//The native player replication inherits the same ceiling: it rides the same
+//protocol 15 entity wire with entity number = slot + 1.
+//
+//GoldSrc allows 32 (common/com_model.h:18 MAX_CLIENTS 32) and valve/settings.scr
+//declares maxplayers as NUMBER 1..32. Reaching it needs protocol 48 on the wire,
+//not a larger constant: the writer side of 48 is uncalled and its control
+//channel is still NetQuake CCREQ_CONNECT.
+#define HLSV_MAX_CLIENTS		16
+
+//svs.maxclients - how many this server accepts. single player is 1. this decides
+//how many edicts are reserved, so it must not be the ceiling: reserving 16 in a
+//solo game shifts every world entity by fifteen
+I64 hl_sv_maxclients = 1;
+
+U0 HLSvMaxClientsSet(I64 n)
+{//globals aren't zeroed; this is the init as well as the setter
+	if (n < 1)
+		n = 1;
+	if (n > HLSV_MAX_CLIENTS)
+		n = HLSV_MAX_CLIENTS;
+
+	hl_sv_maxclients = n;
+}
+
+//guest->host has its own sock, server slots are 0..HLSV_MAX_CLIENTS-1
+#define HLNET_CLIENT_SLOT	(-1)
+#define HLNET_PENDING_DEPTH	4
+
+class CHLScore
+{
+	U8	name[16];
+	I64	frags;
+	I64	colors;		//shirt<<4 | pants, same as svc_updatecolors
+	Bool active;
+};
+
+CHLScore	hl_scores[HLSV_MAX_CLIENTS];
+
+//rest of WriteDest(); sv.datagram (unreliable broadcast) is in HLNet.ZC
+//  MSG_ONE  -> hl_sv_client_msg[slot], that client's reliable message
+//  MSG_ALL  -> hl_sv_reliable_datagram, reliable to everyone
+//  MSG_INIT -> hl_sv_signon, replayed to each client during signon
+CHLMsg	hl_sv_client_msg[HLSV_MAX_CLIENTS];
+CHLMsg	hl_sv_reliable_datagram;
+CHLMsg	hl_sv_signon;
+
+U0 HLSvClearWriteDests()
+{//globals aren't zeroed; reset every buffer at map start. sv.signon is not
+ //cleared here - it is filled during map load and must survive.
+	I64 i;
+
+	for (i = 0; i < HLSV_MAX_CLIENTS; i++)
+		HLMsgClear(&hl_sv_client_msg[i]);
+
+	HLMsgClear(&hl_sv_reliable_datagram);
+}
+
+U0 HLSvClearSignon()
+{//before the world spawns - makestatic and ambientsound fill sv.signon
+	HLMsgClear(&hl_sv_signon);
+}
+
+U0 HLSvColorsForColormap(I64 cmap, I64 *_top, I64 *_bottom)
+{//.colormap is a client number; colors come off the scoreboard
+	I64 colors = 0;
+
+	if (cmap >= 1 && cmap <= HLSV_MAX_CLIENTS)
+		colors = hl_scores[cmap - 1].colors;
+
+	if (_top)
+		*_top = (colors >> 4) & 15;
+	if (_bottom)
+		*_bottom = colors & 15;
+}
+
+class CHLNetSock
+{
+	U32		ip;
+	I64		port;		//peer port. Ironwail is ephemeral, Zeal peers 26000
+	Bool	active;
+	Bool	can_send;
+	U32		send_seq;
+	U32		recv_seq;
+	U32		unrel_send_seq;
+	U32		unrel_recv_seq;
+	U32		ack_seq;
+	I64		send_len;
+	U8		send_msg[HLNET_MAX_MSG];
+	F64		last_send_time;
+	I64		send_offset;
+	//multi-chunk reliable reassembly, WinQuake receiveMessage
+	I64		recv_len;
+	U8		recv_msg[HLNET_MAX_MSG];
+	I64		pending_count;
+	I64		pending_head;
+	I64		pending_tail;
+	I64		pending_len[HLNET_PENDING_DEPTH];
+	//flat: slot i at pending_msg + i * HLNET_MAX_MSG. no 2D class arrays
+	U8		pending_msg[HLNET_PENDING_DEPTH * HLNET_MAX_MSG];
+};
+
+Bool	hl_dgrm_pending_logged = FALSE;
+
+//log the first few rx datagrams: distinguishes nothing arriving from arriving
+//then being dropped
+#define HLNET_DGRM_RX_LOG	12
+I64		hl_dgrm_rx_logged = 0;
+U8		hl_dgrm_line[128];
+
+CHLNetSock	hl_net_socks[HLSV_MAX_CLIENTS];
+CHLNetSock	hl_net_client_sock;
+
+//guest CTL handshake state, cleared by HLNetDgrmInit and on new connect
+Bool	hl_ctl_accepted   = FALSE;
+U8		hl_ctl_name[32];
+I64		hl_ctl_top        = 0;
+I64		hl_ctl_bottom     = 0;
+
+U0 HLNetSockClear(CHLNetSock *s)
+{
+	if (!s)
+		return;
+
+	s->ip              = 0;
+	s->port            = HLNET_PORT_DEFAULT;
+	s->active          = FALSE;
+	s->can_send        = TRUE;
+	s->send_seq        = 0;
+	s->recv_seq        = 0;
+	s->unrel_send_seq  = 0;
+	s->unrel_recv_seq  = 0;
+	s->ack_seq         = 0;
+	s->send_len        = 0;
+	s->last_send_time  = 0.0;
+	s->send_offset     = 0;
+	s->recv_len        = 0;
+	s->pending_count   = 0;
+	s->pending_head    = 0;
+	s->pending_tail    = 0;
+	MemSet(s->send_msg, 0, HLNET_MAX_MSG);
+	MemSet(s->recv_msg, 0, HLNET_MAX_MSG);
+	MemSet(s->pending_len, 0, HLNET_PENDING_DEPTH * sizeof(I64));
+	MemSet(s->pending_msg, 0, HLNET_PENDING_DEPTH * HLNET_MAX_MSG);
+}
+
+//The protocol 48 state is declared far below and ZealC has no forward
+//references, so HLNetDgrmInit cannot clear it. It raises this instead and
+//HLNetSv drains it on the first 48 call after a connection boundary.
+Bool	hl_net48_reset_req = FALSE;
+
+U0 HLNetDgrmInit()
+{
+	I64 i;
+
+	hl_dgrm_rx_logged  = 0;
+	hl_net48_reset_req = TRUE;
+
+	for (i = 0; i < HLSV_MAX_CLIENTS; i++)
+		HLNetSockClear(&hl_net_socks[i]);
+
+	HLNetSockClear(&hl_net_client_sock);
+	hl_ctl_accepted   = FALSE;
+	hl_ctl_name[0]    = 0;
+	hl_ctl_top        = 0;
+	hl_ctl_bottom     = 0;
+}
+
+Bool HLNetDgrmSendCtl(U32 ip, CHLMsg *payload, I64 dest_port=0)
+{//prepend big-endian len|NETFLAG_CTL; payload stays little-endian MSG_* bytes
+	U8	 pkt[HLNET_MAX_DATAGRAM + 4];
+	I64	 total;
+	I64	 dport;
+
+	if (!ip || !payload || payload->overflowed || payload->len < 1)
+		return FALSE;
+
+	total = 4 + payload->len;
+	if (total > HLNET_MAX_DATAGRAM + 4)
+		return FALSE;
+
+	dport = dest_port;
+	if (dport < 1)
+		dport = hl_udp_from_port;
+	if (dport < 1)
+		dport = HLNET_PORT_DEFAULT;
+
+	HLNetWriteBigLong(pkt, total | HLNETFLAG_CTL);
+	MemCopy(pkt + 4, payload->data, payload->len);
+	if (!HLNetUdpEnsureArp(ip))
+		return FALSE;
+	return HLNetUdpSendRawTo(pkt, total, ip, dport);
+}
+
+Bool HLNetClientCtlConnect(U32 ip)
+{//CCREQ_CONNECT - 0x01, "QUAKE", HLNET_CTL_VERSION
+	CHLMsg *m = &hl_net_cmd;
+
+	if (!ip)
+		return FALSE;
+
+	HLMsgClear(m);
+	HLMsgWriteByte(m, HLCCREQ_CONNECT);
+	HLMsgWriteString(m, "QUAKE");
+	HLMsgWriteByte(m, HLNET_CTL_VERSION);
+	return HLNetDgrmSendCtl(ip, m, HLNET_PORT_DEFAULT);
+}
+
+//--- host cache (NET_Slist_f / hostcache) -----------------------------------
+//
+//the control channel carries no transaction id, so a CCREP_SERVER_INFO cannot be
+//tied to the CCREQ that caused it. the pairing is temporal: a reply counts if it
+//lands on the bound port inside the window a broadcast query opened. outside that
+//window a CCREP is unsolicited and dropped, else a stray reply from a finished
+//scan sits in the list forever
+
+#define HLNET_SLIST_MAX		16
+#define HLNET_SLIST_WINDOW	2.0		//seconds a query stays open
+
+class CHLHostCache
+{
+	U32		ip;
+	I64		port;
+	U8		addr[32];	//as the server reported it; the dedupe key
+	U8		name[32];
+	U8		map[32];
+	I64		players;
+	I64		max_players;
+};
+
+CHLHostCache	hl_slist[HLNET_SLIST_MAX];
+I64		hl_slist_count    = 0;
+F64		hl_slist_deadline = 0.0;		//tS past which a reply is unsolicited
+Bool	hl_slist_asked    = FALSE;	//a query went out at least once
+
+U0 HLSlistInit()
+{//globals aren't zeroed; a junk count indexes past the table
+	I64 i;
+
+	hl_slist_count    = 0;
+	hl_slist_deadline = 0.0;
+	hl_slist_asked    = FALSE;
+
+	for (i = 0; i < HLNET_SLIST_MAX; i++)
+	{
+		hl_slist[i].ip          = 0;
+		hl_slist[i].port        = HLNET_PORT_DEFAULT;
+		hl_slist[i].addr[0]     = 0;
+		hl_slist[i].name[0]     = 0;
+		hl_slist[i].map[0]      = 0;
+		hl_slist[i].players     = 0;
+		hl_slist[i].max_players = 0;
+	}
+}
+
+I64 HLSlistFind(U8 *addr)
+{//the reported address is the identity, not the source ip: one server, one row
+	I64 i;
+
+	if (!addr || !addr[0])
+		return -1;
+
+	for (i = 0; i < hl_slist_count; i++)
+	{
+		if (!StrICompare(hl_slist[i].addr, addr))
+			return i;
+	}
+
+	return -1;
+}
+
+Bool HLNetSlistBroadcast()
+{//Datagram_SearchForHosts - CCREQ_SERVER_INFO to the subnet, returns at once.
+ //frames CTL by hand rather than through HLNetDgrmSendCtl: that resolves the
+ //destination mac first, and the broadcast address has none
+	CHLMsg	*m = &hl_net_cmd;
+	U8		 pkt[HLNET_MAX_DATAGRAM + 4];
+	I64		 total;
+
+	if (!hl_udp_ready)
+		return FALSE;
+
+	HLMsgClear(m);
+	HLMsgWriteByte(m, HLCCREQ_SERVER_INFO);
+	HLMsgWriteString(m, "QUAKE");
+	HLMsgWriteByte(m, HLNET_CTL_VERSION);
+
+	if (m->overflowed || m->len < 1)
+		return FALSE;
+
+	total = 4 + m->len;
+	HLNetWriteBigLong(pkt, total | HLNETFLAG_CTL);
+	MemCopy(pkt + 4, m->data, m->len);
+
+	//replies arrive over the next second through the ordinary recv path, so the
+	//window opens before the send, not after
+	hl_slist_deadline = tS + HLNET_SLIST_WINDOW;
+	hl_slist_asked    = TRUE;
+
+	return HLNetUdpSendRawBroadcast(pkt, total, HLNET_PORT_DEFAULT);
+}
+
+Bool HLNetSlistSearching()
+{//TRUE while replies are still expected, so an empty table reads as pending
+	if (!hl_slist_asked)
+		return FALSE;
+
+	return ToBool(tS < hl_slist_deadline);
+}
+
+Bool HLNetDgrmIsCtl(U8 *data, I64 len)
+{
+	U32 word;
+	U32 flags;
+	U32 hdr_len;
+
+	if (!data || len < 4)
+		return FALSE;
+
+	word    = HLNetReadBigLong(data);
+	flags   = word & ~HLNETFLAG_LENGTH_MASK;
+	hdr_len = word & HLNETFLAG_LENGTH_MASK;
+	if (hdr_len != len)
+		return FALSE;
+
+	return ToBool(flags & HLNETFLAG_CTL);
+}
+
+CHLNetSock *HLNetDgrmSock(I64 slot)
+{
+	if (slot == HLNET_CLIENT_SLOT)
+		return &hl_net_client_sock;
+
+	if (slot < 0 || slot >= HLSV_MAX_CLIENTS)
+		return NULL;
+
+	return &hl_net_socks[slot];
+}
+
+CHLNetSock *HLNetDgrmSockByIP(U32 ip)
+{
+	I64 i;
+
+	if (!ip)
+		return NULL;
+
+	if (hl_net_client_sock.active && hl_net_client_sock.ip == ip)
+		return &hl_net_client_sock;
+
+	for (i = 0; i < HLSV_MAX_CLIENTS; i++)
+	{
+		if (hl_net_socks[i].active && hl_net_socks[i].ip == ip)
+			return &hl_net_socks[i];
+	}
+
+	return NULL;
+}
+
+Bool HLNetDgrmSendChunk(CHLNetSock *s, Bool resend)
+{//send or resend one reliable fragment from send_msg[send_offset]
+	U8	 pkt[HLNET_MAX_DATAGRAM + HLNET_HEADERSIZE];
+	I64	 remain;
+	I64	 chunk;
+	I64	 packet_len;
+	U32	 flags;
+	U32	 seq;
+
+	if (!s || !s->ip || s->send_offset >= s->send_len)
+		return FALSE;
+
+	remain = s->send_len - s->send_offset;
+	if (remain > HLNET_MAX_DATAGRAM)
+		chunk = HLNET_MAX_DATAGRAM;
+	else
+		chunk = remain;
+
+	packet_len = HLNET_HEADERSIZE + chunk;
+	flags = HLNETFLAG_DATA;
+	if (chunk == remain)
+		flags |= HLNETFLAG_EOM;
+
+	if (resend)
+		seq = s->send_seq - 1;
+	else
+		seq = s->send_seq++;
+
+	HLNetWriteBigLong(pkt, packet_len | flags);
+	HLNetWriteBigLong(pkt + 4, seq);
+	MemCopy(pkt + HLNET_HEADERSIZE, s->send_msg + s->send_offset, chunk);
+
+	if (!HLNetUdpSendRawTo(pkt, packet_len, s->ip, s->port))
+		return FALSE;
+
+	s->last_send_time = tS;
+	return TRUE;
+}
+
+U0 HLNetDgrmFlushPending(CHLNetSock *s)
+{
+	I64 idx;
+
+	if (!s || !s->can_send || s->pending_count <= 0)
+		return;
+
+	idx = s->pending_tail;
+	MemCopy(s->send_msg, s->pending_msg + idx * HLNET_MAX_MSG, s->pending_len[idx]);
+	s->send_len    = s->pending_len[idx];
+	s->pending_tail = (s->pending_tail + 1) % HLNET_PENDING_DEPTH;
+	s->pending_count--;
+	s->send_offset = 0;
+	s->can_send    = FALSE;
+
+	if (!HLNetDgrmSendChunk(s, FALSE))
+		s->last_send_time = tS;
+}
+
+Bool HLNetDgrmPendingEnqueue(CHLNetSock *s, CHLMsg *m)
+{
+	I64 idx;
+
+	if (!s || !m || m->len < 1)
+		return FALSE;
+
+	if (s->pending_count >= HLNET_PENDING_DEPTH)
+	{
+		if (!hl_dgrm_pending_logged)
+		{
+			HLLog("net: pending reliable full, drop\n");
+			HLLogFlush;
+			hl_dgrm_pending_logged = TRUE;
+		}
+		return FALSE;
+	}
+
+	idx = s->pending_head;
+	MemCopy(s->pending_msg + idx * HLNET_MAX_MSG, m->data, m->len);
+	s->pending_len[idx] = m->len;
+	s->pending_head = (s->pending_head + 1) % HLNET_PENDING_DEPTH;
+	s->pending_count++;
+	return TRUE;
+}
+
+Bool HLNetDgrmSendUnreliable(I64 slot, CHLMsg *m)
+{
+	CHLNetSock	*s;
+	U8			 pkt[HLNET_MAX_DATAGRAM + HLNET_HEADERSIZE];
+	I64			 packet_len;
+
+	s = HLNetDgrmSock(slot);
+	if (!s || !s->active || !s->ip || !m || m->len < 1 || m->overflowed)
+		return FALSE;
+
+	if (m->len > HLNET_MAX_DATAGRAM)
+		return FALSE;
+
+	packet_len = HLNET_HEADERSIZE + m->len;
+	HLNetWriteBigLong(pkt, packet_len | HLNETFLAG_UNRELIABLE);
+	HLNetWriteBigLong(pkt + 4, s->unrel_send_seq++);
+	MemCopy(pkt + HLNET_HEADERSIZE, m->data, m->len);
+
+	return HLNetUdpSendRawTo(pkt, packet_len, s->ip, s->port);
+}
+
+Bool HLNetDgrmSendReliable(I64 slot, CHLMsg *m)
+{//buffer, send the first chunk, block until ACK. stop-and-wait
+	CHLNetSock *s;
+
+	s = HLNetDgrmSock(slot);
+	if (!s || !s->active || !s->ip || !m || m->len < 1 || m->overflowed)
+		return FALSE;
+
+	if (m->len > HLNET_MAX_MSG)
+		return FALSE;
+
+	if (!s->can_send)
+		return HLNetDgrmPendingEnqueue(s, m);
+
+	MemCopy(s->send_msg, m->data, m->len);
+	s->send_len    = m->len;
+	s->send_offset = 0;
+	s->can_send    = FALSE;
+
+	if (!HLNetDgrmSendChunk(s, FALSE))
+	{
+		//keep the buffer; Tick resends once UDP/ARP is up
+		s->last_send_time = tS;
+		return FALSE;
+	}
+
+	return TRUE;
+}
+
+U0 HLNetDgrmTick(F64 now)
+{//resend the outstanding reliable chunk after 1s of silence
+	I64			 i;
+	CHLNetSock	*s;
+
+	for (i = 0; i < HLSV_MAX_CLIENTS; i++)
+	{
+		s = &hl_net_socks[i];
+		if (s->active && s->pending_count > 0 && s->can_send)
+			HLNetDgrmFlushPending(s);
+	}
+
+	s = &hl_net_client_sock;
+	if (s->active && s->pending_count > 0 && s->can_send)
+		HLNetDgrmFlushPending(s);
+
+	for (i = 0; i < HLSV_MAX_CLIENTS; i++)
+	{
+		s = &hl_net_socks[i];
+		if (s->active && !s->can_send && s->send_len > 0 &&
+			now - s->last_send_time > 1.0)
+			HLNetDgrmSendChunk(s, TRUE);
+	}
+
+	s = &hl_net_client_sock;
+	if (s->active && !s->can_send && s->send_len > 0 &&
+		now - s->last_send_time > 1.0)
+		HLNetDgrmSendChunk(s, TRUE);
+}
+
+I64 HLNetDgrmHandleCtl(U8 *data, I64 len, U32 from_ip)
+{//guest-side CTL replies. 0 = no game message delivered. server CCREQ is
+ //HLNetServerHandleCtl in HLNetSv.
+	CHLMsg	*m = &hl_net_cmd;	//scratch; hl_net_recv is not declared yet
+	I64		 cmd;
+	I64		 port;
+	U8		 reason[64];
+	U8		 line[96];
+	//CCREP_SERVER_INFO fields, sized to the host cache row they land in
+	U8		 addr[32];
+	U8		 hname[32];
+	U8		 level[32];
+	I64		 players;
+	I64		 maxp;
+	I64		 ver;
+	I64		 idx;
+
+	if (!data || len < 5 || !HLNetDgrmIsCtl(data, len))
+		return 0;
+
+	//server path: leave it for HLNetServerHandleCtl
+	if (hl_udp_server)
+		return 0;
+
+	HLMsgClear(m);
+	MemCopy(m->data, data + 4, len - 4);
+	m->len  = len - 4;
+	m->read = 0;
+
+	cmd = HLMsgReadByte(m);
+	if (m->badread)
+		return 0;
+
+	if (cmd == HLCCREP_ACCEPT)
+	{
+		port = HLMsgReadLong(m);
+		if (m->badread)
+			return 0;
+
+		HLNetSockClear(&hl_net_client_sock);
+		hl_net_client_sock.ip       = from_ip;
+		hl_net_client_sock.port     = port;
+		if (hl_net_client_sock.port < 1)
+			hl_net_client_sock.port = HLNET_PORT_DEFAULT;
+		hl_net_client_sock.active   = TRUE;
+		hl_net_client_sock.can_send = TRUE;
+		hl_ctl_accepted = TRUE;
+
+		StrPrint(line, "net: CTL ACCEPT port %d from %d.%d.%d.%d\n",
+			port,
+			from_ip & 255, (from_ip >> 8) & 255,
+			(from_ip >> 16) & 255, (from_ip >> 24) & 255);
+		HLLog(line);
+		HLLogFlush;
+		return 4;	//guest ACCEPT; caller may send name/color
+	}
+
+	if (cmd == HLCCREP_REJECT)
+	{
+		HLMsgReadString(m, reason, 64);
+		StrPrint(line, "net: CTL REJECT %s\n", reason);
+		HLLog(line);
+		HLLogFlush;
+		return 0;
+	}
+
+	if (cmd == HLCCREP_SERVER_INFO)
+	{
+		//no transaction id on this channel: the open query window is the whole of
+		//the match. drop anything arriving outside it
+		if (!HLNetSlistSearching)
+			return 0;
+
+		HLMsgReadString(m, addr, 32);
+		HLMsgReadString(m, hname, 32);
+		HLMsgReadString(m, level, 32);
+		players = HLMsgReadByte(m);
+		maxp    = HLMsgReadByte(m);
+		ver     = HLMsgReadByte(m);
+		if (m->badread)
+			return 0;
+
+		if (ver != HLNET_CTL_VERSION)
+			return 0;
+
+		//the address answered from wins over the advertised one: a host with no
+		//local ip set reports 0.0.0.0 in a non-empty string, which lists but does
+		//not join. from_ip is the address the reply came from
+		if (from_ip)
+			StrPrint(addr, "%d.%d.%d.%d:%d",
+				from_ip & 255, (from_ip >> 8) & 255,
+				(from_ip >> 16) & 255, (from_ip >> 24) & 255,
+				HLNET_PORT_DEFAULT);
+		else if (!addr[0])
+			return 0;
+
+		//a broadcast reaches every server once per query and the query repeats, so
+		//refresh in place is the common path and append the rare one
+		idx = HLSlistFind(addr);
+		if (idx < 0)
+		{
+			if (hl_slist_count >= HLNET_SLIST_MAX)
+				return 0;
+			idx = hl_slist_count;
+			hl_slist_count++;
+			HLStrCopy(hl_slist[idx].addr, addr, 32);
+		}
+
+		hl_slist[idx].ip   = from_ip;
+		hl_slist[idx].port = hl_udp_from_port;
+		if (hl_slist[idx].port < 1)
+			hl_slist[idx].port = HLNET_PORT_DEFAULT;
+		HLStrCopy(hl_slist[idx].name, hname, 32);
+		HLStrCopy(hl_slist[idx].map, level, 32);
+		hl_slist[idx].players     = players;
+		hl_slist[idx].max_players = maxp;
+		return 0;
+	}
+
+	return 0;
+}
+
+Bool HLNetDgrmSendAck(CHLNetSock *s, U32 seq)
+{
+	U8 pkt[HLNET_HEADERSIZE];
+
+	if (!s || !s->ip)
+		return FALSE;
+
+	HLNetWriteBigLong(pkt, HLNET_HEADERSIZE | HLNETFLAG_ACK);
+	HLNetWriteBigLong(pkt + 4, seq);
+	return HLNetUdpSendRawTo(pkt, HLNET_HEADERSIZE, s->ip, s->port);
+}
+
+I64 HLNetDgrmProcess(CHLNetSock *s, U8 *buf, I64 len, CHLMsg *out)
+{//one framed game packet for an active sock. returns 0/1/2 as Recv does
+	U32	 word;
+	U32	 flags;
+	U32	 hdr_len;
+	U32	 seq;
+	I64	 payload;
+	I64	 remain;
+	I64	 chunk;
+
+	if (!s || !buf || !out || len < 4)
+		return 0;
+
+	word    = HLNetReadBigLong(buf);
+	flags   = word & ~HLNETFLAG_LENGTH_MASK;
+	hdr_len = word & HLNETFLAG_LENGTH_MASK;
+
+	if (hdr_len != len)
+		return 0;
+
+	if (flags & HLNETFLAG_CTL)
+		return HLNetDgrmHandleCtl(buf, len, s->ip);
+
+	if (len < HLNET_HEADERSIZE)
+		return 0;
+
+	seq     = HLNetReadBigLong(buf + 4);
+	payload = len - HLNET_HEADERSIZE;
+
+	if (flags & HLNETFLAG_UNRELIABLE)
+	{
+		if (seq < s->unrel_recv_seq)
+			return 0;
+
+		s->unrel_recv_seq = seq + 1;
+		HLMsgClear(out);
+		if (payload > 0)
+		{
+			if (payload > HLNET_MAX_MSG)
+				return 0;
+			MemCopy(out->data, buf + HLNET_HEADERSIZE, payload);
+			out->len = payload;
+		}
+		return 2;
+	}
+
+	if (flags & HLNETFLAG_ACK)
+	{
+		if (seq != s->send_seq - 1)
+			return 0;
+
+		if (seq != s->ack_seq)
+			return 0;
+
+		s->ack_seq++;
+
+		remain = s->send_len - s->send_offset;
+		if (remain > HLNET_MAX_DATAGRAM)
+			chunk = HLNET_MAX_DATAGRAM;
+		else
+			chunk = remain;
+
+		s->send_offset += chunk;
+		if (s->send_offset < s->send_len)
+			HLNetDgrmSendChunk(s, FALSE);
+		else
+		{
+			s->send_len    = 0;
+			s->send_offset = 0;
+			s->can_send    = TRUE;
+			HLNetDgrmFlushPending(s);
+		}
+		return 0;
+	}
+
+	if (flags & HLNETFLAG_DATA)
+	{
+		HLNetDgrmSendAck(s, seq);
+
+		if (seq != s->recv_seq)
+			return 0;
+
+		s->recv_seq++;
+
+		if (payload > 0)
+		{
+			if (s->recv_len + payload > HLNET_MAX_MSG)
+			{
+				s->recv_len = 0;
+				return 0;
+			}
+			MemCopy(s->recv_msg + s->recv_len, buf + HLNET_HEADERSIZE, payload);
+			s->recv_len += payload;
+		}
+
+		if (flags & HLNETFLAG_EOM)
+		{
+			HLMsgClear(out);
+			if (s->recv_len > 0)
+			{
+				MemCopy(out->data, s->recv_msg, s->recv_len);
+				out->len = s->recv_len;
+			}
+			s->recv_len = 0;
+			return 1;
+		}
+		return 0;
+	}
+
+	return 0;
+}
+
+//HLNetDgrmRecv is the single ingress and sits at the end of this file: it
+//dispatches into the protocol 48 sections below, which the single-pass compiler
+//requires to be declared first.
+
+//============================================================================
+// Protocol 48: netchan fragment buffers
+//============================================================================
+//
+// protocol 15 (everything above this line) splits a reliable message into
+// MAX_DATAGRAM chunks and sends them stop-and-wait: chunk, ACK, chunk, ACK, EOM.
+// one message in flight, one stream, and the sequence number is the whole of the
+// state. a 30kB signon at 60ms RTT spends over a second waiting.
+//
+// one protocol 48 netchan carries several independent streams, each fragmented on
+// its own:
+//
+//   FRAG_NORMAL_STREAM  ordinary reliable game data
+//   FRAG_FILE_STREAM    an in-band file transfer (a custom decal, a map)
+//
+// a 2MB map download therefore does not stall the signon behind it: the two
+// streams interleave in the same packets and reassemble separately. this is why a
+// fragment carries a stream index.
+//
+// the header, per packet:
+//
+//   long sequence      bit 31 = the sender's reliable toggle
+//                      bit 30 = it carries fragments
+//   long sequence_ack  bit 31 = acknowledging their reliable
+//                      bit 30 = acknowledging their fragments
+//   then, if the fragment bit is set, for each stream with a fragment here:
+//     long  fragid    (id in the high 16 bits, fragment count in the low 16)
+//     short offset    into the reassembled message
+//     short size
+//
+// the reassembly buffers and the fragid split are here; the header codec and the
+// connectionless handshake follow below, and HLNetDgrmRecv dispatches into them
+// when hl_net48_active is set.
+//
+// the engine is not in the SDK checkout - no netchan, no handshake, no
+// connectionless parser - so every wire detail below the fragid split is
+// inferred and marked as such at its definition.
+
+#define HLNET48_MAX_STREAMS		2
+#define HLFRAG_NORMAL_STREAM	0
+#define HLFRAG_FILE_STREAM		1
+
+//connectionless and split-packet markers, read as a little-endian long in the
+//first four bytes. an ordinary netchan packet has neither: its first long is a
+//sequence number, and sequence numbers never reach 0xFFFFFFFE
+#define HLNET48_FLAG_QUERY			0xFFFFFFFF
+#define HLNET48_FLAG_SPLITPACKET	0xFFFFFFFE
+
+//bit 31/30 of the sequence and ack words
+#define HLNET48_SEQ_RELIABLE	0x80000000
+#define HLNET48_SEQ_FRAGMENT	0x40000000
+#define HLNET48_SEQ_MASK		0x3FFFFFFF
+
+I64 HLFragId(U32 fragid)
+{//FRAG_GETID - which multi-fragment message this belongs to
+	return (fragid >> 16) & 0xFFFF;
+}
+
+I64 HLFragCount(U32 fragid)
+{//FRAG_GETCOUNT - how many fragments the whole message is in
+	return fragid & 0xFFFF;
+}
+
+U32 HLFragMakeId(I64 id, I64 count)
+{
+	return ((id & 0xFFFF) << 16) | (count & 0xFFFF);
+}
+
+//a message is at most HLNET_MAX_MSG and a fragment body is HLNET48_FRAG_SIZE,
+//so eight fragments carry the largest message this buffer can hold. 64 leaves
+//room for a sender using a smaller body than ours
+#define HLFRAG_MAX_PARTS	64
+
+class CHLFragBuf
+{
+	Bool	active;			//a message is part-assembled here
+	I64		id;				//which message, from FRAG_GETID
+	I64		total;			//fragments expected, from FRAG_GETCOUNT
+	I64		got;			//fragments copied in
+	I64		len;			//highest offset+size seen; the assembled length
+	U8		data[HLNET_MAX_MSG];
+	//offsets already accepted, so a duplicate is not counted twice: a resent
+	//fragment is normal and counting it completes the message early.
+	//
+	//the offset is the identity, not a fragment number: the header carries no
+	//number, and deriving one as offset/size breaks on the short last fragment -
+	//a 2049 byte message in 1024 byte fragments ends with offset 2048 size 1,
+	//which derives 2048
+	I64		seen[HLFRAG_MAX_PARTS];
+};
+
+//one reassembly slot per stream per peer. the client has one netchan, the server
+//one per slot - same shape as hl_net_socks above.
+CHLFragBuf	hl_frag_sv[HLSV_MAX_CLIENTS * HLNET48_MAX_STREAMS];
+CHLFragBuf	hl_frag_cl[HLNET48_MAX_STREAMS];
+
+U0 HLFragBufClear(CHLFragBuf *b)
+{
+	if (!b)
+		return;
+
+	b->active = FALSE;
+	b->id     = 0;
+	b->total  = 0;
+	b->got    = 0;
+	b->len    = 0;
+	MemSet(b->seen, 0, HLFRAG_MAX_PARTS * sizeof(I64));
+}
+
+U0 HLFragInit()
+{//globals aren't zeroed, and a stale .active makes the first fragment look like
+ //the continuation of a message from the last map
+	I64 i;
+
+	for (i = 0; i < HLSV_MAX_CLIENTS * HLNET48_MAX_STREAMS; i++)
+		HLFragBufClear(&hl_frag_sv[i]);
+
+	for (i = 0; i < HLNET48_MAX_STREAMS; i++)
+		HLFragBufClear(&hl_frag_cl[i]);
+}
+
+HLFragInit;
+
+CHLFragBuf *HLFragBufFor(I64 slot, I64 stream)
+{//slot HLNET_CLIENT_SLOT is the guest's own netchan
+	if (stream < 0 || stream >= HLNET48_MAX_STREAMS)
+		return NULL;
+
+	if (slot == HLNET_CLIENT_SLOT)
+		return &hl_frag_cl[stream];
+
+	if (slot < 0 || slot >= HLSV_MAX_CLIENTS)
+		return NULL;
+
+	return &hl_frag_sv[slot * HLNET48_MAX_STREAMS + stream];
+}
+
+I64 HLFragAdd(I64 slot, I64 stream, U32 fragid, I64 offset, U8 *data, I64 size)
+{//copy one fragment in. returns the assembled length once every fragment has
+ //arrived, 0 while incomplete, -1 on a fragment that cannot belong here.
+ //
+ //offset is into the reassembled message and is carried explicitly rather than
+ //derived from the fragment number, so fragments may arrive in any order and a
+ //resend costs nothing.
+	CHLFragBuf	*b;
+	I64			 id;
+	I64			 total;
+	I64			 i;
+	Bool		 dup;
+
+	b = HLFragBufFor(slot, stream);
+	if (!b || !data || size < 1 || offset < 0)
+		return -1;
+
+	id    = HLFragId(fragid);
+	total = HLFragCount(fragid);
+
+	if (total < 1 || total > HLFRAG_MAX_PARTS)
+		return -1;
+
+	if (offset + size > HLNET_MAX_MSG)
+		return -1;
+
+	//a different id means the previous message was abandoned: a peer that gave up
+	//mid-transfer, or a map change. start over rather than blending the two
+	if (!b->active || b->id != id)
+	{
+		HLFragBufClear(b);
+		b->active = TRUE;
+		b->id     = id;
+		b->total  = total;
+	}
+
+	if (b->total != total)
+		return -1;
+
+	MemCopy(b->data + offset, data, size);
+
+	if (offset + size > b->len)
+		b->len = offset + size;
+
+	//offset+1 is stored, so a zero slot reads as empty and fragment zero is
+	//still distinguishable from it
+	dup = FALSE;
+	for (i = 0; i < b->got; i++)
+	{
+		if (b->seen[i] == offset + 1)
+		{
+			dup = TRUE;
+			break;
+		}
+	}
+
+	if (!dup)
+	{
+		if (b->got >= HLFRAG_MAX_PARTS)
+			return -1;
+		b->seen[b->got] = offset + 1;
+		b->got++;
+	}
+
+	if (b->got < b->total)
+		return 0;
+
+	return b->len;
+}
+
+Bool HLFragTake(I64 slot, I64 stream, CHLMsg *out)
+{//move a completed reassembly into a message buffer and free the slot
+	CHLFragBuf *b;
+
+	b = HLFragBufFor(slot, stream);
+	if (!b || !out || !b->active || b->got < b->total || b->len < 1)
+		return FALSE;
+
+	HLMsgClear(out);
+	MemCopy(out->data, b->data, b->len);
+	out->len = b->len;
+
+	HLFragBufClear(b);
+
+	return TRUE;
+}
+
+//============================================================================
+// Protocol 48: connectionless channel
+//============================================================================
+//
+// The SDK checkout is headers plus the game DLLs. The engine is not in it, so
+// none of the framing below can be cited: there is no netchan, no handshake and
+// no connectionless parser to read. The one citable fact is the shape of the
+// payload - dlls/client.cpp:1833 ConnectionlessPacket receives
+// "const char *args", so what follows the marker is a text command line and not
+// a binary opcode stream. Everything else here is marked inferred at its
+// definition.
+//
+// A connectionless datagram is four 0xFF bytes read as a little-endian long,
+// then the command line. This cannot collide with the protocol 15 framing above:
+// a NETFLAG header is read big-endian and its low 16 bits are the packet length,
+// so 0xFFFFFFFF would claim a 65535 byte datagram against a 1400 byte ceiling.
+// The two framings share one socket and one bound port.
+//
+// The exchange, client first:
+//
+//   -> getchallenge
+//   <- A<n>
+//   -> connect <protocol> <n> "<protinfo>" "<userinfo>"
+//   <- B
+//
+// after which both ends speak the netchan header and nothing is connectionless
+// again for the life of the session.
+//
+// The server replies are single character opcodes packed against the value with
+// no separator - S2C_CHALLENGE 'A', S2C_CONNECTION 'B' - which is inferred, not
+// citable. The reader also accepts the word forms "challenge <n>" and
+// "connection", so a peer written against either spelling still connects.
+
+#define HLNET48_PROTOCOL		48
+#define HLNET48_OOB_MAX			1400	//one datagram; no IP fragmentation here
+#define HLNET48_TEXT_MAX		512
+#define HLNET48_INFO_MAX		256
+#define HLNET48_TOKENS_MAX		8
+#define HLNET48_TOKEN_LEN		144
+#define HLNET48_NO_SLOT			(-99)	//not HLNET_CLIENT_SLOT, which is -1
+
+U8	hl_net48_line[192];
+
+//--- little endian scalars --------------------------------------------------
+//
+// protocol 48 is little endian throughout, where the NETFLAG header above is
+// big endian. shifts bind tighter than * and / on this compiler, so every one
+// of them is parenthesized
+
+U32 HLNet48ReadLong(U8 *p)
+{
+	return (p[0] | (p[1] << 8) | (p[2] << 16) | (p[3] << 24)) & 0xFFFFFFFF;
+}
+
+I64 HLNet48ReadShort(U8 *p)
+{//unsigned; the two short header fields are an offset and a size
+	return p[0] | (p[1] << 8);
+}
+
+U0 HLNet48WriteLong(U8 *p, U32 v)
+{
+	p[0] = v & 0xFF;
+	p[1] = (v >> 8) & 0xFF;
+	p[2] = (v >> 16) & 0xFF;
+	p[3] = (v >> 24) & 0xFF;
+}
+
+U0 HLNet48WriteShort(U8 *p, I64 v)
+{
+	p[0] = v & 0xFF;
+	p[1] = (v >> 8) & 0xFF;
+}
+
+//--- connectionless framing -------------------------------------------------
+
+Bool HLNet48IsOOB(U8 *data, I64 len)
+{
+	if (!data || len < 4)
+		return FALSE;
+
+	return ToBool(HLNet48ReadLong(data) == HLNET48_FLAG_QUERY);
+}
+
+I64 HLNet48FormatOOB(U8 *pkt, I64 max, U8 *text)
+{//Netchan_OutOfBandPrint. marker, command line, terminator. the NUL is on the
+ //wire - inferred from the Quake 2 lineage - and the reader does not need it
+	I64 n;
+	I64 i;
+
+	if (!pkt || !text || max < 6)
+		return 0;
+
+	n = StrLen(text);
+	if (n + 5 > max)
+		return 0;
+
+	pkt[0] = 0xFF;
+	pkt[1] = 0xFF;
+	pkt[2] = 0xFF;
+	pkt[3] = 0xFF;
+
+	for (i = 0; i < n; i++)
+		pkt[4 + i] = text[i];
+
+	pkt[4 + n] = 0;
+
+	return n + 5;
+}
+
+Bool HLNet48SendOOB(U32 ip, I64 port, U8 *text)
+{
+	U8	 pkt[HLNET48_OOB_MAX];
+	I64	 n;
+	I64	 dport;
+
+	if (!ip || !text)
+		return FALSE;
+
+	n = HLNet48FormatOOB(pkt, HLNET48_OOB_MAX, text);
+	if (n < 5)
+		return FALSE;
+
+	dport = port;
+	if (dport < 1 || dport > 65535)
+		dport = HLNET_PORT_DEFAULT;
+
+	if (!HLNetUdpEnsureArp(ip))
+		return FALSE;
+
+	return HLNetUdpSendRawTo(pkt, n, ip, dport);
+}
+
+//--- command line and infostrings -------------------------------------------
+
+I64 HLNet48Tokenize(U8 *text, U8 *tokens, I64 max_tokens, I64 tok_len)
+{//Cmd_TokenizeString. whitespace separates, a double quote spans one token and
+ //the quotes are stripped. connect carries two quoted infostrings, and an
+ //infostring contains backslashes and spaces.
+ //
+ //tokens is a flat buffer, token i at tokens + i * tok_len: no 2D arrays here
+	I64		 i;
+	I64		 n;
+	I64		 j;
+	U8		*t;
+	Bool	 quoted;
+
+	if (!text || !tokens || max_tokens < 1 || tok_len < 2)
+		return 0;
+
+	i = 0;
+	n = 0;
+
+	while (text[i] && n < max_tokens)
+	{
+		while (text[i] && text[i] <= ' ')
+			i++;
+
+		if (!text[i])
+			break;
+
+		quoted = FALSE;
+		if (text[i] == '"')
+		{
+			quoted = TRUE;
+			i++;
+		}
+
+		t = tokens + n * tok_len;
+		j = 0;
+
+		while (text[i])
+		{
+			if (quoted && text[i] == '"')
+			{
+				i++;
+				break;
+			}
+			if (!quoted && text[i] <= ' ')
+				break;
+
+			if (j < tok_len - 1)
+			{
+				t[j] = text[i];
+				j++;
+			}
+			i++;
+		}
+
+		t[j] = 0;
+		n++;
+	}
+
+	return n;
+}
+
+U0 HLNet48InfoValue(U8 *info, U8 *key, U8 *out, I64 max)
+{//Info_ValueForKey. an infostring is "\key\value\key\value".
+ //
+ //HLNetSv.ZC holds the same routine as HLNetInfoValue. It compiles after this
+ //file and the compiler is single pass, so it cannot be called from here
+	I64		 i;
+	I64		 j;
+	U8		 k[64];
+	Bool	 match;
+
+	if (out && max > 0)
+		out[0] = 0;
+	if (!info || !key || !out || max < 2)
+		return;
+
+	i = 0;
+	while (info[i] == '\\')
+	{
+		i++;
+
+		j = 0;
+		while (info[i] && info[i] != '\\')
+		{
+			if (j < 63)
+			{
+				k[j] = info[i];
+				j++;
+			}
+			i++;
+		}
+		k[j] = 0;
+
+		//a key with no separator after it has no value: the string ends here
+		if (info[i] != '\\')
+			return;
+		i++;
+
+		match = ToBool(!StrCompare(k, key));
+
+		j = 0;
+		while (info[i] && info[i] != '\\')
+		{
+			if (match && j < max - 1)
+			{
+				out[j] = info[i];
+				j++;
+			}
+			i++;
+		}
+
+		if (match)
+		{
+			out[j] = 0;
+			return;
+		}
+	}
+}
+
+U0 HLNet48BuildUserInfo(U8 *out, I64 max, U8 *name, I64 top, I64 bottom)
+{//the second quoted argument of connect, and what svc_updateuserinfo carries
+ //back. name, topcolor and bottomcolor are the fields HLNetParseUserInfo48
+ //reads; rate and cl_updaterate are advisory and unenforced here.
+ //
+ //bounded by construction: the name is capped at 32 and the rest is fixed, so
+ //the result is under 130 bytes
+	U8 nm[32];
+
+	if (!out || max < 160)
+		return;
+
+	if (!name || !name[0])
+		HLStrCopy(nm, "player", 32);
+	else
+		HLStrCopy(nm, name, 32);
+
+	StrPrint(out,
+		"\\name\\%s\\model\\gordon\\topcolor\\%d\\bottomcolor\\%d\\rate\\30000\\cl_updaterate\\20",
+		nm, top & 15, bottom & 15);
+}
+
+U0 HLNet48BuildProtInfo(U8 *out, I64 max)
+{//the first quoted argument of connect. a real client carries its Steam ticket
+ //here; there is none in this port, so the auth type is declared raw. field
+ //names inferred
+	if (!out || max < 32)
+		return;
+
+	StrPrint(out, "\\prot\\3\\unique\\-1\\raw\\zeal");
+}
+
+//--- challenges -------------------------------------------------------------
+//
+// the challenge binds a connect to the address that asked for it, so a forged
+// connect from a spoofed source cannot open a slot: the reply to getchallenge
+// goes to the real holder of the address and the attacker never sees the value
+
+#define HLNET48_CHAL_MAX	8
+#define HLNET48_CHAL_TTL	30.0	//seconds a challenge stays answerable
+
+class CHLNet48Chal
+{
+	U32	ip;
+	I64	value;
+	F64	time;
+};
+
+CHLNet48Chal	hl_net48_chal[HLNET48_CHAL_MAX];
+I64		hl_net48_chal_next   = 0;
+I64		hl_net48_chal_serial = 0;
+
+U0 HLNet48ChalInit()
+{//globals aren't zeroed
+	I64 i;
+
+	hl_net48_chal_next   = 0;
+	hl_net48_chal_serial = 0;
+
+	for (i = 0; i < HLNET48_CHAL_MAX; i++)
+	{
+		hl_net48_chal[i].ip    = 0;
+		hl_net48_chal[i].value = 0;
+		hl_net48_chal[i].time  = 0.0;
+	}
+}
+
+I64 HLNet48ChalIssue(U32 ip)
+{//one live challenge per address, refreshed when the address asks again. the
+ //table is a ring: many addresses evict the oldest rather than refusing new ones
+	I64 i;
+	I64 idx;
+	I64 v;
+
+	if (!ip)
+		return 0;
+
+	idx = -1;
+	for (i = 0; i < HLNET48_CHAL_MAX; i++)
+	{
+		if (hl_net48_chal[i].ip == ip)
+		{
+			idx = i;
+			break;
+		}
+	}
+
+	if (idx < 0)
+	{
+		idx = hl_net48_chal_next;
+		hl_net48_chal_next = (hl_net48_chal_next + 1) % HLNET48_CHAL_MAX;
+	}
+
+	//no RNG in this build. milliseconds of uptime mixed with a serial, so two
+	//addresses asking inside the same millisecond still get different values.
+	//2654435761 is Knuth's 32-bit golden ratio multiplier
+	hl_net48_chal_serial++;
+	v = (ToI64(tS * 1000.0) + hl_net48_chal_serial * 2654435761) & 0x7FFFFFFF;
+	if (!v)
+		v = 1;
+
+	hl_net48_chal[idx].ip    = ip;
+	hl_net48_chal[idx].value = v;
+	hl_net48_chal[idx].time  = tS;
+
+	return v;
+}
+
+Bool HLNet48ChalCheck(U32 ip, I64 value)
+{
+	I64 i;
+
+	if (!ip || !value)
+		return FALSE;
+
+	for (i = 0; i < HLNET48_CHAL_MAX; i++)
+	{
+		if (hl_net48_chal[i].ip == ip && hl_net48_chal[i].value == value)
+			return ToBool(tS - hl_net48_chal[i].time <= HLNET48_CHAL_TTL);
+	}
+
+	return FALSE;
+}
+
+//--- netchan ----------------------------------------------------------------
+
+#define HLNET48_FRAG_SIZE	1024	//fragment body; header plus this fits the MTU
+
+//--- the outgoing reliable buffer -------------------------------------------
+//
+// The reliable bit is a one-bit toggle, so a channel holds at most one
+// unacknowledged reliable message. It stays here until the peer echoes the
+// toggle back in bit 31 of its acknowledge word, and goes out again on every
+// resend window until then. Messages offered while one is outstanding queue
+// behind it in arrival order.
+//
+// Deviation, inferred rather than cited: GoldSrc appends the held reliable
+// payload to the next outgoing packet, so a resend costs no datagram of its own.
+// This resends it as a separate packet on a timer. The bytes of any one packet
+// are the same either way; only the packing differs.
+
+#define HLNET48_REL_DEPTH	4
+#define HLNET48_REL_RESEND	1.0		//seconds of silence before a resend
+
+class CHLNet48Rel
+{
+	Bool	pending;		//data holds an unacknowledged message
+	I64		len;
+	I64		seq;			//outgoing_sequence of that message's last packet
+	I64		toggle;			//reliable_sequence value it was sent with
+	F64		last_send;
+	U8		data[HLNET_MAX_MSG];
+	I64		queue_count;
+	I64		queue_head;
+	I64		queue_tail;
+	I64		queue_len[HLNET48_REL_DEPTH];
+	//flat: entry i at queue_data + i * HLNET_MAX_MSG. no 2D class arrays
+	U8		queue_data[HLNET48_REL_DEPTH * HLNET_MAX_MSG];
+};
+
+CHLNet48Rel	hl_net48_rel_sv[HLSV_MAX_CLIENTS];
+CHLNet48Rel	hl_net48_rel_cl;
+
+Bool	hl_net48_rel_full_logged = FALSE;
+
+U0 HLNet48RelClear(CHLNet48Rel *r)
+{
+	if (!r)
+		return;
+
+	r->pending     = FALSE;
+	r->len         = 0;
+	r->seq         = 0;
+	r->toggle      = 0;
+	r->last_send   = 0.0;
+	r->queue_count = 0;
+	r->queue_head  = 0;
+	r->queue_tail  = 0;
+	MemSet(r->queue_len, 0, HLNET48_REL_DEPTH * sizeof(I64));
+}
+
+CHLNet48Rel *HLNet48RelFor(I64 slot)
+{
+	if (slot == HLNET_CLIENT_SLOT)
+		return &hl_net48_rel_cl;
+
+	if (slot < 0 || slot >= HLSV_MAX_CLIENTS)
+		return NULL;
+
+	return &hl_net48_rel_sv[slot];
+}
+
+U0 HLNet48RelInit()
+{//globals aren't zeroed; a stale .pending resends last session's message
+	I64 i;
+
+	hl_net48_rel_full_logged = FALSE;
+
+	for (i = 0; i < HLSV_MAX_CLIENTS; i++)
+		HLNet48RelClear(&hl_net48_rel_sv[i]);
+
+	HLNet48RelClear(&hl_net48_rel_cl);
+}
+
+HLNet48RelInit;
+
+Bool HLNet48RelEnqueue(CHLNet48Rel *r, U8 *data, I64 len)
+{//park a message behind the one in flight. a full queue drops it: truncating or
+ //overwriting desyncs the reader, which is worse
+	I64 idx;
+
+	if (!r || !data || len < 1 || len > HLNET_MAX_MSG)
+		return FALSE;
+
+	if (r->queue_count >= HLNET48_REL_DEPTH)
+	{
+		if (!hl_net48_rel_full_logged)
+		{
+			HLLog("net48: reliable queue full, drop\n");
+			HLLogFlush;
+			hl_net48_rel_full_logged = TRUE;
+		}
+		return FALSE;
+	}
+
+	idx = r->queue_head;
+	MemCopy(r->queue_data + idx * HLNET_MAX_MSG, data, len);
+	r->queue_len[idx] = len;
+	r->queue_head = (r->queue_head + 1) % HLNET48_REL_DEPTH;
+	r->queue_count++;
+
+	return TRUE;
+}
+
+class CHLNet48Chan
+{
+	Bool	active;
+	U32		ip;
+	I64		port;
+	I64		outgoing_sequence;			//next sequence to send
+	I64		incoming_sequence;			//highest accepted, -1 before the first
+	I64		incoming_acknowledged;		//their view of our outgoing_sequence
+	I64		reliable_sequence;			//our reliable toggle, 0 or 1
+	I64		incoming_reliable_sequence;	//their toggle as last accepted
+	I64		frag_serial;				//next FRAG_GETID for our own fragments
+	F64		last_received;
+	I64		dropped;					//sequence gaps seen
+};
+
+CHLNet48Chan	hl_net48_sv[HLSV_MAX_CLIENTS];
+CHLNet48Chan	hl_net48_cl;
+
+Bool	hl_net48_active = FALSE;	//this session speaks 48, not NETFLAG
+
+U0 HLNet48ChanClear(CHLNet48Chan *c)
+{
+	if (!c)
+		return;
+
+	c->active                     = FALSE;
+	c->ip                         = 0;
+	c->port                       = HLNET_PORT_DEFAULT;
+	c->outgoing_sequence          = 0;
+	//-1, not 0: sequence 0 is a valid first packet and must not read as a
+	//duplicate of the initial state
+	c->incoming_sequence          = -1;
+	c->incoming_acknowledged      = 0;
+	c->reliable_sequence          = 0;
+	c->incoming_reliable_sequence = 0;
+	c->frag_serial                = 0;
+	c->last_received              = 0.0;
+	c->dropped                    = 0;
+}
+
+CHLNet48Chan *HLNet48ChanFor(I64 slot)
+{
+	if (slot == HLNET_CLIENT_SLOT)
+		return &hl_net48_cl;
+
+	if (slot < 0 || slot >= HLSV_MAX_CLIENTS)
+		return NULL;
+
+	return &hl_net48_sv[slot];
+}
+
+I64 HLNet48SlotByIP(U32 ip)
+{//HLNET48_NO_SLOT when the address owns no channel
+	I64 i;
+
+	if (!ip)
+		return HLNET48_NO_SLOT;
+
+	if (hl_net48_cl.active && hl_net48_cl.ip == ip)
+		return HLNET_CLIENT_SLOT;
+
+	for (i = 0; i < HLSV_MAX_CLIENTS; i++)
+	{
+		if (hl_net48_sv[i].active && hl_net48_sv[i].ip == ip)
+			return i;
+	}
+
+	return HLNET48_NO_SLOT;
+}
+
+U0 HLNet48ChanSetup(I64 slot, U32 ip, I64 port)
+{//Netchan_Setup - open a channel on a slot the connect handshake just settled
+	CHLNet48Chan	*c;
+	CHLNet48Rel		*r;
+
+	c = HLNet48ChanFor(slot);
+	if (!c || !ip)
+		return;
+
+	//the toggle restarts at 0, so anything held from a previous session on this
+	//slot would be acknowledged by the wrong bit
+	r = HLNet48RelFor(slot);
+	HLNet48RelClear(r);
+
+	//sequences restart at 0 too, so a frame held from the previous session
+	//answers to a sequence this one is about to reuse
+	HLPEFramesClear;
+
+	HLNet48ChanClear(c);
+	c->active        = TRUE;
+	c->ip            = ip;
+	c->port          = port;
+	if (c->port < 1)
+		c->port = HLNET_PORT_DEFAULT;
+	c->last_received = tS;
+}
+
+//--- the netchan header -----------------------------------------------------
+//
+//   long sequence      bit 31 the sender's reliable toggle
+//                      bit 30 fragment descriptors follow
+//   long acknowledge   bit 31 acknowledging their reliable
+//                      bit 30 acknowledging their fragments
+//   then, when bit 30 of sequence is set, per stream in index order:
+//     byte present
+//     when present: long fragid (id<<16 | count), short offset, short size
+//   then the body: a packet with no fragment descriptors carries one whole
+//   message, a packet with them carries one fragment per present stream, in
+//   stream order, each sized by its descriptor.
+//
+// The per-stream present byte is inferred; it is not in the SDK. It cannot live
+// in the sequence word: only bits 30 and 31 are stripped before the sequence is
+// used, so any lower bit would be part of the number.
+//
+// Bit 31 is the sender's reliable toggle in the Quake 2 lineage. It rides every
+// packet, not only the ones carrying reliable data, and the receiver latches it
+// rather than flipping a counter of its own: latching makes a resend of the same
+// message idempotent, where flipping desynchronises the two counters the first
+// time a reliable message is sent twice.
+//
+// No qport field. Quake 2 puts one on every client to server packet so a NAT
+// rebinding does not lose the connection; whether GoldSrc kept it is not
+// checkable here, and this port tracks the peer by source address instead.
+
+class CHLNet48Hdr
+{
+	I64		seq;			//bits 30 and 31 stripped
+	I64		ack;
+	Bool	reliable;
+	Bool	rel_ack;
+	Bool	has_frags;
+	Bool	frag_ack;
+	I64		hdr_len;		//bytes consumed; the payload starts here
+	Bool	frag_present[HLNET48_MAX_STREAMS];
+	I64		frag_id[HLNET48_MAX_STREAMS];
+	I64		frag_count[HLNET48_MAX_STREAMS];
+	I64		frag_off[HLNET48_MAX_STREAMS];
+	I64		frag_len[HLNET48_MAX_STREAMS];
+};
+
+//RX and TX scratch. one task drives both, and neither survives the call
+CHLNet48Hdr	hl_net48_hdr;
+CHLNet48Hdr	hl_net48_thdr;
+
+U0 HLNet48HdrClear(CHLNet48Hdr *h)
+{
+	I64 i;
+
+	if (!h)
+		return;
+
+	h->seq       = 0;
+	h->ack       = 0;
+	h->reliable  = FALSE;
+	h->rel_ack   = FALSE;
+	h->has_frags = FALSE;
+	h->frag_ack  = FALSE;
+	h->hdr_len   = 0;
+
+	for (i = 0; i < HLNET48_MAX_STREAMS; i++)
+	{
+		h->frag_present[i] = FALSE;
+		h->frag_id[i]      = 0;
+		h->frag_count[i]   = 0;
+		h->frag_off[i]     = 0;
+		h->frag_len[i]     = 0;
+	}
+}
+
+I64 HLNet48WriteHeader(U8 *pkt, I64 max, CHLNet48Hdr *h)
+{//bytes written, 0 if it would not fit
+	I64	 n;
+	I64	 i;
+	U32	 seq;
+	U32	 ack;
+
+	if (!pkt || !h || max < 8)
+		return 0;
+
+	seq = h->seq & HLNET48_SEQ_MASK;
+	ack = h->ack & HLNET48_SEQ_MASK;
+
+	if (h->reliable)
+		seq |= HLNET48_SEQ_RELIABLE;
+	if (h->has_frags)
+		seq |= HLNET48_SEQ_FRAGMENT;
+	if (h->rel_ack)
+		ack |= HLNET48_SEQ_RELIABLE;
+	if (h->frag_ack)
+		ack |= HLNET48_SEQ_FRAGMENT;
+
+	HLNet48WriteLong(pkt, seq);
+	HLNet48WriteLong(pkt + 4, ack);
+	n = 8;
+
+	if (!h->has_frags)
+		return n;
+
+	for (i = 0; i < HLNET48_MAX_STREAMS; i++)
+	{
+		if (n + 1 > max)
+			return 0;
+
+		if (!h->frag_present[i])
+		{
+			pkt[n] = 0;
+			n++;
+			goto q48wh_next;
+		}
+
+		if (n + 9 > max)
+			return 0;
+
+		pkt[n] = 1;
+		n++;
+		HLNet48WriteLong(pkt + n, HLFragMakeId(h->frag_id[i], h->frag_count[i]));
+		n += 4;
+		HLNet48WriteShort(pkt + n, h->frag_off[i]);
+		n += 2;
+		HLNet48WriteShort(pkt + n, h->frag_len[i]);
+		n += 2;
+
+q48wh_next:
+	}
+
+	return n;
+}
+
+Bool HLNet48ParseHeader(U8 *buf, I64 len, CHLNet48Hdr *h)
+{
+	I64	 n;
+	I64	 i;
+	U32	 seq;
+	U32	 ack;
+	U32	 fid;
+
+	if (!buf || !h || len < 8)
+		return FALSE;
+
+	HLNet48HdrClear(h);
+
+	seq = HLNet48ReadLong(buf);
+	ack = HLNet48ReadLong(buf + 4);
+
+	h->reliable  = ToBool(seq & HLNET48_SEQ_RELIABLE);
+	h->has_frags = ToBool(seq & HLNET48_SEQ_FRAGMENT);
+	h->rel_ack   = ToBool(ack & HLNET48_SEQ_RELIABLE);
+	h->frag_ack  = ToBool(ack & HLNET48_SEQ_FRAGMENT);
+	h->seq       = seq & HLNET48_SEQ_MASK;
+	h->ack       = ack & HLNET48_SEQ_MASK;
+
+	n = 8;
+
+	if (!h->has_frags)
+	{
+		h->hdr_len = n;
+		return TRUE;
+	}
+
+	for (i = 0; i < HLNET48_MAX_STREAMS; i++)
+	{
+		if (n + 1 > len)
+			return FALSE;
+
+		if (!buf[n])
+		{
+			n++;
+			goto q48ph_next;
+		}
+		n++;
+
+		if (n + 8 > len)
+			return FALSE;
+
+		fid = HLNet48ReadLong(buf + n);
+		n += 4;
+
+		h->frag_present[i] = TRUE;
+		h->frag_id[i]      = HLFragId(fid);
+		h->frag_count[i]   = HLFragCount(fid);
+		h->frag_off[i]     = HLNet48ReadShort(buf + n);
+		n += 2;
+		h->frag_len[i]     = HLNet48ReadShort(buf + n);
+		n += 2;
+
+q48ph_next:
+	}
+
+	h->hdr_len = n;
+
+	return TRUE;
+}
+
+Bool HLNet48SendRaw(I64 slot, U8 *data, I64 len)
+{//the packet writer half of Netchan_Transmit: one packet when the payload fits,
+ //otherwise a burst of normal-stream fragments. every fragment but the last is
+ //HLNET48_FRAG_SIZE bytes.
+ //
+ //the reliable toggle is read here, never advanced: HLNet48Transmit owns it, so
+ //a resend carries the value the first send did
+	CHLNet48Chan	*c;
+	U8				 pkt[HLNET48_OOB_MAX];
+	I64				 hdr;
+	I64				 off;
+	I64				 chunk;
+	I64				 count;
+	I64				 i;
+	Bool			 ok;
+
+	c = HLNet48ChanFor(slot);
+	if (!c || !c->active || !c->ip || !data || len < 1)
+		return FALSE;
+
+	HLNet48HdrClear(&hl_net48_thdr);
+	//bit 31 of the sequence republishes our own toggle on every packet, reliable
+	//or not, rather than flagging that this packet carries reliable data. the
+	//peer latches it, so a resend of the same message is idempotent - under a
+	//flip-on-receipt reading a resend desynchronises the two counters and the
+	//acknowledgement never matches again.
+	//
+	//`reliable` therefore does not reach the wire here; the caller has already
+	//advanced the toggle for a new message
+	hl_net48_thdr.reliable = ToBool(c->reliable_sequence);
+	hl_net48_thdr.rel_ack  = ToBool(c->incoming_reliable_sequence);
+	hl_net48_thdr.ack      = c->incoming_sequence;
+	if (hl_net48_thdr.ack < 0)
+		hl_net48_thdr.ack = 0;
+
+	if (len + 8 <= HLNET48_OOB_MAX)
+	{
+		hl_net48_thdr.seq = c->outgoing_sequence;
+		c->outgoing_sequence++;
+
+		hdr = HLNet48WriteHeader(pkt, HLNET48_OOB_MAX, &hl_net48_thdr);
+		if (hdr < 8)
+			return FALSE;
+
+		MemCopy(pkt + hdr, data, len);
+		return HLNetUdpSendRawTo(pkt, hdr + len, c->ip, c->port);
+	}
+
+	count = (len + HLNET48_FRAG_SIZE - 1) / HLNET48_FRAG_SIZE;
+	if (count > HLFRAG_MAX_PARTS)
+		return FALSE;
+
+	c->frag_serial++;
+	hl_net48_thdr.has_frags                          = TRUE;
+	hl_net48_thdr.frag_present[HLFRAG_NORMAL_STREAM] = TRUE;
+	hl_net48_thdr.frag_id[HLFRAG_NORMAL_STREAM]      = c->frag_serial & 0xFFFF;
+	hl_net48_thdr.frag_count[HLFRAG_NORMAL_STREAM]   = count;
+
+	ok = TRUE;
+	for (i = 0; i < count; i++)
+	{
+		off   = i * HLNET48_FRAG_SIZE;
+		chunk = len - off;
+		if (chunk > HLNET48_FRAG_SIZE)
+			chunk = HLNET48_FRAG_SIZE;
+
+		hl_net48_thdr.frag_off[HLFRAG_NORMAL_STREAM] = off;
+		hl_net48_thdr.frag_len[HLFRAG_NORMAL_STREAM] = chunk;
+		hl_net48_thdr.seq = c->outgoing_sequence;
+		c->outgoing_sequence++;
+
+		hdr = HLNet48WriteHeader(pkt, HLNET48_OOB_MAX, &hl_net48_thdr);
+		if (hdr < 8)
+			return FALSE;
+
+		MemCopy(pkt + hdr, data + off, chunk);
+		if (!HLNetUdpSendRawTo(pkt, hdr + chunk, c->ip, c->port))
+			ok = FALSE;
+	}
+
+	return ok;
+}
+
+Bool HLNet48Transmit(I64 slot, U8 *data, I64 len, Bool reliable)
+{//Netchan_Transmit. unreliable goes straight out; reliable is held for resend
+ //until the peer acknowledges it, and queues behind anything already held
+	CHLNet48Chan	*c;
+	CHLNet48Rel		*r;
+	Bool			 ok;
+
+	c = HLNet48ChanFor(slot);
+	r = HLNet48RelFor(slot);
+	if (!c || !r || !c->active || !c->ip || !data || len < 1)
+		return FALSE;
+
+	if (!reliable)
+		return HLNet48SendRaw(slot, data, len);
+
+	if (len > HLNET_MAX_MSG)
+		return FALSE;
+
+	if (r->pending)
+		return HLNet48RelEnqueue(r, data, len);
+
+	//the toggle advances once per distinct message
+	c->reliable_sequence = 1 - c->reliable_sequence;
+
+	MemCopy(r->data, data, len);
+	r->len       = len;
+	r->pending   = TRUE;
+	r->toggle    = c->reliable_sequence;
+	r->last_send = tS;
+
+	ok     = HLNet48SendRaw(slot, r->data, r->len);
+	//the last packet of the burst; an acknowledge at or above it covers all of it
+	r->seq = c->outgoing_sequence - 1;
+
+	return ok;
+}
+
+U0 HLNet48RelResend(I64 slot)
+{//put the held message out again. the toggle is restored rather than advanced:
+ //to the peer a resend must be the same message, not a new one
+	CHLNet48Chan	*c;
+	CHLNet48Rel		*r;
+
+	c = HLNet48ChanFor(slot);
+	r = HLNet48RelFor(slot);
+	if (!c || !r || !c->active || !r->pending || r->len < 1)
+		return;
+
+	c->reliable_sequence = r->toggle;
+	r->last_send         = tS;
+
+	HLNet48SendRaw(slot, r->data, r->len);
+	r->seq = c->outgoing_sequence - 1;
+}
+
+U0 HLNet48RelAck(I64 slot, I64 ack_seq, Bool rel_ack)
+{//the peer's acknowledge word. Netchan_Transmit frees the held message when the
+ //echoed reliable bit matches the toggle it went out with and the acknowledged
+ //sequence has reached it. the next queued message then goes out at once
+	CHLNet48Chan	*c;
+	CHLNet48Rel		*r;
+	I64				 got;
+	I64				 idx;
+
+	c = HLNet48ChanFor(slot);
+	r = HLNet48RelFor(slot);
+	if (!c || !r || !r->pending)
+		return;
+
+	if (ack_seq < r->seq)
+		return;
+
+	got = 0;
+	if (rel_ack)
+		got = 1;
+
+	if (got != r->toggle)
+		return;
+
+	r->pending = FALSE;
+	r->len     = 0;
+
+	if (r->queue_count < 1)
+		return;
+
+	idx = r->queue_tail;
+	r->queue_tail = (r->queue_tail + 1) % HLNET48_REL_DEPTH;
+	r->queue_count--;
+
+	MemCopy(r->data, r->queue_data + idx * HLNET_MAX_MSG, r->queue_len[idx]);
+	r->len       = r->queue_len[idx];
+	r->pending   = TRUE;
+	r->last_send = tS;
+
+	c->reliable_sequence = 1 - c->reliable_sequence;
+	r->toggle            = c->reliable_sequence;
+
+	HLNet48SendRaw(slot, r->data, r->len);
+	r->seq = c->outgoing_sequence - 1;
+}
+
+U0 HLNet48Tick(F64 now)
+{//resend every held reliable message that has gone unacknowledged for a window.
+ //without this a dropped signon message stalls the session with no recovery
+	I64 i;
+
+	if (hl_net48_cl.active && hl_net48_rel_cl.pending &&
+		now - hl_net48_rel_cl.last_send > HLNET48_REL_RESEND)
+		HLNet48RelResend(HLNET_CLIENT_SLOT);
+
+	for (i = 0; i < HLSV_MAX_CLIENTS; i++)
+	{
+		if (hl_net48_sv[i].active && hl_net48_rel_sv[i].pending &&
+			now - hl_net48_rel_sv[i].last_send > HLNET48_REL_RESEND)
+			HLNet48RelResend(i);
+	}
+}
+
+//--- the handshake, client side ---------------------------------------------
+
+I64		hl_net48_cl_state     = 0;	//0 idle 1 asked 2 connecting 3 connected
+U32		hl_net48_cl_ip        = 0;
+I64		hl_net48_cl_port      = HLNET_PORT_DEFAULT;
+I64		hl_net48_cl_challenge = 0;
+F64		hl_net48_cl_last      = 0.0;
+U8		hl_net48_cl_name[32];
+I64		hl_net48_cl_top       = 0;
+I64		hl_net48_cl_bottom    = 0;
+
+Bool HLNet48ClientSendConnect()
+{
+	U8 line[HLNET48_TEXT_MAX];
+	U8 info[HLNET48_INFO_MAX];
+	U8 prot[HLNET48_INFO_MAX];
+
+	if (!hl_net48_cl_ip || !hl_net48_cl_challenge)
+		return FALSE;
+
+	HLNet48BuildProtInfo(prot, HLNET48_INFO_MAX);
+	HLNet48BuildUserInfo(info, HLNET48_INFO_MAX, hl_net48_cl_name,
+		hl_net48_cl_top, hl_net48_cl_bottom);
+
+	//the two infostrings are quoted: both contain backslashes, and userinfo
+	//contains spaces once a player names himself
+	StrPrint(line, "connect %d %d \"%s\" \"%s\"",
+		HLNET48_PROTOCOL, hl_net48_cl_challenge, prot, info);
+
+	hl_net48_cl_state = 2;
+	hl_net48_cl_last  = tS;
+
+	return HLNet48SendOOB(hl_net48_cl_ip, hl_net48_cl_port, line);
+}
+
+Bool HLNet48ClientBegin(U32 ip, I64 port, U8 *name, I64 top, I64 bottom)
+{//start the handshake. the challenge reply drives the rest
+	if (!ip)
+		return FALSE;
+
+	HLNet48ChanClear(&hl_net48_cl);
+	hl_net48_active       = FALSE;
+	hl_net48_cl_ip        = ip;
+	hl_net48_cl_port      = port;
+	if (hl_net48_cl_port < 1)
+		hl_net48_cl_port = HLNET_PORT_DEFAULT;
+	hl_net48_cl_challenge = 0;
+	hl_net48_cl_top       = top;
+	hl_net48_cl_bottom    = bottom;
+	hl_net48_cl_state     = 1;
+	hl_net48_cl_last      = tS;
+
+	if (name && name[0])
+		HLStrCopy(hl_net48_cl_name, name, 32);
+	else
+		HLStrCopy(hl_net48_cl_name, "player", 32);
+
+	return HLNet48SendOOB(ip, hl_net48_cl_port, "getchallenge");
+}
+
+U0 HLNet48ClientTick(F64 now)
+{//resend the outstanding handshake step after a second of silence. the
+ //connectionless channel is unreliable and carries no sequence
+	if (hl_net48_cl_state == 1 && now - hl_net48_cl_last > 1.0)
+	{
+		hl_net48_cl_last = now;
+		HLNet48SendOOB(hl_net48_cl_ip, hl_net48_cl_port, "getchallenge");
+	}
+	else if (hl_net48_cl_state == 2 && now - hl_net48_cl_last > 1.0)
+		HLNet48ClientSendConnect;
+}
+
+//--- the handshake, server side ---------------------------------------------
+//
+// slot allocation is in HLNetSv. a validated connect is parked here and the
+// server layer drains it: HLNetDgrmRecv returns 5, the caller allocates and
+// calls HLNet48ServerAcceptConnect with the slot, or -1 to refuse
+
+Bool	hl_net48_conn_ready = FALSE;
+U32		hl_net48_conn_ip    = 0;
+I64		hl_net48_conn_port  = HLNET_PORT_DEFAULT;
+U8		hl_net48_conn_userinfo[HLNET48_INFO_MAX];
+U8		hl_net48_conn_protinfo[HLNET48_INFO_MAX];
+
+Bool HLNet48ServerAcceptConnect(I64 slot)
+{//answer a parked connect and open the channel on the slot it was given
+	if (!hl_net48_conn_ready)
+		return FALSE;
+
+	hl_net48_conn_ready = FALSE;
+
+	if (slot < 0)
+	{
+		HLNet48SendOOB(hl_net48_conn_ip, hl_net48_conn_port,
+			"reject \"Server is full\"");
+		return FALSE;
+	}
+
+	HLNet48ChanSetup(slot, hl_net48_conn_ip, hl_net48_conn_port);
+	hl_net48_active = TRUE;
+
+	//S2C_CONNECTION 'B', the letter alone
+	return HLNet48SendOOB(hl_net48_conn_ip, hl_net48_conn_port, "B");
+}
+
+//--- connectionless dispatch ------------------------------------------------
+
+I64 HLNet48HandleOOB(U8 *data, I64 len, U32 ip, I64 port)
+{//5 when a connect is parked for the server layer, else 0
+	U8	 text[HLNET48_TEXT_MAX];
+	U8	 tok[HLNET48_TOKENS_MAX * HLNET48_TOKEN_LEN];
+	U8	 reply[HLNET48_TEXT_MAX];
+	U8	 shown[120];
+	I64	 n;
+	I64	 i;
+	I64	 ntok;
+	I64	 proto;
+	I64	 chal;
+	U8	*t0;
+	U8	*t1;
+
+	if (!data || len < 5)
+		return 0;
+
+	n = len - 4;
+	if (n > HLNET48_TEXT_MAX - 1)
+		n = HLNET48_TEXT_MAX - 1;
+
+	//the sender's NUL is inside the copy and ends the string; terminating again
+	//covers a sender that omitted it
+	for (i = 0; i < n; i++)
+		text[i] = data[4 + i];
+	text[n] = 0;
+
+	ntok = HLNet48Tokenize(text, tok, HLNET48_TOKENS_MAX, HLNET48_TOKEN_LEN);
+	if (ntok < 1)
+		return 0;
+
+	t0 = tok;
+	t1 = tok + HLNET48_TOKEN_LEN;
+
+	if (hl_udp_server)
+	{
+		if (!StrICompare(t0, "getchallenge"))
+		{
+			chal = HLNet48ChalIssue(ip);
+			//S2C_CHALLENGE 'A', value packed against it with no separator
+			StrPrint(reply, "A%d", chal);
+			HLNet48SendOOB(ip, port, reply);
+			return 0;
+		}
+
+		if (!StrICompare(t0, "connect"))
+		{
+			//connect <protocol> <challenge> "<protinfo>" "<userinfo>"
+			if (ntok < 3)
+				return 0;
+
+			proto = Str2I64(t1);
+			if (proto != HLNET48_PROTOCOL)
+			{
+				StrPrint(reply, "reject \"Server is protocol %d\"",
+					HLNET48_PROTOCOL);
+				HLNet48SendOOB(ip, port, reply);
+				return 0;
+			}
+
+			chal = Str2I64(tok + 2 * HLNET48_TOKEN_LEN);
+			if (!HLNet48ChalCheck(ip, chal))
+			{
+				HLNet48SendOOB(ip, port, "reject \"Bad challenge\"");
+				return 0;
+			}
+
+			hl_net48_conn_protinfo[0] = 0;
+			hl_net48_conn_userinfo[0] = 0;
+			if (ntok > 3)
+				HLStrCopy(hl_net48_conn_protinfo,
+					tok + 3 * HLNET48_TOKEN_LEN, HLNET48_INFO_MAX);
+			if (ntok > 4)
+				HLStrCopy(hl_net48_conn_userinfo,
+					tok + 4 * HLNET48_TOKEN_LEN, HLNET48_INFO_MAX);
+
+			hl_net48_conn_ip    = ip;
+			hl_net48_conn_port  = port;
+			hl_net48_conn_ready = TRUE;
+			return 5;
+		}
+
+		return 0;
+	}
+
+	//client. the letter forms are what a GoldSrc server sends and what this port
+	//writes; the word forms stay accepted for a peer spelling them out
+	chal = 0;
+	if (!StrICompare(t0, "challenge") && ntok > 1)
+		chal = Str2I64(t1);
+	else if (t0[0] == 'A' && t0[1] >= '0' && t0[1] <= '9')
+		chal = Str2I64(t0 + 1);
+
+	//S2C_CHALLENGE pads with a zero field before the value
+	if (!chal && ntok > 1 && t0[0] == 'A')
+		chal = Str2I64(t1);
+
+	if (chal)
+	{
+		if (hl_net48_cl_state != 1)
+			return 0;
+
+		hl_net48_cl_challenge = chal;
+		HLNet48ClientSendConnect;
+		return 0;
+	}
+
+	//S2C_CONNECTION is the letter alone, so the whole token must be it: a print
+	//line beginning with B is not an accept
+	if (!StrICompare(t0, "connection") || (t0[0] == 'B' && !t0[1]))
+	{
+		if (hl_net48_cl_state < 2)
+			return 0;
+
+		hl_net48_cl_state = 3;
+		hl_net48_active   = TRUE;
+		HLNet48ChanSetup(HLNET_CLIENT_SLOT, hl_net48_cl_ip, hl_net48_cl_port);
+		HLLog("net48: connection accepted\n");
+		HLLogFlush;
+		return 0;
+	}
+
+	if (!StrICompare(t0, "reject") || !StrICompare(t0, "print"))
+	{
+		HLStrCopy(shown, text, 120);
+		StrPrint(hl_net48_line, "net48: %s\n", shown);
+		HLLog(hl_net48_line);
+		HLLogFlush;
+		return 0;
+	}
+
+	return 0;
+}
+
+//--- netchan receive --------------------------------------------------------
+
+I64 HLNet48Process(I64 slot, U8 *buf, I64 len, CHLMsg *out)
+{//Netchan_Process. 1 when a whole message is in out, 0 otherwise
+	CHLNet48Chan	*c;
+	I64				 payload;
+	I64				 done;
+	I64				 i;
+	I64				 body;
+	I64				 taken;
+	U32				 fid;
+
+	c = HLNet48ChanFor(slot);
+	if (!c || !c->active || !buf || !out || len < 8)
+		return 0;
+
+	if (!HLNet48ParseHeader(buf, len, &hl_net48_hdr))
+		return 0;
+
+	//duplicates and reordering: only a newer sequence advances the channel
+	if (hl_net48_hdr.seq <= c->incoming_sequence)
+		return 0;
+
+	c->dropped += hl_net48_hdr.seq - c->incoming_sequence - 1;
+	c->incoming_sequence     = hl_net48_hdr.seq;
+	c->incoming_acknowledged = hl_net48_hdr.ack;
+	c->last_received         = tS;
+
+	//frees the held reliable message, or starts the next queued one
+	HLNet48RelAck(slot, hl_net48_hdr.ack, hl_net48_hdr.rel_ack);
+
+	//NAT and ephemeral source ports: track the peer, as the NETFLAG path does
+	if (hl_udp_from_port >= 1)
+		c->port = hl_udp_from_port;
+
+	//latched, not flipped: bit 31 is the sender's toggle, so a resend of the same
+	//message leaves this unchanged and the acknowledgement stays correct
+	c->incoming_reliable_sequence = 0;
+	if (hl_net48_hdr.reliable)
+		c->incoming_reliable_sequence = 1;
+
+	payload = len - hl_net48_hdr.hdr_len;
+	if (payload < 0)
+		return 0;
+
+	if (hl_net48_hdr.has_frags)
+	{
+		//fragment bodies follow the header in stream order, each sized by its own
+		//descriptor, so one packet may carry a fragment of every stream
+		body = hl_net48_hdr.hdr_len;
+		done = 0;
+
+		for (i = 0; i < HLNET48_MAX_STREAMS; i++)
+		{
+			if (!hl_net48_hdr.frag_present[i])
+				goto q48pr_next;
+
+			if (body + hl_net48_hdr.frag_len[i] > len)
+				return 0;
+
+			fid = HLFragMakeId(hl_net48_hdr.frag_id[i],
+				hl_net48_hdr.frag_count[i]);
+			taken = HLFragAdd(slot, i, fid, hl_net48_hdr.frag_off[i],
+				buf + body, hl_net48_hdr.frag_len[i]);
+			body += hl_net48_hdr.frag_len[i];
+
+			//only the normal stream becomes a game message. a completed file
+			//stream stays in its buffer for the transfer layer
+			if (taken > 0 && i == HLFRAG_NORMAL_STREAM)
+			{
+				if (HLFragTake(slot, i, out))
+					done = 1;
+			}
+
+q48pr_next:
+		}
+
+		return done;
+	}
+
+	if (payload < 1 || payload > HLNET_MAX_MSG)
+		return 0;
+
+	HLMsgClear(out);
+	MemCopy(out->data, buf + hl_net48_hdr.hdr_len, payload);
+	out->len = payload;
+
+	return 1;
+}
+
+U0 HLNet48Init()
+{//globals aren't zeroed, and declaration initialisers do not run
+	I64 i;
+
+	HLNet48ChalInit;
+	HLNet48RelInit;
+
+	for (i = 0; i < HLSV_MAX_CLIENTS; i++)
+		HLNet48ChanClear(&hl_net48_sv[i]);
+
+	HLNet48ChanClear(&hl_net48_cl);
+	HLNet48HdrClear(&hl_net48_hdr);
+	HLNet48HdrClear(&hl_net48_thdr);
+
+	hl_net48_active       = FALSE;
+	hl_net48_cl_state     = 0;
+	hl_net48_cl_ip        = 0;
+	hl_net48_cl_port      = HLNET_PORT_DEFAULT;
+	hl_net48_cl_challenge = 0;
+	hl_net48_cl_last      = 0.0;
+	hl_net48_cl_top       = 0;
+	hl_net48_cl_bottom    = 0;
+	hl_net48_cl_name[0]   = 0;
+
+	hl_net48_conn_ready      = FALSE;
+	hl_net48_conn_ip         = 0;
+	hl_net48_conn_port       = HLNET_PORT_DEFAULT;
+	hl_net48_conn_userinfo[0] = 0;
+	hl_net48_conn_protinfo[0] = 0;
+
+	hl_net48_line[0]   = 0;
+	hl_net48_reset_req = FALSE;
+}
+
+HLNet48Init;
+
+//--- self check -------------------------------------------------------------
+//
+// every structure here round trips through its own reader, and the header is
+// checked byte for byte against a hand-built layout. nothing in this file has
+// been exchanged with a real GoldSrc peer, so this is the whole of the evidence
+// for the inferred framing: it proves self consistency, not conformance.
+//
+// not called from HLTest; run HLNet48SelfTest; from the prompt
+
+I64 hl_net48_test_fail = 0;
+
+U0 HLNet48TestI(U8 *what, I64 got, I64 want)
+{
+	if (got == want)
+		"  ok   %s\t%d\n", what, got;
+	else
+	{
+		"  FAIL %s\tgot %d want %d\n", what, got, want;
+		hl_net48_test_fail++;
+	}
+}
+
+U0 HLNet48TestS(U8 *what, U8 *got, U8 *want)
+{
+	if (!StrCompare(got, want))
+		"  ok   %s\t[%s]\n", what, got;
+	else
+	{
+		"  FAIL %s\tgot [%s] want [%s]\n", what, got, want;
+		hl_net48_test_fail++;
+	}
+}
+
+//entity stream fixtures. file scope: CHLEntState48 is 500 bytes and a frame is
+//140KB, neither belongs on the stack
+CHLEntState48	hl_net48_test_ref;
+CHLMoveVars48	hl_net48_test_mv;
+
+U0 HLNet48TestFill(CHLEntState48 *e, I64 seed)
+{//a handful of slots, every one an integer inside the width and the multiplier
+ //delta.lst declares for it, so a comparison after a round trip can be exact.
+ //angles and the time windows are left alone: both quantise
+	if (!e)
+		return;
+
+	HLState48Clear(e);
+
+	e->v[HLES_ORIGIN + 0] = ToF64(seed & 255);
+	e->v[HLES_ORIGIN + 1] = ToF64(-(seed & 127));
+	e->v[HLES_ORIGIN + 2] = ToF64((seed * 3) & 511);
+	e->v[HLES_MODELINDEX] = ToF64(seed & 1023);
+	e->v[HLES_FRAME]      = ToF64(seed & 63);
+	e->v[HLES_SEQUENCE]   = ToF64(seed & 255);
+	e->v[HLES_SOLID]      = ToF64(seed & 3);
+	e->active             = TRUE;
+}
+
+Bool HLNet48TestEntSame(CHLEntState48 *a, CHLEntState48 *b)
+{
+	I64 i;
+
+	if (!a || !b)
+		return FALSE;
+
+	for (i = 0; i < HLDELTA_MAX_SLOTS; i++)
+	{
+		if (a->v[i] != b->v[i])
+			return FALSE;
+	}
+
+	return TRUE;
+}
+
+I64 HLNet48TestFrameDiff(CHLFrame48 *a, CHLFrame48 *b)
+{//entries that disagree, or -1 when the lengths do
+	I64 i;
+	I64 bad = 0;
+
+	if (!a || !b)
+		return -1;
+
+	if (a->count != b->count)
+		return -1;
+
+	for (i = 0; i < a->count; i++)
+	{
+		if (a->num[i] != b->num[i])
+			bad++;
+		else if (!HLNet48TestEntSame(&a->ent[i], &b->ent[i]))
+			bad++;
+	}
+
+	return bad;
+}
+
+U0 HLNet48TestEntityStream()
+{//the entity stream against its own writer. every layout under test here is
+ //inferred - see the section banner in HLNet.ZC - so this proves the pair self
+ //consistent and nothing about GoldSrc
+	CHLFrame48	*fa;
+	CHLFrame48	*fb;
+	CHLFrame48	*fc;
+	F64			 tb;
+	I64			 i;
+	I64			 n;
+	I64			 numbase;
+
+	"$$LTBLUE$$--- protocol 48 entity stream ---$$FG$$\n";
+
+	fa = &hl_pe_sv[0];
+	fb = &hl_pe_sv[1];
+	fc = &hl_pe_sv[2];
+	tb = 0.0;
+
+	//no player slots and empty baselines: every entity is entity_state_t and
+	//every full update is measured against zero
+	hl_net48_players = 0;
+	for (i = 0; i < HLNET_MAX_ENTS; i++)
+		HLState48Clear(&hl_net_bl48[i]);
+
+	//--- svc_packetentities --------------------------------------------------
+
+	//an empty frame is the opcode, the count word and the terminator
+	HLPEFrameClear(fa);
+	HLMsgClear(&hl_net_cmd);
+	HLNet48TestI("empty frame written",
+		HLNetWritePacketEntities(&hl_net_cmd, NULL, fa, 0, tb), TRUE);
+	HLNet48TestI("empty frame bytes", hl_net_cmd.len, 5);
+
+	HLPEFrameClear(fb);
+	hl_net_cmd.read = 1;
+	HLNet48TestI("empty frame parses",
+		HLNetReadPacketEntities(&hl_net_cmd, NULL, fb, TRUE, tb), TRUE);
+	HLNet48TestI("empty frame count", fb->count, 0);
+
+	//one entity
+	HLPEFrameClear(fa);
+	HLNet48TestFill(&fa->ent[0], 1);
+	fa->num[0] = 1;
+	fa->count  = 1;
+
+	HLMsgClear(&hl_net_cmd);
+	HLNetWritePacketEntities(&hl_net_cmd, NULL, fa, 0, tb);
+	HLPEFrameClear(fb);
+	hl_net_cmd.read = 1;
+	HLNet48TestI("single parses",
+		HLNetReadPacketEntities(&hl_net_cmd, NULL, fb, TRUE, tb), TRUE);
+	HLNet48TestI("single round trip", HLNet48TestFrameDiff(fa, fb), 0);
+
+	//entity 0 is what the all-zero terminator costs
+	HLPEFrameClear(fa);
+	HLNet48TestFill(&fa->ent[0], 3);
+	fa->num[0] = 0;
+	fa->count  = 1;
+	HLMsgClear(&hl_net_cmd);
+	HLNet48TestI("entity 0 refused",
+		HLNetWritePacketEntities(&hl_net_cmd, NULL, fa, 0, tb), FALSE);
+
+	//the widest number the 11 bit form holds
+	HLPEFrameClear(fa);
+	HLNet48TestFill(&fa->ent[0], 5);
+	fa->num[0] = 2047;
+	fa->count  = 1;
+	HLMsgClear(&hl_net_cmd);
+	HLNetWritePacketEntities(&hl_net_cmd, NULL, fa, 0, tb);
+	HLPEFrameClear(fb);
+	hl_net_cmd.read = 1;
+	HLNet48TestI("entity 2047 parses",
+		HLNetReadPacketEntities(&hl_net_cmd, NULL, fb, TRUE, tb), TRUE);
+	HLNet48TestI("entity 2047 number", fb->num[0], 2047);
+	HLNet48TestI("entity 2047 round trip", HLNet48TestFrameDiff(fa, fb), 0);
+
+	//a full frame at the cap, dense: every header but the first takes the
+	//offset form
+	HLPEFrameClear(fa);
+	for (i = 0; i < HLPE_MAX_ENTS; i++)
+	{
+		fa->num[i] = i + 1;
+		HLNet48TestFill(&fa->ent[i], i + 1);
+	}
+	fa->count = HLPE_MAX_ENTS;
+
+	HLMsgClear(&hl_net_cmd);
+	HLNet48TestI("full frame written",
+		HLNetWritePacketEntities(&hl_net_cmd, NULL, fa, 0, tb), TRUE);
+	HLPEFrameClear(fb);
+	hl_net_cmd.read = 1;
+	HLNet48TestI("full frame parses",
+		HLNetReadPacketEntities(&hl_net_cmd, NULL, fb, TRUE, tb), TRUE);
+	HLNet48TestI("full frame round trip", HLNet48TestFrameDiff(fa, fb), 0);
+
+	//gaps past 62 fall back to the absolute form
+	HLPEFrameClear(fa);
+	for (i = 0; i < 20; i++)
+	{
+		fa->num[i] = 1 + i * 100;
+		HLNet48TestFill(&fa->ent[i], i + 9);
+	}
+	fa->count = 20;
+
+	HLMsgClear(&hl_net_cmd);
+	HLNetWritePacketEntities(&hl_net_cmd, NULL, fa, 0, tb);
+	HLPEFrameClear(fb);
+	hl_net_cmd.read = 1;
+	HLNet48TestI("wide gaps parse",
+		HLNetReadPacketEntities(&hl_net_cmd, NULL, fb, TRUE, tb), TRUE);
+	HLNet48TestI("wide gaps round trip", HLNet48TestFrameDiff(fa, fb), 0);
+
+	//62 apart is the last offset, 63 and 64 are not
+	HLPEFrameClear(fa);
+	fa->num[0] = 1;
+	fa->num[1] = 63;
+	fa->num[2] = 126;
+	fa->num[3] = 190;
+	for (i = 0; i < 4; i++)
+		HLNet48TestFill(&fa->ent[i], i + 2);
+	fa->count = 4;
+
+	HLMsgClear(&hl_net_cmd);
+	HLNetWritePacketEntities(&hl_net_cmd, NULL, fa, 0, tb);
+	HLPEFrameClear(fb);
+	hl_net_cmd.read = 1;
+	HLNet48TestI("offset boundary parses",
+		HLNetReadPacketEntities(&hl_net_cmd, NULL, fb, TRUE, tb), TRUE);
+	HLNet48TestI("offset boundary round trip", HLNet48TestFrameDiff(fa, fb), 0);
+
+	//--- svc_deltapacketentities ---------------------------------------------
+
+	//eight entities, then one changed, one removed and one added
+	HLPEFrameClear(fa);
+	for (i = 0; i < 8; i++)
+	{
+		fa->num[i] = i + 1;
+		HLNet48TestFill(&fa->ent[i], i + 1);
+	}
+	fa->count = 8;
+
+	HLPEFrameClear(fb);
+	for (i = 0; i < 8; i++)
+	{
+		if (fa->num[i] == 4)
+			goto qes_skip;
+
+		fb->num[fb->count] = fa->num[i];
+		HLState48Copy(&fb->ent[fb->count], &fa->ent[i]);
+
+		if (fa->num[i] == 6)
+			fb->ent[fb->count].v[HLES_ORIGIN + 0] += 1.0;
+
+		fb->count++;
+
+qes_skip:
+	}
+	fb->num[fb->count] = 9;
+	HLNet48TestFill(&fb->ent[fb->count], 77);
+	fb->count++;
+
+	HLMsgClear(&hl_net_cmd);
+	HLNetWritePacketEntities(&hl_net_cmd, fa, fb, 7, tb);
+	HLPEFrameClear(fc);
+	hl_net_cmd.read = 1;
+	HLNet48TestI("delta parses",
+		HLNetReadPacketEntities(&hl_net_cmd, fa, fc, FALSE, tb), TRUE);
+	HLNet48TestI("delta count", fc->count, fb->count);
+	HLNet48TestI("delta round trip", HLNet48TestFrameDiff(fb, fc), 0);
+
+	//nothing changed: opcode, count, delta sequence, terminator
+	HLMsgClear(&hl_net_cmd);
+	HLNetWritePacketEntities(&hl_net_cmd, fa, fa, 7, tb);
+	HLNet48TestI("unchanged frame bytes", hl_net_cmd.len, 6);
+	HLPEFrameClear(fc);
+	hl_net_cmd.read = 1;
+	HLNet48TestI("unchanged parses",
+		HLNetReadPacketEntities(&hl_net_cmd, fa, fc, FALSE, tb), TRUE);
+	HLNet48TestI("unchanged carried forward", HLNet48TestFrameDiff(fa, fc), 0);
+
+	//a removal as the last thing before the terminator
+	HLPEFrameClear(fb);
+	fb->count = fa->count - 1;
+	for (i = 0; i < fb->count; i++)
+	{
+		fb->num[i] = fa->num[i];
+		HLState48Copy(&fb->ent[i], &fa->ent[i]);
+	}
+
+	HLMsgClear(&hl_net_cmd);
+	HLNetWritePacketEntities(&hl_net_cmd, fa, fb, 7, tb);
+	HLPEFrameClear(fc);
+	hl_net_cmd.read = 1;
+	HLNet48TestI("trailing removal parses",
+		HLNetReadPacketEntities(&hl_net_cmd, fa, fc, FALSE, tb), TRUE);
+	HLNet48TestI("trailing removal round trip", HLNet48TestFrameDiff(fb, fc), 0);
+
+	//every entity gone
+	HLPEFrameClear(fb);
+	HLMsgClear(&hl_net_cmd);
+	HLNetWritePacketEntities(&hl_net_cmd, fa, fb, 7, tb);
+	HLPEFrameClear(fc);
+	hl_net_cmd.read = 1;
+	HLNet48TestI("all removed parses",
+		HLNetReadPacketEntities(&hl_net_cmd, fa, fc, FALSE, tb), TRUE);
+	HLNet48TestI("all removed count", fc->count, 0);
+
+	//a stream whose numbers step backwards. hand built: the writer cannot
+	//produce one
+	HLMsgClear(&hl_net_cmd);
+	HLMsgWriteByte(&hl_net_cmd, HLSVC_DELTAPACKETENTITIES);
+	HLMsgWriteShort(&hl_net_cmd, 2);
+	HLMsgWriteByte(&hl_net_cmd, 0);
+	HLBitWriteStart(&hl_net_cmd);
+	numbase = 0;
+	HLPEWriteHeader(&hl_net_cmd, 10, &numbase, FALSE, FALSE, FALSE);
+	HLDeltaWrite(&hl_net_cmd, &hl_delta_entity, hl_pe_zero.v, hl_pe_zero.v,
+		NULL, NULL, tb);
+	//absolute form naming a lower number
+	HLBitWriteBits(&hl_net_cmd, 0, 1);
+	HLBitWriteBits(&hl_net_cmd, 5, HLPE_NUM_BITS);
+	HLBitWriteBits(&hl_net_cmd, 0, 1);
+	HLBitWriteBits(&hl_net_cmd, 0, 1);
+	HLDeltaWrite(&hl_net_cmd, &hl_delta_entity, hl_pe_zero.v, hl_pe_zero.v,
+		NULL, NULL, tb);
+	HLPEWriteEnd(&hl_net_cmd, TRUE);
+	HLBitWriteEnd(&hl_net_cmd);
+
+	HLPEFrameClear(fa);
+	HLPEFrameClear(fc);
+	hl_net_cmd.read = 1;
+	HLNet48TestI("out of order rejected",
+		HLNetReadPacketEntities(&hl_net_cmd, fa, fc, FALSE, tb), FALSE);
+
+	//--- svc_spawnbaseline ---------------------------------------------------
+
+	//entity 0 first: the baseline block cannot use the all-zero terminator
+	for (i = 0; i < HLNET_MAX_ENTS; i++)
+		HLState48Clear(&hl_net_bl48[i]);
+	for (i = 0; i < 40; i++)
+		HLNet48TestFill(&hl_net_bl48[i], i + 1);
+
+	HLMsgClear(&hl_net_cmd);
+	HLNet48TestI("baseline written",
+		HLNetWriteSpawnBaseline(&hl_net_cmd, hl_net_bl48, 40, tb), TRUE);
+
+	for (i = 0; i < HLNET_MAX_ENTS; i++)
+		HLState48Clear(&hl_net_bl48[i]);
+
+	hl_net_cmd.read = 1;
+	HLNet48TestI("baseline parses",
+		HLNetReadSpawnBaseline(&hl_net_cmd, tb), TRUE);
+
+	n = 0;
+	for (i = 0; i < 40; i++)
+	{
+		HLNet48TestFill(&hl_net48_test_ref, i + 1);
+		if (!HLNet48TestEntSame(&hl_net_bl48[i], &hl_net48_test_ref))
+			n++;
+	}
+	HLNet48TestI("baseline mismatches", n, 0);
+	HLNet48TestI("baseline entity 0 active", hl_net_bl48[0].active, TRUE);
+	HLNet48TestI("baseline entity 40 untouched", hl_net_bl48[40].active, FALSE);
+
+	//sparse, with gaps past the offset form
+	for (i = 0; i < HLNET_MAX_ENTS; i++)
+		HLState48Clear(&hl_net_bl48[i]);
+	for (i = 0; i < 8; i++)
+		HLNet48TestFill(&hl_net_bl48[i * 70], i + 3);
+
+	HLMsgClear(&hl_net_cmd);
+	HLNetWriteSpawnBaseline(&hl_net_cmd, hl_net_bl48, HLNET_MAX_ENTS, tb);
+
+	for (i = 0; i < HLNET_MAX_ENTS; i++)
+		HLState48Clear(&hl_net_bl48[i]);
+
+	hl_net_cmd.read = 1;
+	HLNet48TestI("sparse baseline parses",
+		HLNetReadSpawnBaseline(&hl_net_cmd, tb), TRUE);
+
+	n = 0;
+	for (i = 0; i < 8; i++)
+	{
+		HLNet48TestFill(&hl_net48_test_ref, i + 3);
+		if (!HLNet48TestEntSame(&hl_net_bl48[i * 70], &hl_net48_test_ref))
+			n++;
+	}
+	HLNet48TestI("sparse baseline mismatches", n, 0);
+
+	//leave nothing behind: these are the baselines every later delta is
+	//measured against
+	for (i = 0; i < HLNET_MAX_ENTS; i++)
+		HLState48Clear(&hl_net_bl48[i]);
+
+	HLPEFramesClear;
+}
+
+U0 HLNet48TestFrameRing()
+{//the send side's frame ring and its reference selection, then svc_newmovevars.
+ //
+ //HLSv48SendFrame is in HLNetSv.ZC, which compiles after this file, so the two
+ //lines that pick the reference are repeated here rather than called. They are
+ //the whole rule: HLPEFrameBySeq against the peer's acknowledged sequence, NULL
+ //meaning a full update
+	CHLFrame48	*from;
+	CHLFrame48	*sv;
+	CHLFrame48	*cl;
+	F64			 tb;
+	I64			 i;
+	I64			 seq;
+	I64			 ack;
+	I64			 from_seq;
+	I64			 n;
+
+	"$$LTBLUE$$--- protocol 48 frame ring and movevars ---$$FG$$\n";
+
+	HLPEFramesClear;
+	hl_net48_players = 0;
+	for (i = 0; i < HLNET_MAX_ENTS; i++)
+		HLState48Clear(&hl_net_bl48[i]);
+
+	tb = 0.0;
+
+	//--- ring identity -------------------------------------------------------
+
+	for (i = 0; i < HLPE_FRAMES; i++)
+	{
+		HLPEFrameClear(&hl_pe_sv_stage);
+		hl_pe_sv_stage.num[0] = 1;
+		HLNet48TestFill(&hl_pe_sv_stage.ent[0], i + 1);
+		hl_pe_sv_stage.count = 1;
+		HLPEFrameStore(hl_pe_sv, &hl_pe_sv_stage, 100 + i, tb);
+	}
+
+	n = 0;
+	for (i = 0; i < HLPE_FRAMES; i++)
+	{
+		if (!HLPEFrameBySeq(hl_pe_sv, 100 + i))
+			n++;
+	}
+	HLNet48TestI("ring holds every stored sequence", n, 0);
+	HLNet48TestI("ring rejects an unstored sequence",
+		ToI64(HLPEFrameBySeq(hl_pe_sv, 99) == NULL), TRUE);
+	HLNet48TestI("ring rejects a negative sequence",
+		ToI64(HLPEFrameBySeq(hl_pe_sv, -1) == NULL), TRUE);
+
+	//one past the depth evicts the oldest: same slot, new sequence
+	HLPEFrameClear(&hl_pe_sv_stage);
+	HLPEFrameStore(hl_pe_sv, &hl_pe_sv_stage, 100 + HLPE_FRAMES, tb);
+	HLNet48TestI("eviction drops the oldest",
+		ToI64(HLPEFrameBySeq(hl_pe_sv, 100) == NULL), TRUE);
+	HLNet48TestI("eviction keeps the newest",
+		ToI64(HLPEFrameBySeq(hl_pe_sv, 100 + HLPE_FRAMES) != NULL), TRUE);
+
+	//--- a three tick exchange ----------------------------------------------
+	//
+	//tick 3 is chosen HLPE_FRAMES after tick 1 so its destination slot is the
+	//slot its reference occupies: the store has to follow the write
+
+	HLPEFramesClear;
+
+	//tick 1: nothing acknowledged, so a full update
+	seq = 10;
+	ack = -1;
+
+	HLPEFrameClear(&hl_pe_sv_stage);
+	for (i = 0; i < 3; i++)
+	{
+		hl_pe_sv_stage.num[i] = i + 1;
+		HLNet48TestFill(&hl_pe_sv_stage.ent[i], i + 1);
+	}
+	hl_pe_sv_stage.count = 3;
+
+	from     = HLPEFrameBySeq(hl_pe_sv, ack);
+	from_seq = 0;
+	if (from)
+		from_seq = from->seq;
+
+	HLNet48TestI("tick 1 has no reference", ToI64(from == NULL), TRUE);
+
+	HLMsgClear(&hl_net_cmd);
+	HLNet48TestI("tick 1 written",
+		HLNetWritePacketEntities(&hl_net_cmd, from, &hl_pe_sv_stage, from_seq,
+		tb), TRUE);
+	HLNet48TestI("tick 1 opcode", hl_net_cmd.data[0], HLSVC_PACKETENTITIES);
+
+	hl_net_cmd.read = 1;
+	HLNet48TestI("tick 1 parses",
+		HLNetParsePacketEntities48(&hl_net_cmd, FALSE, seq, tb), TRUE);
+
+	HLPEFrameStore(hl_pe_sv, &hl_pe_sv_stage, seq, tb);
+
+	sv = HLPEFrameBySeq(hl_pe_sv, seq);
+	cl = HLPEFrameBySeq(hl_pe_cl, seq);
+	HLNet48TestI("tick 1 filed both sides",
+		ToI64(sv != NULL && cl != NULL), TRUE);
+	HLNet48TestI("tick 1 round trip", HLNet48TestFrameDiff(sv, cl), 0);
+
+	//tick 2: the peer acknowledged tick 1, so a delta against it
+	seq = 11;
+	ack = 10;
+
+	HLPEFrameClear(&hl_pe_sv_stage);
+	for (i = 0; i < 3; i++)
+	{
+		hl_pe_sv_stage.num[i] = i + 1;
+		HLNet48TestFill(&hl_pe_sv_stage.ent[i], i + 1);
+	}
+	hl_pe_sv_stage.count = 3;
+	hl_pe_sv_stage.ent[1].v[HLES_ORIGIN + 0] += 8.0;
+
+	from     = HLPEFrameBySeq(hl_pe_sv, ack);
+	from_seq = 0;
+	if (from)
+		from_seq = from->seq;
+
+	HLNet48TestI("tick 2 references tick 1", from_seq, 10);
+
+	HLMsgClear(&hl_net_cmd);
+	HLNet48TestI("tick 2 written",
+		HLNetWritePacketEntities(&hl_net_cmd, from, &hl_pe_sv_stage, from_seq,
+		tb), TRUE);
+	HLNet48TestI("tick 2 opcode", hl_net_cmd.data[0],
+		HLSVC_DELTAPACKETENTITIES);
+	HLNet48TestI("tick 2 names its reference", hl_net_cmd.data[3], 10);
+
+	hl_net_cmd.read = 1;
+	HLNet48TestI("tick 2 parses",
+		HLNetParsePacketEntities48(&hl_net_cmd, TRUE, seq, tb), TRUE);
+
+	HLPEFrameStore(hl_pe_sv, &hl_pe_sv_stage, seq, tb);
+
+	sv = HLPEFrameBySeq(hl_pe_sv, seq);
+	cl = HLPEFrameBySeq(hl_pe_cl, seq);
+	HLNet48TestI("tick 2 round trip", HLNet48TestFrameDiff(sv, cl), 0);
+
+	//tick 3: still delta'd against tick 1, and lands in tick 1's slot
+	seq = 10 + HLPE_FRAMES;
+	ack = 10;
+
+	HLNet48TestI("tick 3 shares the reference slot",
+		ToI64(HLPEFrameSlot(hl_pe_sv, seq) == HLPEFrameSlot(hl_pe_sv, ack)),
+		TRUE);
+
+	HLPEFrameClear(&hl_pe_sv_stage);
+	for (i = 0; i < 4; i++)
+	{
+		hl_pe_sv_stage.num[i] = i + 1;
+		HLNet48TestFill(&hl_pe_sv_stage.ent[i], i + 20);
+	}
+	hl_pe_sv_stage.count = 4;
+
+	from     = HLPEFrameBySeq(hl_pe_sv, ack);
+	from_seq = 0;
+	if (from)
+		from_seq = from->seq;
+
+	HLNet48TestI("tick 3 references tick 1", from_seq, 10);
+
+	HLMsgClear(&hl_net_cmd);
+	HLNet48TestI("tick 3 written",
+		HLNetWritePacketEntities(&hl_net_cmd, from, &hl_pe_sv_stage, from_seq,
+		tb), TRUE);
+
+	hl_net_cmd.read = 1;
+	HLNet48TestI("tick 3 parses",
+		HLNetParsePacketEntities48(&hl_net_cmd, TRUE, seq, tb), TRUE);
+
+	HLPEFrameStore(hl_pe_sv, &hl_pe_sv_stage, seq, tb);
+
+	sv = HLPEFrameBySeq(hl_pe_sv, seq);
+	cl = HLPEFrameBySeq(hl_pe_cl, seq);
+	HLNet48TestI("tick 3 round trip", HLNet48TestFrameDiff(sv, cl), 0);
+	HLNet48TestI("tick 3 evicted tick 1",
+		ToI64(HLPEFrameBySeq(hl_pe_sv, 10) == NULL), TRUE);
+
+	//an acknowledgement older than the ring has no reference left
+	HLNet48TestI("aged out acknowledgement is a full update",
+		ToI64(HLPEFrameBySeq(hl_pe_sv, 1) == NULL), TRUE);
+
+	//the entity table the renderer reads, filled by the last parse
+	HLNet48TestI("entity 1 published", hl_net_cl48[1].active, TRUE);
+	HLNet48TestI("entity 4 published", hl_net_cl48[4].active, TRUE);
+	HLNet48TestI("entity 5 not published", hl_net_cl48[5].active, FALSE);
+
+	HLPEFramesClear;
+
+	//--- svc_newmovevars -----------------------------------------------------
+
+	HLMoveVars48Defaults(&hl_net48_test_mv);
+	hl_net48_test_mv.v[HLMV_GRAVITY]    = 640.0;
+	hl_net48_test_mv.v[HLMV_MAXSPEED]   = 270.0;
+	hl_net48_test_mv.v[HLMV_SKYCOLOR_R] = 132.0;
+	hl_net48_test_mv.v[HLMV_SKYCOLOR_G] = 148.0;
+	hl_net48_test_mv.v[HLMV_SKYCOLOR_B] = 168.0;
+	hl_net48_test_mv.v[HLMV_SKYVEC_X]   = 1.0;
+	hl_net48_test_mv.footsteps          = TRUE;
+	HLStrCopy(hl_net48_test_mv.skyname, "desert", HLMV_SKYNAME_LEN);
+
+	HLMsgClear(&hl_net_cmd);
+	HLNetWriteMoveVars48(&hl_net_cmd, &hl_net48_test_mv);
+
+	//opcode, 16 floats, footsteps, "desert" with its NUL, 8 floats
+	HLNet48TestI("movevars bytes", hl_net_cmd.len, 1 + 64 + 1 + 7 + 32);
+	HLNet48TestI("movevars opcode", hl_net_cmd.data[0], HLSVC_NEWMOVEVARS);
+
+	HLMoveVars48Clear(&hl_movevars48);
+	hl_net_cmd.read = 1;
+	HLNet48TestI("movevars parses",
+		HLNetReadMoveVars48(&hl_net_cmd, &hl_movevars48), TRUE);
+
+	n = 0;
+	for (i = 0; i < HLMV_FLOATS; i++)
+	{
+		if (hl_movevars48.v[i] != hl_net48_test_mv.v[i])
+			n++;
+	}
+	HLNet48TestI("movevars float mismatches", n, 0);
+	HLNet48TestI("movevars footsteps", hl_movevars48.footsteps, TRUE);
+	HLNet48TestS("movevars skyname", hl_movevars48.skyname, "desert");
+	HLNet48TestI("movevars gravity", ToI64(hl_movevars48.v[HLMV_GRAVITY]), 640);
+	HLNet48TestI("movevars sky blue",
+		ToI64(hl_movevars48.v[HLMV_SKYCOLOR_B]), 168);
+
+	//an empty sky name is one byte, and the message still lines up
+	HLMoveVars48Defaults(&hl_net48_test_mv);
+	HLMsgClear(&hl_net_cmd);
+	HLNetWriteMoveVars48(&hl_net_cmd, &hl_net48_test_mv);
+	HLNet48TestI("movevars bytes, no sky", hl_net_cmd.len, 1 + 64 + 1 + 1 + 32);
+
+	HLMoveVars48Clear(&hl_movevars48);
+	hl_net_cmd.read = 1;
+	HLNet48TestI("movevars parses, no sky",
+		HLNetReadMoveVars48(&hl_net_cmd, &hl_movevars48), TRUE);
+	HLNet48TestI("movevars read to the end", hl_net_cmd.read, hl_net_cmd.len);
+	HLNet48TestI("movevars stepsize",
+		ToI64(hl_movevars48.v[HLMV_STEPSIZE]), 18);
+
+	//a truncated message must fail rather than return half a struct
+	HLMsgClear(&hl_net_cmd);
+	HLNetWriteMoveVars48(&hl_net_cmd, &hl_net48_test_mv);
+	hl_net_cmd.len -= 4;
+	HLMoveVars48Clear(&hl_movevars48);
+	hl_net_cmd.read = 1;
+	HLNet48TestI("truncated movevars refused",
+		HLNetReadMoveVars48(&hl_net_cmd, &hl_movevars48), FALSE);
+
+	HLMoveVars48Defaults(&hl_movevars48);
+}
+
+U0 HLNet48SelfTest()
+{
+	U8	 pkt[HLNET48_OOB_MAX];
+	U8	 tok[HLNET48_TOKENS_MAX * HLNET48_TOKEN_LEN];
+	U8	 info[HLNET48_INFO_MAX];
+	U8	 prot[HLNET48_INFO_MAX];
+	U8	 line[HLNET48_TEXT_MAX];
+	U8	 val[64];
+	U8	 body[3000];
+	I64	 n;
+	I64	 i;
+	I64	 off;
+	I64	 chunk;
+	I64	 count;
+	I64	 taken;
+	U32	 fid;
+
+	"$$LTBLUE$$--- protocol 48 handshake and netchan ---$$FG$$\n";
+	hl_net48_test_fail = 0;
+
+	//connectionless framing
+	n = HLNet48FormatOOB(pkt, HLNET48_OOB_MAX, "getchallenge");
+	HLNet48TestI("oob length", n, 17);
+	HLNet48TestI("oob marker", HLNet48ReadLong(pkt), 0xFFFFFFFF);
+	HLNet48TestI("oob first text byte", pkt[4], 'g');
+	HLNet48TestI("oob terminator", pkt[16], 0);
+	HLNet48TestI("oob recognised", HLNet48IsOOB(pkt, n), TRUE);
+
+	//a NETFLAG CTL header must not read as connectionless
+	HLNetWriteBigLong(pkt, 12 | HLNETFLAG_CTL);
+	HLNet48TestI("ctl not oob", HLNet48IsOOB(pkt, 12), FALSE);
+
+	//command line with two quoted infostrings
+	HLNet48BuildProtInfo(prot, HLNET48_INFO_MAX);
+	HLNet48BuildUserInfo(info, HLNET48_INFO_MAX, "gordon freeman", 4, 11);
+	StrPrint(line, "connect %d %d \"%s\" \"%s\"", 48, 1234567, prot, info);
+
+	n = HLNet48Tokenize(line, tok, HLNET48_TOKENS_MAX, HLNET48_TOKEN_LEN);
+	HLNet48TestI("connect token count", n, 5);
+	HLNet48TestS("token 0", tok, "connect");
+	HLNet48TestS("token 1", tok + HLNET48_TOKEN_LEN, "48");
+	HLNet48TestS("token 2", tok + 2 * HLNET48_TOKEN_LEN, "1234567");
+	HLNet48TestS("token 3", tok + 3 * HLNET48_TOKEN_LEN, prot);
+	HLNet48TestS("token 4", tok + 4 * HLNET48_TOKEN_LEN, info);
+
+	//infostring
+	HLNet48InfoValue(info, "name", val, 64);
+	HLNet48TestS("userinfo name", val, "gordon freeman");
+	HLNet48InfoValue(info, "topcolor", val, 64);
+	HLNet48TestS("userinfo topcolor", val, "4");
+	HLNet48InfoValue(info, "bottomcolor", val, 64);
+	HLNet48TestS("userinfo bottomcolor", val, "11");
+	//a prefix of a key must not match it
+	HLNet48InfoValue(info, "top", val, 64);
+	HLNet48TestS("userinfo partial key", val, "");
+	HLNet48InfoValue(prot, "prot", val, 64);
+	HLNet48TestS("protinfo prot", val, "3");
+
+	//challenge issue and check
+	i = HLNet48ChalIssue(0x0100000A);
+	HLNet48TestI("challenge nonzero", ToBool(i != 0), TRUE);
+	HLNet48TestI("challenge accepted", HLNet48ChalCheck(0x0100000A, i), TRUE);
+	HLNet48TestI("challenge wrong value", HLNet48ChalCheck(0x0100000A, i + 1),
+		FALSE);
+	HLNet48TestI("challenge wrong address", HLNet48ChalCheck(0x0200000A, i),
+		FALSE);
+
+	//header, no fragments. bits 31 and 30 sit above a 30-bit sequence
+	HLNet48HdrClear(&hl_net48_thdr);
+	hl_net48_thdr.seq      = 0x1234;
+	hl_net48_thdr.ack      = 0x1233;
+	hl_net48_thdr.reliable = TRUE;
+	hl_net48_thdr.rel_ack  = TRUE;
+
+	n = HLNet48WriteHeader(pkt, HLNET48_OOB_MAX, &hl_net48_thdr);
+	HLNet48TestI("plain header bytes", n, 8);
+	HLNet48TestI("sequence word", HLNet48ReadLong(pkt), 0x80001234);
+	HLNet48TestI("acknowledge word", HLNet48ReadLong(pkt + 4), 0x80001233);
+
+	HLNet48TestI("plain header parses", HLNet48ParseHeader(pkt, n, &hl_net48_hdr),
+		TRUE);
+	HLNet48TestI("rt sequence", hl_net48_hdr.seq, 0x1234);
+	HLNet48TestI("rt acknowledge", hl_net48_hdr.ack, 0x1233);
+	HLNet48TestI("rt reliable", hl_net48_hdr.reliable, TRUE);
+	HLNet48TestI("rt reliable ack", hl_net48_hdr.rel_ack, TRUE);
+	HLNet48TestI("rt fragment bit", hl_net48_hdr.has_frags, FALSE);
+	HLNet48TestI("rt header length", hl_net48_hdr.hdr_len, 8);
+
+	//header with one normal-stream fragment and the file stream absent
+	HLNet48HdrClear(&hl_net48_thdr);
+	hl_net48_thdr.seq        = 7;
+	hl_net48_thdr.ack        = 6;
+	hl_net48_thdr.has_frags  = TRUE;
+	hl_net48_thdr.frag_present[HLFRAG_NORMAL_STREAM] = TRUE;
+	hl_net48_thdr.frag_id[HLFRAG_NORMAL_STREAM]      = 9;
+	hl_net48_thdr.frag_count[HLFRAG_NORMAL_STREAM]   = 3;
+	hl_net48_thdr.frag_off[HLFRAG_NORMAL_STREAM]     = 2048;
+	hl_net48_thdr.frag_len[HLFRAG_NORMAL_STREAM]     = 1024;
+
+	n = HLNet48WriteHeader(pkt, HLNET48_OOB_MAX, &hl_net48_thdr);
+	HLNet48TestI("frag header bytes", n, 18);
+	HLNet48TestI("frag bit set",
+		ToBool(HLNet48ReadLong(pkt) & HLNET48_SEQ_FRAGMENT), TRUE);
+	HLNet48TestI("stream 0 present byte", pkt[8], 1);
+	HLNet48TestI("fragid long", HLNet48ReadLong(pkt + 9), (9 << 16) | 3);
+	HLNet48TestI("fragment offset", HLNet48ReadShort(pkt + 13), 2048);
+	HLNet48TestI("fragment size", HLNet48ReadShort(pkt + 15), 1024);
+	HLNet48TestI("stream 1 present byte", pkt[17], 0);
+
+	HLNet48TestI("frag header parses", HLNet48ParseHeader(pkt, n, &hl_net48_hdr),
+		TRUE);
+	HLNet48TestI("rt stream 0 present",
+		hl_net48_hdr.frag_present[HLFRAG_NORMAL_STREAM], TRUE);
+	HLNet48TestI("rt stream 1 present",
+		hl_net48_hdr.frag_present[HLFRAG_FILE_STREAM], FALSE);
+	HLNet48TestI("rt fragment id", hl_net48_hdr.frag_id[0], 9);
+	HLNet48TestI("rt fragment count", hl_net48_hdr.frag_count[0], 3);
+	HLNet48TestI("rt fragment offset", hl_net48_hdr.frag_off[0], 2048);
+	HLNet48TestI("rt fragment size", hl_net48_hdr.frag_len[0], 1024);
+	HLNet48TestI("rt frag header length", hl_net48_hdr.hdr_len, 18);
+
+	//fragid split
+	HLNet48TestI("fragid id", HLFragId(HLFragMakeId(4321, 77)), 4321);
+	HLNet48TestI("fragid count", HLFragCount(HLFragMakeId(4321, 77)), 77);
+
+	//reassembly, fragments out of order, short last fragment
+	HLFragInit;
+	for (i = 0; i < 3000; i++)
+		body[i] = (i * 31 + 7) & 0xFF;
+
+	count = (3000 + HLNET48_FRAG_SIZE - 1) / HLNET48_FRAG_SIZE;
+	HLNet48TestI("fragment count for 3000", count, 3);
+	fid   = HLFragMakeId(1, count);
+	taken = 0;
+
+	for (i = 0; i < count; i++)
+	{
+		//2, 0, 1 - arrival order does not matter, the offset is explicit
+		off = ((i + 2) % count) * HLNET48_FRAG_SIZE;
+		chunk = 3000 - off;
+		if (chunk > HLNET48_FRAG_SIZE)
+			chunk = HLNET48_FRAG_SIZE;
+
+		taken = HLFragAdd(HLNET_CLIENT_SLOT, HLFRAG_NORMAL_STREAM, fid, off,
+			body + off, chunk);
+	}
+	HLNet48TestI("reassembled length", taken, 3000);
+
+	//a duplicate of the last fragment must not complete anything twice
+	taken = HLFragAdd(HLNET_CLIENT_SLOT, HLFRAG_NORMAL_STREAM, fid, 2048,
+		body + 2048, 3000 - 2048);
+	HLNet48TestI("duplicate still complete", taken, 3000);
+
+	HLNet48TestI("take reassembled",
+		HLFragTake(HLNET_CLIENT_SLOT, HLFRAG_NORMAL_STREAM, &hl_net_cmd), TRUE);
+	HLNet48TestI("taken length", hl_net_cmd.len, 3000);
+
+	n = 0;
+	for (i = 0; i < 3000; i++)
+	{
+		if (hl_net_cmd.data[i] != body[i])
+			n++;
+	}
+	HLNet48TestI("reassembled byte mismatches", n, 0);
+
+	//a 2049 byte message ends with a one byte fragment at offset 2048: the
+	//duplicate test is by offset, never by offset/size
+	HLFragInit;
+	fid = HLFragMakeId(2, 3);
+	HLFragAdd(HLNET_CLIENT_SLOT, HLFRAG_NORMAL_STREAM, fid, 0, body, 1024);
+	HLFragAdd(HLNET_CLIENT_SLOT, HLFRAG_NORMAL_STREAM, fid, 1024, body, 1024);
+	taken = HLFragAdd(HLNET_CLIENT_SLOT, HLFRAG_NORMAL_STREAM, fid, 2048, body, 1);
+	HLNet48TestI("short last fragment", taken, 2049);
+
+	//reply opcodes. S2C_CHALLENGE packs the value against the letter, so the
+	//whole reply is one token and the value starts at byte 1
+	StrPrint(line, "A%d", 1234567);
+	n = HLNet48Tokenize(line, tok, HLNET48_TOKENS_MAX, HLNET48_TOKEN_LEN);
+	HLNet48TestI("challenge reply tokens", n, 1);
+	HLNet48TestS("challenge reply", tok, "A1234567");
+	HLNet48TestI("challenge reply value", Str2I64(tok + 1), 1234567);
+
+	n = HLNet48Tokenize("B", tok, HLNET48_TOKENS_MAX, HLNET48_TOKEN_LEN);
+	HLNet48TestI("connection reply tokens", n, 1);
+	HLNet48TestS("connection reply", tok, "B");
+
+	//retransmit queue. no peer and no socket: the sends fail at the UDP layer
+	//and the channel state advances regardless, which is what is under test
+	HLNet48Init;
+	HLNet48ChanSetup(HLNET_CLIENT_SLOT, 0x0100000A, HLNET_PORT_DEFAULT);
+
+	HLNet48Transmit(HLNET_CLIENT_SLOT, body, 8, TRUE);
+	HLNet48TestI("reliable held", hl_net48_rel_cl.pending, TRUE);
+	HLNet48TestI("reliable toggle set", hl_net48_cl.reliable_sequence, 1);
+	n = hl_net48_cl.outgoing_sequence;
+
+	//the wrong echoed toggle is not an acknowledgement
+	HLNet48RelAck(HLNET_CLIENT_SLOT, hl_net48_rel_cl.seq, FALSE);
+	HLNet48TestI("wrong toggle not an ack", hl_net48_rel_cl.pending, TRUE);
+
+	//an acknowledge behind the message is not one either
+	HLNet48RelAck(HLNET_CLIENT_SLOT, hl_net48_rel_cl.seq - 1, TRUE);
+	HLNet48TestI("stale ack ignored", hl_net48_rel_cl.pending, TRUE);
+
+	//silence past the window puts the same message out again under a new
+	//sequence and the toggle it first carried
+	hl_net48_rel_cl.last_send = tS - 2.0 * HLNET48_REL_RESEND;
+	HLNet48Tick(tS);
+	HLNet48TestI("resent", ToBool(hl_net48_cl.outgoing_sequence > n), TRUE);
+	HLNet48TestI("resend keeps toggle", hl_net48_cl.reliable_sequence, 1);
+	HLNet48TestI("still held", hl_net48_rel_cl.pending, TRUE);
+
+	//a second reliable queues rather than displacing the first
+	HLNet48Transmit(HLNET_CLIENT_SLOT, body + 8, 8, TRUE);
+	HLNet48TestI("second queued", hl_net48_rel_cl.queue_count, 1);
+	HLNet48TestI("queueing does not toggle", hl_net48_cl.reliable_sequence, 1);
+
+	//the matching toggle frees it and releases the queued message
+	HLNet48RelAck(HLNET_CLIENT_SLOT, hl_net48_rel_cl.seq, TRUE);
+	HLNet48TestI("queue drained", hl_net48_rel_cl.queue_count, 0);
+	HLNet48TestI("queued now held", hl_net48_rel_cl.pending, TRUE);
+	HLNet48TestI("queued toggles", hl_net48_cl.reliable_sequence, 0);
+
+	HLNet48RelAck(HLNET_CLIENT_SLOT, hl_net48_rel_cl.seq, FALSE);
+	HLNet48TestI("nothing outstanding", hl_net48_rel_cl.pending, FALSE);
+
+	//an acknowledged channel stops resending
+	n = hl_net48_cl.outgoing_sequence;
+	hl_net48_rel_cl.last_send = tS - 2.0 * HLNET48_REL_RESEND;
+	HLNet48Tick(tS);
+	HLNet48TestI("no resend after ack", hl_net48_cl.outgoing_sequence, n);
+
+	HLFragInit;
+	HLNet48Init;
+
+	HLNet48TestEntityStream;
+	HLNet48TestFrameRing;
+
+	if (!hl_net48_test_fail)
+		"  $$GREEN$$all pass$$FG$$\n";
+	else
+		"  $$RED$$%d failures$$FG$$\n", hl_net48_test_fail;
+}
+
+//============================================================================
+// ingress
+//============================================================================
+
+I64 HLNetDgrmRecv(CHLMsg *out, U32 *from_ip)
+{//0 none/ACK/drop, 1 reliable complete, 2 unreliable,
+ //3 server CTL (whole pkt left in out for HLNetServerHandleCtl), 4 guest ACCEPT,
+ //5 protocol 48 connect parked for HLNet48ServerAcceptConnect
+	U8			 buf[HLNET_MAX_DATAGRAM + HLNET_HEADERSIZE];
+	I64			 got;
+	U32			 ip;
+	U32			 word;
+	U32			 flags;
+	U32			 hdr_len;
+	CHLNetSock	*s;
+	I64			 ret;
+	I64			 slot48;
+
+	if (from_ip)
+		*from_ip = 0;
+
+	if (!out)
+		return 0;
+
+	if (!HLNetUdpRecvRaw(buf, HLNET_MAX_DATAGRAM + HLNET_HEADERSIZE, &got, &ip))
+		return 0;
+
+	if (from_ip)
+		*from_ip = ip;
+
+	//log before any drop path, else a dropped packet looks like one that never
+	//arrived
+	if (hl_dgrm_rx_logged < HLNET_DGRM_RX_LOG)
+	{
+		hl_dgrm_rx_logged++;
+
+		StrPrint(hl_dgrm_line,
+			"net: rx %d bytes from %d.%d.%d.%d:%d hdr %02X%02X%02X%02X\n",
+			got,
+			ip & 255, (ip >> 8) & 255, (ip >> 16) & 255, (ip >> 24) & 255,
+			hl_udp_from_port,
+			buf[0], buf[1], buf[2], buf[3]);
+		HLLog(hl_dgrm_line);
+		HLLogFlush;
+	}
+
+	if (got < 4)
+		return 0;
+
+	//protocol 48 connectionless. tested first and unconditionally: 0xFFFFFFFF is
+	//not a reachable NETFLAG header, so this cannot shadow a protocol 15 packet
+	if (HLNet48IsOOB(buf, got))
+		return HLNet48HandleOOB(buf, got, ip, hl_udp_from_port);
+
+	//an established 48 session has no NETFLAG header at all. the address owning a
+	//netchan is what selects the framing, not hl_net48_active: a listen server
+	//holding both a 48 client and a 15 client must read each on its own framing
+	if (hl_net48_active)
+	{
+		slot48 = HLNet48SlotByIP(ip);
+		if (slot48 != HLNET48_NO_SLOT)
+			return HLNet48Process(slot48, buf, got, out);
+	}
+
+	word    = HLNetReadBigLong(buf);
+	flags   = word & ~HLNETFLAG_LENGTH_MASK;
+	hdr_len = word & HLNETFLAG_LENGTH_MASK;
+
+	if (hdr_len != got)
+	{
+		//SLIRP pads: still try CTL if flagged and the payload fits
+		if (!(flags & HLNETFLAG_CTL) || hdr_len < 4 || hdr_len > got)
+			return 0;
+		got = hdr_len;
+	}
+
+	if (flags & HLNETFLAG_CTL)
+	{
+		//server CCREQ is in HLNetSv: hand the whole packet up
+		if (hl_udp_server)
+		{
+			HLMsgClear(out);
+			if (got > HLNET_MAX_MSG)
+				return 0;
+			MemCopy(out->data, buf, got);
+			out->len = got;
+			return 3;
+		}
+		return HLNetDgrmHandleCtl(buf, got, ip);
+	}
+
+	s = HLNetDgrmSockByIP(ip);
+	if (!s)
+		return 0;
+
+	//NAT and Ironwail source ports drift off 26000: track the peer
+	if (hl_udp_from_port >= 1)
+		s->port = hl_udp_from_port;
+
+	ret = HLNetDgrmProcess(s, buf, got, out);
+	return ret;
+}

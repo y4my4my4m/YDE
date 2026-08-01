@@ -1,0 +1,1507 @@
+// HLHud.ZC - the HUD, driven by sprites/hud.txt
+//
+// HL does not hardcode its HUD art. sprites/hud.txt is a table of
+//
+//     name  resolution  spritefile  x  y  w  h
+//
+// where spritefile carries neither the "sprites/" prefix nor the ".spr"
+// extension, and the rect is a sub-rectangle of that sheet. One row per
+// element per supported resolution, so the same name appears three or four
+// times and only the row matching the canvas is wanted.
+//
+// The sheets are SPR v2 with texFormat ADDITIVE, which is why they are
+// authored light-on-black: drawn opaque every number gets a black box around
+// it. HLSprDrawRect does the blend.
+//
+// Nothing here reads player state directly - health and battery are passed in,
+// and the ammo counts arrive through the mirror globals below because
+// HLWeapon.ZC compiles after this file. See hl_hud_weapon_hook.
+//
+// hud.txt has no crosshair element: `cross` is the health cross beside the
+// number, and the aiming reticle is per weapon in sprites/weapon_<name>.txt as
+// a cell of a shared crosshairs sheet. HLWeapon.ZC draws it, being the only
+// thing that knows which weapon is up.
+
+#define HLHUD_MAX_ENTRIES	160
+
+//sheet budget. the 640 row set shares nine sheets (640hud1..640hud9) plus the
+//pain and train sheets; the weapon layer adds the crosshairs sheet. the
+//1280/2560 sets are one .spr per element and want closer to ninety, so 32
+//covers 640 plus the weapon art and truncates 2560.
+#define HLHUD_MAX_SHEETS	32
+#define HLHUD_NAME_MAX		32
+#define HLHUD_SHEET_MAX		32
+
+//HL's own HUD colours, from cl_dll. yellowish normally, red when whatever it
+//shows is dangerously low
+#define HLHUD_R				255
+#define HLHUD_G				160
+#define HLHUD_B				0
+
+#define HLHUD_LOW_R			255
+#define HLHUD_LOW_G			16
+#define HLHUD_LOW_B			16
+
+class CHLHudEntry
+{
+	U8	name[HLHUD_NAME_MAX];
+	I64	sheet;				//index into hl_hud_sheet
+	I64	x;
+	I64	y;
+	I64	w;
+	I64	h;
+};
+
+CHLHudEntry	hl_hud_entry[HLHUD_MAX_ENTRIES];
+I64			hl_hud_count = 0;
+
+U8			hl_hud_sheet_name[HLHUD_MAX_SHEETS * HLHUD_SHEET_MAX];
+CHLSpr		*hl_hud_sheet[HLHUD_MAX_SHEETS];
+I64			hl_hud_sheet_count = 0;
+
+Bool		hl_hud_ready = FALSE;
+
+//which of hud.txt's four row sets is loaded. the weapon layer needs it: the
+//crosshairs sheet is named per resolution and its cells are sized to match
+I64			hl_hud_res = 640;
+
+//Bumped by every HLHudLoad. HLHudFree empties the sheet table first, so a slot
+//index held across a load names a different sheet or none. The weapon layer
+//caches sheet indices and keys them on this; the resolution alone does not
+//change on a reload at the same canvas width.
+I64			hl_hud_gen = 0;
+
+//--- what the weapon layer pushes here --------------------------------------
+//
+// HLWeapon.ZC compiles after this file, so nothing here can call into it. The
+// counts are mirrored instead, refreshed once a frame by the hook below - the
+// same shape as cl_dll, where CHudAmmo keeps its own copy of what the server
+// last told it rather than reading the weapon.
+//
+// -1 means no readout, for a melee weapon and an empty hand alike: CHudAmmo
+// hides the number rather than printing a zero.
+
+I64			hl_hud_ammo    = -1;	//rounds in the active clip
+I64			hl_hud_reserve = -1;	//rounds left in the pool behind it
+
+//The active weapon's ammo icon, CHudAmmo::Draw's iIconWidth. Every
+//sprites/weapon_<name>.txt names an "ammo" row - a cell of 640hud7 at the 640
+//row set - and the count is right aligned against the icon rather than against
+//the screen edge. The weapon layer is the only thing that knows which weapon is
+//up, so it resolves the row and pushes the rect here; -1 means no icon and the
+//readout falls back to the bare screen edge, which is what it did before.
+I64			hl_hud_icon_sheet = -1;
+I64			hl_hud_icon_x     = 0;
+I64			hl_hud_icon_y     = 0;
+I64			hl_hud_icon_w     = 0;
+I64			hl_hud_icon_h     = 0;
+
+//CHudAmmo::Think's "ammo low" warning - the clip is down to a fifth of what it
+//holds. Decided by the weapon layer, which knows the capacity; the readout is
+//what shows it
+Bool		hl_hud_ammo_low = FALSE;
+
+//--- flashlight, CHudFlashlight ---------------------------------------------
+//
+// The suit's lamp and its charge. HL1.ZC owns the flashlight - impulse 100 and
+// the drain timer - so the state arrives here the same way the ammo counts do.
+// Nothing sets these yet; see the note at the foot of this file.
+
+Bool		hl_hud_flash_on  = FALSE;
+F64			hl_hud_flash_bat = 1.0;		//m_flBat, 0..1
+
+//--- geiger counter, CHudGeiger ---------------------------------------------
+//
+// Distance in units to the nearest radiation source, 1000 when there is none.
+// CBasePlayer::UpdateGeigerCounter (dlls/player.cpp:2363) sends it to the client
+// as a byte of quarter-units every GEIGERDELAY; cl_dll/geiger.cpp turns it into
+// a click rate. It is the only warning retail gives before a radiation volume
+// starts draining health.
+//
+// The entity layer measures the range and writes it here, the same way the
+// weapon layer writes the ammo counts.
+//
+// CHudGeiger draws nothing at all - the click is its whole output - and the
+// click needs the sound layer, which also compiles after this file. So the
+// element is reached through a hook, installed by HLSound.ZC.
+
+F64		hl_hud_geiger_range = 1000.0;
+U0 (*hl_hud_geiger_hook)(F64 range, F64 dt) = NULL;
+
+//--- damage compass, CHudHealth::DrawPain -----------------------------------
+//
+// The four wedges around the crosshair that say where a hit came from.
+// m_fAttackFront / Rear / Left / Right, each 0..1 and fading at twice real time.
+// sprites/640_pain.spr is a four frame sprite loaded on its own - it is NOT in
+// hud.txt - and its frames are top, right, bottom, left in that order.
+
+#define HLHUD_PAIN_UP		0
+#define HLHUD_PAIN_RIGHT		1
+#define HLHUD_PAIN_DOWN		2
+#define HLHUD_PAIN_LEFT		3
+
+CHLSpr		*hl_hud_pain      = NULL;
+Bool		 hl_hud_pain_tried = FALSE;
+F64			 hl_hud_pain_amt[4];
+
+//the world point of the last hit, latched until a frame with a view basis to
+//resolve it against. CHudHealth::MsgFunc_Damage stores the origin and
+//CalcDamageDirection runs at draw time off the same values
+F64			 hl_hud_pain_src[3];
+Bool		 hl_hud_pain_have = FALSE;
+
+//wall clock of the previous HLHudDraw, for the fade delta. The HUD has no game
+//clock - m_flTimeDelta is the client's frame time, which is this
+F64			 hl_hud_last_t = 0.0;
+
+//Per-frame hook, installed by HLWeapon.ZC. HL1.ZC owns the frame loop and the
+//weapon layer cannot reach it, so this is where the weapon tick, the view
+//model, the crosshair and the selection UI are driven from.
+U0 (*hl_hud_weapon_hook)(CHLCanvas *c) = NULL;
+
+U0 HLHudInit()
+{//globals aren't zeroed. HLHudFree below walks this table calling HLSprFree on
+ //every non-NULL slot, and on the first call every slot is garbage - a GP fault
+ //inside HLSprFree before a frame is drawn
+	I64 i;
+
+	for (i = 0; i < HLHUD_MAX_SHEETS; i++)
+	{
+		hl_hud_sheet[i] = NULL;
+		hl_hud_sheet_name[i * HLHUD_SHEET_MAX] = 0;
+	}
+
+	hl_hud_sheet_count = 0;
+	hl_hud_count       = 0;
+	hl_hud_ready       = FALSE;
+	hl_hud_res         = 640;
+	hl_hud_gen         = 0;
+
+	hl_hud_ammo    = -1;
+	hl_hud_reserve = -1;
+
+	hl_hud_icon_sheet = -1;
+	hl_hud_icon_x     = 0;
+	hl_hud_icon_y     = 0;
+	hl_hud_icon_w     = 0;
+	hl_hud_icon_h     = 0;
+	hl_hud_ammo_low   = FALSE;
+
+	hl_hud_flash_on  = FALSE;
+	hl_hud_flash_bat = 1.0;
+
+	//1000 is out of range, dlls/player.cpp:3115
+	hl_hud_geiger_range = 1000.0;
+
+	//the pain sprite is loaded on its own and is not one of the hud.txt sheets,
+	//so HLHudFree does not own it and it is not reloaded on a resolution change
+	hl_hud_pain       = NULL;
+	hl_hud_pain_tried = FALSE;
+
+	for (i = 0; i < 4; i++)
+		hl_hud_pain_amt[i] = 0.0;
+
+	HLVecSet(hl_hud_pain_src, 0.0, 0.0, 0.0);
+	hl_hud_pain_have = FALSE;
+
+	hl_hud_last_t = 0.0;
+
+	//a declaration initialiser on a global is not reliable here and a garbage
+	//function pointer is a call into nothing, so it is cleared explicitly.
+	//
+	//consequence: HLHudInit must be called once only. HLWeapon.ZC installs
+	//itself into this pointer with a top-level statement after this one has
+	//run, and a later HLHudInit would silently unhook every weapon. HLSound.ZC
+	//installs the geiger hook the same way.
+	hl_hud_weapon_hook = NULL;
+	hl_hud_geiger_hook = NULL;
+}
+
+//Top-level statement: runs when this file is compiled, so the table is safe
+//before anything can reach HLHudFree. Not deferred to an init function as
+//HLPakInit is - HLHudLoad calls HLHudFree first thing, and the first HLHudLoad
+//can precede any controlled init pass.
+HLHudInit;
+
+U0 HLHudFree()
+{
+	I64 i;
+
+	for (i = 0; i < HLHUD_MAX_SHEETS; i++)
+	{
+		if (hl_hud_sheet[i])
+			HLSprFree(hl_hud_sheet[i]);
+
+		hl_hud_sheet[i] = NULL;
+		hl_hud_sheet_name[i * HLHUD_SHEET_MAX] = 0;
+	}
+
+	hl_hud_sheet_count = 0;
+	hl_hud_count       = 0;
+	hl_hud_ready       = FALSE;
+}
+
+I64 HLHudSheet(U8 *name)
+{//load a sheet once and hand back its slot, -1 if it will not load
+	U8	path[96];
+	I64	i;
+
+	for (i = 0; i < hl_hud_sheet_count; i++)
+	{
+		if (!StrICompare(&hl_hud_sheet_name[i * HLHUD_SHEET_MAX], name))
+			return i;
+	}
+
+	if (hl_hud_sheet_count >= HLHUD_MAX_SHEETS)
+		return -1;
+
+	//the table stores neither the directory nor the extension
+	StrPrint(path, "sprites/%s.spr", name);
+
+	hl_hud_sheet[hl_hud_sheet_count] = HLSprLoad(path);
+
+	if (!hl_hud_sheet[hl_hud_sheet_count])
+		return -1;
+
+	HLRdName(name, &hl_hud_sheet_name[hl_hud_sheet_count * HLHUD_SHEET_MAX],
+		HLHUD_SHEET_MAX);
+
+	hl_hud_sheet_count++;
+
+	return hl_hud_sheet_count - 1;
+}
+
+I64 HLHudFind(U8 *name)
+{
+	I64 i;
+
+	for (i = 0; i < hl_hud_count; i++)
+	{
+		if (!StrICompare(hl_hud_entry[i].name, name))
+			return i;
+	}
+
+	return -1;
+}
+
+Bool HLHudIsSpace(I64 c)
+{
+	return ToBool(c == ' ' || c == '\t' || c == '\r');
+}
+
+#define HLHUD_TOKENS		7
+
+I64 HLHudSplit(U8 *line, U8 *tok)
+{//split one line into at most HLHUD_TOKENS fields of HLHUD_SHEET_MAX bytes.
+ //tabs and spaces both separate, and hud.txt uses them interchangeably
+	I64 i = 0;
+	I64 n = 0;
+	I64 k;
+
+	while (line[i] && n < HLHUD_TOKENS)
+	{
+		while (line[i] && HLHudIsSpace(line[i]))
+			i++;
+
+		if (!line[i])
+			break;
+
+		k = 0;
+		while (line[i] && !HLHudIsSpace(line[i]) &&
+			k < HLHUD_SHEET_MAX - 1)
+		{
+			tok[n * HLHUD_SHEET_MAX + k] = line[i];
+			k++;
+			i++;
+		}
+
+		tok[n * HLHUD_SHEET_MAX + k] = 0;
+		n++;
+
+		//an over-long field would otherwise split into two
+		while (line[i] && !HLHudIsSpace(line[i]))
+			i++;
+	}
+
+	return n;
+}
+
+Bool HLHudLoad(I64 canvas_width)
+{//parse sprites/hud.txt, keeping only the rows for the best resolution
+ //
+ //hud.txt lists 320, 640, 1280 and 2560 sets. the largest that fits the canvas
+ //wins, so the art is never upscaled
+	U8	*d;
+	U8	 line[192];
+	U8	 tok[HLHUD_TOKENS * HLHUD_SHEET_MAX];
+	U8	 want[8];
+	I64	 size = 0;
+	I64	 pos  = 0;
+	I64	 len;
+	I64	 res;
+	I64	 sheet;
+	I64	 slot;
+
+	HLHudFree;
+
+	//every sheet index handed out before this point is stale from here on
+	hl_hud_gen++;
+
+	if (canvas_width >= 2560)
+		res = 2560;
+	else if (canvas_width >= 1280)
+		res = 1280;
+	else if (canvas_width >= 640)
+		res = 640;
+	else
+		res = 320;
+
+	StrPrint(want, "%d", res);
+
+	//published, so the weapon layer can pick the matching crosshairs sheet
+	hl_hud_res = res;
+
+	//borrowed. HLFileData hands back the loose-file cache's buffer or an
+	//interior pointer into the mounted pak, and neither is a heap block. Free
+	//on it splices a bogus header into the allocator's free list
+	d = HLFileData("sprites/hud.txt", &size);
+	if (!d || size < 8)
+	{
+		"HLHud: sprites/hud.txt missing\n";
+		return FALSE;
+	}
+
+	while (pos < size && hl_hud_count < HLHUD_MAX_ENTRIES)
+	{
+		//one line, NUL terminated, newline consumed
+		len = 0;
+		while (pos < size && d[pos] != '\n' && len < 191)
+		{
+			line[len] = d[pos];
+			len++;
+			pos++;
+		}
+		line[len] = 0;
+
+		while (pos < size && d[pos] != '\n')
+			pos++;
+		pos++;
+
+		//the file opens with a bare count, and is full of // banners
+		if (!len || line[0] == '/')
+			goto qhl_next;
+
+		//name res sheet x y w h. anything shorter is not a row
+		if (HLHudSplit(line, tok) != HLHUD_TOKENS)
+			goto qhl_next;
+
+		if (StrCompare(&tok[1 * HLHUD_SHEET_MAX], want))
+			goto qhl_next;
+
+		sheet = HLHudSheet(&tok[2 * HLHUD_SHEET_MAX]);
+		if (sheet < 0)
+			goto qhl_next;
+
+		slot = hl_hud_count;
+
+		HLRdName(&tok[0], hl_hud_entry[slot].name, HLHUD_NAME_MAX);
+
+		hl_hud_entry[slot].sheet = sheet;
+		hl_hud_entry[slot].x = ToI64(HLAtoF(&tok[3 * HLHUD_SHEET_MAX]));
+		hl_hud_entry[slot].y = ToI64(HLAtoF(&tok[4 * HLHUD_SHEET_MAX]));
+		hl_hud_entry[slot].w = ToI64(HLAtoF(&tok[5 * HLHUD_SHEET_MAX]));
+		hl_hud_entry[slot].h = ToI64(HLAtoF(&tok[6 * HLHUD_SHEET_MAX]));
+
+		hl_hud_count++;
+
+qhl_next:
+	}
+
+	"HLHud: %d elements at %d, %d sheets\n", hl_hud_count, res,
+		hl_hud_sheet_count;
+
+	hl_hud_ready = ToBool(hl_hud_count > 0);
+
+	return hl_hud_ready;
+}
+
+U0 HLHudDrawElement(CHLCanvas *c, I64 idx, I64 x, I64 y,
+	I64 r, I64 g, I64 b)
+{
+	CHLHudEntry *e;
+
+	if (idx < 0 || idx >= hl_hud_count)
+		return;
+
+	e = &hl_hud_entry[idx];
+
+	if (e->sheet < 0 || e->sheet >= hl_hud_sheet_count)
+		return;
+
+	HLSprDrawRect(c, hl_hud_sheet[e->sheet], 0, x, y,
+		e->x, e->y, e->w, e->h, r, g, b);
+}
+
+I64 HLHudDrawNumber(CHLCanvas *c, I64 x, I64 y, I64 value, I64 min_digits,
+	I64 r, I64 g, I64 b)
+{//CHud::DrawHudNumber, hud_redraw.cpp. left to right, returns the width drawn
+ //
+ //DHN_3DIGITS pads the field to min_digits by ADVANCING x over the missing
+ //leading places without emitting a glyph - the commented-out SPR_DrawAdditive
+ //calls in the SDK are the leading blanks. Drawing a zero there instead prints
+ //"007" where HL prints "  7".
+ //
+ //DHN_DRAWZERO is always set on the four readouts this file draws, so a value
+ //of zero still emits one "0" in the last place.
+	U8	 name[HLHUD_NAME_MAX];
+	I64	 place = 1;			//divisor of the most significant place emitted
+	I64	 digits = 1;
+	I64	 blanks;
+	I64	 d;
+	I64	 idx;
+	I64	 unit = 0;			//AmmoWidth, the width of one digit cell
+	I64	 w = 0;
+	I64	 v = value;
+
+	if (v < 0)
+		v = 0;
+
+	while (v / place >= 10)
+	{
+		place *= 10;
+		digits++;
+	}
+
+	idx = HLHudFind("number_0");
+
+	if (idx >= 0)
+		unit = hl_hud_entry[idx].w;
+
+	//the leading places the number does not reach
+	blanks = min_digits - digits;
+
+	if (blanks > 0)
+		w = blanks * unit;
+
+	while (place > 0)
+	{
+		d = (v / place) % 10;
+
+		StrPrint(name, "number_%d", d);
+		idx = HLHudFind(name);
+
+		if (idx >= 0)
+		{
+			HLHudDrawElement(c, idx, x + w, y, r, g, b);
+			w += hl_hud_entry[idx].w;
+		}
+
+		place /= 10;
+	}
+
+	return w;
+}
+
+//--- damage compass ---------------------------------------------------------
+
+U0 HLHudPainLoad()
+{//sprites/<res>_pain.spr, once. Loaded directly rather than through HLHudSheet
+ //because it is not a hud.txt row: CHudHealth::Init does its own SPR_Load of
+ //PAIN_NAME, and the file is four frames rather than one sheet of sub-rects
+	U8 path[64];
+
+	if (hl_hud_pain_tried)
+		return;
+
+	hl_hud_pain_tried = TRUE;
+
+	//320, 640, 1280 and 2560 all ship a set
+	StrPrint(path, "sprites/%d_pain.spr", hl_hud_res);
+
+	hl_hud_pain = HLSprLoad(path);
+}
+
+U0 HLHudDamageFrom(F64 *from, F64 *origin, F64 *forward, F64 *right)
+{//CHudHealth::CalcDamageDirection. `from` is where the damage came from in world
+ //space; the four wedges are how much of it lies along each view axis.
+ //
+ //The SDK's names do not match its own axes: it takes `front` from the dot with
+ //RIGHT and `side` from the dot with FORWARD, then feeds front to the left/right
+ //wedges and side to the front/rear pair. The result is correct and the locals
+ //are misnamed, so the mapping is spelled out here rather than the names copied.
+	F64 delta[3];
+	F64 dist;
+	F64 along;		//dot with forward - the front/rear axis
+	F64 across;		//dot with right   - the left/right axis
+	F64 mag;
+	I64 i;
+
+	if (!from || !origin || !forward || !right)
+		return;
+
+	//a zero vector is "damage from nowhere" - drowning, falling - and clears the
+	//compass instead of pointing anywhere
+	if (from[0] == 0.0 && from[1] == 0.0 && from[2] == 0.0)
+	{
+		for (i = 0; i < 4; i++)
+			hl_hud_pain_amt[i] = 0.0;
+
+		return;
+	}
+
+	HLVecSub(from, origin, delta);
+	dist = HLVecLength(delta);
+
+	if (HLVecNormalize(delta) <= 0.0)
+		return;
+
+	along  = HLVecDot(delta, forward);
+	across = HLVecDot(delta, right);
+
+	//"inside 50 units it came from everywhere" - all four light at once
+	if (dist <= 50.0)
+	{
+		for (i = 0; i < 4; i++)
+			hl_hud_pain_amt[i] = 1.0;
+
+		return;
+	}
+
+	//each wedge keeps the strongest hit it has taken while it is still lit, and
+	//anything under 0.3 off an axis is too oblique to point at all
+	mag = along;
+
+	if (mag < 0.0)
+		mag = -mag;
+
+	if (mag > 0.3)
+	{
+		if (along > 0.0)
+		{
+			if (mag > hl_hud_pain_amt[HLHUD_PAIN_UP])
+				hl_hud_pain_amt[HLHUD_PAIN_UP] = mag;
+		}
+		else if (mag > hl_hud_pain_amt[HLHUD_PAIN_DOWN])
+			hl_hud_pain_amt[HLHUD_PAIN_DOWN] = mag;
+	}
+
+	mag = across;
+
+	if (mag < 0.0)
+		mag = -mag;
+
+	if (mag > 0.3)
+	{
+		if (across > 0.0)
+		{
+			if (mag > hl_hud_pain_amt[HLHUD_PAIN_RIGHT])
+				hl_hud_pain_amt[HLHUD_PAIN_RIGHT] = mag;
+		}
+		else if (mag > hl_hud_pain_amt[HLHUD_PAIN_LEFT])
+			hl_hud_pain_amt[HLHUD_PAIN_LEFT] = mag;
+	}
+}
+
+U0 HLHudDamageSource(F64 *from)
+{//CHudHealth::MsgFunc_Damage's half of the compass: record where the hit came
+ //from and leave the wedges to the draw pass, which is where the view basis is.
+ //
+ //This is the whole of the feed. Anything that hurts the player calls it with
+ //the attacker's world position, or with a zero vector for damage that has no
+ //direction - drowning, falling, a trigger_hurt
+	if (!from)
+		return;
+
+	HLVecCopy(from, hl_hud_pain_src);
+	hl_hud_pain_have = TRUE;
+}
+
+U0 HLHudDrawPain(CHLCanvas *c, F64 dt, I64 r, I64 g, I64 b)
+{//CHudHealth::DrawPain. Four wedges around the view centre, each drawn only
+ //while its own value is over 0.4 and each fading at twice real time.
+ //
+ //The frames are placed off the SPRITE's own size, not off a hud.txt rect: the
+ //top wedge sits three of its own heights above centre, the side ones two of
+ //their own widths out. Anchored on the view centre rather than the canvas
+ //centre, as the crosshair is - the status bar shifts the view rect up
+	F64	frac;
+	I64	sw;
+	I64	sh;
+	I64	cx;
+	I64	cy;
+	I64	shade;
+	I64	dr, dg, db;
+	I64	i;
+
+	if (!c)
+		return;
+
+	//a hit latched since the last frame. The canvas carries the view basis
+	//CalcDamageDirection needs, so the wedges are resolved here rather than at
+	//the point the damage landed
+	if (hl_hud_pain_have)
+	{
+		hl_hud_pain_have = FALSE;
+		HLHudDamageFrom(hl_hud_pain_src, c->origin, c->forward, c->right);
+	}
+
+	//nothing lit, nothing to load
+	if (hl_hud_pain_amt[0] <= 0.0 && hl_hud_pain_amt[1] <= 0.0 &&
+		hl_hud_pain_amt[2] <= 0.0 && hl_hud_pain_amt[3] <= 0.0)
+		return;
+
+	HLHudPainLoad;
+
+	cx = ToI64(c->center_x);
+	cy = ToI64(c->center_y);
+
+	for (i = 0; i < 4; i++)
+	{
+		frac = hl_hud_pain_amt[i];
+
+		if (frac > 0.4 && hl_hud_pain && i < hl_hud_pain->num_frames)
+		{
+			//each wedge is its own frame and they are not all the same shape:
+			//the top and bottom are wide, the sides tall
+			sw = hl_hud_pain->frames[i].width;
+			sh = hl_hud_pain->frames[i].height;
+
+			//shade = 255 * max(value, 0.5), then ScaleColors - the sprite layer
+			//has no alpha, so the brightness goes into the colour
+			shade = ToI64(255.0 * frac);
+
+			if (shade < 128)
+				shade = 128;
+			if (shade > 255)
+				shade = 255;
+
+			dr = r * shade / 255;
+			dg = g * shade / 255;
+			db = b * shade / 255;
+
+			if (i == HLHUD_PAIN_UP)
+				HLSprDrawRect(c, hl_hud_pain, i, cx - sw / 2, cy - sh * 3,
+					0, 0, sw, sh, dr, dg, db);
+			else if (i == HLHUD_PAIN_RIGHT)
+				HLSprDrawRect(c, hl_hud_pain, i, cx + sw * 2, cy - sh / 2,
+					0, 0, sw, sh, dr, dg, db);
+			else if (i == HLHUD_PAIN_DOWN)
+				HLSprDrawRect(c, hl_hud_pain, i, cx - sw / 2, cy + sh * 2,
+					0, 0, sw, sh, dr, dg, db);
+			else
+				HLSprDrawRect(c, hl_hud_pain, i, cx - sw * 3, cy - sh / 2,
+					0, 0, sw, sh, dr, dg, db);
+		}
+
+		//fFade = m_flTimeDelta * 2, subtracted every frame whether or not the
+		//wedge was bright enough to draw
+		hl_hud_pain_amt[i] -= dt * 2.0;
+
+		if (hl_hud_pain_amt[i] < 0.0)
+			hl_hud_pain_amt[i] = 0.0;
+	}
+}
+
+//--- flashlight -------------------------------------------------------------
+
+U0 HLHudDrawFlashlight(CHLCanvas *c)
+{//CHudFlashlight::Draw, cl_dll/flashlight.cpp.
+ //
+ //Three elements out of hud.txt: flash_empty is the casing, flash_full is the
+ //charge bar drawn over it cropped from the LEFT by what has been used, and
+ //flash_beam is the lit lamp shown only while it is on. Reddish under 20%.
+ //
+ //The vertical anchor is the SDK's (m_prc1->bottom - m_prc2->top) / 2, which is
+ //arithmetic on the two rects' positions INSIDE THE SHEET, not on the screen -
+ //an oddity of the original that happens to land near the top of the screen.
+	CHLHudEntry	*e;
+	I64			 casing;
+	I64			 full;
+	I64			 beam;
+	I64			 iw;
+	I64			 x;
+	I64			 y;
+	I64			 off;
+	I64			 a;
+	I64			 r, g, b;
+
+	if (!c)
+		return;
+
+	casing = HLHudFind("flash_empty");
+	full   = HLHudFind("flash_full");
+
+	if (casing < 0 || full < 0)
+		return;
+
+	iw = hl_hud_entry[full].w;
+
+	if (iw < 1)
+		return;
+
+	y = (hl_hud_entry[casing].y + hl_hud_entry[casing].h -
+		hl_hud_entry[full].y) / 2;
+
+	//a = 225 lit, MIN_ALPHA 100 dark. ScaleColors folds it into the colour
+	a = 100;
+
+	if (hl_hud_flash_on)
+		a = 225;
+
+	if (hl_hud_flash_bat < 0.20)
+	{
+		r = HLHUD_LOW_R;
+		g = HLHUD_LOW_G;
+		b = HLHUD_LOW_B;
+	}
+	else
+	{
+		r = HLHUD_R;
+		g = HLHUD_G;
+		b = HLHUD_B;
+	}
+
+	r = r * a / 255;
+	g = g * a / 255;
+	b = b * a / 255;
+
+	x = c->width - iw - iw / 2;
+
+	HLHudDrawElement(c, casing, x, y, r, g, b);
+
+	//the beam hangs off the right of the casing while the lamp is on
+	if (hl_hud_flash_on)
+	{
+		beam = HLHudFind("flash_beam");
+
+		if (beam >= 0)
+			HLHudDrawElement(c, beam, c->width - iw / 2, y, r, g, b);
+	}
+
+	//the charge, cropped from the left by the fraction already spent
+	off = ToI64(ToF64(iw) * (1.0 - hl_hud_flash_bat));
+
+	if (off < 0)
+		off = 0;
+
+	if (off < iw)
+	{
+		e = &hl_hud_entry[full];
+
+		if (e->sheet >= 0 && e->sheet < hl_hud_sheet_count)
+			HLSprDrawRect(c, hl_hud_sheet[e->sheet], 0, x + off, y,
+				e->x + off, e->y, e->w - off, e->h, r, g, b);
+	}
+}
+
+I64 HLHudMsgAxis(F64 v, I64 extent, I64 screen)
+{//CHudMessage::XPosition / YPosition, which are the same rule on both axes.
+ //
+ //   -1        centred
+ //   below 0   measured from the far edge
+ //   0 to 1    a fraction of the screen from the near edge
+	I64 p;
+
+	if (v == -1.0)
+		p = (screen - extent) / 2;
+	else if (v < 0.0)
+		p = ToI64((1.0 + v) * ToF64(screen)) - extent;
+	else
+		p = ToI64(v * ToF64(screen));
+
+	if (p + extent > screen)
+		p = screen - extent;
+	if (p < 0)
+		p = 0;
+
+	return p;
+}
+
+//--- screen fade ------------------------------------------------------------
+//
+// env_fade's gmsgFade, dlls/util.cpp:738, and worldspawn's startdark, which
+// dlls/world.cpp:709 turns into the engine cvar v_dark. A full screen blend
+// toward one colour, alpha driven by the clock.
+//
+// The palette tint in HLPal.ZC is not this. It recolours the world's indexed
+// texels only, leaves the HUD alone, and the water/damage cshift at
+// HL1.ZC:815 rewrites it every frame.
+//
+// Drawn under the message layer and the console: HUD_Redraw runs after the
+// engine has composited the fade, so text posted during a fade to black stays
+// readable. c0a0 depends on it - the map holds the screen black and puts the
+// Half-Life logo on top of it.
+
+//cl.time, pushed in by the shell once a frame and once more as a map comes up.
+//HLGame.ZC owns hl_game_time and compiles far later than this file, so the
+//value cannot be named here.
+//
+//screenfade_t carries absolute times - fadeEnd, fadeTotalEnd, fadeReset,
+//common/screenfade.h:16-19 - and the client compares them against cl.time
+//(dmc/cl_dll/hud_spectator.cpp:565). tS is the wall clock: it runs through the
+//map load, through the menu and through the console, and it outruns the game
+//clock outright below 18fps, where HLSERVER_MAX_CATCHUP caps the tick.
+F64	 hl_hud_time		= 0.0;
+
+#define HLFADE_NONE	0
+#define HLFADE_IN	1		//SF_FADE_IN: start at the colour, ramp to clear
+#define HLFADE_OUT	2		//ramp to the colour, hold, then clear
+
+I64	 hl_fade_r			= 0;
+I64	 hl_fade_g			= 0;
+I64	 hl_fade_b			= 0;
+I64	 hl_fade_a			= 0;		//0..255, the alpha at full strength
+F64	 hl_fade_start		= 0.0;		//game clock, hl_hud_time
+F64	 hl_fade_duration	= 0.0;
+F64	 hl_fade_hold		= 0.0;
+I64	 hl_fade_mode		= HLFADE_NONE;
+
+U0 HLHudFadeInit()
+{//Globals are not zeroed and declaration initialisers do not run.
+	hl_hud_time      = 0.0;
+	hl_fade_r        = 0;
+	hl_fade_g        = 0;
+	hl_fade_b        = 0;
+	hl_fade_a        = 0;
+	hl_fade_start    = 0.0;
+	hl_fade_duration = 0.0;
+	hl_fade_hold     = 0.0;
+	hl_fade_mode     = HLFADE_NONE;
+}
+
+HLHudFadeInit;
+
+U0 HLHudFadeSet(I64 r, I64 g, I64 b, I64 a, F64 duration, F64 hold,
+	Bool fade_in)
+{//CFade::Use, dlls/effects.cpp:1962. One fade at a time: a new one replaces
+ //whatever is running, which is what UTIL_ScreenFadeAll does to the client's
+ //single screenfade_t.
+	hl_fade_r        = ClampI64(r, 0, 255);
+	hl_fade_g        = ClampI64(g, 0, 255);
+	hl_fade_b        = ClampI64(b, 0, 255);
+	hl_fade_a        = ClampI64(a, 0, 255);
+	hl_fade_duration = duration;
+	hl_fade_hold     = hold;
+	hl_fade_start    = hl_hud_time;
+
+	if (fade_in)
+		hl_fade_mode = HLFADE_IN;
+	else
+		hl_fade_mode = HLFADE_OUT;
+}
+
+I64 HLHudFadeAlpha()
+{//Current alpha 0..255, and the point at which a finished fade is dropped.
+ //
+ //FFADE_IN runs the colour out over duration and ends there; holdtime is
+ //carried on the entity but the client has nothing left to hold. FFADE_OUT
+ //ramps in over duration, sits at full for holdtime, then clears.
+	F64 t;
+
+	if (hl_fade_mode == HLFADE_NONE || hl_fade_a <= 0)
+		return 0;
+
+	t = hl_hud_time - hl_fade_start;
+
+	if (t < 0.0)
+		t = 0.0;
+
+	if (hl_fade_mode == HLFADE_IN)
+	{
+		if (hl_fade_duration <= 0.0 || t >= hl_fade_duration)
+		{
+			hl_fade_mode = HLFADE_NONE;
+			return 0;
+		}
+
+		return ToI64(ToF64(hl_fade_a) *
+			(1.0 - t / hl_fade_duration));
+	}
+
+	if (hl_fade_duration > 0.0 && t < hl_fade_duration)
+		return ToI64(ToF64(hl_fade_a) * (t / hl_fade_duration));
+
+	if (t < hl_fade_duration + hl_fade_hold)
+		return hl_fade_a;
+
+	hl_fade_mode = HLFADE_NONE;
+
+	return 0;
+}
+
+U0 HLHudFadeDraw(CHLCanvas *c)
+{//One pass over the canvas, blending toward the fade colour. 8 bit alpha per
+ //channel, source over an opaque destination.
+	U32	*dst;
+	I64	 a;
+	I64	 inv;
+	I64	 x;
+	I64	 y;
+	I64	 px;
+
+	if (!c || !c->pixels)
+		return;
+
+	a = HLHudFadeAlpha;
+
+	if (a <= 0)
+		return;
+
+	inv = 255 - a;
+
+	for (y = 0; y < c->height; y++)
+	{
+		dst = c->pixels + y * c->width;
+
+		for (x = 0; x < c->width; x++)
+		{
+			px = dst[x];
+
+			dst[x] =
+				(((((px >> 16) & 255) * inv + hl_fade_r * a) >> 8) << 16) |
+				(((((px >> 8)  & 255) * inv + hl_fade_g * a) >> 8) << 8)  |
+				 ((((px        & 255) * inv + hl_fade_b * a) >> 8));
+		}
+	}
+}
+
+//--- game title -------------------------------------------------------------
+//
+// worldspawn's gametitle key, dlls/world.cpp:721 to dlls/player.cpp:4154, is
+// the Half-Life logo. CHudMessage::Draw draws it as two additive HUD sprites
+// side by side, title_half then title_life, tinted by the GAMETITLE entry's
+// own colour scaled by the fade blend - cl_dll/message.cpp:341..355.
+//
+// GAMETITLE's block text is a placeholder; only its effect parameters are read.
+
+Bool hl_title_on		= FALSE;
+F64	 hl_title_start		= 0.0;		//game clock, hl_hud_time
+F64	 hl_title_fadein	= 1.0;
+F64	 hl_title_hold		= 3.0;
+F64	 hl_title_fadeout	= 1.5;
+I64	 hl_title_r			= 180;
+I64	 hl_title_g			= 180;
+I64	 hl_title_b			= 180;
+F64	 hl_title_x			= -1.0;
+F64	 hl_title_y			= -1.0;
+
+U0 HLHudTitleInit()
+{
+	hl_title_on      = FALSE;
+	hl_title_start   = 0.0;
+	hl_title_fadein  = 1.0;
+	hl_title_hold    = 3.0;
+	hl_title_fadeout = 1.5;
+	hl_title_r       = 180;
+	hl_title_g       = 180;
+	hl_title_b       = 180;
+	hl_title_x       = -1.0;
+	hl_title_y       = -1.0;
+}
+
+HLHudTitleInit;
+
+U0 HLHudTitleShow(I64 r, I64 g, I64 b, F64 x, F64 y,
+	F64 fadein, F64 hold, F64 fadeout)
+{//MsgFunc_GameTitle, cl_dll/message.cpp:329.
+	hl_title_r       = ClampI64(r, 0, 255);
+	hl_title_g       = ClampI64(g, 0, 255);
+	hl_title_b       = ClampI64(b, 0, 255);
+	hl_title_x       = x;
+	hl_title_y       = y;
+	hl_title_fadein  = fadein;
+	hl_title_hold    = hold;
+	hl_title_fadeout = fadeout;
+	hl_title_start   = hl_hud_time;
+	hl_title_on      = TRUE;
+}
+
+F64 HLHudFadeBlend(F64 fadein, F64 fadeout, F64 hold, F64 t)
+{//CHudMessage::FadeBlend, cl_dll/message.cpp:68. Returns 0..1.
+	F64 fade_time = fadein + hold;
+
+	if (t < 0.0)
+		return 0.0;
+
+	if (t < fadein)
+	{
+		if (fadein <= 0.0)
+			return 1.0;
+
+		return 1.0 - (fadein - t) / fadein;
+	}
+
+	if (t > fade_time)
+	{
+		if (fadeout <= 0.0)
+			return 0.0;
+
+		return 1.0 - (t - fade_time) / fadeout;
+	}
+
+	return 1.0;
+}
+
+U0 HLHudTitleDraw(CHLCanvas *c)
+{
+	F64	 t;
+	F64	 bright;
+	I64	 half;
+	I64	 life;
+	I64	 half_w;
+	I64	 full_w;
+	I64	 full_h;
+	I64	 x;
+	I64	 y;
+
+	if (!hl_title_on || !c || !hl_hud_ready)
+		return;
+
+	t = hl_hud_time - hl_title_start;
+
+	if (t > hl_title_fadein + hl_title_hold + hl_title_fadeout)
+	{
+		hl_title_on = FALSE;
+		return;
+	}
+
+	half = HLHudFind("title_half");
+	life = HLHudFind("title_life");
+
+	if (half < 0 || life < 0)
+	{
+		hl_title_on = FALSE;
+		return;
+	}
+
+	bright = HLHudFadeBlend(hl_title_fadein, hl_title_fadeout,
+		hl_title_hold, t);
+
+	half_w = hl_hud_entry[half].w;
+	full_w = half_w + hl_hud_entry[life].w;
+	full_h = hl_hud_entry[half].h;
+
+	x = HLHudMsgAxis(hl_title_x, full_w, c->width);
+	y = HLHudMsgAxis(hl_title_y, full_h, c->height);
+
+	HLHudDrawElement(c, half, x, y,
+		ToI64(bright * ToF64(hl_title_r)),
+		ToI64(bright * ToF64(hl_title_g)),
+		ToI64(bright * ToF64(hl_title_b)));
+
+	HLHudDrawElement(c, life, x + half_w, y,
+		ToI64(bright * ToF64(hl_title_r)),
+		ToI64(bright * ToF64(hl_title_g)),
+		ToI64(bright * ToF64(hl_title_b)));
+}
+
+U0 HLHudOverlayDraw(CHLCanvas *c)
+{//The two full-screen elements, in composite order: the fade darkens the world
+ //and the HUD, the logo sits on top of it.
+	HLHudFadeDraw(c);
+	HLHudTitleDraw(c);
+}
+
+U0 HLHudDraw(CHLCanvas *c, I64 health, I64 battery, I64 ammo,
+	Bool has_suit)
+{//the bottom row: health at the left, the suit charge beside it, ammo on the
+ //right. Three separate CHudBase elements in the SDK, each anchored on its own
+ //terms - they do NOT flow out of one another:
+ //
+ //  CHudHealth::Draw   cross at x = CrossWidth/2, number at CrossWidth + w/2
+ //  CHudBattery::Draw  suit at x = 3 * suit_width, number at that + suit_width
+ //  CHudAmmo::Draw     clip at x = ScreenWidth - 8*AmmoWidth - iIconWidth
+ //
+ //and all three share the vertical anchor
+ //
+ //  y  = ScreenHeight - m_iFontHeight - m_iFontHeight/2
+ //  y += m_iFontHeight * 0.2      (the numbers only; the icons sit on y)
+ //
+ //m_iFontHeight is CHud::Init's number_0 height, not a font metric - see
+ //hud.cpp. The sub-rect out of hud.txt is already in the chosen sheet's own
+ //pixels and the sheet is picked to match the canvas, so nothing scales it.
+	CHLHudEntry *e;
+	I64 idx;
+	I64 x;
+	I64 fh      = 24;		//gHUD.m_iFontHeight
+	I64 num_w   = 20;		//AmmoWidth / HealthWidth
+	I64 base_y;				//the icon row
+	I64 num_y;				//the digit row, nudged down by a fifth of a digit
+	I64 cross_w = 0;
+	I64 suit_w  = 0;
+	I64 suit_h  = 0;
+	I64 top;
+	I64 reserve;
+	I64 icon_w = 0;			//iIconWidth, 0 when the weapon names no ammo icon
+	I64 r, g, b;
+	F64 dt;
+
+	if (!c)
+		return;
+
+	//m_flTimeDelta: the wall clock step since the previous HUD frame, which is
+	//what the pain compass fades on. Clamped so a level load does not blank the
+	//compass and a stalled clock does not freeze it lit
+	dt = tS - hl_hud_last_t;
+
+	if (dt < 0.0 || dt > 0.25)
+		dt = 0.0;
+
+	hl_hud_last_t = tS;
+
+	//before the hl_hud_ready gate and before anything is drawn: the weapon
+	//layer's tick must run even with no hud.txt on disk, and the counts it
+	//pushes into hl_hud_ammo are read further down this same call
+	if (hl_hud_weapon_hook)
+		hl_hud_weapon_hook(c);
+
+	//CHudGeiger::Draw, also ahead of the hl_hud_ready gate: the counter has no
+	//sprite and its click is due with or without hud.txt on disk
+	if (hl_hud_geiger_hook)
+		hl_hud_geiger_hook(hl_hud_geiger_range, dt);
+
+	if (!hl_hud_ready)
+		return;
+
+	idx = HLHudFind("number_0");
+	if (idx >= 0)
+	{
+		fh    = hl_hud_entry[idx].h;
+		num_w = hl_hud_entry[idx].w;
+	}
+
+	base_y = c->height - fh - fh / 2;
+	num_y  = base_y + ToI64(ToF64(fh) * 0.2);
+
+	//--- health, CHudHealth::Draw ---
+	//
+	//GetPainColor: yellowish above a quarter health, flat red at or below it
+	r = HLHUD_R;
+	g = HLHUD_G;
+	b = HLHUD_B;
+
+	if (health <= 25)
+	{
+		r = HLHUD_LOW_R;
+		g = HLHUD_LOW_G;
+		b = HLHUD_LOW_B;
+
+		//CHudHealth::Draw pulses the low readout rather than holding it: the
+		//number and the cross drop to a third brightness twice a second, which
+		//is what makes a red HUD read as an alarm instead of a colour change.
+		//The SDK does it with the m_fFade alpha ramp; the sprite layer has no
+		//alpha, so the pulse goes into the colour the same way DrawPain's does
+		if (ToI64(tS * 4.0) & 1)
+		{
+			r /= 3;
+			g /= 3;
+			b /= 3;
+		}
+	}
+
+	//the compass is drawn in the health colour and sits around the crosshair,
+	//so it goes down before the bottom row
+	HLHudDrawPain(c, dt, r, g, b);
+
+	idx = HLHudFind("cross");
+	if (idx >= 0)
+	{
+		cross_w = hl_hud_entry[idx].w;
+
+		//the cross sits on base_y, half its own width in from the edge
+		HLHudDrawElement(c, idx, cross_w / 2, base_y, r, g, b);
+	}
+
+	x  = cross_w + num_w / 2;
+	x += HLHudDrawNumber(c, x, num_y, health, 3, r, g, b);
+
+	//FillRGBA(x, y, HealthWidth/10, m_iFontHeight). the divider element is
+	//exactly HealthWidth/10 wide in all four row sets, so it stands in for the
+	//fill; it is taller than a digit, so it is centred on the digit row
+	x += num_w / 2;
+
+	idx = HLHudFind("divider");
+	if (idx >= 0)
+		HLHudDrawElement(c, idx, x,
+			num_y + (fh - hl_hud_entry[idx].h) / 2,
+			HLHUD_R, HLHUD_G, HLHUD_B);
+
+	//--- suit charge, CHudBattery::Draw ---
+	//no suit, no battery readout, as HL hides it until the suit is picked up
+	if (has_suit)
+	{
+		r = HLHUD_R;
+		g = HLHUD_G;
+		b = HLHUD_B;
+
+		idx = HLHudFind("suit_empty");
+
+		if (idx >= 0)
+		{
+			suit_w = hl_hud_entry[idx].w;
+			suit_h = hl_hud_entry[idx].h;
+		}
+
+		//"this used to just be ScreenWidth/5 but that caused real issues at
+		//higher resolutions. Instead, base it on the width of this sprite."
+		x = 3 * suit_w;
+
+		if (idx >= 0)
+			HLHudDrawElement(c, idx, x, base_y - suit_h / 6, r, g, b);
+
+		//suit_full is drawn over the empty one, cropped from the top by the
+		//charge missing - the sub-rect walks down as the battery drains
+		idx = HLHudFind("suit_full");
+
+		if (idx >= 0 && battery > 0)
+		{
+			e = &hl_hud_entry[idx];
+
+			top = ToI64(ToF64(e->h) * ToF64(100 - battery) * 0.01);
+
+			if (top < 0)
+				top = 0;
+			if (top > e->h)
+				top = e->h;
+
+			if (e->sheet >= 0 && e->sheet < hl_hud_sheet_count)
+				HLSprDrawRect(c, hl_hud_sheet[e->sheet], 0,
+					x, base_y - suit_h / 6 + top,
+					e->x, e->y + top, e->w, e->h - top, r, g, b);
+		}
+
+		x += suit_w;
+
+		HLHudDrawNumber(c, x, num_y, battery, 3, r, g, b);
+	}
+
+	//--- flashlight, top right ---
+	//
+	//CHudFlashlight::Draw returns early without the suit, exactly as the battery
+	//readout does
+	if (has_suit)
+		HLHudDrawFlashlight(c);
+
+	//--- ammo, right aligned ---
+	//
+	//HL1.ZC has no weapon state to hand over - HLHudDrawFrame passes -1 - so the
+	//count comes from the mirror the weapon layer refreshed at the top of this
+	//function. an explicit argument still wins, for the demo and thin client
+	//paths that do know what the host is holding.
+	if (ammo < 0)
+		ammo = hl_hud_ammo;
+
+	reserve = hl_hud_reserve;
+
+	if (ammo >= 0)
+	{
+		//CHudAmmo::Draw is RGB_YELLOWISH unconditionally. It never reddens on the
+		//count itself, but CHudAmmo::Think fires the "ammo low" warning when the
+		//clip is down to a fifth of its capacity, and the readout is what carries
+		//that here - a dry weapon otherwise looks the same as a full one
+		r = HLHUD_R;
+		g = HLHUD_G;
+		b = HLHUD_B;
+
+		if (hl_hud_ammo_low)
+		{
+			r = HLHUD_LOW_R;
+			g = HLHUD_LOW_G;
+			b = HLHUD_LOW_B;
+
+			//the same half-second pulse the low health readout uses
+			if (ToI64(tS * 4.0) & 1)
+			{
+				r /= 3;
+				g /= 3;
+				b /= 3;
+			}
+		}
+
+		//the weapon's own ammo icon, right of the count. iIconWidth in the SDK,
+		//and the reason the count is offset from the screen edge by more than the
+		//digits need
+		icon_w = 0;
+
+		if (hl_hud_icon_sheet >= 0 && hl_hud_icon_sheet < hl_hud_sheet_count)
+		{
+			icon_w = hl_hud_icon_w;
+
+			HLSprDrawRect(c, hl_hud_sheet[hl_hud_icon_sheet], 0,
+				c->width - icon_w, base_y,
+				hl_hud_icon_x, hl_hud_icon_y, hl_hud_icon_w, hl_hud_icon_h,
+				r, g, b);
+		}
+
+		if (reserve >= 0)
+		{
+			//"room for the number and the '|' and the current ammo":
+			//x = ScreenWidth - (8 * AmmoWidth) - iIconWidth
+			x  = c->width - 8 * num_w - icon_w;
+			x += HLHudDrawNumber(c, x, num_y, ammo, 3, r, g, b);
+
+			//FillRGBA(x, y, AmmoWidth/10, m_iFontHeight) between the two, at
+			//x += AmmoWidth/2 and then x += iBarWidth + AmmoWidth/2
+			x += num_w / 2;
+
+			idx = HLHudFind("divider");
+			if (idx >= 0)
+			{
+				HLHudDrawElement(c, idx, x,
+					num_y + (fh - hl_hud_entry[idx].h) / 2, r, g, b);
+
+				x += hl_hud_entry[idx].w;
+			}
+			else
+				x += num_w / 10;
+
+			x += num_w / 2;
+
+			HLHudDrawNumber(c, x, num_y, reserve, 3, r, g, b);
+		}
+		else
+		{
+			//"SPR_Draw a bullets only line" - the clipless weapons, whose whole
+			//readout is the pool
+			x = c->width - 4 * num_w - icon_w;
+
+			HLHudDrawNumber(c, x, num_y, ammo, 3, r, g, b);
+		}
+	}
+
+}
+
+//--- CHudMessage ------------------------------------------------------------
+//
+// game_text and env_message. The centreprint path in HLSbar.ZC drops position,
+// colour and timing; this is the real thing, from cl_dll/message.cpp.
+//
+// One message at a time. HL keeps MAX_TEXTMESSAGES 16 concurrent slots, but no
+// shipped single player map stacks them, and the credit sequences that look
+// stacked are a multi_manager firing one env_message after another.
+
+#define HLMSG_MAX_TEXT		512
+
+//pMessage->effect. 0 fades the whole string in and out, 1 adds a flickering
+//second colour, 2 scans the string in one character at a time.
+#define HLMSG_FX_FADE		0
+#define HLMSG_FX_FLICKER		1
+#define HLMSG_FX_WRITEOUT	2
+
+U8	 hl_msg_text[HLMSG_MAX_TEXT];
+Bool hl_msg_active		= FALSE;
+F64	 hl_msg_start		= 0.0;		//wall clock, as the draw side has no game clock
+I64	 hl_msg_effect		= HLMSG_FX_FADE;
+F64	 hl_msg_x			= -1.0;		//-1 centres on that axis
+F64	 hl_msg_y			= -1.0;
+F64	 hl_msg_fadein		= 0.0;
+F64	 hl_msg_fadeout		= 0.0;
+F64	 hl_msg_hold			= 0.0;
+F64	 hl_msg_fxtime		= 0.0;
+I64	 hl_msg_r1			= 255;
+I64	 hl_msg_g1			= 255;
+I64	 hl_msg_b1			= 255;
+I64	 hl_msg_r2			= 255;
+I64	 hl_msg_g2			= 255;
+I64	 hl_msg_b2			= 255;
+
+U0 HLHudMsgInit()
+{//Globals are not zeroed and declaration initialisers do not run.
+	hl_msg_text[0]  = 0;
+	hl_msg_active   = FALSE;
+	hl_msg_start    = 0.0;
+	hl_msg_effect   = HLMSG_FX_FADE;
+	hl_msg_x        = -1.0;
+	hl_msg_y        = -1.0;
+	hl_msg_fadein   = 0.0;
+	hl_msg_fadeout  = 0.0;
+	hl_msg_hold     = 0.0;
+	hl_msg_fxtime   = 0.0;
+	hl_msg_r1       = 255;
+	hl_msg_g1       = 255;
+	hl_msg_b1       = 255;
+	hl_msg_r2       = 255;
+	hl_msg_g2       = 255;
+	hl_msg_b2       = 255;
+}
+
+HLHudMsgInit;
+
+U0 HLHudMsgClear()
+{
+	hl_msg_active  = FALSE;
+	hl_msg_text[0] = 0;
+}
+
+U0 HLHudMsgShow(U8 *text, I64 effect, F64 x, F64 y,
+	I64 r1, I64 g1, I64 b1, I64 r2, I64 g2, I64 b2,
+	F64 fadein, F64 fadeout, F64 hold, F64 fxtime)
+{//CHudMessage::MessageAdd. The entity layer calls this; it owns no timing.
+	I64 i = 0;
+
+	if (!text || !text[0])
+		return;
+
+	while (text[i] && i < HLMSG_MAX_TEXT - 1)
+	{
+		hl_msg_text[i] = text[i];
+		i++;
+	}
+
+	hl_msg_text[i] = 0;
+
+	hl_msg_effect  = effect;
+	hl_msg_x       = x;
+	hl_msg_y       = y;
+	hl_msg_r1      = r1;
+	hl_msg_g1      = g1;
+	hl_msg_b1      = b1;
+	hl_msg_r2      = r2;
+	hl_msg_g2      = g2;
+	hl_msg_b2      = b2;
+	hl_msg_fadein  = fadein;
+	hl_msg_fadeout = fadeout;
+	hl_msg_hold    = hold;
+	hl_msg_fxtime  = fxtime;
+
+	if (hl_msg_hold <= 0.0)
+		hl_msg_hold = 2.0;
+
+	hl_msg_start  = hl_hud_time;
+	hl_msg_active = TRUE;
+}
+
+//HLHudMsgAxis is defined above HLHudDraw: the game title logo places itself by
+//the same rule and the compiler is single pass.
+
+//The measuring and drawing halves live in HL1.ZC: the font is in HLWad.ZC,
+//which compiles after this file, so nothing here can size or draw a glyph.
+
+//--- what the shell still has to fill ---------------------------------------
+//
+// One element above draws from state this file cannot reach. It is inert until
+// something writes it - the flashlight renders as a dark casing on a full
+// charge - so it is not wrong on screen today, only idle.
+//
+//   hl_hud_flash_on   HL1.ZC owns impulse 100 and the lamp. Set TRUE while it
+//   hl_hud_flash_bat  is on; set the charge 0..1 from the drain timer.
+//                     CFlashlight in the SDK drains over 100 seconds of use and
+//                     recharges over 200 idle.
+//
+// The damage compass now resolves itself: HLHudDrawPain reads the view basis
+// off the canvas. Its feed is one call, from wherever the player takes damage:
+//
+//   HLHudDamageSource(attacker_origin)
+//                     HLEntity.ZC owns hl_ent_player_health and is where the
+//                     hits land. A zero vector clears the compass, which is
+//                     what the SDK does for drowning and falling.
+//
+// The geiger counter wants one more, from the same layer:
+//
+//   hl_hud_geiger_range
+//                     units to the nearest live radiation trigger_hurt, 1000
+//                     when none is in range, refreshed every GEIGERDELAY of
+//                     0.25 s. HLSound.ZC turns it into the click.
+//
+// The ammo icon and the low-ammo flag are already filled, by HLWeapon.ZC's
+// per-frame hook - it is the only thing that knows which weapon is up.

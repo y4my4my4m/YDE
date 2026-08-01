@@ -1,0 +1,2711 @@
+// HLPart.ZC - particles
+//
+// Most visible effects - explosions, blood, sparks, teleport fog - do not come
+// from the particle builtin. They arrive as temp entities in a network message
+// assembled by the Write* builtins.
+//
+// Drawn as points, depth tested against the world.
+
+#define HLPART_MAX		2048
+#define HLPART_GRAVITY	-40.0	//particles fall slower than players
+
+//additive dot weights, 0..256. The mask edge holds HLPART_DOT_RIM rather than
+//falling to nothing: adjacent fire ramp entries are 16 apart in red, and 64/256
+//of the darkest entry is +28 red, one step of that ramp and still a visible
+//edge. Below that the rim pixels cost a blend and show nothing
+#define HLPART_DOT_FULL	256
+#define HLPART_DOT_RIM	64
+
+//particle behaviours
+#define HLPT_STATIC		0
+#define HLPT_GRAV		1
+#define HLPT_FIRE		2		//ramps up the colour table then dies
+#define HLPT_EXPLODE		3
+#define HLPT_BLOB		4
+#define HLPT_SPARK		5		//fire ramp at 20Hz instead of 5
+
+class CHLParticle
+{
+	F64	org[3];
+	F64	vel[3];
+	F64	die;
+	F64	ramp;
+	I64	color;
+	I64	type;
+};
+
+CHLParticle	hl_particles[HLPART_MAX];
+I64			hl_part_count	= 0;
+I64			hl_part_drawn	= 0;
+
+//an index walks these as the particle ages: yellow down to dark red
+I64 hl_ramp_fire[8]		= {0x6f, 0x6e, 0x6d, 0x6c, 0x6b, 0x6a, 0x68, 0x66};
+I64 hl_ramp_explode[8]	= {0x6f, 0x6d, 0x6b, 0x69, 0x67, 0x65, 0x63, 0x61};
+
+//--- gibs ------------------------------------------------------------------
+//
+// CGib, dlls/combat.cpp. The SDK allocates one edict per gib; this port has no
+// runtime entity allocation, so gibs are a fixed pool with their own
+// integration and a point-hull world trace.
+//
+// CGib::Spawn sets MOVETYPE_BOUNCE, friction 0.55, m_lifeTime 25 and
+// m_cBloodDecals 5. BounceGibTouch damps to 0.9 on the ground and drops one
+// blood decal per airborne touch; WaitTillLand starts the fade once the
+// velocity reaches zero.
+//
+// The pool is declared here rather than beside the rest of the effects because
+// the compiler is single pass and HLPartInit has to reach HLGibInit.
+
+#define HLGIB_MAX			48
+#define HLGIB_GRAVITY		800.0	//sv_gravity, as HLPHYS_GRAVITY
+#define HLGIB_FRICTION		0.55	//CGib::Spawn pev->friction
+#define HLGIB_BOUNCE		1.5		//SV_Physics_Bounce backoff
+#define HLGIB_GROUND_DAMP	0.9		//BounceGibTouch on FL_ONGROUND
+#define HLGIB_LIFETIME		25.0	//CGib::Spawn m_lifeTime, seconds
+#define HLGIB_MAXVEL		1500.0	//CGib::LimitVelocity
+#define HLGIB_DECALS		5		//CGib::Spawn m_cBloodDecals
+#define HLGIB_STOPSPEED		40.0	//below this on a floor the gib settles
+
+//submodel counts, not piece counts: dlls/combat.cpp:202 and :208 draw a body
+//from these ranges
+#define HLGIB_HUMAN_COUNT	6		//HUMAN_GIB_COUNT, dlls/combat.cpp:40
+#define HLGIB_ALIEN_COUNT	4		//ALIEN_GIB_COUNT, dlls/combat.cpp:41
+
+//pieces GibMonster throws, human or alien - SpawnRandomGibs(pev, 4, ...) at
+//dlls/combat.cpp:316 and :322
+#define HLGIB_DEATH_COUNT	4
+
+//CBaseMonster::ShouldGibMonster gibs a GIB_NORMAL kill below this -
+//dlls/combat.cpp:537 against GIB_HEALTH_VALUE, dlls/cbase.h:579.
+//CBasePlayer::Killed uses -40 instead, dlls/player.cpp:996
+#define HLGIB_HEALTH_VALUE	-30.0
+
+//TE_BREAKMODEL as CBreakable::Die writes it, func_break.cpp:679-711: shards
+//from inside the entity's box, velocity randomization 10 percent, duration
+//byte 25 for 2.5 seconds. The shard count byte is 0, which hands the count to
+//the client; the engine's figure is not in the SDK, so the caller names one
+#define HLGIB_DEBRIS_LIFE	2.5
+#define HLGIB_DEBRIS_SPREAD	0.1
+
+//material debris models, func_break.cpp:284-341. Eight ship, plus whatever
+//gibmodel keys the maps carry
+#define HLGIB_DEBRIS_MDLS	16
+#define HLGIB_DEBRIS_NAME	64
+
+//dlls/util.h
+#define HLBLOOD_DONT		-1		//DONT_BLEED
+#define HLBLOOD_RED			247		//BLOOD_COLOR_RED
+#define HLBLOOD_YELLOW		195		//BLOOD_COLOR_YELLOW, also BLOOD_COLOR_GREEN
+
+class CHLGib
+{
+	F64	 origin[3];
+	F64	 prev[3];		//blood trail is laid over the segment just moved
+	F64	 velocity[3];
+	F64	 angles[3];
+	F64	 avelocity[3];
+	F64	 die;
+	I64	 body;			//submodel within the model below
+	I64	 blood_color;
+	I64	 decals_left;
+
+	//borrowed from the studio cache, never freed here. NULL selects hgibs.mdl
+	//or agibs.mdl by the human flag; anything else is material debris
+	CHLStudio *mdl;
+
+	Bool human;
+	Bool on_ground;
+	Bool active;
+};
+
+CHLGib		 hl_gibs[HLGIB_MAX];
+I64			 hl_gib_next		= 0;
+I64			 hl_gib_live		= 0;
+I64			 hl_gib_drawn		= 0;
+CHLStudio	*hl_gib_mdl_human	= NULL;
+CHLStudio	*hl_gib_mdl_alien	= NULL;
+Bool		 hl_gib_mdl_tried	= FALSE;
+
+//UTIL_DecalTrace drops a mark unless what the trace hit is a BSP model
+//(dlls/util.cpp:1240) - a decal on a monster's bounding box hangs in the air
+//once the monster moves. The test needs the entity table, which compiles after
+//this file, so it arrives through a pointer, the same backward-call idiom as
+//hl_snd_entorigin_hook in HLSound.ZC.
+//
+//TRUE means the surface takes the mark. NULL means every trace does, which is
+//correct for a world-only trace: the world is always a BSP model.
+//
+//Reads the state the last trace left, so it is called immediately after the
+//trace whose end point the decal goes on.
+Bool (*hl_part_decalsurface_hook)(CHLTrace *tr) = NULL;
+
+//declaration initialisers on globals do not run. Not cleared by HLGibInit: the
+//hook is installed at load time by a later file, and clearing it at game start
+//would silently unhook it
+hl_part_decalsurface_hook = NULL;
+
+//--- damage note ------------------------------------------------------------
+//
+// CBaseMonster::TakeDamage reads bitsDamageType where health crosses zero and
+// picks GIB_ALWAYS, GIB_NEVER or GIB_NORMAL from it (dlls/combat.cpp:911-925);
+// ShouldGibMonster (:535) tests the overkill against GIB_HEALTH_VALUE.
+//
+// CHLEntity carries neither. There is no dmgtype field, and HLEntTakeDamageType
+// clamps a dead entity's health to zero, so the overkill is gone before the
+// monster death path looks at the corpse. The last hit is recorded here, keyed
+// on the entity that took it. The record lives in this file because it feeds
+// the gib decision and because HLPart is the earliest file both HLAI and
+// HLWeapon compile after.
+//
+// The recorded health is the raw subtraction. CBreakable::TakeDamage's material
+// scaling (func_break.cpp:550-559) is brush-only and no brush entity gibs.
+
+I64	hl_dmg_note_ent		= -1;
+I64	hl_dmg_note_bits	= 0;
+F64	hl_dmg_note_health	= 0.0;
+
+U0 HLDmgNote(I64 ent, I64 bits, F64 health)
+{//record one hit. health is what the entity's health would be if nothing
+ //clamped it
+	hl_dmg_note_ent    = ent;
+	hl_dmg_note_bits   = bits;
+	hl_dmg_note_health = health;
+}
+
+I64 HLDmgNoteBits(I64 ent)
+{//mask of the last hit on ent. 0 - DMG_GENERIC - when the last hit went
+ //elsewhere, which is what an untyped damage call carries anyway
+	if (ent != hl_dmg_note_ent)
+		return 0;
+
+	return hl_dmg_note_bits;
+}
+
+F64 HLDmgNoteHealth(I64 ent)
+{//health after the last hit on ent, unclamped. 0 when the last hit went
+ //elsewhere, which reads as no overkill
+	if (ent != hl_dmg_note_ent)
+		return 0.0;
+
+	return hl_dmg_note_health;
+}
+
+//debris model cache, keyed by path. A NULL entry is a load that failed and is
+//not retried, so a map missing woodgibs.mdl does not hit the filesystem on
+//every crate. Entries are borrowed from HLStudioCacheGet
+U8			 hl_gib_dbg_name[HLGIB_DEBRIS_MDLS * HLGIB_DEBRIS_NAME];
+CHLStudio	*hl_gib_dbg_mdl[HLGIB_DEBRIS_MDLS];
+I64			 hl_gib_dbg_count	= 0;
+
+U0 HLGibInit()
+{//globals are not zeroed, and this table is walked every frame
+	I64 i;
+
+	for (i = 0; i < HLGIB_MAX; i++)
+	{
+		hl_gibs[i].active      = FALSE;
+		hl_gibs[i].on_ground   = FALSE;
+		hl_gibs[i].human       = TRUE;
+		hl_gibs[i].die         = 0.0;
+		hl_gibs[i].body        = 0;
+		hl_gibs[i].blood_color = HLBLOOD_RED;
+		hl_gibs[i].decals_left = 0;
+		hl_gibs[i].mdl         = NULL;
+		HLVecSet(hl_gibs[i].origin, 0.0, 0.0, 0.0);
+		HLVecSet(hl_gibs[i].prev, 0.0, 0.0, 0.0);
+		HLVecSet(hl_gibs[i].velocity, 0.0, 0.0, 0.0);
+		HLVecSet(hl_gibs[i].angles, 0.0, 0.0, 0.0);
+		HLVecSet(hl_gibs[i].avelocity, 0.0, 0.0, 0.0);
+	}
+
+	hl_gib_next      = 0;
+	hl_gib_live      = 0;
+	hl_gib_drawn     = 0;
+	hl_gib_mdl_human = NULL;
+	hl_gib_mdl_alien = NULL;
+	hl_gib_mdl_tried = FALSE;
+
+	for (i = 0; i < HLGIB_DEBRIS_MDLS; i++)
+	{
+		hl_gib_dbg_mdl[i]                      = NULL;
+		hl_gib_dbg_name[i * HLGIB_DEBRIS_NAME] = 0;
+	}
+
+	hl_gib_dbg_count = 0;
+
+	hl_dmg_note_ent    = -1;
+	hl_dmg_note_bits   = 0;
+	hl_dmg_note_health = 0.0;
+}
+
+//--- temp entities ---------------------------------------------------------
+//
+// Half-Life barely uses point particles. Almost every effect is a temp entity:
+// a short lived sprite with an origin, a velocity, a frame cursor, a render
+// mode and a lifetime, spawned server side by a TE_* message and aged client
+// side by CL_TempEntUpdate.
+//
+// TEMPENTITY, common/r_efx.h. The engine list holds 500 and is priority
+// ordered; this one is fixed and recycles the slot nearest death.
+//
+// The pool is declared ahead of HLPartInit because the compiler is single pass
+// and HLPartInit has to reach HLTEntInit.
+
+#define HLTENT_MAX			192
+
+//FTENT_*, common/r_efx.h
+#define HLTENT_GRAVITY		0x0002
+#define HLTENT_SLOWGRAVITY	0x0008
+#define HLTENT_FADEOUT		0x0080
+#define HLTENT_SPRANIMATE	0x0100
+#define HLTENT_SPRCYCLE		0x0800
+#define HLTENT_SPRLOOP		0x10000		//FTENT_SPRANIMATELOOP
+
+//kRenderNormal and kRenderTransAdd, common/const.h
+//
+//the blend a sprite really uses is its own texFormat word, which HLSprPutPixel
+//already honours. The mode picks what the texels are scaled by instead: world
+//light for a solid sprite, the render amount for a self lit one
+#define HLTENT_MODE_NORMAL	0
+#define HLTENT_MODE_ADD		5
+
+//CL_TempEntUpdate: gravity is -frametime * cl_gravity, and FTENT_SLOWGRAVITY
+//is half of that
+#define HLTENT_GRAV_ACCEL	-800.0
+
+//the sprite is clamped to a minimum half extent so the texel walk never
+//divides by a zero span
+#define HLTENT_MIN_HALF		0.5
+
+class CHLTEnt
+{
+	F64		 origin[3];
+	F64		 vel[3];
+	F64		 frame;			//cursor, in frames
+	F64		 frame_max;
+	F64		 frame_rate;
+	F64		 scale;
+	F64		 bright;		//renderamt, 0..255
+	F64		 born;
+	F64		 die;
+	CHLSpr	*spr;
+	I64		 flags;
+	I64		 mode;
+	Bool	 active;
+};
+
+CHLTEnt	hl_tents[HLTENT_MAX];
+I64		hl_tent_live	= 0;
+I64		hl_tent_drawn	= 0;
+I64		hl_tent_next	= 0;
+
+//the effect sprites CBasePlayerWeapon::Precache and the client hud precache.
+//One load each, on first use: the paks are not mounted yet when HLPartInit runs
+CHLSpr	*hl_te_fireball		= NULL;		//g_sModelIndexFireball
+CHLSpr	*hl_te_smoke		= NULL;		//g_sModelIndexSmoke
+CHLSpr	*hl_te_trailsmoke	= NULL;		//the rpg and gauss trail sprite
+CHLSpr	*hl_te_bloodspray	= NULL;		//g_sModelIndexBloodSpray
+CHLSpr	*hl_te_blooddrop	= NULL;		//g_sModelIndexBloodDrop
+CHLSpr	*hl_te_bubble		= NULL;		//g_sModelIndexBubbles
+CHLSpr	*hl_te_richo		= NULL;		//R_RicochetSprite
+CHLSpr	*hl_te_spark		= NULL;		//R_SparkEffect
+CHLSpr	*hl_te_wallpuff		= NULL;		//R_BulletImpactParticles' puff
+CHLSpr	*hl_te_muzzle		= NULL;		//R_MuzzleFlash, cl_muzzleflash[0]
+Bool	 hl_te_spr_tried	= FALSE;
+
+U0 HLTEntLoadSprites()
+{//once. A missing sprite leaves its pointer NULL and the effect falls back to
+ //the particle pool, so a trimmed install degrades rather than goes silent
+	if (hl_te_spr_tried)
+		return;
+
+	hl_te_spr_tried = TRUE;
+
+	hl_te_fireball   = HLSprLoad("sprites/zerogxplode.spr");
+	hl_te_smoke      = HLSprLoad("sprites/steam1.spr");
+	hl_te_trailsmoke = HLSprLoad("sprites/smoke.spr");
+	hl_te_bloodspray = HLSprLoad("sprites/bloodspray.spr");
+	hl_te_blooddrop  = HLSprLoad("sprites/blood.spr");
+	hl_te_bubble     = HLSprLoad("sprites/bubble.spr");
+	hl_te_richo      = HLSprLoad("sprites/richo1.spr");
+	hl_te_spark      = HLSprLoad("sprites/spark1.spr");
+	hl_te_wallpuff   = HLSprLoad("sprites/wallpuff.spr");
+	hl_te_muzzle     = HLSprLoad("sprites/muzzleflash1.spr");
+}
+
+U0 HLTEntClear()
+{//retire every live temp entity, keeping the sprite cache
+ //
+ //the sprites live in valve/sprites for the whole session, so a map load only
+ //has to drop the effects standing in the old level's coordinates
+	I64 i;
+
+	for (i = 0; i < HLTENT_MAX; i++)
+	{
+		hl_tents[i].active     = FALSE;
+		hl_tents[i].spr        = NULL;
+		hl_tents[i].die        = 0.0;
+		hl_tents[i].born       = 0.0;
+		hl_tents[i].frame      = 0.0;
+		hl_tents[i].frame_max  = 1.0;
+		hl_tents[i].frame_rate = 0.0;
+		hl_tents[i].scale      = 1.0;
+		hl_tents[i].bright     = 255.0;
+		hl_tents[i].flags      = 0;
+		hl_tents[i].mode       = HLTENT_MODE_NORMAL;
+		HLVecSet(hl_tents[i].origin, 0.0, 0.0, 0.0);
+		HLVecSet(hl_tents[i].vel, 0.0, 0.0, 0.0);
+	}
+
+	hl_tent_live  = 0;
+	hl_tent_drawn = 0;
+	hl_tent_next  = 0;
+}
+
+U0 HLTEntInit()
+{//globals are not zeroed, and this table is walked every frame
+	hl_te_fireball   = NULL;
+	hl_te_smoke      = NULL;
+	hl_te_trailsmoke = NULL;
+	hl_te_bloodspray = NULL;
+	hl_te_blooddrop  = NULL;
+	hl_te_bubble     = NULL;
+	hl_te_richo      = NULL;
+	hl_te_spark      = NULL;
+	hl_te_wallpuff   = NULL;
+	hl_te_muzzle     = NULL;
+	hl_te_spr_tried  = FALSE;
+
+	HLTEntClear;
+}
+
+U0 HLPartInit()
+{//globals are not zeroed, and this table is walked every frame
+	I64 i;
+
+	for (i = 0; i < HLPART_MAX; i++)
+	{
+		hl_particles[i].die   = 0.0;
+		hl_particles[i].type  = HLPT_STATIC;
+		hl_particles[i].color = 0;
+		hl_particles[i].ramp  = 0.0;
+		HLVecSet(hl_particles[i].org, 0.0, 0.0, 0.0);
+		HLVecSet(hl_particles[i].vel, 0.0, 0.0, 0.0);
+	}
+
+	hl_part_count = 0;
+	hl_part_drawn = 0;
+
+	HLGibInit;
+	HLTEntInit;
+	HLDecalInit;
+}
+
+F64 HLPartRand(F64 range)
+{//symmetric random in [-range, range]
+	return (ToF64(RandU32 & 0xFFFF) / 32768.0 - 1.0) * range;
+}
+
+F64 HLPartRandCone()
+{//one axis of FireBulletsPlayer's circular gaussian spread, combat.cpp:1522.
+ //
+ //Two independent halves summed, not one draw over the whole interval. Both
+ //span [-1, 1]; the sum has RMS 0.408 against the single draw's 0.577, so a
+ //uniform draw widens the effective cone by 41%
+	return HLPartRand(0.5) + HLPartRand(0.5);
+}
+
+I64 HLPartRandI(I64 n)
+{
+	if (n <= 0)
+		return 0;
+
+	return RandU32 % n;
+}
+
+CHLParticle *HLPartAlloc(F64 now)
+{//first dead slot. NULL when saturated, so a busy moment drops sparks
+	I64 i;
+
+	for (i = 0; i < HLPART_MAX; i++)
+	{
+		if (hl_particles[i].die <= now)
+		{
+			if (i >= hl_part_count)
+				hl_part_count = i + 1;
+			return &hl_particles[i];
+		}
+	}
+
+	return NULL;
+}
+
+U0 HLPartExplosion(F64 *org, F64 now)
+{//R_ParticleExplosion
+	CHLParticle	*p;
+	I64			 i;
+	I64			 j;
+
+	for (i = 0; i < 512; i++)
+	{
+		p = HLPartAlloc(now);
+		if (!p)
+			return;
+
+		p->die   = now + 5.0;
+		p->color = hl_ramp_explode[0];
+		p->ramp  = ToF64(HLPartRandI(4));
+
+		if (i & 1)
+			p->type = HLPT_EXPLODE;
+		else
+			p->type = HLPT_FIRE;
+
+		for (j = 0; j < 3; j++)
+		{
+			p->org[j] = org[j] + ToF64(HLPartRandI(32) - 16);
+			p->vel[j] = HLPartRand(256.0);
+		}
+	}
+}
+
+U0 HLPartEffect(F64 *org, F64 *dir, I64 color, I64 count, F64 now)
+{//R_RunParticleEffect - colour snapped to an 8 entry group and randomised
+ //inside it, which produces the speckle
+	CHLParticle	*p;
+	I64			 i;
+	I64			 j;
+
+	for (i = 0; i < count; i++)
+	{
+		p = HLPartAlloc(now);
+		if (!p)
+			return;
+
+		p->die   = now + 0.1 * ToF64(HLPartRandI(5));
+		p->color = (color & ~7) + HLPartRandI(8);
+		p->type  = HLPT_GRAV;
+		p->ramp  = 0.0;
+
+		for (j = 0; j < 3; j++)
+		{
+			p->org[j] = org[j] + ToF64(HLPartRandI(16) - 8);
+			if (dir)
+				p->vel[j] = dir[j] * 15.0 + HLPartRand(150.0);
+			else
+				p->vel[j] = HLPartRand(150.0);
+		}
+	}
+}
+
+U0 HLPartLavaSplash(F64 *org, F64 now)
+{//R_LavaSplash
+	CHLParticle	*p;
+	F64			 dir[3];
+	F64			 vel;
+	I64			 i;
+	I64			 j;
+
+	for (i = -16; i < 16; i++)
+	{
+		for (j = -16; j < 16; j++)
+		{
+			p = HLPartAlloc(now);
+			if (!p)
+				return;
+
+			p->die   = now + 2.0 + ToF64(HLPartRandI(64)) / 64.0;
+			p->color = 224 + HLPartRandI(8);
+			p->type  = HLPT_BLOB;
+			p->ramp  = 0.0;
+
+			dir[0] = ToF64(j * 8 + HLPartRandI(8));
+			dir[1] = ToF64(i * 8 + HLPartRandI(8));
+			dir[2] = 256.0;
+
+			p->org[0] = org[0] + dir[0];
+			p->org[1] = org[1] + dir[1];
+			p->org[2] = org[2] + ToF64(HLPartRandI(64));
+
+			HLVecNormalize(dir);
+			vel = 50.0 + ToF64(HLPartRandI(64));
+			HLVecScale(dir, vel, p->vel);
+		}
+	}
+}
+
+U0 HLPartTeleport(F64 *org, F64 now)
+{//R_TeleportSplash
+	CHLParticle	*p;
+	F64			 dir[3];
+	F64			 vel;
+	I64			 i;
+	I64			 j;
+	I64			 k;
+
+	for (i = -16; i < 16; i += 4)
+	{
+		for (j = -16; j < 16; j += 4)
+		{
+			for (k = -24; k < 32; k += 4)
+			{
+				p = HLPartAlloc(now);
+				if (!p)
+					return;
+
+				p->die   = now + 0.2 + ToF64(HLPartRandI(8)) / 64.0;
+				p->color = 7 + HLPartRandI(8);
+				p->type  = HLPT_STATIC;
+				p->ramp  = 0.0;
+
+				p->org[0] = org[0] + ToF64(i) + ToF64(HLPartRandI(4));
+				p->org[1] = org[1] + ToF64(j) + ToF64(HLPartRandI(4));
+				p->org[2] = org[2] + ToF64(k) + ToF64(HLPartRandI(4));
+
+				dir[0] = ToF64(j * 8);
+				dir[1] = ToF64(i * 8);
+				dir[2] = ToF64(k * 8);
+
+				HLVecNormalize(dir);
+				vel = 50.0 + ToF64(HLPartRandI(64));
+				HLVecScale(dir, vel, p->vel);
+			}
+		}
+	}
+}
+
+//--- entity trails ---------------------------------------------------------
+//
+// R_RocketTrail - laid along the segment moved since the last frame, one
+// particle every three units, so density is speed independent. The trail type
+// comes from the model header flags word.
+
+#define HLTRAIL_ROCKET	0
+#define HLTRAIL_SMOKE	1
+#define HLTRAIL_BLOOD	2
+#define HLTRAIL_TRACER	3
+#define HLTRAIL_SLIGHT	4		//zombie gib: sparser blood
+#define HLTRAIL_TRACER2	5
+#define HLTRAIL_VOOR		6
+
+//per-entity trail memory. CL_RelinkEntities keeps the previous position on the
+//client entity; the edict holds only the current position
+#define HLTRAIL_MAX_ENTS	1024
+
+F64	 hl_trail_org[HLTRAIL_MAX_ENTS * 3];
+Bool hl_trail_valid[HLTRAIL_MAX_ENTS];
+
+U0 HLPartTrailReset()
+{//globals are not zeroed. A slot carried across a map load would trail from the
+ //old level's coordinates
+	I64 i;
+
+	for (i = 0; i < HLTRAIL_MAX_ENTS; i++)
+	{
+		hl_trail_valid[i]        = FALSE;
+		hl_trail_org[i * 3]      = 0.0;
+		hl_trail_org[i * 3 + 1]  = 0.0;
+		hl_trail_org[i * 3 + 2]  = 0.0;
+	}
+
+	//decal patches borrow their texture bodies from decals.wad, which the map
+	//load unmounts, and a gib carried across a load would bounce off the old
+	//level's geometry
+	HLDecalClear;
+	HLGibInit;
+
+	//a temp entity carried across a load would burn in mid air over the new
+	//level. The sprite cache survives, so nothing is reloaded
+	HLTEntClear;
+}
+
+U0 HLPartTrail(F64 *start, F64 *end, I64 type, F64 now)
+{
+	CHLParticle	*p;
+	F64			 vec[3];
+	F64			 pos[3];
+	F64			 len;
+	I64			 step;
+	I64			 j;
+
+	HLVecCopy(start, pos);
+	HLVecSub(end, start, vec);
+	len = HLVecLength(vec);
+
+	if (len < 0.01)
+		return;
+
+	//a teleport moves an entity arbitrarily far in one frame; no line is
+	//painted across the level
+	if (len > 1000.0)
+		return;
+
+	HLVecScale(vec, 1.0 / len, vec);
+
+	//blood is sparser, as in the original
+	step = 3;
+	if (type == HLTRAIL_SLIGHT)
+		step = 6;
+
+	while (len > 0.0)
+	{
+		len -= ToF64(step);
+
+		p = HLPartAlloc(now);
+		if (!p)
+			return;
+
+		HLVecSet(p->vel, 0.0, 0.0, 0.0);
+		p->ramp = 0.0;
+		p->type = HLPT_STATIC;
+		p->die  = now + 2.0;
+
+		switch (type)
+		{
+			case HLTRAIL_ROCKET:
+				//fire ramp, drifts up as it cools
+				p->die   = now + 2.0;
+				p->type  = HLPT_FIRE;
+				p->ramp  = ToF64(HLPartRandI(4));
+				p->color = hl_ramp_fire[ClampI64(ToI64(p->ramp), 0, 7)];
+				for (j = 0; j < 3; j++)
+					p->org[j] = pos[j] + HLPartRand(3.0);
+				break;
+
+			case HLTRAIL_SMOKE:
+				p->die   = now + 2.0;
+				p->type  = HLPT_FIRE;
+				p->ramp  = ToF64(HLPartRandI(4)) + 2.0;
+				p->color = hl_ramp_fire[ClampI64(ToI64(p->ramp), 0, 7)];
+				for (j = 0; j < 3; j++)
+					p->org[j] = pos[j] + HLPartRand(3.0);
+				break;
+
+			case HLTRAIL_BLOOD:
+			case HLTRAIL_SLIGHT:
+				//palette blood range is 67..70
+				p->die   = now + 2.0;
+				p->type  = HLPT_GRAV;
+				p->color = 67 + HLPartRandI(4);
+				for (j = 0; j < 3; j++)
+					p->org[j] = pos[j] + HLPartRand(3.0);
+				break;
+
+			case HLTRAIL_TRACER:
+			case HLTRAIL_TRACER2:
+				p->die   = now + 0.5;
+				p->type  = HLPT_STATIC;
+				if (type == HLTRAIL_TRACER)
+					p->color = 52 + (HLPartRandI(2) << 1);
+				else
+					p->color = 230 + (HLPartRandI(2) << 1);
+				HLVecCopy(pos, p->org);
+				break;
+
+			default:
+				//TRAIL_VOOR, the vore's spit
+				p->die   = now + 0.3;
+				p->color = 9 * 16 + 8 + HLPartRandI(4);
+				for (j = 0; j < 3; j++)
+					p->org[j] = pos[j] + HLPartRand(16.0);
+				break;
+		}
+
+		HLVecMA(pos, ToF64(step), vec, pos);
+	}
+}
+
+U0 HLPartEntityTrail(I64 slot, F64 *org, I64 flags, F64 now)
+{//CL_RelinkEntities trail dispatch. The segment runs from where the entity was
+ //last drawn to where it is now
+	F64 *prev;
+
+	if (slot < 0 || slot >= HLTRAIL_MAX_ENTS || !flags)
+		return;
+
+	prev = hl_trail_org + slot * 3;
+
+	if (hl_trail_valid[slot])
+	{
+		if (flags & HLMDLF_ROCKET)
+			HLPartTrail(prev, org, HLTRAIL_ROCKET, now);
+		else if (flags & HLMDLF_GRENADE)
+			HLPartTrail(prev, org, HLTRAIL_SMOKE, now);
+		else if (flags & HLMDLF_GIB)
+			HLPartTrail(prev, org, HLTRAIL_BLOOD, now);
+		else if (flags & HLMDLF_ZOMGIB)
+			HLPartTrail(prev, org, HLTRAIL_SLIGHT, now);
+		else if (flags & HLMDLF_TRACER)
+			HLPartTrail(prev, org, HLTRAIL_TRACER, now);
+		else if (flags & HLMDLF_TRACER2)
+			HLPartTrail(prev, org, HLTRAIL_TRACER2, now);
+		else if (flags & HLMDLF_TRACER3)
+			HLPartTrail(prev, org, HLTRAIL_VOOR, now);
+	}
+
+	HLVecCopy(org, prev);
+	hl_trail_valid[slot] = TRUE;
+}
+
+//--- half-life effect primitives -------------------------------------------
+//
+// The server side of every effect below is a temp entity message assembled by
+// dlls/util.cpp, dlls/effects.cpp and dlls/explode.cpp; the code that draws it
+// lives in the closed engine behind common/r_efx.h. Valve's numbers - counts,
+// speeds, colours, lifetimes, damage scaling - are taken from the SDK and
+// preserved here; the rendering itself is this port's, built out of the
+// particle pool above, the decal layer in HLDraw.ZC and the dynamic lights.
+//
+// Nothing here allocates an entity. Of the four TE codes that need one:
+//
+//   TE_BREAKMODEL   HLGibSpawnDebris below, run in the fixed gib pool.
+//   TE_MODEL        is absent. EjectBrass, dlls/weapons.cpp:203, throws the
+//                   brass shell; no weapon here ejects one.
+//   TE_EXPLODEMODEL no live SDK caller - ExplodeModel sits inside #if 0,
+//                   dlls/weapons.cpp:223-238.
+//   TE_PROJECTILE   no caller anywhere under dlls/.
+
+//TE_TRACER and TE_SPARKS are sprites in GoldSrc, so there is no Valve palette
+//index for either. These are base palette picks: the fire ramp head for a
+//spark, the Quake tracer green for a tracer, the grey ramp for smoke
+#define HLFX_SPARK_COLOR	0x6f
+#define HLFX_TRACER_COLOR	52
+#define HLFX_SMOKE_COLOR	8
+
+#define HLFX_TRACER_SPEED	6000.0	//units per second, the engine tracer rate
+#define HLFX_TRACER_LEN		100.0	//units of streak drawn behind the head
+
+//TE_BUBBLES carries a count byte. A funnel emitting 255 sprites would evict
+//every other temp entity, so only this many become sprites
+#define HLFX_BUBBLE_MAX		24
+
+F64 HLFxRandF(F64 low, F64 high)
+{//RANDOM_FLOAT
+	if (high <= low)
+		return low;
+
+	return low + (high - low) * (ToF64(RandU32 & 0xFFFF) / 65535.0);
+}
+
+I64 HLFxRandI(I64 low, I64 high)
+{//RANDOM_LONG, both ends included
+	if (high <= low)
+		return low;
+
+	return low + RandU32 % (high - low + 1);
+}
+
+//--- temp entity pool operations -------------------------------------------
+
+CHLTEnt *HLTEntAlloc(F64 now)
+{//CL_TempEntAllocHigh - a free slot, else the one nearest death
+	CHLTEnt	*t;
+	F64		 worst;
+	I64		 pick;
+	I64		 i;
+
+	for (i = 0; i < HLTENT_MAX; i++)
+	{
+		if (!hl_tents[i].active || hl_tents[i].die <= now)
+		{
+			t = &hl_tents[i];
+			t->active = TRUE;
+			return t;
+		}
+	}
+
+	pick  = hl_tent_next;
+	worst = hl_tents[pick].die;
+
+	for (i = 0; i < HLTENT_MAX; i++)
+	{
+		if (hl_tents[i].die < worst)
+		{
+			worst = hl_tents[i].die;
+			pick  = i;
+		}
+	}
+
+	hl_tent_next = pick + 1;
+	if (hl_tent_next >= HLTENT_MAX)
+		hl_tent_next = 0;
+
+	t = &hl_tents[pick];
+	t->active = TRUE;
+	return t;
+}
+
+CHLTEnt *HLTEntSpawn(CHLSpr *sp, F64 *org, F64 *vel, F64 scale, F64 bright,
+	I64 mode, F64 frame_rate, F64 life, I64 flags, F64 now)
+{//R_DefaultSprite plus the fields R_TempSprite fills in
+ //
+ //with HLTENT_SPRANIMATE and a life of num_frames/frame_rate this is TE_SPRITE:
+ //an additive sprite that plays one cycle and retires
+ //
+ //NULL sprite means the install is missing it; the caller reads the NULL back
+ //and runs its particle fallback instead
+	CHLTEnt *t;
+
+	if (!sp || sp->num_frames < 1 || life <= 0.0)
+		return NULL;
+
+	t = HLTEntAlloc(now);
+
+	HLVecCopy(org, t->origin);
+
+	if (vel)
+		HLVecCopy(vel, t->vel);
+	else
+		HLVecSet(t->vel, 0.0, 0.0, 0.0);
+
+	if (scale < 0.01)
+		scale = 0.01;
+
+	t->frame      = 0.0;
+	t->frame_max  = ToF64(sp->num_frames);
+	t->frame_rate = frame_rate;
+	t->scale      = scale;
+	t->bright     = bright;
+	t->born       = now;
+	t->die        = now + life;
+	t->spr        = sp;
+	t->flags      = flags;
+	t->mode       = mode;
+
+	return t;
+}
+
+U0 HLTEntSpray(CHLSpr *sp, F64 *org, F64 *dir, I64 count, F64 speed,
+	F64 noise, F64 scale, I64 mode, F64 now)
+{//TE_SPRITE_SPRAY - a spray of alpha sprites thrown along dir
+ //
+ //the message carries a velocity, a count, a speed byte and a noise byte. The
+ //engine scatters each sprite's direction by noise/100 of a unit vector and
+ //gives it FTENT_FADEOUT with gravity
+	CHLTEnt	*t;
+	F64		 vel[3];
+	F64		 scatter;
+	I64		 i;
+	I64		 j;
+
+	if (!sp)
+		return;
+
+	scatter = noise * 0.01;
+
+	for (i = 0; i < count; i++)
+	{
+		for (j = 0; j < 3; j++)
+			vel[j] = (dir[j] + HLPartRand(scatter)) * speed;
+
+		t = HLTEntSpawn(sp, org, vel, scale, 255.0, mode, 15.0,
+			0.35 + HLFxRandF(0.0, 0.35), HLTENT_GRAVITY | HLTENT_FADEOUT |
+			HLTENT_SPRCYCLE, now);
+
+		if (!t)
+			return;
+
+		//a spray of identical frames reads as one object, so each starts
+		//somewhere else in the cycle
+		t->frame = ToF64(HLPartRandI(sp->num_frames));
+	}
+}
+
+U0 HLTEntUpdate(F64 dt, F64 now)
+{//CL_TempEntUpdate - move, age the frame cursor, retire
+	CHLTEnt	*t;
+	F64		 grav;
+	I64		 i;
+
+	grav = HLTENT_GRAV_ACCEL * dt;
+	hl_tent_live = 0;
+
+	for (i = 0; i < HLTENT_MAX; i++)
+	{
+		t = &hl_tents[i];
+
+		if (!t->active)
+			goto qte_next;
+
+		if (t->die <= now || !t->spr)
+		{
+			t->active = FALSE;
+			goto qte_next;
+		}
+
+		hl_tent_live++;
+
+		HLVecMA(t->origin, dt, t->vel, t->origin);
+
+		if (t->flags & HLTENT_GRAVITY)
+			t->vel[2] += grav;
+		else if (t->flags & HLTENT_SLOWGRAVITY)
+			t->vel[2] += grav * 0.5;
+
+		if (t->frame_max < 1.0)
+			t->frame_max = 1.0;
+
+		if (t->flags & HLTENT_SPRANIMATE)
+		{
+			t->frame += t->frame_rate * dt;
+
+			//one cycle then gone, unless FTENT_SPRANIMATELOOP holds it
+			if ((t->frame >= t->frame_max) && !(t->flags & HLTENT_SPRLOOP))
+			{
+				t->active = FALSE;
+				goto qte_next;
+			}
+
+			while (t->frame >= t->frame_max)
+				t->frame -= t->frame_max;
+		}
+		else if (t->flags & HLTENT_SPRCYCLE)
+		{
+			//FTENT_SPRCYCLE wraps and never retires on the frame count
+			t->frame += t->frame_rate * dt;
+
+			while (t->frame >= t->frame_max)
+				t->frame -= t->frame_max;
+		}
+
+qte_next:
+	}
+}
+
+U0 HLTEntDrawSpr(CHLCanvas *c, CHLTEnt *t, I64 light)
+{//the flat-on blit of HLSprDraw with a scale
+ //
+ //HLSprDrawModel takes no scale, and scale is the whole of TE_EXPLOSION's and
+ //TE_SMOKE's size byte. Every effect sprite in valve/sprites is VP_PARALLEL or
+ //VP_PARALLEL_ORIENTED at zero roll, for which this blit is exact
+ //
+ //a translucent sprite tests the depth buffer but does not write it, so two
+ //additive puffs over one another both show
+	CHLSpr		*sp;
+	CHLSprFrame	*fr;
+	U32			*row;
+	F64			*zrow;
+	F64			 rel[3];
+	F64			 cam_x;
+	F64			 cam_y;
+	F64			 cam_z;
+	F64			 inv_z;
+	F64			 sx;
+	F64			 sy;
+	F64			 half_w;
+	F64			 half_h;
+	I64			 frame;
+	I64			 x0, x1, y0, y1;
+	I64			 x, y;
+	I64			 tx, ty;
+	I64			 texel;
+	I64			 shade;
+	Bool		 solid;
+
+	sp = t->spr;
+
+	if (!c || !sp)
+		return;
+
+	frame = ToI64(t->frame);
+	if (frame < 0)
+		frame = 0;
+	if (frame >= sp->num_frames)
+		frame = sp->num_frames - 1;
+
+	fr = &sp->frames[frame];
+
+	if (!fr->pixels || fr->width < 1 || fr->height < 1)
+		return;
+
+	HLVecSub(t->origin, c->origin, rel);
+	cam_x = HLVecDot(rel, c->right);
+	cam_y = HLVecDot(rel, c->up);
+	cam_z = HLVecDot(rel, c->forward);
+
+	if (cam_z < 1.0)
+		return;
+
+	inv_z = 1.0 / cam_z;
+
+	sx = c->center_x + cam_x * c->x_scale * inv_z;
+	sy = c->center_y - cam_y * c->y_scale * inv_z;
+
+	half_w = ToF64(fr->width) * 0.5 * t->scale * c->x_scale * inv_z;
+	half_h = ToF64(fr->height) * 0.5 * t->scale * c->y_scale * inv_z;
+
+	if (half_w < HLTENT_MIN_HALF)
+		half_w = HLTENT_MIN_HALF;
+	if (half_h < HLTENT_MIN_HALF)
+		half_h = HLTENT_MIN_HALF;
+
+	//the frame origin is a texel offset from centre and scales with the sprite
+	sx += ToF64(fr->origin_x + fr->width / 2) * t->scale * c->x_scale * inv_z;
+	sy -= ToF64(fr->origin_y - fr->height / 2) * t->scale * c->y_scale * inv_z;
+
+	x0 = ToI64(Ceil(sx - half_w));
+	x1 = ToI64(Ceil(sx + half_w));
+	y0 = ToI64(Ceil(sy - half_h));
+	y1 = ToI64(Ceil(sy + half_h));
+
+	if (x0 < c->vx)					x0 = c->vx;
+	if (y0 < c->vy)					y0 = c->vy;
+	if (x1 > c->vx + c->vw)			x1 = c->vx + c->vw;
+	if (y1 > c->vy + c->vh)			y1 = c->vy + c->vh;
+
+	if (x1 <= x0 || y1 <= y0)
+		return;
+
+	shade = ClampI64((255 - light) >> 2, 0, HLPAL_SHADES - 1);
+
+	//NORMAL and ALPHATEST are opaque where they draw, so they own the depth
+	solid = ToBool(sp->tex_format == HLSPR_NORMAL ||
+				   sp->tex_format == HLSPR_ALPHATEST);
+
+	hl_rs_sprites++;
+
+	for (y = y0; y < y1; y++)
+	{
+		row  = c->pixels + y * c->width;
+		zrow = c->depth + y * c->width;
+
+		//counted per row, never per pixel
+		hl_rs_sprite_px += x1 - x0;
+
+		ty = ToI64((ToF64(y) - (sy - half_h)) / (half_h * 2.0) *
+				ToF64(fr->height));
+		ty = ClampI64(ty, 0, fr->height - 1);
+
+		for (x = x0; x < x1; x++)
+		{
+			if (inv_z <= zrow[x])
+				goto qtd_next_col;
+
+			tx = ToI64((ToF64(x) - (sx - half_w)) / (half_w * 2.0) *
+					ToF64(fr->width));
+			tx = ClampI64(tx, 0, fr->width - 1);
+
+			texel = fr->pixels[ty * fr->width + tx];
+
+			if (!HLSprTexelVisible(sp, texel))
+				goto qtd_next_col;
+
+			HLSprPutPixel(sp, row, x, texel, light, shade);
+
+			if (solid)
+				zrow[x] = inv_z;
+
+qtd_next_col:
+		}
+	}
+}
+
+U0 HLTEntDraw(CHLCanvas *c, CHLMap *map, F64 now)
+{//one sprite per live temp entity
+	if (!hl_r_drawsprites)
+		return;
+
+ //
+ //FTENT_FADEOUT scales renderamt down over the life. A self lit sprite carries
+ //that straight into the texel brightness; a solid one is lit by the world
+	CHLTEnt	*t;
+	F64		 rel[3];
+	F64		 frac;
+	F64		 amt;
+	I64		 light;
+	I64		 i;
+
+	hl_tent_drawn = 0;
+
+	for (i = 0; i < HLTENT_MAX; i++)
+	{
+		t = &hl_tents[i];
+
+		if (!t->active || !t->spr || t->die <= now)
+			goto qtdr_next;
+
+		//behind the eye, which HLTEntDrawSpr rejects on the same test. Hoisted
+		//above the shading because a NORMAL sprite is lit by R_LightPoint, and
+		//that is a full BSP trace down through the world per sprite per frame -
+		//paid for smoke standing behind the player otherwise
+		HLVecSub(t->origin, c->origin, rel);
+		if (HLVecDot(rel, c->forward) < 1.0)
+			goto qtdr_next;
+
+		frac = 1.0;
+
+		if ((t->flags & HLTENT_FADEOUT) && t->die > t->born)
+			frac = (t->die - now) / (t->die - t->born);
+
+		if (frac > 1.0)
+			frac = 1.0;
+
+		if (t->mode == HLTENT_MODE_NORMAL)
+			amt = ToF64(HLLightPoint(map, t->origin)) * frac;
+		else
+			amt = t->bright * frac;
+
+		light = ClampI64(ToI64(amt), 0, 255);
+
+		if (light < 1)
+			goto qtdr_next;
+
+		HLTEntDrawSpr(c, t, light);
+		hl_tent_drawn++;
+
+qtdr_next:
+	}
+}
+
+U0 HLFxRandomBloodVector(F64 *out)
+{//UTIL_RandomBloodVector - x and y either way, z upward only
+	out[0] = HLFxRandF(-1.0, 1.0);
+	out[1] = HLFxRandF(-1.0, 1.0);
+	out[2] = HLFxRandF(0.0, 1.0);
+}
+
+Bool HLFxShouldShowBlood(I64 color)
+{//UTIL_ShouldShowBlood, minus the violence cvars this port has no home for
+	return ToBool(color != HLBLOOD_DONT);
+}
+
+U0 HLFxBloodDecal(F64 *org, F64 *normal, I64 color)
+{//UTIL_BloodDecalTrace - six red patches or six yellow, picked at random
+	if (!HLFxShouldShowBlood(color))
+		return;
+
+	if (color == HLBLOOD_RED)
+		HLDecalAdd(org, normal, HLDECAL_BLOOD1 + HLFxRandI(0, 5));
+	else
+		HLDecalAdd(org, normal, HLDECAL_YBLOOD1 + HLFxRandI(0, 5));
+}
+
+U0 HLFxBlood(F64 *org, F64 *dir, I64 color, I64 speed, F64 now)
+{//TE_BLOOD, R_Blood - the plain particle spray
+ //
+ //the colour byte is a base palette index; the low three bits are replaced per
+ //particle, the same speckle R_RunParticleEffect makes
+	CHLParticle	*p;
+	I64			 i;
+	I64			 j;
+
+	if (!HLFxShouldShowBlood(color))
+		return;
+
+	for (i = 0; i < 24; i++)
+	{
+		p = HLPartAlloc(now);
+		if (!p)
+			return;
+
+		p->die   = now + 1.0 + HLFxRandF(0.0, 0.5);
+		p->color = (color & ~7) + HLPartRandI(8);
+		p->type  = HLPT_GRAV;
+		p->ramp  = 0.0;
+
+		for (j = 0; j < 3; j++)
+		{
+			p->org[j] = org[j] + HLPartRand(4.0);
+			p->vel[j] = dir[j] * ToF64(speed) + HLPartRand(ToF64(speed) * 0.4);
+		}
+	}
+}
+
+U0 HLFxBloodStream(F64 *org, F64 *dir, I64 color, I64 amount, F64 now)
+{//UTIL_BloodStream, TE_BLOODSTREAM, R_BloodStream
+ //
+ //the message carries the direction and a speed byte; the amount the caller
+ //passes is that speed. A stream is a tight jet that arcs over, so the spread
+ //is a fraction of the launch speed and every particle falls under gravity
+	CHLParticle	*p;
+	F64			 speed;
+	I64			 i;
+	I64			 j;
+
+	if (!HLFxShouldShowBlood(color))
+		return;
+
+	if (amount > 255)
+		amount = 255;
+
+	if (amount <= 0)
+		return;
+
+	speed = ToF64(amount);
+
+	for (i = 0; i < 100; i++)
+	{
+		p = HLPartAlloc(now);
+		if (!p)
+			return;
+
+		p->die   = now + 2.0;
+		p->color = (color & ~7) + HLPartRandI(8);
+		p->type  = HLPT_GRAV;
+		p->ramp  = 0.0;
+
+		//the jet thins along its length: later particles start slower, so the
+		//stream stretches instead of arriving as one clump
+		for (j = 0; j < 3; j++)
+		{
+			p->org[j] = org[j] + HLPartRand(2.0);
+			p->vel[j] = dir[j] * speed * (0.4 + ToF64(i) / 100.0) +
+						HLPartRand(speed * 0.15);
+		}
+	}
+}
+
+U0 HLFxBloodDrips(F64 *org, F64 *dir, I64 color, I64 amount, F64 now)
+{//UTIL_BloodDrips, TE_BLOODSPRITE, R_BloodSprite
+ //
+ //Valve sends bloodspray.spr as the initial burst and blood.spr as the
+ //droplets, with a size of min(max(3, amount/10), 16). The size is the whole of
+ //the damage scaling: the sprite scale in tenths and the droplet count
+ //
+ //both sprites are red, and HLSprPutPixel has no tint. Yellow blood keeps the
+ //particle spray below, which carries its palette index
+	CHLTEnt		*t;
+	CHLParticle	*p;
+	F64			 vel[3];
+	F64			 size;
+	I64			 count;
+	I64			 i;
+	I64			 j;
+
+	if (!HLFxShouldShowBlood(color) || !amount)
+		return;
+
+	if (amount > 255)
+		amount = 255;
+
+	count = amount / 10;
+	if (count < 3)
+		count = 3;
+	if (count > 16)
+		count = 16;
+
+	size = ToF64(count);
+
+	HLTEntLoadSprites;
+
+	if (color == HLBLOOD_RED && hl_te_bloodspray && hl_te_blooddrop)
+	{
+		//sprite1, one opaque cycle at the impact. TE_BLOODSPRITE is a
+		//high-priority tent, so it is spawned before the droplets take slots
+		t = HLTEntSpawn(hl_te_bloodspray, org, NULL, size * 0.1, 255.0,
+			HLTENT_MODE_NORMAL, 20.0, ToF64(hl_te_bloodspray->num_frames) /
+			20.0, HLTENT_SPRANIMATE, now);
+
+		//sprite2, the droplets that fall for one to two seconds
+		for (i = 0; i < count; i++)
+		{
+			for (j = 0; j < 3; j++)
+				vel[j] = dir[j] * size * 6.0 + HLPartRand(size * 8.0);
+
+			t = HLTEntSpawn(hl_te_blooddrop, org, vel, size * 0.08, 255.0,
+				HLTENT_MODE_NORMAL, 12.0, 1.0 + HLFxRandF(0.0, 1.0),
+				HLTENT_GRAVITY | HLTENT_SPRCYCLE, now);
+
+			if (!t)
+				goto qbd_done;
+
+			t->frame = ToF64(HLPartRandI(hl_te_blooddrop->num_frames));
+		}
+
+qbd_done:
+		return;
+	}
+
+	//the spray, thrown along the attack direction
+	for (i = 0; i < count * 2; i++)
+	{
+		p = HLPartAlloc(now);
+		if (!p)
+			return;
+
+		p->die   = now + 0.5 + HLFxRandF(0.0, 0.5);
+		p->color = (color & ~7) + HLPartRandI(8);
+		p->type  = HLPT_GRAV;
+		p->ramp  = 0.0;
+
+		for (j = 0; j < 3; j++)
+		{
+			p->org[j] = org[j] + HLPartRand(size * 0.5);
+			p->vel[j] = dir[j] * size * 6.0 + HLPartRand(size * 8.0);
+		}
+	}
+
+	//the drips, which the sprite half of the message drops for one to two
+	//seconds. Nearly still at birth, so they fall rather than fly
+	for (i = 0; i < count; i++)
+	{
+		p = HLPartAlloc(now);
+		if (!p)
+			return;
+
+		p->die   = now + 1.0 + HLFxRandF(0.0, 1.0);
+		p->color = (color & ~7) + HLPartRandI(8);
+		p->type  = HLPT_GRAV;
+		p->ramp  = 0.0;
+
+		for (j = 0; j < 3; j++)
+		{
+			p->org[j] = org[j] + HLPartRand(size);
+			p->vel[j] = HLPartRand(size);
+		}
+	}
+}
+
+U0 HLFxSpawnBlood(F64 *org, F64 *dir, I64 color, F64 damage, F64 now)
+{//SpawnBlood, weapons.cpp:147 - UTIL_BloodDrips along g_vecAttackDir, with the
+ //damage passed straight through as the amount.
+ //
+ //g_vecAttackDir is a global the damage path sets to the shot direction, so it
+ //is a parameter here. NULL takes UTIL_RandomBloodVector instead, which is what
+ //an attack with no direction of its own leaves in it
+	F64 rnd[3];
+
+	if (dir)
+	{
+		HLFxBloodDrips(org, dir, color, ToI64(damage), now);
+		return;
+	}
+
+	HLFxRandomBloodVector(rnd);
+	HLFxBloodDrips(org, rnd, color, ToI64(damage), now);
+}
+
+U0 HLFxSparks(F64 *org, F64 now)
+{//UTIL_Sparks, TE_SPARKS - eight tracers with gravity and a ricochet sprite
+ //
+ //the tracers stay particles: they are tracers in the engine too, and the fire
+ //ramp dims them as they fall. The sprite is spark1.spr, additive and fading
+	CHLTEnt		*t;
+	CHLParticle	*p;
+	F64			 dir[3];
+	F64			 speed;
+	I64			 i;
+	I64			 j;
+
+	HLTEntLoadSprites;
+
+	if (hl_te_spark)
+		t = HLTEntSpawn(hl_te_spark, org, NULL, 0.4, 255.0, HLTENT_MODE_ADD,
+			20.0, ToF64(hl_te_spark->num_frames) / 20.0,
+			HLTENT_SPRANIMATE | HLTENT_FADEOUT, now);
+
+	for (i = 0; i < 8; i++)
+	{
+		p = HLPartAlloc(now);
+		if (!p)
+			return;
+
+		p->die   = now + 0.3 + HLFxRandF(0.0, 0.2);
+		p->color = HLFX_SPARK_COLOR;
+		p->type  = HLPT_SPARK;
+		p->ramp  = ToF64(HLPartRandI(2));
+
+		HLVecSet(dir, HLPartRand(1.0), HLPartRand(1.0),
+			HLFxRandF(0.0, 1.0));
+
+		if (HLVecNormalize(dir) < 0.001)
+			HLVecSet(dir, 0.0, 0.0, 1.0);
+
+		speed = HLFxRandF(100.0, 300.0);
+
+		for (j = 0; j < 3; j++)
+		{
+			p->org[j] = org[j] + HLPartRand(2.0);
+			p->vel[j] = dir[j] * speed;
+		}
+	}
+}
+
+U0 HLFxSparkShower(F64 *org, F64 *normal, F64 now)
+{//CShower::Spawn - the spark_shower an explosion scatters along the surface
+ //normal it was traced against
+ //
+ //Valve makes it a bouncing entity that calls UTIL_Sparks once every 0.1s for
+ //half to one and a half seconds. Without an entity to bounce, the whole burst
+ //is emitted at once from the spawn point
+	F64	dir[3];
+	F64	burst[3];
+	I64	i;
+
+	HLVecCopy(normal, dir);
+	if (HLVecNormalize(dir) < 0.001)
+		HLVecSet(dir, 0.0, 0.0, 1.0);
+
+	//TE_SPRITE_SPRAY along the normal, which is the streak half of the shower
+	HLTEntLoadSprites;
+
+	if (hl_te_spark)
+		HLTEntSpray(hl_te_spark, org, dir, 6, 220.0, 60.0, 0.25,
+			HLTENT_MODE_ADD, now);
+
+	for (i = 0; i < 4; i++)
+	{
+		burst[0] = org[0] + dir[0] * ToF64(i) * 4.0;
+		burst[1] = org[1] + dir[1] * ToF64(i) * 4.0;
+		burst[2] = org[2] + dir[2] * ToF64(i) * 4.0;
+		HLFxSparks(burst, now);
+	}
+}
+
+U0 HLFxRicochet(F64 *org, F64 scale, F64 now)
+{//UTIL_Ricochet, TE_ARMOR_RICOCHET - a quick spark sprite and a sound
+ //
+ //R_RicochetSprite: richo1.spr, additive, at the caller's scale for a tenth of
+ //a second. Valve sends scale*10 as the byte, which is the same number
+	CHLTEnt		*t;
+	CHLParticle	*p;
+	I64			 count;
+	I64			 i;
+	I64			 j;
+
+	HLTEntLoadSprites;
+
+	if (hl_te_richo)
+	{
+		t = HLTEntSpawn(hl_te_richo, org, NULL, scale, 255.0, HLTENT_MODE_ADD,
+			10.0, 0.1, HLTENT_FADEOUT, now);
+
+		if (t)
+			return;
+	}
+
+	count = ToI64(scale * 10.0);
+	if (count < 4)
+		count = 4;
+	if (count > 32)
+		count = 32;
+
+	for (i = 0; i < count; i++)
+	{
+		p = HLPartAlloc(now);
+		if (!p)
+			return;
+
+		p->die   = now + 0.15 + HLFxRandF(0.0, 0.1);
+		p->color = HLFX_SPARK_COLOR;
+		p->type  = HLPT_FIRE;
+		p->ramp  = ToF64(HLPartRandI(3));
+
+		for (j = 0; j < 3; j++)
+		{
+			p->org[j] = org[j] + HLPartRand(1.0);
+			p->vel[j] = HLPartRand(180.0);
+		}
+	}
+}
+
+//Muzzle flash world width at a caller scale of 1.0, in units.
+//
+//HLTEntDrawSpr maps one sprite texel to one world unit at scale 1.0
+//(HLPart.ZC:1026), the same convention mspriteframe_t's left/right/up/down
+//carry. muzzleflash1.spr is 64x64 with its frame origin at (-32, 32), so the
+//caller's scale reached the blit as a 64 unit sprite - at the view model
+//attachment, some 15 units from the eye, that is the whole screen.
+//
+//The width below is this port's; the engine's own factor is not in the SDK.
+#define HLFX_MUZZLE_WIDTH	12.0
+
+//per-shot size jitter, so consecutive shots differ. R_MuzzleFlash varies the
+//sprite's roll instead; screen aligned sprites here cannot roll
+#define HLFX_MUZZLE_JITTER	0.15
+
+U0 HLFxMuzzleFlash(F64 *org, F64 scale, F64 now)
+{//R_MuzzleFlash - what the engine draws for an entity carrying EF_MUZZLEFLASH,
+ //anchored on studio attachment 0
+ //
+ //muzzleflash1.spr, additive at full render amount, dying on the next frame.
+ //R_MuzzleFlash gives the sprite a random roll of 0..20 degrees so consecutive
+ //shots differ; sprites here are screen aligned and cannot roll, so the frame
+ //is picked at random instead
+ //
+ //deviation: EF_MUZZLEFLASH is a single frame ELIGHT, common/const.h:105. An
+ //elight shades models and leaves world surfaces alone. There is no elight path
+ //here, so the flash takes a dlight and lights the surrounding geometry as
+ //well. Added whether or not the sprite spawned.
+ //
+ //radius, lifetime and colour are this port's. The engine's elight parameters
+ //are not in the SDK.
+	CHLTEnt	*t;
+	F64		 spr_scale;
+	F64		 texels;
+
+	HLTEntLoadSprites;
+
+	if (hl_te_muzzle)
+	{
+		//scale is the engine's: 0.5 with no scale byte, 1.0 for the view model.
+		//It sizes the flash relative to HLFX_MUZZLE_WIDTH rather than being the
+		//texel-to-unit ratio itself
+		texels = ToF64(hl_te_muzzle->max_width);
+		if (texels < 1.0)
+			texels = 1.0;
+
+		spr_scale = scale * HLFX_MUZZLE_WIDTH / texels;
+		spr_scale += spr_scale * HLPartRand(HLFX_MUZZLE_JITTER);
+
+		t = HLTEntSpawn(hl_te_muzzle, org, NULL, spr_scale, 255.0,
+			HLTENT_MODE_ADD, 0.0, 0.05, 0, now);
+
+		if (t)
+			t->frame = ToF64(HLPartRandI(hl_te_muzzle->num_frames));
+	}
+
+	HLDlightAdd(org, 120.0 * scale, 0.05, 0.0, now, 255, 220, 140);
+}
+
+U0 HLFxGunshot(F64 *org, F64 now)
+{//TE_GUNSHOT - particle effect plus ricochet sound. R_RunParticleEffect with
+ //twenty particles of colour 0, which is what svc_temp_entity does for it
+ //
+ //the impact has no plane here, so the puff sits on the point it was given
+	CHLTEnt *t;
+
+	HLTEntLoadSprites;
+
+	if (hl_te_wallpuff)
+	{
+		t = HLTEntSpawn(hl_te_wallpuff, org, NULL, 0.15, 180.0,
+			HLTENT_MODE_ADD, 10.0, 0.4, HLTENT_FADEOUT, now);
+
+		if (t)
+			return;
+	}
+
+	HLPartEffect(org, NULL, 0, 20, now);
+}
+
+//Impact puff drift. The trace plane normal points out of the struck surface
+//toward the shooter (HLClip.ZC:1725 calls normal[2] >= 0.7 a floor), so the
+//smoke leaves along +normal. Speed and cone are this port's; the engine's
+//R_BulletImpactParticles is not in the SDK.
+#define HLFX_PUFF_SPEED		40.0	//units/s out of the surface
+#define HLFX_PUFF_SPREAD	14.0	//units/s, one cone axis
+#define HLFX_PUFF_RISE		10.0	//units/s, buoyancy once clear of the wall
+
+U0 HLFxGunshotDecal(F64 *org, F64 *normal, F64 now)
+{//EV_HLDM_GunshotDecalTrace - R_BulletImpactParticles, then one of the five
+ //shot patches. Only brush surfaces take a decal, which is the caller's test
+ //
+ //the puff is wallpuff.spr, an index-alpha mask lifted one unit off the plane
+ //so it does not fight the decal for the depth test
+	CHLTEnt	*t;
+	F64		 spot[3];
+	I64		 i;
+
+	HLTEntLoadSprites;
+
+	if (hl_te_wallpuff)
+	{
+		HLVecMA(org, 2.0, normal, spot);
+
+		t = HLTEntSpawn(hl_te_wallpuff, spot, NULL, 0.15, 180.0,
+			HLTENT_MODE_ADD, 10.0, 0.4, HLTENT_FADEOUT, now);
+
+		//the drifting smoke the puff leaves behind
+		if (t && hl_te_trailsmoke)
+		{
+			t = HLTEntSpawn(hl_te_trailsmoke, spot, NULL, 0.12, 110.0,
+				HLTENT_MODE_ADD, 8.0, 0.7, HLTENT_FADEOUT | HLTENT_SPRCYCLE,
+				now);
+
+			//sprayed back out of the wall along the normal, not upward
+			if (t)
+			{
+				for (i = 0; i < 3; i++)
+					t->vel[i] = normal[i] * HLFX_PUFF_SPEED +
+						HLPartRandCone() * HLFX_PUFF_SPREAD;
+
+				t->vel[2] += HLFX_PUFF_RISE;
+			}
+		}
+	}
+	else
+		HLPartEffect(org, normal, 0, 12, now);
+
+	HLDecalAdd(org, normal, HLDECAL_GUNSHOT1 + HLFxRandI(0, 4));
+}
+
+U0 HLFxSmoke(F64 *org, F64 scale, F64 now)
+{//TE_SMOKE - alphablend sprite, moves vertically 30 pps
+ //
+ //g_sModelIndexSmoke is steam1.spr, an index-alpha mask. CEnvExplosion::Smoke
+ //sends the scale in tenths and a framerate of 12
+	CHLTEnt		*t;
+	CHLParticle	*p;
+	F64			 radius;
+	I64			 count;
+	I64			 i;
+	I64			 j;
+
+	HLTEntLoadSprites;
+
+	if (hl_te_smoke)
+	{
+		t = HLTEntSpawn(hl_te_smoke, org, NULL, scale * 0.1, 220.0,
+			HLTENT_MODE_ADD, 12.0, ToF64(hl_te_smoke->num_frames) / 12.0,
+			HLTENT_SPRANIMATE | HLTENT_FADEOUT, now);
+
+		if (t)
+		{
+			t->vel[2] = 30.0;
+			return;
+		}
+	}
+
+	radius = scale * 0.1 * 8.0;
+	if (radius < 4.0)
+		radius = 4.0;
+
+	count = ToI64(radius);
+	if (count < 8)
+		count = 8;
+	if (count > 64)
+		count = 64;
+
+	for (i = 0; i < count; i++)
+	{
+		p = HLPartAlloc(now);
+		if (!p)
+			return;
+
+		p->die   = now + 1.5 + HLFxRandF(0.0, 1.0);
+		p->color = HLFX_SMOKE_COLOR + HLPartRandI(4);
+		p->type  = HLPT_STATIC;
+		p->ramp  = 0.0;
+
+		for (j = 0; j < 3; j++)
+			p->org[j] = org[j] + HLPartRand(radius);
+
+		//30 pps upward, with a little drift so the puff spreads
+		p->vel[0] = HLPartRand(radius);
+		p->vel[1] = HLPartRand(radius);
+		p->vel[2] = 30.0 + HLFxRandF(0.0, 10.0);
+	}
+}
+
+U0 HLFxBubbles(F64 *mins, F64 *maxs, F64 height, I64 count, F64 speed, F64 now)
+{//UTIL_Bubbles, TE_BUBBLES - alpha sprites started anywhere in the box and
+ //floating up. height is the distance to the surface, so it sets the life
+ //
+ //g_sModelIndexBubbles is bubble.spr, one index-alpha frame. The count byte
+ //reaches 255, which would evict every other effect, so the sprites are capped
+ //and the remainder stays in the particle pool
+	CHLTEnt		*t;
+	CHLParticle	*p;
+	F64			 org[3];
+	F64			 life;
+	I64			 sprites;
+	I64			 i;
+
+	if (count > 255)
+		count = 255;
+
+	if (speed < 1.0)
+		speed = 8.0;			//UTIL_Bubbles writes 8
+
+	life = height / speed;
+	if (life <= 0.0)
+		return;
+
+	if (life > 10.0)
+		life = 10.0;
+
+	HLTEntLoadSprites;
+
+	sprites = 0;
+
+	if (hl_te_bubble)
+	{
+		sprites = count;
+		if (sprites > HLFX_BUBBLE_MAX)
+			sprites = HLFX_BUBBLE_MAX;
+
+		for (i = 0; i < sprites; i++)
+		{
+			org[0] = mins[0] + HLFxRandF(0.0, maxs[0] - mins[0]);
+			org[1] = mins[1] + HLFxRandF(0.0, maxs[1] - mins[1]);
+			org[2] = mins[2] + HLFxRandF(0.0, maxs[2] - mins[2]);
+
+			t = HLTEntSpawn(hl_te_bubble, org, NULL, 0.4, 200.0,
+				HLTENT_MODE_ADD, 0.0, life, 0, now);
+
+			if (!t)
+				goto qbu_rest;
+
+			//a bubble wobbles as it rises
+			t->vel[0] = HLPartRand(3.0);
+			t->vel[1] = HLPartRand(3.0);
+			t->vel[2] = speed;
+		}
+	}
+
+qbu_rest:
+	for (i = sprites; i < count; i++)
+	{
+		p = HLPartAlloc(now);
+		if (!p)
+			return;
+
+		p->die   = now + life;
+		p->color = 254;			//the base palette's near white
+		p->type  = HLPT_STATIC;
+		p->ramp  = 0.0;
+
+		p->org[0] = mins[0] + HLFxRandF(0.0, maxs[0] - mins[0]);
+		p->org[1] = mins[1] + HLFxRandF(0.0, maxs[1] - mins[1]);
+		p->org[2] = mins[2] + HLFxRandF(0.0, maxs[2] - mins[2]);
+
+		p->vel[0] = HLPartRand(2.0);
+		p->vel[1] = HLPartRand(2.0);
+		p->vel[2] = speed;
+	}
+}
+
+U0 HLFxBubbleTrail(F64 *from, F64 *to, F64 height, I64 count, F64 speed,
+	F64 now)
+{//UTIL_BubbleTrail, TE_BUBBLETRAIL - the same, spread along a segment
+	CHLTEnt		*t;
+	CHLParticle	*p;
+	F64			 org[3];
+	F64			 life;
+	F64			 f;
+	I64			 sprites;
+	I64			 i;
+
+	if (count > 255)
+		count = 255;
+
+	if (speed < 1.0)
+		speed = 8.0;
+
+	life = height / speed;
+	if (life <= 0.0)
+		return;
+
+	if (life > 10.0)
+		life = 10.0;
+
+	HLTEntLoadSprites;
+
+	sprites = 0;
+
+	if (hl_te_bubble)
+	{
+		sprites = count;
+		if (sprites > HLFX_BUBBLE_MAX)
+			sprites = HLFX_BUBBLE_MAX;
+
+		for (i = 0; i < sprites; i++)
+		{
+			f = HLFxRandF(0.0, 1.0);
+
+			org[0] = from[0] + (to[0] - from[0]) * f + HLPartRand(2.0);
+			org[1] = from[1] + (to[1] - from[1]) * f + HLPartRand(2.0);
+			org[2] = from[2] + (to[2] - from[2]) * f + HLPartRand(2.0);
+
+			t = HLTEntSpawn(hl_te_bubble, org, NULL, 0.4, 200.0,
+				HLTENT_MODE_ADD, 0.0, life, 0, now);
+
+			if (!t)
+				goto qbt_rest;
+
+			t->vel[0] = HLPartRand(3.0);
+			t->vel[1] = HLPartRand(3.0);
+			t->vel[2] = speed;
+		}
+	}
+
+qbt_rest:
+	for (i = sprites; i < count; i++)
+	{
+		p = HLPartAlloc(now);
+		if (!p)
+			return;
+
+		f = HLFxRandF(0.0, 1.0);
+
+		p->die   = now + life;
+		p->color = 254;
+		p->type  = HLPT_STATIC;
+		p->ramp  = 0.0;
+
+		p->org[0] = from[0] + (to[0] - from[0]) * f + HLPartRand(2.0);
+		p->org[1] = from[1] + (to[1] - from[1]) * f + HLPartRand(2.0);
+		p->org[2] = from[2] + (to[2] - from[2]) * f + HLPartRand(2.0);
+
+		p->vel[0] = HLPartRand(2.0);
+		p->vel[1] = HLPartRand(2.0);
+		p->vel[2] = speed;
+	}
+}
+
+U0 HLFxTracer(F64 *start, F64 *end, F64 now)
+{//TE_TRACER, EV_CreateTracer - a streak that travels from start to end
+ //
+ //the engine draws one sprite moving at 6000 units a second. Here the streak
+ //is a short line of particles given that velocity, so the head arrives at the
+ //same time and the tail follows it
+	CHLParticle	*p;
+	F64			 dir[3];
+	F64			 len;
+	F64			 life;
+	F64			 back;
+	I64			 i;
+	I64			 j;
+
+	HLVecSub(end, start, dir);
+	len = HLVecNormalize(dir);
+
+	if (len < 1.0)
+		return;
+
+	life = len / HLFX_TRACER_SPEED;
+
+	for (i = 0; i < 8; i++)
+	{
+		p = HLPartAlloc(now);
+		if (!p)
+			return;
+
+		back = HLFX_TRACER_LEN * ToF64(i) / 8.0;
+
+		p->die   = now + life;
+		p->color = HLFX_TRACER_COLOR + (HLPartRandI(2) << 1);
+		p->type  = HLPT_STATIC;
+		p->ramp  = 0.0;
+
+		for (j = 0; j < 3; j++)
+		{
+			p->org[j] = start[j] - dir[j] * back;
+			p->vel[j] = dir[j] * HLFX_TRACER_SPEED;
+		}
+	}
+}
+
+U0 HLFxExplosion(F64 *org, F64 scale, I64 flags, F64 now)
+{//TE_EXPLOSION - additive fireball sprite, two dynamic lights, flickering
+ //particles, moves vertically 8 pps. flags are the TE_EXPLFLAG_* set in
+ //common/const.h
+ //
+ //g_sModelIndexFireball is zerogxplode.spr, fifteen additive frames.
+ //CEnvExplosion::Use sends the scale in tenths and a framerate of 15
+	CHLTEnt	*t;
+	F64		 radius;
+	I64		 mode;
+
+	radius = scale * 0.1 * 20.0;
+	if (radius < 100.0)
+		radius = 100.0;
+
+	HLTEntLoadSprites;
+
+	t = NULL;
+
+	if (hl_te_fireball)
+	{
+		//TE_EXPLFLAG_NOADDITIVE draws the sprite opaque, which here means the
+		//world lights it instead of its own render amount
+		mode = HLTENT_MODE_ADD;
+		if (flags & 1)
+			mode = HLTENT_MODE_NORMAL;
+
+		t = HLTEntSpawn(hl_te_fireball, org, NULL, scale * 0.1, 255.0, mode,
+			15.0, ToF64(hl_te_fireball->num_frames) / 15.0,
+			HLTENT_SPRANIMATE, now);
+
+		if (t)
+			t->vel[2] = 8.0;
+	}
+
+	//R_ParticleExplosion is the Quake fireball, and stands in only when
+	//zerogxplode.spr is missing from the install
+	if (!t && !(flags & 8))			//TE_EXPLFLAG_NOPARTICLES
+		HLPartExplosion(org, now);
+
+	if (!(flags & 2))				//TE_EXPLFLAG_NODLIGHTS
+	{
+		//two lights, the second dimmer and longer, which is what gives the
+		//flash its falloff
+		HLDlightAdd(org, radius, 0.5, radius * 2.0, now, 255, 190, 90);
+		HLDlightAdd(org, radius * 0.6, 1.0, radius, now, 255, 120, 40);
+	}
+}
+
+U0 HLFxExplosionCreate(CHLMap *map, F64 *center, I64 magnitude, F64 now)
+{//ExplosionCreate and CEnvExplosion::Use, dlls/explode.cpp
+ //
+ //the sprite scale is (magnitude - 50) * 0.6 with a floor of 10. The origin is
+ //pulled out of whatever is under it by (magnitude - 24) * 0.6 along the plane
+ //normal, exactly as the SDK does, so a blast against a floor lifts clear of it
+ //
+ //CEnvExplosion::Smoke runs 0.3s later on a think. There is no think scheduler
+ //for a non-entity effect here, so the smoke goes out with the fireball
+	CHLTrace	tr;
+	F64			spot[3];
+	F64			down[3];
+	F64			org[3];
+	F64			up[3];
+	F64			scale;
+	I64			sparks;
+	I64			i;
+
+	scale = (ToF64(magnitude) - 50.0) * 0.6;
+	if (scale < 10.0)
+		scale = 10.0;
+
+	HLVecSet(up, 0.0, 0.0, 1.0);
+	HLVecCopy(center, org);
+
+	HLVecSet(spot, center[0], center[1], center[2] + 8.0);
+	HLVecSet(down, spot[0], spot[1], spot[2] - 40.0);
+
+	//UTIL_TraceLine, dlls/explode.cpp:161. Point trace: the scorch and the
+	//lifted fireball origin both come off tr.end_pos, and a hull-1 sweep would
+	//stop the probe 36 units above the floor
+	HLTracePoint(map, spot, down, &tr);
+
+	if (tr.fraction != 1.0)
+	{
+		HLVecMA(tr.end_pos, (ToF64(magnitude) - 24.0) * 0.6, tr.plane_normal,
+			org);
+		HLVecCopy(tr.plane_normal, up);
+
+		//SF_ENVEXPLOSION_NODECAL is not set by ExplosionCreate, so the scorch
+		//always lands: one of the two at even odds
+		if (HLFxRandF(0.0, 1.0) < 0.5)
+			HLDecalAdd(tr.end_pos, tr.plane_normal, HLDECAL_SCORCH1);
+		else
+			HLDecalAdd(tr.end_pos, tr.plane_normal, HLDECAL_SCORCH2);
+	}
+
+	HLFxExplosion(org, scale, 0, now);
+	HLFxSmoke(org, scale, now);
+
+	//RANDOM_LONG(0,3) spark showers along the surface normal
+	sparks = HLFxRandI(0, 3);
+	for (i = 0; i < sparks; i++)
+		HLFxSparkShower(org, up, now);
+}
+
+//--- gib pool --------------------------------------------------------------
+
+U0 HLGibLoadModels()
+{//hgibs.mdl and agibs.mdl, once. A missing model is not retried: the pool
+ //still runs and the blood trail shows where the gibs went
+	if (hl_gib_mdl_tried)
+		return;
+
+	hl_gib_mdl_tried = TRUE;
+	hl_gib_mdl_human = HLStudioCacheGet("models/hgibs.mdl");
+	hl_gib_mdl_alien = HLStudioCacheGet("models/agibs.mdl");
+}
+
+U0 HLGibLimitVelocity(CHLGib *g)
+{//CGib::LimitVelocity - the gib velocity equation is unbounded, so it is
+ //capped at 1500 rather than tuned in three places
+	F64 len;
+
+	len = HLVecLength(g->velocity);
+	if (len > HLGIB_MAXVEL)
+		HLVecScale(g->velocity, HLGIB_MAXVEL / len, g->velocity);
+}
+
+U0 HLGibHealthScale(CHLGib *g, F64 health)
+{//the shared tail of SpawnRandomGibs, SpawnHeadGib and SpawnStickyGibs: the
+ //deader the victim, the harder the pieces fly
+	if (health > -50.0)
+		HLVecScale(g->velocity, 0.7, g->velocity);
+	else if (health > -200.0)
+		HLVecScale(g->velocity, 2.0, g->velocity);
+	else
+		HLVecScale(g->velocity, 4.0, g->velocity);
+}
+
+CHLGib *HLGibAlloc(F64 now)
+{//oldest slot recycled once the pool is full, as the engine drops the oldest
+ //temp entity
+	CHLGib	*g;
+	I64		 i;
+
+	for (i = 0; i < HLGIB_MAX; i++)
+	{
+		if (!hl_gibs[i].active)
+		{
+			hl_gibs[i].active = TRUE;
+			return &hl_gibs[i];
+		}
+	}
+
+	g = &hl_gibs[hl_gib_next];
+
+	hl_gib_next++;
+	if (hl_gib_next >= HLGIB_MAX)
+		hl_gib_next = 0;
+
+	g->active = TRUE;
+	return g;
+}
+
+U0 HLGibSpawn(CHLGib *g, F64 *origin, Bool human, I64 body, I64 blood_color,
+	F64 now)
+{//CGib::Spawn plus the fields every caller sets afterwards
+	HLVecCopy(origin, g->origin);
+	HLVecCopy(origin, g->prev);
+	HLVecSet(g->velocity, 0.0, 0.0, 0.0);
+	HLVecSet(g->angles, 0.0, 0.0, 0.0);
+	HLVecSet(g->avelocity, 0.0, 0.0, 0.0);
+
+	g->human       = human;
+	g->body        = body;
+	g->blood_color = blood_color;
+	g->decals_left = HLGIB_DECALS;
+	g->mdl         = NULL;
+	g->on_ground   = FALSE;
+	g->die         = now + HLGIB_LIFETIME;
+}
+
+U0 HLGibSpawnRandomGibs(F64 *absmin, F64 *size, F64 *attack_dir, F64 health,
+	I64 count, Bool human, I64 blood_color, F64 now)
+{//CGib::SpawnRandomGibs - cGibs pieces from anywhere inside the victim's box,
+ //thrown back down the attack vector
+ //
+ //human bodies start at submodel 1 so the skull is not thrown at random
+	CHLGib	*g;
+	I64		 i;
+	I64		 body;
+
+	HLGibLoadModels;
+
+	for (i = 0; i < count; i++)
+	{
+		if (human)
+			body = HLFxRandI(1, HLGIB_HUMAN_COUNT - 1);
+		else
+			body = HLFxRandI(0, HLGIB_ALIEN_COUNT - 1);
+
+		g = HLGibAlloc(now);
+
+		//absmin.z sits in the floor, the engine having shrunk the box by one
+		g->origin[0] = absmin[0] + size[0] * HLFxRandF(0.0, 1.0);
+		g->origin[1] = absmin[1] + size[1] * HLFxRandF(0.0, 1.0);
+		g->origin[2] = absmin[2] + size[2] * HLFxRandF(0.0, 1.0) + 1.0;
+
+		HLGibSpawn(g, g->origin, human, body, blood_color, now);
+
+		//away from the attack vector, with noise mixed in before the speed
+		//multiply, so the noise scales with it
+		g->velocity[0] = -attack_dir[0] + HLFxRandF(-0.25, 0.25);
+		g->velocity[1] = -attack_dir[1] + HLFxRandF(-0.25, 0.25);
+		g->velocity[2] = -attack_dir[2] + HLFxRandF(-0.25, 0.25);
+
+		HLVecScale(g->velocity, HLFxRandF(300.0, 400.0), g->velocity);
+
+		g->avelocity[0] = HLFxRandF(100.0, 200.0);
+		g->avelocity[1] = HLFxRandF(100.0, 300.0);
+		g->avelocity[2] = 0.0;
+
+		HLGibHealthScale(g, health);
+		HLGibLimitVelocity(g);
+	}
+}
+
+U0 HLGibSpawnHeadGib(F64 *origin, F64 *target, F64 health, I64 blood_color,
+	F64 now)
+{//CGib::SpawnHeadGib - one head, submodel 0 of hgibs.mdl, from the victim's
+ //eye position
+ //
+ //target is the eye of a player in the PVS; five times in a hundred the head
+ //is thrown at it at 300 units a second. NULL skips that case
+	CHLGib	*g;
+	F64		 dir[3];
+
+	HLGibLoadModels;
+
+	g = HLGibAlloc(now);
+	HLGibSpawn(g, origin, TRUE, 0, blood_color, now);
+
+	if (target && HLFxRandI(0, 100) <= 5)
+	{
+		HLVecSub(target, origin, dir);
+		if (HLVecNormalize(dir) < 0.001)
+			HLVecSet(dir, 0.0, 0.0, 1.0);
+
+		HLVecScale(dir, 300.0, g->velocity);
+		g->velocity[2] += 100.0;
+	}
+	else
+		HLVecSet(g->velocity, HLFxRandF(-100.0, 100.0),
+			HLFxRandF(-100.0, 100.0), HLFxRandF(200.0, 300.0));
+
+	g->avelocity[0] = HLFxRandF(100.0, 200.0);
+	g->avelocity[1] = HLFxRandF(100.0, 300.0);
+	g->avelocity[2] = 0.0;
+
+	HLGibHealthScale(g, health);
+	HLGibLimitVelocity(g);
+}
+
+CHLStudio *HLGibDebrisModel(U8 *path)
+{//material debris model by path. A load that fails is cached as NULL and not
+ //retried, so a map missing woodgibs.mdl does not reach the filesystem on every
+ //crate. The studio cache owns what this returns
+	CHLStudio	*m;
+	I64			 i;
+
+	if (!path || !path[0])
+		return NULL;
+
+	for (i = 0; i < hl_gib_dbg_count; i++)
+	{
+		if (!StrICompare(&hl_gib_dbg_name[i * HLGIB_DEBRIS_NAME], path))
+			return hl_gib_dbg_mdl[i];
+	}
+
+	m = HLStudioCacheGet(path);
+
+	if (hl_gib_dbg_count < HLGIB_DEBRIS_MDLS)
+	{
+		HLRdName(path, &hl_gib_dbg_name[hl_gib_dbg_count * HLGIB_DEBRIS_NAME],
+			HLGIB_DEBRIS_NAME);
+		hl_gib_dbg_mdl[hl_gib_dbg_count] = m;
+		hl_gib_dbg_count++;
+	}
+
+	return m;
+}
+
+U0 HLGibSpawnDebris(F64 *absmin, F64 *size, F64 *velocity, I64 count,
+	U8 *path, F64 now)
+{//CBreakable::Die's TE_BREAKMODEL, run in the pool instead of on a client.
+ //
+ //path is a material model from func_break.cpp:284-341 - woodgibs.mdl,
+ //glassgibs.mdl, metalplategibs.mdl, fleshgibs.mdl, cindergibs.mdl,
+ //ceilinggibs.mdl, computergibs.mdl, rockgibs.mdl - or a map's own gibmodel key.
+ //
+ //velocity is CBreakable::Die's vecVelocity: g_vecAttackDir * 200 for an
+ //expDirected break, zero otherwise. NULL reads as zero.
+ //
+ //debris does not bleed, so blood_color is HLBLOOD_DONT and no trail is laid
+	CHLGib		*g;
+	CHLStudio	*m;
+	F64			 base;
+	I64			 bodies;
+	I64			 body;
+	I64			 i;
+
+	if (!absmin || !size || count <= 0)
+		return;
+
+	m = HLGibDebrisModel(path);
+
+	if (!m)
+		return;
+
+	//one bodypart per debris model, one submodel per shard shape
+	bodies = 1;
+
+	if (m->num_bodyparts > 0 && m->bodyparts)
+		bodies = m->bodyparts[0].num_models;
+
+	if (bodies < 1)
+		bodies = 1;
+
+	base = 0.0;
+
+	if (velocity)
+		base = HLVecLength(velocity);
+
+	for (i = 0; i < count; i++)
+	{
+		body = HLFxRandI(0, bodies - 1);
+		g    = HLGibAlloc(now);
+
+		g->origin[0] = absmin[0] + size[0] * HLFxRandF(0.0, 1.0);
+		g->origin[1] = absmin[1] + size[1] * HLFxRandF(0.0, 1.0);
+		g->origin[2] = absmin[2] + size[2] * HLFxRandF(0.0, 1.0) + 1.0;
+
+		HLGibSpawn(g, g->origin, FALSE, body, HLBLOOD_DONT, now);
+
+		g->mdl = m;
+		g->die = now + HLGIB_DEBRIS_LIFE;
+
+		if (velocity)
+			HLVecCopy(velocity, g->velocity);
+
+		//the randomization byte is a percentage of the sent velocity
+		g->velocity[0] += HLFxRandF(-base, base) * HLGIB_DEBRIS_SPREAD;
+		g->velocity[1] += HLFxRandF(-base, base) * HLGIB_DEBRIS_SPREAD;
+		g->velocity[2] += HLFxRandF(-base, base) * HLGIB_DEBRIS_SPREAD;
+
+		//an undirected break sends zero velocity and the shards get their
+		//scatter from the client. That figure is not in the SDK; this one keeps
+		//the pieces inside the broken entity's footprint
+		if (base < 1.0)
+		{
+			g->velocity[0] += HLFxRandF(-25.0, 25.0);
+			g->velocity[1] += HLFxRandF(-25.0, 25.0);
+			g->velocity[2] += HLFxRandF(70.0, 130.0);
+		}
+
+		g->avelocity[0] = HLFxRandF(100.0, 200.0);
+		g->avelocity[1] = HLFxRandF(100.0, 300.0);
+		g->avelocity[2] = 0.0;
+
+		HLGibLimitVelocity(g);
+	}
+}
+
+U0 HLGibUpdate(CHLMap *map, F64 dt, F64 now)
+{//SV_Physics_Bounce over the pool, with CGib::BounceGibTouch on every impact
+ //
+ //a gib is UTIL_SetSize'd to a zero box, so every trace here is HLTracePoint
+ //against hull 0; hull 1 would hold it 36 units clear of every floor
+	CHLGib		*g;
+	CHLTrace	 tr;
+	CHLTrace	 dtr;
+	F64			 want[3];
+	F64			 clipped[3];
+	F64			 spot[3];
+	F64			 down[3];
+	F64			 speed;
+	Bool		 mark;
+	I64			 i;
+	I64			 j;
+
+	hl_gib_live = 0;
+
+	for (i = 0; i < HLGIB_MAX; i++)
+	{
+		g = &hl_gibs[i];
+
+		if (!g->active)
+			goto qgu_next;
+
+		if (g->die <= now)
+		{
+			g->active = FALSE;
+			goto qgu_next;
+		}
+
+		hl_gib_live++;
+		HLVecCopy(g->origin, g->prev);
+
+		if (g->on_ground)
+		{
+			//settled. WaitTillLand stops thinking once the velocity is zero
+			//and lets m_lifeTime run out
+			goto qgu_trail;
+		}
+
+		for (j = 0; j < 3; j++)
+			g->angles[j] = HLAngleNorm(g->angles[j] + g->avelocity[j] * dt);
+
+		g->velocity[2] -= HLGIB_GRAVITY * dt;
+		HLVecMA(g->origin, dt, g->velocity, want);
+
+		HLTracePoint(map, g->origin, want, &tr);
+
+		if (tr.all_solid || tr.start_solid)
+		{
+			//spawned inside the world, which SpawnRandomGibs can do from a
+			//box that overlaps a wall. Drop it rather than let it tunnel
+			g->active = FALSE;
+			goto qgu_next;
+		}
+
+		HLVecCopy(tr.end_pos, g->origin);
+
+		if (!tr.hit)
+			goto qgu_trail;
+
+		//CGib::BounceGibTouch. On the ground the bounce is damped and the
+		//pitch and roll are levelled; in the air the gib leaves a decal
+		HLClipVelocity(g->velocity, tr.plane_normal, HLGIB_BOUNCE, clipped);
+		HLVecScale(clipped, HLGIB_FRICTION, g->velocity);
+
+		speed = HLVecLength(g->velocity);
+
+		if (tr.plane_normal[2] > 0.7 && speed < HLGIB_STOPSPEED)
+		{
+			HLVecSet(g->velocity, 0.0, 0.0, 0.0);
+			HLVecSet(g->avelocity, 0.0, 0.0, 0.0);
+			g->angles[0] = 0.0;
+			g->angles[2] = 0.0;
+			g->on_ground = TRUE;
+
+			//WaitTillLand starts the fade timer only once it has landed
+			g->die = now + HLGIB_LIFETIME;
+			goto qgu_trail;
+		}
+
+		if (tr.plane_normal[2] > 0.7)
+		{
+			HLVecScale(g->velocity, HLGIB_GROUND_DAMP, g->velocity);
+			g->angles[0]    = 0.0;
+			g->angles[2]    = 0.0;
+			g->avelocity[0] = 0.0;
+			g->avelocity[2] = 0.0;
+			goto qgu_trail;
+		}
+
+		if (g->decals_left > 0 && g->blood_color != HLBLOOD_DONT)
+		{
+			//BounceGibTouch, dlls/combat.cpp:731: up 8, down 24, then
+			//UTIL_BloodDecalTrace. The bounce plane is already known, but the
+			//SDK spends the decal charge on the probe whether or not the probe
+			//lands, and the mark goes where the probe ends, not on the plane
+			//the gib struck
+			HLVecSet(spot, g->origin[0], g->origin[1], g->origin[2] + 8.0);
+			HLVecSet(down, spot[0], spot[1], spot[2] - 24.0);
+
+			HLTracePoint(map, spot, down, &dtr);
+
+			//UTIL_DecalTrace's flFraction == 1.0 early-out, dlls/util.cpp:1236
+			mark = FALSE;
+			if (dtr.fraction != 1.0)
+				mark = TRUE;
+
+			if (mark && hl_part_decalsurface_hook)
+				mark = hl_part_decalsurface_hook(&dtr);
+
+			if (mark)
+				HLFxBloodDecal(dtr.end_pos, dtr.plane_normal,
+					g->blood_color);
+
+			g->decals_left--;
+		}
+
+qgu_trail:
+		//hgibs.mdl carries the gib flag, which is a blood trail
+		if (g->blood_color != HLBLOOD_DONT && !g->on_ground)
+			HLPartTrail(g->prev, g->origin, HLTRAIL_BLOOD, now);
+
+qgu_next:
+	}
+}
+
+U0 HLGibDraw(CHLCanvas *c, CHLMap *map, F64 now)
+{//one studio model per gib, submodel picked by body
+ //
+ //the pool is 48 and every model is a cached load, so this is cheaper than the
+ //entity pass it sits beside. Without a model nothing is drawn and the blood
+ //trail is all that marks the gib
+	CHLGib		*g;
+	CHLStudio	*m;
+	I64			 i;
+
+	hl_gib_drawn = 0;
+
+	for (i = 0; i < HLGIB_MAX; i++)
+	{
+		g = &hl_gibs[i];
+
+		if (!g->active || g->die <= now)
+			goto qgd_next;
+
+		//material debris carries its own model; a body gib picks by species
+		m = g->mdl;
+
+		if (!m)
+		{
+			if (g->human)
+				m = hl_gib_mdl_human;
+			else
+				m = hl_gib_mdl_alien;
+		}
+
+		if (!m)
+			goto qgd_next;
+
+		HLStudioDraw(c, m, g->origin, g->angles, 0, 0.0, 0.0, g->body, 0,
+			HLLightPoint(map, g->origin));
+
+		hl_gib_drawn++;
+
+qgd_next:
+	}
+}
+
+U0 HLPartUpdate(F64 dt, F64 now)
+{//R_UpdateParticles
+	CHLParticle	*p;
+	I64			 i;
+	I64			 idx;
+
+	//gibs move on the same tick and lay their trails into the pool below, so
+	//they run first
+	HLGibUpdate(hl_map, dt, now);
+
+	//CL_TempEntUpdate runs on the render clock, which is what HL1.ZC passes
+	HLTEntUpdate(dt, now);
+
+	for (i = 0; i < hl_part_count; i++)
+	{
+		p = &hl_particles[i];
+
+		if (p->die <= now)
+			goto qp_next;
+
+		HLVecMA(p->org, dt, p->vel, p->org);
+
+		switch (p->type)
+		{
+			case HLPT_FIRE:
+				//5Hz through the fire table, then expires
+				p->ramp += dt * 5.0;
+				idx = ToI64(p->ramp);
+				if (idx >= 6)
+					p->die = now;
+				else
+					p->color = hl_ramp_fire[ClampI64(idx, 0, 7)];
+				p->vel[2] += HLPART_GRAVITY * dt;
+				break;
+
+			case HLPT_SPARK:
+				//a spark tracer lives 0.3 to 0.5s. At the fire ramp's 5Hz the
+				//table is still on its second entry when the particle expires,
+				//so every spark holds the head colour for its whole life. 20Hz
+				//runs all eight entries inside 0.4s
+				p->ramp += dt * 20.0;
+				idx = ToI64(p->ramp);
+				if (idx >= 8)
+					p->die = now;
+				else
+					p->color = hl_ramp_fire[ClampI64(idx, 0, 7)];
+				p->vel[2] += HLPART_GRAVITY * dt;
+				break;
+
+			case HLPT_EXPLODE:
+				p->ramp += dt * 10.0;
+				idx = ToI64(p->ramp);
+				if (idx >= 8)
+					p->die = now;
+				else
+					p->color = hl_ramp_explode[ClampI64(idx, 0, 7)];
+				p->vel[2] += HLPART_GRAVITY * dt;
+				break;
+
+			case HLPT_GRAV:
+			case HLPT_BLOB:
+				p->vel[2] += HLPART_GRAVITY * dt;
+				break;
+
+			default:
+				break;
+		}
+
+qp_next:
+	}
+}
+
+U0 HLPartDraw(CHLCanvas *c, F64 now)
+{//D_DrawParticle, with a round additive dot in place of the solid block
+ //
+ //D_DrawParticle fills a size x size square with one palette colour, opaque,
+ //corner anchored on the projected point. GoldSrc draws a camera facing quad
+ //textured with a radial dot and blends it, so a spark reads as a point of
+ //light. The sizing below is D_DrawParticle's; the compositing is not.
+	CHLParticle	*p;
+	F64			 rel[3];
+	F64			 cam[3];
+	F64			 inv_z;
+	F64			 sx;
+	F64			 sy;
+	I64			 i;
+	I64			 x;
+	I64			 y;
+	I64			 px;
+	I64			 py;
+	I64			 size;
+	I64			 izi;
+	I64			 vw;
+	I64			 pix_shift;
+	I64			 pix_min;
+	I64			 pix_max;
+	I64			 idx;
+	I64			 dx;
+	I64			 dy;
+	I64			 d2;
+	I64			 rad2;
+	I64			 core2;
+	I64			 span;
+	I64			 w;
+	I64			 sr;
+	I64			 sg;
+	I64			 sb;
+	I64			 pr;
+	I64			 pg;
+	I64			 pb;
+	U32			 c32;
+	U32			 dst;
+	Bool		 add;
+
+	hl_part_drawn = 0;
+
+	//decals read the depth buffer the world left and write no depth, so they
+	//go down before anything additive; gibs are solid and write their own
+	HLDrawDecals(c);
+	HLGibDraw(c, hl_map, now);
+
+	//D_DrawParticle sizing, from D_SetupFrame. A particle is a square block whose
+	//side comes from 1/z, so it grows as it nears the eye
+	//
+	//all three bounds scale with r_refdef.vrect.width, the 3d view rect and not
+	//the whole screen. Measured against the canvas they are oversized at any
+	//viewsize below 100
+	vw = c->vw;
+	if (vw < 1)
+		vw = c->width;
+
+	pix_shift = 8 - ToI64(ToF64(vw) / 320.0 + 0.5);
+	pix_min   = vw / 320;
+	if (pix_min < 1)
+		pix_min = 1;
+	pix_max = ToI64(ToF64(vw) / 80.0 + 0.5);
+	if (pix_max < 1)
+		pix_max = 1;
+
+	for (i = 0; i < hl_part_count; i++)
+	{
+		p = &hl_particles[i];
+
+		if (p->die <= now)
+			goto qd_next;
+
+		HLVecSub(p->org, c->origin, rel);
+		cam[2] = HLVecDot(rel, c->forward);
+
+		//behind the near clip
+		if (cam[2] < HLNEAR_CLIP)
+			goto qd_next;
+
+		cam[0] = HLVecDot(rel, c->right);
+		cam[1] = HLVecDot(rel, c->up);
+
+		inv_z = 1.0 / cam[2];
+		sx    = c->center_x + cam[0] * c->x_scale * inv_z;
+		sy    = c->center_y - cam[1] * c->y_scale * inv_z;
+
+		x = ToI64(sx);
+		y = ToI64(sy);
+
+		//izi is the original's fixed point 1/z, zi * 0x8000; the shift turns it
+		//into a pixel count
+		izi  = ToI64(inv_z * 32768.0);
+		size = izi >> pix_shift;
+
+		if (size < pix_min)
+			size = pix_min;
+		else if (size > pix_max)
+			size = pix_max;
+
+		//the dot is centred on the projected point. Corner anchoring puts a
+		//round mask half a block off the position it was computed for
+		x -= size >> 1;
+		y -= size >> 1;
+
+		//the ramp driven types are self lit: they add and write no depth, so
+		//two overlapping sparks both show and neither punches a hole in the
+		//wall behind it. Blood and gib trails stay opaque
+		add = ToBool(p->type == HLPT_FIRE || p->type == HLPT_EXPLODE ||
+					 p->type == HLPT_SPARK);
+
+		c32 = HLPalColor(p->color);
+		sr  = (c32 >> 16) & 255;
+		sg  = (c32 >> 8) & 255;
+		sb  = c32 & 255;
+
+		//offsets below are doubled, so rad2 is the mask radius squared in those
+		//units. d2 inside core2 carries full weight; outside it the weight falls
+		//linearly to HLPART_DOT_RIM at the mask edge
+		//
+		//the innermost pixel of an even sized block sits at d2 = 2, never 0, so a
+		//plateau smaller than 2 leaves an even dot with no full weight pixel at
+		//all. At the 2x2 minimum that capped every pixel at half brightness and
+		//the dot disappeared into the wall behind it
+		rad2  = size * size;
+		core2 = rad2 >> 2;
+		if (core2 < 2)
+			core2 = 2;
+		span = rad2 - core2;
+		if (span < 1)
+			span = 1;
+
+		for (py = y; py < y + size; py++)
+		{
+			if (py < 0 || py >= c->height)
+				goto qd_skip_row;
+
+			hl_rs_part_px += size;
+
+			//doubled so an even sized block has its centre between two texels
+			dy = (py - y) * 2 - (size - 1);
+
+			for (px = x; px < x + size; px++)
+			{
+				if (px < 0 || px >= c->width)
+					goto qd_next_col;
+
+				dx = (px - x) * 2 - (size - 1);
+				d2 = dx * dx + dy * dy;
+
+				if (d2 > rad2)
+					goto qd_next_col;
+
+				idx = py * c->width + px;
+
+				if (inv_z <= c->depth[idx])
+					goto qd_next_col;
+
+				if (!add)
+				{
+					c->pixels[idx] = c32;
+					c->depth[idx]  = inv_z;
+					goto qd_next_col;
+				}
+
+				if (d2 <= core2)
+					w = HLPART_DOT_FULL;
+				else
+				{
+					w = HLPART_DOT_FULL -
+						((HLPART_DOT_FULL - HLPART_DOT_RIM) *
+							(d2 - core2)) / span;
+					if (w < HLPART_DOT_RIM)
+						w = HLPART_DOT_RIM;
+				}
+
+				dst = c->pixels[idx];
+
+				//>> binds tighter than *, so the product needs its own parens or
+				//the shift takes w alone and the channel drops out
+				pr = ((sr * w) >> 8) + ((dst >> 16) & 255);
+				pg = ((sg * w) >> 8) + ((dst >> 8) & 255);
+				pb = ((sb * w) >> 8) + (dst & 255);
+
+				if (pr > 255)	pr = 255;
+				if (pg > 255)	pg = 255;
+				if (pb > 255)	pb = 255;
+
+				c->pixels[idx] = (pr << 16) | (pg << 8) | pb;
+
+qd_next_col:
+			}
+
+qd_skip_row:
+		}
+
+		hl_part_drawn++;
+
+qd_next:
+	}
+
+	//temp entities last: most of them are additive and read the framebuffer,
+	//so everything they blend over has to be down already
+	HLTEntDraw(c, hl_map, now);
+}

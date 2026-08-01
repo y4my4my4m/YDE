@@ -1,0 +1,5048 @@
+// HLDraw.ZC - span rasterizer
+//
+// canvas is 0x00RRGGBB truecolor. every miptex carries its own 256 colour
+// palette, so there is no shared colormap to shade through - lighting is a
+// per-channel multiply, folded in once per surface texel by the surface cache
+//
+// per face: world verts -> camera space -> near clip -> project -> scanline
+// fill with perspective-correct texture and lightmap
+//
+// FIXME: hand-write the span loop in asm
+
+//Draw-pass toggles, GoldSrc's r_* names. HLDraw.ZC compiles before the cvar
+//table, so the shell copies the cvars into these once a frame.
+Bool hl_r_decals      = TRUE;
+Bool hl_r_dynamic     = TRUE;
+Bool hl_r_drawentities = TRUE;
+Bool hl_r_drawsprites = TRUE;
+Bool hl_r_lightpoint  = TRUE;
+Bool hl_r_beams       = TRUE;
+Bool hl_r_drawsky     = TRUE;
+
+hl_r_decals       = TRUE;
+hl_r_dynamic      = TRUE;
+hl_r_drawentities = TRUE;
+hl_r_drawsprites  = TRUE;
+hl_r_lightpoint   = TRUE;
+hl_r_beams        = TRUE;
+hl_r_drawsky      = TRUE;
+
+#define HLSCR_W			320
+#define HLSCR_H			240
+#define HLMAX_POLY_VERTS	64
+#define HLNEAR_CLIP		4.0		//world units in front of the eye
+
+//pixels between exact perspective divides, error stays under a texel
+#define HLSPAN_SUB		16
+
+class CHLPolyVert
+{
+	F64	cam[3];		//x right, y up, z forward
+	F64	s;			//texel units
+	F64	t;
+};
+
+class CHLScreenVert
+{
+	F64	x;
+	F64	y;
+	F64	inv_z;
+	F64	s_over_z;
+	F64	t_over_z;
+};
+
+class CHLCanvas
+{
+	//0x00RRGGBB, not palette indices. HL's per-texture palettes leave no
+	//single 256 colour space the world could be composited in
+	U32	*pixels;
+	F64	*depth;			//1/z, larger is nearer
+	I64	 width;
+	I64	 height;
+
+	//view state for the frame being drawn
+	F64	 origin[3];
+	F64	 forward[3];
+	F64	 right[3];
+	F64	 up[3];
+	F64	 x_scale;
+	F64	 y_scale;
+	F64	 center_x;
+	F64	 center_y;
+
+	//SCR_CalcRefdef r_refdef.vrect - outside it is left alone so the border
+	//and status bar show through
+	I64	 vx;
+	I64	 vy;
+	I64	 vw;
+	I64	 vh;
+
+	I64	 faces_drawn;
+	I64	 spans_drawn;
+};
+
+//--- r_speeds --------------------------------------------------------------
+//
+// Per-frame cost attribution, as the engine's r_speeds does. Every pass adds to
+// one of these, so a frame's cost is read rather than guessed.
+//
+// The pixel counters are the load-bearing ones: a pass is expensive in
+// proportion to the pixels it touches, and a pass that touches more pixels than
+// the canvas has is doing work the depth buffer already threw away.
+//
+// Counted at span and row granularity, never per pixel, so the instrumentation
+// itself stays off the hot path.
+
+I64	hl_rs_faces		= 0;	//BSP faces submitted
+I64	hl_rs_spans		= 0;	//world spans rasterised
+I64	hl_rs_span_px	= 0;	//world span pixels stepped
+I64	hl_rs_sky_px		= 0;	//sky span pixels stepped
+I64	hl_rs_surf_hit	= 0;	//surface cache reuses
+I64	hl_rs_surf_build	= 0;	//surface cache builds this frame
+I64	hl_rs_surf_texels = 0;	//texels lit by those builds
+I64	hl_rs_surf_evict	= 0;	//slots released to make room
+I64	hl_rs_surf_dlit	= 0;	//faces R_MarkLights reached this frame
+I64	hl_rs_decals		= 0;	//decal patches scanned
+I64	hl_rs_decal_px	= 0;	//decal pixels ray cast
+I64	hl_rs_decal_hit	= 0;	//decal pixels blended
+I64	hl_rs_tris		= 0;	//studio triangles submitted
+I64	hl_rs_model_px	= 0;	//studio span pixels
+I64	hl_rs_sprites	= 0;	//sprites blitted
+I64	hl_rs_sprite_px	= 0;	//sprite pixels stepped
+I64	hl_rs_part_px	= 0;	//particle block pixels
+I64	hl_rs_beams		= 0;	//beams submitted
+I64	hl_rs_beam_px	= 0;	//beam ribbon pixels stepped
+I64	hl_rs_lightpoint	= 0;	//R_LightPoint traces, one BSP trace each
+
+//off by default: the readout is a Print and costs a line of output a frame
+Bool hl_rs_enable = FALSE;
+
+U0 HLRSpeedsReset()
+{//globals are not zeroed, so this is also the init path
+	hl_rs_faces		= 0;
+	hl_rs_spans		= 0;
+	hl_rs_span_px		= 0;
+	hl_rs_sky_px		= 0;
+	hl_rs_surf_hit	= 0;
+	hl_rs_surf_build	= 0;
+	hl_rs_surf_texels	= 0;
+	hl_rs_surf_evict	= 0;
+	hl_rs_surf_dlit	= 0;
+	hl_rs_decals		= 0;
+	hl_rs_decal_px	= 0;
+	hl_rs_decal_hit	= 0;
+	hl_rs_tris		= 0;
+	hl_rs_model_px	= 0;
+	hl_rs_sprites		= 0;
+	hl_rs_sprite_px	= 0;
+	hl_rs_part_px		= 0;
+	hl_rs_beams		= 0;
+	hl_rs_beam_px		= 0;
+	hl_rs_lightpoint	= 0;
+}
+
+U0 HLRSpeedsPrint()
+{//one line per pass, pixels first - the canvas area is the yardstick
+	"wsurf %d spans %d px %d sky %d\n",
+		hl_rs_faces, hl_rs_spans, hl_rs_span_px, hl_rs_sky_px;
+	//texels are 4 bytes each, so the build cost reads directly as bytes written
+	//dlit is what a dynamic light costs: every face in it is a candidate
+	//rebuild, and the flashlight re-adds its light every frame
+	"surf  hit %d build %d texels %d bytes %d evict %d dlit %d\n",
+		hl_rs_surf_hit, hl_rs_surf_build, hl_rs_surf_texels,
+		hl_rs_surf_texels * 4, hl_rs_surf_evict, hl_rs_surf_dlit;
+	"decal %d px %d blend %d\n",
+		hl_rs_decals, hl_rs_decal_px, hl_rs_decal_hit;
+	"model tris %d px %d\n", hl_rs_tris, hl_rs_model_px;
+	"efx   spr %d px %d part %d lightpt %d\n",
+		hl_rs_sprites, hl_rs_sprite_px, hl_rs_part_px, hl_rs_lightpoint;
+	"beam  %d px %d\n", hl_rs_beams, hl_rs_beam_px;
+}
+
+U0 HLRSpeeds(Bool on = TRUE)
+{//toggle from the prompt, or from an r_speeds cvar in the frame loop
+	hl_rs_enable = on;
+}
+
+//--- turbulent surfaces ----------------------------------------------------
+//
+// R_InitTurb / D_DrawTurbulent8Span. each axis is displaced by the table
+// indexed with the other axis
+//
+//     sturb = ((s + turb[(t>>16) & (CYCLE-1)]) >> 16) & 63
+//     tturb = ((t + turb[(s>>16) & (CYCLE-1)]) >> 16) & 63
+//
+// table is AMP + sin(i*2pi/CYCLE)*AMP, AMP = 8 texels. turb textures are
+// always 64x64, hence the & 63
+#define HLTURB_CYCLE		128
+#define HLTURB_AMP		8.0
+#define HLTURB_SPEED		20.0
+
+F64 hl_turb_table[HLTURB_CYCLE];
+I64 hl_turb_phase = 0;
+
+U0 HLTurbInit()
+{//R_InitTurb
+	I64 i;
+
+	for (i = 0; i < HLTURB_CYCLE; i++)
+		hl_turb_table[i] = HLTURB_AMP +
+			Sin(ToF64(i) * 2.0 * pi / ToF64(HLTURB_CYCLE)) * HLTURB_AMP;
+}
+
+U0 HLTurbFrame(F64 time)
+{//cl.time*SPEED, wrapped to the table
+	hl_turb_phase = ToI64(time * HLTURB_SPEED) & (HLTURB_CYCLE - 1);
+}
+
+//--- dynamic lights --------------------------------------------------------
+//
+// muzzle flashes, explosions, rocket glow. these move, so they are not in the
+// compiled lightmap and get folded in at draw time by R_AddDynamicLights
+//
+// the light is projected onto the surface plane and each luxel brightened by
+// distance from the impact, using the cheap approximation, no sqrt
+
+#define HLMAX_DLIGHTS		32
+#define HLDLIGHT_MINLIGHT	4.0
+
+class CHLDlight
+{
+	F64	origin[3];
+	F64	radius;
+	F64	die;			//absolute time
+	F64	decay;			//radius lost per second
+	F64	min_light;
+
+	//CL_AllocDlight's key. A light re-added under the same key reclaims the
+	//slot it held. 0 is unkeyed, one slot per add.
+	//
+	//A light re-added every frame needs one: its previous instance is still
+	//alive, so an unkeyed add takes a fresh slot, its bit in
+	//CHLFace.dlight_bits moves, HLSurfLightKey changes, and every face it
+	//marks rebuilds its surface cache every frame. The stale instances also
+	//stack in HLLightAddDynamic.
+	I64	key;
+
+	//quake dlights are white. HL carries an rgb triple on the wire for every
+	//TE_DLIGHT and every muzzleflash, so colour is per light here.
+	//0-255 per channel, scaling the brightness this light contributes
+	I64	color[3];
+};
+
+CHLDlight	hl_dlight[HLMAX_DLIGHTS];
+I64			hl_dlight_count = 0;
+
+U0 HLDlightClear()
+{
+	hl_dlight_count = 0;
+}
+
+U0 HLDlightAdd(F64 *origin, F64 radius, F64 life, F64 decay, F64 time,
+	I64 cr = 255, I64 cg = 255, I64 cb = 255, I64 key = 0)
+{//CL_AllocDlight: the slot already holding this key, else a dead one, else the
+ //oldest. Keyless lights skip the first pass and are one slot per add.
+ //
+ //colour defaults to white, which is quake behaviour
+	CHLDlight	*d;
+	I64			 slot = -1;
+	I64			 i;
+
+	if (key)
+	{
+		for (i = 0; i < hl_dlight_count; i++)
+		{
+			if (hl_dlight[i].key == key)
+			{
+				slot = i;
+				break;
+			}
+		}
+	}
+
+	if (slot < 0)
+	{
+		for (i = 0; i < hl_dlight_count; i++)
+		{
+			if (hl_dlight[i].die <= time)
+			{
+				slot = i;
+				break;
+			}
+		}
+	}
+
+	if (slot < 0)
+	{
+		if (hl_dlight_count < HLMAX_DLIGHTS)
+		{
+			slot = hl_dlight_count;
+			hl_dlight_count++;
+		}
+		else
+			slot = 0;
+	}
+
+	d = &hl_dlight[slot];
+	HLVecCopy(origin, d->origin);
+	d->radius    = radius;
+	d->die       = time + life;
+	d->decay     = decay;
+	d->key       = key;
+	d->min_light = HLDLIGHT_MINLIGHT;
+	d->color[0]  = ClampI64(cr, 0, 255);
+	d->color[1]  = ClampI64(cg, 0, 255);
+	d->color[2]  = ClampI64(cb, 0, 255);
+}
+
+U0 HLDlightKill(I64 key)
+{//retire a keyed light. A keyed light is held by re-adding it every frame, so
+ //the source stopping has to say so or the light burns its remaining life
+	I64 i;
+
+	if (!key)
+		return;
+
+	for (i = 0; i < hl_dlight_count; i++)
+	{
+		if (hl_dlight[i].key == key)
+		{
+			hl_dlight[i].die = 0.0;
+			hl_dlight[i].key = 0;
+		}
+	}
+}
+
+U0 HLDlightUpdate(F64 dt, F64 time)
+{//shrink live lights, drop expired
+	I64 i;
+
+	for (i = 0; i < hl_dlight_count; i++)
+	{
+		if (hl_dlight[i].die <= time)
+			goto qdl_next;
+
+		hl_dlight[i].radius -= dt * hl_dlight[i].decay;
+		if (hl_dlight[i].radius < 0.0)
+			hl_dlight[i].die = 0.0;
+
+qdl_next:
+	}
+}
+
+Bool HLDlightsActive(F64 time)
+{//cheap gate, most frames have none
+	I64 i;
+
+	for (i = 0; i < hl_dlight_count; i++)
+	{
+		if (hl_dlight[i].die > time && hl_dlight[i].radius > 0.0)
+			return TRUE;
+	}
+
+	return FALSE;
+}
+
+Bool HLDlightNear(F64 *point, F64 time)
+{//is any live dynamic light reaching this point?
+ //
+ //the sphere test R_LightPoint's dlight loop runs, without the sample. A
+ //cached light value is only invalidated by a flash that touches the entity,
+ //so a muzzle flash across the room costs nothing.
+ //
+ //time is an argument for the reason HLDlightsActive takes one: the frame
+ //clock is declared further down this file
+	F64 dl[3];
+	I64 i;
+
+	if (!point)
+		return FALSE;
+
+	for (i = 0; i < hl_dlight_count; i++)
+	{
+		if (hl_dlight[i].die <= time || hl_dlight[i].radius <= 0.0)
+			goto qdn_next;
+
+		HLVecSub(point, hl_dlight[i].origin, dl);
+
+		if (HLVecLength(dl) < hl_dlight[i].radius)
+			return TRUE;
+
+qdn_next:
+	}
+
+	return FALSE;
+}
+
+//--- animated light styles -------------------------------------------------
+//
+// a style is a letter string sampled at 10Hz: 'a' black, 'm' normal, 'z' about
+// double. R_AnimateLight turns the current letter into a scale and a face's
+// lightmap is the sum of one block per style, each scaled by its value
+//
+// faces whose styles are all steady take the fast path and use the map data
+// directly, only animated faces get recombined
+
+#define HLMAX_LIGHTSTYLES	64
+#define HLLIGHTSTYLE_LEN		64
+#define HLLIGHTSTYLE_NORMAL	256		//style with no string
+
+//what a steady style resolves to. worldspawn sets style 0 to "m", and
+//('m'-'a')*22 = 264, not 256. dividing by 256 leaves every face 3% dim and
+//the fast path never fires
+#define HLLIGHT_UNITY		264
+#define HLLIGHT_SCRATCH		4096	//one face's lightmap block, in LUXELS
+
+//BSP30 lighting is RGB, so every buffer below is three bytes per luxel and
+//every block offset is scaled by HLLIGHT_STRIDE
+#define HLLIGHT_SCRATCH_B	(HLLIGHT_SCRATCH * HLLIGHT_STRIDE)
+
+//no lit surface found under a model
+#define HLLIGHT_FALLBACK		170
+
+U8	hl_lightstyle[HLMAX_LIGHTSTYLES * HLLIGHTSTYLE_LEN];
+I64	hl_lightstyle_value[HLMAX_LIGHTSTYLES];
+U8	hl_light_scratch[HLLIGHT_SCRATCH_B];
+U8	hl_light_black[HLLIGHT_SCRATCH_B];	//unlit face lightmap, all zeros
+
+//recombine path counters
+I64	hl_light_acc[HLLIGHT_SCRATCH_B];	//per-channel acc, 8 bits of fraction
+Bool hl_dlight_any	= FALSE;		//any live dynamic light this frame
+I64	hl_light_fast	= 0;
+I64	hl_light_slow	= 0;
+I64	hl_light_clamped	= 0;
+
+//R_PushDlights. the frame counter makes face marks self-expiring - a face
+//carrying last frame's number has no lights on it now
+I64 hl_dlight_frame	= 0;
+I64 hl_ambient_light	= 0;		//r_refdef.ambientlight
+
+//dlight origins in the space of the brush entity currently being drawn.
+//
+//A BSP submodel's faces, planes and texinfo all stay in the space the brush was
+//authored in; the entity's origin and angles are applied at draw time. So the
+//light is carried into that space rather than the geometry pushed into the
+//world, which is what R_DrawBrushModel does. Off during the world pass, where
+//the two spaces are the same.
+F64	hl_dlight_mspace[HLMAX_DLIGHTS * 3];
+Bool	hl_dlight_mspace_on	= FALSE;
+
+F64 *HLDlightOrigin(I64 i)
+{//the origin to light and to key the surface cache with
+	if (hl_dlight_mspace_on)
+		return &hl_dlight_mspace[i * 3];
+
+	return hl_dlight[i].origin;
+}
+
+//lightstyle the last R_LightPoint sample landed on, -1 when no lit face was
+//found. A cache of the sample has to know which style animates it - see
+//HLEntLightPoint
+I64 hl_light_pt_style = -1;
+
+//Every lightstyle value on that face, folded the way HLSurfLightKey folds them.
+//The sample sums all four blocks, so one style index no longer identifies what
+//can change it. -1 when no lit face was found.
+I64 hl_light_pt_key = -1;
+
+F64 hl_light_time = 0.0;		//time this frame is drawn at
+F64 hl_light_last = 0.0;		//previous frame, for dynamic light decay
+
+U0 HLLightInit()
+{//globals are not zeroed, so every style is set steady explicitly
+	I64 i;
+
+	MemSet(hl_light_black, 0, HLLIGHT_SCRATCH_B);
+
+	//the r_speeds readout lives in this file and its toggle is a global, so it
+	//is cleared with the rest of the draw layer's state. A declaration
+	//initialiser does not run
+	hl_rs_enable = FALSE;
+	HLRSpeedsReset;
+
+	hl_dlight_any  = FALSE;
+	hl_dlight_count = 0;
+	hl_dlight_frame = 0;
+	hl_dlight_mspace_on = FALSE;
+	hl_ambient_light = 0;
+	hl_light_last  = 0.0;
+	hl_light_time  = 0.0;
+	hl_light_pt_style = -1;
+
+	for (i = 0; i < HLMAX_LIGHTSTYLES; i++)
+	{
+		hl_lightstyle[i * HLLIGHTSTYLE_LEN] = 0;
+		hl_lightstyle_value[i]             = HLLIGHTSTYLE_NORMAL;
+	}
+}
+
+U0 HLLightStyleSet(I64 style, U8 *str)
+{//the lightstyle builtin, called at spawn for every switchable light
+	if (style < 0 || style >= HLMAX_LIGHTSTYLES || !str)
+		return;
+
+	HLStrCopy(&hl_lightstyle[style * HLLIGHTSTYLE_LEN], str, HLLIGHTSTYLE_LEN);
+}
+
+U0 HLLightFrame(F64 time)
+{//expire and shrink dynamic lights, cache whether any survive
+ //
+ //dt is tracked here, not passed in - dlights decay in real time, independent
+ //of the fixed server step
+	F64 dt = time - hl_light_last;
+
+	hl_light_last = time;
+
+	//a level load must not decay everything at once
+	if (dt < 0.0 || dt > 0.25)
+		dt = 0.0;
+
+	hl_light_time = time;
+	HLDlightUpdate(dt, time);
+	hl_dlight_any = HLDlightsActive(time);
+}
+
+U0 HLLightAnimate(F64 time)
+{//R_AnimateLight
+	U8	*str;
+	I64	 frame = ToI64(time * 10.0);
+	I64	 len;
+	I64	 i;
+	I64	 k;
+
+	for (i = 0; i < HLMAX_LIGHTSTYLES; i++)
+	{
+		str = &hl_lightstyle[i * HLLIGHTSTYLE_LEN];
+		len = StrLen(str);
+
+		if (!len)
+		{
+			hl_lightstyle_value[i] = HLLIGHTSTYLE_NORMAL;
+			goto ql_next;
+		}
+
+		k = frame % len;
+		if (k < 0)
+			k = 0;
+
+		//'a'..'z' -> 0..550 in steps of 22
+		hl_lightstyle_value[i] = (str[k] - 'a') * 22;
+
+ql_next:
+	}
+}
+
+Bool HLLightTouchesFace(CHLMap *map, CHLDlight *light, CHLFace *f)
+{//Does this light brighten any luxel of this face?
+ //
+ //R_MarkLights marks every face on a straddled NODE, and a node's face list
+ //covers the whole extent of its plane. Quake's nodes are small enough for
+ //that to be close; HL's brushwork is not, and a 220 unit flashlight marked
+ //hundreds of faces that its sphere never reached. Each of those is a full
+ //surface-cache rebuild.
+ //
+ //The test is the same projection R_AddDynamicLights uses, run once against
+ //the face's whole lightmap rectangle instead of per luxel: project the light
+ //onto the surface plane, clamp the impact into [0,extent] in each axis, and
+ //compare the resulting distance against the radius left after the off-plane
+ //part is spent. The metric is R_AddDynamicLights' own (larger axis plus half
+ //the smaller), so a face passes here exactly when at least one point of its
+ //rectangle would be brightened there.
+	CHLPlane	*plane;
+	CHLTexInfo	*ti;
+	CHLTexture	*tex;
+	F64			 impact[3];
+	F64			 dist;
+	F64			 rad;
+	F64			 local_s;
+	F64			 local_t;
+	F64			 sd;
+	F64			 td;
+	F64			 adist;
+	I64			 j;
+
+	//BSP indices used to form pointers - out of range is a wild address
+	if (f->plane_num < 0 || f->plane_num >= map->num_planes)
+		return FALSE;
+	if (f->tex_info < 0 || f->tex_info >= map->num_texinfo)
+		return FALSE;
+
+	ti = &map->texinfo[f->tex_info];
+
+	//sky and turb carry no lightmap, so a dlight on them changes nothing
+	if (ti->miptex >= 0 && ti->miptex < map->num_textures)
+	{
+		tex = &map->textures[ti->miptex];
+		if (tex->is_sky || tex->is_turb)
+			return FALSE;
+	}
+
+	plane = &map->planes[f->plane_num];
+
+	//signed distance off the plane, then the radius left on the plane itself
+	dist = HLVecDot(light->origin, plane->normal) - plane->dist;
+
+	if (dist < 0.0)
+		rad = light->radius + dist;
+	else
+		rad = light->radius - dist;
+
+	if (rad < light->min_light)
+		return FALSE;
+
+	rad -= light->min_light;
+
+	for (j = 0; j < 3; j++)
+		impact[j] = light->origin[j] - plane->normal[j] * dist;
+
+	local_s = HLVecDot(impact, &ti->vecs[0]) + ti->vecs[3] - f->mins_s;
+	local_t = HLVecDot(impact, &ti->vecs[4]) + ti->vecs[7] - f->mins_t;
+
+	//distance from the impact to the nearest point of the lightmap rectangle,
+	//zero inside it
+	sd = 0.0;
+	if (local_s < 0.0)
+		sd = -local_s;
+	else if (local_s > ToF64(f->extent_s))
+		sd = local_s - ToF64(f->extent_s);
+
+	td = 0.0;
+	if (local_t < 0.0)
+		td = -local_t;
+	else if (local_t > ToF64(f->extent_t))
+		td = local_t - ToF64(f->extent_t);
+
+	if (sd > td)
+		adist = sd + td * 0.5;
+	else
+		adist = td + sd * 0.5;
+
+	if (adist < rad)
+		return TRUE;
+
+	return FALSE;
+}
+
+U0 HLMarkLights(CHLMap *map, CHLDlight *light, I64 bit, I64 node_index)
+{//R_MarkLights - flag every face the light sphere reaches, descending only
+ //the side(s) it straddles
+	CHLNode	*node;
+	CHLPlane	*plane;
+	CHLFace	*f;
+	F64		 dist;
+	I64		 i;
+
+	if (node_index < 0 || node_index >= map->num_nodes)
+		return;
+
+	node = &map->nodes[node_index];
+
+	if (node->plane_num < 0 || node->plane_num >= map->num_planes)
+		return;
+
+	plane = &map->planes[node->plane_num];
+	dist  = HLVecDot(light->origin, plane->normal) - plane->dist;
+
+	//entirely on one side, only that child can be lit
+	if (dist > light->radius)
+	{
+		HLMarkLights(map, light, bit, node->children[0]);
+		return;
+	}
+	if (dist < -light->radius)
+	{
+		HLMarkLights(map, light, bit, node->children[1]);
+		return;
+	}
+
+	for (i = 0; i < node->num_faces; i++)
+	{
+		if (node->first_face + i < 0 ||
+			node->first_face + i >= map->num_faces)
+			goto qml_next;
+
+		f = &map->faces[node->first_face + i];
+
+		if (!HLLightTouchesFace(map, light, f))
+			goto qml_next;
+
+		//first light to reach this face this frame resets the mask
+		if (f->dlight_frame != hl_dlight_frame)
+		{
+			f->dlight_bits  = 0;
+			f->dlight_frame = hl_dlight_frame;
+			hl_rs_surf_dlit++;
+		}
+
+		f->dlight_bits |= bit;
+
+qml_next:
+	}
+
+	HLMarkLights(map, light, bit, node->children[0]);
+	HLMarkLights(map, light, bit, node->children[1]);
+}
+
+U0 HLPushDlights(CHLMap *map, F64 time)
+{//R_PushDlights, once per frame before anything is drawn
+	I64 i;
+
+	hl_dlight_frame++;
+
+	//r_dynamic 0 has to stop the MARKING, not just the model shading. A marked
+	//face folds hl_dlight_frame into its surface-cache key and therefore
+	//rebuilds every frame by design, so one wide dlight re-added per frame -
+	//the flashlight is exactly that - invalidates the whole visible set and
+	//turns the cache into a full re-light per frame.
+	if (!hl_r_dynamic)
+	{
+		hl_dlight_any = FALSE;
+		return;
+	}
+
+	if (!map || !map->nodes || map->num_nodes < 1)
+		return;
+
+	for (i = 0; i < hl_dlight_count && i < HLMAX_DLIGHTS; i++)
+	{
+		if (hl_dlight[i].die <= time || hl_dlight[i].radius <= 0.0)
+			goto qpd_next;
+
+		HLMarkLights(map, &hl_dlight[i], 1 << i, 0);
+
+qpd_next:
+	}
+}
+
+//scratch light, in the space of the submodel being marked. A global: a
+//class-typed declaration inside a nested block faults on this compiler
+CHLDlight hl_dlight_scratch;
+
+U0 HLMarkLightsModel(CHLMap *map, CHLModel *bm, F64 *origin, F64 *xform)
+{//R_DrawBrushModel's dlight pass, gl_rsurf.c. A submodel's faces hang off its
+ //own head_node, and the world descent from node 0 never reaches them, so
+ //without this no dynamic light lands on a door, a platform or a tram.
+ //
+ //origin is the entity's world position and xform its model->world 3x4, either
+ //may be NULL. Both spaces coincide for a brush that has neither.
+ //
+ //Fills hl_dlight_mspace for every live light, not only the ones that mark:
+ //HLLightAddDynamic and HLSurfLightKey index it by light number off
+ //f->dlight_bits, which can carry a mark this call declined to make
+	F64	 lmins[3];
+	F64	 lmaxs[3];
+	F64	 d;
+	F64	 near_d;
+	I64	 i;
+	I64	 j;
+	Bool descend;
+
+	if (!hl_r_dynamic || !map || !bm)
+		return;
+
+	//head_node[0] of models[0] is the world root, which HLPushDlights already
+	//walked; descending it once per brush entity is the whole world tree each
+	//time. The origins are still needed - the world's own faces carry marks
+	descend = ToBool(bm != &map->models[0] &&
+		bm->head_node[0] >= 0 && bm->head_node[0] < map->num_nodes);
+
+	//the submodel's own extent, in its own space
+	HLVecCopy(bm->mins, lmins);
+	HLVecCopy(bm->maxs, lmaxs);
+
+	for (i = 0; i < hl_dlight_count && i < HLMAX_DLIGHTS; i++)
+	{
+		if (xform)
+			HLMatTransformInv(hl_dlight[i].origin, xform,
+				&hl_dlight_mspace[i * 3]);
+		else if (origin)
+			HLVecSub(hl_dlight[i].origin, origin, &hl_dlight_mspace[i * 3]);
+		else
+			HLVecCopy(hl_dlight[i].origin, &hl_dlight_mspace[i * 3]);
+
+		if (!descend)
+			goto qmlm_next;
+
+		if (hl_dlight[i].die <= hl_light_time || hl_dlight[i].radius <= 0.0)
+			goto qmlm_next;
+
+		//sphere against the box, before any node descent: most brush entities
+		//in a map are nowhere near the flashlight
+		near_d = 0.0;
+
+		for (j = 0; j < 3; j++)
+		{
+			d = 0.0;
+
+			if (hl_dlight_mspace[i * 3 + j] < lmins[j])
+				d = lmins[j] - hl_dlight_mspace[i * 3 + j];
+			else if (hl_dlight_mspace[i * 3 + j] > lmaxs[j])
+				d = hl_dlight_mspace[i * 3 + j] - lmaxs[j];
+
+			near_d += d * d;
+		}
+
+		if (near_d >= hl_dlight[i].radius * hl_dlight[i].radius)
+			goto qmlm_next;
+
+		MemCopy(&hl_dlight_scratch, &hl_dlight[i], sizeof(CHLDlight));
+		HLVecCopy(&hl_dlight_mspace[i * 3], hl_dlight_scratch.origin);
+
+		HLMarkLights(map, &hl_dlight_scratch, 1 << i, bm->head_node[0]);
+
+qmlm_next:
+	}
+}
+
+U0 HLLightAddDynamic(CHLMap *map, CHLFace *f, I64 lm_w, I64 lm_h, F64 time)
+{//R_AddDynamicLights - fold every light touching this face into the acc
+	CHLDlight	*d;
+	CHLPlane		*plane;
+	CHLTexInfo	*ti;
+	F64			*dorg;
+	F64			 impact[3];
+	F64			 local_s;
+	F64			 local_t;
+	F64			 dist;
+	F64			 rad;
+	F64			 minlight;
+	F64			 sd;
+	F64			 td;
+	F64			 adist;
+	I64			 lnum;
+	I64			 sx;
+	I64			 ty;
+	I64			 j;
+	I64			 add;
+	I64			 lx;
+
+	//BSP indices used to form pointers - out of range is a wild address, not
+	//a wrong colour
+	if (f->plane_num < 0 || f->plane_num >= map->num_planes)
+		return;
+	if (f->tex_info < 0 || f->tex_info >= map->num_texinfo)
+		return;
+
+	plane = &map->planes[f->plane_num];
+	ti    = &map->texinfo[f->tex_info];
+
+	for (lnum = 0; lnum < hl_dlight_count; lnum++)
+	{
+		//R_MarkLights already decided which lights reach this face
+		if (!(f->dlight_bits & (1 << lnum)))
+			goto qad_next;
+
+		d = &hl_dlight[lnum];
+
+		if (d->die <= time || d->radius <= 0.0)
+			goto qad_next;
+
+		//the face's plane and texinfo are in the brush's own space
+		dorg = HLDlightOrigin(lnum);
+
+		//distance off the plane - a back side face has its normal flipped
+		dist = HLVecDot(dorg, plane->normal) - plane->dist;
+		if (f->side)
+			dist = -dist;
+
+		rad = d->radius;
+		if (dist < 0.0)
+			rad -= -dist;
+		else
+			rad -= dist;
+
+		minlight = d->min_light;
+		if (rad < minlight)
+			goto qad_next;
+
+		minlight = rad - minlight;
+
+		//project onto the surface
+		for (j = 0; j < 3; j++)
+		{
+			if (f->side)
+				impact[j] = dorg[j] + plane->normal[j] * dist;
+			else
+				impact[j] = dorg[j] - plane->normal[j] * dist;
+		}
+
+		local_s = HLVecDot(impact, &ti->vecs[0]) + ti->vecs[3] - f->mins_s;
+		local_t = HLVecDot(impact, &ti->vecs[4]) + ti->vecs[7] - f->mins_t;
+
+		for (ty = 0; ty < lm_h; ty++)
+		{
+			td = local_t - ToF64(ty * 16);
+			if (td < 0.0)
+				td = -td;
+
+			for (sx = 0; sx < lm_w; sx++)
+			{
+				sd = local_s - ToF64(sx * 16);
+				if (sd < 0.0)
+					sd = -sd;
+
+				//cheap distance - larger axis plus half the smaller, no sqrt
+				if (sd > td)
+					adist = sd + td * 0.5;
+				else
+					adist = td + sd * 0.5;
+
+				if (adist < minlight)
+				{
+					add = ToI64((rad - adist) * 256.0);
+					lx  = (ty * lm_w + sx) * HLLIGHT_STRIDE;
+
+					//the light's own colour scales what it adds, so a red
+					//muzzleflash reddens the wall rather than brightening it
+					hl_light_acc[lx]     += (add * d->color[0]) / 255;
+					hl_light_acc[lx + 1] += (add * d->color[1]) / 255;
+					hl_light_acc[lx + 2] += (add * d->color[2]) / 255;
+				}
+			}
+		}
+
+qad_next:
+	}
+}
+
+U8 *HLLightFaceMap(CHLMap *map, CHLFace *f, I64 lm_w, I64 lm_h, F64 time)
+{//R_BuildLightMap - compiled lighting scaled by each style, plus dlights
+ //
+ //returns the map's own data untouched when nothing is animated, so the
+ //common case costs one compare instead of a per-texel recombine
+	U8	*base;
+	I64	 size  = lm_w * lm_h;			//luxels
+	I64	 bytes = size * HLLIGHT_STRIDE;	//what one style's block occupies
+	I64	 count;
+	I64	 acc;
+	I64	 scale;
+	I64	 i;
+	I64	 j;
+	Bool dyn;
+
+	//only a map with no lightdata renders fullbright - R_BuildLightMap's
+	//!lightdata case. a face with no samples in a lit map renders black
+	if (!map->lightdata)
+		return NULL;
+	if (f->light_offset < 0)
+	{
+		//a flash still lands on an unlit face, the zeros are the base
+		if (hl_dlight_any && f->dlight_frame == hl_dlight_frame &&
+			f->dlight_bits != 0 && size > 0 && bytes <= HLLIGHT_SCRATCH_B)
+		{
+			for (i = 0; i < bytes; i++)
+				hl_light_acc[i] = 0;
+
+			HLLightAddDynamic(map, f, lm_w, lm_h, time);
+
+			for (i = 0; i < bytes; i++)
+			{
+				acc = hl_light_acc[i] / HLLIGHT_UNITY;
+				if (acc > 255)
+					acc = 255;
+				if (acc < 0)
+					acc = 0;
+				hl_light_scratch[i] = acc;
+			}
+
+			return hl_light_scratch;
+		}
+
+		//bounded by the scratch length, like every other return here
+		if (bytes > HLLIGHT_SCRATCH_B)
+			return NULL;
+
+		return hl_light_black;
+	}
+
+	if (hl_ambient_light < 0)
+		hl_ambient_light = 0;
+	if (hl_ambient_light > 255)
+		hl_ambient_light = 255;
+
+	base = map->lightdata + f->light_offset;
+
+	//styles in use. 255 terminates, and so does any out of range index
+	count = 0;
+	while (count < 4 && f->styles[count] != 255 &&
+		f->styles[count] < HLMAX_LIGHTSTYLES)
+		count++;
+
+	if (!count)
+		return base;
+
+	if (size <= 0 || bytes > HLLIGHT_SCRATCH_B)
+		return base;
+
+	//marked by R_MarkLights this frame, not merely "some light exists"
+	dyn = ToBool(hl_dlight_any && f->dlight_frame == hl_dlight_frame &&
+			f->dlight_bits != 0);
+
+	//one steady style and no dlight makes the recombine a no-op
+	//ambient hits every luxel, so it rules out the fast path
+	if (!dyn && !hl_ambient_light && count == 1 &&
+		hl_lightstyle_value[f->styles[0]] == HLLIGHT_UNITY)
+	{
+		hl_light_fast++;
+		return base;
+	}
+
+	//each extra style is another block, past the caller's single-block check
+	if (f->light_offset + count * bytes > map->lightdata_size)
+		return base;
+
+	hl_light_slow++;
+
+	//8 bits of fraction so dlights add before any rounding or clamp.
+	//channels are interleaved, so one flat pass over bytes covers all three
+	for (i = 0; i < bytes; i++)
+	{
+		//R_BuildLightMap clears to ambient first, in accumulator units
+		acc = hl_ambient_light * HLLIGHT_UNITY;
+
+		for (j = 0; j < count; j++)
+		{
+			scale = hl_lightstyle_value[f->styles[j]];
+			//no ToI64: base[] is a U8 and ToI64 is the F64->I64 intrinsic,
+			//it would read the byte as a double bit pattern. U8 widens
+			acc  += base[j * bytes + i] * scale;
+		}
+
+		hl_light_acc[i] = acc;
+	}
+
+	if (dyn)
+		HLLightAddDynamic(map, f, lm_w, lm_h, time);
+
+	for (i = 0; i < bytes; i++)
+	{
+		//divide by what a steady style resolves to, not 256 - 256 puts every
+		//luxel above 248 into the clamp
+		acc = hl_light_acc[i] / HLLIGHT_UNITY;
+
+		if (acc > 255)
+		{
+			acc = 255;
+			hl_light_clamped++;
+		}
+		if (acc < 0)
+			acc = 0;
+
+		hl_light_scratch[i] = acc;
+	}
+
+	return hl_light_scratch;
+}
+
+I64 HLLightPoint(CHLMap *map, F64 *point)
+{//R_LightPoint - sample the lightmap of the surface below a point
+	//r_lightpoint 0: skip the BSP walk and the dlight loop entirely.
+	if (!hl_r_lightpoint)
+		return HLLIGHT_FALLBACK;
+
+ //
+ //alias models carry no lightmap, this is their only shading input
+	F64		  end[3];
+	F64		  dl[3];
+	F64		  add;
+	CHLTrace	  tr;
+	CHLFace	 *f;
+	CHLTexInfo *ti;
+	CHLLeaf	 *leaf;
+	F64		  s_coord;
+	F64		 t_coord;
+	I64		 ds;
+	I64		 dt;
+	I64		 lofs;
+	I64		 lm_w;
+	I64		 lm_h;
+	I64		 lm_sz;
+	I64		 acc[3];
+	I64		 count;
+	I64		 taken;
+	I64		 scale;
+	I64		 key;
+	I64		 ch;
+	I64		 j;
+	I64		 i;
+	I64		 node;
+	I64		 best = -1;
+
+	hl_light_pt_style = -1;
+	hl_light_pt_key   = -1;
+
+	if (!map || !map->lightdata)
+		return HLLIGHT_FALLBACK;
+
+	//counted here rather than at the call sites, so the r_speeds line is the
+	//number of traces actually run
+	hl_rs_lightpoint++;
+
+	//straight down, past any room height
+	HLVecCopy(point, end);
+	end[2] -= 2048.0;
+
+	//point trace. R_LightPoint descends the render tree to the surface itself;
+	//a hull-1 sweep would stop 36 units up in an air leaf, and both the leaf
+	//lookup and the s/t bounds test below would run on that displaced point
+	HLTracePoint(map, point, end, &tr);
+
+	if (!tr.hit || tr.fraction == 1.0)
+		return HLLIGHT_FALLBACK;
+
+	//the trace gives a position but not a face, so test the leaf's surfaces
+	node = HLVisLeafForPoint(map, tr.end_pos);
+	if (node <= 0 || node >= map->num_leafs)
+		return HLLIGHT_FALLBACK;
+
+	leaf = &map->leafs[node];
+
+	for (i = 0; i < leaf->num_marksurfaces; i++)
+	{
+		f = &map->faces[map->marksurfaces[leaf->first_marksurface + i]];
+
+		if (f->light_offset < 0)
+			goto qlp_next;
+
+		//texture axes live on the texinfo, not the face
+		ti      = &map->texinfo[f->tex_info];
+		s_coord = HLVecDot(tr.end_pos, &ti->vecs[0]) + ti->vecs[3] - f->mins_s;
+		t_coord = HLVecDot(tr.end_pos, &ti->vecs[4]) + ti->vecs[7] - f->mins_t;
+
+		if (s_coord < 0.0 || t_coord < 0.0)
+			goto qlp_next;
+		if (s_coord > ToF64(f->extent_s) || t_coord > ToF64(f->extent_t))
+			goto qlp_next;
+
+		lm_w = f->extent_s / 16 + 1;
+		lm_h = f->extent_t / 16 + 1;
+		ds   = ToI64(s_coord) / 16;
+		dt   = ToI64(t_coord) / 16;
+
+		if (ds < 0)   ds = 0;
+		if (dt < 0)   dt = 0;
+		if (ds >= lm_w) ds = lm_w - 1;
+		if (dt >= lm_h) dt = lm_h - 1;
+
+		lm_sz = lm_w * lm_h;
+
+		//styles in use, the terminator rule R_BuildLightMap uses
+		count = 0;
+		while (count < 4 && f->styles[count] != 255 &&
+			f->styles[count] < HLMAX_LIGHTSTYLES)
+			count++;
+
+		//R_BuildLightMap's accumulate, one luxel wide: ambient, then every
+		//style's block scaled by its current value. Reading block 0 raw left a
+		//model unlit by any switchable style the surface under it animates on
+		for (ch = 0; ch < HLLIGHT_STRIDE; ch++)
+			acc[ch] = hl_ambient_light * HLLIGHT_UNITY;
+
+		key   = 0;
+		taken = 0;
+
+		for (j = 0; j < count; j++)
+		{
+			//block stride is the whole lightmap, so block j's luxel is j
+			//lightmaps further in
+			lofs = f->light_offset +
+				(j * lm_sz + dt * lm_w + ds) * HLLIGHT_STRIDE;
+
+			if (lofs + HLLIGHT_STRIDE > map->lightdata_size)
+				break;
+
+			scale = hl_lightstyle_value[f->styles[j]];
+			key   = key * 31 + scale;
+
+			//no ToI64: lightdata[] is a U8 and widens
+			for (ch = 0; ch < HLLIGHT_STRIDE; ch++)
+				acc[ch] += map->lightdata[lofs + ch] * scale;
+
+			taken++;
+		}
+
+		//an unstyled face still carries one block; take it raw, as
+		//R_BuildLightMap returns it
+		if (count < 1)
+		{
+			lofs = f->light_offset + (dt * lm_w + ds) * HLLIGHT_STRIDE;
+
+			if (lofs + HLLIGHT_STRIDE > map->lightdata_size)
+				goto qlp_next;
+
+			for (ch = 0; ch < HLLIGHT_STRIDE; ch++)
+				acc[ch] = map->lightdata[lofs + ch] * HLLIGHT_UNITY;
+
+			taken = 1;
+		}
+
+		if (taken < 1)
+			goto qlp_next;
+
+		for (ch = 0; ch < HLLIGHT_STRIDE; ch++)
+		{
+			//divide by what a steady style resolves to, not 256
+			acc[ch] = acc[ch] / HLLIGHT_UNITY;
+
+			if (acc[ch] > 255)
+				acc[ch] = 255;
+			if (acc[ch] < 0)
+				acc[ch] = 0;
+		}
+
+		//alias shading is a single scalar, so the RGB luxel collapses to
+		//luminance here
+		best = (acc[0] * 77 + acc[1] * 151 + acc[2] * 28) >> 8;
+
+		//every style on the face. A steady style never changes value and never
+		//invalidates anything, so a face of steady styles folds to a constant
+		hl_light_pt_key = key;
+
+		if (f->styles[0] < HLMAX_LIGHTSTYLES)
+			hl_light_pt_style = f->styles[0];
+
+		break;
+
+qlp_next:
+	}
+
+	if (best < 0)
+		best = HLLIGHT_FALLBACK;
+
+	//dlights reach models too, radius minus distance from the origin.
+	//R_DrawAliasModel does this before the shading setup
+	if (!hl_r_dynamic)
+		goto qlp_no_dlights;
+
+	for (i = 0; i < hl_dlight_count; i++)
+	{
+		if (hl_dlight[i].die <= hl_light_time || hl_dlight[i].radius <= 0.0)
+			goto qlp_dl_next;
+
+		HLVecSub(point, hl_dlight[i].origin, dl);
+		add = hl_dlight[i].radius - HLVecLength(dl);
+
+		if (add > 0.0)
+			best += ToI64(add);
+
+qlp_dl_next:
+	}
+
+qlp_no_dlights:
+
+	//cap so a nearby light doesn't wash the model out
+	if (best > 128)
+		best = 128;
+
+	//floor so models don't go black in unlit corners
+	if (best < 24)
+		best = 24;
+
+	return best;
+}
+
+CHLCanvas *HLDrawNew(I64 w, I64 h)
+{//cost scales with pixel count - this is the main performance dial
+	CHLCanvas *c = CAlloc(sizeof(CHLCanvas));
+
+	if (w < 64)		w = 64;
+	if (h < 64)		h = 64;
+	if (w > 1920)	w = 1920;
+	if (h > 1200)	h = 1200;
+
+	c->width  = w;
+	c->height = h;
+
+	//full canvas until SCR_CalcRefdef says otherwise
+	c->vx = 0;
+	c->vy = 0;
+	c->vw = w;
+	c->vh = h;
+	c->pixels = CAlloc(w * h * sizeof(U32));
+	c->depth  = CAlloc(w * h * sizeof(F64));
+
+	//12 bytes per pixel between the two buffers, so 800x600 is 5.8MB against
+	//320x240's 0.9MB. A failed allocation here must not reach the rasteriser
+	//as a canvas with NULL planes.
+	if (!c->pixels || !c->depth)
+	{
+		if (c->pixels)	Free(c->pixels);
+		if (c->depth)	Free(c->depth);
+		Free(c);
+		return NULL;
+	}
+
+	return c;
+}
+
+U0 HLDrawFree(CHLCanvas *c)
+{
+	if (!c)
+		return;
+
+	if (c->pixels)	Free(c->pixels);
+	if (c->depth)	Free(c->depth);
+
+	Free(c);
+}
+
+U0 HLDrawClear(CHLCanvas *c, I64 color_index)
+{//still takes a palette index - every caller is 2D art or a debug fill, and
+ //the global palette.lmp is still what those are authored against
+	U32	 fill = HLPalColor(color_index);
+	I64	 n    = c->width * c->height;
+	I64	 i;
+
+	for (i = 0; i < n; i++)
+		c->pixels[i] = fill;
+
+	MemSet(c->depth, 0, c->width * c->height * sizeof(F64));
+	c->faces_drawn = 0;
+	c->spans_drawn = 0;
+
+	//the frame just finished, reported at the head of the next one - the render
+	//path has no other place a whole frame is known to be complete
+	if (hl_rs_enable)
+	{
+		"--- r_speeds %d x %d ---\n", c->width, c->height;
+		HLRSpeedsPrint;
+	}
+
+	HLRSpeedsReset;
+}
+
+U0 HLDrawSetViewRect(CHLCanvas *c, F64 viewsize, I64 sbar_h)
+{//SCR_CalcRefdef - 100 and up fills the width, below that the view shrinks
+ //and is centred above the status bar
+	F64 size;
+	I64 avail;
+
+	if (viewsize < 30.0)	viewsize = 30.0;
+	if (viewsize > 120.0)	viewsize = 120.0;
+
+	//sbar_h is sb_lines and comes from the caller. recomputing it here drops
+	//the whole bar at viewsize 110 instead of the inventory row alone
+	size = viewsize;
+	if (size > 100.0)
+		size = 100.0;
+	size = size / 100.0;
+
+	avail = c->height - sbar_h;
+
+	c->vw = ToI64(ToF64(c->width) * size);
+	c->vh = ToI64(ToF64(c->height) * size);
+
+	if (c->vw < 96)
+		c->vw = 96;
+	if (c->vh > avail)
+		c->vh = avail;
+	if (c->vh < 64)
+		c->vh = 64;
+
+	c->vx = (c->width - c->vw) / 2;
+	c->vy = (avail - c->vh) / 2;
+
+	if (c->vx < 0)	c->vx = 0;
+	if (c->vy < 0)	c->vy = 0;
+}
+
+//The basis of the last world pass. hl_angles lives in the shell, which compiles
+//last, and the sound listener carries only the roll-free right vector, which
+//holds no pitch; a file between the two that needs the true view ray reads
+//these. hl_view_basis is FALSE until the first recorded pass.
+F64  hl_view_org[3];
+F64  hl_view_fwd[3];
+Bool hl_view_basis = FALSE;
+
+hl_view_basis = FALSE;
+
+U0 HLDrawSetView(CHLCanvas *c, F64 *origin, F64 *angles, F64 fov_x,
+	Bool record = TRUE)
+{//projection scales from the horizontal fov, y reuses x so pixels stay square
+ //
+ //record off for a camera that is not the player's - a model preview aims a
+ //canvas somewhere else and must not be mistaken for the view ray.
+	F64 half = fov_x * 0.5 * HLDEG2RAD;
+
+	HLVecCopy(origin, c->origin);
+	HLAngleVectors(angles, c->forward, c->right, c->up);
+
+	if (record)
+	{
+		HLVecCopy(c->origin, hl_view_org);
+		HLVecCopy(c->forward, hl_view_fwd);
+		hl_view_basis = TRUE;
+	}
+
+	//centred on the VIEW RECT, not the canvas
+	c->center_x = ToF64(c->vx) + ToF64(c->vw) * 0.5;
+	c->center_y = ToF64(c->vy) + ToF64(c->vh) * 0.5;
+	c->x_scale  = ToF64(c->vw) * 0.5 / Tan(half);
+	c->y_scale  = c->x_scale;
+}
+
+F64 HLDrawFovY(F64 fov_x, I64 width, I64 height)
+{//matching vertical fov for square pixels, in degrees
+	F64 half = fov_x * 0.5 * HLDEG2RAD;
+	F64 t    = Tan(half) * ToF64(height) / ToF64(width);
+
+	return ATan(t) * 2.0 / HLDEG2RAD;
+}
+
+I64 HLDrawClipNear(CHLPolyVert *in, I64 count, CHLPolyVert *out)
+{//Sutherland-Hodgman against z = HLNEAR_CLIP. the only plane that must be
+ //exact - the rest is clamped at scan time
+	I64 i;
+	I64 j;
+	I64 n = 0;
+	F64 d1;
+	F64 d2;
+	F64 frac;
+
+	for (i = 0; i < count; i++)
+	{
+		j  = (i + 1) % count;
+		d1 = in[i].cam[2] - HLNEAR_CLIP;
+		d2 = in[j].cam[2] - HLNEAR_CLIP;
+
+		if (d1 >= 0.0)
+		{
+			if (n < HLMAX_POLY_VERTS)
+			{
+				MemCopy(&out[n], &in[i], sizeof(CHLPolyVert));
+				n++;
+			}
+		}
+
+		//crossing either way contributes one new vertex
+		if ((d1 >= 0.0) != (d2 >= 0.0))
+		{
+			if (n < HLMAX_POLY_VERTS && (d1 - d2) != 0.0)
+			{
+				frac = d1 / (d1 - d2);
+				out[n].cam[0] = in[i].cam[0] + frac * (in[j].cam[0] - in[i].cam[0]);
+				out[n].cam[1] = in[i].cam[1] + frac * (in[j].cam[1] - in[i].cam[1]);
+				out[n].cam[2] = in[i].cam[2] + frac * (in[j].cam[2] - in[i].cam[2]);
+				out[n].s      = in[i].s + frac * (in[j].s - in[i].s);
+				out[n].t      = in[i].t + frac * (in[j].t - in[i].t);
+				n++;
+			}
+		}
+	}
+
+	return n;
+}
+
+U0 HLLightBilinear(U8 *lightmap, I64 lm_w, I64 lm_h, F64 ls, F64 lt, I64 *out)
+{//one lightmap sample, four neighbours blended, into out[0..2] as 0-255
+ //
+ //R_DrawSurfaceBlock8 interpolates with lightleftstep/lightstep. nearest
+ //luxel makes every 16-texel cell a flat slab with hard edges
+	I64 lx0, ly0, lx1, ly1;
+	I64 ch;
+	F64 fs, ft;
+	F64 top, bot;
+
+	if (ls < 0.0)	ls = 0.0;
+	if (lt < 0.0)	lt = 0.0;
+
+	lx0 = ToI64(Floor(ls));
+	ly0 = ToI64(Floor(lt));
+	fs  = ls - ToF64(lx0);
+	ft  = lt - ToF64(ly0);
+
+	lx1 = lx0 + 1;
+	ly1 = ly0 + 1;
+
+	lx0 = ClampI64(lx0, 0, lm_w - 1);
+	lx1 = ClampI64(lx1, 0, lm_w - 1);
+	ly0 = ClampI64(ly0, 0, lm_h - 1);
+	ly1 = ClampI64(ly1, 0, lm_h - 1);
+
+	//BSP30 luxels are RGB triples, 3 bytes per luxel. each channel goes
+	//through the same weights rather than collapsing to luminance
+	for (ch = 0; ch < HLLIGHT_STRIDE; ch++)
+	{
+		top = ToF64(lightmap[(ly0 * lm_w + lx0) * HLLIGHT_STRIDE + ch]) * (1.0 - fs) +
+			  ToF64(lightmap[(ly0 * lm_w + lx1) * HLLIGHT_STRIDE + ch]) * fs;
+		bot = ToF64(lightmap[(ly1 * lm_w + lx0) * HLLIGHT_STRIDE + ch]) * (1.0 - fs) +
+			  ToF64(lightmap[(ly1 * lm_w + lx1) * HLLIGHT_STRIDE + ch]) * fs;
+
+		out[ch] = ClampI64(ToI64(top * (1.0 - ft) + bot * ft), 0, 255);
+	}
+}
+
+I64 HLTextureAnimation(CHLMap *map, I64 miptex, I64 frame, F64 time)
+{//R_TextureAnimation - walk the ring to the frame covering this tick, after
+ //swapping to the alternate chain if the entity asked
+	CHLTexture	*base;
+	I64			 idx;
+	I64			 rel;
+	I64			 count;
+
+	if (miptex < 0 || miptex >= map->num_textures)
+		return -1;
+
+	idx  = miptex;
+	base = &map->textures[idx];
+
+	//.frame selects the alternate sequence - pressed button, open door
+	if (frame && base->alt_anims >= 0 &&
+		base->alt_anims < map->num_textures)
+	{
+		idx  = base->alt_anims;
+		base = &map->textures[idx];
+	}
+
+	if (!base->anim_total)
+		return idx;
+
+	rel = ToI64(time * 10.0) % base->anim_total;
+	if (rel < 0)
+		rel += base->anim_total;
+
+	count = 0;
+	while (base->anim_min > rel || base->anim_max <= rel)
+	{
+		idx = base->anim_next;
+		if (idx < 0 || idx >= map->num_textures)
+			break;
+
+		base = &map->textures[idx];
+
+		//a malformed ring must not hang the renderer
+		count++;
+		if (count > 100)
+			break;
+	}
+
+	//an index, not a pointer: ZealC pointer subtraction is not reliably scaled
+	//by element size, and the caller needs the number to key the cache
+	return idx;
+}
+
+//--- sky -------------------------------------------------------------------
+//
+// GoldSrc has no scrolling sky. It draws a six-face skybox from
+// gfx/env/<skyname>{rt,lf,bk,ft,up,dn}.tga and clips it to the surfaces whose
+// texture is named "sky". worldspawn's "skyname" key names the set and is
+// forwarded to the sv_skyname cvar, dlls/world.cpp:674.
+//
+// The BSP's "sky" miptex is 16x16 with a zero data offset - boot_camp.bsp and
+// c1a3b.bsp both carry exactly that - so it holds no image. Quake's two 128x128
+// scrolling layers have nothing to read there and the path drew nothing.
+//
+// Face axes are GLQuake's st_to_vec and skytexorder from gl_warp.c, inverted
+// to go from a view ray to a face and a texel. Writing a face's ray as
+// v(s,t) = A + s*S + t*T with s and t in -1..1:
+//
+//   rt   A +x   S -y   T +z
+//   lf   A -x   S +y   T +z
+//   bk   A +y   S +x   T +z
+//   ft   A -y   S -x   T +z
+//   up   A +z   S -y   T -x
+//   dn   A -z   S -y   T +x
+//
+// with u = (s+1)/2 and v = (1-t)/2 across the image, v growing down the rows.
+// Checked against the shipped desert set: under this mapping every shared edge
+// of every face pair agrees to a mean per-channel error of 7 to 22 of 255,
+// against 67 to 85 for any other pairing, reversal or flip. Sampling a great
+// circle in each coordinate plane, all twelve face crossings hold to a mean
+// per-channel jump of 2.0 to 4.8.
+//
+// Shipped data: 19 complete TGA sets under valve/gfx/env, 256x256, type 2
+// uncompressed 24bpp, bottom-left origin. 53 of the 125 maps set skyname over
+// 15 distinct values; "day" and "dawn", one map each, name no shipped set and
+// fall through to the solid colour. The other 72 maps take HLSKY_DEFAULT, and
+// only 49 maps carry a "sky" texture at all.
+//
+// The rest of movevars_t's sky fields (pm_movevars.h:37-42) come from
+// light_environment, not worldspawn: "_light" through qrad's gamma curve is
+// sv_skycolor_r/g/b (dlls/lights.cpp:150-177) and the entity's aim forward is
+// sv_skyvec_x/y/z (dlls/lights.cpp:186-197). 112 maps carry the entity.
+// skycolor is what a missing face draws; skyvec is parsed and unused - there
+// is no directional pass to feed it.
+
+#define HLSKY_FACES		6
+#define HLSKY_RT			0
+#define HLSKY_LF			1
+#define HLSKY_BK			2
+#define HLSKY_FT			3
+#define HLSKY_UP			4
+#define HLSKY_DN			5
+
+//sv_skyname's engine default. worldspawn omits the key on maps with no sky
+#define HLSKY_DEFAULT	"desert"
+
+U32	*hl_sky_pix[HLSKY_FACES];	//0x00RRGGBB, one owned block per face
+I64	 hl_sky_w[HLSKY_FACES];
+I64	 hl_sky_h[HLSKY_FACES];
+U8	 hl_sky_name[64];			//loaded set, empty when none
+U32	 hl_sky_solid	= 0;			//sv_skycolor, drawn where a face is missing
+Bool hl_sky_ready	= FALSE;
+I64	 hl_sky_loaded	= 0;			//faces of the set that decoded, 0..6
+
+//movevars_t sky fields, pm_movevars.h:37-42. skycolor comes from
+//light_environment's "_light" (dlls/lights.cpp:150-177), skyvec from that
+//entity's aim forward (dlls/lights.cpp:186-197)
+F64	 hl_sky_vec[3];				//sv_skyvec_x/y/z, unit
+Bool hl_sky_color_set	= FALSE;	//a light_environment supplied skycolor
+Bool hl_sky_vec_set		= FALSE;
+
+//the map the loaded set belongs to. HLLoadMap frees the old CHLMap before
+//allocating the new one and the allocator reuses the address, so the pointer
+//alone cannot tell two maps apart
+CHLMap	*hl_sky_map = NULL;
+U8		 hl_sky_map_name[96];
+
+//underwater view distortion, set from the player's water level. amount is in
+//source pixels of sideways shear, zero disables the path
+F64 hl_warp_amount = 0.0;
+F64 hl_warp_time   = 0.0;
+
+U8 *HLSkySuffix(I64 face)
+{//file name suffix per face, GoldSrc's own
+	if (face == HLSKY_RT)	return "rt";
+	if (face == HLSKY_LF)	return "lf";
+	if (face == HLSKY_BK)	return "bk";
+	if (face == HLSKY_FT)	return "ft";
+	if (face == HLSKY_UP)	return "up";
+
+	return "dn";
+}
+
+U0 HLSkyFree()
+{//release the loaded set. HLSkyInit runs first and nulls the table, so a NULL
+ //here is a face that never loaded, not startup garbage
+	I64 i;
+
+	for (i = 0; i < HLSKY_FACES; i++)
+	{
+		if (hl_sky_pix[i])
+			Free(hl_sky_pix[i]);
+
+		hl_sky_pix[i] = NULL;
+		hl_sky_w[i]   = 0;
+		hl_sky_h[i]   = 0;
+	}
+
+	hl_sky_ready   = FALSE;
+	hl_sky_loaded  = 0;
+	hl_sky_name[0] = 0;
+}
+
+U0 HLSkyInit()
+{//before any face is ever loaded, when hl_sky_pix holds startup garbage
+	I64 i;
+
+	for (i = 0; i < HLSKY_FACES; i++)
+	{
+		hl_sky_pix[i] = NULL;
+		hl_sky_w[i]   = 0;
+		hl_sky_h[i]   = 0;
+	}
+
+	hl_sky_ready       = FALSE;
+	hl_sky_loaded      = 0;
+	hl_sky_name[0]     = 0;
+	hl_sky_solid       = 0;
+	hl_sky_map         = NULL;
+	hl_sky_map_name[0] = 0;
+
+	hl_sky_color_set = FALSE;
+	hl_sky_vec_set   = FALSE;
+	hl_sky_vec[0]    = 0.0;
+	hl_sky_vec[1]    = 0.0;
+	hl_sky_vec[2]    = -1.0;
+}
+
+//--- surface cache ----------------------------------------------------------
+//
+// D_CacheSurface. a wall is not lit per pixel per frame - the texture is built
+// once with its lighting folded in at the mip being drawn, and the span loop
+// is then a plain fetch. unchanged surfaces are reused next frame
+//
+// keyed on mip AND a lighting key, so an animated style or a dlight rebuilds
+// while a static wall never does
+
+//a slot is a table entry, not a surface: memory is capped by HLSURF_BUDGET.
+//512 was below the visible set of an ordinary room - 547 world surfaces in one
+//frame of c1a0 - so the last faces found no slot every frame and drew the slow
+//path forever. at the observed 12.8KB per lit surface the budget covers ~1900
+#define HLSURF_SLOTS			2048
+#define HLSURF_BUDGET		25165824	//24MB of lit surfaces
+//4x the quake budget: surfaces are 32bpp now, and HL maps are bigger
+
+//a cached surface texel that must not be drawn. the canvas is 0x00RRGGBB, so
+//the top byte is free and no lit colour can collide with this value.
+//a masked texture cannot store its cutout as a colour: in the shipped wads
+//palette entry 255 is pure blue (0,0,255), and multiplying it by the lightmap
+//yields an ordinary dark blue that no downstream test can tell from real art
+#define HLSURF_TRANSPARENT	0xFF000000
+
+class CHLSurfCache
+{
+	U32	*pixels;		//0x00RRGGBB, lighting already folded in
+	I64	 bytes;			//allocated, may exceed w*h after a rebuild
+	I64	 w;
+	I64	 h;
+	I64	 mip;
+	I64	 face;			//owning face index, -1 when free
+	I64	 frame;			//last used, for eviction
+	I64	 light_key;		//lighting state built from
+	I64	 texture;		//animation frame built from
+};
+
+CHLSurfCache	 hl_surf[HLSURF_SLOTS];
+I64			*hl_face_surf	= NULL;		//face index -> slot, -1 for none
+I64			 hl_face_surf_n	= 0;
+CHLMap		*hl_surf_map		= NULL;
+
+//identity of the map hl_surf_map points at, not just its address. HLLoadMap
+//frees the old CHLMap before allocating the new one and the allocator hands
+//back the same address often, so the pointer alone cannot tell two maps apart.
+//every independent allocation and count of one bsp must match
+U8			 hl_surf_map_name[96];
+U8			*hl_surf_map_raw		= NULL;
+I64			 hl_surf_map_raw_size	= 0;
+CHLFace		*hl_surf_map_faces	= NULL;
+I64			 hl_surf_map_nfaces	= 0;
+U8			*hl_surf_map_light	= NULL;
+I64			 hl_surf_bytes	= 0;
+I64			 hl_surf_frame	= 0;
+I64			 hl_surf_builds	= 0;
+I64			 hl_surf_hits	= 0;
+
+U0 HLSurfCacheInit()
+{//globals are not zeroed, and every pointer here goes to Free on map load -
+ //garbage faults inside the allocator, nowhere near here
+	I64 i;
+
+	//the sky faces are freed on map load for the same reason and this is the
+	//only one-time init the shell calls. HLLightInit runs again at every level
+	//start and would leak the loaded set
+	HLSkyInit;
+
+	for (i = 0; i < HLSURF_SLOTS; i++)
+	{
+		hl_surf[i].pixels    = NULL;
+		hl_surf[i].bytes     = 0;
+		hl_surf[i].w         = 0;
+		hl_surf[i].h         = 0;
+		hl_surf[i].face      = -1;
+		hl_surf[i].frame     = -1;
+		hl_surf[i].mip       = -1;
+		hl_surf[i].light_key = -1;
+		hl_surf[i].texture   = -1;
+	}
+
+	hl_face_surf   = NULL;
+	hl_face_surf_n = 0;
+	hl_surf_map    = NULL;
+	hl_surf_bytes  = 0;
+
+	hl_surf_map_name[0]   = 0;
+	hl_surf_map_raw       = NULL;
+	hl_surf_map_raw_size  = 0;
+	hl_surf_map_faces     = NULL;
+	hl_surf_map_nfaces    = 0;
+	hl_surf_map_light     = NULL;
+	hl_surf_frame  = 0;
+	hl_surf_builds = 0;
+	hl_surf_hits   = 0;
+}
+
+U0 HLSurfCacheFlush()
+{//map change or palette change
+	I64 i;
+
+	for (i = 0; i < HLSURF_SLOTS; i++)
+	{
+		if (hl_surf[i].pixels)
+			Free(hl_surf[i].pixels);
+
+		hl_surf[i].pixels    = NULL;
+		hl_surf[i].bytes     = 0;
+		hl_surf[i].face      = -1;
+		hl_surf[i].frame     = -1;
+		hl_surf[i].mip       = -1;
+		hl_surf[i].light_key = -1;
+		hl_surf[i].texture   = -1;
+	}
+
+	if (hl_face_surf)
+	{
+		for (i = 0; i < hl_face_surf_n; i++)
+			hl_face_surf[i] = -1;
+	}
+
+	hl_surf_bytes = 0;
+}
+
+U0 HLSurfCacheSetMap(CHLMap *map)
+{//One slot table per map: a cached surface is keyed by face index, and face 42
+ //of one map has nothing to do with face 42 of the next.
+ //
+ //Called once per frame from HLRenderFrame, so it must return without touching
+ //anything while the map is unchanged. Flushing here unconditionally emptied
+ //the cache before every traversal: the hit counter read 0 and the evict
+ //counter read 0 with it, because a flush is not an eviction.
+ //
+ //Testing the map POINTER alone is not enough. HLLoadMap frees the old CHLMap
+ //before allocating the new one, and the allocator hands back the same address
+ //often enough that a pointer guard silently keeps the previous map's lit
+ //surfaces, and faces draw whatever texture the last map had at that index.
+ //So the guard compares the name and every independent allocation and count of
+ //the bsp. A reload of the same file matches, and matching is correct: the
+ //cached pixels are self-contained copies of identical geometry and lighting
+	Bool same;
+
+	same = FALSE;
+
+	if (map && map == hl_surf_map && map->raw == hl_surf_map_raw &&
+		map->raw_size == hl_surf_map_raw_size &&
+		map->faces == hl_surf_map_faces &&
+		map->num_faces == hl_surf_map_nfaces &&
+		map->lightdata == hl_surf_map_light &&
+		hl_face_surf && hl_face_surf_n == map->num_faces &&
+		!StrCompare(hl_surf_map_name, hl_map_name))
+		same = TRUE;
+
+	if (same)
+		return;
+
+	HLSurfCacheFlush;
+
+	if (hl_face_surf)
+	{
+		Free(hl_face_surf);
+		hl_face_surf   = NULL;
+		hl_face_surf_n = 0;
+	}
+
+	hl_surf_map = map;
+
+	if (map && map->num_faces > 0)
+	{
+		hl_face_surf_n = map->num_faces;
+		hl_face_surf   = MAlloc(hl_face_surf_n * sizeof(I64));
+		MemSet(hl_face_surf, 0xFF, hl_face_surf_n * sizeof(I64));
+	}
+
+	//fingerprint the map the table now belongs to
+	if (map)
+	{
+		hl_surf_map_raw      = map->raw;
+		hl_surf_map_raw_size = map->raw_size;
+		hl_surf_map_faces    = map->faces;
+		hl_surf_map_nfaces   = map->num_faces;
+		hl_surf_map_light    = map->lightdata;
+		HLStrCopy(hl_surf_map_name, hl_map_name, 96);
+	}
+	else
+	{
+		hl_surf_map_raw      = NULL;
+		hl_surf_map_raw_size = 0;
+		hl_surf_map_faces    = NULL;
+		hl_surf_map_nfaces   = 0;
+		hl_surf_map_light    = NULL;
+		hl_surf_map_name[0]  = 0;
+	}
+}
+
+Bool HLSurfCacheRelease()
+{//free the LRU slot that actually holds memory, report whether any did
+ //
+ //an empty slot frees nothing and the caller's release-until-it-fits loop
+ //would spin on it forever
+	I64 best = -1;
+	I64 best_frame = I64_MAX;
+	I64 i;
+
+	for (i = 0; i < HLSURF_SLOTS; i++)
+	{
+		if (!hl_surf[i].pixels)
+			goto qsr_next;
+
+		//in use this frame, about to be drawn
+		if (hl_surf[i].frame == hl_surf_frame)
+			goto qsr_next;
+
+		if (hl_surf[i].frame < best_frame)
+		{
+			best_frame = hl_surf[i].frame;
+			best       = i;
+		}
+
+qsr_next:
+	}
+
+	if (best < 0)
+		return FALSE;
+
+	if (hl_face_surf && hl_surf[best].face >= 0 &&
+		hl_surf[best].face < hl_face_surf_n)
+		hl_face_surf[hl_surf[best].face] = -1;
+
+	hl_surf_bytes -= hl_surf[best].bytes;
+	hl_rs_surf_evict++;
+	Free(hl_surf[best].pixels);
+
+	hl_surf[best].pixels    = NULL;
+	hl_surf[best].bytes     = 0;
+	hl_surf[best].face      = -1;
+	hl_surf[best].frame     = -1;
+	hl_surf[best].mip       = -1;
+	hl_surf[best].light_key = -1;
+
+	return TRUE;
+}
+
+I64 HLSurfCacheEvict()
+{//a slot to build into, free or LRU
+	I64 best = -1;
+	I64 best_frame = I64_MAX;
+	I64 i;
+
+	for (i = 0; i < HLSURF_SLOTS; i++)
+	{
+		if (hl_surf[i].face < 0)
+			return i;
+
+		if (hl_surf[i].frame < best_frame)
+		{
+			best_frame = hl_surf[i].frame;
+			best       = i;
+		}
+	}
+
+	if (best < 0)
+		return -1;
+
+	//never take a slot already used this frame
+	if (hl_surf[best].frame == hl_surf_frame)
+		return -1;
+
+	if (hl_face_surf && hl_surf[best].face >= 0 &&
+		hl_surf[best].face < hl_face_surf_n)
+		hl_face_surf[hl_surf[best].face] = -1;
+
+	hl_surf[best].face = -1;
+
+	//taking a slot off another face is an eviction even though the pixels are
+	//kept and overwritten. counting only HLSurfCacheRelease reported evict 0
+	//while every slot changed owner each frame
+	hl_rs_surf_evict++;
+
+	return best;
+}
+
+I64 HLTexWrap(I64 v, I64 n)
+{//tile into 0..n-1 for any n
+ //
+ //quake texture dimensions are multiples of 16, not powers of two - 96x64 is
+ //an ordinary size, and masking with (n-1) folds coordinates back on
+ //themselves. powers of two, which are most textures, still take the mask
+	if (n < 1)
+		return 0;
+
+	if (!(n & (n - 1)))
+		return v & (n - 1);
+
+	v = v % n;
+	if (v < 0)
+		v += n;
+
+	return v;
+}
+
+//quantum the dlight hash rounds a light's origin and radius to, in world
+//units. A light that has not crossed a step contributes the same key and its
+//surfaces stay cached. One step moves a luxel by 2/264 of full scale, under
+//one output level of 255
+#define HLDLIGHT_KEY_QUANT	2.0
+
+I64 HLSurfLightKey(CHLFace *f)
+{//any change here means rebuild
+	CHLDlight	*d;
+	F64			*o;
+	I64			 key = 0;
+	I64			 j;
+
+	for (j = 0; j < 4; j++)
+	{
+		if (f->styles[j] == 255)
+			break;
+		if (f->styles[j] < HLMAX_LIGHTSTYLES)
+			key = key * 31 + hl_lightstyle_value[f->styles[j]];
+	}
+
+	key = key * 31 + hl_ambient_light;
+
+	//A marked face has to rebuild whenever the light on it CHANGES, not
+	//whenever a light is present. Folding in hl_dlight_frame made the key
+	//differ every frame by construction, so the flashlight - one wide dlight
+	//re-added each frame at the same place while the player stands still -
+	//re-lit its whole visible set every frame at a guaranteed cache miss.
+	//
+	//Hashing the lights themselves instead: same lights in the same place at
+	//the same radius and colour produce the same key and the cached pixels
+	//are already correct. The mask is part of the key, so a light arriving or
+	//leaving rebuilds once.
+	if (f->dlight_frame == hl_dlight_frame && f->dlight_bits)
+	{
+		key = key * 31 + f->dlight_bits;
+
+		for (j = 0; j < hl_dlight_count && j < HLMAX_DLIGHTS; j++)
+		{
+			if (!(f->dlight_bits & (1 << j)))
+				goto qslk_next;
+
+			d = &hl_dlight[j];
+
+			//model space on a brush entity, so a tram moving under a fixed
+			//light rebuilds and a stationary door under one does not
+			o = HLDlightOrigin(j);
+
+			key = key * 31 +
+				ToI64(o[0] / HLDLIGHT_KEY_QUANT);
+			key = key * 31 +
+				ToI64(o[1] / HLDLIGHT_KEY_QUANT);
+			key = key * 31 +
+				ToI64(o[2] / HLDLIGHT_KEY_QUANT);
+			key = key * 31 +
+				ToI64(d->radius / HLDLIGHT_KEY_QUANT);
+			key = key * 31 + d->color[0];
+			key = key * 31 + d->color[1];
+			key = key * 31 + d->color[2];
+
+qslk_next:
+		}
+	}
+
+	return key;
+}
+
+U32 *HLSurfCacheGet(CHLMap *map, CHLFace *f, I64 face_index, CHLTexture *tex,
+	I64 mip, U8 *lightmap, I64 lm_w, I64 lm_h, I64 *_cw, I64 *_ch,
+	I64 tex_key = 0)
+{//R_DrawSurface - texture with lighting applied at the mip being drawn.
+ //NULL means not cached, light it per pixel
+ //
+ //output is 0x00RRGGBB, not palette indices. HL gives every texture its own
+ //256 colours, so there is no shared colormap to shade through - the multiply
+ //happens once per surface texel here instead of once per screen pixel
+ //
+ //gamma and the damage/water tint are not folded in: they are display state,
+ //and baking them here would invalidate every surface on a damage flash.
+ //HLDispCorrect applies them, at blit time
+	CHLSurfCache	*sc;
+	U8			*texels;
+	U8			*pal;
+	U32			*out;
+	I64			 slot;
+	I64			 cw, ch;
+	I64			 tw, th;
+	I64			 need;
+	I64			 key;
+	I64			 u, v;
+	I64			 tx, ty;
+	I64			 s0, t0;
+	I64			 mins_s_i, mins_t_i;
+	I64			 texel;
+	I64			 lrgb[3];
+	I64			 r, g, b;
+
+	//slots are indexed by face number within ONE map - an external brush model
+	//numbers its own faces and would collide with the world
+	if (map != hl_surf_map)
+		return NULL;
+
+	if (!hl_face_surf || face_index < 0 || face_index >= hl_face_surf_n)
+		return NULL;
+
+	texels = tex->texels[mip];
+	pal    = tex->palette;
+	tw     = tex->width >> mip;
+	th     = tex->height >> mip;
+
+	//no palette means the texture never resolved out of a wad - the slow path
+	//has nothing to draw either, but it fails visibly instead of wildly
+	if (!texels || !pal || tw <= 0 || th <= 0)
+		return NULL;
+
+	cw = (f->extent_s >> mip) + 1;
+	ch = (f->extent_t >> mip) + 1;
+
+	if (cw <= 0 || ch <= 0)
+		return NULL;
+
+	need = cw * ch * sizeof(U32);
+	if (need > HLSURF_BUDGET / 4)
+		return NULL;			//absurdly large surface, not worth caching
+
+	key  = HLSurfLightKey(f);
+	slot = hl_face_surf[face_index];
+
+	if (slot >= 0 && slot < HLSURF_SLOTS)
+	{
+		sc = &hl_surf[slot];
+
+		if (sc->face == face_index && sc->mip == mip &&
+			sc->light_key == key && sc->texture == tex_key && sc->pixels)
+		{
+			sc->frame = hl_surf_frame;
+			*_cw = sc->w;
+			*_ch = sc->h;
+			hl_surf_hits++;
+			hl_rs_surf_hit++;
+			return sc->pixels;
+		}
+	}
+	else
+	{
+		slot = HLSurfCacheEvict;
+		if (slot < 0)
+			return NULL;
+	}
+
+	sc = &hl_surf[slot];
+
+	//grow only - a surface bounces between mips as the player walks
+	if (sc->bytes < need)
+	{
+		//release until it fits, give up the moment nothing more can go
+		while (hl_surf_bytes + need - sc->bytes > HLSURF_BUDGET)
+		{
+			if (!HLSurfCacheRelease)
+				break;
+		}
+
+		//still over budget with nothing left, draw it the slow way
+		if (hl_surf_bytes + need - sc->bytes > HLSURF_BUDGET)
+			return NULL;
+
+		if (sc->pixels)
+		{
+			hl_surf_bytes -= sc->bytes;
+			Free(sc->pixels);
+			sc->pixels = NULL;
+			sc->bytes  = 0;
+		}
+
+		sc->pixels = MAlloc(need);
+		if (!sc->pixels)
+		{
+			sc->bytes = 0;
+			return NULL;
+		}
+
+		sc->bytes = need;
+		hl_surf_bytes += need;
+	}
+
+	out      = sc->pixels;
+	mins_s_i = ToI64(f->mins_s);
+	mins_t_i = ToI64(f->mins_t);
+
+	for (v = 0; v < ch; v++)
+	{
+		t0 = v << mip;
+		ty = HLTexWrap((mins_t_i + t0) >> mip, th);
+
+		for (u = 0; u < cw; u++)
+		{
+			s0 = u << mip;
+			tx = HLTexWrap((mins_s_i + s0) >> mip, tw);
+
+			texel = texels[ty * tw + tx];
+
+			//the cutout is decided before any lighting arithmetic. every mip
+			//of a masked miptex stores index 255 verbatim - the wad holds
+			//four separate levels, none of them filtered - so the test is
+			//the same at every mip
+			if (tex->is_masked && texel == 255)
+			{
+				out[v * cw + u] = HLSURF_TRANSPARENT;
+				goto qsc_next_texel;
+			}
+
+			//'~' textures are qrad's emitters, and are also the ones that
+			//must not go dark in an unlit corridor. HL has
+			//no fullbright palette range the way quake does
+			if (tex->is_light || !lightmap || lm_w <= 0 || lm_h <= 0)
+			{
+				lrgb[0] = 255;
+				lrgb[1] = 255;
+				lrgb[2] = 255;
+			}
+			else
+				HLLightBilinear(lightmap, lm_w, lm_h,
+					ToF64(s0) / 16.0, ToF64(t0) / 16.0, lrgb);
+
+			r = (pal[texel * 3]     * lrgb[0]) / 255;
+			g = (pal[texel * 3 + 1] * lrgb[1]) / 255;
+			b = (pal[texel * 3 + 2] * lrgb[2]) / 255;
+
+			out[v * cw + u] = (r << 16) | (g << 8) | b;
+
+qsc_next_texel:
+		}
+	}
+
+	sc->w         = cw;
+	sc->h         = ch;
+	sc->mip       = mip;
+	sc->face      = face_index;
+	sc->frame     = hl_surf_frame;
+	sc->light_key = key;
+	sc->texture   = tex_key;
+
+	hl_face_surf[face_index] = slot;
+	hl_surf_builds++;
+
+	//the build is O(surface texels) and a magnified wall has far more of those
+	//than it covers screen pixels, so this is the number that says whether the
+	//cache is paying for itself
+	hl_rs_surf_build++;
+	hl_rs_surf_texels += cw * ch;
+
+	*_cw = cw;
+	*_ch = ch;
+
+	return out;
+}
+
+//--- render modes -----------------------------------------------------------
+//
+// kRenderMode, common/const.h. A brush entity carries one in its "rendermode"
+// key with an opacity in "renderamt": glass is kRenderTransTexture, a light
+// cone or a force field kRenderTransAdd. The renderer that consumes them is
+// engine side and is not in the SDK checkout, so the blends below are the
+// standard ones the modes are named for rather than a transcription.
+//
+// Handled here: NORMAL, TRANSTEXTURE, TRANSALPHA, TRANSADD. TRANSCOLOR and
+// GLOW are drawn as NORMAL - TRANSCOLOR replaces the texture with the entity's
+// rendercolor, which the span has no field for, and GLOW is a sprite-only mode.
+#define HLRENDER_NORMAL			0
+#define HLRENDER_TRANSCOLOR		1
+#define HLRENDER_TRANSTEXTURE	2
+#define HLRENDER_GLOW			3
+#define HLRENDER_TRANSALPHA		4
+#define HLRENDER_TRANSADD		5
+
+Bool HLRenderTranslucent(I64 mode)
+{//whether the mode reads the framebuffer. TRANSALPHA is a cutout at full
+ //opacity, so it is opaque wherever it draws at all
+	return ToBool(mode == HLRENDER_TRANSTEXTURE || mode == HLRENDER_TRANSADD);
+}
+
+U0 HLDrawSpan(CHLCanvas *c, I64 y, I64 x1, I64 x2,
+	F64 iz1, F64 soz1, F64 toz1, F64 iz2, F64 soz2, F64 toz2,
+	CHLTexture *tex, U8 *lightmap, I64 lm_w, I64 lm_h,
+	F64 mins_s, F64 mins_t, I64 flat_light, I64 mip,
+	U32 *surf = NULL, I64 sw = 0, I64 sh = 0,
+	I64 blend = 0, I64 amt = 255)
+{//fill one horizontal run. hot loop - a few hundred thousand iterations a
+ //frame against a few thousand calls for everything else
+ //
+ //blend is HLRENDER_*, amt the entity's renderamt. A translucent run reads the
+ //framebuffer and writes no depth: what is behind it stays visible and stays
+ //available to anything drawn later. blend is constant over the run
+	U32	*row;
+	U32	*surf32 = surf;
+	U8	*texels;
+	U8	*pal;
+	F64	*zrow;
+	F64	 span;
+	F64	 d_iz;
+	F64	 d_soz;
+	F64	 d_toz;
+	F64	 iz;
+	F64	 soz;
+	F64	 toz;
+	F64	 z;
+	F64	 s;
+	F64	 t;
+	F64	 ws;
+	F64	 wt;
+	Bool	 turb;
+	I64	 x;
+	I64	 tw;
+	I64	 th;
+	I64	 tx;
+	I64	 ty;
+	//light steps per channel - one bilinear pair per block per channel
+	F64	 lightv[3];
+	F64	 dlight[3];
+	I64	 lstart[3];
+	I64	 lend[3];
+	I64	 ch;
+	I64	 texel;
+	U32	 surf_texel;
+	U32	 dst;
+	I64	 r;
+	I64	 g;
+	I64	 b;
+	I64	 xe;
+	I64	 n;
+	I64	 mins_s_i;
+	I64	 mins_t_i;
+	F64	 iz_e;
+	F64	 soz_e;
+	F64	 toz_e;
+	F64	 s_e;
+	F64	 t_e;
+	F64	 ds;
+	F64	 dt;
+	Bool clamp_tex;
+
+	//clipped to the VIEW RECT, not the canvas - outside is border or sbar
+	if (y < c->vy || y >= c->vy + c->vh)
+		return;
+
+	//clamp horizontally, carrying the interpolants with the clamp
+	span = ToF64(x2 - x1);
+	if (span <= 0.0)
+		return;
+
+	d_iz  = (iz2 - iz1) / span;
+	d_soz = (soz2 - soz1) / span;
+	d_toz = (toz2 - toz1) / span;
+
+	if (x1 < c->vx)
+	{
+		iz1  += d_iz * ToF64(c->vx - x1);
+		soz1 += d_soz * ToF64(c->vx - x1);
+		toz1 += d_toz * ToF64(c->vx - x1);
+		x1 = c->vx;
+	}
+
+	if (x2 > c->vx + c->vw)
+		x2 = c->vx + c->vw;
+
+	if (x1 >= x2)
+		return;
+
+	//counted once for the whole run, never inside the pixel loop
+	hl_rs_spans++;
+	hl_rs_span_px += x2 - x1;
+
+	//four mips per texture in the BSP. the small ones kill point-sample
+	//shimmer and keep distant geometry in cache
+	if (mip < 0)
+		mip = 0;
+	if (mip > 3)
+		mip = 3;
+
+	while (mip > 0 && !tex->texels[mip])
+		mip--;
+
+	//a cached surface is already lit and addressed in surface space, so it
+	//needs neither the wrap nor the palette lookup below
+	if (surf && sw > 0 && sh > 0)
+	{
+		texels = NULL;			//the 32bpp surface is read through surf32
+		pal    = NULL;
+		tw     = sw;
+		th     = sh;
+	}
+	else
+	{
+		surf32 = NULL;
+		texels = tex->texels[mip];
+		pal    = tex->palette;
+		tw     = tex->width >> mip;
+		th     = tex->height >> mip;
+
+		//an unresolved texture has no palette to look colours up in
+		if (!pal)
+			return;
+	}
+
+	if (tw <= 0 || th <= 0 || (!texels && !surf32))
+		return;
+
+	mins_s_i = ToI64(mins_s);
+	mins_t_i = ToI64(mins_t);
+
+	clamp_tex = tex->clamp;
+
+	//turb never mips - the warp is defined in level 0 texels
+	turb = tex->is_turb;
+	if (turb)
+		mip = 0;
+
+	row  = c->pixels + y * c->width;
+	zrow = c->depth + y * c->width;
+
+	iz  = iz1;
+	soz = soz1;
+	toz = toz1;
+
+	//exact coords at the start of the run
+	if (iz != 0.0)
+	{
+		z = 1.0 / iz;
+		s = soz * z;
+		t = toz * z;
+	}
+	else
+	{
+		s = 0.0;
+		t = 0.0;
+	}
+
+	x = x1;
+
+	//exact only at block ends, linear between - one divide per block instead
+	//of per pixel, error stays well under a texel over 16
+	while (x < x2)
+	{
+		xe = x + HLSPAN_SUB;
+		if (xe > x2)
+			xe = x2;
+		n = xe - x;
+
+		//interpolants at the far end of this block
+		iz_e  = iz + d_iz * ToF64(n);
+		soz_e = soz + d_soz * ToF64(n);
+		toz_e = toz + d_toz * ToF64(n);
+
+		if (iz_e != 0.0)
+		{
+			z   = 1.0 / iz_e;
+			s_e = soz_e * z;
+			t_e = toz_e * z;
+		}
+		else
+		{
+			s_e = s;
+			t_e = t;
+		}
+
+		ds = (s_e - s) / ToF64(n);
+		dt = (t_e - t) / ToF64(n);
+
+		//light steps like s and t - one bilinear fetch per block, not per pixel
+		if (lightmap && lm_w > 0 && lm_h > 0)
+		{
+			HLLightBilinear(lightmap, lm_w, lm_h,
+				(s - mins_s) / 16.0, (t - mins_t) / 16.0, lstart);
+			HLLightBilinear(lightmap, lm_w, lm_h,
+				(s_e - mins_s) / 16.0, (t_e - mins_t) / 16.0, lend);
+
+			for (ch = 0; ch < 3; ch++)
+			{
+				lightv[ch]  = ToF64(lstart[ch]);
+				dlight[ch]  = ToF64(lend[ch] - lstart[ch]) / ToF64(n);
+			}
+		}
+		else
+		{
+			for (ch = 0; ch < 3; ch++)
+			{
+				lightv[ch] = ToF64(flat_light);
+				dlight[ch] = 0.0;
+			}
+		}
+
+		while (x < xe)
+		{
+			//depth test first, a rejected pixel costs only the adds below
+			if (iz > zrow[x])
+			{
+			//Floor, not ToI64 - ToI64 truncates toward zero and leaves a
+			//one-texel seam wherever s or t crosses 0
+			//
+			//s and t stay in level 0 space and are shifted to the mip here,
+			//so the lightmap lookup below still sees unshifted values
+			if (surf32)
+			{
+				//surface space, one cache texel per drawn texel at this mip
+				tx = ClampI64((ToI64(Floor(s)) - mins_s_i) >> mip, 0, tw - 1);
+				ty = ClampI64((ToI64(Floor(t)) - mins_t_i) >> mip, 0, th - 1);
+			}
+			else if (turb)
+			{
+				//cross-coupled sine warp, each axis indexed by the OTHER
+				ws = s + hl_turb_table[(ToI64(Floor(t)) + hl_turb_phase) &
+						(HLTURB_CYCLE - 1)];
+				wt = t + hl_turb_table[(ToI64(Floor(s)) + hl_turb_phase) &
+						(HLTURB_CYCLE - 1)];
+
+				tx = ToI64(Floor(ws)) >> mip;
+				ty = ToI64(Floor(wt)) >> mip;
+			}
+			else
+			{
+				tx = ToI64(Floor(s)) >> mip;
+				ty = ToI64(Floor(t)) >> mip;
+			}
+
+			if (surf32)
+			{
+				//already clamped above
+			}
+			else if (clamp_tex)
+			{
+				//model skin, arbitrary size, never tiles
+				tx = ClampI64(tx, 0, tw - 1);
+				ty = ClampI64(ty, 0, th - 1);
+			}
+			else
+			{
+				//world texture, tiles at whatever size it is
+				tx = HLTexWrap(tx, tw);
+				ty = HLTexWrap(ty, th);
+			}
+
+			if (surf32)
+			{
+				//lit when the surface was built. a masked cutout was baked as
+				//HLSURF_TRANSPARENT there and is dropped here, so the cached
+				//path masks exactly like the uncached one below
+				surf_texel = surf32[ty * tw + tx];
+
+				if (surf_texel == HLSURF_TRANSPARENT)
+					goto qds_skip_texel;
+
+				if (blend)
+				{
+					r = (surf_texel >> 16) & 255;
+					g = (surf_texel >> 8) & 255;
+					b = surf_texel & 255;
+					goto qds_blend;
+				}
+
+				row[x] = surf_texel;
+			}
+			else
+			{
+				texel = texels[ty * tw + tx];
+
+				//'{' textures key on the last palette entry. on a world brush
+				//that entry is an ordinary colour; an entity drawn in texture
+				//mode needs it skipped
+				if (tex->is_masked && texel == 255)
+					goto qds_skip_texel;
+
+				if (tex->is_light)
+				{
+					r = pal[texel * 3];
+					g = pal[texel * 3 + 1];
+					b = pal[texel * 3 + 2];
+				}
+				else
+				{
+					r = (pal[texel * 3] *
+							ClampI64(ToI64(lightv[0]), 0, 255)) / 255;
+					g = (pal[texel * 3 + 1] *
+							ClampI64(ToI64(lightv[1]), 0, 255)) / 255;
+					b = (pal[texel * 3 + 2] *
+							ClampI64(ToI64(lightv[2]), 0, 255)) / 255;
+				}
+
+				if (blend)
+					goto qds_blend;
+
+				row[x] = (r << 16) | (g << 8) | b;
+			}
+
+			zrow[x] = iz;
+			goto qds_skip_texel;
+
+qds_blend:
+			//No depth write: a translucent surface must not occlude what is
+			//behind it, and the faces of one brush entity have to show through
+			//each other. Two of them overlapping composite in submission order
+			//with no sort, which is what GoldSrc's own painter pass does.
+			dst = row[x];
+
+			if (blend == HLRENDER_TRANSADD)
+			{
+				r = ((dst >> 16) & 255) + (r * amt) / 255;
+				g = ((dst >> 8) & 255) + (g * amt) / 255;
+				b = (dst & 255) + (b * amt) / 255;
+
+				if (r > 255)	r = 255;
+				if (g > 255)	g = 255;
+				if (b > 255)	b = 255;
+			}
+			else
+			{
+				r = (r * amt + ((dst >> 16) & 255) * (255 - amt)) / 255;
+				g = (g * amt + ((dst >> 8) & 255) * (255 - amt)) / 255;
+				b = (b * amt + (dst & 255) * (255 - amt)) / 255;
+			}
+
+			row[x] = (r << 16) | (g << 8) | b;
+
+qds_skip_texel:
+			}
+
+			s          += ds;
+			t          += dt;
+			lightv[0]  += dlight[0];
+			lightv[1]  += dlight[1];
+			lightv[2]  += dlight[2];
+			iz         += d_iz;
+			x++;
+		}
+
+		//resync exact, don't carry stepping error into the next block
+		iz  = iz_e;
+		soz = soz_e;
+		toz = toz_e;
+		s   = s_e;
+		t   = t_e;
+	}
+
+	c->spans_drawn++;
+}
+
+U0 HLDrawPolygon(CHLCanvas *c, CHLScreenVert *v, I64 count,
+	CHLTexture *tex, U8 *lightmap, I64 lm_w, I64 lm_h,
+	F64 mins_s, F64 mins_t, I64 flat_light, I64 mip,
+	U32 *surf = NULL, I64 sw = 0, I64 sh = 0,
+	I64 blend = 0, I64 amt = 255)
+{//scanline fill of a convex poly - intersect every edge per row, extremes
+ //become the span. O(edges), but rarely more than eight after clipping, and
+ //no active edge table to get the winding order wrong in
+	F64	 y_min = 1.0e30;
+	F64	 y_max = -1.0e30;
+	F64	 xl;
+	F64	 xr;
+	F64	 izl;
+	F64	 izr;
+	F64	 sozl;
+	F64	 sozr;
+	F64	 tozl;
+	F64	 tozr;
+	F64	 ya;
+	F64	 yb;
+	F64	 frac;
+	F64	 xi;
+	F64	 izi;
+	F64	 sozi;
+	F64	 tozi;
+	F64	 yc;
+	I64	 i;
+	I64	 j;
+	I64	 y;
+	I64	 y0;
+	I64	 y1;
+	Bool found;
+
+	if (count < 3)
+		return;
+
+	for (i = 0; i < count; i++)
+	{
+		if (v[i].y < y_min)
+			y_min = v[i].y;
+		if (v[i].y > y_max)
+			y_max = v[i].y;
+	}
+
+	y0 = ToI64(Ceil(y_min));
+	y1 = ToI64(Floor(y_max));
+
+	if (y0 < c->vy)
+		y0 = c->vy;
+	if (y1 >= c->vy + c->vh)
+		y1 = c->vy + c->vh - 1;
+
+	for (y = y0; y <= y1; y++)
+	{
+		yc    = ToF64(y);
+		found = FALSE;
+		xl    = 0.0;
+		xr    = 0.0;
+		izl   = 0.0;
+		izr   = 0.0;
+		sozl  = 0.0;
+		sozr  = 0.0;
+		tozl  = 0.0;
+		tozr  = 0.0;
+
+		for (i = 0; i < count; i++)
+		{
+			j  = (i + 1) % count;
+			ya = v[i].y;
+			yb = v[j].y;
+
+			//half open so a shared vertex isn't counted twice
+			if ((ya <= yc && yb > yc) || (yb <= yc && ya > yc))
+			{
+				frac = (yc - ya) / (yb - ya);
+				xi   = v[i].x + frac * (v[j].x - v[i].x);
+				izi  = v[i].inv_z + frac * (v[j].inv_z - v[i].inv_z);
+				sozi = v[i].s_over_z + frac * (v[j].s_over_z - v[i].s_over_z);
+				tozi = v[i].t_over_z + frac * (v[j].t_over_z - v[i].t_over_z);
+
+				if (!found)
+				{
+					xl = xi; izl = izi; sozl = sozi; tozl = tozi;
+					xr = xi; izr = izi; sozr = sozi; tozr = tozi;
+					found = TRUE;
+				}
+				else
+				{
+					if (xi < xl)
+					{
+						xl = xi; izl = izi; sozl = sozi; tozl = tozi;
+					}
+					if (xi > xr)
+					{
+						xr = xi; izr = izi; sozr = sozi; tozr = tozi;
+					}
+				}
+			}
+		}
+
+		if (found && xr > xl)
+		{
+			HLDrawSpan(c, y, ToI64(Ceil(xl)), ToI64(Ceil(xr)),
+				izl, sozl, tozl, izr, sozr, tozr,
+				tex, lightmap, lm_w, lm_h, mins_s, mins_t, flat_light, mip,
+				surf, sw, sh, blend, amt);
+		}
+	}
+}
+
+//--- sky faces ------------------------------------------------------------
+//
+// Loading and sampling. The state and its init live above, with the surface
+// cache, because both are freed on map load.
+
+Bool HLSkyLoadFace(U8 *name, I64 face)
+{//one gfx/env face into an owned 0x00RRGGBB block
+ //
+ //the CDC body is 0xFFRRGGBB and its rows are width_internal apart, so the
+ //copy is per row and masks the top byte off
+	U8	*data;
+	U8	*sfx;
+	CDC	*dc;
+	U32	*out;
+	U8	 path[96];
+	I64	 size = 0;
+	I64	 w;
+	I64	 h;
+	I64	 x;
+	I64	 y;
+
+	sfx = HLSkySuffix(face);
+	StrPrint(path, "gfx/env/%s%s.tga", name, sfx);
+
+	data = HLFileLoad(path, &size);
+	if (!data)
+		return FALSE;
+
+	dc = TGAReadBuf(data, size);
+	Free(data);
+
+	if (!dc)
+		return FALSE;
+
+	w = dc->width;
+	h = dc->height;
+
+	if (w < 1 || h < 1)
+	{
+		DCDel(dc);
+		return FALSE;
+	}
+
+	out = MAlloc(w * h * sizeof(U32));
+
+	if (!out)
+	{
+		DCDel(dc);
+		return FALSE;
+	}
+
+	for (y = 0; y < h; y++)
+	{
+		for (x = 0; x < w; x++)
+			out[y * w + x] = dc->body[y * dc->width_internal + x] & 0x00FFFFFF;
+	}
+
+	DCDel(dc);
+
+	hl_sky_pix[face] = out;
+	hl_sky_w[face]   = w;
+	hl_sky_h[face]   = h;
+
+	return TRUE;
+}
+
+U0 HLSkyLoad(U8 *name)
+{//R_LoadSkys. a missing face draws hl_sky_solid rather than failing the set:
+ //some third party skies ship five files
+	I64 ok = 0;
+	I64 i;
+
+	HLSkyFree;
+
+	if (!name || !name[0])
+		return;
+
+	HLStrCopy(hl_sky_name, name, 64);
+
+	for (i = 0; i < HLSKY_FACES; i++)
+	{
+		if (HLSkyLoadFace(name, i))
+			ok++;
+	}
+
+	hl_sky_loaded = ok;
+
+	if (ok > 0)
+		hl_sky_ready = TRUE;
+	else
+		hl_sky_name[0] = 0;
+
+	//a set with no files at all is a data problem, not a map with no sky:
+	//worldspawn asked for it by name. say so once per map
+	if (ok == HLSKY_FACES)
+	{
+		"HLSky: %s, six faces\n", name;
+	}
+	else if (ok > 0)
+	{
+		"HLSky: %s, %d of 6 faces, rest solid\n", name, ok;
+	}
+	else
+	{
+		"HLSky: gfx/env/%s* not found, solid sky\n", name;
+	}
+}
+
+U0 HLSkySetColor(I64 r, I64 g, I64 b)
+{//sv_skycolor_r/g/b, set from light_environment - dlls/lights.cpp:173
+	hl_sky_solid = (ClampI64(r, 0, 255) << 16) |
+				   (ClampI64(g, 0, 255) << 8) |
+					ClampI64(b, 0, 255);
+
+	hl_sky_color_set = TRUE;
+}
+
+U0 HLSkyMeanColor()
+{//mean of the loaded faces, for a set that arrived without a light_environment
+ //
+ //every 32nd texel of every face: 256x256x6 is 393216 texels and the mean of
+ //12288 of them is within a unit of the full sum on the shipped sets
+	I64 r = 0;
+	I64 g = 0;
+	I64 b = 0;
+	I64 n = 0;
+	I64 face;
+	I64 i;
+	I64 total;
+	U32 *p;
+	U32 c;
+
+	for (face = 0; face < HLSKY_FACES; face++)
+	{
+		p = hl_sky_pix[face];
+		if (!p)
+			goto qsmc_next;
+
+		total = hl_sky_w[face] * hl_sky_h[face];
+
+		for (i = 0; i < total; i += 32)
+		{
+			c  = p[i];
+			r += (c >> 16) & 0xFF;
+			g += (c >> 8) & 0xFF;
+			b += c & 0xFF;
+			n++;
+		}
+
+qsmc_next:
+	}
+
+	if (n < 1)
+		return;
+
+	hl_sky_solid = ((r / n) << 16) | ((g / n) << 8) | (b / n);
+}
+
+I64 HLSkyTokens(U8 *s, F64 *out, I64 max)
+{//whitespace separated decimals, returns how many were found
+	U8	tok[64];
+	I64	i = 0;
+	I64	n = 0;
+	I64	k;
+
+	while (s[i] && n < max)
+	{
+		while (s[i] == ' ' || s[i] == '\t')
+			i++;
+
+		k = 0;
+		while (s[i] && s[i] != ' ' && s[i] != '\t' && k < 63)
+		{
+			tok[k] = s[i];
+			k++;
+			i++;
+		}
+		tok[k] = 0;
+
+		if (k < 1)
+			break;
+
+		out[n] = HLAtoF(tok);
+		n++;
+	}
+
+	return n;
+}
+
+U0 HLSkyLightColor(U8 *val)
+{//CEnvLight::KeyValue "_light", dlls/lights.cpp:150-177.
+ //
+ //One token is a grey level; four scale the triple by v/255. The result then
+ //takes qrad's direct/ambient/gamma curve, pow(c/114,0.6)*264, which is what
+ //reaches sv_skycolor_r/g/b - not the raw key
+	F64	v[4];
+	F64	r;
+	F64	g;
+	F64	b;
+	F64	s;
+	I64	n;
+
+	n = HLSkyTokens(val, v, 4);
+
+	if (n < 1)
+		return;
+
+	r = v[0];
+	g = r;
+	b = r;
+
+	if (n >= 3)
+	{
+		g = v[1];
+		b = v[2];
+	}
+
+	if (n >= 4)
+	{
+		s  = v[3] / 255.0;
+		r *= s;
+		g *= s;
+		b *= s;
+	}
+
+	//<= rather than <: "0 0 0 255" is a shipped value and HLAtoF returns a
+	//negative zero for "-0", which SYS_POW takes down the log path
+	if (r <= 0.0)	r = 0.0;
+	if (g <= 0.0)	g = 0.0;
+	if (b <= 0.0)	b = 0.0;
+
+	r = Pow(r / 114.0, 0.6) * 264.0;
+	g = Pow(g / 114.0, 0.6) * 264.0;
+	b = Pow(b / 114.0, 0.6) * 264.0;
+
+	HLSkySetColor(ToI64(r), ToI64(g), ToI64(b));
+}
+
+U0 HLSkySetVec(F64 pitch, F64 yaw, F64 roll)
+{//CEnvLight::Spawn, dlls/lights.cpp:186-197. UTIL_MakeAimVectors negates pitch
+ //before AngleVectors (dlls/util.cpp:602-608), so the stored angle and the
+ //aim direction differ in sign on x
+	F64 ang[3];
+
+	ang[0] = -pitch;
+	ang[1] = yaw;
+	ang[2] = roll;
+
+	HLAngleVectors(ang, hl_sky_vec, NULL, NULL);
+
+	hl_sky_vec_set = TRUE;
+}
+
+U0 HLSkyMoveVars(CHLMap *map, U8 *out_name, I64 max)
+{//the movevars_t sky fields out of the entity lump: skyname from worldspawn
+ //(dlls/world.cpp:674-677), skycolor and skyvec from light_environment
+ //(dlls/lights.cpp:150-197).
+ //
+ //Blocks are scanned whole rather than by key name alone: "classname" is the
+ //LAST key in a shipped block, so the class is known only at the closing brace
+ //and every key of interest has to be held until then.
+ //
+ //Of the 125 shipped maps 53 set skyname and 112 carry a light_environment;
+ //110 of those spell "_light" as four tokens and 2 as one
+	U8	*e;
+	U8	 key[64];
+	U8	 val[160];
+	U8	 cls[64];
+	U8	 light[160];
+	F64	 ang[3];
+	F64	 tmp[3];
+	I64	 n;
+	I64	 i;
+	I64	 k;
+	Bool have_light;
+	Bool have_pitch;
+
+	out_name[0] = 0;
+
+	hl_sky_color_set = FALSE;
+	hl_sky_vec_set   = FALSE;
+
+	if (!map || !map->entities || map->entities_size < 12)
+		return;
+
+	e = map->entities;
+	n = map->entities_size;
+	i = 0;
+
+	while (i < n && e[i])
+	{
+		if (e[i] != '{')
+		{
+			i++;
+			goto qsm_next_block;
+		}
+
+		i++;
+
+		cls[0]     = 0;
+		light[0]   = 0;
+		have_light = FALSE;
+		have_pitch = FALSE;
+		ang[0]     = 0.0;
+		ang[1]     = 0.0;
+		ang[2]     = 0.0;
+
+		while (i < n && e[i] && e[i] != '}')
+		{
+			if (e[i] != '"')
+			{
+				i++;
+				goto qsm_next_key;
+			}
+
+			i++;
+			k = 0;
+			while (i < n && e[i] && e[i] != '"')
+			{
+				if (k < 63)
+				{
+					key[k] = e[i];
+					k++;
+				}
+				i++;
+			}
+			key[k] = 0;
+			i++;
+
+			while (i < n && e[i] && e[i] != '"')
+				i++;
+			i++;
+
+			k = 0;
+			while (i < n && e[i] && e[i] != '"')
+			{
+				if (k < 159)
+				{
+					val[k] = e[i];
+					k++;
+				}
+				i++;
+			}
+			val[k] = 0;
+			i++;
+
+			if (!StrCompare(key, "classname"))
+				HLStrCopy(cls, val, 64);
+			else if (!StrCompare(key, "skyname"))
+				HLStrCopy(out_name, val, max);
+			else if (!StrCompare(key, "_light"))
+			{
+				HLStrCopy(light, val, 160);
+				have_light = TRUE;
+			}
+			else if (!StrCompare(key, "pitch"))
+			{
+				//CLight::KeyValue, dlls/lights.cpp:66. overrides angles[0]
+				ang[0]     = HLAtoF(val);
+				have_pitch = TRUE;
+			}
+			else if (!StrCompare(key, "angle"))
+			{
+				//the engine's own key: yaw only
+				ang[1] = HLAtoF(val);
+			}
+			else if (!StrCompare(key, "angles"))
+			{
+				//"pitch" wins whichever order the two arrive in
+				HLParseVec(val, tmp);
+
+				if (!have_pitch)
+					ang[0] = tmp[0];
+
+				ang[1] = tmp[1];
+				ang[2] = tmp[2];
+			}
+
+qsm_next_key:
+		}
+
+		if (i < n && e[i] == '}')
+			i++;
+
+		if (!StrCompare(cls, "light_environment"))
+		{
+			if (have_light)
+				HLSkyLightColor(light);
+
+			HLSkySetVec(ang[0], ang[1], ang[2]);
+		}
+
+qsm_next_block:
+	}
+
+	//straight down, the pitch -75 to -90 the shipped maps cluster around
+	if (!hl_sky_vec_set)
+	{
+		hl_sky_vec[0] = 0.0;
+		hl_sky_vec[1] = 0.0;
+		hl_sky_vec[2] = -1.0;
+	}
+}
+
+U0 HLSkySetName(U8 *name)
+{//sv_skyname arriving from the server, overriding worldspawn
+	if (!name || !name[0])
+		return;
+
+	if (hl_sky_ready && !StrICompare(hl_sky_name, name))
+		return;
+
+	HLSkyLoad(name);
+
+	//claim the current map so the per-frame check does not undo this
+	hl_sky_map = hl_surf_map;
+	HLStrCopy(hl_sky_map_name, hl_map_name, 96);
+}
+
+U0 HLSkyCheckMap(CHLMap *map)
+{//load the set this map asks for, once per map
+	U8 name[64];
+
+	if (map == hl_sky_map && !StrCompare(hl_sky_map_name, hl_map_name))
+		return;
+
+	hl_sky_map = map;
+	HLStrCopy(hl_sky_map_name, hl_map_name, 96);
+
+	//colour before the faces: a set that loads nothing falls back on it, and
+	//the mean below only runs when no light_environment gave one
+	HLSkyMoveVars(map, name, 64);
+
+	if (!name[0])
+		HLStrCopy(name, HLSKY_DEFAULT, 64);
+
+	HLSkyLoad(name);
+
+	//"day" and "dawn" are named by one shipped map each and ship no gfx/env
+	//files; those fall through to the solid colour
+	if (hl_sky_color_set)
+		return;
+
+	if (hl_sky_loaded > 0)
+		HLSkyMeanColor;
+	else
+		hl_sky_solid = 0;	//no set, no light_environment: not the last map's
+}
+
+U0 HLSkyRay(F64 *d, I64 *_face, F64 *_u, F64 *_v)
+{//view ray to face and texel. st_to_vec inverted - see the table above
+	F64 ax;
+	F64 ay;
+	F64 az;
+	F64 den;
+	F64 s;
+	F64 t;
+	I64 face;
+
+	ax = d[0];
+	if (ax < 0.0)
+		ax = -ax;
+	ay = d[1];
+	if (ay < 0.0)
+		ay = -ay;
+	az = d[2];
+	if (az < 0.0)
+		az = -az;
+
+	if (ax >= ay && ax >= az)
+	{
+		if (d[0] > 0.0)
+		{
+			face = HLSKY_RT;	den =  d[0];	s = -d[1];	t =  d[2];
+		}
+		else
+		{
+			face = HLSKY_LF;	den = -d[0];	s =  d[1];	t =  d[2];
+		}
+	}
+	else if (ay >= az)
+	{
+		if (d[1] > 0.0)
+		{
+			face = HLSKY_BK;	den =  d[1];	s =  d[0];	t =  d[2];
+		}
+		else
+		{
+			face = HLSKY_FT;	den = -d[1];	s = -d[0];	t =  d[2];
+		}
+	}
+	else
+	{
+		if (d[2] > 0.0)
+		{
+			face = HLSKY_UP;	den =  d[2];	s = -d[1];	t = -d[0];
+		}
+		else
+		{
+			face = HLSKY_DN;	den = -d[2];	s = -d[1];	t =  d[0];
+		}
+	}
+
+	//den is the dominant magnitude and cannot be zero for a real ray
+	if (den < 0.000001)
+		den = 0.000001;
+
+	s /= den;
+	t /= den;
+
+	*_face = face;
+	*_u    = (s + 1.0) * 0.5 * ToF64(hl_sky_w[face]);
+	*_v    = (1.0 - t) * 0.5 * ToF64(hl_sky_h[face]);
+}
+
+U32 HLSkyTexel(I64 face, F64 u, F64 v)
+{//nearest texel, clamped. the ray is exact only at block ends, so an
+ //interpolated coordinate can land one outside at a face edge
+	U32	*p;
+	I64	 w;
+	I64	 h;
+	I64	 iu;
+	I64	 iv;
+
+	if (!hl_sky_ready || face < 0 || face >= HLSKY_FACES)
+		return hl_sky_solid;
+
+	p = hl_sky_pix[face];
+	if (!p)
+		return hl_sky_solid;
+
+	w  = hl_sky_w[face];
+	h  = hl_sky_h[face];
+	iu = ToI64(u);
+	iv = ToI64(v);
+
+	if (iu < 0)
+		iu = 0;
+	if (iu >= w)
+		iu = w - 1;
+	if (iv < 0)
+		iv = 0;
+	if (iv >= h)
+		iv = h - 1;
+
+	return p[iv * w + iu];
+}
+
+U0 HLDrawSkySpan(CHLCanvas *c, I64 y, I64 x1, I64 x2, F64 iz1, F64 iz2)
+{//one run of sky. the ray is linear across the span, the cube projection is
+ //not, so it is solved exactly at block ends and interpolated between
+ //
+ //the depth TEST uses the sky surface's own 1/z, so geometry already drawn in
+ //front of it wins. the depth WRITE is zero, the far value the buffer clears
+ //to, so the skybox sits behind everything drawn after it as well
+	U32	*row;
+	F64	*zrow;
+	F64	 dir[3];
+	F64	 step[3];
+	F64	 cur[3];
+	F64	 sxf;
+	F64	 syf;
+	F64	 span;
+	F64	 d_iz;
+	F64	 iz;
+	F64	 u0, v0;
+	F64	 u1, v1;
+	F64	 du, dv;
+	F64	 u, v;
+	I64	 f0;
+	I64	 f1;
+	I64	 fc;
+	I64	 x;
+	I64	 xe;
+	I64	 n;
+	I64	 i;
+
+	//clipped to the VIEW RECT, not the canvas - outside is border or sbar
+	if (y < c->vy || y >= c->vy + c->vh)
+		return;
+
+	span = ToF64(x2 - x1);
+	if (span <= 0.0)
+		return;
+
+	d_iz = (iz2 - iz1) / span;
+
+	if (x1 < c->vx)
+	{
+		iz1 += d_iz * ToF64(c->vx - x1);
+		x1   = c->vx;
+	}
+	if (x2 > c->vx + c->vw)
+		x2 = c->vx + c->vw;
+	if (x1 >= x2)
+		return;
+
+	hl_rs_sky_px += x2 - x1;
+
+	row  = c->pixels + y * c->width;
+	zrow = c->depth + y * c->width;
+	iz   = iz1;
+
+	//no set loaded, or the pass is off: sv_skycolor with no ray at all. every
+	//texel would resolve to this value anyway
+	if (!hl_sky_ready || !hl_r_drawsky)
+	{
+		for (x = x1; x < x2; x++)
+		{
+			if (iz > zrow[x])
+			{
+				row[x]  = hl_sky_solid;
+				zrow[x] = 0.0;
+			}
+
+			iz += d_iz;
+		}
+
+		c->spans_drawn++;
+		return;
+	}
+
+	//ray through the first pixel, and the per-pixel step along it
+	sxf = (ToF64(x1) - c->center_x) / c->x_scale;
+	syf = (c->center_y - ToF64(y)) / c->y_scale;
+
+	for (i = 0; i < 3; i++)
+	{
+		dir[i]  = c->forward[i] + c->right[i] * sxf + c->up[i] * syf;
+		step[i] = c->right[i] / c->x_scale;
+	}
+
+	x = x1;
+
+	HLSkyRay(dir, &f0, &u0, &v0);
+
+	while (x < x2)
+	{
+		xe = x + HLSPAN_SUB;
+		if (xe > x2)
+			xe = x2;
+		n = xe - x;
+
+		for (i = 0; i < 3; i++)
+			cur[i] = dir[i] + step[i] * ToF64(n);
+
+		HLSkyRay(cur, &f1, &u1, &v1);
+
+		if (f1 == f0)
+		{
+			//one face across the block: u and v step
+			du = (u1 - u0) / ToF64(n);
+			dv = (v1 - v0) / ToF64(n);
+			u  = u0;
+			v  = v0;
+			fc = f0;
+
+			while (x < xe)
+			{
+				if (iz > zrow[x])
+				{
+					row[x]  = HLSkyTexel(fc, u, v);
+					zrow[x] = 0.0;
+				}
+
+				u  += du;
+				v  += dv;
+				iz += d_iz;
+				x++;
+			}
+		}
+		else
+		{
+			//the block crosses an edge, where the two faces' coordinates have
+			//nothing in common. solve every pixel
+			for (i = 0; i < 3; i++)
+				cur[i] = dir[i];
+
+			while (x < xe)
+			{
+				if (iz > zrow[x])
+				{
+					HLSkyRay(cur, &fc, &u, &v);
+					row[x]  = HLSkyTexel(fc, u, v);
+					zrow[x] = 0.0;
+				}
+
+				cur[0] += step[0];
+				cur[1] += step[1];
+				cur[2] += step[2];
+				iz     += d_iz;
+				x++;
+			}
+		}
+
+		for (i = 0; i < 3; i++)
+			dir[i] += step[i] * ToF64(n);
+
+		f0 = f1;
+		u0 = u1;
+		v0 = v1;
+	}
+
+	c->spans_drawn++;
+}
+
+U0 HLDrawSkyPolygon(CHLCanvas *c, CHLScreenVert *v, I64 count)
+{//same edge walk as the textured path, but only depth interpolates - the
+ //texture comes from the view ray, not surface coords
+	F64	 y_min = 1.0e30;
+	F64	 y_max = -1.0e30;
+	F64	 xl;
+	F64	 xr;
+	F64	 izl;
+	F64	 izr;
+	F64	 ya;
+	F64	 yb;
+	F64	 frac;
+	F64	 xi;
+	F64	 izi;
+	F64	 yc;
+	I64	 i;
+	I64	 j;
+	I64	 y;
+	I64	 y0;
+	I64	 y1;
+	Bool found;
+
+	if (count < 3)
+		return;
+
+	for (i = 0; i < count; i++)
+	{
+		if (v[i].y < y_min)
+			y_min = v[i].y;
+		if (v[i].y > y_max)
+			y_max = v[i].y;
+	}
+
+	y0 = ToI64(Ceil(y_min));
+	y1 = ToI64(Floor(y_max));
+
+	if (y0 < c->vy)
+		y0 = c->vy;
+	if (y1 >= c->vy + c->vh)
+		y1 = c->vy + c->vh - 1;
+
+	for (y = y0; y <= y1; y++)
+	{
+		yc    = ToF64(y);
+		found = FALSE;
+		xl    = 0.0;
+		xr    = 0.0;
+		izl   = 0.0;
+		izr   = 0.0;
+
+		for (i = 0; i < count; i++)
+		{
+			j  = (i + 1) % count;
+			ya = v[i].y;
+			yb = v[j].y;
+
+			if ((ya <= yc && yb > yc) || (yb <= yc && ya > yc))
+			{
+				frac = (yc - ya) / (yb - ya);
+				xi   = v[i].x + frac * (v[j].x - v[i].x);
+				izi  = v[i].inv_z + frac * (v[j].inv_z - v[i].inv_z);
+
+				if (!found)
+				{
+					xl = xi; izl = izi;
+					xr = xi; izr = izi;
+					found = TRUE;
+				}
+				else
+				{
+					if (xi < xl)
+					{
+						xl = xi; izl = izi;
+					}
+					if (xi > xr)
+					{
+						xr = xi; izr = izi;
+					}
+				}
+			}
+		}
+
+		if (found && xr > xl)
+			HLDrawSkySpan(c, y, ToI64(Ceil(xl)), ToI64(Ceil(xr)), izl, izr);
+	}
+}
+
+U0 HLDrawFace(CHLCanvas *c, CHLMap *map, I64 face_index, F64 *offset = NULL,
+	I64 ent_frame = 0, F64 *xform = NULL, I64 blend = 0, I64 amt = 255)
+{//transform, clip, project and fill one BSP face
+ //
+ //offset translates the face in world space, which is what lets a brush model
+ //follow its entity - submodel verts are authored where the designer put the
+ //brush, so without it every door draws shut. NULL is the world
+ //
+ //xform is the rotated brush path: a 3x4 carrying rotation and translation,
+ //so it replaces offset rather than adding to it. only HLDrawBrushModel
+ //passes one, and only for non-identity angles
+ //
+ //texture coords come from the unshifted position - the texture is fixed to
+ //the brush, so a moving door does not drag its texture along and a rotating
+ //brush turns its texture with it, as GoldSrc does
+	CHLFace		*f  = &map->faces[face_index];
+	CHLTexInfo	*ti;
+	CHLTexture	*tex;
+	CHLPolyVert	 poly[HLMAX_POLY_VERTS];
+	CHLPolyVert	 clipped[HLMAX_POLY_VERTS];
+	CHLScreenVert scr[HLMAX_POLY_VERTS];
+	CHLVertex	*wv;
+	U8			*lightmap = NULL;
+	U32			*surf = NULL;
+	I64			 sw = 0;
+	I64			 sh = 0;
+	F64			 rel[3];
+	F64			 inv_z;
+	I64			 n = 0;
+	I64			 count;
+	I64			 lm_w = 0;
+	I64			 lm_h = 0;
+	I64			 i;
+	I64			 e;
+	I64			 anim_tex;
+	I64			 mip;
+	F64			 near_z;
+	F64			 ratio;
+	F64			 tex_s;
+	F64			 tex_t;
+	F64			 tex_len;
+	F64		   shifted[3];
+
+	if (f->num_edges < 3 || f->num_edges > HLMAX_POLY_VERTS)
+		return;
+
+	//only the two modes the span blends survive to the rasteriser; the rest
+	//draw as NORMAL, and a mode that reads the framebuffer at zero opacity
+	//contributes nothing. "renderamt = 0 - the engine won't draw this model"
+	if (!HLRenderTranslucent(blend))
+		blend = 0;
+	else
+	{
+		amt = ClampI64(amt, 0, 255);
+
+		if (amt <= 0)
+			return;
+	}
+
+	ti = &map->texinfo[f->tex_info];
+	if (ti->miptex < 0 || ti->miptex >= map->num_textures)
+		return;
+
+	//R_TextureAnimation - miptex names the FIRST frame, not the one to draw.
+	//ent_frame picks the alternate chain
+	anim_tex = HLTextureAnimation(map, ti->miptex, ent_frame, hl_light_time);
+	if (anim_tex < 0)
+		return;
+
+	tex = &map->textures[anim_tex];
+	if (!tex->texels[0] || tex->width <= 0 || tex->height <= 0)
+		return;
+
+	//gather the outline. a negative surfedge runs the other way, so its
+	//second vertex leads
+	for (i = 0; i < f->num_edges; i++)
+	{
+		e = map->surfedges[f->first_edge + i];
+		if (e >= 0)
+			wv = &map->vertices[map->edges[e].v[0]];
+		else
+			wv = &map->vertices[map->edges[-e].v[1]];
+
+		//from the world position, before the view moves
+		poly[n].s = HLVecDot(wv->pt, &ti->vecs[0]) + ti->vecs[3];
+		poly[n].t = HLVecDot(wv->pt, &ti->vecs[4]) + ti->vecs[7];
+
+		//the world path (both pointers NULL) costs one extra pointer test and
+		//no extra arithmetic, per vertex rather than per pixel - 4 to 8 per
+		//face against thousands of spans
+		if (xform)
+		{
+			HLMatTransform(wv->pt, xform, shifted);
+			HLVecSub(shifted, c->origin, rel);
+		}
+		else if (offset)
+		{
+			HLVecAdd(wv->pt, offset, shifted);
+			HLVecSub(shifted, c->origin, rel);
+		}
+		else
+			HLVecSub(wv->pt, c->origin, rel);
+		poly[n].cam[0] = HLVecDot(rel, c->right);
+		poly[n].cam[1] = HLVecDot(rel, c->up);
+		poly[n].cam[2] = HLVecDot(rel, c->forward);
+		n++;
+	}
+
+	count = HLDrawClipNear(poly, n, clipped);
+	if (count < 3)
+		return;
+
+	for (i = 0; i < count; i++)
+	{
+		inv_z = 1.0 / clipped[i].cam[2];
+
+		//screen y grows down, camera y grows up
+		scr[i].x = c->center_x + clipped[i].cam[0] * c->x_scale * inv_z;
+		scr[i].y = c->center_y - clipped[i].cam[1] * c->y_scale * inv_z;
+
+		//interpolate s/z and t/z, not s and t, or the texture swims
+		scr[i].inv_z    = inv_z;
+		scr[i].s_over_z = clipped[i].s * inv_z;
+		scr[i].t_over_z = clipped[i].t * inv_z;
+	}
+
+	//a face with no samples is black, not fullbright - R_BuildLightMap clears
+	//to zero. a NULL lightmap means 255 to every drawer below, so it must not
+	//be handed out here
+	//
+	//turb and sky are emissive and also arrive with light_offset -1, so they
+	//are told apart here rather than by the absence of samples
+	if (map->lightdata && !tex->is_turb && !tex->is_sky)
+	{
+		lm_w = f->extent_s / 16 + 1;
+		lm_h = f->extent_t / 16 + 1;
+
+		//only a face with samples needs room in the lump, and a BSP30
+		//luxel is three bytes wide
+		if (f->light_offset >= 0 &&
+			(f->light_offset >= map->lightdata_size ||
+			 f->light_offset + lm_w * lm_h * HLLIGHT_STRIDE >
+				map->lightdata_size))
+		{
+			lm_w = 0;
+			lm_h = 0;
+		}
+		else
+			lightmap = HLLightFaceMap(map, f, lm_w, lm_h, hl_light_time);
+	}
+
+	if (tex->is_sky)
+	{
+		//the miptex is a 16x16 stub, so the sky surface is a stencil and the
+		//image comes from gfx/env. The set is per map and loaded on first use
+		HLSkyCheckMap(map);
+		HLDrawSkyPolygon(c, scr, count);
+	}
+	else
+	{
+		//D_MipLevelForScale. The decision is texels per screen pixel at the
+		//nearest point of the surface, not distance.
+		//
+		//Distance alone is what Quake's mipadjust corrects for: the texinfo s/t
+		//vectors are texels per world unit, so a texture stretched across a
+		//wall covers the same pixels with fewer texels and must mip later. HL
+		//scales textures far more than Quake does, and its textures are 128 or
+		//256 where Quake's are 64, so ignoring the vector length costs one to
+		//two mip levels on most world geometry.
+		near_z = 1.0e30;
+		for (i = 0; i < count; i++)
+		{
+			if (clipped[i].cam[2] < near_z)
+				near_z = clipped[i].cam[2];
+		}
+
+		//Mean of the two vector lengths, as Mod_LoadTexinfo takes it.
+		tex_s = Sqrt(ti->vecs[0] * ti->vecs[0] +
+					 ti->vecs[1] * ti->vecs[1] +
+					 ti->vecs[2] * ti->vecs[2]);
+		tex_t = Sqrt(ti->vecs[4] * ti->vecs[4] +
+					 ti->vecs[5] * ti->vecs[5] +
+					 ti->vecs[6] * ti->vecs[6]);
+
+		tex_len = (tex_s + tex_t) * 0.5;
+		if (tex_len < 0.001)
+			tex_len = 1.0;
+
+		//World units per screen pixel at this depth, times texels per unit.
+		//
+		//Against the 90 degree reference scale, vw*0.5, not the live x_scale.
+		//x_scale is vw*0.5/Tan(fov/2), so a scoped fov of 20 is 5.67x wider and
+		//divides the ratio down by that, dragging surfaces from mip 3 to mip 0.
+		//A cached surface is ((extent_s>>mip)+1)*((extent_t>>mip)+1)*4 bytes, so
+		//that is 64x each and a room's worth no longer fits HLSURF_BUDGET; the
+		//cache then rebuilds and evicts itself every frame. The slot key carries
+		//the mip, so the level may still change with distance.
+		ratio = tex_len * near_z / (ToF64(c->vw) * 0.5);
+
+		//Quake's d_scalemip thresholds, inverted: basemip 1.0, 0.4, 0.2.
+		if (ratio < 1.0)
+			mip = 0;
+		else if (ratio < 2.5)
+			mip = 1;
+		else if (ratio < 5.0)
+			mip = 2;
+		else
+			mip = 3;
+
+		//D_CacheSurface. turb warps every frame and sky is drawn by direction,
+		//so neither caches
+		if (!tex->is_turb && !tex->clamp)
+			surf = HLSurfCacheGet(map, f, face_index, tex, mip,
+					lightmap, lm_w, lm_h, &sw, &sh, anim_tex);
+
+		//NULL lightmap means fullbright, and by here that is only turb
+		HLDrawPolygon(c, scr, count, tex, lightmap, lm_w, lm_h,
+			f->mins_s, f->mins_t, 255, mip, surf, sw, sh, blend, amt);
+	}
+
+	c->faces_drawn++;
+	hl_rs_faces++;
+}
+
+U0 HLDrawWorld(CHLCanvas *c, CHLMap *map, CHLVisState *vs)
+{//faces arrive front to back, so the depth test kills most overdraw
+	I64 i;
+
+	for (i = 0; i < vs->face_count; i++)
+		HLDrawFace(c, map, vs->face_list[i]);
+}
+
+U0 HLDrawBrushModel(CHLCanvas *c, CHLMap *map, I64 model_index,
+	F64 *origin = NULL, I64 ent_frame = 0, F64 *angles = NULL,
+	I64 blend = 0, I64 amt = 255)
+{//BSP submodel (door, platform, button). not in the PVS, so every face is
+ //submitted and the depth buffer sorts it out
+ //
+ //blend is the entity's rendermode and amt its renderamt, HLRENDER_*. A
+ //translucent submodel writes no depth, so the caller must submit it after
+ //the world and after every opaque entity or there is nothing behind it to
+ //blend with
+ //
+ //origin is required for anything that moves, or the geometry stays where the
+ //brush was authored
+ //
+ //angles is the entity's (pitch, yaw, roll) in degrees and may be NULL or
+ //identity, the common case - a turning func_rotating needs it, a func_wall
+ //does not. HLMatAnglesActive is tested once per submodel, and identity runs
+ //no matrix work at all
+ //
+ //callers must not forward a door's angles. GoldSrc SetMovedir consumes the
+ //"angle"/"angles" key of a sliding mover into movedir and zeroes
+ //pev->angles, so the engine can read non-identity angles as "this brush is
+ //turned". forwarding angles for an entity that only used them to pick a
+ //direction renders the brush rotated - func_door and func_train show it
+	CHLModel *m;
+	F64		  xf[12];
+	F64		  org[3];
+	F64		 *xform = NULL;
+	F64		 *ofs;
+	I64		  i;
+
+	if (model_index < 0 || model_index >= map->num_models)
+		return;
+
+	ofs = origin;
+
+	if (angles)
+	{
+		if (HLMatAnglesActive(angles))
+		{
+			//rotation is about model-space (0,0,0), not the submodel's
+			//bounding-box centre. the BSP compiler recentres a submodel
+			//holding an 'origin' brush around that brush and writes the
+			//point into the entity's origin key, so rotating about zero and
+			//then translating by origin turns the brush about its pivot. a
+			//rotating entity built without an origin brush swings around the
+			//world origin, which is engine behaviour
+			if (origin)
+				HLVecCopy(origin, org);
+			else
+				HLVecSet(org, 0.0, 0.0, 0.0);
+
+			HLMatFromAngles(angles, org, xf);
+			xform = xf;
+
+			//the matrix already carries the translation; passing offset as
+			//well would apply the origin twice
+			ofs = NULL;
+		}
+	}
+
+	m = &map->models[model_index];
+
+	//R_DrawBrushModel marks dlights against the submodel's own nodes. The world
+	//descent in HLPushDlights starts at node 0 and cannot reach these faces, so
+	//this is the whole of a mover's dynamic lighting. hl_dlight_mspace_on stays
+	//up for the face loop: HLLightAddDynamic and HLSurfLightKey both read the
+	//model-space origins it left behind
+	HLMarkLightsModel(map, m, origin, xform);
+	hl_dlight_mspace_on = hl_r_dynamic;
+
+	//no face culling: a rotated submodel has no world-space face plane to test
+	//against
+	for (i = 0; i < m->num_faces; i++)
+	{
+		if (m->first_face + i < map->num_faces)
+			HLDrawFace(c, map, m->first_face + i, ofs, ent_frame, xform,
+				blend, amt);
+	}
+
+	hl_dlight_mspace_on = FALSE;
+}
+
+U0 HLDrawFadeScreen(CHLCanvas *c)
+{//Draw_FadeScreen - dim the frame so a menu reads over it. M_Draw only falls
+ //back to conback when the console is actually down
+ //
+ //a dither, not a blend - kept as one even on a 32bpp canvas, because it is
+ //what the menus were drawn against. one pixel in four survives, and the kept
+ //column shifts per row so it reads as a screen door
+	U32	*row;
+	I64	 x;
+	I64	 y;
+	I64	 t;
+	I64	 step;
+
+	//the pattern is defined in 320x200 pixels. an unscaled one-in-four mask on
+	//a wider canvas stops reading as a screen door and turns into a flat wash
+	//with moire, so the cell scales to keep the same apparent size
+	step = c->width / 320;
+	if (step < 1)
+		step = 1;
+
+	for (y = 0; y < c->height; y++)
+	{
+		row = c->pixels + y * c->width;
+
+		//alternates the kept column between 0 and 2
+		t = ((y / step) & 1) << 1;
+
+		for (x = 0; x < c->width; x++)
+		{
+			if (((x / step) & 3) != t)
+				row[x] = 0;
+		}
+	}
+}
+
+U32 HLDispCorrect(U32 rgb)
+{//gamma and the damage/water tint, applied per channel at blit time
+	if (hl_disp_identity)
+		return rgb;
+
+	return (hl_disp_r[(rgb >> 16) & 255] << 16) |
+		   (hl_disp_g[(rgb >> 8) & 255] << 8) |
+			hl_disp_b[rgb & 255];
+}
+
+U0 HLDrawBlitFit(CHLCanvas *c, CDC *dc, I64 dst_x, I64 dst_y, I64 dst_w,
+	I64 dst_h)
+{//stretch the canvas into any destination rect
+ //
+ //the source step is fixed point so any render size fills the same rectangle.
+ //integer-only scaling displays higher render resolutions smaller
+	U32	*src;
+	U32	*dst;
+	I64	 sx_step;
+	I64	 sy_step;
+	I64	 sxf;
+	I64	 sy;
+	I64	 x;
+	I64	 y;
+	I64	 py;
+	I64	 warp;
+	I64	 sx;
+	I64	 pitch = dc->width_internal;
+
+	if (dst_w < 1 || dst_h < 1)
+		return;
+
+	//16.16 fixed point. parenthesised - shifts bind tighter than divide in
+	//this compiler and it reorders these silently
+	sx_step = (c->width << 16) / dst_w;
+	sy_step = (c->height << 16) / dst_h;
+
+	for (y = 0; y < dst_h; y++)
+	{
+		py = dst_y + y;
+		if (py < 0 || py >= dc->height)
+			goto qbf_next_row;
+
+		sy = (y * sy_step) >> 16;
+		if (sy >= c->height)
+			sy = c->height - 1;
+
+		src = c->pixels + sy * c->width;
+		dst = dc->body + py * pitch;
+
+		//underwater warp - shear each row along a travelling sine. a view
+		//space effect on the finished image, one sine per row at blit time
+		if (hl_warp_amount > 0.0)
+		{
+			warp = ToI64(Sin(ToF64(sy) * 0.06 + hl_warp_time * 3.0) *
+				hl_warp_amount);
+			sxf = warp << 16;
+		}
+		else
+			sxf = 0;
+
+		for (x = 0; x < dst_w; x++)
+		{
+			//clamp, not wrap - wrapping tears the image across the screen
+			sx = sxf >> 16;
+			if (sx < 0)
+				sx = 0;
+			if (sx >= c->width)
+				sx = c->width - 1;
+
+			if (dst_x + x >= 0 && dst_x + x < dc->width)
+				dst[dst_x + x] = HLDispCorrect(src[sx]);
+
+			sxf += sx_step;
+		}
+
+qbf_next_row:
+	}
+}
+
+//--- decals ----------------------------------------------------------------
+//
+// R_DecalShoot. A decal is a texture patch on the world surface a trace struck.
+//
+// It is drawn as a screen space pass after the world rather than by re-cutting
+// the face: every pixel inside the patch's screen bounds casts a view ray, meets
+// the decal plane, and is kept when its 1/z agrees with the depth already in the
+// buffer. That makes the patch follow whatever geometry lies under it, at any
+// angle, with no clipping and no second surface cache entry.
+//
+// Textures come from decals.wad, mounted on first use. gDecals in dlls/world.cpp
+// names them and dlls/decals.h numbers them; both are reproduced below. The
+// leading masked-texture character of each name is prepended at run time.
+
+//Ring, oldest overwritten. r_decals defaults to 300 in GoldSrc; at 128 a
+//firefight recycled the far patches, which reads as a distance cut.
+#define HLDECAL_MAX			300
+#define HLDECAL_TEX_MAX		42		//decal_e, DECAL_GUNSHOT1..DECAL_MOMMASPLAT
+#define HLDECAL_NAME_MAX	24
+
+//Units of world space a decal may sit behind the surface under it and still be
+//drawn. Covers the span rasteriser's own interpolation error; anything further
+//back is behind a wall.
+#define HLDECAL_DEPTH_SLACK	2.0
+
+//The pass costs one ray cast per pixel of every patch's screen bounds, and
+//nothing about the pool bounds that: a wall emptied a clip into carries 128
+//patches whose bounds all grow as the player walks up to it, and the total
+//passes the whole canvas several times over.
+//
+//So the frame gets a pixel allowance, a share of the view rect, and patches are
+//taken newest first until it is spent. GoldSrc bounds the same cost by cutting
+//each decal into the surface once and never paying per frame; a screen space
+//pass has to bound it here instead.
+#define HLDECAL_PX_SHARE	2		//view rect pixels / this
+
+//decal_e, dlls/decals.h. Only the bases the effect layer picks from are named
+#define HLDECAL_GUNSHOT1		0
+#define HLDECAL_SCORCH1			11
+#define HLDECAL_SCORCH2			12
+#define HLDECAL_BLOOD1			13
+#define HLDECAL_YBLOOD1			19
+#define HLDECAL_BIGSHOT1		28
+#define HLDECAL_SMALLSCORCH1	36
+
+class CHLDecal
+{
+	F64	 origin[3];
+	F64	 normal[3];
+	F64	 sdir[3];		//in plane basis, s across
+	F64	 tdir[3];		//in plane basis, t down
+	F64	 half_s;		//world units, half the texture width
+	F64	 half_t;
+	I64	 tex;			//decal_e
+	Bool active;
+};
+
+CHLDecal	hl_decals[HLDECAL_MAX];
+CHLTexture	hl_decal_tex[HLDECAL_TEX_MAX];
+Bool		hl_decal_tex_ok[HLDECAL_TEX_MAX];
+Bool		hl_decal_tex_tried[HLDECAL_TEX_MAX];
+I64			hl_decal_next	= 0;
+I64			hl_decal_drawn	= 0;
+Bool		hl_decal_wad_tried = FALSE;
+
+//live ring size, r_decals. Clamped to the pool; 0 leaves hl_r_decals to gate
+//the pass off entirely
+I64			hl_r_decal_max	= HLDECAL_MAX;
+
+U0 HLDecalSetMax(I64 n)
+{//r_decals as a count. The ring shrinks in place, so anything past the new
+ //bound is dropped
+	I64 i;
+
+	if (n < 1)
+		n = 1;
+	if (n > HLDECAL_MAX)
+		n = HLDECAL_MAX;
+
+	hl_r_decal_max = n;
+
+	for (i = n; i < HLDECAL_MAX; i++)
+		hl_decals[i].active = FALSE;
+
+	if (hl_decal_next >= n)
+		hl_decal_next = 0;
+}
+
+U8 *HLDecalName(I64 n)
+{//gDecals, dlls/world.cpp, without its leading masked-texture character
+ //
+ //a U8 *table[] of adjacent literals concatenates and truncates at the first
+ //NUL, so the table has to be a comparison chain
+	if (n == 0)		return "shot1";
+	if (n == 1)		return "shot2";
+	if (n == 2)		return "shot3";
+	if (n == 3)		return "shot4";
+	if (n == 4)		return "shot5";
+	if (n == 5)		return "lambda01";
+	if (n == 6)		return "lambda02";
+	if (n == 7)		return "lambda03";
+	if (n == 8)		return "lambda04";
+	if (n == 9)		return "lambda05";
+	if (n == 10)	return "lambda06";
+	if (n == 11)	return "scorch1";
+	if (n == 12)	return "scorch2";
+	if (n == 13)	return "blood1";
+	if (n == 14)	return "blood2";
+	if (n == 15)	return "blood3";
+	if (n == 16)	return "blood4";
+	if (n == 17)	return "blood5";
+	if (n == 18)	return "blood6";
+	if (n == 19)	return "yblood1";
+	if (n == 20)	return "yblood2";
+	if (n == 21)	return "yblood3";
+	if (n == 22)	return "yblood4";
+	if (n == 23)	return "yblood5";
+	if (n == 24)	return "yblood6";
+	if (n == 25)	return "break1";
+	if (n == 26)	return "break2";
+	if (n == 27)	return "break3";
+	if (n == 28)	return "bigshot1";
+	if (n == 29)	return "bigshot2";
+	if (n == 30)	return "bigshot3";
+	if (n == 31)	return "bigshot4";
+	if (n == 32)	return "bigshot5";
+	if (n == 33)	return "spit1";
+	if (n == 34)	return "spit2";
+	if (n == 35)	return "bproof1";
+	if (n == 36)	return "gargstomp";
+	if (n == 37)	return "smscorch1";
+	if (n == 38)	return "smscorch2";
+	if (n == 39)	return "smscorch3";
+	if (n == 40)	return "mommablob";
+	if (n == 41)	return "mommablob";
+
+	return NULL;
+}
+
+U0 HLDecalClear()
+{//a map change unmounts decals.wad, and every texture body here is borrowed
+ //from it, so the load state is dropped with the patches
+	I64 i;
+
+	for (i = 0; i < HLDECAL_MAX; i++)
+		hl_decals[i].active = FALSE;
+
+	for (i = 0; i < HLDECAL_TEX_MAX; i++)
+	{
+		hl_decal_tex_ok[i]    = FALSE;
+		hl_decal_tex_tried[i] = FALSE;
+		MemSet(&hl_decal_tex[i], 0, sizeof(CHLTexture));
+	}
+
+	hl_decal_next      = 0;
+	hl_decal_drawn     = 0;
+	hl_decal_wad_tried = FALSE;
+
+	//globals carry no initialiser at run time
+	if (hl_r_decal_max < 1 || hl_r_decal_max > HLDECAL_MAX)
+		hl_r_decal_max = HLDECAL_MAX;
+}
+
+U0 HLDecalInit()
+{//globals are not zeroed and this table is walked every frame
+	HLDecalClear;
+}
+
+Bool HLDecalTexGet(I64 n)
+{//one decal texture, loaded on demand
+ //
+ //decals.wad is not listed in the map's wad key - the engine mounts it always -
+ //so it is mounted here the first time a decal is placed. FALSE means
+ //valve/decals.wad could not be opened, and the caller records nothing. Not a
+ //port deviation: the shipped tree carries the archive
+	U8	*base;
+	U8	*mip;
+	U8	 name[HLDECAL_NAME_MAX];
+	I64	 size = 0;
+
+	if (n < 0 || n >= HLDECAL_TEX_MAX)
+		return FALSE;
+
+	if (hl_decal_tex_tried[n])
+		return hl_decal_tex_ok[n];
+
+	hl_decal_tex_tried[n] = TRUE;
+	hl_decal_tex_ok[n]    = FALSE;
+
+	base = HLDecalName(n);
+	if (!base)
+		return FALSE;
+
+	if (!hl_decal_wad_tried)
+	{
+		hl_decal_wad_tried = TRUE;
+		HLWad3MountByName("decals");
+	}
+
+	name[0] = 0x7B;		//the masked-texture prefix every gDecals name carries
+	StrCopy(name + 1, base);
+
+	mip = HLWad3FindMip(name, &size);
+	if (!mip)
+		return FALSE;
+
+	if (!HLBSPDecodeMiptex(&hl_decal_tex[n], mip, size))
+		return FALSE;
+
+	if (!hl_decal_tex[n].palette || !hl_decal_tex[n].texels[0])
+		return FALSE;
+
+	if (hl_decal_tex[n].width <= 0 || hl_decal_tex[n].height <= 0)
+		return FALSE;
+
+	hl_decal_tex_ok[n] = TRUE;
+	return TRUE;
+}
+
+U0 HLDecalAdd(F64 *origin, F64 *normal, I64 decal)
+{//UTIL_DecalTrace's client half. origin is the trace end and normal the plane
+ //it struck
+ //
+ //the patch is the texture's own size in world units, one texel per unit, which
+ //is how GoldSrc scales a decal
+	CHLDecal	*d;
+	CHLTexture	*t;
+	F64			 axis[3];
+
+	if (!HLDecalTexGet(decal))
+		return;
+
+	if (hl_r_decal_max < 1 || hl_r_decal_max > HLDECAL_MAX)
+		hl_r_decal_max = HLDECAL_MAX;
+	if (hl_decal_next < 0 || hl_decal_next >= hl_r_decal_max)
+		hl_decal_next = 0;
+
+	t = &hl_decal_tex[decal];
+	d = &hl_decals[hl_decal_next];
+
+	hl_decal_next++;
+	if (hl_decal_next >= hl_r_decal_max)
+		hl_decal_next = 0;
+
+	d->active = FALSE;
+
+	HLVecCopy(origin, d->origin);
+	HLVecCopy(normal, d->normal);
+
+	if (HLVecNormalize(d->normal) < 0.001)
+		return;
+
+	//a decal carries no authored rotation, so any in plane basis serves. world
+	//up degenerates on a floor or a ceiling, where world x is used instead
+	HLVecSet(axis, 0.0, 0.0, 1.0);
+	if (d->normal[2] > 0.7 || d->normal[2] < -0.7)
+		HLVecSet(axis, 1.0, 0.0, 0.0);
+
+	HLVecCross(axis, d->normal, d->sdir);
+	if (HLVecNormalize(d->sdir) < 0.001)
+		return;
+
+	HLVecCross(d->normal, d->sdir, d->tdir);
+	if (HLVecNormalize(d->tdir) < 0.001)
+		return;
+
+	d->half_s = ToF64(t->width) * 0.5;
+	d->half_t = ToF64(t->height) * 0.5;
+	d->tex    = decal;
+	d->active = TRUE;
+}
+
+Bool HLDecalBounds(CHLCanvas *c, CHLDecal *d, I64 *_x0, I64 *_y0,
+	I64 *_x1, I64 *_y1)
+{//screen bounds of one patch, clipped to the near plane and the view rect.
+ //FALSE means nothing of it is on screen
+ //
+ //the quad is clipped in camera space before projecting, the same way a face is.
+ //Falling back to the whole view rect when a corner crosses the near plane costs
+ //a full screen of ray casts for one patch, and that case is not rare: any patch
+ //wider than the near clip seen at a grazing angle straddles the plane
+	CHLPolyVert	quad[4];
+	CHLPolyVert	clipped[HLMAX_POLY_VERTS];
+	F64			corner[3];
+	F64			rel[3];
+	F64			min_x = 1.0e30;
+	F64			min_y = 1.0e30;
+	F64			max_x = -1.0e30;
+	F64			max_y = -1.0e30;
+	F64			inv_z;
+	F64			sx;
+	F64			sy;
+	I64			cx0;
+	I64			cy0;
+	I64			cx1;
+	I64			cy1;
+	I64			count;
+	I64			k;
+
+	//the eye is behind the surface the patch lies on
+	HLVecSub(d->origin, c->origin, rel);
+	if (HLVecDot(rel, d->normal) > 0.0)
+		return FALSE;
+
+	//SCR_CalcRefdef vrect, so a decal cannot bleed into the border or the
+	//status bar
+	cx0 = c->vx;
+	cy0 = c->vy;
+	cx1 = c->vx + c->vw - 1;
+	cy1 = c->vy + c->vh - 1;
+
+	if (c->vw < 1 || c->vh < 1)
+	{
+		cx0 = 0;
+		cy0 = 0;
+		cx1 = c->width - 1;
+		cy1 = c->height - 1;
+	}
+
+	if (cx0 < 0)				cx0 = 0;
+	if (cy0 < 0)				cy0 = 0;
+	if (cx1 > c->width - 1)		cx1 = c->width - 1;
+	if (cy1 > c->height - 1)	cy1 = c->height - 1;
+
+	//wound around the patch, so the clipper sees a convex quad
+	for (k = 0; k < 4; k++)
+	{
+		HLVecCopy(d->origin, corner);
+
+		if (k == 0 || k == 3)
+			HLVecMA(corner, -d->half_s, d->sdir, corner);
+		else
+			HLVecMA(corner, d->half_s, d->sdir, corner);
+
+		if (k < 2)
+			HLVecMA(corner, -d->half_t, d->tdir, corner);
+		else
+			HLVecMA(corner, d->half_t, d->tdir, corner);
+
+		HLVecSub(corner, c->origin, rel);
+
+		quad[k].cam[0] = HLVecDot(rel, c->right);
+		quad[k].cam[1] = HLVecDot(rel, c->up);
+		quad[k].cam[2] = HLVecDot(rel, c->forward);
+
+		//the clipper carries s and t through; the patch is addressed by the ray
+		//hit, not by these, so they only have to be defined
+		quad[k].s = 0.0;
+		quad[k].t = 0.0;
+	}
+
+	count = HLDrawClipNear(quad, 4, clipped);
+	if (count < 3)
+		return FALSE;
+
+	for (k = 0; k < count; k++)
+	{
+		inv_z = 1.0 / clipped[k].cam[2];
+		sx    = c->center_x + clipped[k].cam[0] * c->x_scale * inv_z;
+		sy    = c->center_y - clipped[k].cam[1] * c->y_scale * inv_z;
+
+		if (sx < min_x)	min_x = sx;
+		if (sx > max_x)	max_x = sx;
+		if (sy < min_y)	min_y = sy;
+		if (sy > max_y)	max_y = sy;
+	}
+
+	//Floor and Ceil, not ToI64 - ToI64 truncates toward zero and would pull the
+	//left edge inward for a patch straddling the centre line
+	*_x0 = ToI64(Floor(min_x));
+	*_y0 = ToI64(Floor(min_y));
+	*_x1 = ToI64(Ceil(max_x));
+	*_y1 = ToI64(Ceil(max_y));
+
+	if (*_x0 < cx0)	*_x0 = cx0;
+	if (*_y0 < cy0)	*_y0 = cy0;
+	if (*_x1 > cx1)	*_x1 = cx1;
+	if (*_y1 > cy1)	*_y1 = cy1;
+
+	if (*_x0 > *_x1 || *_y0 > *_y1)
+		return FALSE;
+
+	return TRUE;
+}
+
+U0 HLDrawDecals(CHLCanvas *c)
+{//every live patch, depth tested against the world already in the buffer
+	if (!hl_r_decals)
+		return;
+
+ //
+ //decals.wad holds two kinds. When the last palette entry is pure blue the
+ //texture is a cutout and the last index is the transparent key; otherwise the
+ //index is coverage and the last entry is the colour, the same rule HLSpr uses
+ //for an INDEXALPHA sprite
+	CHLDecal	*d;
+	CHLTexture	*t;
+	U8			*pal;
+	U8			*texels;
+	U32			*row;
+	Bool		 keep[HLDECAL_MAX];
+	F64			 rel[3];
+	F64			 dir[3];
+	F64			 denom;
+	F64			 d_denom;
+	F64			 ns;
+	F64			 d_ns;
+	F64			 nt;
+	F64			 d_nt;
+	F64			 ray;
+	F64			 plane_k;
+	F64			 base_s;
+	F64			 base_t;
+	F64			 su;
+	F64			 tv;
+	F64			 a0;
+	F64			 b;
+	F64			 fs;
+	F64			 ft;
+	I64			 i;
+	I64			 slot;
+	I64			 x;
+	I64			 y;
+	I64			 x0;
+	I64			 x1;
+	I64			 y0;
+	I64			 y1;
+	I64			 tw;
+	I64			 th;
+	I64			 tx;
+	I64			 ty;
+	I64			 texel;
+	I64			 cr;
+	I64			 cg;
+	I64			 cb;
+	I64			 alpha;
+	I64			 dr;
+	I64			 dg;
+	I64			 db;
+	I64			 idx;
+	I64			 budget;
+	I64			 spent;
+	Bool		 masked;
+	U32			 c32;
+
+	hl_decal_drawn = 0;
+
+	if (!c || !c->pixels || !c->depth)
+		return;
+
+	//globals carry no initialiser at run time
+	if (hl_r_decal_max < 1 || hl_r_decal_max > HLDECAL_MAX)
+		hl_r_decal_max = HLDECAL_MAX;
+	if (hl_decal_next < 0 || hl_decal_next >= hl_r_decal_max)
+		hl_decal_next = 0;
+
+	budget = c->vw * c->vh;
+	if (budget < 1)
+		budget = c->width * c->height;
+	budget = budget / HLDECAL_PX_SHARE;
+
+	//Newest first, so a spent allowance drops the oldest patches - the ones the
+	//player is least likely to be looking at. hl_decal_next is the slot about to
+	//be overwritten, hence the oldest.
+	spent = 0;
+
+	for (i = 0; i < hl_r_decal_max; i++)
+	{
+		slot = hl_decal_next - 1 - i;
+		while (slot < 0)
+			slot += hl_r_decal_max;
+
+		keep[slot] = FALSE;
+
+		if (spent >= budget)
+			goto qdb_next;
+
+		d = &hl_decals[slot];
+
+		if (!d->active)
+			goto qdb_next;
+
+		if (d->tex < 0 || d->tex >= HLDECAL_TEX_MAX)
+			goto qdb_next;
+
+		if (!hl_decal_tex_ok[d->tex])
+			goto qdb_next;
+
+		if (!HLDecalBounds(c, d, &x0, &y0, &x1, &y1))
+			goto qdb_next;
+
+		keep[slot] = TRUE;
+		spent += (x1 - x0 + 1) * (y1 - y0 + 1);
+
+qdb_next:
+	}
+
+	//Drawn oldest first, so the newest patch composites on top of the ones it
+	//landed over - the order an index-alpha blood splat is authored for.
+	for (i = 0; i < hl_r_decal_max; i++)
+	{
+		slot = hl_decal_next + i;
+		while (slot >= hl_r_decal_max)
+			slot -= hl_r_decal_max;
+
+		if (!keep[slot])
+			goto qdc_next;
+
+		d = &hl_decals[slot];
+
+		t      = &hl_decal_tex[d->tex];
+		pal    = t->palette;
+		texels = t->texels[0];
+		tw     = t->width;
+		th     = t->height;
+
+		if (!pal || !texels || tw <= 0 || th <= 0)
+			goto qdc_next;
+
+		if (!HLDecalBounds(c, d, &x0, &y0, &x1, &y1))
+			goto qdc_next;
+
+		masked = ToBool(pal[765] == 0 && pal[766] == 0 && pal[767] == 255);
+
+		//the last entry is the colour of an index-alpha patch
+		cr = pal[765];
+		cg = pal[766];
+		cb = pal[767];
+
+		//Everything the inner loop needs is affine in x, so it is stepped rather
+		//than rebuilt. The ray direction, the plane denominator and the two
+		//in-plane numerators all move by a constant per pixel, which leaves one
+		//divide and three multiplies against a vector build and four dot
+		//products before.
+		plane_k = HLVecDot(d->normal, d->origin) - HLVecDot(d->normal, c->origin);
+
+		//hit = eye + ray*dir, so the in-plane coordinate is a constant plus ray
+		//times the direction's own component along that axis
+		HLVecSub(c->origin, d->origin, rel);
+		base_s = HLVecDot(rel, d->sdir);
+		base_t = HLVecDot(rel, d->tdir);
+
+		d_denom = HLVecDot(d->normal, c->right) / c->x_scale;
+		d_ns    = HLVecDot(d->sdir, c->right) / c->x_scale;
+		d_nt    = HLVecDot(d->tdir, c->right) / c->x_scale;
+
+		su = ToF64(tw) / (d->half_s * 2.0);
+		tv = ToF64(th) / (d->half_t * 2.0);
+
+		a0 = (ToF64(x0) + 0.5 - c->center_x) / c->x_scale;
+
+		hl_rs_decals++;
+
+		for (y = y0; y <= y1; y++)
+		{
+			row = c->pixels + y * c->width;
+			b   = -(ToF64(y) + 0.5 - c->center_y) / c->y_scale;
+
+			//forward component is 1, so the plane parameter is the camera space
+			//z of the hit and needs no second projection
+			dir[0] = c->forward[0] + c->right[0] * a0 + c->up[0] * b;
+			dir[1] = c->forward[1] + c->right[1] * a0 + c->up[1] * b;
+			dir[2] = c->forward[2] + c->right[2] * a0 + c->up[2] * b;
+
+			denom = HLVecDot(d->normal, dir);
+			ns    = HLVecDot(d->sdir, dir);
+			nt    = HLVecDot(d->tdir, dir);
+
+			hl_rs_decal_px += x1 - x0 + 1;
+
+			for (x = x0; x <= x1; x++)
+			{
+				//parallel to the plane, or looking at its back
+				if (denom > -0.0001)
+					goto qdc_next_pixel;
+
+				ray = plane_k / denom;
+				if (ray < HLNEAR_CLIP)
+					goto qdc_next_pixel;
+
+				idx = y * c->width + x;
+
+				//nothing was drawn here, so there is no surface to sit on
+				if (c->depth[idx] <= 0.0)
+					goto qdc_next_pixel;
+
+				//Compared in world units, not as a fraction of 1/z. A relative
+				//tolerance on 1/z is a world tolerance that grows as z squared:
+				//at range the patch passed the test over geometry it was
+				//nowhere near, which reads as a coloured sheet hanging in the
+				//distance that snaps away as the player closes on it.
+				//
+				//The surface depth is 1/z, and ray is at least HLNEAR_CLIP and
+				//so above the slack, so the world-unit compare is the same test
+				//multiplied through by a positive 1/z - one divide fewer.
+				//
+				//Tested both ways. A patch belongs to the surface under it; one
+				//that meets the ray in open space in FRONT of that surface is
+				//not on it, and drawing it there is a sheet hanging in midair.
+				//GoldSrc cuts the decal into the face and cannot reach that
+				//state. The near side also drops the overhang of a patch laid
+				//near a brush edge, and drops a patch left behind by a brush
+				//entity that has since moved.
+				if ((ray - HLDECAL_DEPTH_SLACK) * c->depth[idx] > 1.0)
+					goto qdc_next_pixel;
+
+				if ((ray + HLDECAL_DEPTH_SLACK) * c->depth[idx] < 1.0)
+					goto qdc_next_pixel;
+
+				fs = base_s + ray * ns;
+				ft = base_t + ray * nt;
+
+				if (fs < -d->half_s || fs >= d->half_s)
+					goto qdc_next_pixel;
+				if (ft < -d->half_t || ft >= d->half_t)
+					goto qdc_next_pixel;
+
+				tx = ToI64((fs + d->half_s) * su);
+				ty = ToI64((ft + d->half_t) * tv);
+
+				if (tx < 0)			tx = 0;
+				if (ty < 0)			ty = 0;
+				if (tx > tw - 1)	tx = tw - 1;
+				if (ty > th - 1)	ty = th - 1;
+
+				texel = texels[ty * tw + tx];
+
+				if (masked)
+				{
+					if (texel == 255)
+						goto qdc_next_pixel;
+
+					alpha = 255;
+					cr    = pal[texel * 3];
+					cg    = pal[texel * 3 + 1];
+					cb    = pal[texel * 3 + 2];
+				}
+				else
+				{
+					if (!texel)
+						goto qdc_next_pixel;
+
+					alpha = texel;
+				}
+
+				c32 = row[x];
+				dr  = (c32 >> 16) & 255;
+				dg  = (c32 >> 8) & 255;
+				db  = c32 & 255;
+
+				dr = (dr * (255 - alpha) + cr * alpha) / 255;
+				dg = (dg * (255 - alpha) + cg * alpha) / 255;
+				db = (db * (255 - alpha) + cb * alpha) / 255;
+
+				//the depth is left alone: the patch is coplanar with the
+				//surface under it and must not occlude anything
+				row[x] = (dr << 16) | (dg << 8) | db;
+				hl_decal_drawn++;
+				hl_rs_decal_hit++;
+
+qdc_next_pixel:
+				denom += d_denom;
+				ns    += d_ns;
+				nt    += d_nt;
+			}
+		}
+
+qdc_next:
+	}
+}
+
+//--- beams ------------------------------------------------------------------
+//
+// A beam is a screen-facing ribbon between two world points, textured along its
+// length and added to what is behind it. env_beam, env_laser, the gauss and egon
+// bolts and the tripmine tripwire are all this one primitive.
+//
+// HLSpr.ZC compiles after this file, so the texture arrives as one sprite
+// frame's texels and palette rather than as a sprite handle.
+//
+// Width and noise amplitude reach the entity layer in tenths of a world unit.
+// CBeam holds width in pev->scale and noise in pev->body as ints
+// (dlls/effects.h:130,131) while R_BeamPoints takes a float width in world units
+// (common/r_efx.h:181); both feed beam_s.width and beam_s.amplitude
+// (common/beamdef.h:47,49), and the tripmine's SetWidth(10)
+// (dlls/tripmine.cpp:257) is a one unit tripwire against the gauss beam's 1.0
+// (cl_dll/ev_hldm.cpp:972). This takes world units; the caller applies the tenth.
+//
+// Absent: BEAM_HOSE and BEAM_ENTS attachment tracking, both entity-side
+// concerns, and the ring variant. SF_BEAM_RING (dlls/effects.h:21) is set on 5
+// of the 803 env_beam/env_laser entities in the shipped maps.
+
+#define HLBEAM_SEG_MAX		64		//ribbon segments, the noise resolution
+#define HLBEAM_PTS			65		//HLBEAM_SEG_MAX + 1 segment boundaries
+#define HLBEAM_SEG_LEN		24.0	//world units per segment
+#define HLBEAM_TEX_REPEAT	100.0	//world units per texture repeat along t
+#define HLBEAM_MIN_PX		0.75	//projected half width floor, pixels
+#define HLBEAM_NOISE_CYCLES	3.0		//sine periods along the beam
+#define HLBEAM_NOISE_RATE	12.0	//noise phase, radians per second
+
+U0 HLDrawBeamSpan(CHLCanvas *c, I64 y, I64 x1, I64 x2,
+	F64 iz1, F64 soz1, F64 toz1, F64 iz2, F64 soz2, F64 toz2,
+	U8 *texels, U8 *pal, I64 tw, I64 th, I64 mod_r, I64 mod_g, I64 mod_b)
+{//one additive run across the ribbon
+ //
+ //mod_* are colour times brightness, folded to 0-255 by the caller
+ //
+ //one divide per pixel: a beam covers a small fraction of the canvas, so the
+ //block stepping HLDrawSpan carries buys nothing here
+	U32	*row;
+	F64	*zrow;
+	F64	 span;
+	F64	 d_iz;
+	F64	 d_soz;
+	F64	 d_toz;
+	F64	 iz;
+	F64	 soz;
+	F64	 toz;
+	F64	 z;
+	I64	 x;
+	I64	 tx;
+	I64	 ty;
+	I64	 texel;
+	I64	 sr;
+	I64	 sg;
+	I64	 sb;
+	I64	 dr;
+	I64	 dg;
+	I64	 db;
+	U32	 c32;
+
+	//the view rect, not the canvas - outside it is border and status bar
+	if (y < c->vy || y >= c->vy + c->vh)
+		return;
+
+	span = ToF64(x2 - x1);
+	if (span <= 0.0)
+		return;
+
+	d_iz  = (iz2 - iz1) / span;
+	d_soz = (soz2 - soz1) / span;
+	d_toz = (toz2 - toz1) / span;
+
+	if (x1 < c->vx)
+	{
+		iz1  += d_iz * ToF64(c->vx - x1);
+		soz1 += d_soz * ToF64(c->vx - x1);
+		toz1 += d_toz * ToF64(c->vx - x1);
+		x1 = c->vx;
+	}
+
+	if (x2 > c->vx + c->vw)
+		x2 = c->vx + c->vw;
+
+	if (x1 >= x2)
+		return;
+
+	hl_rs_beam_px += x2 - x1;
+
+	row  = c->pixels + y * c->width;
+	zrow = c->depth + y * c->width;
+
+	iz  = iz1;
+	soz = soz1;
+	toz = toz1;
+
+	for (x = x1; x < x2; x++)
+	{
+		//depth holds 1/z, larger nearer. an untouched pixel reads 0 and lets
+		//any positive 1/z through, so a beam over open sky still draws
+		if (iz <= zrow[x])
+			goto qbs_next;
+
+		z = 1.0 / iz;
+
+		//s spans the width once, t repeats along the length
+		tx = ToI64(soz * z);
+		if (tx < 0)			tx = 0;
+		if (tx > tw - 1)	tx = tw - 1;
+
+		ty = HLTexWrap(ToI64(toz * z), th);
+
+		texel = texels[ty * tw + tx];
+
+		sr = pal[texel * 3];
+		sg = pal[texel * 3 + 1];
+		sb = pal[texel * 3 + 2];
+
+		//additive, so black is the cutout whatever the sprite's texFormat says
+		//and no index may be keyed out. lgtning.spr is SPR_NORMAL with palette
+		//entry 255 black; xbeam3.spr is SPR_ADDITIVE with entry 255 white
+		if (!(sr | sg | sb))
+			goto qbs_next;
+
+		c32 = row[x];
+
+		dr = ((c32 >> 16) & 255) + (sr * mod_r) / 255;
+		dg = ((c32 >> 8) & 255) + (sg * mod_g) / 255;
+		db = (c32 & 255) + (sb * mod_b) / 255;
+
+		if (dr > 255)	dr = 255;
+		if (dg > 255)	dg = 255;
+		if (db > 255)	db = 255;
+
+		//depth is left alone: a beam is translucent, so it occludes nothing and
+		//two crossing beams both show
+		row[x] = (dr << 16) | (dg << 8) | db;
+
+qbs_next:
+		iz  += d_iz;
+		soz += d_soz;
+		toz += d_toz;
+	}
+}
+
+U0 HLDrawBeamQuad(CHLCanvas *c, CHLScreenVert *v, I64 count,
+	U8 *texels, U8 *pal, I64 tw, I64 th, I64 mod_r, I64 mod_g, I64 mod_b)
+{//HLDrawPolygon's scanline fill against the additive span
+	F64	 y_min = 1.0e30;
+	F64	 y_max = -1.0e30;
+	F64	 xl;
+	F64	 xr;
+	F64	 izl;
+	F64	 izr;
+	F64	 sozl;
+	F64	 sozr;
+	F64	 tozl;
+	F64	 tozr;
+	F64	 ya;
+	F64	 yb;
+	F64	 frac;
+	F64	 xi;
+	F64	 izi;
+	F64	 sozi;
+	F64	 tozi;
+	F64	 yc;
+	I64	 i;
+	I64	 j;
+	I64	 y;
+	I64	 y0;
+	I64	 y1;
+	Bool found;
+
+	if (count < 3)
+		return;
+
+	for (i = 0; i < count; i++)
+	{
+		if (v[i].y < y_min)
+			y_min = v[i].y;
+		if (v[i].y > y_max)
+			y_max = v[i].y;
+	}
+
+	y0 = ToI64(Ceil(y_min));
+	y1 = ToI64(Floor(y_max));
+
+	if (y0 < c->vy)
+		y0 = c->vy;
+	if (y1 >= c->vy + c->vh)
+		y1 = c->vy + c->vh - 1;
+
+	for (y = y0; y <= y1; y++)
+	{
+		yc    = ToF64(y);
+		found = FALSE;
+		xl    = 0.0;
+		xr    = 0.0;
+		izl   = 0.0;
+		izr   = 0.0;
+		sozl  = 0.0;
+		sozr  = 0.0;
+		tozl  = 0.0;
+		tozr  = 0.0;
+
+		for (i = 0; i < count; i++)
+		{
+			j  = (i + 1) % count;
+			ya = v[i].y;
+			yb = v[j].y;
+
+			//half open so a shared vertex isn't counted twice
+			if ((ya <= yc && yb > yc) || (yb <= yc && ya > yc))
+			{
+				frac = (yc - ya) / (yb - ya);
+				xi   = v[i].x + frac * (v[j].x - v[i].x);
+				izi  = v[i].inv_z + frac * (v[j].inv_z - v[i].inv_z);
+				sozi = v[i].s_over_z + frac * (v[j].s_over_z - v[i].s_over_z);
+				tozi = v[i].t_over_z + frac * (v[j].t_over_z - v[i].t_over_z);
+
+				if (!found)
+				{
+					xl = xi; izl = izi; sozl = sozi; tozl = tozi;
+					xr = xi; izr = izi; sozr = sozi; tozr = tozi;
+					found = TRUE;
+				}
+				else
+				{
+					if (xi < xl)
+					{
+						xl = xi; izl = izi; sozl = sozi; tozl = tozi;
+					}
+					if (xi > xr)
+					{
+						xr = xi; izr = izi; sozr = sozi; tozr = tozi;
+					}
+				}
+			}
+		}
+
+		if (found && xr > xl)
+		{
+			HLDrawBeamSpan(c, y, ToI64(Ceil(xl)), ToI64(Ceil(xr)),
+				izl, sozl, tozl, izr, sozr, tozr,
+				texels, pal, tw, th, mod_r, mod_g, mod_b);
+		}
+	}
+}
+
+U0 HLDrawBeam(CHLCanvas *c, F64 *start, F64 *end,
+	U8 *texels, U8 *pal, I64 tw, I64 th,
+	F64 width, F64 amplitude, F64 scroll, F64 time,
+	I64 r = 255, I64 g = 255, I64 b = 255, I64 brightness = 255)
+{//one beam from start to end, world units throughout
+ //
+ //texels/pal/tw/th are one sprite frame. A NULL palette is not accepted: every
+ //shipped beam sprite is version 2 and carries its own 256 colours
+ //
+ //time is the RENDER clock. Scroll and noise are visual, not simulation
+	CHLPolyVert		quad[4];
+	CHLPolyVert		clipped[HLMAX_POLY_VERTS];
+	CHLScreenVert	scr[HLMAX_POLY_VERTS];
+	//camera space ribbon edges, one point per segment boundary
+	F64	edge_a[HLBEAM_PTS * 3];
+	F64	edge_b[HLBEAM_PTS * 3];
+	F64	tex_t[HLBEAM_PTS];
+	F64	dir[3];
+	F64	nrm[3];
+	F64	ptv[3];
+	F64	pt[3];
+	F64	rel[3];
+	F64	len;
+	F64	half;
+	F64	hw;
+	F64	frac;
+	F64	phase;
+	F64	wave;
+	F64	ang;
+	F64	disp;
+	F64	cz;
+	F64	px_w;
+	F64	inv_z;
+	I64	mod_r;
+	I64	mod_g;
+	I64	mod_b;
+	I64	segs;
+	I64	count;
+	I64	i;
+	I64	k;
+
+	if (!hl_r_beams)
+		return;
+
+	if (!c || !c->pixels || !c->depth || !texels || !pal)
+		return;
+
+	if (tw < 1 || th < 1)
+		return;
+
+	HLVecSub(end, start, dir);
+	len = HLVecNormalize(dir);
+
+	if (len < 1.0)
+		return;
+
+	if (width < 0.1)
+		width = 0.1;
+	half = width * 0.5;
+
+	//colour times brightness, folded once per beam
+	mod_r = ClampI64(r, 0, 255) * ClampI64(brightness, 0, 255) / 255;
+	mod_g = ClampI64(g, 0, 255) * ClampI64(brightness, 0, 255) / 255;
+	mod_b = ClampI64(b, 0, 255) * ClampI64(brightness, 0, 255) / 255;
+
+	if (!(mod_r | mod_g | mod_b))
+		return;
+
+	//a straight beam is one quad. only noise needs subdivision
+	segs = 1;
+	if (amplitude > 0.0)
+	{
+		segs = ToI64(len / HLBEAM_SEG_LEN);
+		if (segs < 2)
+			segs = 2;
+		if (segs > HLBEAM_SEG_MAX)
+			segs = HLBEAM_SEG_MAX;
+	}
+
+	//texture scrolls along t. scroll is world units per second, so the phase is
+	//in repeats and folds into 0..1 to keep the texel coordinate small
+	phase = time * scroll / HLBEAM_TEX_REPEAT;
+	phase -= Floor(phase);
+
+	wave = time * HLBEAM_NOISE_RATE;
+
+	for (i = 0; i <= segs; i++)
+	{
+		frac = ToF64(i) / ToF64(segs);
+		HLVecMA(start, len * frac, dir, pt);
+
+		HLVecSub(pt, c->origin, ptv);
+
+		//the ribbon lies in the plane holding the beam and the eye, so it turns
+		//to face the viewer about its own axis and never presents an edge
+		HLVecCross(dir, ptv, nrm);
+
+		//looking straight down the beam leaves no such plane; any perpendicular
+		//serves at that angle
+		if (HLVecNormalize(nrm) < 0.001)
+			HLVecCopy(c->up, nrm);
+
+		if (amplitude > 0.0)
+		{
+			//zero at both ends: the endpoints are anchored to the entities that
+			//own them. two incommensurate sines, or the arc reads as a rope
+			//swinging in one plane
+			ang  = frac * HLBEAM_NOISE_CYCLES * 2.0 * pi;
+			disp = Sin(ang + wave) * 0.6 + Sin(ang * 2.7 - wave * 1.3) * 0.4;
+			disp *= Sin(frac * pi) * amplitude;
+
+			HLVecMA(pt, disp, nrm, pt);
+			HLVecSub(pt, c->origin, ptv);
+		}
+
+		cz = HLVecDot(ptv, c->forward);
+
+		//a beam narrower than a pixel drops out in gaps and reads as a dashed
+		//line. the floor is converted back to world units at this point's depth
+		//so the strip stays continuous
+		hw = half;
+		if (cz > HLNEAR_CLIP)
+		{
+			px_w = hw * c->x_scale / cz;
+			if (px_w < HLBEAM_MIN_PX)
+				hw = HLBEAM_MIN_PX * cz / c->x_scale;
+		}
+
+		HLVecMA(ptv, -hw, nrm, rel);
+		edge_a[i * 3]     = HLVecDot(rel, c->right);
+		edge_a[i * 3 + 1] = HLVecDot(rel, c->up);
+		edge_a[i * 3 + 2] = HLVecDot(rel, c->forward);
+
+		HLVecMA(ptv, hw, nrm, rel);
+		edge_b[i * 3]     = HLVecDot(rel, c->right);
+		edge_b[i * 3 + 1] = HLVecDot(rel, c->up);
+		edge_b[i * 3 + 2] = HLVecDot(rel, c->forward);
+
+		tex_t[i] = (phase + frac * len / HLBEAM_TEX_REPEAT) * ToF64(th);
+	}
+
+	for (i = 0; i < segs; i++)
+	{
+		//wound around the segment, so the clipper sees a convex quad
+		quad[0].cam[0] = edge_a[i * 3];
+		quad[0].cam[1] = edge_a[i * 3 + 1];
+		quad[0].cam[2] = edge_a[i * 3 + 2];
+		quad[0].s      = 0.0;
+		quad[0].t      = tex_t[i];
+
+		quad[1].cam[0] = edge_b[i * 3];
+		quad[1].cam[1] = edge_b[i * 3 + 1];
+		quad[1].cam[2] = edge_b[i * 3 + 2];
+		quad[1].s      = ToF64(tw);
+		quad[1].t      = tex_t[i];
+
+		quad[2].cam[0] = edge_b[(i + 1) * 3];
+		quad[2].cam[1] = edge_b[(i + 1) * 3 + 1];
+		quad[2].cam[2] = edge_b[(i + 1) * 3 + 2];
+		quad[2].s      = ToF64(tw);
+		quad[2].t      = tex_t[i + 1];
+
+		quad[3].cam[0] = edge_a[(i + 1) * 3];
+		quad[3].cam[1] = edge_a[(i + 1) * 3 + 1];
+		quad[3].cam[2] = edge_a[(i + 1) * 3 + 2];
+		quad[3].s      = 0.0;
+		quad[3].t      = tex_t[i + 1];
+
+		count = HLDrawClipNear(quad, 4, clipped);
+		if (count < 3)
+			goto qbm_next;
+
+		for (k = 0; k < count; k++)
+		{
+			inv_z = 1.0 / clipped[k].cam[2];
+
+			//screen y grows down, camera y grows up
+			scr[k].x = c->center_x + clipped[k].cam[0] * c->x_scale * inv_z;
+			scr[k].y = c->center_y - clipped[k].cam[1] * c->y_scale * inv_z;
+
+			scr[k].inv_z    = inv_z;
+			scr[k].s_over_z = clipped[k].s * inv_z;
+			scr[k].t_over_z = clipped[k].t * inv_z;
+		}
+
+		HLDrawBeamQuad(c, scr, count, texels, pal, tw, th,
+			mod_r, mod_g, mod_b);
+
+qbm_next:
+	}
+
+	hl_rs_beams++;
+}

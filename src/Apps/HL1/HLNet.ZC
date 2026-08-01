@@ -1,0 +1,3167 @@
+// HLNet.ZC - message buffers and the loopback link
+//
+// wire format. demos and other HL1 clients depend on it:
+//   coord  16-bit signed, 1/8 unit    (MSG_WriteCoord: (int)(f*8))
+//   angle  8-bit, 256 units per turn  (MSG_WriteAngle: (int)(f*256/360) & 255)
+//   short  16-bit little endian
+//   long   32-bit little endian
+//
+// a coord spans +/-4096 units at eighth resolution; the original nudges the view
+// by 1/32 to keep it off node planes
+
+#define HLNET_MAX_MSG		8192	//signon / reliable ceiling (MAX_MSGLEN)
+//unreliable datagrams must fit one Ethernet frame: no IP fragmentation here, and
+//RTL8139/QEMU drops a multi-kB UDP datagram outright
+#define HLNET_MAX_DATAGRAM	1400
+#define HLNET_MAX_BACKLOG	4		//loopback messages held before dropping
+
+//WinQuake net.h NETFLAG_* and control opcodes, big-endian on the wire
+#define HLNETFLAG_LENGTH_MASK	0x0000FFFF
+#define HLNETFLAG_DATA		0x00010000
+#define HLNETFLAG_ACK		0x00020000
+#define HLNETFLAG_NAK		0x00040000
+#define HLNETFLAG_EOM		0x00080000
+#define HLNETFLAG_UNRELIABLE	0x00100000
+#define HLNETFLAG_CTL		0x80000000
+#define HLNET_HEADERSIZE		8
+#define HLNET_CTL_VERSION	3
+
+#define HLCCREQ_CONNECT		0x01
+#define HLCCREQ_SERVER_INFO	0x02
+#define HLCCREP_ACCEPT		0x81
+#define HLCCREP_REJECT		0x82
+#define HLCCREP_SERVER_INFO	0x83
+
+U32 HLNetBigLong(U32 v)
+{
+	return EndianU32(v);
+}
+
+U0 HLNetWriteBigLong(U8 *p, U32 v)
+{
+	U32 be = EndianU32(v);
+	MemCopy(p, &be, 4);
+}
+
+U32 HLNetReadBigLong(U8 *p)
+{
+	U32 be;
+	MemCopy(&be, p, 4);
+	return EndianU32(be);
+}
+
+//--- svc_: server to client, GoldSrc protocol 48 ----------------------------
+//
+// not protocol 15's table. 0-12 and 15,16,18-32,34 share numbers with 15; 13,
+// 14, 17 and 33 are repurposed, so a protocol 15 parser fed a 48 stream reads
+// svc_updateuserinfo as svc_updatename and desyncs on the first player to join.
+//
+//   13  updatename    -> updateuserinfo      (name+colours are an infostring)
+//   14  updatefrags   -> deltadescription    (the delta tables, over the wire)
+//   17  updatecolors  -> pings
+//   33  sellscreen    -> restore
+//
+// 3 (svc_event) also replaced svc_updatestat: HL has no stat table, the game
+// DLL owns the HUD and pushes it through user messages instead.
+#define HLSVC_BAD				0
+#define HLSVC_NOP				1
+#define HLSVC_DISCONNECT		2
+#define HLSVC_EVENT				3
+#define HLSVC_VERSION			4
+#define HLSVC_SETVIEW			5
+#define HLSVC_SOUND				6
+#define HLSVC_TIME				7
+#define HLSVC_PRINT				8
+#define HLSVC_STUFFTEXT			9
+#define HLSVC_SETANGLE			10
+#define HLSVC_SERVERINFO		11
+#define HLSVC_LIGHTSTYLE		12
+#define HLSVC_UPDATEUSERINFO	13
+#define HLSVC_DELTADESCRIPTION	14
+#define HLSVC_CLIENTDATA		15
+#define HLSVC_STOPSOUND			16
+#define HLSVC_PINGS				17
+#define HLSVC_PARTICLE			18
+#define HLSVC_DAMAGE			19
+#define HLSVC_SPAWNSTATIC		20
+#define HLSVC_EVENT_RELIABLE	21
+#define HLSVC_SPAWNBASELINE		22
+#define HLSVC_TEMPENTITY_		23
+#define HLSVC_SETPAUSE			24
+#define HLSVC_SIGNONNUM			25
+#define HLSVC_CENTERPRINT		26
+#define HLSVC_KILLEDMONSTER		27
+#define HLSVC_FOUNDSECRET		28
+#define HLSVC_SPAWNSTATICSOUND	29
+#define HLSVC_INTERMISSION_		30
+#define HLSVC_FINALE_			31
+#define HLSVC_CDTRACK			32
+#define HLSVC_RESTORE			33
+#define HLSVC_CUTSCENE_			34
+#define HLSVC_WEAPONANIM		35
+#define HLSVC_DECALNAME			36
+#define HLSVC_ROOMTYPE			37
+#define HLSVC_ADDANGLE			38
+#define HLSVC_NEWUSERMSG		39
+#define HLSVC_PACKETENTITIES	40
+#define HLSVC_DELTAPACKETENTITIES 41
+#define HLSVC_CHOKE				42
+#define HLSVC_RESOURCELIST		43
+#define HLSVC_NEWMOVEVARS		44
+#define HLSVC_RESOURCEREQUEST	45
+#define HLSVC_CUSTOMIZATION		46
+#define HLSVC_CROSSHAIRANGLE	47
+#define HLSVC_SOUNDFADE			48
+#define HLSVC_FILETXFERFAILED	49
+#define HLSVC_HLTV				50
+#define HLSVC_DIRECTOR			51
+#define HLSVC_VOICEINIT			52
+#define HLSVC_VOICEDATA			53
+#define HLSVC_SENDEXTRAINFO		54
+#define HLSVC_TIMESCALE			55
+#define HLSVC_RESOURCELOCATION	56
+#define HLSVC_SENDCVARVALUE		57
+#define HLSVC_SENDCVARVALUE2	58
+
+//last engine opcode. 64 and up are user message numbers handed out by
+//pfnRegUserMsg - see HLUserMsg* below. the engine reserves 59..63.
+#define HLSVC_ENGINE_LAST		58
+#define HLUSERMSG_FIRST			64
+
+//svc_sound field_mask bits. protocol 48 moved svc_sound into a bit stream and
+//widened the mask; these are not protocol 15's two flags.
+#define HLSND_VOLUME			1
+#define HLSND_ATTENUATION		2
+#define HLSND_LARGE_INDEX		4		//SND_LARGE_INDEX: 16-bit sound number
+#define HLSND_PITCH				8
+#define HLSND_SENTENCE			16
+#define HLSND_STOP				32
+#define HLSND_CHANGE_VOL		64
+#define HLSND_CHANGE_PITCH		128
+#define HLSND_SPAWNING			256
+#define HLSND_DEFAULT_VOL		255
+#define HLSND_DEFAULT_ATTEN		1.0
+#define HLSND_DEFAULT_PITCH		100
+
+//--- clc_: client to server, protocol 48 ------------------------------------
+#define HLCLC_BAD				0
+#define HLCLC_NOP				1
+#define HLCLC_MOVE				2
+#define HLCLC_STRINGCMD			3
+#define HLCLC_DELTA				4
+#define HLCLC_RESOURCELIST		5
+#define HLCLC_TMOVE				6
+#define HLCLC_FILECONSISTENCY	7
+#define HLCLC_VOICEDATA			8
+#define HLCLC_HLTV				9
+#define HLCLC_CVARVALUE			10
+#define HLCLC_CVARVALUE2		11
+
+class CHLMsg
+{
+	U8	 data[HLNET_MAX_MSG];
+	I64	 len;			//bytes written
+	I64	 read;			//read cursor
+	Bool overflowed;	//a write did not fit, the message is unusable
+	Bool badread;		//a read ran past the end
+
+	//protocol 48 bit cursors, in bits from the start of data. protocol 15 was
+	//byte aligned throughout; 48 opens a bit stream inside particular messages
+	//(delta, resourcelist, packetentities) and returns to byte writes after it.
+	//separate from len/read so an unopened bit stream cannot consume a byte
+	//message - see HLBitWriteStart / HLBitReadStart.
+	I64	 wbit;
+	I64	 rbit;
+};
+
+//sv.datagram - TE, sounds, particles. QuakeC Write* and sound() append here,
+//remotes get a copy in their packet. cleared each SV_SendClientMessages.
+//must sit after class CHLMsg (single-pass compiler)
+CHLMsg	hl_sv_datagram;
+
+//--- writing ----------------------------------------------------------------
+
+U0 HLMsgClear(CHLMsg *m)
+{
+	m->len        = 0;
+	m->read       = 0;
+	m->overflowed = FALSE;
+	m->badread    = FALSE;
+	m->wbit       = 0;
+	m->rbit       = 0;
+}
+
+U0 HLMsgWriteByte(CHLMsg *m, I64 v)
+{//overflow is recorded, never truncated: a half-written message resyncs the
+ //reader mid-field and corrupts everything after it
+	if (m->len + 1 > HLNET_MAX_MSG)
+	{
+		m->overflowed = TRUE;
+		return;
+	}
+
+	m->data[m->len] = v & 0xFF;
+	m->len++;
+}
+
+U0 HLMsgWriteShort(CHLMsg *m, I64 v)
+{//little endian
+	HLMsgWriteByte(m, v & 0xFF);
+	HLMsgWriteByte(m, (v >> 8) & 0xFF);
+}
+
+U0 HLMsgWriteLong(CHLMsg *m, I64 v)
+{
+	HLMsgWriteByte(m, v & 0xFF);
+	HLMsgWriteByte(m, (v >> 8) & 0xFF);
+	HLMsgWriteByte(m, (v >> 16) & 0xFF);
+	HLMsgWriteByte(m, (v >> 24) & 0xFF);
+}
+
+U0 HLMsgWriteChar(CHLMsg *m, I64 v)
+{//MSG_WriteChar - same byte as MSG_WriteByte, the reader sign extends it
+	HLMsgWriteByte(m, v & 0xFF);
+}
+
+U0 HLMsgWriteFloat(CHLMsg *m, F64 f)
+{//MSG_WriteFloat - raw IEEE-754 binary32. only svc_time and svc_version need
+ //more range than a coord
+	HLMsgWriteLong(m, HLWrF32(f));
+}
+
+U0 HLMsgWriteCoord(CHLMsg *m, F64 f)
+{//MSG_WriteCoord - eighths of a unit in a signed short
+	HLMsgWriteShort(m, ToI64(f * 8.0));
+}
+
+U0 HLMsgWriteAngle(CHLMsg *m, F64 f)
+{//MSG_WriteAngle - a whole turn in 256 steps
+	HLMsgWriteByte(m, ToI64(f * 256.0 / 360.0) & 255);
+}
+
+U0 HLMsgWriteHiresAngle(CHLMsg *m, F64 f)
+{//MSG_WriteHiresAngle - protocol 48 only. a whole turn in 65536 steps.
+ //48 keeps the 8-bit format for entity angles and uses this for player aim: a
+ //1.4 degree quantum on the view shows as jitter
+	HLMsgWriteShort(m, ToI64(f * 65536.0 / 360.0) & 65535);
+}
+
+U0 HLMsgWriteString(CHLMsg *m, U8 *s)
+{//NUL terminated
+	I64 i = 0;
+
+	if (s)
+	{
+		while (s[i])
+		{
+			HLMsgWriteByte(m, s[i]);
+			i++;
+		}
+	}
+
+	HLMsgWriteByte(m, 0);
+}
+
+U0 HLMsgAppend(CHLMsg *dst, CHLMsg *src)
+{//copy src onto the end of dst, no-op if src is empty or either is bad
+	I64 i;
+
+	if (!dst || !src || src->len < 1 || dst->overflowed || src->overflowed)
+		return;
+
+	for (i = 0; i < src->len; i++)
+		HLMsgWriteByte(dst, src->data[i]);
+}
+
+U0 HLMsgAppendIfRoom(CHLMsg *dst, CHLMsg *src, I64 max_len)
+{//append only if the result still fits max_len (MTU budget)
+	if (!dst || !src || src->len < 1)
+		return;
+	if (dst->len + src->len > max_len)
+		return;
+	HLMsgAppend(dst, src);
+}
+
+//--- reading ----------------------------------------------------------------
+//
+// every read is bounds checked and sets badread on failure (msg_badread in the
+// original), so a truncated message cannot walk off the buffer
+
+I64 HLMsgReadByte(CHLMsg *m)
+{
+	I64 v;
+
+	if (m->read + 1 > m->len)
+	{
+		m->badread = TRUE;
+		return -1;
+	}
+
+	v = m->data[m->read];
+	m->read++;
+
+	return v;
+}
+
+I64 HLMsgReadShort(CHLMsg *m)
+{//sign extended, coordinates are signed
+	I64 v;
+
+	if (m->read + 2 > m->len)
+	{
+		m->badread = TRUE;
+		return -1;
+	}
+
+	v = m->data[m->read] | (m->data[m->read + 1] << 8);
+	m->read += 2;
+
+	if (v & 0x8000)
+		v -= 0x10000;
+
+	return v;
+}
+
+I64 HLMsgReadLong(CHLMsg *m)
+{
+	I64 v;
+
+	if (m->read + 4 > m->len)
+	{
+		m->badread = TRUE;
+		return -1;
+	}
+
+	v = m->data[m->read] | (m->data[m->read + 1] << 8) |
+		(m->data[m->read + 2] << 16) | (m->data[m->read + 3] << 24);
+	m->read += 4;
+
+	//MSG_ReadLong returns a signed int; svc_updatestat and frag counts go
+	//negative
+	if (v & 0x80000000)
+		v -= 0x100000000;
+
+	return v;
+}
+
+I64 HLMsgReadChar(CHLMsg *m)
+{//MSG_ReadChar - one byte, sign extended
+	I64 v = HLMsgReadByte(m);
+
+	if (v < 0)
+		return -1;			//badread already recorded
+
+	if (v & 0x80)
+		v -= 0x100;
+
+	return v;
+}
+
+F64 HLMsgReadFloat(CHLMsg *m)
+{
+	U8 b[4];
+	I64 i;
+
+	for (i = 0; i < 4; i++)
+	{
+		b[i] = HLMsgReadByte(m) & 0xFF;
+		if (m->badread)
+			return 0.0;
+	}
+
+	return HLRdF32(b);
+}
+
+F64 HLMsgReadCoord(CHLMsg *m)
+{
+	return ToF64(HLMsgReadShort(m)) * 0.125;
+}
+
+F64 HLMsgReadAngle(CHLMsg *m)
+{//MSG_ReadAngle reads a char, so the range is -180..178.6, not 0..358.6.
+ //equivalent modulo a turn; kept signed to match the original
+	return ToF64(HLMsgReadChar(m)) * 360.0 / 256.0;
+}
+
+F64 HLMsgReadHiresAngle(CHLMsg *m)
+{//MSG_ReadHiresAngle. HLMsgReadShort sign extends, so the range is -180..180
+ //rather than 0..360 - equivalent modulo a turn, as HLMsgReadAngle above
+	return ToF64(HLMsgReadShort(m)) * 360.0 / 65536.0;
+}
+
+U0 HLMsgReadString(CHLMsg *m, U8 *out, I64 max)
+{//always NUL terminates, never writes past max
+	I64 i = 0;
+	I64 c;
+
+	while (i < max - 1)
+	{
+		c = HLMsgReadByte(m);
+		if (c <= 0)
+			break;
+
+		out[i] = c;
+		i++;
+	}
+
+	out[i] = 0;
+}
+
+//--- loopback link ----------------------------------------------------------
+//
+// a queue of whole messages. server writes its send buffer and calls
+// HLNetSendToClient, client drains with HLNetGetMessage. a UDP socket replaces
+// those two functions and nothing else
+
+class CHLNetLink
+{
+	CHLMsg	queue[HLNET_MAX_BACKLOG];
+	I64		head;			//next slot to write
+	I64		tail;			//next slot to read
+	I64		count;
+	I64		dropped;		//messages lost to a full queue
+};
+
+//two queues: entity updates go down hl_net_s2c, client moves back up hl_net_c2s
+CHLNetLink	hl_net_s2c;
+CHLNetLink	hl_net_c2s;
+CHLMsg		hl_net_send;		//server's scratch message being built
+CHLMsg		hl_net_cmd;		//client's scratch message being built
+Bool		hl_net_active = FALSE;
+
+U0 HLNetLinkClear(CHLNetLink *l)
+{
+	I64 i;
+
+	l->head    = 0;
+	l->tail    = 0;
+	l->count   = 0;
+	l->dropped = 0;
+
+	for (i = 0; i < HLNET_MAX_BACKLOG; i++)
+		HLMsgClear(&l->queue[i]);
+}
+
+U0 HLNetInit()
+{//globals aren't zeroed
+	HLNetLinkClear(&hl_net_s2c);
+	HLNetLinkClear(&hl_net_c2s);
+
+	HLMsgClear(&hl_net_send);
+	HLMsgClear(&hl_net_cmd);
+	HLMsgClear(&hl_sv_datagram);
+	hl_net_active = TRUE;
+}
+
+Bool HLNetLinkSend(CHLNetLink *l, CHLMsg *m)
+{//queue a finished message, FALSE if it was dropped
+	CHLMsg *slot;
+
+	if (!hl_net_active || m->overflowed || m->len < 1)
+		return FALSE;
+
+	if (l->count >= HLNET_MAX_BACKLOG)
+	{
+		//drop a whole message; a partial one desyncs the reader
+		l->dropped++;
+		return FALSE;
+	}
+
+	slot = &l->queue[l->head];
+	HLMsgClear(slot);
+	MemCopy(slot->data, m->data, m->len);
+	slot->len = m->len;
+
+	l->head = (l->head + 1) % HLNET_MAX_BACKLOG;
+	l->count++;
+
+	return TRUE;
+}
+
+Bool HLNetLinkGet(CHLNetLink *l, CHLMsg *out)
+{//take the next queued message
+	CHLMsg *slot;
+
+	if (!hl_net_active || l->count < 1)
+		return FALSE;
+
+	slot = &l->queue[l->tail];
+
+	HLMsgClear(out);
+	MemCopy(out->data, slot->data, slot->len);
+	out->len = slot->len;
+
+	l->tail = (l->tail + 1) % HLNET_MAX_BACKLOG;
+	l->count--;
+
+	return TRUE;
+}
+
+Bool HLNetSendToClient(CHLMsg *m)
+{//server -> client
+	return HLNetLinkSend(&hl_net_s2c, m);
+}
+
+Bool HLNetGetMessage(CHLMsg *out)
+{//client reads what the server sent
+	return HLNetLinkGet(&hl_net_s2c, out);
+}
+
+Bool HLNetSendToServer(CHLMsg *m)
+{//client -> server
+	return HLNetLinkSend(&hl_net_c2s, m);
+}
+
+Bool HLNetServerGetMessage(CHLMsg *out)
+{//server reads what the client sent
+	return HLNetLinkGet(&hl_net_c2s, out);
+}
+
+#define HLNET_MAX_ENTS	600
+
+//bits in an svc_update byte, U_MOREBITS chains a second
+#define HLU_MOREBITS		1
+#define HLU_ORIGIN1		2
+#define HLU_ORIGIN2		4
+#define HLU_ORIGIN3		8
+#define HLU_ANGLE2		16
+#define HLU_NOLERP		32
+#define HLU_FRAME		64
+#define HLU_SIGNAL		128
+#define HLU_ANGLE1		256
+#define HLU_ANGLE3		512
+#define HLU_MODEL		1024
+#define HLU_COLORMAP		2048
+#define HLU_SKIN			4096
+#define HLU_EFFECTS		8192
+#define HLU_LONGENTITY	16384
+
+class CHLEntState
+{
+	F64	 origin[3];
+	F64	 angles[3];
+	I64	 modelindex;
+	I64	 frame;
+	I64	 colormap;
+	I64	 skin;
+	I64	 effects;
+	Bool step;			//MOVETYPE_STEP, the client must not interpolate it
+	Bool active;		//the client has been told about this entity
+	F64	 msgtime;		//server time of the message that last described it
+
+	//CL_RelinkEntities lays a trail along last frame's segment, so the old
+	//position must survive the update that overwrites origin
+	F64	 trail_org[3];
+	Bool trail_valid;	//FALSE until the entity has been seen twice
+
+	//msg_origins[1] / msg_angles[1] - the previous update. origin and angles
+	//above are msg_origins[0]; the drawn position lerps between the two
+	F64	 prev_origin[3];
+	F64	 prev_angles[3];
+	Bool forcelink;		//no previous update, snap instead of lerping
+};
+
+//hostname. a string, so it cannot live in the F64 cvar table. declared here
+//because HLNetSv answers CCREP_SERVER_INFO with it and compiles before the menu
+U8	hl_host_name[32];
+
+U0 HLHostNameInit()
+{//globals aren't zeroed
+	HLStrCopy(hl_host_name, "UNNAMED", 32);
+}
+
+//cl.mtime[0] from svc_time. entity updates are stamped with it: anything not in
+//the latest message has left the PVS
+F64 hl_net_msgtime = 0.0;
+
+//cl.mtime[1], the update before. the pair brackets the lerp interval
+F64 hl_net_msgtime_prev = 0.0;
+
+//cl.time for a client that is not also the server - advances in real time and
+//is pulled back into the [mtime1, mtime0] window by the lerp
+F64 hl_cl_clock = 0.0;
+F64 hl_cl_clock_last = 0.0;	//real time at the previous advance
+
+U0 HLNetClockInit()
+{//globals aren't zeroed; a garbage clock pins the lerp out of range
+	hl_net_msgtime      = 0.0;
+	hl_net_msgtime_prev = 0.0;
+	hl_cl_clock         = 0.0;
+	hl_cl_clock_last    = 0.0;
+}
+
+//NQ deltas against the baseline, not the last packet sent. svc_spawnbaseline
+//gives every entity a starting state at signon and every svc_update is measured
+//from it: costs bandwidth against QuakeWorld's delta-vs-last-sent, buys
+//statelessness - a lost packet cannot desync
+CHLEntState	hl_net_baseline[HLNET_MAX_ENTS];
+CHLEntState	hl_net_sent[HLNET_MAX_ENTS];
+CHLEntState	hl_net_cl[HLNET_MAX_ENTS];
+I64			hl_net_num_ents = 0;
+
+U0 HLNetStateClear(CHLEntState *e)
+{
+	HLVecSet(e->origin, 0.0, 0.0, 0.0);
+	HLVecSet(e->angles, 0.0, 0.0, 0.0);
+	e->modelindex = 0;
+	e->frame      = 0;
+	e->colormap   = 0;
+	e->skin       = 0;
+	e->effects    = 0;
+	e->step       = FALSE;
+	e->active     = FALSE;
+	e->msgtime    = 0.0;
+	HLVecSet(e->trail_org, 0.0, 0.0, 0.0);
+	e->trail_valid = FALSE;
+	HLVecSet(e->prev_origin, 0.0, 0.0, 0.0);
+	HLVecSet(e->prev_angles, 0.0, 0.0, 0.0);
+	e->forcelink = TRUE;
+}
+
+U0 HLNetStatesClear()
+{//globals aren't zeroed
+	I64 i;
+
+	for (i = 0; i < HLNET_MAX_ENTS; i++)
+	{
+		HLNetStateClear(&hl_net_baseline[i]);
+		HLNetStateClear(&hl_net_sent[i]);
+		HLNetStateClear(&hl_net_cl[i]);
+	}
+
+	hl_net_num_ents = 0;
+}
+
+Bool HLNetOriginDiffers(F64 a, F64 b)
+{//SV_WriteEntitiesToClient's 0.1 tolerance: a coord round-tripped through the
+ //eighth-unit wire format never compares equal exactly
+	F64 miss = a - b;
+
+	return ToBool(miss < -0.1 || miss > 0.1);
+}
+
+U0 HLNetWriteEntityUpdate(CHLMsg *m, I64 num, CHLEntState *now,
+	CHLEntState *baseline)
+{//one delta-compressed entity update, in the original's field order. svc_update
+ //puts the mask ahead of the fields it describes; the reader has no other way to
+ //know what follows
+	I64 bits = 0;
+
+	if (HLNetOriginDiffers(now->origin[0], baseline->origin[0]))
+		bits |= HLU_ORIGIN1;
+	if (HLNetOriginDiffers(now->origin[1], baseline->origin[1]))
+		bits |= HLU_ORIGIN2;
+	if (HLNetOriginDiffers(now->origin[2], baseline->origin[2]))
+		bits |= HLU_ORIGIN3;
+
+	if (now->angles[0] != baseline->angles[0])	bits |= HLU_ANGLE1;
+	if (now->angles[1] != baseline->angles[1])	bits |= HLU_ANGLE2;
+	if (now->angles[2] != baseline->angles[2])	bits |= HLU_ANGLE3;
+
+	//U_NOLERP is a property of the entity, not a delta: a MOVETYPE_STEP mover
+	//teleports between fixed positions and lerping smears the step
+	if (now->step)
+		bits |= HLU_NOLERP;
+
+	if (now->frame      != baseline->frame)		bits |= HLU_FRAME;
+	if (now->modelindex != baseline->modelindex)	bits |= HLU_MODEL;
+	if (now->colormap   != baseline->colormap)	bits |= HLU_COLORMAP;
+	if (now->skin       != baseline->skin)		bits |= HLU_SKIN;
+	if (now->effects    != baseline->effects)	bits |= HLU_EFFECTS;
+
+	//no early-out on an empty mask: the mask byte is the "here and visible"
+	//signal, and suppressing it makes an unchanged entity look like one that
+	//left the PVS
+	if (num >= 256)
+		bits |= HLU_LONGENTITY;
+	if (bits >= 256)
+		bits |= HLU_MOREBITS;
+
+	//U_SIGNAL is the high bit of byte 0 and is always set: it is how the client's
+	//loop tells an entity update from an svc_ opcode
+	HLMsgWriteByte(m, (bits | HLU_SIGNAL) & 255);
+
+	if (bits & HLU_MOREBITS)
+		HLMsgWriteByte(m, (bits >> 8) & 255);
+
+	if (bits & HLU_LONGENTITY)
+		HLMsgWriteShort(m, num);
+	else
+		HLMsgWriteByte(m, num);
+
+	if (bits & HLU_MODEL)	HLMsgWriteByte(m, now->modelindex);
+	if (bits & HLU_FRAME)	HLMsgWriteByte(m, now->frame);
+	if (bits & HLU_COLORMAP)	HLMsgWriteByte(m, now->colormap);
+	if (bits & HLU_SKIN)		HLMsgWriteByte(m, now->skin);
+	if (bits & HLU_EFFECTS)	HLMsgWriteByte(m, now->effects);
+
+	if (bits & HLU_ORIGIN1)	HLMsgWriteCoord(m, now->origin[0]);
+	if (bits & HLU_ANGLE1)	HLMsgWriteAngle(m, now->angles[0]);
+	if (bits & HLU_ORIGIN2)	HLMsgWriteCoord(m, now->origin[1]);
+	if (bits & HLU_ANGLE2)	HLMsgWriteAngle(m, now->angles[1]);
+	if (bits & HLU_ORIGIN3)	HLMsgWriteCoord(m, now->origin[2]);
+	if (bits & HLU_ANGLE3)	HLMsgWriteAngle(m, now->angles[2]);
+}
+
+Bool HLNetReadEntityUpdate(CHLMsg *m, I64 bits)
+{//CL_ParseUpdate. the low mask byte is already read - it identified this as an
+ //update
+	CHLEntState	*e;
+	I64			 num;
+
+	if (bits & HLU_MOREBITS)
+		bits |= HLMsgReadByte(m) << 8;
+
+	if (bits & HLU_LONGENTITY)
+		num = HLMsgReadShort(m);
+	else
+		num = HLMsgReadByte(m);
+
+	if (num < 0 || num >= HLNET_MAX_ENTS || m->badread)
+		return FALSE;
+
+	e = &hl_net_cl[num];
+
+	//a first sighting starts from the baseline, not from zero: CL_ParseUpdate
+	//copies ent->baseline in, else omitted fields read back as 0
+	if (!e->active)
+	{
+		MemCopy(e, &hl_net_baseline[num], sizeof(CHLEntState));
+		e->forcelink = TRUE;
+	}
+
+	//absent from the last message means it reappeared: snap, do not slide in
+	//from wherever it was last seen
+	if (e->msgtime != hl_net_msgtime_prev)
+		e->forcelink = TRUE;
+
+	//msg_origins[0] becomes msg_origins[1], the bytes below overwrite [0]
+	HLVecCopy(e->origin, e->prev_origin);
+	HLVecCopy(e->angles, e->prev_angles);
+
+	e->step = ToBool((bits & HLU_NOLERP) != 0);
+
+	//anything not in the mask keeps its previous value: the client's copy is an
+	//accumulation of every update applied, not a snapshot
+	if (bits & HLU_MODEL)	e->modelindex = HLMsgReadByte(m);
+	if (bits & HLU_FRAME)	e->frame      = HLMsgReadByte(m);
+	if (bits & HLU_COLORMAP)	e->colormap   = HLMsgReadByte(m);
+	if (bits & HLU_SKIN)		e->skin       = HLMsgReadByte(m);
+	if (bits & HLU_EFFECTS)	e->effects    = HLMsgReadByte(m);
+
+	if (bits & HLU_ORIGIN1)	e->origin[0] = HLMsgReadCoord(m);
+	if (bits & HLU_ANGLE1)	e->angles[0] = HLMsgReadAngle(m);
+	if (bits & HLU_ORIGIN2)	e->origin[1] = HLMsgReadCoord(m);
+	if (bits & HLU_ANGLE2)	e->angles[1] = HLMsgReadAngle(m);
+	if (bits & HLU_ORIGIN3)	e->origin[2] = HLMsgReadCoord(m);
+	if (bits & HLU_ANGLE3)	e->angles[2] = HLMsgReadAngle(m);
+
+	if (e->forcelink)
+	{
+		HLVecCopy(e->origin, e->prev_origin);
+		HLVecCopy(e->angles, e->prev_angles);
+	}
+
+	e->active  = TRUE;
+	e->msgtime = hl_net_msgtime;
+
+	if (num >= hl_net_num_ents)
+		hl_net_num_ents = num + 1;
+
+	return ToBool(!m->badread);
+}
+
+//============================================================================
+// Protocol 48: the bit stream
+//============================================================================
+//
+// protocol 15 was byte aligned end to end. 48 is not: svc_clientdata,
+// svc_packetentities, svc_resourcelist, svc_spawnbaseline and every delta open a
+// bit stream at the current byte and pack fields to their declared width. a
+// field declared 3 bits in delta.lst costs 3 bits.
+//
+// bit order: bits fill each byte from the low bit up, bytes run in increasing
+// address order. bit k of an n-bit value goes to stream bit (start + k), i.e.
+// the value's least significant bit goes out first.
+//
+// the cursors live in CHLMsg (wbit/rbit) beside len/read rather than replacing
+// them, because a message mixes the two: the svc_ opcode byte and most headers
+// are byte writes, and the bit stream is opened and closed inside the payload.
+
+U0 HLBitWriteStart(CHLMsg *m)
+{//open a bit stream at the current end of the message
+	m->wbit = m->len * 8;
+}
+
+U0 HLBitWriteBits(CHLMsg *m, I64 v, I64 n)
+{//MSG_WriteBits. bit by bit: the widths in delta.lst are arbitrary (3, 9, 11,
+ //13, 21, 22 bits), so a word-at-a-time version is all corner case for no gain
+ //at these message sizes
+	I64 i;
+	I64 byte_idx;
+
+	if (n < 1 || n > 32)
+		return;
+
+	for (i = 0; i < n; i++)
+	{
+		byte_idx = m->wbit >> 3;
+
+		if (byte_idx >= HLNET_MAX_MSG)
+		{
+			m->overflowed = TRUE;
+			return;
+		}
+
+		//zero a byte before starting it. HLMsgClear resets len and leaves data
+		//alone, so the OR below would otherwise fold in whatever the previous
+		//message left at this offset
+		if (!(m->wbit & 7))
+			m->data[byte_idx] = 0;
+
+		if ((v >> i) & 1)
+			m->data[byte_idx] = m->data[byte_idx] | (1 << (m->wbit & 7));
+
+		m->wbit++;
+
+		//len tracks the partial byte too, so a byte write that follows without
+		//HLBitWriteEnd lands after the bits instead of on top of them
+		if (byte_idx + 1 > m->len)
+			m->len = byte_idx + 1;
+	}
+}
+
+U0 HLBitWriteSBits(CHLMsg *m, I64 v, I64 n)
+{//MSG_WriteSBits - two's complement in n bits, no separate sign flag. the reader
+ //sign extends from bit n-1
+	if (n < 1 || n > 32)
+		return;
+
+	HLBitWriteBits(m, v & ((1 << n) - 1), n);
+}
+
+U0 HLBitWriteEnd(CHLMsg *m)
+{//close the bit stream: byte writes resume after the last touched byte, and
+ //the unused high bits of a partial byte stay zero
+	m->wbit = m->len * 8;
+}
+
+U0 HLBitReadStart(CHLMsg *m)
+{
+	m->rbit = m->read * 8;
+}
+
+I64 HLBitReadBits(CHLMsg *m, I64 n)
+{//MSG_ReadBits. sets badread past the end, as the byte readers do.
+	I64 i;
+	I64 v = 0;
+	I64 byte_idx;
+
+	if (n < 1 || n > 32)
+		return 0;
+
+	for (i = 0; i < n; i++)
+	{
+		byte_idx = m->rbit >> 3;
+
+		if (byte_idx >= m->len)
+		{
+			m->badread = TRUE;
+			return 0;
+		}
+
+		if (m->data[byte_idx] & (1 << (m->rbit & 7)))
+			v = v | (1 << i);
+
+		m->rbit++;
+	}
+
+	return v;
+}
+
+I64 HLBitReadSBits(CHLMsg *m, I64 n)
+{//sign extend from bit n-1
+	I64 v = HLBitReadBits(m, n);
+
+	if (n < 1 || n >= 32)
+		return v;
+
+	if (v & (1 << (n - 1)))
+		v -= 1 << n;
+
+	return v;
+}
+
+U0 HLBitReadEnd(CHLMsg *m)
+{//byte reads resume at the next whole byte
+	m->read = (m->rbit + 7) >> 3;
+}
+
+U0 HLBitWriteBitString(CHLMsg *m, U8 *s)
+{//MSG_WriteBitString - characters and terminator, 8 bits each, not byte aligned.
+ //only clientdata_t.physinfo uses DT_STRING
+	I64 i = 0;
+
+	if (s)
+	{
+		while (s[i])
+		{
+			HLBitWriteBits(m, s[i], 8);
+			i++;
+		}
+	}
+
+	HLBitWriteBits(m, 0, 8);
+}
+
+U0 HLBitReadBitString(CHLMsg *m, U8 *out, I64 max)
+{//always NUL terminates. the stream is drained to the terminator even when the
+ //destination fills first; otherwise every bit after this is misaligned
+	I64 i = 0;
+	I64 c;
+
+	if (out && max > 0)
+		out[0] = 0;
+
+	while (TRUE)
+	{
+		c = HLBitReadBits(m, 8);
+		if (m->badread || !c)
+			break;
+
+		if (out && i < max - 1)
+		{
+			out[i] = c;
+			i++;
+		}
+	}
+
+	if (out && max > 0)
+		out[i] = 0;
+}
+
+U0 HLBitWriteBitCoord(CHLMsg *m, F64 f)
+{//MSG_WriteBitCoord. not MSG_WriteCoord: the byte-aligned coord is a 16-bit
+ //fixed point short, this one is variable width -
+ //
+ //   1 bit  integer part present
+ //   1 bit  fractional part present
+ //   if either:
+ //      1 bit   sign
+ //      12 bits integer part   (if present)
+ //      3 bits  eighths        (if present)
+ //
+ //an exact zero costs two bits, and most coords in a snapshot are zero
+ //(mins/maxs of a point entity, velocity at rest)
+	I64	sign = 0;
+	I64	intval;
+	I64	fracval;
+	F64	av;
+
+	av = f;
+	if (av < 0.0)
+	{
+		sign = 1;
+		av   = -av;
+	}
+
+	intval  = ToI64(av);
+	fracval = ToI64(av * 8.0) & 7;
+
+	//12 bits of integer part: past 4095 units the coord cannot be expressed, so
+	//clamp
+	if (intval > 4095)
+		intval = 4095;
+
+	if (intval)
+		HLBitWriteBits(m, 1, 1);
+	else
+		HLBitWriteBits(m, 0, 1);
+
+	if (fracval)
+		HLBitWriteBits(m, 1, 1);
+	else
+		HLBitWriteBits(m, 0, 1);
+
+	if (!intval && !fracval)
+		return;
+
+	HLBitWriteBits(m, sign, 1);
+
+	if (intval)
+		HLBitWriteBits(m, intval, 12);
+	if (fracval)
+		HLBitWriteBits(m, fracval, 3);
+}
+
+F64 HLBitReadBitCoord(CHLMsg *m)
+{//MSG_ReadBitCoord
+	I64	has_int;
+	I64	has_frac;
+	I64	intval  = 0;
+	I64	fracval = 0;
+	I64	sign    = 0;
+	F64	v;
+
+	has_int  = HLBitReadBits(m, 1);
+	has_frac = HLBitReadBits(m, 1);
+
+	if (!has_int && !has_frac)
+		return 0.0;
+
+	sign = HLBitReadBits(m, 1);
+
+	if (has_int)
+		intval = HLBitReadBits(m, 12);
+	if (has_frac)
+		fracval = HLBitReadBits(m, 3);
+
+	v = ToF64(intval) + ToF64(fracval) * 0.125;
+
+	if (sign)
+		v = -v;
+
+	return v;
+}
+
+U0 HLBitWriteBitAngle(CHLMsg *m, F64 f, I64 bits)
+{//MSG_WriteBitAngle - a whole turn across the declared width. delta.lst uses 16
+ //bits for every DT_ANGLE, matching MSG_WriteHiresAngle's resolution
+	I64 shift;
+
+	if (bits < 1 || bits > 32)
+		return;
+
+	shift = 1 << bits;
+	HLBitWriteBits(m, ToI64(f * ToF64(shift) / 360.0) & (shift - 1), bits);
+}
+
+F64 HLBitReadBitAngle(CHLMsg *m, I64 bits)
+{
+	I64 shift;
+
+	if (bits < 1 || bits > 32)
+		return 0.0;
+
+	shift = 1 << bits;
+
+	return ToF64(HLBitReadBits(m, bits)) * 360.0 / ToF64(shift);
+}
+
+//============================================================================
+// Protocol 48: delta compression
+//============================================================================
+//
+// protocol 15 hard coded one bitmask per message type (HLU_*, HLSU_*) and one
+// field order in the reader and the writer. 48 describes every delta-able
+// structure as a table of field descriptors - name, type, width, multiplier -
+// and both ends walk the same table. valve/delta.lst is that description, and it
+// ships with the game because the game DLL, not the engine, decides what a mod's
+// entity_state_t looks like.
+//
+// the tables below are transcribed from src/Apps/HL1/valve/delta.lst in file
+// order, and the order is load-bearing: a field's index in the table is its bit
+// index in the change mask. reordering two lines swaps two fields on the wire.
+//
+// DT_* values are the HLSDK delta.h bit flags. DT_SIGNED is a modifier, the rest
+// are exclusive.
+
+#define HLDT_BYTE			1
+#define HLDT_SHORT			2
+#define HLDT_FLOAT			4
+#define HLDT_INTEGER		8
+#define HLDT_ANGLE			16
+#define HLDT_TIMEWINDOW_8	32
+#define HLDT_TIMEWINDOW_BIG	64
+#define HLDT_STRING			128
+#define HLDT_SIGNED			0x80000000
+#define HLDT_TYPEMASK		0x7FFFFFFF
+
+//a delta-able structure is held as a flat array of F64 and a descriptor carries
+//the index. one codec then serves all seven tables with no per-field pointer
+//arithmetic or casting, and no field can be read at the wrong width.
+//
+//every DT_ type is an integer or a scaled fixed point on the wire and F64 holds
+//all of them exactly: the widest is DT_INTEGER 32, inside an F64 mantissa.
+#define HLDELTA_MAX_SLOTS	64
+#define HLDELTA_MAX_FIELDS	64
+
+class CHLDeltaField
+{
+	I64	slot;		//index into the F64 value array
+	I64	type;		//HLDT_*, possibly | HLDT_SIGNED
+	I64	bits;
+	F64	scale;		//DEFINE_DELTA multiplier: wire = value * scale
+	F64	post;		//DEFINE_DELTA_POST postmultiply, 0.0 = none
+	U8	name[24];	//for logs only, nothing indexes by it
+};
+
+class CHLDelta
+{
+	CHLDeltaField	f[HLDELTA_MAX_FIELDS];
+	I64				count;
+	U8				name[24];
+};
+
+//the seven structures delta.lst describes. usercmd_t and weapon_data_t are the
+//upstream/prediction halves; nothing writes them - see HLDeltaWriteMove
+CHLDelta	hl_delta_entity;		//entity_state_t
+CHLDelta	hl_delta_player;		//entity_state_player_t
+CHLDelta	hl_delta_custom;		//custom_entity_state_t
+CHLDelta	hl_delta_clientdata;	//clientdata_t
+CHLDelta	hl_delta_weapon;		//weapon_data_t
+CHLDelta	hl_delta_usercmd;		//usercmd_t
+CHLDelta	hl_delta_event;			//event_t
+
+//--- slot numbering ---------------------------------------------------------
+//
+// entity_state_t, entity_state_player_t and custom_entity_state_t share one
+// numbering: the same C struct in the SDK with different fields delta'd, so a
+// baseline captured for one is readable as the other.
+
+#define HLES_ANIMTIME		0
+#define HLES_FRAME			1
+#define HLES_ORIGIN			2	//+0..2
+#define HLES_ANGLES			5	//+0..2
+#define HLES_SEQUENCE		8
+#define HLES_GAITSEQUENCE	9
+#define HLES_MODELINDEX		10
+#define HLES_MOVETYPE		11
+#define HLES_SOLID			12
+#define HLES_MINS			13	//+0..2
+#define HLES_MAXS			16	//+0..2
+#define HLES_ENDPOS			19	//+0..2
+#define HLES_STARTPOS		22	//+0..2
+#define HLES_IMPACTTIME		25
+#define HLES_STARTTIME		26
+#define HLES_WEAPONMODEL	27
+#define HLES_OWNER			28
+#define HLES_EFFECTS		29
+#define HLES_EFLAGS			30
+#define HLES_COLORMAP		31
+#define HLES_FRAMERATE		32
+#define HLES_SKIN			33
+#define HLES_CONTROLLER		34	//+0..3
+#define HLES_BLENDING		38	//+0..1
+#define HLES_BODY			40
+#define HLES_RENDERMODE		41
+#define HLES_RENDERAMT		42
+#define HLES_RENDERFX		43
+#define HLES_SCALE			44
+#define HLES_RENDERCOLOR	45	//+0..2, r g b
+#define HLES_AIMENT			48
+#define HLES_BASEVELOCITY	49	//+0..2
+#define HLES_PLAYERCLASS	52
+#define HLES_TEAM			53
+#define HLES_FRICTION		54
+#define HLES_USEHULL		55
+#define HLES_GRAVITY		56
+#define HLES_SPECTATOR		57
+#define HLES_SLOTS			58
+
+#define HLCD_TIMESTEPSOUND	0
+#define HLCD_ORIGIN			1	//+0..2
+#define HLCD_VELOCITY		4	//+0..2
+#define HLCD_NEXTATTACK		7
+#define HLCD_AMMO_NAILS		8
+#define HLCD_AMMO_SHELLS	9
+#define HLCD_AMMO_CELLS		10
+#define HLCD_AMMO_ROCKETS	11
+#define HLCD_M_IID			12
+#define HLCD_PUNCHANGLE		13	//+0..2
+#define HLCD_FLAGS			16
+#define HLCD_WEAPONANIM		17
+#define HLCD_HEALTH			18
+#define HLCD_MAXSPEED		19
+#define HLCD_DUCKTIME		20
+#define HLCD_VIEW_OFS		21	//+0..2, only [2] is delta'd
+#define HLCD_VIEWMODEL		24
+#define HLCD_WEAPONS		25
+#define HLCD_PUSHMSEC		26
+#define HLCD_DEADFLAG		27
+#define HLCD_FOV			28
+#define HLCD_PHYSINFO		29	//DT_STRING, the F64 slot is unused
+#define HLCD_INDUCK			30
+#define HLCD_SWIMTIME		31
+#define HLCD_WATERJUMPTIME	32
+#define HLCD_WATERLEVEL		33
+#define HLCD_IUSER1			34
+#define HLCD_IUSER2			35
+#define HLCD_VUSER1			36	//+0..2
+#define HLCD_VUSER2			39	//+0..2
+#define HLCD_VUSER3			42	//+0..2
+#define HLCD_VUSER4			45	//+0..2
+#define HLCD_FUSER1			48
+#define HLCD_FUSER2			49
+#define HLCD_FUSER3			50
+#define HLCD_FUSER4			51
+#define HLCD_SLOTS			52
+
+#define HLWD_TIMEWEAPONIDLE	0
+#define HLWD_NEXTPRIMARY	1
+#define HLWD_NEXTRELOAD		2
+#define HLWD_NEXTAIMBONUS	3
+#define HLWD_NEXTSECONDARY	4
+#define HLWD_CLIP			5
+#define HLWD_PUMPTIME		6
+#define HLWD_SPECIALRELOAD	7
+#define HLWD_RELOADTIME		8
+#define HLWD_INRELOAD		9
+#define HLWD_AIMEDDAMAGE	10
+#define HLWD_INZOOM			11
+#define HLWD_WEAPONSTATE	12
+#define HLWD_ID				13
+#define HLWD_IUSER1			14
+#define HLWD_IUSER2			15
+#define HLWD_IUSER3			16
+#define HLWD_FUSER1			17
+#define HLWD_FUSER2			18
+#define HLWD_FUSER3			19
+#define HLWD_SLOTS			20
+
+#define HLUC_LERP_MSEC		0
+#define HLUC_MSEC			1
+#define HLUC_VIEWANGLES		2	//+0..2
+#define HLUC_BUTTONS		5
+#define HLUC_FORWARDMOVE	6
+#define HLUC_LIGHTLEVEL		7
+#define HLUC_SIDEMOVE		8
+#define HLUC_UPMOVE			9
+#define HLUC_IMPULSE		10
+#define HLUC_IMPACT_INDEX	11
+#define HLUC_IMPACT_POS		12	//+0..2
+#define HLUC_SLOTS			15
+
+#define HLEV_ENTINDEX		0
+#define HLEV_BPARAM1		1
+#define HLEV_BPARAM2		2
+#define HLEV_ORIGIN			3	//+0..2
+#define HLEV_FPARAM1		6
+#define HLEV_FPARAM2		7
+#define HLEV_IPARAM1		8
+#define HLEV_IPARAM2		9
+#define HLEV_ANGLES			10	//+0..2
+#define HLEV_DUCKING		13
+#define HLEV_SLOTS			14
+
+U0 HLDeltaAdd(CHLDelta *d, I64 slot, I64 type, I64 bits, F64 scale,
+	F64 post, U8 *name)
+{//one DEFINE_DELTA line. appended in file order - the index is the mask bit
+	CHLDeltaField *f;
+
+	if (!d || d->count >= HLDELTA_MAX_FIELDS)
+		return;
+
+	f = &d->f[d->count];
+	f->slot  = slot;
+	f->type  = type;
+	f->bits  = bits;
+	f->scale = scale;
+	f->post  = post;
+	HLStrCopy(f->name, name, 24);
+
+	d->count++;
+}
+
+U0 HLDeltaClear(CHLDelta *d, U8 *name)
+{
+	d->count = 0;
+	HLStrCopy(d->name, name, 24);
+}
+
+U0 HLDeltaInitClientData()
+{//clientdata_t, delta.lst line order. no conditional encoder ("none")
+	CHLDelta *d = &hl_delta_clientdata;
+
+	HLDeltaClear(d, "clientdata_t");
+
+	HLDeltaAdd(d, HLCD_TIMESTEPSOUND, HLDT_INTEGER, 10, 1.0, 0.0,
+		"flTimeStepSound");
+	HLDeltaAdd(d, HLCD_ORIGIN + 0, HLDT_SIGNED | HLDT_FLOAT, 21, 128.0, 0.0,
+		"origin[0]");
+	HLDeltaAdd(d, HLCD_ORIGIN + 1, HLDT_SIGNED | HLDT_FLOAT, 21, 128.0, 0.0,
+		"origin[1]");
+	HLDeltaAdd(d, HLCD_VELOCITY + 0, HLDT_SIGNED | HLDT_FLOAT, 16, 8.0, 0.0,
+		"velocity[0]");
+	HLDeltaAdd(d, HLCD_VELOCITY + 1, HLDT_SIGNED | HLDT_FLOAT, 16, 8.0, 0.0,
+		"velocity[1]");
+	HLDeltaAdd(d, HLCD_NEXTATTACK, HLDT_FLOAT | HLDT_SIGNED, 22, 1000.0, 0.0,
+		"m_flNextAttack");
+	HLDeltaAdd(d, HLCD_ORIGIN + 2, HLDT_SIGNED | HLDT_FLOAT, 21, 128.0, 0.0,
+		"origin[2]");
+	HLDeltaAdd(d, HLCD_VELOCITY + 2, HLDT_SIGNED | HLDT_FLOAT, 16, 8.0, 0.0,
+		"velocity[2]");
+	HLDeltaAdd(d, HLCD_AMMO_NAILS, HLDT_SIGNED | HLDT_INTEGER, 10, 1.0, 0.0,
+		"ammo_nails");
+	HLDeltaAdd(d, HLCD_AMMO_SHELLS, HLDT_SIGNED | HLDT_INTEGER, 10, 1.0, 0.0,
+		"ammo_shells");
+	HLDeltaAdd(d, HLCD_AMMO_CELLS, HLDT_SIGNED | HLDT_INTEGER, 10, 1.0, 0.0,
+		"ammo_cells");
+	HLDeltaAdd(d, HLCD_AMMO_ROCKETS, HLDT_SIGNED | HLDT_INTEGER, 10, 1.0, 0.0,
+		"ammo_rockets");
+	HLDeltaAdd(d, HLCD_M_IID, HLDT_INTEGER, 5, 1.0, 0.0, "m_iId");
+	HLDeltaAdd(d, HLCD_PUNCHANGLE + 2, HLDT_SIGNED | HLDT_FLOAT, 16, 8.0, 0.0,
+		"punchangle[2]");
+	HLDeltaAdd(d, HLCD_FLAGS, HLDT_INTEGER, 32, 1.0, 0.0, "flags");
+	HLDeltaAdd(d, HLCD_WEAPONANIM, HLDT_INTEGER, 8, 1.0, 0.0, "weaponanim");
+	HLDeltaAdd(d, HLCD_HEALTH, HLDT_SIGNED | HLDT_FLOAT, 10, 1.0, 0.0, "health");
+	HLDeltaAdd(d, HLCD_MAXSPEED, HLDT_FLOAT, 16, 10.0, 0.0, "maxspeed");
+	HLDeltaAdd(d, HLCD_DUCKTIME, HLDT_INTEGER, 10, 1.0, 0.0, "flDuckTime");
+	HLDeltaAdd(d, HLCD_VIEW_OFS + 2, HLDT_SIGNED | HLDT_FLOAT, 10, 4.0, 0.0,
+		"view_ofs[2]");
+	HLDeltaAdd(d, HLCD_PUNCHANGLE + 0, HLDT_SIGNED | HLDT_FLOAT, 16, 8.0, 0.0,
+		"punchangle[0]");
+	HLDeltaAdd(d, HLCD_PUNCHANGLE + 1, HLDT_SIGNED | HLDT_FLOAT, 16, 8.0, 0.0,
+		"punchangle[1]");
+	HLDeltaAdd(d, HLCD_VIEWMODEL, HLDT_INTEGER, 10, 1.0, 0.0, "viewmodel");
+	HLDeltaAdd(d, HLCD_WEAPONS, HLDT_INTEGER, 32, 1.0, 0.0, "weapons");
+	HLDeltaAdd(d, HLCD_PUSHMSEC, HLDT_INTEGER, 11, 1.0, 0.0, "pushmsec");
+	HLDeltaAdd(d, HLCD_DEADFLAG, HLDT_INTEGER, 3, 1.0, 0.0, "deadflag");
+	HLDeltaAdd(d, HLCD_FOV, HLDT_FLOAT, 8, 1.0, 0.0, "fov");
+	//the only DT_STRING in the file. width 1 is not a bit count for a string;
+	//MSG_WriteBitString ignores it
+	HLDeltaAdd(d, HLCD_PHYSINFO, HLDT_STRING, 1, 1.0, 0.0, "physinfo");
+	HLDeltaAdd(d, HLCD_INDUCK, HLDT_INTEGER, 1, 1.0, 0.0, "bInDuck");
+	HLDeltaAdd(d, HLCD_SWIMTIME, HLDT_INTEGER, 10, 1.0, 0.0, "flSwimTime");
+	HLDeltaAdd(d, HLCD_WATERJUMPTIME, HLDT_INTEGER, 15, 1.0, 0.0,
+		"waterjumptime");
+	HLDeltaAdd(d, HLCD_WATERLEVEL, HLDT_INTEGER, 2, 1.0, 0.0, "waterlevel");
+	HLDeltaAdd(d, HLCD_IUSER1, HLDT_INTEGER, 3, 1.0, 0.0, "iuser1");
+	HLDeltaAdd(d, HLCD_IUSER2, HLDT_INTEGER, 5, 1.0, 0.0, "iuser2");
+	HLDeltaAdd(d, HLCD_VUSER1 + 0, HLDT_SIGNED | HLDT_FLOAT, 10, 1.0, 0.0,
+		"vuser1[0]");
+	HLDeltaAdd(d, HLCD_VUSER1 + 1, HLDT_SIGNED | HLDT_FLOAT, 10, 1.0, 0.0,
+		"vuser1[1]");
+	HLDeltaAdd(d, HLCD_VUSER1 + 2, HLDT_SIGNED | HLDT_FLOAT, 10, 1.0, 0.0,
+		"vuser1[2]");
+	HLDeltaAdd(d, HLCD_VUSER2 + 0, HLDT_SIGNED | HLDT_FLOAT, 10, 1.0, 0.0,
+		"vuser2[0]");
+	HLDeltaAdd(d, HLCD_VUSER2 + 1, HLDT_SIGNED | HLDT_FLOAT, 10, 1.0, 0.0,
+		"vuser2[1]");
+	HLDeltaAdd(d, HLCD_VUSER2 + 2, HLDT_SIGNED | HLDT_FLOAT, 10, 1.0, 0.0,
+		"vuser2[2]");
+	HLDeltaAdd(d, HLCD_VUSER3 + 0, HLDT_SIGNED | HLDT_FLOAT, 10, 1.0, 0.0,
+		"vuser3[0]");
+	HLDeltaAdd(d, HLCD_VUSER3 + 1, HLDT_SIGNED | HLDT_FLOAT, 10, 1.0, 0.0,
+		"vuser3[1]");
+	HLDeltaAdd(d, HLCD_VUSER3 + 2, HLDT_SIGNED | HLDT_FLOAT, 10, 1.0, 0.0,
+		"vuser3[2]");
+	HLDeltaAdd(d, HLCD_VUSER4 + 0, HLDT_SIGNED | HLDT_FLOAT, 10, 1.0, 0.0,
+		"vuser4[0]");
+	HLDeltaAdd(d, HLCD_VUSER4 + 1, HLDT_SIGNED | HLDT_FLOAT, 10, 1.0, 0.0,
+		"vuser4[1]");
+	HLDeltaAdd(d, HLCD_VUSER4 + 2, HLDT_SIGNED | HLDT_FLOAT, 10, 1.0, 0.0,
+		"vuser4[2]");
+	HLDeltaAdd(d, HLCD_FUSER1, HLDT_SIGNED | HLDT_FLOAT, 22, 128.0, 0.0,
+		"fuser1");
+	HLDeltaAdd(d, HLCD_FUSER2, HLDT_SIGNED | HLDT_FLOAT, 10, 128.0, 0.0,
+		"fuser2");
+	HLDeltaAdd(d, HLCD_FUSER3, HLDT_SIGNED | HLDT_FLOAT, 10, 128.0, 0.0,
+		"fuser3");
+	HLDeltaAdd(d, HLCD_FUSER4, HLDT_SIGNED | HLDT_FLOAT, 2, 128.0, 0.0,
+		"fuser4");
+}
+
+U0 HLDeltaInitEntity()
+{//entity_state_t. delta.lst names Entity_Encode in the game DLL as a conditional
+ //encoder: it clears fields the client can derive before the compare runs, so an
+ //unchanged frame costs no bits. the entity code here is native, so there is no
+ //callback to invoke; the encoder explains why some of these fields look
+ //redundant
+	CHLDelta *d = &hl_delta_entity;
+
+	HLDeltaClear(d, "entity_state_t");
+
+	HLDeltaAdd(d, HLES_ANIMTIME, HLDT_TIMEWINDOW_8, 8, 1.0, 0.0, "animtime");
+	HLDeltaAdd(d, HLES_FRAME, HLDT_FLOAT, 10, 4.0, 0.0, "frame");
+	HLDeltaAdd(d, HLES_ORIGIN + 0, HLDT_SIGNED | HLDT_FLOAT, 16, 8.0, 0.0,
+		"origin[0]");
+	HLDeltaAdd(d, HLES_ANGLES + 0, HLDT_ANGLE, 16, 1.0, 0.0, "angles[0]");
+	HLDeltaAdd(d, HLES_ANGLES + 1, HLDT_ANGLE, 16, 1.0, 0.0, "angles[1]");
+	HLDeltaAdd(d, HLES_ORIGIN + 1, HLDT_SIGNED | HLDT_FLOAT, 16, 8.0, 0.0,
+		"origin[1]");
+	HLDeltaAdd(d, HLES_ORIGIN + 2, HLDT_SIGNED | HLDT_FLOAT, 16, 8.0, 0.0,
+		"origin[2]");
+	HLDeltaAdd(d, HLES_SEQUENCE, HLDT_INTEGER, 8, 1.0, 0.0, "sequence");
+	HLDeltaAdd(d, HLES_MODELINDEX, HLDT_INTEGER, 10, 1.0, 0.0, "modelindex");
+	HLDeltaAdd(d, HLES_MOVETYPE, HLDT_INTEGER, 4, 1.0, 0.0, "movetype");
+	HLDeltaAdd(d, HLES_SOLID, HLDT_SHORT, 3, 1.0, 0.0, "solid");
+	HLDeltaAdd(d, HLES_MINS + 0, HLDT_SIGNED | HLDT_FLOAT, 16, 8.0, 0.0,
+		"mins[0]");
+	HLDeltaAdd(d, HLES_MINS + 1, HLDT_SIGNED | HLDT_FLOAT, 16, 8.0, 0.0,
+		"mins[1]");
+	HLDeltaAdd(d, HLES_MINS + 2, HLDT_SIGNED | HLDT_FLOAT, 16, 8.0, 0.0,
+		"mins[2]");
+	HLDeltaAdd(d, HLES_MAXS + 0, HLDT_SIGNED | HLDT_FLOAT, 16, 8.0, 0.0,
+		"maxs[0]");
+	HLDeltaAdd(d, HLES_MAXS + 1, HLDT_SIGNED | HLDT_FLOAT, 16, 8.0, 0.0,
+		"maxs[1]");
+	HLDeltaAdd(d, HLES_MAXS + 2, HLDT_SIGNED | HLDT_FLOAT, 16, 8.0, 0.0,
+		"maxs[2]");
+	HLDeltaAdd(d, HLES_ENDPOS + 0, HLDT_SIGNED | HLDT_FLOAT, 13, 1.0, 0.0,
+		"endpos[0]");
+	HLDeltaAdd(d, HLES_ENDPOS + 1, HLDT_SIGNED | HLDT_FLOAT, 13, 1.0, 0.0,
+		"endpos[1]");
+	HLDeltaAdd(d, HLES_ENDPOS + 2, HLDT_SIGNED | HLDT_FLOAT, 13, 1.0, 0.0,
+		"endpos[2]");
+	HLDeltaAdd(d, HLES_STARTPOS + 0, HLDT_SIGNED | HLDT_FLOAT, 13, 1.0, 0.0,
+		"startpos[0]");
+	HLDeltaAdd(d, HLES_STARTPOS + 1, HLDT_SIGNED | HLDT_FLOAT, 13, 1.0, 0.0,
+		"startpos[1]");
+	HLDeltaAdd(d, HLES_STARTPOS + 2, HLDT_SIGNED | HLDT_FLOAT, 13, 1.0, 0.0,
+		"startpos[2]");
+	HLDeltaAdd(d, HLES_IMPACTTIME, HLDT_TIMEWINDOW_BIG, 13, 100.0, 0.0,
+		"impacttime");
+	HLDeltaAdd(d, HLES_STARTTIME, HLDT_TIMEWINDOW_BIG, 13, 100.0, 0.0,
+		"starttime");
+	HLDeltaAdd(d, HLES_WEAPONMODEL, HLDT_INTEGER, 10, 1.0, 0.0, "weaponmodel");
+	HLDeltaAdd(d, HLES_OWNER, HLDT_INTEGER, 5, 1.0, 0.0, "owner");
+	HLDeltaAdd(d, HLES_EFFECTS, HLDT_INTEGER, 8, 1.0, 0.0, "effects");
+	//2 bits, not 1: EFLAG_FLESH_SOUND was added, and delta.lst must agree with
+	//the game DLL
+	HLDeltaAdd(d, HLES_EFLAGS, HLDT_INTEGER, 2, 1.0, 0.0, "eflags");
+	HLDeltaAdd(d, HLES_ANGLES + 2, HLDT_ANGLE, 16, 1.0, 0.0, "angles[2]");
+	HLDeltaAdd(d, HLES_COLORMAP, HLDT_INTEGER, 16, 1.0, 0.0, "colormap");
+	HLDeltaAdd(d, HLES_FRAMERATE, HLDT_SIGNED | HLDT_FLOAT, 8, 16.0, 0.0,
+		"framerate");
+	HLDeltaAdd(d, HLES_SKIN, HLDT_SHORT | HLDT_SIGNED, 9, 1.0, 0.0, "skin");
+	HLDeltaAdd(d, HLES_CONTROLLER + 0, HLDT_BYTE, 8, 1.0, 0.0, "controller[0]");
+	HLDeltaAdd(d, HLES_CONTROLLER + 1, HLDT_BYTE, 8, 1.0, 0.0, "controller[1]");
+	HLDeltaAdd(d, HLES_CONTROLLER + 2, HLDT_BYTE, 8, 1.0, 0.0, "controller[2]");
+	HLDeltaAdd(d, HLES_CONTROLLER + 3, HLDT_BYTE, 8, 1.0, 0.0, "controller[3]");
+	HLDeltaAdd(d, HLES_BLENDING + 0, HLDT_BYTE, 8, 1.0, 0.0, "blending[0]");
+	HLDeltaAdd(d, HLES_BLENDING + 1, HLDT_BYTE, 8, 1.0, 0.0, "blending[1]");
+	HLDeltaAdd(d, HLES_BODY, HLDT_INTEGER, 8, 1.0, 0.0, "body");
+	HLDeltaAdd(d, HLES_RENDERMODE, HLDT_INTEGER, 8, 1.0, 0.0, "rendermode");
+	HLDeltaAdd(d, HLES_RENDERAMT, HLDT_INTEGER, 8, 1.0, 0.0, "renderamt");
+	HLDeltaAdd(d, HLES_RENDERFX, HLDT_INTEGER, 8, 1.0, 0.0, "renderfx");
+	HLDeltaAdd(d, HLES_SCALE, HLDT_FLOAT, 16, 256.0, 0.0, "scale");
+	HLDeltaAdd(d, HLES_RENDERCOLOR + 0, HLDT_BYTE, 8, 1.0, 0.0, "rendercolor.r");
+	HLDeltaAdd(d, HLES_RENDERCOLOR + 1, HLDT_BYTE, 8, 1.0, 0.0, "rendercolor.g");
+	HLDeltaAdd(d, HLES_RENDERCOLOR + 2, HLDT_BYTE, 8, 1.0, 0.0, "rendercolor.b");
+	HLDeltaAdd(d, HLES_AIMENT, HLDT_INTEGER, 11, 1.0, 0.0, "aiment");
+	HLDeltaAdd(d, HLES_BASEVELOCITY + 0, HLDT_SIGNED | HLDT_FLOAT, 16, 8.0, 0.0,
+		"basevelocity[0]");
+	HLDeltaAdd(d, HLES_BASEVELOCITY + 1, HLDT_SIGNED | HLDT_FLOAT, 16, 8.0, 0.0,
+		"basevelocity[1]");
+	HLDeltaAdd(d, HLES_BASEVELOCITY + 2, HLDT_SIGNED | HLDT_FLOAT, 16, 8.0, 0.0,
+		"basevelocity[2]");
+	HLDeltaAdd(d, HLES_PLAYERCLASS, HLDT_INTEGER, 1, 1.0, 0.0, "playerclass");
+}
+
+U0 HLDeltaInitPlayer()
+{//entity_state_player_t - a separate table for the same C struct, used for any
+ //entity that is a player. neither a superset nor a subset of entity_state_t:
+ //origin is 18 bits at 32 units here against 16 at 8, and endpos/startpos/
+ //impacttime (beam fields) are replaced by usehull/friction/gravity/spectator
+	CHLDelta *d = &hl_delta_player;
+
+	HLDeltaClear(d, "entity_state_player_t");
+
+	HLDeltaAdd(d, HLES_ANIMTIME, HLDT_TIMEWINDOW_8, 8, 1.0, 0.0, "animtime");
+	HLDeltaAdd(d, HLES_FRAME, HLDT_FLOAT, 8, 1.0, 0.0, "frame");
+	HLDeltaAdd(d, HLES_ORIGIN + 0, HLDT_SIGNED | HLDT_FLOAT, 18, 32.0, 0.0,
+		"origin[0]");
+	HLDeltaAdd(d, HLES_ANGLES + 0, HLDT_ANGLE, 16, 1.0, 0.0, "angles[0]");
+	HLDeltaAdd(d, HLES_ANGLES + 1, HLDT_ANGLE, 16, 1.0, 0.0, "angles[1]");
+	HLDeltaAdd(d, HLES_ORIGIN + 1, HLDT_SIGNED | HLDT_FLOAT, 18, 32.0, 0.0,
+		"origin[1]");
+	HLDeltaAdd(d, HLES_ORIGIN + 2, HLDT_SIGNED | HLDT_FLOAT, 18, 32.0, 0.0,
+		"origin[2]");
+	HLDeltaAdd(d, HLES_GAITSEQUENCE, HLDT_INTEGER, 8, 1.0, 0.0, "gaitsequence");
+	HLDeltaAdd(d, HLES_SEQUENCE, HLDT_INTEGER, 8, 1.0, 0.0, "sequence");
+	HLDeltaAdd(d, HLES_MODELINDEX, HLDT_INTEGER, 10, 1.0, 0.0, "modelindex");
+	HLDeltaAdd(d, HLES_MOVETYPE, HLDT_INTEGER, 4, 1.0, 0.0, "movetype");
+	HLDeltaAdd(d, HLES_SOLID, HLDT_SHORT, 3, 1.0, 0.0, "solid");
+	HLDeltaAdd(d, HLES_MINS + 0, HLDT_SIGNED | HLDT_FLOAT, 16, 8.0, 0.0,
+		"mins[0]");
+	HLDeltaAdd(d, HLES_MINS + 1, HLDT_SIGNED | HLDT_FLOAT, 16, 8.0, 0.0,
+		"mins[1]");
+	HLDeltaAdd(d, HLES_MINS + 2, HLDT_SIGNED | HLDT_FLOAT, 16, 8.0, 0.0,
+		"mins[2]");
+	HLDeltaAdd(d, HLES_MAXS + 0, HLDT_SIGNED | HLDT_FLOAT, 16, 8.0, 0.0,
+		"maxs[0]");
+	HLDeltaAdd(d, HLES_MAXS + 1, HLDT_SIGNED | HLDT_FLOAT, 16, 8.0, 0.0,
+		"maxs[1]");
+	HLDeltaAdd(d, HLES_MAXS + 2, HLDT_SIGNED | HLDT_FLOAT, 16, 8.0, 0.0,
+		"maxs[2]");
+	HLDeltaAdd(d, HLES_WEAPONMODEL, HLDT_INTEGER, 10, 1.0, 0.0, "weaponmodel");
+	HLDeltaAdd(d, HLES_TEAM, HLDT_INTEGER, 4, 1.0, 0.0, "team");
+	HLDeltaAdd(d, HLES_PLAYERCLASS, HLDT_INTEGER, 4, 1.0, 0.0, "playerclass");
+	HLDeltaAdd(d, HLES_OWNER, HLDT_INTEGER, 5, 1.0, 0.0, "owner");
+	HLDeltaAdd(d, HLES_EFFECTS, HLDT_INTEGER, 8, 1.0, 0.0, "effects");
+	HLDeltaAdd(d, HLES_ANGLES + 2, HLDT_ANGLE, 16, 1.0, 0.0, "angles[2]");
+	HLDeltaAdd(d, HLES_COLORMAP, HLDT_INTEGER, 16, 1.0, 0.0, "colormap");
+	HLDeltaAdd(d, HLES_FRAMERATE, HLDT_SIGNED | HLDT_FLOAT, 8, 16.0, 0.0,
+		"framerate");
+	HLDeltaAdd(d, HLES_SKIN, HLDT_SHORT | HLDT_SIGNED, 9, 1.0, 0.0, "skin");
+	HLDeltaAdd(d, HLES_CONTROLLER + 0, HLDT_BYTE, 8, 1.0, 0.0, "controller[0]");
+	HLDeltaAdd(d, HLES_CONTROLLER + 1, HLDT_BYTE, 8, 1.0, 0.0, "controller[1]");
+	HLDeltaAdd(d, HLES_CONTROLLER + 2, HLDT_BYTE, 8, 1.0, 0.0, "controller[2]");
+	HLDeltaAdd(d, HLES_CONTROLLER + 3, HLDT_BYTE, 8, 1.0, 0.0, "controller[3]");
+	HLDeltaAdd(d, HLES_BLENDING + 0, HLDT_BYTE, 8, 1.0, 0.0, "blending[0]");
+	HLDeltaAdd(d, HLES_BLENDING + 1, HLDT_BYTE, 8, 1.0, 0.0, "blending[1]");
+	HLDeltaAdd(d, HLES_BODY, HLDT_INTEGER, 8, 1.0, 0.0, "body");
+	HLDeltaAdd(d, HLES_RENDERMODE, HLDT_INTEGER, 8, 1.0, 0.0, "rendermode");
+	HLDeltaAdd(d, HLES_RENDERAMT, HLDT_INTEGER, 8, 1.0, 0.0, "renderamt");
+	HLDeltaAdd(d, HLES_RENDERFX, HLDT_INTEGER, 8, 1.0, 0.0, "renderfx");
+	HLDeltaAdd(d, HLES_SCALE, HLDT_FLOAT, 16, 256.0, 0.0, "scale");
+	HLDeltaAdd(d, HLES_RENDERCOLOR + 0, HLDT_BYTE, 8, 1.0, 0.0, "rendercolor.r");
+	HLDeltaAdd(d, HLES_RENDERCOLOR + 1, HLDT_BYTE, 8, 1.0, 0.0, "rendercolor.g");
+	HLDeltaAdd(d, HLES_RENDERCOLOR + 2, HLDT_BYTE, 8, 1.0, 0.0, "rendercolor.b");
+	HLDeltaAdd(d, HLES_FRICTION, HLDT_SIGNED | HLDT_FLOAT, 16, 8.0, 0.0,
+		"friction");
+	HLDeltaAdd(d, HLES_USEHULL, HLDT_INTEGER, 1, 1.0, 0.0, "usehull");
+	HLDeltaAdd(d, HLES_GRAVITY, HLDT_SIGNED | HLDT_FLOAT, 16, 32.0, 0.0,
+		"gravity");
+	HLDeltaAdd(d, HLES_AIMENT, HLDT_INTEGER, 11, 1.0, 0.0, "aiment");
+	HLDeltaAdd(d, HLES_BASEVELOCITY + 0, HLDT_SIGNED | HLDT_FLOAT, 16, 8.0, 0.0,
+		"basevelocity[0]");
+	HLDeltaAdd(d, HLES_BASEVELOCITY + 1, HLDT_SIGNED | HLDT_FLOAT, 16, 8.0, 0.0,
+		"basevelocity[1]");
+	HLDeltaAdd(d, HLES_BASEVELOCITY + 2, HLDT_SIGNED | HLDT_FLOAT, 16, 8.0, 0.0,
+		"basevelocity[2]");
+	HLDeltaAdd(d, HLES_SPECTATOR, HLDT_INTEGER, 1, 1.0, 0.0, "spectator");
+}
+
+U0 HLDeltaInitCustom()
+{//custom_entity_state_t - beams and tempents the client owns. the two
+ //DEFINE_DELTA_POST entries are the only postmultiply in the file: the wire
+ //carries an 8-bit integer and the reader multiplies by 0.1 after decoding, so
+ //scale spans 0..25.5 in eight bits
+	CHLDelta *d = &hl_delta_custom;
+
+	HLDeltaClear(d, "custom_entity_state_t");
+
+	HLDeltaAdd(d, HLES_RENDERMODE, HLDT_INTEGER, 8, 1.0, 0.0, "rendermode");
+	HLDeltaAdd(d, HLES_ORIGIN + 0, HLDT_SIGNED | HLDT_FLOAT, 17, 8.0, 0.0,
+		"origin[0]");
+	HLDeltaAdd(d, HLES_ORIGIN + 1, HLDT_SIGNED | HLDT_FLOAT, 17, 8.0, 0.0,
+		"origin[1]");
+	HLDeltaAdd(d, HLES_ORIGIN + 2, HLDT_SIGNED | HLDT_FLOAT, 17, 8.0, 0.0,
+		"origin[2]");
+	//DT_FLOAT, not DT_ANGLE: a beam endpoint angle is a direction, and wrapping
+	//it into a turn loses the magnitude
+	HLDeltaAdd(d, HLES_ANGLES + 0, HLDT_SIGNED | HLDT_FLOAT, 17, 8.0, 0.0,
+		"angles[0]");
+	HLDeltaAdd(d, HLES_ANGLES + 1, HLDT_SIGNED | HLDT_FLOAT, 17, 8.0, 0.0,
+		"angles[1]");
+	HLDeltaAdd(d, HLES_ANGLES + 2, HLDT_SIGNED | HLDT_FLOAT, 17, 8.0, 0.0,
+		"angles[2]");
+	HLDeltaAdd(d, HLES_SEQUENCE, HLDT_INTEGER, 16, 1.0, 0.0, "sequence");
+	HLDeltaAdd(d, HLES_SKIN, HLDT_INTEGER, 16, 1.0, 0.0, "skin");
+	HLDeltaAdd(d, HLES_MODELINDEX, HLDT_INTEGER, 16, 1.0, 0.0, "modelindex");
+	HLDeltaAdd(d, HLES_SCALE, HLDT_FLOAT, 8, 1.0, 0.1, "scale");
+	HLDeltaAdd(d, HLES_BODY, HLDT_INTEGER, 8, 1.0, 0.0, "body");
+	HLDeltaAdd(d, HLES_RENDERCOLOR + 0, HLDT_BYTE, 8, 1.0, 0.0, "rendercolor.r");
+	HLDeltaAdd(d, HLES_RENDERCOLOR + 1, HLDT_BYTE, 8, 1.0, 0.0, "rendercolor.g");
+	HLDeltaAdd(d, HLES_RENDERCOLOR + 2, HLDT_BYTE, 8, 1.0, 0.0, "rendercolor.b");
+	HLDeltaAdd(d, HLES_RENDERFX, HLDT_INTEGER, 8, 1.0, 0.0, "renderfx");
+	HLDeltaAdd(d, HLES_RENDERAMT, HLDT_INTEGER, 8, 1.0, 0.0, "renderamt");
+	HLDeltaAdd(d, HLES_FRAME, HLDT_FLOAT, 8, 1.0, 0.0, "frame");
+	HLDeltaAdd(d, HLES_ANIMTIME, HLDT_FLOAT, 8, 1.0, 0.1, "animtime");
+}
+
+U0 HLDeltaInitWeapon()
+{//weapon_data_t - one per weapon slot, carried inside svc_clientdata so the
+ //client can predict its own firing
+	CHLDelta *d = &hl_delta_weapon;
+
+	HLDeltaClear(d, "weapon_data_t");
+
+	HLDeltaAdd(d, HLWD_TIMEWEAPONIDLE, HLDT_FLOAT | HLDT_SIGNED, 22, 1000.0,
+		0.0, "m_flTimeWeaponIdle");
+	HLDeltaAdd(d, HLWD_NEXTPRIMARY, HLDT_FLOAT | HLDT_SIGNED, 22, 1000.0, 0.0,
+		"m_flNextPrimaryAttack");
+	HLDeltaAdd(d, HLWD_NEXTRELOAD, HLDT_FLOAT | HLDT_SIGNED, 22, 1000.0, 0.0,
+		"m_flNextReload");
+	HLDeltaAdd(d, HLWD_NEXTAIMBONUS, HLDT_FLOAT | HLDT_SIGNED, 22, 1000.0, 0.0,
+		"m_fNextAimBonus");
+	HLDeltaAdd(d, HLWD_NEXTSECONDARY, HLDT_FLOAT | HLDT_SIGNED, 22, 1000.0, 0.0,
+		"m_flNextSecondAttack");
+	HLDeltaAdd(d, HLWD_CLIP, HLDT_SIGNED | HLDT_INTEGER, 10, 1.0, 0.0,
+		"m_iClip");
+	HLDeltaAdd(d, HLWD_PUMPTIME, HLDT_FLOAT | HLDT_SIGNED, 22, 1000.0, 0.0,
+		"m_flPumpTime");
+	HLDeltaAdd(d, HLWD_SPECIALRELOAD, HLDT_INTEGER, 2, 1.0, 0.0,
+		"m_fInSpecialReload");
+	HLDeltaAdd(d, HLWD_RELOADTIME, HLDT_FLOAT, 16, 100.0, 0.0, "m_fReloadTime");
+	HLDeltaAdd(d, HLWD_INRELOAD, HLDT_INTEGER, 1, 1.0, 0.0, "m_fInReload");
+	HLDeltaAdd(d, HLWD_AIMEDDAMAGE, HLDT_FLOAT, 6, 0.1, 0.0, "m_fAimedDamage");
+	HLDeltaAdd(d, HLWD_INZOOM, HLDT_INTEGER, 1, 1.0, 0.0, "m_fInZoom");
+	HLDeltaAdd(d, HLWD_WEAPONSTATE, HLDT_INTEGER, 2, 1.0, 0.0,
+		"m_iWeaponState");
+	HLDeltaAdd(d, HLWD_ID, HLDT_INTEGER, 5, 1.0, 0.0, "m_iId");
+	HLDeltaAdd(d, HLWD_IUSER1, HLDT_SIGNED | HLDT_INTEGER, 10, 1.0, 0.0,
+		"iuser1");
+	HLDeltaAdd(d, HLWD_IUSER2, HLDT_SIGNED | HLDT_INTEGER, 10, 1.0, 0.0,
+		"iuser2");
+	HLDeltaAdd(d, HLWD_IUSER3, HLDT_SIGNED | HLDT_INTEGER, 10, 1.0, 0.0,
+		"iuser3");
+	HLDeltaAdd(d, HLWD_FUSER1, HLDT_SIGNED | HLDT_FLOAT, 22, 1000.0, 0.0,
+		"fuser1");
+	HLDeltaAdd(d, HLWD_FUSER2, HLDT_SIGNED | HLDT_FLOAT, 22, 128.0, 0.0,
+		"fuser2");
+	HLDeltaAdd(d, HLWD_FUSER3, HLDT_SIGNED | HLDT_FLOAT, 22, 128.0, 0.0,
+		"fuser3");
+}
+
+U0 HLDeltaInitUserCmd()
+{//usercmd_t - the upstream half. protocol 15's clc_move was a fixed 16-byte
+ //record; 48 delta-encodes the command against the previous one and sends several
+ //backups per packet, which makes lost input recoverable
+	CHLDelta *d = &hl_delta_usercmd;
+
+	HLDeltaClear(d, "usercmd_t");
+
+	HLDeltaAdd(d, HLUC_LERP_MSEC, HLDT_SHORT, 9, 1.0, 0.0, "lerp_msec");
+	HLDeltaAdd(d, HLUC_MSEC, HLDT_BYTE, 8, 1.0, 0.0, "msec");
+	HLDeltaAdd(d, HLUC_VIEWANGLES + 1, HLDT_ANGLE, 16, 1.0, 0.0,
+		"viewangles[1]");
+	HLDeltaAdd(d, HLUC_VIEWANGLES + 0, HLDT_ANGLE, 16, 1.0, 0.0,
+		"viewangles[0]");
+	HLDeltaAdd(d, HLUC_BUTTONS, HLDT_SHORT, 16, 1.0, 0.0, "buttons");
+	HLDeltaAdd(d, HLUC_FORWARDMOVE, HLDT_SIGNED | HLDT_FLOAT, 12, 1.0, 0.0,
+		"forwardmove");
+	HLDeltaAdd(d, HLUC_LIGHTLEVEL, HLDT_BYTE, 8, 1.0, 0.0, "lightlevel");
+	HLDeltaAdd(d, HLUC_SIDEMOVE, HLDT_SIGNED | HLDT_FLOAT, 12, 1.0, 0.0,
+		"sidemove");
+	HLDeltaAdd(d, HLUC_UPMOVE, HLDT_SIGNED | HLDT_FLOAT, 12, 1.0, 0.0,
+		"upmove");
+	HLDeltaAdd(d, HLUC_IMPULSE, HLDT_BYTE, 8, 1.0, 0.0, "impulse");
+	HLDeltaAdd(d, HLUC_VIEWANGLES + 2, HLDT_ANGLE, 16, 1.0, 0.0,
+		"viewangles[2]");
+	HLDeltaAdd(d, HLUC_IMPACT_INDEX, HLDT_INTEGER, 6, 1.0, 0.0, "impact_index");
+	HLDeltaAdd(d, HLUC_IMPACT_POS + 0, HLDT_SIGNED | HLDT_FLOAT, 16, 8.0, 0.0,
+		"impact_position[0]");
+	HLDeltaAdd(d, HLUC_IMPACT_POS + 1, HLDT_SIGNED | HLDT_FLOAT, 16, 8.0, 0.0,
+		"impact_position[1]");
+	HLDeltaAdd(d, HLUC_IMPACT_POS + 2, HLDT_SIGNED | HLDT_FLOAT, 16, 8.0, 0.0,
+		"impact_position[2]");
+}
+
+U0 HLDeltaInitEvent()
+{//event_t - svc_event / svc_event_reliable. the game DLL fires an event index and
+ //the client DLL plays it, putting a muzzle flash on the frame of the shot rather
+ //than a packet later
+	CHLDelta *d = &hl_delta_event;
+
+	HLDeltaClear(d, "event_t");
+
+	HLDeltaAdd(d, HLEV_ENTINDEX, HLDT_INTEGER, 10, 1.0, 0.0, "entindex");
+	HLDeltaAdd(d, HLEV_BPARAM1, HLDT_INTEGER, 1, 1.0, 0.0, "bparam1");
+	HLDeltaAdd(d, HLEV_BPARAM2, HLDT_INTEGER, 1, 1.0, 0.0, "bparam2");
+	HLDeltaAdd(d, HLEV_ORIGIN + 0, HLDT_SIGNED | HLDT_FLOAT, 16, 8.0, 0.0,
+		"origin[0]");
+	HLDeltaAdd(d, HLEV_ORIGIN + 1, HLDT_SIGNED | HLDT_FLOAT, 16, 8.0, 0.0,
+		"origin[1]");
+	HLDeltaAdd(d, HLEV_ORIGIN + 2, HLDT_SIGNED | HLDT_FLOAT, 16, 8.0, 0.0,
+		"origin[2]");
+	HLDeltaAdd(d, HLEV_FPARAM1, HLDT_FLOAT | HLDT_SIGNED, 20, 100.0, 0.0,
+		"fparam1");
+	HLDeltaAdd(d, HLEV_FPARAM2, HLDT_FLOAT | HLDT_SIGNED, 20, 100.0, 0.0,
+		"fparam2");
+	HLDeltaAdd(d, HLEV_IPARAM1, HLDT_INTEGER | HLDT_SIGNED, 16, 1.0, 0.0,
+		"iparam1");
+	HLDeltaAdd(d, HLEV_IPARAM2, HLDT_INTEGER | HLDT_SIGNED, 16, 1.0, 0.0,
+		"iparam2");
+	HLDeltaAdd(d, HLEV_ANGLES + 0, HLDT_SIGNED | HLDT_FLOAT, 16, 8.0, 0.0,
+		"angles[0]");
+	HLDeltaAdd(d, HLEV_ANGLES + 1, HLDT_SIGNED | HLDT_FLOAT, 16, 8.0, 0.0,
+		"angles[1]");
+	HLDeltaAdd(d, HLEV_ANGLES + 2, HLDT_SIGNED | HLDT_FLOAT, 16, 8.0, 0.0,
+		"angles[2]");
+	HLDeltaAdd(d, HLEV_DUCKING, HLDT_INTEGER, 1, 1.0, 0.0, "ducking");
+}
+
+U0 HLDeltaInit()
+{//globals aren't zeroed, and these tables are indexed by field number, so a
+ //garbage count walks off the array
+	HLDeltaInitClientData();
+	HLDeltaInitEntity();
+	HLDeltaInitPlayer();
+	HLDeltaInitCustom();
+	HLDeltaInitWeapon();
+	HLDeltaInitUserCmd();
+	HLDeltaInitEvent();
+}
+
+//runs at build time, as HLAIInit / HLWeaponInit do. the tables are constant and
+//nothing may read them before this line
+HLDeltaInit;
+
+//--- the codec --------------------------------------------------------------
+
+I64 HLDeltaScaled(F64 v, F64 scale)
+{//DELTA_WriteField's cast. (int) in C truncates toward zero and so does ToI64:
+ //-1.9 * 1.0 goes out as -1, not -2. rounding instead returns an unchanged value
+ //one quantum off every frame
+	return ToI64(v * scale);
+}
+
+Bool HLDeltaFieldDiffers(CHLDeltaField *f, F64 *from, F64 *to, U8 *from_str,
+	U8 *to_str)
+{//DELTA_MarkSendFields compares the raw struct field, not the quantised wire
+ //value, so a change smaller than the field's resolution still costs its bits.
+ //stock behaviour, and required: comparing after quantising saves bandwidth but
+ //drifts the baseline away from a real client's, and baselines are shared state
+	if ((f->type & HLDT_TYPEMASK) == HLDT_STRING)
+	{
+		if (!from_str || !to_str)
+			return FALSE;
+
+		//StrCompare returns 0 when equal
+		return ToBool(StrCompare(from_str, to_str) != 0);
+	}
+
+	return ToBool(from[f->slot] != to[f->slot]);
+}
+
+U0 HLDeltaWriteField(CHLMsg *m, CHLDeltaField *f, F64 v, U8 *str, F64 timebase)
+{//one field, at its declared width. the bit stream must already be open
+	I64 base = f->type & HLDT_TYPEMASK;
+	I64 iv;
+
+	if (base == HLDT_STRING)
+	{
+		HLBitWriteBitString(m, str);
+		return;
+	}
+
+	if (base == HLDT_ANGLE)
+	{
+		HLBitWriteBitAngle(m, v, f->bits);
+		return;
+	}
+
+	//DT_TIMEWINDOW_*: the wire carries the field as an offset back from the server
+	//clock, not an absolute time. animtime and starttime are absolute seconds
+	//since level start and grow without bound, so no fixed width holds them; an
+	//offset of a fraction of a second fits in eight bits indefinitely.
+	//
+	//scale unverified. delta.lst declares DT_TIMEWINDOW_8 with multiplier 1.0,
+	//but 8 bits cannot hold a second at 1.0, so the engine applies a fixed factor
+	//of its own. 100 here (hundredths, matching the 100.0 on the TIMEWINDOW_BIG
+	//entries).
+	if (base == HLDT_TIMEWINDOW_8)
+	{
+		HLBitWriteSBits(m, ToI64((timebase - v) * 100.0), f->bits);
+		return;
+	}
+
+	if (base == HLDT_TIMEWINDOW_BIG)
+	{
+		HLBitWriteSBits(m, ToI64((timebase - v) * f->scale), f->bits);
+		return;
+	}
+
+	//BYTE / SHORT / INTEGER / FLOAT all encode as a scaled integer at the declared
+	//width. the declared type documents the game DLL's struct member; it does not
+	//change the encoding
+	iv = HLDeltaScaled(v, f->scale);
+
+	if (f->type & HLDT_SIGNED)
+		HLBitWriteSBits(m, iv, f->bits);
+	else
+		HLBitWriteBits(m, iv, f->bits);
+}
+
+F64 HLDeltaReadField(CHLMsg *m, CHLDeltaField *f, U8 *str, I64 str_max,
+	F64 timebase)
+{//inverse of HLDeltaWriteField. DT_STRING lands in str, and the return value is
+ //undefined for it
+	I64	base = f->type & HLDT_TYPEMASK;
+	I64	iv;
+	F64	v;
+
+	if (base == HLDT_STRING)
+	{
+		HLBitReadBitString(m, str, str_max);
+		return 0.0;
+	}
+
+	if (base == HLDT_ANGLE)
+		return HLBitReadBitAngle(m, f->bits);
+
+	if (base == HLDT_TIMEWINDOW_8)
+		return timebase - ToF64(HLBitReadSBits(m, f->bits)) / 100.0;
+
+	if (base == HLDT_TIMEWINDOW_BIG)
+		return timebase - ToF64(HLBitReadSBits(m, f->bits)) / f->scale;
+
+	if (f->type & HLDT_SIGNED)
+		iv = HLBitReadSBits(m, f->bits);
+	else
+		iv = HLBitReadBits(m, f->bits);
+
+	v = ToF64(iv) / f->scale;
+
+	//DEFINE_DELTA_POST, applied on decode only: the writer does not divide it back
+	//out, so the pair is asymmetric unless the game keeps the field pre-multiplied.
+	//only custom_entity_state_t scale and animtime declare it.
+	if (f->post != 0.0)
+		v = v * f->post;
+
+	return v;
+}
+
+//mask bytes the widest table can need. the 3-bit count carries 0..7 and the
+//largest table (entity_state_t, 53 fields) needs 7: no headroom, so a 57th field
+//in any structure cannot be expressed
+#define HLDELTA_MAX_MASK	8
+
+Bool HLDeltaAnyChange(CHLDelta *d, F64 *from, F64 *to, U8 *from_str, U8 *to_str)
+{//whether HLDeltaWrite would set any mask bit. an entity with an empty delta is
+ //left out of a packet entities frame entirely rather than costing a header
+	I64 i;
+
+	if (!d)
+		return FALSE;
+
+	for (i = 0; i < d->count && i < HLDELTA_MAX_MASK * 8; i++)
+	{
+		if (HLDeltaFieldDiffers(&d->f[i], from, to, from_str, to_str))
+			return TRUE;
+	}
+
+	return FALSE;
+}
+
+U0 HLDeltaWrite(CHLMsg *m, CHLDelta *d, F64 *from, F64 *to, U8 *from_str,
+	U8 *to_str, F64 timebase)
+{//DELTA_WriteDelta. the change mask is variable length: 3 bits say how many mask
+ //bytes follow, then that many bytes of one-bit-per-field, then the changed
+ //fields in table order.
+ //
+ //a field's index in the table is its bit in the mask - bit 0 of mask byte 0 is
+ //field 0. trailing fields that never change cost nothing, not even a mask bit,
+ //so delta.lst puts the hot fields (origin, angles) first and the vuser/fuser
+ //scratch last.
+ //
+ //the bit stream must already be open (HLBitWriteStart): several messages pack a
+ //header, a delta, and then more bits after it.
+	U8	mask[HLDELTA_MAX_MASK];
+	I64	i;
+	I64	last;
+	I64	bytecount;
+
+	if (!m || !d)
+		return;
+
+	MemSet(mask, 0, HLDELTA_MAX_MASK);
+	last = -1;
+
+	for (i = 0; i < d->count && i < HLDELTA_MAX_MASK * 8; i++)
+	{
+		if (!HLDeltaFieldDiffers(&d->f[i], from, to, from_str, to_str))
+			goto qdw_next;
+
+		mask[i >> 3] = mask[i >> 3] | (1 << (i & 7));
+		last = i;
+
+qdw_next:
+	}
+
+	if (last < 0)
+		bytecount = 0;
+	else
+		bytecount = (last >> 3) + 1;
+
+	//the count is 3 bits, so a table whose last changed field sits past bit 55
+	//cannot be described. log rather than truncate the mask and leave the reader
+	//interpreting field payloads as mask bytes
+	if (bytecount > 7)
+	{
+		HLLog("net: delta mask over 7 bytes - table too wide for protocol 48\n");
+		HLLogFlush;
+		bytecount = 7;
+	}
+
+	HLBitWriteBits(m, bytecount, 3);
+
+	for (i = 0; i < bytecount; i++)
+		HLBitWriteBits(m, mask[i], 8);
+
+	for (i = 0; i < d->count && i < bytecount * 8; i++)
+	{
+		if (!(mask[i >> 3] & (1 << (i & 7))))
+			goto qdw_next2;
+
+		HLDeltaWriteField(m, &d->f[i], to[d->f[i].slot], to_str, timebase);
+
+qdw_next2:
+	}
+}
+
+Bool HLDeltaRead(CHLMsg *m, CHLDelta *d, F64 *to, U8 *to_str, I64 str_max,
+	F64 timebase)
+{//DELTA_ParseDelta.
+ //
+ //the caller must have copied the 'from' state into to[] first. a delta is not a
+ //snapshot: a field absent from the mask is unchanged, not zero. protocol 15's
+ //svc_clientdata was a full snapshot every frame, where an absent field did mean
+ //zero.
+	U8	mask[HLDELTA_MAX_MASK];
+	I64	i;
+	I64	bytecount;
+	I64	slot;
+
+	if (!m || !d)
+		return FALSE;
+
+	MemSet(mask, 0, HLDELTA_MAX_MASK);
+
+	bytecount = HLBitReadBits(m, 3);
+
+	for (i = 0; i < bytecount; i++)
+		mask[i] = HLBitReadBits(m, 8);
+
+	if (m->badread)
+		return FALSE;
+
+	for (i = 0; i < bytecount * 8; i++)
+	{
+		if (!(mask[i >> 3] & (1 << (i & 7))))
+			goto qdr_next;
+
+		//a bit set past the end of this table means the sender's delta.lst differs.
+		//the field's width is unknowable, so every bit after it is garbage: abort
+		//rather than desync. a real client calls this a protocol error
+		if (i >= d->count)
+		{
+			HLLog("net: delta field past end of table - delta.lst mismatch\n");
+			HLLogFlush;
+			return FALSE;
+		}
+
+		slot = d->f[i].slot;
+		//x[i] = Call() with a computed index loses the store: keep it split
+		to[slot] = HLDeltaReadField(m, &d->f[i], to_str, str_max, timebase);
+
+qdr_next:
+	}
+
+	return ToBool(!m->badread);
+}
+
+//--- protocol 48 state containers -------------------------------------------
+//
+// CHLEntState above is protocol 15's shape: HLTest round-trips through it and the
+// loopback/demo path still speaks 15. this is the 48 side; the two share nothing.
+
+class CHLEntState48
+{
+	F64	 v[HLDELTA_MAX_SLOTS];	//indexed by HLES_*
+	Bool player;		//which table describes it: entity_state_player_t if set
+	Bool custom;		//custom_entity_state_t instead: beams, entityType ENTITY_BEAM
+	Bool active;		//the server has described it at least once
+	F64	 msgtime;		//server time of the frame that last carried it
+};
+
+class CHLClData48
+{
+	F64	 v[HLDELTA_MAX_SLOTS];	//indexed by HLCD_*
+	U8	 physinfo[256];			//the one DT_STRING field
+};
+
+U0 HLState48Clear(CHLEntState48 *e)
+{//a baseline for an undescribed entity is all zero: an entity's first delta is
+ //measured against zero, so both ends must agree on what "not yet seen" contains
+	I64 i;
+
+	if (!e)
+		return;
+
+	for (i = 0; i < HLDELTA_MAX_SLOTS; i++)
+		e->v[i] = 0.0;
+
+	e->player  = FALSE;
+	e->custom  = FALSE;
+	e->active  = FALSE;
+	e->msgtime = 0.0;
+}
+
+U0 HLClData48Clear(CHLClData48 *c)
+{
+	I64 i;
+
+	if (!c)
+		return;
+
+	for (i = 0; i < HLDELTA_MAX_SLOTS; i++)
+		c->v[i] = 0.0;
+
+	c->physinfo[0] = 0;
+}
+
+//svc_packetentities deltas against the last acknowledged frame, not a fixed
+//baseline, so it needs a history of frames rather than one table. hl_net_bl48 is
+//the signon baseline (svc_spawnbaseline), hl_net_cl48 the client's current
+//reconstruction.
+CHLEntState48	hl_net_bl48[HLNET_MAX_ENTS];
+CHLEntState48	hl_net_cl48[HLNET_MAX_ENTS];
+CHLClData48		hl_cl_data48;
+CHLClData48		hl_cl_data48_prev;
+
+U0 HLNetStates48Clear()
+{//globals aren't zeroed
+	I64 i;
+
+	for (i = 0; i < HLNET_MAX_ENTS; i++)
+	{
+		HLState48Clear(&hl_net_bl48[i]);
+		HLState48Clear(&hl_net_cl48[i]);
+	}
+
+	HLClData48Clear(&hl_cl_data48);
+	HLClData48Clear(&hl_cl_data48_prev);
+}
+
+HLNetStates48Clear;
+
+CHLDelta *HLDeltaForEnt(CHLEntState48 *e)
+{//an entity is described by entity_state_player_t, custom_entity_state_t or
+ //entity_state_t. the custom bit travels in the entity header; nothing in the
+ //message distinguishes the other two, so the client decides from the entity
+ //number (1..maxclients are players). wrong choice decodes every field after
+ //origin at the wrong width
+	if (!e)
+		return &hl_delta_entity;
+
+	if (e->custom)
+		return &hl_delta_custom;
+
+	if (e->player)
+		return &hl_delta_player;
+
+	return &hl_delta_entity;
+}
+
+Bool HLDeltaWriteEntState(CHLMsg *m, CHLEntState48 *from, CHLEntState48 *to,
+	F64 timebase)
+{//one entity's fields. the entity header (number, and the removed/same-as-last
+ //bits) is not written here - see HLNetWritePacketEntities
+	if (!m || !from || !to)
+		return FALSE;
+
+	HLDeltaWrite(m, HLDeltaForEnt(to), from->v, to->v, NULL, NULL, timebase);
+
+	return ToBool(!m->overflowed);
+}
+
+Bool HLDeltaReadEntState(CHLMsg *m, CHLEntState48 *from, CHLEntState48 *to,
+	F64 timebase)
+{//from and to may be the same object. the copy below is what makes an absent field
+ //mean unchanged
+	I64 i;
+
+	if (!m || !from || !to)
+		return FALSE;
+
+	if (from != to)
+	{
+		for (i = 0; i < HLDELTA_MAX_SLOTS; i++)
+			to->v[i] = from->v[i];
+
+		to->player = from->player;
+		to->custom = from->custom;
+	}
+
+	return HLDeltaRead(m, HLDeltaForEnt(to), to->v, NULL, 0, timebase);
+}
+
+//============================================================================
+// Protocol 48: the entity stream
+//============================================================================
+//
+// svc_packetentities, svc_deltapacketentities and svc_spawnbaseline share one
+// per-entity framing.
+//
+// INFERRED, all of it. The engine is not in the SDK checkout: there is no
+// netchan, no delta compression and no packet entities writer to read. The field
+// payload comes from valve/delta.lst and the field set from
+// common/entity_state.h; the framing below is derived from the Quake and Quake 2
+// lineage and is proved only against this file's own reader. No GoldSrc peer has
+// seen it.
+//
+// Frame header, byte aligned, before the bit stream opens:
+//
+//   svc_packetentities        byte 40, word entity count
+//   svc_deltapacketentities   byte 41, word entity count, byte delta sequence
+//   svc_spawnbaseline         byte 22
+//
+// The delta sequence names the frame this one is measured against - the last
+// frame the client acknowledged. The word count is advisory: the reader takes
+// the entity list from the stream and only compares.
+//
+// Entity header, in the bit stream, one per entity, entity numbers strictly
+// ascending:
+//
+//   1 bit    number form
+//              1 -> 6 bits offset, number = previous number + offset
+//              0 -> 11 bits absolute number, 0..2047
+//   1 bit    removed
+//   if not removed:
+//     1 bit  custom          (custom_entity_state_t, a beam)
+//     if full:
+//       1 bit  instanced baseline index present
+//       6 bits instanced baseline index
+//   delta payload, HLDeltaWrite against the entity's previous state
+//
+// Two number forms because most of a frame is a dense ascending run: entity n+1
+// after entity n costs 7 bits instead of 12. The offset is 6 bits and the writer
+// uses it for 1..62 only, falling back to the absolute form for wider gaps.
+//
+// Offset 63 is reserved as the end of block marker, and is the terminator the
+// baseline block uses: a baseline stream starts at entity 0, so an all-zero
+// sentinel would be indistinguishable from worldspawn's own baseline.
+//
+// The packet entities blocks end with 16 zero bits instead. Entity 0 never
+// appears in a frame - the world is the BSP, it is never delta'd - so absolute
+// form number 0 is free there, and 16 bits rather than 12 covers the removal,
+// custom and baseline bits that follow, so a reader that decodes the header
+// before testing it still lands on number 0. Both terminators are accepted on
+// read; the writer refuses entity 0 in a packet entities frame rather than emit
+// something the 16-bit sentinel would swallow.
+//
+// The removal bit carries no payload. An entity present in the previous frame
+// and absent from this one is removed explicitly; an entity present in both and
+// unchanged is not mentioned at all and is carried forward by the reader. That
+// asymmetry is what makes an idle frame cost 2 bytes.
+
+#define HLPE_OFF_BITS	6
+#define HLPE_NUM_BITS	11
+#define HLPE_OFF_MAX	62		//widest gap the offset form expresses
+#define HLPE_OFF_END	63		//reserved: end of block
+#define HLPE_MAX_NUM	2048	//1 << HLPE_NUM_BITS
+
+//entities in one frame. the engine's own cap is higher; a frame past this is
+//refused rather than silently trimmed
+#define HLPE_MAX_ENTS	256
+
+//frames kept for delta reference, indexed by sequence number. a client
+//acknowledges a frame several packets after receiving it, so the sender needs
+//the older one still intact. power of two: the index is a mask
+#define HLPE_FRAMES		8
+#define HLPE_FRAME_MASK	7
+
+class CHLFrame48
+{
+	I64				seq;		//netchan sequence this frame travelled under
+	Bool			valid;
+	F64				msgtime;	//server time the frame describes
+	I64				count;
+	I64				num[HLPE_MAX_ENTS];		//ascending
+	CHLEntState48	ent[HLPE_MAX_ENTS];
+};
+
+//hl_pe_cl is the client's reconstruction history, hl_pe_sv what the server sent.
+//one server ring, so one remote client: a second would need its own history and
+//its own acknowledged sequence.
+CHLFrame48		hl_pe_cl[HLPE_FRAMES];
+CHLFrame48		hl_pe_sv[HLPE_FRAMES];
+CHLEntState48	hl_pe_zero;
+
+//scratch for the two readers. file scope, not locals: a class sized declaration
+//inside a function is 500 bytes of stack per call and ZealC faults on one in a
+//nested block
+CHLEntState48	hl_pe_tmp;
+CHLEntState48	hl_pe_scratch;
+
+//a frame is decoded here and copied into the ring afterwards: the slot a new
+//sequence lands in can be the slot its delta reference occupies
+CHLFrame48		hl_pe_stage;
+
+//the send side stages the same way, and for the same reason: the sequence the
+//frame will be named by is only known after the packet is on the wire, so the
+//ring slot cannot be chosen before the frame is written
+CHLFrame48		hl_pe_sv_stage;
+
+//entity numbers 1..hl_net48_players are player slots and take
+//entity_state_player_t. set from svc_serverinfo on the client and from
+//hl_sv_maxclients on the server; zero means no slot is a player
+I64	hl_net48_players = 0;
+
+U0 HLState48Copy(CHLEntState48 *dst, CHLEntState48 *src)
+{
+	if (!dst || !src)
+		return;
+
+	MemCopy(dst, src, sizeof(CHLEntState48));
+}
+
+U0 HLPEFrameClear(CHLFrame48 *f)
+{
+	if (!f)
+		return;
+
+	f->seq     = -1;
+	f->valid   = FALSE;
+	f->msgtime = 0.0;
+	f->count   = 0;
+}
+
+U0 HLPEFramesClear()
+{//globals aren't zeroed
+	I64 i;
+
+	for (i = 0; i < HLPE_FRAMES; i++)
+	{
+		HLPEFrameClear(&hl_pe_cl[i]);
+		HLPEFrameClear(&hl_pe_sv[i]);
+	}
+
+	HLPEFrameClear(&hl_pe_stage);
+	HLPEFrameClear(&hl_pe_sv_stage);
+	HLState48Clear(&hl_pe_zero);
+	HLState48Clear(&hl_pe_tmp);
+	HLState48Clear(&hl_pe_scratch);
+	hl_net48_players = 0;
+}
+
+HLPEFramesClear;
+
+CHLFrame48 *HLPEFrameSlot(CHLFrame48 *ring, I64 seq)
+{//the slot a sequence lands in, whatever is in it now
+	if (!ring)
+		return NULL;
+
+	return &ring[seq & HLPE_FRAME_MASK];
+}
+
+CHLFrame48 *HLPEFrameByLowByte(CHLFrame48 *ring, I64 low)
+{//svc_deltapacketentities names its reference frame with a byte, not the whole
+ //sequence. the ring is 8 deep, so at most one live frame carries a given low
+ //byte and the truncation is recoverable
+	I64 i;
+
+	if (!ring)
+		return NULL;
+
+	for (i = 0; i < HLPE_FRAMES; i++)
+	{
+		if (ring[i].valid && (ring[i].seq & 0xFF) == (low & 0xFF))
+			return &ring[i];
+	}
+
+	return NULL;
+}
+
+CHLFrame48 *HLPEFrameBySeq(CHLFrame48 *ring, I64 seq)
+{//the send side names its reference by the whole sequence, not the low byte the
+ //wire carries. HLPEFrameByLowByte is the receiver's recovery of the same thing
+	I64 i;
+
+	if (!ring || seq < 0)
+		return NULL;
+
+	for (i = 0; i < HLPE_FRAMES; i++)
+	{
+		if (ring[i].valid && ring[i].seq == seq)
+			return &ring[i];
+	}
+
+	return NULL;
+}
+
+U0 HLPEFrameCopy(CHLFrame48 *dst, CHLFrame48 *src)
+{//only the occupied entries: the tail of ent[] is 100KB of nothing
+	I64 i;
+
+	if (!dst || !src)
+		return;
+
+	dst->seq     = src->seq;
+	dst->valid   = src->valid;
+	dst->msgtime = src->msgtime;
+	dst->count   = src->count;
+
+	for (i = 0; i < src->count; i++)
+	{
+		dst->num[i] = src->num[i];
+		HLState48Copy(&dst->ent[i], &src->ent[i]);
+	}
+}
+
+U0 HLPEFrameStore(CHLFrame48 *ring, CHLFrame48 *src, I64 seq, F64 msgtime)
+{//name a staged frame and file it. the destination slot may be the one the
+ //frame was just written against, so this runs after the write, never before
+	CHLFrame48 *dst;
+
+	if (!ring || !src || seq < 0)
+		return;
+
+	src->seq     = seq;
+	src->valid   = TRUE;
+	src->msgtime = msgtime;
+
+	dst = HLPEFrameSlot(ring, seq);
+	HLPEFrameCopy(dst, src);
+}
+
+CHLEntState48 *HLPEBaseline(I64 num)
+{//svc_spawnbaseline fills hl_net_bl48. numbers past the table decode against
+ //zero: the number is still 11 bits on the wire, the table is not that wide
+	if (num < 0 || num >= HLNET_MAX_ENTS)
+		return &hl_pe_zero;
+
+	return &hl_net_bl48[num];
+}
+
+Bool HLPEIsPlayer(I64 num)
+{
+	if (hl_net48_players < 1)
+		return FALSE;
+
+	return ToBool(num >= 1 && num <= hl_net48_players);
+}
+
+Bool HLPEFrameAppend(CHLFrame48 *f, I64 num, CHLEntState48 *e)
+{
+	if (!f || !e || f->count >= HLPE_MAX_ENTS)
+		return FALSE;
+
+	f->num[f->count] = num;
+	HLState48Copy(&f->ent[f->count], e);
+	f->count++;
+
+	return TRUE;
+}
+
+U0 HLPEWriteHeader(CHLMsg *m, I64 num, I64 *numbase, Bool remove, Bool custom,
+	Bool full)
+{//numbase carries the previous entity number and is advanced here
+	I64 off;
+
+	if (!m || !numbase)
+		return;
+
+	off = num - *numbase;
+
+	if (off >= 1 && off <= HLPE_OFF_MAX)
+	{
+		HLBitWriteBits(m, 1, 1);
+		HLBitWriteBits(m, off, HLPE_OFF_BITS);
+	}
+	else
+	{
+		HLBitWriteBits(m, 0, 1);
+		HLBitWriteBits(m, num, HLPE_NUM_BITS);
+	}
+
+	*numbase = num;
+
+	if (remove)
+	{
+		HLBitWriteBits(m, 1, 1);
+		return;
+	}
+
+	HLBitWriteBits(m, 0, 1);
+
+	if (custom)
+		HLBitWriteBits(m, 1, 1);
+	else
+		HLBitWriteBits(m, 0, 1);
+
+	//instanced baselines are a signon-time table of shared starting states an
+	//entity can name instead of its own. none are built here, so the presence
+	//bit is always clear and the 6 bit index never follows
+	if (full)
+		HLBitWriteBits(m, 0, 1);
+}
+
+U0 HLPEWriteEnd(CHLMsg *m, Bool zero_end)
+{
+	if (!m)
+		return;
+
+	if (zero_end)
+	{
+		HLBitWriteBits(m, 0, 16);
+		return;
+	}
+
+	HLBitWriteBits(m, 1, 1);
+	HLBitWriteBits(m, HLPE_OFF_END, HLPE_OFF_BITS);
+}
+
+I64 HLPEReadHeader(CHLMsg *m, I64 *numbase, I64 *_num, Bool *_remove,
+	Bool *_custom, Bool full, Bool zero_end)
+{//1 a header was decoded, 0 end of block, -1 malformed
+	I64	 form;
+	I64	 off;
+	I64	 num;
+	I64	 save;
+	I64	 peek;
+	Bool rem;
+
+	if (!m || !numbase || !_num || !_remove || !_custom)
+		return -1;
+
+	*_num    = 0;
+	*_remove = FALSE;
+	*_custom = FALSE;
+
+	if (zero_end)
+	{
+		//peek: 16 zero bits end the block, anything else is a header and the
+		//cursor goes back
+		save = m->rbit;
+		peek = HLBitReadBits(m, 16);
+		m->rbit = save;
+
+		if (m->badread)
+			return -1;
+
+		if (!peek)
+		{
+			HLBitReadBits(m, 16);
+			return 0;
+		}
+	}
+
+	form = HLBitReadBits(m, 1);
+
+	if (form)
+	{
+		off = HLBitReadBits(m, HLPE_OFF_BITS);
+
+		if (m->badread)
+			return -1;
+
+		if (off == HLPE_OFF_END)
+			return 0;
+
+		num = *numbase + off;
+	}
+	else
+	{
+		num = HLBitReadBits(m, HLPE_NUM_BITS);
+
+		if (m->badread)
+			return -1;
+	}
+
+	if (num < 0 || num >= HLPE_MAX_NUM)
+		return -1;
+
+	*numbase = num;
+	*_num    = num;
+
+	rem = ToBool(HLBitReadBits(m, 1) != 0);
+	*_remove = rem;
+
+	if (!rem)
+	{
+		*_custom = ToBool(HLBitReadBits(m, 1) != 0);
+
+		if (full)
+		{
+			//presence bit, then the index. nothing here emits one, but the
+			//width has to be consumed or every bit after it is misaligned
+			if (HLBitReadBits(m, 1))
+				HLBitReadBits(m, 6);
+		}
+	}
+
+	if (m->badread)
+		return -1;
+
+	return 1;
+}
+
+Bool HLNetWritePacketEntities(CHLMsg *m, CHLFrame48 *from, CHLFrame48 *to,
+	I64 delta_seq, F64 timebase)
+{//SV_EmitPacketEntities. from NULL writes svc_packetentities, every entity
+ //measured against its signon baseline; otherwise svc_deltapacketentities,
+ //measured against the named frame.
+ //
+ //the two lists are walked together in ascending number order, which is what
+ //makes a removal free to detect: an old number with no new number beside it
+	I64				oldi;
+	I64				newi;
+	I64				numbase;
+	I64				newnum;
+	I64				oldnum;
+	Bool			full;
+	CHLEntState48	*base;
+	CHLEntState48	*cur;
+
+	if (!m || !to)
+		return FALSE;
+
+	full = ToBool(from == NULL);
+
+	//entity 0 collides with the all-zero terminator, in either form and from
+	//either list: a removal names a number out of the old frame
+	if (to->count > 0 && to->num[0] == 0)
+	{
+		HLLog("net: entity 0 in a packet entities frame\n");
+		HLLogFlush;
+		return FALSE;
+	}
+
+	if (!full && from->count > 0 && from->num[0] == 0)
+	{
+		HLLog("net: entity 0 in the reference frame\n");
+		HLLogFlush;
+		return FALSE;
+	}
+
+	if (full)
+		HLMsgWriteByte(m, HLSVC_PACKETENTITIES);
+	else
+		HLMsgWriteByte(m, HLSVC_DELTAPACKETENTITIES);
+
+	HLMsgWriteShort(m, to->count);
+
+	if (!full)
+		HLMsgWriteByte(m, delta_seq & 0xFF);
+
+	HLBitWriteStart(m);
+
+	oldi    = 0;
+	newi    = 0;
+	numbase = 0;
+
+	while (TRUE)
+	{
+		//a number past every real one, so the shorter list runs out first
+		newnum = HLPE_MAX_NUM;
+		oldnum = HLPE_MAX_NUM;
+
+		if (newi < to->count)
+			newnum = to->num[newi];
+
+		if (!full && oldi < from->count)
+			oldnum = from->num[oldi];
+
+		if (newnum >= HLPE_MAX_NUM && oldnum >= HLPE_MAX_NUM)
+			break;
+
+		if (newnum == oldnum)
+		{
+			//in both frames: only the changed fields, and nothing at all when
+			//none changed
+			base = &from->ent[oldi];
+			cur  = &to->ent[newi];
+
+			if (HLDeltaAnyChange(HLDeltaForEnt(cur), base->v, cur->v, NULL,
+				NULL))
+			{
+				HLPEWriteHeader(m, newnum, &numbase, FALSE, cur->custom, full);
+				HLDeltaWrite(m, HLDeltaForEnt(cur), base->v, cur->v, NULL, NULL,
+					timebase);
+			}
+
+			oldi++;
+			newi++;
+		}
+		else if (newnum < oldnum)
+		{
+			//new this frame: measured against the baseline, and forced out even
+			//when it matches it, or the client never learns the entity exists
+			cur  = &to->ent[newi];
+			base = HLPEBaseline(newnum);
+
+			HLPEWriteHeader(m, newnum, &numbase, FALSE, cur->custom, full);
+			HLDeltaWrite(m, HLDeltaForEnt(cur), base->v, cur->v, NULL, NULL,
+				timebase);
+
+			newi++;
+		}
+		else
+		{
+			HLPEWriteHeader(m, oldnum, &numbase, TRUE, FALSE, full);
+			oldi++;
+		}
+
+		if (m->overflowed)
+			return FALSE;
+	}
+
+	HLPEWriteEnd(m, TRUE);
+	HLBitWriteEnd(m);
+
+	return ToBool(!m->overflowed);
+}
+
+Bool HLNetReadPacketEntities(CHLMsg *m, CHLFrame48 *from, CHLFrame48 *to,
+	Bool full, F64 timebase)
+{//CL_ParsePacketEntities. the opcode byte is already consumed.
+ //
+ //from is the frame this delta is measured against, NULL for svc_packetentities.
+ //an entity in from that this frame never names is unchanged and is carried
+ //forward here; only an explicit removal drops one
+	I64				oldi;
+	I64				numbase;
+	I64				num;
+	I64				prev;
+	I64				declared;
+	I64				r;
+	Bool			remove;
+	Bool			custom;
+	CHLEntState48	*base;
+	CHLEntState48	*tmp;
+
+	if (!m || !to)
+		return FALSE;
+
+	tmp = &hl_pe_tmp;
+
+	declared = HLMsgReadShort(m);
+
+	if (!full)
+		HLMsgReadByte(m);			//delta sequence, resolved by the caller
+
+	if (m->badread)
+		return FALSE;
+
+	to->count = 0;
+	oldi      = 0;
+	numbase   = 0;
+	prev      = -1;
+
+	HLBitReadStart(m);
+
+	while (TRUE)
+	{
+		r = HLPEReadHeader(m, &numbase, &num, &remove, &custom, full, TRUE);
+
+		if (r < 0)
+			return FALSE;
+
+		if (!r)
+			break;
+
+		//strictly ascending. the parallel walk below depends on it, and a
+		//repeat or a step backwards means the stream is misaligned
+		if (num <= prev)
+		{
+			HLLog("net: packet entities out of order\n");
+			HLLogFlush;
+			return FALSE;
+		}
+
+		prev = num;
+
+		if (from)
+		{
+			while (oldi < from->count && from->num[oldi] < num)
+			{
+				if (!HLPEFrameAppend(to, from->num[oldi], &from->ent[oldi]))
+					return FALSE;
+
+				oldi++;
+			}
+		}
+
+		base = NULL;
+
+		if (from && oldi < from->count && from->num[oldi] == num)
+		{
+			base = &from->ent[oldi];
+			oldi++;
+		}
+
+		if (!base)
+			base = HLPEBaseline(num);
+
+		if (remove)
+			goto qpe_next;
+
+		HLState48Copy(tmp, base);
+		tmp->custom  = custom;
+		tmp->player  = HLPEIsPlayer(num);
+		tmp->active  = TRUE;
+		tmp->msgtime = timebase;
+
+		if (!HLDeltaRead(m, HLDeltaForEnt(tmp), tmp->v, NULL, 0, timebase))
+			return FALSE;
+
+		if (!HLPEFrameAppend(to, num, tmp))
+			return FALSE;
+
+qpe_next:
+	}
+
+	if (from)
+	{
+		while (oldi < from->count)
+		{
+			if (!HLPEFrameAppend(to, from->num[oldi], &from->ent[oldi]))
+				return FALSE;
+
+			oldi++;
+		}
+	}
+
+	HLBitReadEnd(m);
+
+	to->msgtime = timebase;
+
+	//the word count leads the bit stream and cannot be trusted over it: log the
+	//disagreement and keep the list the stream produced
+	if (declared != to->count)
+	{
+		HLLog("net: packet entities count disagrees with the stream\n");
+		HLLogFlush;
+	}
+
+	return ToBool(!m->badread);
+}
+
+U0 HLPEFrameToEntTable(CHLFrame48 *f)
+{//a frame is a list ordered by entity number; the renderer wants a table indexed
+ //by it. active is cleared first, so an entity that left the frame stops being
+ //drawn without anything having to name it
+	I64 i;
+	I64 num;
+
+	for (i = 0; i < HLNET_MAX_ENTS; i++)
+		hl_net_cl48[i].active = FALSE;
+
+	if (!f)
+		return;
+
+	for (i = 0; i < f->count; i++)
+	{
+		num = f->num[i];
+
+		if (num < 0 || num >= HLNET_MAX_ENTS)
+			goto qpt_next;
+
+		HLState48Copy(&hl_net_cl48[num], &f->ent[i]);
+
+qpt_next:
+	}
+}
+
+Bool HLNetParsePacketEntities48(CHLMsg *m, Bool is_delta, I64 seq, F64 timebase)
+{//CL_ParsePacketEntities' caller side: pick the reference frame, decode, publish.
+ //
+ //seq is the netchan sequence the packet arrived under and becomes this frame's
+ //name. the opcode byte is already consumed.
+	CHLFrame48	*from;
+	CHLFrame48	*slot;
+	I64			 dseq;
+
+	if (!m)
+		return FALSE;
+
+	from = NULL;
+
+	if (is_delta)
+	{
+		//the reference frame has to be chosen before the payload is read, and
+		//the byte naming it sits after the 16 bit entity count. peeked rather
+		//than read: HLNetReadPacketEntities consumes the whole frame header
+		if (m->read + 3 > m->len)
+		{
+			m->badread = TRUE;
+			return FALSE;
+		}
+
+		dseq = m->data[m->read + 2];
+		from = HLPEFrameByLowByte(hl_pe_cl, dseq);
+
+		//the reference has aged out of the ring. every field in the payload is
+		//an offset from a state that no longer exists, so nothing here is
+		//recoverable and the client must ask for a full update
+		if (!from)
+		{
+			HLLog("net: delta packet entities against a frame that is gone\n");
+			HLLogFlush;
+			return FALSE;
+		}
+	}
+
+	HLPEFrameClear(&hl_pe_stage);
+
+	if (!HLNetReadPacketEntities(m, from, &hl_pe_stage, ToBool(!is_delta),
+		timebase))
+		return FALSE;
+
+	hl_pe_stage.seq   = seq;
+	hl_pe_stage.valid = TRUE;
+
+	slot = HLPEFrameSlot(hl_pe_cl, seq);
+	HLPEFrameCopy(slot, &hl_pe_stage);
+	HLPEFrameToEntTable(slot);
+
+	return TRUE;
+}
+
+Bool HLNetWriteSpawnBaseline(CHLMsg *m, CHLEntState48 *tbl, I64 count,
+	F64 timebase)
+{//SV_CreateBaseline. every active entry, measured against zero, entity 0 first.
+ //the reserved offset terminates: entity 0 has a baseline, so an all-zero
+ //sentinel is not available here
+	I64	i;
+	I64	numbase;
+
+	if (!m || !tbl)
+		return FALSE;
+
+	if (count > HLNET_MAX_ENTS)
+		count = HLNET_MAX_ENTS;
+
+	HLMsgWriteByte(m, HLSVC_SPAWNBASELINE);
+	HLBitWriteStart(m);
+
+	numbase = 0;
+
+	for (i = 0; i < count; i++)
+	{
+		if (!tbl[i].active)
+			goto qbl_next;
+
+		HLPEWriteHeader(m, i, &numbase, FALSE, tbl[i].custom, FALSE);
+		HLDeltaWrite(m, HLDeltaForEnt(&tbl[i]), hl_pe_zero.v, tbl[i].v, NULL,
+			NULL, timebase);
+
+		if (m->overflowed)
+			return FALSE;
+
+qbl_next:
+	}
+
+	HLPEWriteEnd(m, FALSE);
+	HLBitWriteEnd(m);
+
+	return ToBool(!m->overflowed);
+}
+
+Bool HLNetReadSpawnBaseline(CHLMsg *m, F64 timebase)
+{//CL_ParseBaseline. fills hl_net_bl48 in place; the opcode byte is already
+ //consumed. numbers past the table are decoded and discarded, because skipping
+ //a delta payload without decoding it is not possible
+	I64				numbase;
+	I64				num;
+	I64				prev;
+	I64				r;
+	Bool			remove;
+	Bool			custom;
+	CHLEntState48	*e;
+
+	if (!m)
+		return FALSE;
+
+	numbase = 0;
+	prev    = -1;
+
+	HLBitReadStart(m);
+
+	while (TRUE)
+	{
+		r = HLPEReadHeader(m, &numbase, &num, &remove, &custom, FALSE, FALSE);
+
+		if (r < 0)
+			return FALSE;
+
+		if (!r)
+			break;
+
+		if (num <= prev)
+		{
+			HLLog("net: spawnbaseline out of order\n");
+			HLLogFlush;
+			return FALSE;
+		}
+
+		prev = num;
+
+		//a removal has no meaning in the baseline block
+		if (remove)
+		{
+			HLLog("net: removal bit in spawnbaseline\n");
+			HLLogFlush;
+			return FALSE;
+		}
+
+		if (num < HLNET_MAX_ENTS)
+			e = &hl_net_bl48[num];
+		else
+			e = &hl_pe_scratch;
+
+		HLState48Clear(e);
+		e->custom  = custom;
+		e->player  = HLPEIsPlayer(num);
+		e->active  = TRUE;
+		e->msgtime = timebase;
+
+		if (!HLDeltaRead(m, HLDeltaForEnt(e), e->v, NULL, 0, timebase))
+			return FALSE;
+	}
+
+	HLBitReadEnd(m);
+
+	return ToBool(!m->badread);
+}
+
+//============================================================================
+// Protocol 48: movevars
+//============================================================================
+//
+// svc_newmovevars carries movevars_t whole, no delta. The field set, order and
+// C types are pm_movevars.h:15-43: sixteen floats through waveHeight, the
+// qboolean footsteps, char skyName[32], then eight more floats.
+//
+// Inferred: that struct order is wire order, that footsteps travels as one byte
+// rather than a four byte int, and that skyName travels as a NUL terminated
+// string rather than 32 fixed bytes. Nothing in the checkout writes this
+// message. A wrong choice on any of the three shifts every field after it, and
+// the reader has no way to notice, so the writer here is the only peer this
+// pair is known to agree with.
+
+#define HLMV_FLOATS			24
+#define HLMV_PRE_FLOATS		16		//gravity..waveHeight, ahead of footsteps
+
+#define HLMV_GRAVITY		0
+#define HLMV_STOPSPEED		1
+#define HLMV_MAXSPEED		2
+#define HLMV_SPECTATORMAX	3
+#define HLMV_ACCELERATE		4
+#define HLMV_AIRACCELERATE	5
+#define HLMV_WATERACCEL		6
+#define HLMV_FRICTION		7
+#define HLMV_EDGEFRICTION	8
+#define HLMV_WATERFRICTION	9
+#define HLMV_ENTGRAVITY		10
+#define HLMV_BOUNCE			11
+#define HLMV_STEPSIZE		12
+#define HLMV_MAXVELOCITY	13
+#define HLMV_ZMAX			14
+#define HLMV_WAVEHEIGHT		15
+#define HLMV_ROLLANGLE		16
+#define HLMV_ROLLSPEED		17
+#define HLMV_SKYCOLOR_R		18
+#define HLMV_SKYCOLOR_G		19
+#define HLMV_SKYCOLOR_B		20
+#define HLMV_SKYVEC_X		21
+#define HLMV_SKYVEC_Y		22
+#define HLMV_SKYVEC_Z		23
+
+#define HLMV_SKYNAME_LEN	32		//char skyName[32], pm_movevars.h:34
+
+class CHLMoveVars48
+{
+	F64		v[HLMV_FLOATS];
+	Bool	footsteps;
+	U8		skyname[HLMV_SKYNAME_LEN];
+};
+
+CHLMoveVars48	hl_movevars48;
+
+U0 HLMoveVars48Clear(CHLMoveVars48 *mv)
+{
+	I64 i;
+
+	if (!mv)
+		return;
+
+	for (i = 0; i < HLMV_FLOATS; i++)
+		mv->v[i] = 0.0;
+
+	mv->footsteps  = FALSE;
+	mv->skyname[0] = 0;
+}
+
+U0 HLMoveVars48Defaults(CHLMoveVars48 *mv)
+{//stock listen server cvar values; sv_gravity 800 and sv_maxspeed 320 are the
+ //HL defaults, the rest are the engine constants pm_shared uses
+	if (!mv)
+		return;
+
+	HLMoveVars48Clear(mv);
+
+	mv->v[HLMV_GRAVITY]      = 800.0;
+	mv->v[HLMV_STOPSPEED]    = 100.0;
+	mv->v[HLMV_MAXSPEED]     = 320.0;
+	mv->v[HLMV_SPECTATORMAX] = 500.0;
+	mv->v[HLMV_ACCELERATE]   = 10.0;
+	mv->v[HLMV_AIRACCELERATE] = 10.0;
+	mv->v[HLMV_WATERACCEL]   = 10.0;
+	mv->v[HLMV_FRICTION]     = 4.0;
+	mv->v[HLMV_EDGEFRICTION] = 2.0;
+	mv->v[HLMV_WATERFRICTION] = 1.0;
+	mv->v[HLMV_ENTGRAVITY]   = 1.0;
+	mv->v[HLMV_BOUNCE]       = 1.0;
+	mv->v[HLMV_STEPSIZE]     = 18.0;
+	mv->v[HLMV_MAXVELOCITY]  = 2000.0;
+	mv->v[HLMV_ZMAX]         = 4096.0;
+	mv->v[HLMV_ROLLANGLE]    = 2.0;
+	mv->v[HLMV_ROLLSPEED]    = 200.0;
+	mv->v[HLMV_SKYCOLOR_R]   = 0.0;
+	mv->v[HLMV_SKYCOLOR_G]   = 0.0;
+	mv->v[HLMV_SKYCOLOR_B]   = 0.0;
+	mv->v[HLMV_SKYVEC_X]     = 0.0;
+	mv->v[HLMV_SKYVEC_Y]     = 0.0;
+	mv->v[HLMV_SKYVEC_Z]     = 0.0;
+	mv->footsteps            = TRUE;
+	mv->skyname[0]           = 0;
+}
+
+U0 HLMoveVars48Init()
+{//globals aren't zeroed and declaration initialisers do not run
+	HLMoveVars48Defaults(&hl_movevars48);
+}
+
+HLMoveVars48Init;
+
+U0 HLNetWriteMoveVars48(CHLMsg *m, CHLMoveVars48 *mv)
+{//SV_WriteMovevarsToClient. Byte layout as described above; the opcode leads.
+	I64 i;
+
+	if (!m || !mv)
+		return;
+
+	HLMsgWriteByte(m, HLSVC_NEWMOVEVARS);
+
+	for (i = 0; i < HLMV_PRE_FLOATS; i++)
+		HLMsgWriteFloat(m, mv->v[i]);
+
+	if (mv->footsteps)
+		HLMsgWriteByte(m, 1);
+	else
+		HLMsgWriteByte(m, 0);
+
+	HLMsgWriteString(m, mv->skyname);
+
+	for (i = HLMV_PRE_FLOATS; i < HLMV_FLOATS; i++)
+		HLMsgWriteFloat(m, mv->v[i]);
+}
+
+Bool HLNetReadMoveVars48(CHLMsg *m, CHLMoveVars48 *mv)
+{//the opcode byte is already consumed
+	I64 i;
+
+	if (!m || !mv)
+		return FALSE;
+
+	for (i = 0; i < HLMV_PRE_FLOATS; i++)
+		mv->v[i] = HLMsgReadFloat(m);
+
+	mv->footsteps = ToBool(HLMsgReadByte(m) != 0);
+
+	HLMsgReadString(m, mv->skyname, HLMV_SKYNAME_LEN);
+
+	for (i = HLMV_PRE_FLOATS; i < HLMV_FLOATS; i++)
+		mv->v[i] = HLMsgReadFloat(m);
+
+	return ToBool(!m->badread);
+}
+
+//============================================================================
+// Protocol 48: user messages
+//============================================================================
+//
+// how the game talks to the HUD. no equivalent in protocol 15: Quake's HUD read a
+// fixed stat table (svc_updatestat, MAX_CL_STATS entries), so the engine knew
+// every value the status bar could show. HL moved the HUD into the client DLL and
+// the rules into the game DLL, and the engine carries opaque named messages.
+//
+// the game DLL calls pfnRegUserMsg("Health", 1) at startup; the engine hands back
+// a number from 64 up, sends svc_newusermsg to every client to publish the
+// pairing, and from then on MESSAGE_BEGIN(MSG_ONE, gmsgHealth) writes an ordinary
+// datagram whose opcode is that number. the client DLL has hooked the same name
+// and gets the payload.
+//
+// the engine needs two things: the name/number/size table and a dispatcher. it
+// never needs the meaning of a Health message, which is what makes an unknown
+// user message survivable where an unknown svc_ is not - the registered size
+// gives the byte count to skip.
+//
+// size -1 (0xFF on the wire) means variable: a length byte leads the payload.
+
+#define HLUSERMSG_MAX		192		//64..255
+#define HLUSERMSG_NAME		20		//svc_newusermsg carries 16, plus NUL
+#define HLUSERMSG_MAX_BODY	192
+
+class CHLUserMsg
+{
+	U8	 name[HLUSERMSG_NAME];
+	I64	 size;			//-1 = variable length, leading byte
+	Bool used;
+	I64	 count;			//how many have arrived, for the netstat page
+	I64	 body_len;		//most recent payload, polled by the HUD
+	U8	 body[HLUSERMSG_MAX_BODY];
+};
+
+//indexed by (number - HLUSERMSG_FIRST)
+CHLUserMsg	hl_usermsg[HLUSERMSG_MAX];
+I64			hl_usermsg_count = 0;	//registered
+I64			hl_usermsg_unknown = 0;	//arrived with no registration
+
+U0 HLUserMsgClear()
+{//globals aren't zeroed, and .used decides whether a payload can be skipped
+	I64 i;
+
+	for (i = 0; i < HLUSERMSG_MAX; i++)
+	{
+		hl_usermsg[i].name[0]  = 0;
+		hl_usermsg[i].size     = -1;
+		hl_usermsg[i].used     = FALSE;
+		hl_usermsg[i].count    = 0;
+		hl_usermsg[i].body_len = 0;
+	}
+
+	hl_usermsg_count   = 0;
+	hl_usermsg_unknown = 0;
+}
+
+HLUserMsgClear;
+
+Bool HLUserMsgRegister(I64 num, I64 size, U8 *name)
+{//svc_newusermsg on the client, pfnRegUserMsg on the server. re-registering the
+ //same number happens on every map change
+	I64 idx;
+
+	if (num < HLUSERMSG_FIRST || num > 255)
+		return FALSE;
+
+	idx = num - HLUSERMSG_FIRST;
+
+	if (!hl_usermsg[idx].used)
+		hl_usermsg_count++;
+
+	HLStrCopy(hl_usermsg[idx].name, name, HLUSERMSG_NAME);
+
+	//0xFF on the wire means variable length
+	if (size == 255)
+		size = -1;
+
+	hl_usermsg[idx].size = size;
+	hl_usermsg[idx].used = TRUE;
+
+	return TRUE;
+}
+
+I64 HLUserMsgFind(U8 *name)
+{//number for a registered name, or -1. the game side addresses messages it did
+ //not allocate through this
+	I64 i;
+
+	if (!name || !name[0])
+		return -1;
+
+	for (i = 0; i < HLUSERMSG_MAX; i++)
+	{
+		if (hl_usermsg[i].used && !StrCompare(hl_usermsg[i].name, name))
+			return i + HLUSERMSG_FIRST;
+	}
+
+	return -1;
+}
+
+CHLUserMsg *HLUserMsgGet(I64 num)
+{
+	if (num < HLUSERMSG_FIRST || num > 255)
+		return NULL;
+
+	if (!hl_usermsg[num - HLUSERMSG_FIRST].used)
+		return NULL;
+
+	return &hl_usermsg[num - HLUSERMSG_FIRST];
+}

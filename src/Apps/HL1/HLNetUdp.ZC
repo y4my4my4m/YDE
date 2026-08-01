@@ -1,0 +1,628 @@
+// HLNetUdp.ZC - udp transport, same two ops as the loopback link
+//
+// the net stack is not in the kernel; RunNet.ZC loads it. a defined UDP_MAX_PORT
+// is the test for that, hence the #ifdef: quake must compile without it
+
+#define HLNET_PORT_DEFAULT	26000
+
+//limited broadcast. the only address a slist query can use: neither end knows the
+//other exists yet, so there is nothing to unicast to (Datagram_SearchForHosts)
+#define HLNET_BROADCAST_IP	0xFFFFFFFF
+
+I64		hl_udp_port		= HLNET_PORT_DEFAULT;
+U32		hl_udp_peer_ip	= 0;		//peer address, 0 = none
+U32		hl_udp_from_ip	= 0;		//sender of the datagram just received
+I64		hl_udp_from_port	= HLNET_PORT_DEFAULT;	//sender port; ironwail is ephemeral
+Bool	hl_udp_ready		= FALSE;	//socket open and bound
+Bool	hl_udp_server	= FALSE;	//hosting
+I64		hl_udp_sent		= 0;
+I64		hl_udp_recvd		= 0;
+I64		hl_udp_errors	= 0;
+I64		hl_udp_unresolved = 0;	//sends skipped, peer mac unknown
+Bool	hl_dhcp_failed	= FALSE;	//latched, to avoid re-stalling a link with no dhcp
+U8		hl_udp_status[96];
+
+#ifdef UDP_MAX_PORT
+
+CUDPSocket			*hl_udp_socket	= NULL;
+CSocketAddressIPV4	*hl_udp_bind		= NULL;
+
+Bool HLNetUdpOpen(I64 port)
+{//both ends bind the same port, as the original does.
+	if (hl_udp_ready)
+		return TRUE;
+
+	//no dhcp here: it retries to exhaustion and stalls the frame loop on a link
+	//with no server. qip sets an address statically, netdhcp asks for one
+	if (!ipv4_globals.local_ip)
+	{
+		HLStrCopy(hl_udp_status,
+			"set ip first: qip 10.0.0.2, THEN connect", 96);
+		return FALSE;
+	}
+
+	hl_udp_socket = UDPSocket(AF_INET);
+	if (!hl_udp_socket)
+	{
+		HLStrCopy(hl_udp_status, "UDPSocket failed", 96);
+		return FALSE;
+	}
+
+	hl_udp_bind = CAlloc(sizeof(CSocketAddressIPV4));
+
+	//ports go on the wire big endian; the socket layer does not swap
+	hl_udp_bind->family	= AF_INET;
+	hl_udp_bind->port	= EndianU16(port);
+
+	//INADDR_ANY, not the local address: UDPHandler matches the bound address
+	//against the packet source, so the local one matches nothing a peer sends
+	hl_udp_bind->address.address	= INADDR_ANY;
+
+	if (UDPSocketBind(hl_udp_socket, hl_udp_bind) == -1)
+	{
+		HLStrCopy(hl_udp_status, "UDPSocketBind failed", 96);
+		Free(hl_udp_bind);
+		hl_udp_bind = NULL;
+		UDPSocketClose(hl_udp_socket);
+		hl_udp_socket = NULL;
+		return FALSE;
+	}
+
+	//must be non blocking: with a timeout set UDPSocketReceiveFrom sleeps, and the
+	//frame loop stalls for as long as the peer stays quiet
+	hl_udp_socket->receive_timeout_ms = 0;
+
+	hl_udp_port  = port;
+	hl_udp_ready = TRUE;
+	hl_udp_sent  = 0;
+	hl_udp_recvd = 0;
+
+	StrPrint(hl_udp_status, "bound to port %d", port);
+
+	return TRUE;
+}
+
+U0 HLNetUdpClose()
+{
+	if (!hl_udp_ready)
+		return;
+
+	if (hl_udp_socket)
+		UDPSocketClose(hl_udp_socket);
+
+	if (hl_udp_bind)
+		Free(hl_udp_bind);
+
+	hl_udp_socket = NULL;
+	hl_udp_bind   = NULL;
+	hl_udp_ready  = FALSE;
+	hl_udp_server = FALSE;
+	hl_udp_peer_ip = 0;
+}
+
+Bool HLNetUdpSendTo(CHLMsg *m, U32 dest_ip, I64 dest_port=0)
+{//NET_SendPacket - one message, one datagram, never blocks
+	U8	*payload;
+	I64	 de_index;
+	I64	 dport;
+
+	if (!hl_udp_ready || !dest_ip || m->len < 1 || m->overflowed)
+		return FALSE;
+
+	//ethernet mtu. no ip fragmentation on this stack, so oversized datagrams
+	//vanish. entity updates are capped at HLNET_MAX_DATAGRAM
+	if (m->len > 1472)
+		return FALSE;
+
+	dport = dest_port;
+	if (dport < 1 || dport > 65535)
+		dport = HLNET_PORT_DEFAULT;
+
+	//cache only: IPV4AddressMACGet blocks 2s on a miss. resolution belongs in
+	//HLNetUdpResolvePeer, not the frame loop
+	if (!ARPCacheFind(dest_ip))
+	{
+		hl_udp_unresolved++;
+		return FALSE;
+	}
+
+	de_index = UDPPacketAllocate(&payload, ipv4_globals.local_ip, hl_udp_port,
+		dest_ip, dport, m->len);
+
+	if (de_index < 0)
+	{
+		hl_udp_errors++;
+		return FALSE;
+	}
+
+	MemCopy(payload, m->data, m->len);
+	UDPPacketFinish(de_index);
+
+	hl_udp_sent++;
+
+	return TRUE;
+}
+
+Bool HLNetUdpSend(CHLMsg *m)
+{//to the latched peer. listen server remotes use HLNetUdpSendTo(slot.ip)
+	return HLNetUdpSendTo(m, hl_udp_peer_ip);
+}
+
+Bool HLNetUdpSendRawTo(U8 *data, I64 len, U32 dest_ip, I64 dest_port=0)
+{//raw NETFLAG framed bytes. dest_port 0 means HLNET_PORT_DEFAULT.
+ //ironwail CCREQ comes from an ephemeral port, so CTL Accept replies there and
+ //not to 26000, which is the local bind rather than the client socket
+	U8	*payload;
+	I64	 de_index;
+	I64	 dport;
+
+	if (!hl_udp_ready || !dest_ip || !data || len < 1)
+		return FALSE;
+
+	if (len > 1472)
+		return FALSE;
+
+	dport = dest_port;
+	if (dport < 1 || dport > 65535)
+		dport = HLNET_PORT_DEFAULT;
+
+	if (!ARPCacheFind(dest_ip))
+	{
+		hl_udp_unresolved++;
+		return FALSE;
+	}
+
+	de_index = UDPPacketAllocate(&payload, ipv4_globals.local_ip, hl_udp_port,
+		dest_ip, dport, len);
+
+	if (de_index < 0)
+	{
+		hl_udp_errors++;
+		return FALSE;
+	}
+
+	MemCopy(payload, data, len);
+	UDPPacketFinish(de_index);
+
+	hl_udp_sent++;
+
+	return TRUE;
+}
+
+Bool HLNetUdpSendRawBroadcast(U8 *data, I64 len, I64 dest_port=0)
+{//raw NETFLAG framed bytes to the whole subnet, for the slist query only.
+ //
+ //no ARPCacheFind: 255.255.255.255 is never in the cache. IPV4AddressMACGet short
+ //circuits that address to ethernet_globals.ethernet_broadcast and returns at
+ //once, so unlike a unicast miss this costs no stall.
+ //
+ //source port stays hl_udp_port, where the CCREP must come back to
+	U8	*payload;
+	I64	 de_index;
+	I64	 dport;
+
+	if (!hl_udp_ready || !data || len < 1)
+		return FALSE;
+
+	if (len > 1472)
+		return FALSE;
+
+	dport = dest_port;
+	if (dport < 1 || dport > 65535)
+		dport = HLNET_PORT_DEFAULT;
+
+	de_index = UDPPacketAllocate(&payload, ipv4_globals.local_ip, hl_udp_port,
+		HLNET_BROADCAST_IP, dport, len);
+
+	if (de_index < 0)
+	{
+		hl_udp_errors++;
+		return FALSE;
+	}
+
+	MemCopy(payload, data, len);
+	UDPPacketFinish(de_index);
+
+	hl_udp_sent++;
+
+	return TRUE;
+}
+
+Bool HLNetUdpRecv(CHLMsg *out)
+{//one datagram if one is waiting, never blocks
+	CSocketAddressStorage	from;
+	CSocketAddressIPV4		*v4;
+	I64						 got;
+
+	if (!hl_udp_ready)
+		return FALSE;
+
+	MemSet(&from, 0, sizeof(CSocketAddressStorage));
+
+	got = UDPSocketReceiveFrom(hl_udp_socket, out->data, HLNET_MAX_MSG, &from);
+	if (got < 1)
+		return FALSE;
+
+	HLMsgClear(out);
+	out->len = got;
+
+	//report the sender every time. with several clients the address decides whose
+	//message this is; latching it once lands everyone's moves on whoever spoke
+	//first
+	if (from.family == AF_INET)
+	{
+		v4 = &from;
+
+		/*	sockaddr ipv4 is network order. quake, ARPCache and
+			UDPPacketAllocate want host order, first octet in the low byte,
+			the layout IPV4AddressParse produces.
+
+			taken raw, the listen server latches a byte swapped peer:
+			ARPCacheFind misses, every reply is skipped, and the joining
+			client sits in the menu while netstat still shows its slot. */
+		hl_udp_from_ip = EndianU32(v4->address.address);
+
+		//a listen server has nobody to reply to until someone speaks, which lets
+		//host work with no prior configuration
+		if (!hl_udp_peer_ip)
+			hl_udp_peer_ip = hl_udp_from_ip;
+
+		hl_udp_from_port = EndianU16(v4->port);
+		if (hl_udp_from_port < 1)
+			hl_udp_from_port = HLNET_PORT_DEFAULT;
+	}
+	else
+	{
+		hl_udp_from_ip = 0;
+		hl_udp_from_port = HLNET_PORT_DEFAULT;
+	}
+
+	hl_udp_recvd++;
+
+	return TRUE;
+}
+
+Bool HLNetUdpRecvRaw(U8 *buf, I64 max, I64 *out_len, U32 *from_ip)
+{//raw bytes for HLNetDgrm framing, never blocks
+	CSocketAddressStorage	from;
+	CSocketAddressIPV4		*v4;
+	I64						 got;
+
+	if (out_len)
+		*out_len = 0;
+	if (from_ip)
+		*from_ip = 0;
+
+	if (!hl_udp_ready || !buf || max < 1)
+		return FALSE;
+
+	MemSet(&from, 0, sizeof(CSocketAddressStorage));
+
+	got = UDPSocketReceiveFrom(hl_udp_socket, buf, max, &from);
+	if (got < 1)
+		return FALSE;
+
+	if (out_len)
+		*out_len = got;
+
+	if (from.family == AF_INET)
+	{
+		v4 = &from;
+		hl_udp_from_ip = EndianU32(v4->address.address);
+		//sockaddr port is network order
+		hl_udp_from_port = EndianU16(v4->port);
+		if (hl_udp_from_port < 1)
+			hl_udp_from_port = HLNET_PORT_DEFAULT;
+		if (!hl_udp_peer_ip)
+			hl_udp_peer_ip = hl_udp_from_ip;
+	}
+	else
+	{
+		hl_udp_from_ip = 0;
+		hl_udp_from_port = HLNET_PORT_DEFAULT;
+	}
+
+	if (from_ip)
+		*from_ip = hl_udp_from_ip;
+
+	hl_udp_recvd++;
+
+	return TRUE;
+}
+
+Bool HLNetUdpAvailable()
+{
+	return TRUE;
+}
+
+#else
+
+//no net stack at compile time. the transport must still exist - the menu and the
+//shell reference it either way. it reports; it does not fake a connect
+
+Bool HLNetUdpOpen(I64 port)
+{
+	HLStrCopy(hl_udp_status,
+		"net stack not loaded - run ::/Home/Net/Start, then rebuild", 96);
+
+	return FALSE;
+}
+
+U0 HLNetUdpClose()
+{
+}
+
+Bool HLNetUdpSend(CHLMsg *m)
+{
+	return FALSE;
+}
+
+Bool HLNetUdpSendTo(CHLMsg *m, U32 dest_ip, I64 dest_port=0)
+{
+	return FALSE;
+}
+
+Bool HLNetUdpSendRawTo(U8 *data, I64 len, U32 dest_ip, I64 dest_port=0)
+{
+	return FALSE;
+}
+
+Bool HLNetUdpSendRawBroadcast(U8 *data, I64 len, I64 dest_port=0)
+{
+	return FALSE;
+}
+
+Bool HLNetUdpRecv(CHLMsg *out)
+{
+	return FALSE;
+}
+
+Bool HLNetUdpRecvRaw(U8 *buf, I64 max, I64 *out_len, U32 *from_ip)
+{
+	if (out_len)
+		*out_len = 0;
+	if (from_ip)
+		*from_ip = 0;
+	return FALSE;
+}
+
+Bool HLNetUdpAvailable()
+{
+	return FALSE;
+}
+
+#endif
+
+U0 HLNetUdpInit()
+{//globals aren't zeroed
+	//only exists in the net stack build; referencing it outside this guard breaks
+	//the single-player-only build
+#ifdef UDP_MAX_PORT
+	hl_udp_bind = NULL;
+#endif
+
+	hl_udp_port    = HLNET_PORT_DEFAULT;
+	hl_dhcp_failed = FALSE;
+	hl_udp_peer_ip = 0;
+	hl_udp_from_ip = 0;
+	hl_udp_from_port = HLNET_PORT_DEFAULT;
+	hl_udp_ready   = FALSE;
+	hl_udp_server  = FALSE;
+	hl_udp_sent       = 0;
+	hl_udp_recvd      = 0;
+	hl_udp_errors     = 0;
+	hl_udp_unresolved = 0;
+
+	if (HLNetUdpAvailable())
+		HLStrCopy(hl_udp_status, "udp available", 96);
+	else
+		HLStrCopy(hl_udp_status, "udp not compiled in", 96);
+}
+
+U0 HLNetUdpSetPeer(U32 ip)
+{
+	hl_udp_peer_ip = ip;
+}
+
+#ifdef UDP_MAX_PORT
+
+Bool HLNetUdpPeerResolved()
+{//cache lookup only; sends nothing
+	if (!hl_udp_peer_ip)
+		return FALSE;
+
+	return ToBool(ARPCacheFind(hl_udp_peer_ip) != NULL);
+}
+
+U0 HLNetUdpArpProbe()
+{//ask who the peer is without waiting for the answer.
+ //ARPSend returns immediately and ARPHandler puts the reply in the cache, so this
+ //is frame loop safe where IPV4AddressMACGet is not. a client whose server was
+ //not yet up recovers once it appears
+	if (!hl_udp_ready || !hl_udp_peer_ip)
+		return;
+
+	ARPSend(ARP_REQUEST,
+		ethernet_globals.ethernet_broadcast,
+		EthernetMACGet,
+		ipv4_globals.local_ip_be,
+		ethernet_globals.ethernet_null,
+		EndianU32(hl_udp_peer_ip));
+}
+
+Bool HLNetUdpResolvePeer()
+{//resolve the peer mac once, from a menu or console command where a two second
+ //stall is acceptable. everything after this sends without blocking.
+ //doubles as the reachability test: no arp answer means the other machine is not
+ //on the wire
+	U8 *mac = NULL;
+
+	if (!hl_udp_ready || !hl_udp_peer_ip)
+		return FALSE;
+
+	if (ARPCacheFind(hl_udp_peer_ip))
+		return TRUE;
+
+	IPV4AddressMACGet(hl_udp_peer_ip, &mac);
+
+	return ToBool(ARPCacheFind(hl_udp_peer_ip) != NULL);
+}
+
+Bool HLNetUdpEnsureArp(U32 ip)
+{//block until the dest mac is known: CTL Accept must not drop on a cold cache
+	U8 *mac = NULL;
+
+	if (!ip)
+		return FALSE;
+	if (ARPCacheFind(ip))
+		return TRUE;
+
+	IPV4AddressMACGet(ip, &mac);
+	return ToBool(ARPCacheFind(ip) != NULL);
+}
+
+#else
+
+U0 HLNetUdpArpProbe()
+{
+}
+
+Bool HLNetUdpPeerResolved()
+{
+	return FALSE;
+}
+
+Bool HLNetUdpResolvePeer()
+{
+	return FALSE;
+}
+
+Bool HLNetUdpEnsureArp(U32 ip)
+{
+	return FALSE;
+}
+
+#endif
+
+#ifdef UDP_MAX_PORT
+
+U32 HLNetLocalIP()
+{//in the same byte order as everything else in this port.
+ //
+ //ipv4_globals keeps two copies. local_ip is conventional host order, first octet
+ //in the high byte. every address the quake layer handles - what HLConParseIPV4
+ //builds, what HLNetUdpSetPeer and the arp cache take, and the from_ip a packet
+ //arrives with - is first octet low, which is what local_ip_be holds.
+ //
+ //returning raw local_ip advertises the address reversed: 10.0.2.15 goes out as
+ //15.2.0.10, and a client trusting the address in CCREP_SERVER_INFO connects to
+ //nothing. a hand-typed address never touches this value
+	return ipv4_globals.local_ip_be;
+}
+
+U0 HLNetDhcp()
+{//explicit, only on request
+	//NetConfigure retries DISCOVER for seconds and a direct link has nothing to
+	//discover, so the failure is latched to keep the menu responsive
+	if (hl_dhcp_failed)
+	{
+		HLStrCopy(hl_udp_status, "dhcp already failed - use qip", 96);
+		return;
+	}
+
+	NetConfigure;
+
+	if (ipv4_globals.local_ip)
+		StrPrint(hl_udp_status, "dhcp ok: %d.%d.%d.%d",
+			ipv4_globals.local_ip & 255,
+			(ipv4_globals.local_ip >> 8) & 255,
+			(ipv4_globals.local_ip >> 16) & 255,
+			(ipv4_globals.local_ip >> 24) & 255);
+	else
+	{
+		hl_dhcp_failed = TRUE;
+		HLStrCopy(hl_udp_status, "dhcp failed - no server? use qip", 96);
+	}
+}
+
+Bool HLNetUdpSetLocalIP(U32 ip)
+{//static address for a link with no dhcp server, as two qemu guests joined by
+ //-netdev socket are. arp works there; only address and subnet are missing
+	U32 got;
+
+	if (!ip)
+	{
+		HLStrCopy(hl_udp_status, "qip: could not parse that address", 96);
+		return FALSE;
+	}
+
+	IPV4AddressSet(ip);
+
+	//a /24 with no router: everything on-link, nothing forwarded to a gateway that
+	//does not exist
+	IPV4SubnetSet(0, 0x00FFFFFF);
+
+	//read back what the stack holds rather than echoing the request: a set that
+	//did not take otherwise surfaces as an unrelated failure later
+	got = ipv4_globals.local_ip;
+
+	StrPrint(hl_udp_status, "ip now %d.%d.%d.%d",
+		got & 255, (got >> 8) & 255, (got >> 16) & 255, (got >> 24) & 255);
+
+	return ToBool(got == ip);
+}
+
+Bool HLNetAutoIP(U32 server_ip)
+{//pick a static address when the link has nobody to hand one out.
+ //hosting takes .1 on a private /24, joining takes a neighbour on the server's
+ //own /24, so both ends are on the same wire by construction. qip overrides, and
+ //anything already configured is left alone
+	U32 ip;
+	U32 last;
+
+	if (ipv4_globals.local_ip)
+		return TRUE;
+
+	if (!server_ip)
+		//first octet in the low byte, matching IPV4AddressParse. the other way
+		//round is 1.0.0.10, which binds and reaches nobody
+		ip = 10 | (0 << 8) | (0 << 16) | (1 << 24);	//10.0.0.1, host
+	else
+	{
+		//keep the top three octets, move only the host part, away from .0 and .255
+		last = (server_ip >> 24) & 255;
+
+		if (last >= 253)
+			last -= 1;
+		else
+			last += 1;
+
+		ip = (server_ip & 0x00FFFFFF) | (last << 24);
+	}
+
+	return HLNetUdpSetLocalIP(ip);
+}
+
+#else
+
+Bool HLNetAutoIP(U32 server_ip)
+{
+	return FALSE;
+}
+
+U32 HLNetLocalIP()
+{
+	return 0;
+}
+
+U0 HLNetDhcp()
+{
+	HLStrCopy(hl_udp_status, "no net stack - run RunNet.ZC", 96);
+}
+
+Bool HLNetUdpSetLocalIP(U32 ip)
+{
+	return FALSE;
+}
+
+#endif
