@@ -26,13 +26,13 @@
 #define D1SND_PATH		80
 #define D1SND_SFX_VOL	256		//AUDIO_VOL_UNITY
 #define D1SND_MUS_VOL	100		//music sits under the sfx, as sound.cpp
-#define D1SND_FEED_CHUNK 2048	//frames pushed per feeder wake, ~43ms
 
 class CD1SndCache
 {
 	U8	 path[D1SND_PATH];
-	U32	*frames;			//48kHz stereo, owned here; voices borrow it
+	U32	*frames;			//native rate, stereo; owned here, voices borrow it
 	I64	 count;
+	I64	 rate;				//source rate; AudioSFXPlayRef steps the voice
 	I64	 stamp;				//LRU tick
 	Bool missing;			//negative result cached, no re-probe per play
 };
@@ -53,17 +53,8 @@ I64	 d1snd_stamp = 0;
 U32	*d1snd_mus_frames = NULL;	//48kHz stereo, owned here
 I64	 d1snd_mus_count  = 0;
 I64	 d1snd_mus_rate   = 0;
-I64	 d1snd_mus_handle = -1;		//unused; music runs on a stream, not a voice
+I64	 d1snd_mus_handle = -1;		//looping voice
 U8	 d1snd_mus_path[D1SND_PATH];
-
-//music rides an output stream fed by its own task, the path ZealAmp uses.
-//a voice random-accesses its whole buffer once per output sample; a stream
-//is a sequential fifo the mixer drains, and only the fifo has to keep up.
-I64	 d1snd_mus_stream = -1;
-I64	 d1snd_mus_pos    = 0;		//frame index into d1snd_mus_frames
-Bool d1snd_mus_feed   = FALSE;	//feeder is allowed to touch the PCM
-Bool d1snd_mus_busy   = FALSE;	//feeder is inside the PCM right now
-Bool d1snd_mus_spawn  = FALSE;	//feeder task exists
 
 //D1Store owns a one-shot voice channel for towner speech; it compiles later,
 //so teardown reaches it through this hook rather than by name
@@ -306,6 +297,7 @@ U0 D1SndInitState()
 		d1snd_cache[i].path[0] = 0;
 		d1snd_cache[i].frames  = NULL;
 		d1snd_cache[i].count   = 0;
+		d1snd_cache[i].rate    = 0;
 		d1snd_cache[i].stamp   = 0;
 		d1snd_cache[i].missing = FALSE;
 	}
@@ -321,9 +313,6 @@ U0 D1SndInitState()
 	d1snd_mus_rate    = 0;
 	d1snd_mus_handle  = -1;
 	d1snd_mus_path[0] = 0;
-	d1snd_mus_pos     = 0;
-	d1snd_mus_feed    = FALSE;
-	d1snd_mus_busy    = FALSE;
 	d1snd_ready       = TRUE;
 }
 
@@ -422,18 +411,19 @@ I64 D1SndCacheLoad(U8 *path)
 	raw = D1MpqRead(path, &size);
 	if (!raw)
 		return -1;
+	//no resample: the mixer steps each voice by rate/QSND_MIX_RATE, so
+	//pre-converting to 48kHz only inflates the buffer. QSound.ZC does the same.
 	ncount = D1SndDecodeNative(raw, size, &native, &rate);
 	Free(raw);
 	if (!ncount)
 		return -1;
-	frames = D1SndResample48(native, ncount, rate, &count);
-	Free(native);
-	if (!frames)
-		return -1;
 
-	d1snd_cache[idx].frames  = frames;
-	d1snd_cache[idx].count   = count;
+	d1snd_cache[idx].frames  = native;
+	d1snd_cache[idx].count   = ncount;
+	d1snd_cache[idx].rate    = rate;
 	d1snd_cache[idx].missing = FALSE;
+	no_warn frames;
+	no_warn count;
 	return idx;
 }
 
@@ -474,7 +464,7 @@ U0 D1SndPlay(U8 *path)
 		return;
 	v = D1SndVoiceSlot();
 	handle = D1SndHwPlay(d1snd_cache[idx].frames, d1snd_cache[idx].count,
-		D1SND_RATE, D1SND_SFX_VOL, FALSE);
+		d1snd_cache[idx].rate, D1SND_SFX_VOL, FALSE);
 	if (handle < 0)
 		return;
 	d1snd_stamp++;
@@ -515,60 +505,8 @@ U0 D1SndPlayMon(U8 *gfx_fmt, U8 letter)
 
 //--- music ------------------------------------------------------------------
 
-U0 D1SndMusicTask()
-{//tops the stream fifo up every ms, wrapping at the end of the track.
- //mirrors ZealAmp's feeder loop. d1snd_mus_feed gates access to the PCM;
- //d1snd_mus_busy reports whether this task is inside it right now, so a
- //stop can wait the pointer out instead of freeing under the feeder.
-	I64 i;
-
-	while (TRUE)
-	{
-		if (d1snd_mus_feed && d1snd_mus_frames && d1snd_mus_stream >= 0 &&
-			d1snd_mus_count > 0)
-		{
-			d1snd_mus_busy = TRUE;
-			//re-read the gate after claiming: a stop between the test and
-			//the claim would otherwise free the buffer under this loop
-			if (d1snd_mus_feed)
-			{
-				i = 0;
-				while (i < D1SND_FEED_CHUNK && d1snd_mus_feed)
-				{
-					if (!AudioStreamPush(d1snd_mus_stream,
-						d1snd_mus_frames[d1snd_mus_pos]))
-						i = D1SND_FEED_CHUNK;	//fifo full
-					else
-					{
-						d1snd_mus_pos++;
-						if (d1snd_mus_pos >= d1snd_mus_count)
-							d1snd_mus_pos = 0;
-						i++;
-					}
-				}
-			}
-			d1snd_mus_busy = FALSE;
-		}
-		Sleep(1);
-	}
-}
-
 U0 D1SndMusicStop()
 {
-	I64 i;
-
-	//close the gate, then wait for the feeder to leave the buffer
-	d1snd_mus_feed = FALSE;
-	for (i = 0; i < 64; i++)
-	{
-		if (!d1snd_mus_busy)
-			i = 64;
-		else
-			Sleep(2);
-	}
-	if (d1snd_mus_stream >= 0)
-		AudioStreamStop(d1snd_mus_stream);
-
 	if (d1snd_mus_handle >= 0)
 	{
 		D1SndHwStop(d1snd_mus_handle);
@@ -583,7 +521,6 @@ U0 D1SndMusicStop()
 	}
 	d1snd_mus_count   = 0;
 	d1snd_mus_rate    = 0;
-	d1snd_mus_pos     = 0;
 	d1snd_mus_path[0] = 0;
 }
 
@@ -610,32 +547,23 @@ U0 D1SndMusic(U8 *path)
 		I64	 ncount;
 		I64	 nrate = 0;
 
+		//kept at the source rate. resampling DLvlB to 48kHz stereo is a 64MB
+		//buffer off a 101MB transient; the mixer steps the voice instead.
 		ncount = D1SndDecodeNative(raw, size, &nat, &nrate);
 		Free(raw);
 		if (!ncount)
 			return;
-		//resample to the mixer rate so the voice steps 1:1; the native
-		//fractional step plays rougher on this AC97 path
-		d1snd_mus_frames = D1SndResample48(nat, ncount, nrate,
-			&d1snd_mus_count);
-		Free(nat);
-		if (!d1snd_mus_frames)
-			return;
-		d1snd_mus_rate = D1SND_RATE;
+		d1snd_mus_frames = nat;
+		d1snd_mus_count  = ncount;
+		d1snd_mus_rate   = nrate;
 	}
 	D1StrCopy(d1snd_mus_path, path, D1SND_PATH);
 
-	if (d1snd_mus_stream < 0)
-		d1snd_mus_stream = AudioStreamOpen();
-	if (d1snd_mus_stream < 0)
-		return;					//no free stream; track stays silent
-	if (!d1snd_mus_spawn)
-	{
-		Spawn(&D1SndMusicTask, , "D1 Music", 1);
-		d1snd_mus_spawn = TRUE;
-	}
-	d1snd_mus_pos  = 0;
-	d1snd_mus_feed = TRUE;
+	//a looping voice at the source rate, as QSound.ZC plays its tracks. the
+	//stream fifo carries mixer-rate frames only, so native-rate music cannot
+	//ride it without the resample this avoids.
+	d1snd_mus_handle = D1SndHwPlay(d1snd_mus_frames, d1snd_mus_count,
+		d1snd_mus_rate, D1SND_MUS_VOL, TRUE);
 }
 
 U0 D1SndMusicForLevel(I64 level)
