@@ -74,7 +74,7 @@ comments. Deviations are deliberate and marked.
 - VGUI mouse input; menus are keyboard-only.
 - Sequence groups (`<name>NN.mdl`), chrome, per-vertex model lighting / Gouraud.
 - Client prediction, demo record (Wave C).
-- Span asm hot path (Wave B partial: LightPoint cache + brush backface landed).
+- Optional hand-asm span (C fast path via `hl_r_spanfast` landed).
 
 ## Recently landed (Wave A/B start)
 
@@ -83,7 +83,10 @@ comments. Deviations are deliberate and marked.
 - `MakeDormant` for off-map globalname copies.
 - Headcrab leap flight + leech AI row.
 - Autoaim HUD reticle, gauss glow sprites, RPG spot glow.
-- Soft-raster: `HLLightPoint` grid cache; unrotated brush backface cull.
+- Soft-raster: `HLLightPoint` grid cache; unrotated brush backface cull;
+  opaque `surf32` span fast path (`hl_r_spanfast`); view-rect clear;
+  1:1 blit path; studio local-pose bone cache; keyed rocket/muzzle/explosion
+  dlights.
 
 ## Game data
 
