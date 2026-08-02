@@ -400,6 +400,21 @@ qdn_next:
 //no lit surface found under a model
 #define HLLIGHT_FALLBACK		170
 
+//R_LightPoint grid cache for sprites/tents that sample many nearby origins
+#define HLLIGHT_PT_GRID		32
+#define HLLIGHT_PT_SLOTS	16
+
+class CHLLightPtSlot
+{
+	I64	qx;
+	I64	qy;
+	I64	qz;
+	I64	frame;		//hl_dlight_frame when filled; -1 empty
+	I64	val;
+	I64	key;
+	I64	style;
+};
+
 U8	hl_lightstyle[HLMAX_LIGHTSTYLES * HLLIGHTSTYLE_LEN];
 I64	hl_lightstyle_value[HLMAX_LIGHTSTYLES];
 U8	hl_light_scratch[HLLIGHT_SCRATCH_B];
@@ -445,6 +460,8 @@ I64 hl_light_pt_style = -1;
 //can change it. -1 when no lit face was found.
 I64 hl_light_pt_key = -1;
 
+CHLLightPtSlot hl_light_pt_cache[HLLIGHT_PT_SLOTS];
+
 F64 hl_light_time = 0.0;		//time this frame is drawn at
 F64 hl_light_last = 0.0;		//previous frame, for dynamic light decay
 
@@ -468,6 +485,9 @@ U0 HLLightInit()
 	hl_light_last  = 0.0;
 	hl_light_time  = 0.0;
 	hl_light_pt_style = -1;
+
+	for (i = 0; i < HLLIGHT_PT_SLOTS; i++)
+		hl_light_pt_cache[i].frame = -1;
 
 	for (i = 0; i < HLMAX_LIGHTSTYLES; i++)
 	{
@@ -1049,6 +1069,7 @@ I64 HLLightPoint(CHLMap *map, F64 *point)
 	CHLFace	 *f;
 	CHLTexInfo *ti;
 	CHLLeaf	 *leaf;
+	CHLLightPtSlot *cs;
 	F64		  s_coord;
 	F64		 t_coord;
 	I64		 ds;
@@ -1067,12 +1088,40 @@ I64 HLLightPoint(CHLMap *map, F64 *point)
 	I64		 i;
 	I64		 node;
 	I64		 best = -1;
+	I64		 qx;
+	I64		 qy;
+	I64		 qz;
+	I64		 slot;
+	Bool		 cache_ok;
 
 	hl_light_pt_style = -1;
 	hl_light_pt_key   = -1;
 
 	if (!map || !map->lightdata)
 		return HLLIGHT_FALLBACK;
+
+	//32uu grid cache. same cell + frame reuses the sample. live dlights make
+	//the result origin-sensitive inside the cell, so the cache stays off then
+	cache_ok = FALSE;
+	if (!hl_dlight_any && point)
+	{
+		qx = ToI64(Floor(point[0] / ToF64(HLLIGHT_PT_GRID)));
+		qy = ToI64(Floor(point[1] / ToF64(HLLIGHT_PT_GRID)));
+		qz = ToI64(Floor(point[2] / ToF64(HLLIGHT_PT_GRID)));
+		slot = (qx * 73856093 + qy * 19349663 + qz * 83492791) &
+			(HLLIGHT_PT_SLOTS - 1);
+		cs = &hl_light_pt_cache[slot];
+		cache_ok = TRUE;
+
+		if (cs->frame == hl_dlight_frame &&
+			cs->qx == qx && cs->qy == qy && cs->qz == qz)
+		{
+			hl_light_pt_key   = cs->key;
+			hl_light_pt_style = cs->style;
+			best = cs->val;
+			goto qlp_cached;
+		}
+	}
 
 	//counted here rather than at the call sites, so the r_speeds line is the
 	//number of traces actually run
@@ -1088,12 +1137,18 @@ I64 HLLightPoint(CHLMap *map, F64 *point)
 	HLTracePoint(map, point, end, &tr);
 
 	if (!tr.hit || tr.fraction == 1.0)
-		return HLLIGHT_FALLBACK;
+	{
+		best = HLLIGHT_FALLBACK;
+		goto qlp_store;
+	}
 
 	//the trace gives a position but not a face, so test the leaf's surfaces
 	node = HLVisLeafForPoint(map, tr.end_pos);
 	if (node <= 0 || node >= map->num_leafs)
-		return HLLIGHT_FALLBACK;
+	{
+		best = HLLIGHT_FALLBACK;
+		goto qlp_store;
+	}
 
 	leaf = &map->leafs[node];
 
@@ -1238,6 +1293,19 @@ qlp_no_dlights:
 	if (best < 24)
 		best = 24;
 
+qlp_store:
+	if (cache_ok)
+	{
+		cs->qx    = qx;
+		cs->qy    = qy;
+		cs->qz    = qz;
+		cs->frame = hl_dlight_frame;
+		cs->val   = best;
+		cs->key   = hl_light_pt_key;
+		cs->style = hl_light_pt_style;
+	}
+
+qlp_cached:
 	return best;
 }
 
@@ -3761,11 +3829,15 @@ U0 HLDrawBrushModel(CHLCanvas *c, CHLMap *map, I64 model_index,
  //turned". forwarding angles for an entity that only used them to pick a
  //direction renders the brush rotated - func_door and func_train show it
 	CHLModel *m;
+	CHLFace	 *f;
+	CHLPlane	 *plane;
 	F64		  xf[12];
 	F64		  org[3];
 	F64		 *xform = NULL;
 	F64		 *ofs;
+	F64		  ndot;
 	I64		  i;
+	Bool		  unrot = TRUE;
 
 	if (model_index < 0 || model_index >= map->num_models)
 		return;
@@ -3790,6 +3862,7 @@ U0 HLDrawBrushModel(CHLCanvas *c, CHLMap *map, I64 model_index,
 
 			HLMatFromAngles(angles, org, xf);
 			xform = xf;
+			unrot = FALSE;
 
 			//the matrix already carries the translation; passing offset as
 			//well would apply the origin twice
@@ -3807,13 +3880,32 @@ U0 HLDrawBrushModel(CHLCanvas *c, CHLMap *map, I64 model_index,
 	HLMarkLightsModel(map, m, origin, xform);
 	hl_dlight_mspace_on = hl_r_dynamic;
 
-	//no face culling: a rotated submodel has no world-space face plane to test
-	//against
+	//unrotated brushes keep authored plane normals, so a view-dir backface
+	//cull is safe. rotated ones have no world-space plane here - skip. AABB
+	//frustum needs a CHLVisState this path does not carry
 	for (i = 0; i < m->num_faces; i++)
 	{
-		if (m->first_face + i < map->num_faces)
-			HLDrawFace(c, map, m->first_face + i, ofs, ent_frame, xform,
-				blend, amt);
+		if (m->first_face + i >= map->num_faces)
+			goto qbm_next;
+
+		if (unrot)
+		{
+			f = &map->faces[m->first_face + i];
+			if (f->plane_num >= 0 && f->plane_num < map->num_planes)
+			{
+				plane = &map->planes[f->plane_num];
+				ndot  = HLVecDot(plane->normal, c->forward);
+				if (f->side)
+					ndot = -ndot;
+				if (ndot > 0.0)
+					goto qbm_next;
+			}
+		}
+
+		HLDrawFace(c, map, m->first_face + i, ofs, ent_frame, xform,
+			blend, amt);
+
+qbm_next:
 	}
 
 	hl_dlight_mspace_on = FALSE;

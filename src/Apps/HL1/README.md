@@ -66,14 +66,24 @@ comments. Deviations are deliberate and marked.
 
 ## Not done
 
-- Remaining monster classes: the small fauna (leech and friends) spawn inert.
+- Remaining fauna beyond leech (assassin, garg, ichthyosaur stay model-only).
 - Protocol 48 server send loop; field encoding and delta.lst are done.
 - Present buffer for the frame; fades can flicker.
-- Squad AI: hgrunts fight as individuals.
-- Monster-vs-monster collision: traces clip `SOLID_BSP` only.
-- `func_tracktrain` hull issues remain; no driveables.
+- Node cover / scent / scripted death poses (Wave L).
+- `func_tracktrain` bank key still unused; rotating hull is on.
 - VGUI mouse input; menus are keyboard-only.
-- Sequence groups (`<name>NN.mdl`), chrome, per-vertex model lighting.
+- Sequence groups (`<name>NN.mdl`), chrome, per-vertex model lighting / Gouraud.
+- Client prediction, demo record (Wave C).
+- Span asm hot path (Wave B partial: LightPoint cache + brush backface landed).
+
+## Recently landed (Wave A/B start)
+
+- AI projectiles via `hl_proj` queue (spit, hornet, ctrl ball, grunt grenade).
+- `func_monsterclip` solid to monsters only (`hl_clip_for_monster`).
+- `MakeDormant` for off-map globalname copies.
+- Headcrab leap flight + leech AI row.
+- Autoaim HUD reticle, gauss glow sprites, RPG spot glow.
+- Soft-raster: `HLLightPoint` grid cache; unrotated brush backface cull.
 
 ## Game data
 
