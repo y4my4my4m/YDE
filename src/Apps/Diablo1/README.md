@@ -208,15 +208,15 @@ pinned, frames eyeballed as PNG) and in-VM by D1Test.
   levels, so his own level is not built.
 - AI_CLEAVER, AI_SKELKING and AI_WARLORD are unimplemented; all three
   bosses reduce to the skeleton melee AI.
-- The hovered name floats over the actor. Retail puts it in the panel
-  info box at panel-relative 177,434; the port's gold/level line holds
-  that slot.
+- The hovered name floats over ground items (colored Alt-style). Retail puts
+  actor names in the panel info box; monsters still fill that box too. When
+  Enemy Health Bar is on, the top bar shows frame + HP fill + monster name.
 - towners.cpp AnimOrder frame-sequence tables are absent. Six of the
   eight towners play a hand-authored sequence upstream; here they cycle
   their frames linearly at the correct per-towner rate.
 - Level 13 keeps its down stairs, which DRLG_L4's Q_WARLORD branch omits.
-- L3ANVIL is a miniset upstream, not a DUN, and is not implemented, so
-  level 10 carries no set piece.
+- L3ANVIL places on level 10; Anvil of Fury ground item drops there.
+  Griswold turn-in (reward weapon) is not wired yet.
 - Music plays one pass and stops.
 - Multiplayer: lockstep transport and peer sim are in tree
   (`D1Net.ZC`, `D1Peer*` in `D1Play.ZC`); Host/Join menu and character-
