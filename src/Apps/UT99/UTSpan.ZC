@@ -1,11 +1,16 @@
-// UTSpan.ZC - SoftDrv span buffer. Upstream: UnRender.h FSpan / FSpanBuffer.
+// UTSpan.ZC - SoftDrv FSpan / FSpanBuffer (UnSpan.h).
 //
-// SoftDrv sets URenderDevice::SpanBased. Spans are the CPU occlusion
-// representation: per scanline, ordered open [start,end) segments. Hardware
-// devices ignore this and use a Z buffer alone; this port keeps both.
+// SoftDrv SpanBased=1. Screen holds free (undrawn) [start,end) runs per Y.
+// Render FSpanBuffer::CopyFromRasterUpdate claims raster ∩ open into Facet.Span
+// and punches the screen. SoftDrv DrawComplexSurface / DrawGouraudPolygon then
+// walks Facet.Span->Index[y] linked list (every FSpan on the row).
+//
+// This buffer is the screen open set. Draw clips against it then punches.
+// Overflow must not drop leftover opens — that sealed the view black.
 
 #define UT_SPAN_MAX_ROWS	1200
-#define UT_SPAN_MAX_SEGS	32		//open segments per row; 8 dropped fragments → black seal
+#define UT_SPAN_MAX_SEGS	64		//UnSpan grows from FMemStack; fixed pool here
+#define UT_SPAN_MAX_HIT		32		//intersect results per row for one raster
 
 class CUTSpanSeg
 {
@@ -26,10 +31,11 @@ class CUTSpanBuf
 	CUTSpanRow	row[UT_SPAN_MAX_ROWS];
 	I64			spans_drawn;
 	I64			spans_clipped;
+	I64			punch_abort;	//overflow refused punch (kept opens)
 };
 
 U0 UTSpanClear(CUTSpanBuf *sb, I64 w, I64 h)
-{//full-screen open: one segment [0,w) per row. Lock() with ClearScreen.
+{//AllocIndexForScreen: one open [0,w) per row. SoftDrv Lock + ClearScreen.
 	I64 y;
 
 	if (h > UT_SPAN_MAX_ROWS)
@@ -40,6 +46,7 @@ U0 UTSpanClear(CUTSpanBuf *sb, I64 w, I64 h)
 	sb->height = h;
 	sb->spans_drawn   = 0;
 	sb->spans_clipped = 0;
+	sb->punch_abort   = 0;
 	y = 0;
 	while (y < h)
 	{
@@ -51,7 +58,7 @@ U0 UTSpanClear(CUTSpanBuf *sb, I64 w, I64 h)
 }
 
 U0 UTSpanEmpty(CUTSpanBuf *sb, I64 w, I64 h)
-{//no open pixels (fully occluded)
+{//fully occluded
 	I64 y;
 
 	if (h > UT_SPAN_MAX_ROWS)
@@ -60,6 +67,7 @@ U0 UTSpanEmpty(CUTSpanBuf *sb, I64 w, I64 h)
 	sb->height = h;
 	sb->spans_drawn   = 0;
 	sb->spans_clipped = 0;
+	sb->punch_abort   = 0;
 	y = 0;
 	while (y < h)
 	{
@@ -68,56 +76,108 @@ U0 UTSpanEmpty(CUTSpanBuf *sb, I64 w, I64 h)
 	}
 }
 
-Bool UTSpanClip(CUTSpanBuf *sb, I64 y, I64 *x1, I64 *x2)
-{//clip [x1,x2) against first overlapping open segment.
- //World BSP passes span=NULL (Z-buffer). Multi-seg walk needed before
- //re-enabling FSpan on complex maps — first-seg-only left holes.
+I64 UTSpanIntersect(CUTSpanBuf *sb, I64 y, I64 x1, I64 x2,
+	I64 *out_a, I64 *out_b, I64 max_out)
+{//raster ∩ open segs. SoftDrv: for (FSpan* S=Index[y]; S; S=S->Next).
 	CUTSpanRow *r;
 	I64 i;
+	I64 n;
 	I64 a;
 	I64 b;
 	I64 s0;
 	I64 s1;
 
-	if (!sb || y < 0 || y >= sb->height)
-		return FALSE;
-	a = *x1;
-	b = *x2;
-	if (a < 0) a = 0;
-	if (b > sb->width) b = sb->width;
-	if (a >= b)
-		return FALSE;
+	n = 0;
+	if (!sb || !out_a || !out_b || max_out < 1)
+		return 0;
+	if (y < 0 || y >= sb->height)
+		return 0;
+	if (x1 < 0) x1 = 0;
+	if (x2 > sb->width) x2 = sb->width;
+	if (x1 >= x2)
+		return 0;
 	r = &sb->row[y];
 	i = 0;
-	while (i < r->n)
+	while (i < r->n && n < max_out)
 	{
 		s0 = r->seg[i].start;
 		s1 = r->seg[i].end;
-		if (b > s0 && a < s1)
+		a = x1;
+		b = x2;
+		if (a < s0) a = s0;
+		if (b > s1) b = s1;
+		if (a < b)
 		{
-			if (a < s0) a = s0;
-			if (b > s1) b = s1;
-			if (a < b)
-			{
-				*x1 = a;
-				*x2 = b;
-				return TRUE;
-			}
+			out_a[n] = a;
+			out_b[n] = b;
+			n++;
 		}
 		i++;
 	}
-	sb->spans_clipped++;
+	if (n == 0)
+		sb->spans_clipped++;
+	return n;
+}
+
+Bool UTSpanClip(CUTSpanBuf *sb, I64 y, I64 *x1, I64 *x2)
+{//first overlapping open only. Prefer UTSpanIntersect for SoftDrv fill.
+	I64 a[1];
+	I64 b[1];
+	I64 n;
+
+	n = UTSpanIntersect(sb, y, *x1, *x2, a, b, 1);
+	if (n < 1)
+		return FALSE;
+	*x1 = a[0];
+	*x2 = b[0];
+	return TRUE;
+}
+
+Bool UTSpanBoxVisible(CUTSpanBuf *sb, I64 x1, I64 y1, I64 x2, I64 y2)
+{//FSpanBuffer::BoxIsVisible — any open pixel in AABB.
+	I64 y;
+	I64 i;
+	CUTSpanRow *r;
+	I64 s0;
+	I64 s1;
+
+	if (!sb)
+		return TRUE;
+	if (y1 < 0) y1 = 0;
+	if (y2 > sb->height) y2 = sb->height;
+	if (x1 < 0) x1 = 0;
+	if (x2 > sb->width) x2 = sb->width;
+	if (x1 >= x2 || y1 >= y2)
+		return FALSE;
+	y = y1;
+	while (y < y2)
+	{
+		r = &sb->row[y];
+		i = 0;
+		while (i < r->n)
+		{
+			s0 = r->seg[i].start;
+			s1 = r->seg[i].end;
+			if (x2 > s0 && x1 < s1)
+				return TRUE;
+			i++;
+		}
+		y++;
+	}
 	return FALSE;
 }
 
 U0 UTSpanPunch(CUTSpanBuf *sb, I64 y, I64 x1, I64 x2)
-{//mark [x1,x2) drawn: split/remove open segments. SoftDrv occlusion update.
+{//remove [x1,x2) from open set. SoftDrv occlusion update (screen side of
+ //CopyFromRasterUpdate). Abort whole row update on pool overflow — never
+ //drop leftover opens (that sealed near walls black).
 	CUTSpanRow *r;
 	CUTSpanSeg	tmp_seg[UT_SPAN_MAX_SEGS];
 	I64			tn;
 	I64			i;
 	I64			s0;
 	I64			s1;
+	Bool		overflow;
 
 	if (!sb || y < 0 || y >= sb->height)
 		return;
@@ -127,6 +187,7 @@ U0 UTSpanPunch(CUTSpanBuf *sb, I64 y, I64 x1, I64 x2)
 		return;
 	r  = &sb->row[y];
 	tn = 0;
+	overflow = FALSE;
 	i  = 0;
 	while (i < r->n)
 	{
@@ -134,29 +195,47 @@ U0 UTSpanPunch(CUTSpanBuf *sb, I64 y, I64 x1, I64 x2)
 		s1 = r->seg[i].end;
 		if (s1 <= x1 || s0 >= x2)
 		{
-			if (tn < UT_SPAN_MAX_SEGS)
+			if (tn >= UT_SPAN_MAX_SEGS)
 			{
-				tmp_seg[tn].start = s0;
-				tmp_seg[tn].end   = s1;
-				tn++;
+				overflow = TRUE;
+				goto punch_done;
 			}
+			tmp_seg[tn].start = s0;
+			tmp_seg[tn].end   = s1;
+			tn++;
 		}
 		else
 		{
-			if (s0 < x1 && tn < UT_SPAN_MAX_SEGS)
+			if (s0 < x1)
 			{
+				if (tn >= UT_SPAN_MAX_SEGS)
+				{
+					overflow = TRUE;
+					goto punch_done;
+				}
 				tmp_seg[tn].start = s0;
 				tmp_seg[tn].end   = x1;
 				tn++;
 			}
-			if (s1 > x2 && tn < UT_SPAN_MAX_SEGS)
+			if (s1 > x2)
 			{
+				if (tn >= UT_SPAN_MAX_SEGS)
+				{
+					overflow = TRUE;
+					goto punch_done;
+				}
 				tmp_seg[tn].start = x2;
 				tmp_seg[tn].end   = s1;
 				tn++;
 			}
 		}
 		i++;
+	}
+punch_done:
+	if (overflow)
+	{
+		sb->punch_abort++;
+		return;
 	}
 	r->n = tn;
 	if (tn > 0)
@@ -171,6 +250,8 @@ I64 UTSpanOpenCount(CUTSpanBuf *sb)
 	I64 i;
 
 	n = 0;
+	if (!sb)
+		return 0;
 	y = 0;
 	while (y < sb->height)
 	{

@@ -2,13 +2,23 @@
 
 Fork of `::/Apps/Quake` aimed at FitzQuake / QuakeSpasm / Ironwail-class mods
 (Alkaline, qbj3, …). Stock WinQuake stays in `Quake/`; this tree takes the
-raised limits, BSP2, loose gamedir files, `.lit`, and related engine work.
+raised limits, BSP2, loose gamedir files, and related engine work.
 
-Base today is still the NetQuake-shaped ZealC port (software rasterizer,
-QuakeC VM, protocol 15). Ironwail features land here; reference:
-https://github.com/andrei-drexler/ironwail
+Base: NetQuake-shaped ZealC port (software rasterizer, QuakeC VM, protocol 15).
+Reference: https://github.com/andrei-drexler/ironwail
 
-Mods in-tree (gitignored data): `alkaline/`, `qbj3/`. Select with `game <dir>`.
+## Enhanced vs stock Quake/
+
+| Feature | QuakePlus |
+|---------|-----------|
+| BSP29 + BSP2 + 2PSB | yes |
+| Loose files under gamedir | yes (mod paks → mod loose → id1 paks → id1 loose) |
+| Mod without pak0 | yes (qbj3-style tree) |
+| Max edicts / net ents | 8192 |
+| Precache models+sounds | 2048 |
+| CSQC / `.lit` / MD3 | not yet — stock sbar |
+
+Mods in-tree (gitignored data): `alkaline/`, `qbj3/`. Console: `game alkaline` or `game qbj3`, then `map start`.
 
 
 ## Game data

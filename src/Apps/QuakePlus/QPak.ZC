@@ -1,12 +1,22 @@
-// QPak.ZC - id PAK archive reader, COM_LoadPackFile
+// QPak.ZC - PAK archives + COM_LoadFile search path
 //
 // header: "PACK", dir offset, dir length. dir entry is 64 bytes -
 // 56-byte NUL-padded path, i32 offset, i32 size.
 //
 // whole archive stays resident (PAK0 is ~18MB) - ZealOS FileRead has no
 // seek, so lookups hand back interior pointers instead of copying
+//
+// search order (Ironwail COM_FindFile intent):
+//   mod paks (newest first) → mod loose → id1 paks → id1 loose
+// within one gamedir, a pak beats a loose file of the same name
 
-#define QPAK_MAX_PAKS	8
+#define QPAK_MAX_PAKS		16
+#define QCOM_MAX_LOOSE		64
+#define QCOM_BASE			"::/Apps/QuakePlus"
+
+//COM_AddGameDirectory target. empty = id1 only. owned here so QPakLoad can
+//see it (QMenu / Quake compile later)
+U8	q_game_dir[32];
 
 class CQPakEntry
 {
@@ -21,22 +31,43 @@ class CQPak
 	I64			 data_size;
 	CQPakEntry	*files;
 	I64			 num_files;
+	U8			 gamedir[32];
 };
 
-CQPak	*qpaks[QPAK_MAX_PAKS];
-I64		 qpak_count = 0;
+//loose FileRead blobs kept until unmount so QPakData can return borrowed ptrs
+class CQComLoose
+{
+	U8	*data;
+	I64	 size;
+	U8	 name[64];
+	U8	 gamedir[32];
+};
+
+CQPak		*qpaks[QPAK_MAX_PAKS];
+I64			 qpak_count = 0;
+CQComLoose	 q_com_loose[QCOM_MAX_LOOSE];
+I64			 q_com_loose_count = 0;
 
 U0 QPakInit()
 {//globals aren't zeroed
 	I64 i;
 
 	qpak_count = 0;
+	q_com_loose_count = 0;
+	q_game_dir[0] = 0;
 	for (i = 0; i < QPAK_MAX_PAKS; i++)
 		qpaks[i] = NULL;
+	for (i = 0; i < QCOM_MAX_LOOSE; i++)
+	{
+		q_com_loose[i].data = NULL;
+		q_com_loose[i].size = 0;
+		q_com_loose[i].name[0] = 0;
+		q_com_loose[i].gamedir[0] = 0;
+	}
 }
 
-Bool QPakMount(U8 *filename)
-{//index one archive, later mounts win on lookup
+Bool QPakMount(U8 *filename, U8 *gamedir)
+{//index one archive, later mounts win on lookup within that gamedir
 	CQPak		*pak;
 	CQPakEntry	*e;
 	U8			*d;
@@ -83,6 +114,10 @@ Bool QPakMount(U8 *filename)
 	pak->data_size	= size;
 	pak->num_files	= count;
 	pak->files		= CAlloc(count * sizeof(CQPakEntry));
+	if (gamedir)
+		QStrCopy(pak->gamedir, gamedir, 32);
+	else
+		pak->gamedir[0] = 0;
 
 	for (i = 0; i < count; i++)
 	{
@@ -101,17 +136,32 @@ Bool QPakMount(U8 *filename)
 	return TRUE;
 }
 
+U0 QComLooseFreeAll()
+{
+	I64 i;
+
+	for (i = 0; i < q_com_loose_count; i++)
+	{
+		if (q_com_loose[i].data)
+			Free(q_com_loose[i].data);
+		q_com_loose[i].data = NULL;
+		q_com_loose[i].size = 0;
+		q_com_loose[i].name[0] = 0;
+		q_com_loose[i].gamedir[0] = 0;
+	}
+	q_com_loose_count = 0;
+}
+
 U0 QPakUnmountAll()
-{//release every archive. the whole file stays resident and lookups hand back
- //interior pointers, so NOTHING may still hold one when this runs - flush every
- //cache first
+{//release every archive and sticky loose blob. lookups hand back interior
+ //pointers, so NOTHING may still hold one when this runs
 	CQPak	*pak;
 	I64		 i;
 
 	for (i = 0; i < QPAK_MAX_PAKS; i++)
 	{
 		pak = qpaks[i];
-		qpaks[i] = NULL;		//cleared before the free, not after
+		qpaks[i] = NULL;
 
 		if (!pak)
 			goto qpu_next;
@@ -127,10 +177,11 @@ qpu_next:
 	}
 
 	qpak_count = 0;
+	QComLooseFreeAll;
 }
 
-CQPakEntry *QPakFind(U8 *name, CQPak **_pak = NULL)
-{//newest pak first so it overrides
+CQPakEntry *QPakFindInDir(U8 *name, U8 *gamedir, CQPak **_pak)
+{//newest pak that belongs to gamedir first
 	CQPak		*pak;
 	CQPakEntry	*e;
 	I64			 p;
@@ -139,55 +190,162 @@ CQPakEntry *QPakFind(U8 *name, CQPak **_pak = NULL)
 	for (p = qpak_count - 1; p >= 0; p--)
 	{
 		pak = qpaks[p];
-		if (pak)
+		if (!pak)
+			goto qfid_next;
+		if (StrICompare(pak->gamedir, gamedir))
+			goto qfid_next;
+
+		for (i = 0; i < pak->num_files; i++)
 		{
-			for (i = 0; i < pak->num_files; i++)
+			e = &pak->files[i];
+			if (!StrICompare(e->name, name))
 			{
-				e = &pak->files[i];
-				if (!StrICompare(e->name, name))
-				{
-					if (_pak)
-						*_pak = pak;
-					return e;
-				}
+				if (_pak)
+					*_pak = pak;
+				return e;
 			}
 		}
+
+qfid_next:
 	}
 
 	if (_pak)
 		*_pak = NULL;
-
 	return NULL;
 }
 
-U8 *QPakData(U8 *name, I64 *_size = NULL)
-{//borrowed pointer into the pak, do NOT Free
-	CQPak		*pak = NULL;
-	CQPakEntry	*e   = QPakFind(name, &pak);
+U8 *QComLooseGet(U8 *gamedir, U8 *name, I64 *_size)
+{//FileRead into sticky cache, or return an existing entry
+	U8	 path[256];
+	U8	*d;
+	I64	 size = 0;
+	I64	 i;
 
-	if (!e || !pak)
+	for (i = 0; i < q_com_loose_count; i++)
+	{
+		if (!StrICompare(q_com_loose[i].gamedir, gamedir) &&
+			!StrICompare(q_com_loose[i].name, name))
+		{
+			if (_size)
+				*_size = q_com_loose[i].size;
+			return q_com_loose[i].data;
+		}
+	}
+
+	StrPrint(path, "%s/%s/%s", QCOM_BASE, gamedir, name);
+	if (!FileFind(path))
 	{
 		if (_size)
 			*_size = 0;
 		return NULL;
 	}
 
-	if (e->offset < 0 || e->offset + e->size > pak->data_size)
+	d = FileRead(path, &size);
+	if (!d)
 	{
-		"QPak: %s has an out-of-range extent\n", name;
 		if (_size)
 			*_size = 0;
 		return NULL;
+	}
+
+	if (q_com_loose_count >= QCOM_MAX_LOOSE)
+	{
+		"QPak: loose cache full, cannot keep %s\n", path;
+		Free(d);
+		if (_size)
+			*_size = 0;
+		return NULL;
+	}
+
+	i = q_com_loose_count;
+	q_com_loose_count++;
+	q_com_loose[i].data = d;
+	q_com_loose[i].size = size;
+	QStrCopy(q_com_loose[i].name, name, 64);
+	QStrCopy(q_com_loose[i].gamedir, gamedir, 32);
+
+	if (_size)
+		*_size = size;
+	return d;
+}
+
+U8 *QPakData(U8 *name, I64 *_size = NULL)
+{//borrowed pointer - pak interior or sticky loose blob. do NOT Free
+	CQPak		*pak = NULL;
+	CQPakEntry	*e;
+	U8			*src;
+	I64			 size = 0;
+
+	if (q_game_dir[0])
+	{
+		e = QPakFindInDir(name, q_game_dir, &pak);
+		if (e && pak)
+		{
+			if (e->offset < 0 || e->offset + e->size > pak->data_size)
+			{
+				"QPak: %s has an out-of-range extent\n", name;
+				if (_size)
+					*_size = 0;
+				return NULL;
+			}
+			if (_size)
+				*_size = e->size;
+			return pak->data + e->offset;
+		}
+
+		src = QComLooseGet(q_game_dir, name, &size);
+		if (src)
+		{
+			if (_size)
+				*_size = size;
+			return src;
+		}
+	}
+
+	e = QPakFindInDir(name, "id1", &pak);
+	if (e && pak)
+	{
+		if (e->offset < 0 || e->offset + e->size > pak->data_size)
+		{
+			"QPak: %s has an out-of-range extent\n", name;
+			if (_size)
+				*_size = 0;
+			return NULL;
+		}
+		if (_size)
+			*_size = e->size;
+		return pak->data + e->offset;
+	}
+
+	src = QComLooseGet("id1", name, &size);
+	if (src)
+	{
+		if (_size)
+			*_size = size;
+		return src;
 	}
 
 	if (_size)
-		*_size = e->size;
+		*_size = 0;
+	return NULL;
+}
 
-	return pak->data + e->offset;
+CQPakEntry *QPakFind(U8 *name, CQPak **_pak = NULL)
+{//compat: first match in COM order that lives in a pak (not loose)
+	CQPakEntry *e;
+
+	if (q_game_dir[0])
+	{
+		e = QPakFindInDir(name, q_game_dir, _pak);
+		if (e)
+			return e;
+	}
+
+	return QPakFindInDir(name, "id1", _pak);
 }
 
 U8 *QPakLoad(U8 *name, I64 *_size = NULL)
-{//owned copy, caller Frees
+{//owned copy, caller Frees. COM_LoadFile
 	I64  size = 0;
 	U8  *src  = QPakData(name, &size);
 	U8  *dst;
