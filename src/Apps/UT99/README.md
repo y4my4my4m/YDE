@@ -2,7 +2,12 @@
 
 Native ZealC SoftDrv port. Formats from FaultyRAM/Ut99PubSrc + retail packages.
 
-**SoftDrv = CPU framebuffer only** (P8 canvas → ARGB blit). UI = Canvas DrawTile + GrFont TTF LookAndFeel chrome. Full UScript UWindow Exec absent.
+## SoftDrv vs menu
+
+- **SoftDrv** = CPU `URenderDevice` only (P8 Lock/Unlock/DrawTile → ARGB blit).
+- **Menu** = UnrealScript **UWindow** from retail `System/UWindow.u`, `UMenu.u`, `UTMenu.u`.
+- Paint path = Engine **Canvas** `DrawTile` / `DrawText` (iNative 465–469 / 472–474) → SoftDrv P8.
+- PubSrc has `Window/` (Win32) + Engine Canvas headers. **No** `UWindow.uc` in pubsrc — class bodies live as ScriptText + bytecode inside retail `.u`.
 
 ## Runs
 
@@ -10,30 +15,35 @@ Native ZealC SoftDrv port. Formats from FaultyRAM/Ut99PubSrc + retail packages.
 Cd("::/Apps/UT99");;ExeFile("Run");
 ```
 
-Boot opens Practice Session (MenuGr metal desktop, menubar, lavender LAF window).
+Boot = `UTUWin` package client:
+- Object graph: `UMenuRootWindow` + `UMenuMenuBar` + `UTGameMenu` pulldown (CreateRootWindow host)
+- Art: `UMenu.u` Texture exports (`MenuBlack`, `Bg11`–`Bg43`, `BlueBar*`, `BlueMenu*`)
+- Paint: mirrors `UMenuRootWindow.Paint` + `UMenuBlueLookAndFeel.Menu_Draw*` via Canvas DrawTile
+- Input: mouse / keys → menubar + Game pulldown (`UTGameMenu` items from `UTMenu.int`)
+
+Enter or **Start Practice Session** = start match. ESC/Q = quit. In-game ESC returns to UWindow.
+
+Debug SoftDrv LAF clone: `ut_menu_fake_laf=TRUE` before `UT99` (not default).
+
 WASD mouse SPACE jump LMB/RMB fire `[` `]` weapons Tab scores K suicide.
-ESC pause menu. Maps: 1–4 favorites, `n`/`b` cycle.
+Maps: 1–4 favorites, `n`/`b` cycle.
 
 ## Present
 
 - SoftDrv P8 + FTB BSP + FSpan; per-surf `.utx`
-- UPalette from ArenaTex/MenuGr → `ut_pal_argb` blit; index 0 black; reserved pens include Win95 LAF lavender/blue
-- **UTWin**: UCanvas DrawTile / DrawText; LAF frame/button/combo/tab helpers
-- **UTFont**: `::/System/Gr/UISANS.TTF` via GrFont; optional UWindowFonts UFont
-- Menu: MenuGr `rmetal` + embossed U (`epic`/`logo2`); Game menubar; Start Practice Session Match/Rules/Settings/Bots; Mutators stub dialog
+- **UTWin**: UCanvas DrawTile / DrawText
+- **UTUWin**: RootWindow graph + package Texture paint + Canvas iNative bind
+- **UTVM**: Canvas natives 465–469 / 472–474 skip-parms + cmd flags
 - ChallengeHUD-style HUD via Canvas/TTF
-- Zone-0 volume solid + upward facet floors; OOB Z rescue to spawn
-- Bot spawn skips player start; 5s fire grace
-- Light actors → facet shade; Botpack weapons; announcer; IT music; CTF/DOM
+- Zone-0 volume solid; bots; Botpack weapons; CTF/DOM
 
 ## Gaps
 
-- Full UWindow hierarchy / UScript Exec not running
+- Full UScript object `New` / property linker for every widget still thin — host graph covers Root/MenuBar/Game menu
+- DrawTile iNative does not yet pop Texture object refs from bytecode (host Paint drives tiles)
 - Latent UScript / IpDrv net
 - Lightmaps absent; SoftDrv index-shade only
-- Zone portals / thin same-zone walls incomplete
-- Mutator list is stub labels only
 
 ## Modules
 
-`UTPal` `UTFont` `UTWin` `UTMenu` `UTSoft` `UTBsp` `UTGame` `UTHUD` …
+`UTPal` `UTFont` `UTWin` `UTUWin` `UTMenu` (debug LAF) `UTSoft` `UTBsp` `UTGame` `UTHUD` `UTVM` …
