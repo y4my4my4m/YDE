@@ -602,6 +602,12 @@ F64		hl_ent_tank_rocket_dmg		= 100.0;
 //and the timing are the entity's and run here. The shell drains the request
 Bool	hl_ent_loadsaved_pending	= FALSE;
 
+//gDisplayTitle, dlls/globals.cpp. worldspawn gametitle sets it; the player's
+//UpdateClientData fires GameTitle once and clears it, player.cpp:4154. A save
+//load remounts the map (which would set the flag again) and must clear it
+//before the first play frame, or the logo repeats on every Load Game.
+Bool	hl_ent_display_title		= FALSE;
+
 //trigger_endsection. pfnEndSection takes the section name and hands the player
 //back to the menu. The name is carried so the shell can pick a credits roll
 U8		hl_ent_endsection[64];
@@ -1628,7 +1634,9 @@ U0 HLEntPlayerDeathThink()
 		if (hl_ent_time < hl_ent_dead_time + HLENT_RESPAWN_DELAY)
 			return;
 
-		//FPlayerCanRespawn is always true in single player
+		//FPlayerCanRespawn is always true in CHalfLifeRules. SP still waits on
+		//the button; the press then reloads the last save (see RESPAWNABLE
+		//branch), matching client.cpp:respawn rather than a keep-world Spawn.
 		hl_ent_dead_time = hl_ent_time;
 		hl_ent_deadflag  = HLDEAD_RESPAWNABLE;
 		return;
@@ -1640,7 +1648,14 @@ U0 HLEntPlayerDeathThink()
 	if (!hl_ent_death_button)
 		return;
 
-	HLEntPlayerRespawn;
+	//client.cpp:140 respawn(): deathmatch/coop Spawn in place; single-player
+	//SERVER_COMMAND("reload") restores the last save. Keep-world Spawn left
+	//corpses of everything killed since the last autosave - that is MP rules
+	//on an SP death.
+	if (HLCvarGet("deathmatch") != 0.0 || HLCvarGet("coop") != 0.0)
+		HLEntPlayerRespawn;
+	else
+		hl_ent_loadsaved_pending = TRUE;
 }
 
 //--- helpers ----------------------------------------------------------------
@@ -6920,8 +6935,8 @@ U0 HLRevertMessage(I64 self)
 {//CRevertSaved::MessageThink and LoadThink, player.cpp:5025 and :5039, folded
  //into one method: the second visit is the load
  //
- //The reload needs a save system, which this port has no hook into. The request
- //is published and the shell decides what a revert means
+ //LoadThink does SERVER_COMMAND("reload\n"), player.cpp:5042. The shell drains
+ //hl_ent_loadsaved_pending into HLLoadGame (last slot), not a fresh map.
 	CHLEntity	*e = HLEntGet(self);
 	CHLTitleMsg	 t;
 	U8			 text[HLMSG_MAX_TEXT];
@@ -8664,17 +8679,99 @@ U0 HLItemTouch(I64 self)
 // delivers the key edge stamps once and the drain stops HLENT_USE_HOLD_GAP
 // later; one that delivers a held key drains for as long as it is held.
 //
-// The range test stands in for the SDK's trace to the charger.
+// Walk-away is the stale use_last gap, not a distance test: brush chargers
+// almost always sit at origin 0,0,0 with world mins/maxs, so comparing the
+// player to e->origin killed every unit past spawn. PlayerUse already keeps
+// the probe on the abs box while IN_USE is held (healthkit.cpp / h_battery).
 //
 // The two pool sizes are hl_ent_charge_health and hl_ent_charge_armor, above
 // HLItemTouch: they vary with difficulty and so cannot be defines.
 #define HLENT_CHARGE_STEP		0.1		//seconds between points
-#define HLENT_CHARGE_RANGE		72.0	//how far you can stand and still charge
+#define HLENT_CHARGE_LOOP_DELAY	0.56	//m_flSoundTime, healthkit.cpp:222
+
+//m_iOn, healthkit.cpp / h_battery.cpp: 0 idle, 1 start cue played, 2 looping
+I64		hl_charger_on[HLENT_MAX];
+I64		hl_charger_voice[HLENT_MAX];	//HLSndLoopHold handle, -1 silent
+I64		hl_charger_pitch[HLENT_MAX];
+Bool	hl_charger_snd_valid = FALSE;
+
+U0 HLChargerSndReset()
+{//map change: charge loops outlive the entity table otherwise
+	I64 i;
+
+	for (i = 0; i < HLENT_MAX; i++)
+	{
+		if (hl_charger_snd_valid)
+			HLSndLoopStop(hl_charger_voice[i]);
+
+		hl_charger_on[i]    = 0;
+		hl_charger_voice[i] = -1;
+		hl_charger_pitch[i] = 0;
+	}
+
+	hl_charger_snd_valid = TRUE;
+}
+
+U0 HLChargerCentre(CHLEntity *e, F64 *out)
+{
+	I64 i;
+
+	for (i = 0; i < 3; i++)
+		out[i] = e->origin[i] + (e->mins[i] + e->maxs[i]) * 0.5;
+}
+
+U0 HLChargerOff(I64 self)
+{//CWallHealth::Off / CRecharge::Off - stop the charge loop
+	if (self < 0 || self >= HLENT_MAX)
+		return;
+
+	HLSndLoopStop(hl_charger_voice[self]);
+	hl_charger_voice[self] = -1;
+	hl_charger_pitch[self] = 0;
+	hl_charger_on[self]    = 0;
+}
+
+U0 HLChargerLoopKeep(I64 self, CHLEntity *e, Bool health)
+{//EMIT_SOUND CHAN_STATIC charge loop, healthkit.cpp:227 / h_battery.cpp:160.
+ //Held via HLSndLoopHold: brush chargers sit at origin 0 and HLSndPlayAt's
+ //entity-follow path / PickChannel under ambient load both drop the hum.
+	F64	 centre[3];
+	F64	 vol;
+	U8	*loop_wav;
+
+	if (self < 0 || self >= HLENT_MAX || !e)
+		return;
+
+	if (hl_charger_on[self] < 1)
+		return;
+
+	if (hl_ent_time < e->charge_next)
+		return;
+
+	hl_charger_on[self] = 2;
+
+	HLChargerCentre(e, centre);
+
+	if (health)
+	{
+		loop_wav = "items/medcharge4.wav";
+		vol      = 1.0;
+	}
+	else
+	{
+		loop_wav = "items/suitcharge1.wav";
+		vol      = 0.85;
+	}
+
+	hl_charger_voice[self] = HLSndLoopHold(hl_charger_voice[self],
+		hl_charger_pitch[self], loop_wav, centre, vol, HLENT_SND_ATTEN,
+		HLPITCH_NORM);
+	hl_charger_pitch[self] = HLSndLoopPitchQuant(HLPITCH_NORM);
+}
 
 U0 HLChargerThink(I64 self)
 {
 	CHLEntity	*e = HLEntGet(self);
-	F64			 dist[3];
 	Bool		 health;
 	Bool		 full;
 
@@ -8689,14 +8786,7 @@ U0 HLChargerThink(I64 self)
 	//while pev->button carries IN_USE, player.cpp:1669
 	if (hl_ent_time - e->use_last > HLENT_USE_HOLD_GAP)
 	{
-		HLEntSetThink(e, HLM_NONE, 0.0);
-		return;
-	}
-
-	HLVecSub(hl_ent_player_org, e->origin, dist);
-
-	if (HLVecLength(dist) > HLENT_CHARGE_RANGE)
-	{
+		HLChargerOff(self);
 		HLEntSetThink(e, HLM_NONE, 0.0);
 		return;
 	}
@@ -8706,6 +8796,8 @@ U0 HLChargerThink(I64 self)
 		//CHAN_ITEM. CWallHealth::Use, healthkit.cpp:204, at volume 1.0;
 		//CRecharge::Use, h_battery.cpp:126, at 0.85. Refusal plays once and
 		//then the charger goes quiet.
+		HLChargerOff(self);
+
 		if (health)
 			HLEntSound(self, e, "items/medshotno1.wav", HLCHAN_ITEM, 1.0);
 		else
@@ -8734,11 +8826,16 @@ U0 HLChargerThink(I64 self)
 
 	if (full)
 	{
+		HLChargerOff(self);
 		HLEntSetThink(e, HLM_NONE, 0.0);
 		return;
 	}
 
 	e->charge -= 1.0;
+
+	//keep the hum alive on the think clock too: Use runs after thinks, so a
+	//frame where the probe misses would otherwise leave a one-shot start cue
+	HLChargerLoopKeep(self, e, health);
 
 	HLEntSetThink(e, HLM_CHARGER_THINK, hl_ent_time + HLENT_CHARGE_STEP);
 }
@@ -8752,12 +8849,21 @@ U0 HLChargerUse(I64 self)
 	if (!e)
 		return;
 
+	if (self < 0 || self >= HLENT_MAX)
+		return;
+
 	health = ToBool(!StrICompare(e->classname, "func_healthcharger"));
 
 	//a gap in the stamp means the key was released between this use and the
 	//last, which is where the start cue belongs
 	first       = ToBool(hl_ent_time - e->use_last > HLENT_USE_HOLD_GAP);
 	e->use_last = hl_ent_time;
+
+	//fresh press: CWallHealth::Off already ran on release; if think has not
+	//drained yet this frame, clear the previous on-state so the start cue
+	//and loop delay run again
+	if (first)
+		HLChargerOff(self);
 
 	if (e->charge <= 0.0)
 	{
@@ -8770,16 +8876,35 @@ U0 HLChargerUse(I64 self)
 		return;
 	}
 
-	//the start cue only. the SDK loops for as long as it is charging; stopping
-	//a loop needs a channel this side can reclaim.
-	//healthkit.cpp:221 and h_battery.cpp:154, both CHAN_ITEM
-	if (first)
+	//suit charger refuses without the HEV, h_battery.cpp:121
+	if (!health && !hl_ent_player_suit)
 	{
+		if (first)
+			HLEntSound(self, e, "items/suitchargeno1.wav", HLCHAN_ITEM, 0.85);
+		return;
+	}
+
+	//already topped off this hold: think called Off; do not re-fire the start
+	//cue every frame while +use stays down
+	if (health && hl_ent_player_health >= HLENT_MAX_HEALTH)
+		return;
+	if (!health && hl_ent_player_armor >= HLENT_MAX_ARMOR)
+		return;
+
+	//Play the on sound or the looping charging sound.
+	//healthkit.cpp:217-228 / h_battery.cpp:150-161
+	if (hl_charger_on[self] == 0)
+	{
+		hl_charger_on[self] = 1;
+		e->charge_next = hl_ent_time + HLENT_CHARGE_LOOP_DELAY;
+
 		if (health)
 			HLEntSound(self, e, "items/medshot4.wav", HLCHAN_ITEM, 1.0);
 		else
 			HLEntSound(self, e, "items/suitchargeok1.wav", HLCHAN_ITEM, 0.85);
 	}
+
+	HLChargerLoopKeep(self, e, health);
 
 	//already draining: the think owns the pacing, and re-entering it here
 	//would give a point per tick instead of one every HLENT_CHARGE_STEP
@@ -12332,6 +12457,17 @@ I64 HLEntSpawnOne(CHLMap *map, I64 i)
 		if (e->speed == 0.0)
 			e->speed = 100.0;
 
+		//CFuncConveyor::UpdateSpeed, bmodels.cpp:179: |speed|*16 in
+		//rendercolor g:b, sign in r. Draw reads that for scroll* slides.
+		if (e->speed < 0.0)
+			e->rendercolor[0] = 1.0;
+		else
+			e->rendercolor[0] = 0.0;
+		e->rendercolor[1] =
+			ToF64((ToI64(HLEntAbsF(e->speed) * 16.0) >> 8) & 255);
+		e->rendercolor[2] =
+			ToF64(ToI64(HLEntAbsF(e->speed) * 16.0) & 255);
+
 		HLEntSetAbsBox(e);
 		return 1;
 	}
@@ -13591,11 +13727,15 @@ U0 HLEntTrace(U8 *what, I64 ent, I64 method)
 // Two keys the entity table does not carry. CWorld::KeyValue turns startdark
 // into the engine cvar v_dark and gametitle into gDisplayTitle -
 // dlls/world.cpp:702 and :718 - and CWorld::Spawn applies both at :648.
-// gDisplayTitle reaches the client on the player's first spawn,
-// dlls/player.cpp:4154.
+// gDisplayTitle reaches the client on the player's first UpdateClientData,
+// dlls/player.cpp:4154, then clears: once per fresh map start, never again.
 //
 // c0a0's worldspawn sets both. Without them the chapter opens on a lit world
 // with no logo.
+//
+// Deviation avoided: showing the logo inside this scan (the old path) fired
+// on every HLLoadMap, including the remount HLLoadGame does before restore,
+// so Load Game always replayed HALF-LIFE.
 //
 // The lump is re-scanned rather than the keys added to CHLEntity, the way
 // HLEntParseMultiManagers does - read the notes there, in particular that the
@@ -13603,18 +13743,20 @@ U0 HLEntTrace(U8 *what, I64 ent, I64 method)
 
 U0 HLEntWorldStartup(CHLMap *map)
 {
-	CHLTitleMsg	 t;
 	U8			*p;
 	U8			*end;
 	U8			 key[64];
 	U8			 val[64];
-	U8			 text[HLMSG_MAX_TEXT];
 	I64			 k;
 	Bool		 dark;
 	Bool		 title;
 
 	dark  = FALSE;
 	title = FALSE;
+
+	//stale logo from a previous map must not survive this one
+	HLHudTitleInit;
+	hl_ent_display_title = FALSE;
 
 	if (!map || !map->entities || map->entities_size <= 0)
 		return;
@@ -13684,18 +13826,28 @@ U0 HLEntWorldStartup(CHLMap *map)
 		//v_dark's own ramp is engine side and not in the SDK. Held at black
 		//and released after three seconds, so a map that sets startdark and
 		//never fires an env_fade still comes back. c0a0 fires one at 0.3s,
-		//which replaces this.
+		//which replaces this. HLLoadGame clears the fade after restore.
 		HLHudFadeSet(0, 0, 0, 255, 0.0, 3.0, FALSE);
 	}
 
-	if (title)
-	{
-		//GAMETITLE holds the logo's timing and colour; its block text is a
-		//placeholder the SDK never draws - valve/titles.txt:518.
-		if (HLEntTitleLook("GAMETITLE", text, HLMSG_MAX_TEXT, &t))
-			HLHudTitleShow(t.r1, t.g1, t.b1, t.x, t.y,
-				t.fadein, t.holdtime, t.fadeout);
-	}
+	//gDisplayTitle only - the shell drains this into HLHudTitleShow once
+	hl_ent_display_title = title;
+}
+
+U0 HLEntGameTitleDrain()
+{//CBasePlayer::UpdateClientData's GameTitle hack, player.cpp:4154.
+ //GAMETITLE holds timing and colour; block text is unused - titles.txt:518.
+	CHLTitleMsg	 t;
+	U8			 text[HLMSG_MAX_TEXT];
+
+	if (!hl_ent_display_title)
+		return;
+
+	hl_ent_display_title = FALSE;
+
+	if (HLEntTitleLook("GAMETITLE", text, HLMSG_MAX_TEXT, &t))
+		HLHudTitleShow(t.r1, t.g1, t.b1, t.x, t.y,
+			t.fadein, t.holdtime, t.fadeout);
 }
 
 U0 HLEntDropPickups(CHLMap *map)
@@ -13779,6 +13931,9 @@ I64 HLEntSpawnAll(CHLMap *map)
 	//Looping train voices are indexed the same way and leak across a map change
 	//for the same reason.
 	HLTrainVoiceReset;
+
+	//Wall charger CHAN_STATIC charge loops, same lifetime rule
+	HLChargerSndReset;
 
 	//HLCvarInit runs at startup and this file compiles after it, so the ride
 	//trace registers its own cvar here. HLConCvarCommand rejects names that are
@@ -15164,6 +15319,13 @@ U0 HLEntTouchPlayer(F64 *player_org)
 			e->touch_fn != HLM_CONVEYOR_TOUCH &&
 			e->touch_fn != HLM_XEN_TREE_TOUCH &&
 			e->touch_fn != HLM_PUSH_MOVE_TOUCH)
+			goto qetp_next;
+
+		//SV does not link SOLID_NOT for touch. func_water still has DoorTouch
+		//(doors.cpp:323) after skin makes it SOLID_NOT, but the engine never
+		//delivers that touch. Testing it here DoorActivate'd every pool on
+		//foot-entry; default yaw 0 → movedir +X → water slides left-right.
+		if (e->solid == HLSOLID_NOT)
 			goto qetp_next;
 
 		//the grown box for the solid classes only; a trigger volume is entered,
