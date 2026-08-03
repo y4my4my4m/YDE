@@ -1,0 +1,651 @@
+// D1Snd.ZC - WAV decode, SFX cache + voice pool, looped music
+//
+// devilution counterparts: effects.cpp sound_file_load/PlaySFX,
+// sound.cpp snd_play_snd/music_start, monster.cpp PlayEffect.
+//
+// the AC97 layer (System/AC97.ZC) owns all mixing. AudioSFXPlayRef takes
+// a BORROWED U32 frame buffer (L16 | R16 << 16) at a caller-chosen rate
+// and nearest-sample steps it to the 48kHz output. sfx are decoded once,
+// linear-interp resampled to 48kHz stereo here, cached, and played by
+// reference; the mixer then steps 1:1. music stays at its native rate:
+// DTowne.wav is 25MB of 22050Hz 16-bit stereo, 55MB resampled, and the
+// mixer resamples per voice anyway.
+//
+// verified against DIABDAT.MPQ: sfx are PCM mono 22050Hz 8-bit
+// (Sfx\Misc\Walk1.wav is 16-bit); music is PCM 22050Hz 16-bit,
+// DTowne/Dintro stereo, DLvlA-D mono.
+//
+// no AC97 device -> ac97.present FALSE -> every entry point no-ops.
+//
+// hardware access is confined to the D1SndHw* wrappers and D1SndInit;
+// everything else is pure and runs on the host transpile rig.
+
+#define D1SND_RATE		48000	//mixer output rate (AC97 QSND_MIX_RATE)
+#define D1SND_CACHE		16		//decoded sfx entries, LRU evicted
+#define D1SND_VOICES	8		//concurrent sfx; oldest stolen when full
+#define D1SND_PATH		80
+#define D1SND_SFX_VOL	256		//AUDIO_VOL_UNITY, default sfx volume
+#define D1SND_MUS_VOL	100		//music sits under the sfx, as sound.cpp
+
+//live volumes, 0..256. retail maps VOLUME_MIN..VOLUME_MAX (-1600..0
+//centibels) through DSound; D1SndLinToHw approximates that curve so a
+//mid slider is quieter than linear 50%.
+I64	 d1_snd_sfx_vol = D1SND_SFX_VOL;
+I64	 d1_snd_mus_vol = D1SND_MUS_VOL;
+
+I64 D1SndLinToHw(I64 lin)
+{//0..256 slider → 0..256 hardware gain (approx 20*log10 / centibel curve)
+	I64 v;
+
+	if (lin <= 0)
+		return 0;
+	if (lin >= 256)
+		return 256;
+	v = (lin * lin) / 256;
+	return (v * 3 + lin) / 4;
+}
+
+class CD1SndCache
+{
+	U8	 path[D1SND_PATH];
+	U32	*frames;			//native rate, stereo; owned here, voices borrow it
+	I64	 count;
+	I64	 rate;				//source rate; AudioSFXPlayRef steps the voice
+	I64	 stamp;				//LRU tick
+	Bool missing;			//negative result cached, no re-probe per play
+};
+
+class CD1SndVoice
+{
+	I64	handle;				//AC97 voice handle, -1 free
+	I64	cache_idx;			//which cache entry the PCM belongs to
+	I64	stamp;
+};
+
+CD1SndCache	 d1snd_cache[D1SND_CACHE];
+CD1SndVoice	 d1snd_voice[D1SND_VOICES];
+Bool d1snd_ready = FALSE;
+Bool d1snd_on	 = FALSE;	//AC97 device present
+I64	 d1snd_stamp = 0;
+
+U32	*d1snd_mus_frames = NULL;	//48kHz stereo, owned here
+I64	 d1snd_mus_count  = 0;
+I64	 d1snd_mus_rate   = 0;
+I64	 d1snd_mus_handle = -1;		//looping voice
+U8	 d1snd_mus_path[D1SND_PATH];
+
+//D1Store owns a one-shot voice channel for towner speech; it compiles later,
+//so teardown reaches it through this hook rather than by name
+U0 (*d1snd_vox_stop)() = NULL;
+
+//private LCG for sfx variant picks; the game RNG stream stays untouched
+//(upstream random_(164,2) does perturb it - deviation, determinism kept)
+I64	 d1snd_rng = 0x1234ABCD;
+
+Bool D1SndTag(U8 *p, U8 *tag)
+{//4-byte chunk id compare
+	return p[0] == tag[0] && p[1] == tag[1] && p[2] == tag[2] &&
+		p[3] == tag[3];
+}
+
+I64 D1SndS16(I64 v)
+{//low 16 bits as signed
+	v &= 0xFFFF;
+	if (v & 0x8000)
+		v -= 0x10000;
+	return v;
+}
+
+I64 D1SndRnd2()
+{//0 or 1
+	d1snd_rng = (d1snd_rng * 0x015A4E35 + 1) & 0xFFFFFFFF;
+	return (d1snd_rng >> 16) & 1;
+}
+
+I64 D1SndDecodeNative(U8 *raw, I64 size, U32 **_frames, I64 *_rate)
+{//RIFF/WAVE PCM -> stereo U32 frames at the file's own rate. count or 0.
+ //chunk walk; fmt fields read at byte offsets, never a struct overlay.
+ //fmt payload: tag u16 @0, channels u16 @2, rate u32 @4, bits u16 @14.
+ //8-bit data is unsigned, 128 silence; 16-bit signed LE. mono duplicates.
+	U8	*p;
+	U8	*end;
+	U8	*data = NULL;
+	U8	*s;
+	I64	 chunk;
+	I64	 tag      = 1;
+	I64	 channels = 1;
+	I64	 rate     = 22050;
+	I64	 bits     = 8;
+	I64	 dsize    = 0;
+	I64	 in_count;
+	I64	 i;
+	I64	 l;
+	I64	 r;
+	U32	*out;
+
+	*_frames = NULL;
+	if (_rate)
+		*_rate = 0;
+
+	if (!raw || size < 44)
+		return 0;
+	if (!D1SndTag(raw, "RIFF") || !D1SndTag(raw + 8, "WAVE"))
+		return 0;
+
+	p   = raw + 12;
+	end = raw + size;
+	while (p + 8 <= end)
+	{
+		chunk = D1RdU32(p + 4);
+		if (p + 8 + chunk > end)
+			chunk = end - (p + 8);		//truncated final chunk clamped
+		if (D1SndTag(p, "fmt ") && chunk >= 16)
+		{
+			tag      = D1RdU16(p + 8);
+			channels = D1RdU16(p + 10);
+			rate     = D1RdU32(p + 12);
+			bits     = D1RdU16(p + 22);
+		}
+		else if (D1SndTag(p, "data"))
+		{
+			data  = p + 8;
+			dsize = chunk;
+		}
+		p += 8 + chunk + (chunk & 1);	//chunks are word aligned
+	}
+
+	if (tag != 1 || !data || dsize < 1 || rate < 1)
+		return 0;
+	if (channels < 1 || channels > 2)
+		return 0;
+	if (bits != 8 && bits != 16)
+		return 0;
+
+	in_count = dsize / (channels * (bits / 8));
+	if (in_count < 1)
+		return 0;
+
+	//sys_task heap: the mixer task borrows this pointer, so it must outlive
+	//the task that decoded it
+	out = CAlloc(in_count * 4, sys_task);
+	for (i = 0; i < in_count; i++)
+	{
+		if (bits == 8)
+		{
+			s = data + i * channels;
+			l = (s[0] - 128) << 8;
+			r = l;
+			if (channels > 1)
+				r = (s[1] - 128) << 8;
+		}
+		else
+		{
+			s = data + i * channels * 2;
+			l = D1RdI16(s);
+			r = l;
+			if (channels > 1)
+				r = D1RdI16(s + 2);
+		}
+		out[i] = (l & 0xFFFF) | ((r & 0xFFFF) << 16);
+	}
+
+	*_frames = out;
+	if (_rate)
+		*_rate = rate;
+	return in_count;
+}
+
+U32 *D1SndResample48(U32 *src, I64 in_count, I64 src_rate, I64 *_out_count)
+{//linear interp to the mixer rate, both channels. fresh CAlloc buffer.
+ //16.16 position; the last sample holds for the tail
+	I64	 step_fp;
+	I64	 out_count;
+	I64	 pos_fp;
+	I64	 idx;
+	I64	 frac;
+	I64	 i;
+	I64	 l0;
+	I64	 r0;
+	I64	 l1;
+	I64	 r1;
+	I64	 l;
+	I64	 r;
+	U32	*out;
+
+	*_out_count = 0;
+	if (!src || in_count < 1 || src_rate < 1)
+		return NULL;
+
+	step_fp   = (src_rate << 16) / D1SND_RATE;
+	out_count = (in_count * D1SND_RATE) / src_rate;
+	if (out_count < 1)
+		out_count = 1;
+
+	out = CAlloc(out_count * 4, sys_task);
+	for (i = 0; i < out_count; i++)
+	{
+		pos_fp = i * step_fp;
+		idx    = pos_fp >> 16;
+		frac   = pos_fp & 0xFFFF;
+		if (idx > in_count - 1)
+			idx = in_count - 1;
+		l0 = D1SndS16(src[idx]);
+		r0 = D1SndS16(src[idx] >> 16);
+		if (idx < in_count - 1)
+		{
+			l1 = D1SndS16(src[idx + 1]);
+			r1 = D1SndS16(src[idx + 1] >> 16);
+		}
+		else
+		{
+			l1 = l0;
+			r1 = r0;
+		}
+		l = l0 + (((l1 - l0) * frac) >> 16);
+		r = r0 + (((r1 - r0) * frac) >> 16);
+		out[i] = (l & 0xFFFF) | ((r & 0xFFFF) << 16);
+	}
+
+	*_out_count = out_count;
+	return out;
+}
+
+//--- hardware wrappers ------------------------------------------------------
+//the only functions that touch AC97 state; the host rig stubs exactly these
+
+I64 D1SndHwPlay(U32 *frames, I64 count, I64 rate, I64 vol, Bool loop)
+{//voice handle or -1. the buffer must outlive playback
+	if (!d1snd_on)
+		return -1;
+	return AudioSFXPlayRef(frames, count, rate, vol, vol, loop);
+}
+
+Bool D1SndHwPlaying(I64 handle)
+{
+	if (!d1snd_on || handle < 0)
+		return FALSE;
+	return AudioSFXPlaying(handle);
+}
+
+U0 D1SndHwStop(I64 handle)
+{
+	if (d1snd_on && handle >= 0)
+		AudioSFXStop(handle);
+}
+
+U0 D1SndHwStopAllVoices()
+{//AudioSFXStopAll outwaits the in-flight mix pass; PCM freeable after
+	if (d1snd_on)
+		AudioSFXStopAll;
+}
+
+U0 D1SndHwVol(I64 handle, I64 l, I64 r)
+{//volume of a running voice, 0..256 per channel
+	if (d1snd_on && handle >= 0)
+		AudioSFXVoiceVolSet(handle, l, r);
+}
+
+U0 D1SndHwDrain()
+{//after stopping individual voices, before freeing their PCM: the mixer
+ //task may hold a frames pointer for the 1ms pass it is in
+	if (d1snd_on)
+		Sleep(4);
+}
+
+Bool D1SndHwIdle(I64 handle)
+{//TRUE once the voice is provably not running. a stopped voice reports
+ //not-playing; a stale handle reports the same because the serial no
+ //longer matches, which is the answer we need either way.
+	I64 i;
+
+	if (!d1snd_on || handle < 0)
+		return TRUE;
+	for (i = 0; i < 64; i++)
+	{
+		if (!AudioSFXPlaying(handle))
+			return TRUE;
+		AudioSFXStop(handle);
+		Sleep(2);
+	}
+	return FALSE;
+}
+
+//--- state ------------------------------------------------------------------
+
+U0 D1SndInitState()
+{//globals are not zeroed; this table gets walked and freed
+	I64 i;
+
+	for (i = 0; i < D1SND_CACHE; i++)
+	{
+		d1snd_cache[i].path[0] = 0;
+		d1snd_cache[i].frames  = NULL;
+		d1snd_cache[i].count   = 0;
+		d1snd_cache[i].rate    = 0;
+		d1snd_cache[i].stamp   = 0;
+		d1snd_cache[i].missing = FALSE;
+	}
+	for (i = 0; i < D1SND_VOICES; i++)
+	{
+		d1snd_voice[i].handle    = -1;
+		d1snd_voice[i].cache_idx = -1;
+		d1snd_voice[i].stamp     = 0;
+	}
+	d1snd_stamp       = 0;
+	d1snd_mus_frames  = NULL;
+	d1snd_mus_count   = 0;
+	d1snd_mus_rate    = 0;
+	d1snd_mus_handle  = -1;
+	d1snd_mus_path[0] = 0;
+	d1snd_ready       = TRUE;
+}
+
+U0 D1SndInit()
+{//call once at app start, after the MPQ is mounted
+	D1SndInitState;
+	d1snd_on = ac97.present;
+	if (!d1snd_on)
+		"D1Snd: no AC97 device, audio off\n";
+}
+
+//--- sfx cache --------------------------------------------------------------
+
+I64 D1SndCacheFind(U8 *path)
+{
+	I64 i;
+
+	for (i = 0; i < D1SND_CACHE; i++)
+	{
+		if (d1snd_cache[i].path[0] && !StrCompare(d1snd_cache[i].path, path))
+			return i;
+	}
+	return -1;
+}
+
+U0 D1SndCacheEvict(I64 idx)
+{//voices reference the cached PCM; stop those first, outwait the mixer
+	I64	 i;
+	Bool stopped = FALSE;
+
+	for (i = 0; i < D1SND_VOICES; i++)
+	{
+		if (d1snd_voice[i].cache_idx == idx && d1snd_voice[i].handle >= 0)
+		{
+			D1SndHwStop(d1snd_voice[i].handle);
+			D1SndHwIdle(d1snd_voice[i].handle);
+			d1snd_voice[i].handle    = -1;
+			d1snd_voice[i].cache_idx = -1;
+			stopped = TRUE;
+		}
+	}
+	if (stopped)
+		D1SndHwDrain;
+
+	if (d1snd_cache[idx].frames)
+		Free(d1snd_cache[idx].frames);
+	d1snd_cache[idx].frames  = NULL;
+	d1snd_cache[idx].count   = 0;
+	d1snd_cache[idx].path[0] = 0;
+	d1snd_cache[idx].missing = FALSE;
+}
+
+I64 D1SndCacheSlot()
+{//free slot, else the LRU one emptied
+	I64 i;
+	I64 best = 0;
+
+	for (i = 0; i < D1SND_CACHE; i++)
+	{
+		if (!d1snd_cache[i].path[0])
+			return i;
+		if (d1snd_cache[i].stamp < d1snd_cache[best].stamp)
+			best = i;
+	}
+	D1SndCacheEvict(best);
+	return best;
+}
+
+I64 D1SndCacheLoad(U8 *path)
+{//index of the decoded entry, -1 on missing/undecodable (result cached)
+	I64	 idx;
+	I64	 size   = 0;
+	I64	 rate   = 0;
+	I64	 ncount;
+	I64	 count  = 0;
+	U8	*raw;
+	U32	*native = NULL;
+	U32	*frames;
+
+	idx = D1SndCacheFind(path);
+	if (idx >= 0)
+	{
+		d1snd_stamp++;
+		d1snd_cache[idx].stamp = d1snd_stamp;
+		if (d1snd_cache[idx].missing)
+			return -1;
+		return idx;
+	}
+
+	idx = D1SndCacheSlot();
+	D1StrCopy(d1snd_cache[idx].path, path, D1SND_PATH);
+	d1snd_stamp++;
+	d1snd_cache[idx].stamp   = d1snd_stamp;
+	d1snd_cache[idx].missing = TRUE;
+
+	raw = D1MpqRead(path, &size);
+	if (!raw)
+		return -1;
+	//no resample: the mixer steps each voice by rate/QSND_MIX_RATE, so
+	//pre-converting to 48kHz only inflates the buffer. QSound.ZC does the same.
+	ncount = D1SndDecodeNative(raw, size, &native, &rate);
+	Free(raw);
+	if (!ncount)
+		return -1;
+
+	d1snd_cache[idx].frames  = native;
+	d1snd_cache[idx].count   = ncount;
+	d1snd_cache[idx].rate    = rate;
+	d1snd_cache[idx].missing = FALSE;
+	no_warn frames;
+	no_warn count;
+	return idx;
+}
+
+//--- voices -----------------------------------------------------------------
+
+I64 D1SndVoiceSlot()
+{//free voice, else the oldest one stolen
+	I64 i;
+	I64 best = 0;
+
+	for (i = 0; i < D1SND_VOICES; i++)
+	{
+		if (d1snd_voice[i].handle < 0)
+			return i;
+		if (!D1SndHwPlaying(d1snd_voice[i].handle))
+		{
+			d1snd_voice[i].handle = -1;
+			return i;
+		}
+		if (d1snd_voice[i].stamp < d1snd_voice[best].stamp)
+			best = i;
+	}
+	D1SndHwStop(d1snd_voice[best].handle);
+	d1snd_voice[best].handle = -1;
+	return best;
+}
+
+U0 D1SndPlay(U8 *path)
+{//fire-and-forget sfx, decoded once per path
+	I64 idx;
+	I64 v;
+	I64 handle;
+
+	if (!d1snd_ready || !d1snd_on)
+		return;
+	idx = D1SndCacheLoad(path);
+	if (idx < 0)
+		return;
+	v = D1SndVoiceSlot();
+	handle = D1SndHwPlay(d1snd_cache[idx].frames, d1snd_cache[idx].count,
+		d1snd_cache[idx].rate, D1SndLinToHw(d1_snd_sfx_vol), FALSE);
+	if (handle < 0)
+		return;
+	d1snd_stamp++;
+	d1snd_voice[v].handle    = handle;
+	d1snd_voice[v].cache_idx = idx;
+	d1snd_voice[v].stamp     = d1snd_stamp;
+}
+
+U0 D1SndMonPath(U8 *dst, U8 *gfx_fmt, U8 letter, I64 variant)
+{//monstdat sndfile equals the gfx pattern with %c.CL2 -> %c%i.WAV,
+ //verified for all nine families in the roster. letters per
+ //effects.cpp MonstSndChar: a attack, h hit, d death, s special
+	I64 i = 0;
+	I64 o = 0;
+
+	while (gfx_fmt[i] && gfx_fmt[i] != '%' && o < D1SND_PATH - 8)
+	{
+		dst[o] = gfx_fmt[i];
+		o++;
+		i++;
+	}
+	dst[o] = letter;
+	o++;
+	dst[o] = '0' + variant;
+	o++;
+	D1StrCopy(dst + o, ".WAV", 5);
+}
+
+U0 D1SndPlayMon(U8 *gfx_fmt, U8 letter)
+{//monster voice; variant 1 or 2 at random (monster.cpp PlayEffect)
+	U8 path[D1SND_PATH];
+
+	if (!d1snd_ready || !d1snd_on)
+		return;
+	D1SndMonPath(path, gfx_fmt, letter, 1 + D1SndRnd2());
+	D1SndPlay(path);
+}
+
+//--- music ------------------------------------------------------------------
+
+U0 D1SndMusicStop()
+{
+	if (d1snd_mus_handle >= 0)
+	{
+		D1SndHwStop(d1snd_mus_handle);
+		D1SndHwIdle(d1snd_mus_handle);
+		d1snd_mus_handle = -1;
+		D1SndHwDrain;
+	}
+	if (d1snd_mus_frames)
+	{
+		Free(d1snd_mus_frames);
+		d1snd_mus_frames = NULL;
+	}
+	d1snd_mus_count   = 0;
+	d1snd_mus_rate    = 0;
+	d1snd_mus_path[0] = 0;
+}
+
+U0 D1SndMusic(U8 *path)
+{//switch the looped track; NULL stops. the same track keeps playing.
+ //fully decoded at native rate onto one looping voice, under sfx volume
+	U8	*raw;
+	I64	 size = 0;
+
+	if (!d1snd_ready || !d1snd_on)
+		return;
+	if (path && d1snd_mus_frames && !StrCompare(d1snd_mus_path, path))
+		return;
+
+	D1SndMusicStop;
+	if (!path)
+		return;
+
+	raw = D1MpqRead(path, &size);
+	if (!raw)
+		return;
+	{
+		U32	*nat = NULL;
+		I64	 ncount;
+		I64	 nrate = 0;
+
+		//kept at the source rate. resampling DLvlB to 48kHz stereo is a 64MB
+		//buffer off a 101MB transient; the mixer steps the voice instead.
+		ncount = D1SndDecodeNative(raw, size, &nat, &nrate);
+		Free(raw);
+		if (!ncount)
+			return;
+		d1snd_mus_frames = nat;
+		d1snd_mus_count  = ncount;
+		d1snd_mus_rate   = nrate;
+	}
+	D1StrCopy(d1snd_mus_path, path, D1SND_PATH);
+
+	//a looping voice at the source rate, as QSound.ZC plays its tracks. the
+	//stream fifo carries mixer-rate frames only, so native-rate music cannot
+	//ride it without the resample this avoids.
+	d1snd_mus_handle = D1SndHwPlay(d1snd_mus_frames, d1snd_mus_count,
+		d1snd_mus_rate, D1SndLinToHw(d1_snd_mus_vol), TRUE);
+}
+
+U0 D1SndMusVolApply()
+{//already-playing music voice follows the slider (sound.cpp snd_update)
+	I64 v = D1SndLinToHw(d1_snd_mus_vol);
+
+	D1SndHwVol(d1snd_mus_handle, v, v);
+}
+
+U0 D1SndMusicForLevel(I64 level)
+{//sound.cpp sgszMusicTracks bands: town, L1-4, L5-8, L9-12, L13-16
+	if (level == 0)
+		D1SndMusic("Music\\DTowne.wav");
+	else if (level <= 4)
+		D1SndMusic("Music\\DLvlA.wav");
+	else if (level <= 8)
+		D1SndMusic("Music\\DLvlB.wav");
+	else if (level <= 12)
+		D1SndMusic("Music\\DLvlC.wav");
+	else
+		D1SndMusic("Music\\DLvlD.wav");
+}
+
+//--- shutdown ---------------------------------------------------------------
+
+U0 D1SndStopAll()
+{//silence everything, release the music PCM. the sfx cache stays decoded
+	I64 i;
+
+	if (!d1snd_ready)
+		return;
+	D1SndHwStopAllVoices;
+	for (i = 0; i < D1SND_VOICES; i++)
+	{
+		d1snd_voice[i].handle    = -1;
+		d1snd_voice[i].cache_idx = -1;
+	}
+	//through the stop, not a bare Free: the feeder task holds the pointer
+	D1SndMusicStop;
+	if (d1snd_vox_stop)
+		(*d1snd_vox_stop)();
+}
+
+U0 D1SndFree()
+{//app teardown: every borrowed buffer silenced, then released
+	I64 i;
+
+	if (!d1snd_ready)
+		return;
+	D1SndStopAll;
+	for (i = 0; i < D1SND_CACHE; i++)
+	{
+		if (d1snd_cache[i].frames)
+			Free(d1snd_cache[i].frames);
+		d1snd_cache[i].frames  = NULL;
+		d1snd_cache[i].count   = 0;
+		d1snd_cache[i].path[0] = 0;
+		d1snd_cache[i].missing = FALSE;
+	}
+	d1snd_ready = FALSE;
+}

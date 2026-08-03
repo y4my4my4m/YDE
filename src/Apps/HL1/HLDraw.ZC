@@ -7,10 +7,18 @@
 // per face: world verts -> camera space -> near clip -> project -> scanline
 // fill with perspective-correct texture and lightmap
 //
-// FIXME: hand-write the span loop in asm
+// Studio/alias paths carry CHLScreenVert.light (0..255) and interpolate it
+// screen-space across each span (affine Gouraud). A lightmap ignores it.
+//
+// Span hot path: opaque surf32 is unrolled in C (FIXME was asm; ZealC
+// unroll beats the branched general loop). Set hl_r_spanfast FALSE to force
+// the slow path for debugging.
+Bool hl_r_spanfast = TRUE;
+hl_r_spanfast = TRUE;
 
-//Draw-pass toggles, GoldSrc's r_* names. HLDraw.ZC compiles before the cvar
-//table, so the shell copies the cvars into these once a frame.
+//Bumped in HLDrawClear. HLStudio bone cache keys on it (same-frame reuse)
+I64 hl_draw_frame = 0;
+hl_draw_frame = 0;
 Bool hl_r_decals      = TRUE;
 Bool hl_r_dynamic     = TRUE;
 Bool hl_r_drawentities = TRUE;
@@ -40,6 +48,7 @@ class CHLPolyVert
 	F64	cam[3];		//x right, y up, z forward
 	F64	s;			//texel units
 	F64	t;
+	F64	light;		//0..255 studio/alias shade; unused under a lightmap
 };
 
 class CHLScreenVert
@@ -49,6 +58,7 @@ class CHLScreenVert
 	F64	inv_z;
 	F64	s_over_z;
 	F64	t_over_z;
+	F64	light;		//screen-space Gouraud, affine across the span
 };
 
 class CHLCanvas
@@ -174,6 +184,10 @@ U0 HLRSpeeds(Bool on = TRUE)
 //
 // table is AMP + sin(i*2pi/CYCLE)*AMP, AMP = 8 texels. turb textures are
 // always 64x64, hence the & 63
+//
+// GoldSrc OpenGL also lifts verts by WaveHeight (pev->scale) in
+// EmitWaterPolys. UV turb alone reads as sideways swim; Z wave is the
+// up/down the maps set on func_water.
 #define HLTURB_CYCLE		128
 #define HLTURB_AMP		8.0
 #define HLTURB_SPEED		20.0
@@ -400,6 +414,21 @@ qdn_next:
 //no lit surface found under a model
 #define HLLIGHT_FALLBACK		170
 
+//R_LightPoint grid cache for sprites/tents that sample many nearby origins
+#define HLLIGHT_PT_GRID		32
+#define HLLIGHT_PT_SLOTS	16
+
+class CHLLightPtSlot
+{
+	I64	qx;
+	I64	qy;
+	I64	qz;
+	I64	frame;		//hl_dlight_frame when filled; -1 empty
+	I64	val;
+	I64	key;
+	I64	style;
+};
+
 U8	hl_lightstyle[HLMAX_LIGHTSTYLES * HLLIGHTSTYLE_LEN];
 I64	hl_lightstyle_value[HLMAX_LIGHTSTYLES];
 U8	hl_light_scratch[HLLIGHT_SCRATCH_B];
@@ -445,8 +474,26 @@ I64 hl_light_pt_style = -1;
 //can change it. -1 when no lit face was found.
 I64 hl_light_pt_key = -1;
 
+CHLLightPtSlot hl_light_pt_cache[HLLIGHT_PT_SLOTS];
+
 F64 hl_light_time = 0.0;		//time this frame is drawn at
 F64 hl_light_last = 0.0;		//previous frame, for dynamic light decay
+
+F64 HLWaterWaveZ(F64 x, F64 y, F64 z, F64 amp)
+{//EmitWaterPolys vertex Z. amp is pev->scale (= WaveHeight/8).
+	F64 nv;
+	I64 i1;
+	I64 i2;
+
+	if (amp <= 0.0)
+		return z;
+
+	i1 = ToI64(hl_light_time * 160.0 + y + x) & (HLTURB_CYCLE - 1);
+	i2 = ToI64(x * 5.0 + hl_light_time * 171.0 - y) & (HLTURB_CYCLE - 1);
+	nv = hl_turb_table[i1];
+	nv = hl_turb_table[i2] * 0.8 + nv;
+	return z + nv * amp;
+}
 
 U0 HLLightInit()
 {//globals are not zeroed, so every style is set steady explicitly
@@ -468,6 +515,9 @@ U0 HLLightInit()
 	hl_light_last  = 0.0;
 	hl_light_time  = 0.0;
 	hl_light_pt_style = -1;
+
+	for (i = 0; i < HLLIGHT_PT_SLOTS; i++)
+		hl_light_pt_cache[i].frame = -1;
 
 	for (i = 0; i < HLMAX_LIGHTSTYLES; i++)
 	{
@@ -1049,6 +1099,7 @@ I64 HLLightPoint(CHLMap *map, F64 *point)
 	CHLFace	 *f;
 	CHLTexInfo *ti;
 	CHLLeaf	 *leaf;
+	CHLLightPtSlot *cs;
 	F64		  s_coord;
 	F64		 t_coord;
 	I64		 ds;
@@ -1067,12 +1118,40 @@ I64 HLLightPoint(CHLMap *map, F64 *point)
 	I64		 i;
 	I64		 node;
 	I64		 best = -1;
+	I64		 qx;
+	I64		 qy;
+	I64		 qz;
+	I64		 slot;
+	Bool		 cache_ok;
 
 	hl_light_pt_style = -1;
 	hl_light_pt_key   = -1;
 
 	if (!map || !map->lightdata)
 		return HLLIGHT_FALLBACK;
+
+	//32uu grid cache. same cell + frame reuses the sample. live dlights make
+	//the result origin-sensitive inside the cell, so the cache stays off then
+	cache_ok = FALSE;
+	if (!hl_dlight_any && point)
+	{
+		qx = ToI64(Floor(point[0] / ToF64(HLLIGHT_PT_GRID)));
+		qy = ToI64(Floor(point[1] / ToF64(HLLIGHT_PT_GRID)));
+		qz = ToI64(Floor(point[2] / ToF64(HLLIGHT_PT_GRID)));
+		slot = (qx * 73856093 + qy * 19349663 + qz * 83492791) &
+			(HLLIGHT_PT_SLOTS - 1);
+		cs = &hl_light_pt_cache[slot];
+		cache_ok = TRUE;
+
+		if (cs->frame == hl_dlight_frame &&
+			cs->qx == qx && cs->qy == qy && cs->qz == qz)
+		{
+			hl_light_pt_key   = cs->key;
+			hl_light_pt_style = cs->style;
+			best = cs->val;
+			goto qlp_cached;
+		}
+	}
 
 	//counted here rather than at the call sites, so the r_speeds line is the
 	//number of traces actually run
@@ -1088,12 +1167,18 @@ I64 HLLightPoint(CHLMap *map, F64 *point)
 	HLTracePoint(map, point, end, &tr);
 
 	if (!tr.hit || tr.fraction == 1.0)
-		return HLLIGHT_FALLBACK;
+	{
+		best = HLLIGHT_FALLBACK;
+		goto qlp_store;
+	}
 
 	//the trace gives a position but not a face, so test the leaf's surfaces
 	node = HLVisLeafForPoint(map, tr.end_pos);
 	if (node <= 0 || node >= map->num_leafs)
-		return HLLIGHT_FALLBACK;
+	{
+		best = HLLIGHT_FALLBACK;
+		goto qlp_store;
+	}
 
 	leaf = &map->leafs[node];
 
@@ -1238,6 +1323,19 @@ qlp_no_dlights:
 	if (best < 24)
 		best = 24;
 
+qlp_store:
+	if (cache_ok)
+	{
+		cs->qx    = qx;
+		cs->qy    = qy;
+		cs->qz    = qz;
+		cs->frame = hl_dlight_frame;
+		cs->val   = best;
+		cs->key   = hl_light_pt_key;
+		cs->style = hl_light_pt_style;
+	}
+
+qlp_cached:
 	return best;
 }
 
@@ -1261,9 +1359,9 @@ CHLCanvas *HLDrawNew(I64 w, I64 h)
 	c->pixels = CAlloc(w * h * sizeof(U32));
 	c->depth  = CAlloc(w * h * sizeof(F64));
 
-	//12 bytes per pixel between the two buffers, so 800x600 is 5.8MB against
-	//320x240's 0.9MB. A failed allocation here must not reach the rasteriser
-	//as a canvas with NULL planes.
+	//12 bytes per pixel between the two buffers, so 800x600 is 5.8MB and
+	//1280x720 is ~11MB against 320x240's 0.9MB. A refused allocation returns
+	//NULL and the shell must fall back rather than leave a half-built canvas.
 	if (!c->pixels || !c->depth)
 	{
 		if (c->pixels)	Free(c->pixels);
@@ -1289,14 +1387,61 @@ U0 HLDrawFree(CHLCanvas *c)
 U0 HLDrawClear(CHLCanvas *c, I64 color_index)
 {//still takes a palette index - every caller is 2D art or a debug fill, and
  //the global palette.lmp is still what those are authored against
+ //
+ //Clear only the view rect when SCR_CalcRefdef shrank it - letterbox pixels
+ //are never drawn into and need not be wiped every frame
 	U32	 fill = HLPalColor(color_index);
-	I64	 n    = c->width * c->height;
+	U32	*row;
+	F64	*zrow;
+	I64	 n;
 	I64	 i;
+	I64	 x;
+	I64	 y;
+	I64	 x0;
+	I64	 y0;
+	I64	 x1;
+	I64	 y1;
 
-	for (i = 0; i < n; i++)
-		c->pixels[i] = fill;
+	x0 = c->vx;
+	y0 = c->vy;
+	x1 = c->vx + c->vw;
+	y1 = c->vy + c->vh;
 
-	MemSet(c->depth, 0, c->width * c->height * sizeof(F64));
+	if (x0 < 0)			x0 = 0;
+	if (y0 < 0)			y0 = 0;
+	if (x1 > c->width)	x1 = c->width;
+	if (y1 > c->height)	y1 = c->height;
+
+	if (x0 <= 0 && y0 <= 0 && x1 >= c->width && y1 >= c->height)
+	{
+		n = c->width * c->height;
+
+		//palette index 0 is black (0x000000) - byte MemSet beats a U32 loop
+		if (!fill)
+			MemSet(c->pixels, 0, n * sizeof(U32));
+		else
+		{
+			for (i = 0; i < n; i++)
+				c->pixels[i] = fill;
+		}
+
+		MemSet(c->depth, 0, n * sizeof(F64));
+	}
+	else
+	{
+		for (y = y0; y < y1; y++)
+		{
+			row  = c->pixels + y * c->width;
+			zrow = c->depth  + y * c->width;
+
+			for (x = x0; x < x1; x++)
+			{
+				row[x]  = fill;
+				zrow[x] = 0.0;
+			}
+		}
+	}
+
 	c->faces_drawn = 0;
 	c->spans_drawn = 0;
 
@@ -1309,6 +1454,8 @@ U0 HLDrawClear(CHLCanvas *c, I64 color_index)
 	}
 
 	HLRSpeedsReset;
+
+	hl_draw_frame++;
 }
 
 U0 HLDrawSetViewRect(CHLCanvas *c, F64 viewsize, I64 sbar_h)
@@ -1425,6 +1572,7 @@ I64 HLDrawClipNear(CHLPolyVert *in, I64 count, CHLPolyVert *out)
 				out[n].cam[2] = in[i].cam[2] + frac * (in[j].cam[2] - in[i].cam[2]);
 				out[n].s      = in[i].s + frac * (in[j].s - in[i].s);
 				out[n].t      = in[i].t + frac * (in[j].t - in[i].t);
+				out[n].light  = in[i].light + frac * (in[j].light - in[i].light);
 				n++;
 			}
 		}
@@ -2239,6 +2387,7 @@ Bool HLRenderTranslucent(I64 mode)
 
 U0 HLDrawSpan(CHLCanvas *c, I64 y, I64 x1, I64 x2,
 	F64 iz1, F64 soz1, F64 toz1, F64 iz2, F64 soz2, F64 toz2,
+	F64 light1, F64 light2,
 	CHLTexture *tex, U8 *lightmap, I64 lm_w, I64 lm_h,
 	F64 mins_s, F64 mins_t, I64 flat_light, I64 mip,
 	U32 *surf = NULL, I64 sw = 0, I64 sh = 0,
@@ -2249,6 +2398,10 @@ U0 HLDrawSpan(CHLCanvas *c, I64 y, I64 x1, I64 x2,
  //blend is HLRENDER_*, amt the entity's renderamt. A translucent run reads the
  //framebuffer and writes no depth: what is behind it stays visible and stays
  //available to anything drawn later. blend is constant over the run
+ //
+ //light1/light2 are the screen-space Gouraud ends of the run (0..255). A
+ //lightmap ignores them. With no lightmap, a zero pair falls back to
+ //flat_light so world turb and older alias callers keep working
 	U32	*row;
 	U32	*surf32 = surf;
 	U8	*texels;
@@ -2258,9 +2411,11 @@ U0 HLDrawSpan(CHLCanvas *c, I64 y, I64 x1, I64 x2,
 	F64	 d_iz;
 	F64	 d_soz;
 	F64	 d_toz;
+	F64	 d_lit;
 	F64	 iz;
 	F64	 soz;
 	F64	 toz;
+	F64	 lit;
 	F64	 z;
 	F64	 s;
 	F64	 t;
@@ -2291,6 +2446,7 @@ U0 HLDrawSpan(CHLCanvas *c, I64 y, I64 x1, I64 x2,
 	F64	 iz_e;
 	F64	 soz_e;
 	F64	 toz_e;
+	F64	 lit_e;
 	F64	 s_e;
 	F64	 t_e;
 	F64	 ds;
@@ -2309,12 +2465,14 @@ U0 HLDrawSpan(CHLCanvas *c, I64 y, I64 x1, I64 x2,
 	d_iz  = (iz2 - iz1) / span;
 	d_soz = (soz2 - soz1) / span;
 	d_toz = (toz2 - toz1) / span;
+	d_lit = (light2 - light1) / span;
 
 	if (x1 < c->vx)
 	{
-		iz1  += d_iz * ToF64(c->vx - x1);
-		soz1 += d_soz * ToF64(c->vx - x1);
-		toz1 += d_toz * ToF64(c->vx - x1);
+		iz1    += d_iz * ToF64(c->vx - x1);
+		soz1   += d_soz * ToF64(c->vx - x1);
+		toz1   += d_toz * ToF64(c->vx - x1);
+		light1 += d_lit * ToF64(c->vx - x1);
 		x1 = c->vx;
 	}
 
@@ -2379,6 +2537,7 @@ U0 HLDrawSpan(CHLCanvas *c, I64 y, I64 x1, I64 x2,
 	iz  = iz1;
 	soz = soz1;
 	toz = toz1;
+	lit = light1;
 
 	//exact coords at the start of the run
 	if (iz != 0.0)
@@ -2408,6 +2567,7 @@ U0 HLDrawSpan(CHLCanvas *c, I64 y, I64 x1, I64 x2,
 		iz_e  = iz + d_iz * ToF64(n);
 		soz_e = soz + d_soz * ToF64(n);
 		toz_e = toz + d_toz * ToF64(n);
+		lit_e = lit + d_lit * ToF64(n);
 
 		if (iz_e != 0.0)
 		{
@@ -2440,14 +2600,54 @@ U0 HLDrawSpan(CHLCanvas *c, I64 y, I64 x1, I64 x2,
 		}
 		else
 		{
-			for (ch = 0; ch < 3; ch++)
+			//Gouraud: lit..lit_e across the block. A zero pair means the
+			//caller left CHLScreenVert.light unset, so flat_light stands in
+			if (lit == 0.0 && lit_e == 0.0)
 			{
-				lightv[ch] = ToF64(flat_light);
-				dlight[ch] = 0.0;
+				for (ch = 0; ch < 3; ch++)
+				{
+					lightv[ch] = ToF64(flat_light);
+					dlight[ch] = 0.0;
+				}
+			}
+			else
+			{
+				for (ch = 0; ch < 3; ch++)
+				{
+					lightv[ch] = lit;
+					dlight[ch] = (lit_e - lit) / ToF64(n);
+				}
 			}
 		}
 
-		while (x < xe)
+		//Opaque surface-cache path: no blend, no turb, no per-texel light.
+		//Drops the general branch forest. hl_r_spanfast gates it.
+		if (hl_r_spanfast && surf32 && !blend)
+		{
+			while (x < xe)
+			{
+				if (iz > zrow[x])
+				{
+					tx = ClampI64((ToI64(Floor(s)) - mins_s_i) >> mip,
+						0, tw - 1);
+					ty = ClampI64((ToI64(Floor(t)) - mins_t_i) >> mip,
+						0, th - 1);
+					surf_texel = surf32[ty * tw + tx];
+
+					if (surf_texel != HLSURF_TRANSPARENT)
+					{
+						row[x]  = surf_texel;
+						zrow[x] = iz;
+					}
+				}
+
+				s  += ds;
+				t  += dt;
+				iz += d_iz;
+				x++;
+			}
+		}
+		else while (x < xe)
 		{
 			//depth test first, a rejected pixel costs only the adds below
 			if (iz > zrow[x])
@@ -2594,6 +2794,7 @@ qds_skip_texel:
 		iz  = iz_e;
 		soz = soz_e;
 		toz = toz_e;
+		lit = lit_e;
 		s   = s_e;
 		t   = t_e;
 	}
@@ -2609,6 +2810,9 @@ U0 HLDrawPolygon(CHLCanvas *c, CHLScreenVert *v, I64 count,
 {//scanline fill of a convex poly - intersect every edge per row, extremes
  //become the span. O(edges), but rarely more than eight after clipping, and
  //no active edge table to get the winding order wrong in
+ //
+ //CHLScreenVert.light is screen-space Gouraud (affine). A lightmap path
+ //ignores it. flat_light is the uniform fill when every vert light is 0
 	F64	 y_min = 1.0e30;
 	F64	 y_max = -1.0e30;
 	F64	 xl;
@@ -2619,6 +2823,8 @@ U0 HLDrawPolygon(CHLCanvas *c, CHLScreenVert *v, I64 count,
 	F64	 sozr;
 	F64	 tozl;
 	F64	 tozr;
+	F64	 litl;
+	F64	 litr;
 	F64	 ya;
 	F64	 yb;
 	F64	 frac;
@@ -2626,6 +2832,7 @@ U0 HLDrawPolygon(CHLCanvas *c, CHLScreenVert *v, I64 count,
 	F64	 izi;
 	F64	 sozi;
 	F64	 tozi;
+	F64	 liti;
 	F64	 yc;
 	I64	 i;
 	I64	 j;
@@ -2665,6 +2872,8 @@ U0 HLDrawPolygon(CHLCanvas *c, CHLScreenVert *v, I64 count,
 		sozr  = 0.0;
 		tozl  = 0.0;
 		tozr  = 0.0;
+		litl  = 0.0;
+		litr  = 0.0;
 
 		for (i = 0; i < count; i++)
 		{
@@ -2680,11 +2889,12 @@ U0 HLDrawPolygon(CHLCanvas *c, CHLScreenVert *v, I64 count,
 				izi  = v[i].inv_z + frac * (v[j].inv_z - v[i].inv_z);
 				sozi = v[i].s_over_z + frac * (v[j].s_over_z - v[i].s_over_z);
 				tozi = v[i].t_over_z + frac * (v[j].t_over_z - v[i].t_over_z);
+				liti = v[i].light + frac * (v[j].light - v[i].light);
 
 				if (!found)
 				{
-					xl = xi; izl = izi; sozl = sozi; tozl = tozi;
-					xr = xi; izr = izi; sozr = sozi; tozr = tozi;
+					xl = xi; izl = izi; sozl = sozi; tozl = tozi; litl = liti;
+					xr = xi; izr = izi; sozr = sozi; tozr = tozi; litr = liti;
 					found = TRUE;
 				}
 				else
@@ -2692,10 +2902,12 @@ U0 HLDrawPolygon(CHLCanvas *c, CHLScreenVert *v, I64 count,
 					if (xi < xl)
 					{
 						xl = xi; izl = izi; sozl = sozi; tozl = tozi;
+						litl = liti;
 					}
 					if (xi > xr)
 					{
 						xr = xi; izr = izi; sozr = sozi; tozr = tozi;
+						litr = liti;
 					}
 				}
 			}
@@ -2703,8 +2915,10 @@ U0 HLDrawPolygon(CHLCanvas *c, CHLScreenVert *v, I64 count,
 
 		if (found && xr > xl)
 		{
-			HLDrawSpan(c, y, ToI64(Ceil(xl)), ToI64(Ceil(xr)),
-				izl, sozl, tozl, izr, sozr, tozr,
+			//Floor left / Ceil right: both-Ceil collapses sub-pixel rails
+			//(xl=10.1,xr=10.3 → 11..11 empty). Keep ≥1 column when xr>xl.
+			HLDrawSpan(c, y, ToI64(Floor(xl)), ToI64(Ceil(xr)),
+				izl, sozl, tozl, izr, sozr, tozr, litl, litr,
 				tex, lightmap, lm_w, lm_h, mins_s, mins_t, flat_light, mip,
 				surf, sw, sh, blend, amt);
 		}
@@ -3505,7 +3719,8 @@ U0 HLDrawSkyPolygon(CHLCanvas *c, CHLScreenVert *v, I64 count)
 }
 
 U0 HLDrawFace(CHLCanvas *c, CHLMap *map, I64 face_index, F64 *offset = NULL,
-	I64 ent_frame = 0, F64 *xform = NULL, I64 blend = 0, I64 amt = 255)
+	I64 ent_frame = 0, F64 *xform = NULL, I64 blend = 0, I64 amt = 255,
+	F64 wave_amp = 0.0, F64 scroll_speed = 0.0)
 {//transform, clip, project and fill one BSP face
  //
  //offset translates the face in world space, which is what lets a brush model
@@ -3519,6 +3734,9 @@ U0 HLDrawFace(CHLCanvas *c, CHLMap *map, I64 face_index, F64 *offset = NULL,
  //texture coords come from the unshifted position - the texture is fixed to
  //the brush, so a moving door does not drag its texture along and a rotating
  //brush turns its texture with it, as GoldSrc does
+ //
+ //wave_amp is pev->scale for turb faces (WaveHeight/8). scroll_speed is
+ //texels/sec along s for "scroll*" / "{scroll*" (func_conveyor).
 	CHLFace		*f  = &map->faces[face_index];
 	CHLTexInfo	*ti;
 	CHLTexture	*tex;
@@ -3546,6 +3764,8 @@ U0 HLDrawFace(CHLCanvas *c, CHLMap *map, I64 face_index, F64 *offset = NULL,
 	F64			 tex_t;
 	F64			 tex_len;
 	F64		   shifted[3];
+	F64			 world_pt[3];
+	F64			 scroll_s;
 
 	if (f->num_edges < 3 || f->num_edges > HLMAX_POLY_VERTS)
 		return;
@@ -3577,6 +3797,10 @@ U0 HLDrawFace(CHLCanvas *c, CHLMap *map, I64 face_index, F64 *offset = NULL,
 	if (!tex->texels[0] || tex->width <= 0 || tex->height <= 0)
 		return;
 
+	scroll_s = 0.0;
+	if (tex->is_scroll && scroll_speed != 0.0)
+		scroll_s = hl_light_time * scroll_speed;
+
 	//gather the outline. a negative surfedge runs the other way, so its
 	//second vertex leads
 	for (i = 0; i < f->num_edges; i++)
@@ -3588,7 +3812,7 @@ U0 HLDrawFace(CHLCanvas *c, CHLMap *map, I64 face_index, F64 *offset = NULL,
 			wv = &map->vertices[map->edges[-e].v[1]];
 
 		//from the world position, before the view moves
-		poly[n].s = HLVecDot(wv->pt, &ti->vecs[0]) + ti->vecs[3];
+		poly[n].s = HLVecDot(wv->pt, &ti->vecs[0]) + ti->vecs[3] + scroll_s;
 		poly[n].t = HLVecDot(wv->pt, &ti->vecs[4]) + ti->vecs[7];
 
 		//the world path (both pointers NULL) costs one extra pointer test and
@@ -3597,18 +3821,26 @@ U0 HLDrawFace(CHLCanvas *c, CHLMap *map, I64 face_index, F64 *offset = NULL,
 		if (xform)
 		{
 			HLMatTransform(wv->pt, xform, shifted);
-			HLVecSub(shifted, c->origin, rel);
+			HLVecCopy(shifted, world_pt);
 		}
 		else if (offset)
 		{
 			HLVecAdd(wv->pt, offset, shifted);
-			HLVecSub(shifted, c->origin, rel);
+			HLVecCopy(shifted, world_pt);
 		}
 		else
-			HLVecSub(wv->pt, c->origin, rel);
+			HLVecCopy(wv->pt, world_pt);
+
+		//WaveHeight: lift turb verts in world Z before the view transform
+		if (tex->is_turb && wave_amp > 0.0)
+			world_pt[2] = HLWaterWaveZ(world_pt[0], world_pt[1],
+				world_pt[2], wave_amp);
+
+		HLVecSub(world_pt, c->origin, rel);
 		poly[n].cam[0] = HLVecDot(rel, c->right);
 		poly[n].cam[1] = HLVecDot(rel, c->up);
 		poly[n].cam[2] = HLVecDot(rel, c->forward);
+		poly[n].light  = 0.0;
 		n++;
 	}
 
@@ -3628,6 +3860,7 @@ U0 HLDrawFace(CHLCanvas *c, CHLMap *map, I64 face_index, F64 *offset = NULL,
 		scr[i].inv_z    = inv_z;
 		scr[i].s_over_z = clipped[i].s * inv_z;
 		scr[i].t_over_z = clipped[i].t * inv_z;
+		scr[i].light    = 0.0;
 	}
 
 	//a face with no samples is black, not fullbright - R_BuildLightMap clears
@@ -3713,9 +3946,9 @@ U0 HLDrawFace(CHLCanvas *c, CHLMap *map, I64 face_index, F64 *offset = NULL,
 		else
 			mip = 3;
 
-		//D_CacheSurface. turb warps every frame and sky is drawn by direction,
-		//so neither caches
-		if (!tex->is_turb && !tex->clamp)
+		//D_CacheSurface. turb warps every frame, scroll slides every frame,
+		//and sky is drawn by direction, so none of them cache
+		if (!tex->is_turb && !tex->is_scroll && !tex->clamp)
 			surf = HLSurfCacheGet(map, f, face_index, tex, mip,
 					lightmap, lm_w, lm_h, &sw, &sh, anim_tex);
 
@@ -3730,17 +3963,24 @@ U0 HLDrawFace(CHLCanvas *c, CHLMap *map, I64 face_index, F64 *offset = NULL,
 
 U0 HLDrawWorld(CHLCanvas *c, CHLMap *map, CHLVisState *vs)
 {//faces arrive front to back, so the depth test kills most overdraw
+ //
+ //scroll_speed 35: world "scroll*" faces have no entity to encode speed in
+ //rendercolor. Quake-compatible default from DrawGLPoly.
 	I64 i;
 
 	for (i = 0; i < vs->face_count; i++)
-		HLDrawFace(c, map, vs->face_list[i]);
+		HLDrawFace(c, map, vs->face_list[i], NULL, 0, NULL, 0, 255,
+			0.0, 35.0);
 }
 
 U0 HLDrawBrushModel(CHLCanvas *c, CHLMap *map, I64 model_index,
 	F64 *origin = NULL, I64 ent_frame = 0, F64 *angles = NULL,
-	I64 blend = 0, I64 amt = 255)
+	I64 blend = 0, I64 amt = 255, CHLVisState *vs = NULL,
+	F64 wave_amp = 0.0, F64 scroll_speed = 0.0)
 {//BSP submodel (door, platform, button). not in the PVS, so every face is
- //submitted and the depth buffer sorts it out
+ //submitted and the depth buffer sorts it out - unless vs is the frame's
+ //vis state, in which case an AABB frustum reject drops the whole brush
+ //before the face loop (world already culled that way).
  //
  //blend is the entity's rendermode and amt its renderamt, HLRENDER_*. A
  //translucent submodel writes no depth, so the caller must submit it after
@@ -3760,12 +4000,28 @@ U0 HLDrawBrushModel(CHLCanvas *c, CHLMap *map, I64 model_index,
  //pev->angles, so the engine can read non-identity angles as "this brush is
  //turned". forwarding angles for an entity that only used them to pick a
  //direction renders the brush rotated - func_door and func_train show it
+ //
+ //wave_amp / scroll_speed: WaveHeight and scroll* texture slide for this
+ //entity. 0 leaves world defaults (HLDrawFace applies scroll only when the
+ //face's texture asks for it and speed is nonzero).
 	CHLModel *m;
+	CHLFace	 *f;
+	CHLPlane	 *plane;
 	F64		  xf[12];
 	F64		  org[3];
+	F64		  wmins[3];
+	F64		  wmaxs[3];
+	F64		  corner[3];
+	F64		  world[3];
 	F64		 *xform = NULL;
 	F64		 *ofs;
+	F64		  ndot;
 	I64		  i;
+	I64		  cx;
+	I64		  cy;
+	I64		  cz;
+	Bool		  unrot = TRUE;
+	Bool		  first;
 
 	if (model_index < 0 || model_index >= map->num_models)
 		return;
@@ -3790,6 +4046,7 @@ U0 HLDrawBrushModel(CHLCanvas *c, CHLMap *map, I64 model_index,
 
 			HLMatFromAngles(angles, org, xf);
 			xform = xf;
+			unrot = FALSE;
 
 			//the matrix already carries the translation; passing offset as
 			//well would apply the origin twice
@@ -3799,6 +4056,74 @@ U0 HLDrawBrushModel(CHLCanvas *c, CHLMap *map, I64 model_index,
 
 	m = &map->models[model_index];
 
+	//AABB frustum cull against the same planes HLVisRecurse uses. Off when
+	//the caller has no vis (net preview, tests). Rotated: transform the eight
+	//model-box corners and take a world AABB - conservative but cheap.
+	if (vs)
+	{
+		if (unrot)
+		{
+			for (i = 0; i < 3; i++)
+			{
+				wmins[i] = m->mins[i];
+				wmaxs[i] = m->maxs[i];
+
+				if (ofs)
+				{
+					wmins[i] += ofs[i];
+					wmaxs[i] += ofs[i];
+				}
+			}
+		}
+		else
+		{
+			first = TRUE;
+
+			for (cx = 0; cx < 2; cx++)
+			{
+				corner[0] = m->mins[0];
+				if (cx)
+					corner[0] = m->maxs[0];
+
+				for (cy = 0; cy < 2; cy++)
+				{
+					corner[1] = m->mins[1];
+					if (cy)
+						corner[1] = m->maxs[1];
+
+					for (cz = 0; cz < 2; cz++)
+					{
+						corner[2] = m->mins[2];
+						if (cz)
+							corner[2] = m->maxs[2];
+
+						HLMatTransform(corner, xform, world);
+
+						if (first)
+						{
+							HLVecCopy(world, wmins);
+							HLVecCopy(world, wmaxs);
+							first = FALSE;
+						}
+						else
+						{
+							for (i = 0; i < 3; i++)
+							{
+								if (world[i] < wmins[i])
+									wmins[i] = world[i];
+								if (world[i] > wmaxs[i])
+									wmaxs[i] = world[i];
+							}
+						}
+					}
+				}
+			}
+		}
+
+		if (!HLVisBoxInFrustum(vs, wmins, wmaxs))
+			return;
+	}
+
 	//R_DrawBrushModel marks dlights against the submodel's own nodes. The world
 	//descent in HLPushDlights starts at node 0 and cannot reach these faces, so
 	//this is the whole of a mover's dynamic lighting. hl_dlight_mspace_on stays
@@ -3807,13 +4132,36 @@ U0 HLDrawBrushModel(CHLCanvas *c, CHLMap *map, I64 model_index,
 	HLMarkLightsModel(map, m, origin, xform);
 	hl_dlight_mspace_on = hl_r_dynamic;
 
-	//no face culling: a rotated submodel has no world-space face plane to test
-	//against
+	//unrotated brushes keep authored plane normals, so an eye-vs-plane
+	//backface cull is safe. rotated ones have no world-space plane here -
+	//skip.
+	//
+	//Must use the eye, not view forward: N·forward culls a floor the moment
+	//you look up (N_z·F_z > 0) and thin ladder faces at glancing angles.
+	//Same test as HLVisRecurse; ofs moves the eye into model space.
 	for (i = 0; i < m->num_faces; i++)
 	{
-		if (m->first_face + i < map->num_faces)
-			HLDrawFace(c, map, m->first_face + i, ofs, ent_frame, xform,
-				blend, amt);
+		if (m->first_face + i >= map->num_faces)
+			goto qbm_next;
+
+		if (unrot)
+		{
+			f = &map->faces[m->first_face + i];
+			if (f->plane_num >= 0 && f->plane_num < map->num_planes)
+			{
+				plane = &map->planes[f->plane_num];
+				ndot  = HLVecDot(plane->normal, c->origin) - plane->dist;
+				if (ofs)
+					ndot -= HLVecDot(plane->normal, ofs);
+				if ((ndot < 0.0) != ToBool(f->side))
+					goto qbm_next;
+			}
+		}
+
+		HLDrawFace(c, map, m->first_face + i, ofs, ent_frame, xform,
+			blend, amt, wave_amp, scroll_speed);
+
+qbm_next:
 	}
 
 	hl_dlight_mspace_on = FALSE;
@@ -3885,6 +4233,37 @@ U0 HLDrawBlitFit(CHLCanvas *c, CDC *dc, I64 dst_x, I64 dst_y, I64 dst_w,
 
 	if (dst_w < 1 || dst_h < 1)
 		return;
+
+	//1:1, no underwater warp: one DispCorrect per pixel, no fixed-point step.
+	//Identity display table (no gamma/tint) copies whole rows.
+	if (dst_w == c->width && dst_h == c->height && hl_warp_amount <= 0.0)
+	{
+		for (y = 0; y < dst_h; y++)
+		{
+			py = dst_y + y;
+
+			if (py < 0 || py >= dc->height)
+				goto qbf_1to1_next;
+
+			src = c->pixels + y * c->width;
+			dst = dc->body + py * pitch;
+
+			if (hl_disp_identity && dst_x == 0 && dst_w <= dc->width)
+				MemCopy(dst, src, dst_w * sizeof(U32));
+			else
+			{
+				for (x = 0; x < dst_w; x++)
+				{
+					if (dst_x + x >= 0 && dst_x + x < dc->width)
+						dst[dst_x + x] = HLDispCorrect(src[x]);
+				}
+			}
+
+qbf_1to1_next:
+		}
+
+		return;
+	}
 
 	//16.16 fixed point. parenthesised - shifts bind tighter than divide in
 	//this compiler and it reorders these silently
@@ -4283,6 +4662,7 @@ Bool HLDecalBounds(CHLCanvas *c, CHLDecal *d, I64 *_x0, I64 *_y0,
 		//hit, not by these, so they only have to be defined
 		quad[k].s = 0.0;
 		quad[k].t = 0.0;
+		quad[k].light = 0.0;
 	}
 
 	count = HLDrawClipNear(quad, 4, clipped);
@@ -5002,24 +5382,28 @@ U0 HLDrawBeam(CHLCanvas *c, F64 *start, F64 *end,
 		quad[0].cam[2] = edge_a[i * 3 + 2];
 		quad[0].s      = 0.0;
 		quad[0].t      = tex_t[i];
+		quad[0].light  = 0.0;
 
 		quad[1].cam[0] = edge_b[i * 3];
 		quad[1].cam[1] = edge_b[i * 3 + 1];
 		quad[1].cam[2] = edge_b[i * 3 + 2];
 		quad[1].s      = ToF64(tw);
 		quad[1].t      = tex_t[i];
+		quad[1].light  = 0.0;
 
 		quad[2].cam[0] = edge_b[(i + 1) * 3];
 		quad[2].cam[1] = edge_b[(i + 1) * 3 + 1];
 		quad[2].cam[2] = edge_b[(i + 1) * 3 + 2];
 		quad[2].s      = ToF64(tw);
 		quad[2].t      = tex_t[i + 1];
+		quad[2].light  = 0.0;
 
 		quad[3].cam[0] = edge_a[(i + 1) * 3];
 		quad[3].cam[1] = edge_a[(i + 1) * 3 + 1];
 		quad[3].cam[2] = edge_a[(i + 1) * 3 + 2];
 		quad[3].s      = 0.0;
 		quad[3].t      = tex_t[i + 1];
+		quad[3].light  = 0.0;
 
 		count = HLDrawClipNear(quad, 4, clipped);
 		if (count < 3)
@@ -5036,6 +5420,7 @@ U0 HLDrawBeam(CHLCanvas *c, F64 *start, F64 *end,
 			scr[k].inv_z    = inv_z;
 			scr[k].s_over_z = clipped[k].s * inv_z;
 			scr[k].t_over_z = clipped[k].t * inv_z;
+			scr[k].light    = 0.0;
 		}
 
 		HLDrawBeamQuad(c, scr, count, texels, pal, tw, th,

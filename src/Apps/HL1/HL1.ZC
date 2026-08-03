@@ -43,9 +43,54 @@
 CHLVisState	*hl_vis		= NULL;
 CHLCanvas	*hl_canvas	= NULL;
 
+//Finished-frame colour plane. draw_it blit reads this, not the live canvas:
+//HLHudFadeDraw walks every pixel and a compositor mid-pass shows a torn fade.
+U32			*hl_present		= NULL;
+I64			 hl_present_w	= 0;
+I64			 hl_present_h	= 0;
+
 //Resolution the canvas was actually built at. hl_opt_res is what the menu asked
 //for, which is not the same thing once an allocation has been refused.
 I64			 hl_res_applied = 0;
+
+U0 HLPresentFree()
+{
+	if (hl_present)
+		Free(hl_present);
+	hl_present   = NULL;
+	hl_present_w = 0;
+	hl_present_h = 0;
+}
+
+Bool HLPresentAlloc(I64 w, I64 h)
+{//colour plane only; depth stays on the back canvas
+	HLPresentFree;
+
+	if (w < 1 || h < 1)
+		return FALSE;
+
+	hl_present = CAlloc(w * h * sizeof(U32));
+	if (!hl_present)
+		return FALSE;
+
+	hl_present_w = w;
+	hl_present_h = h;
+	return TRUE;
+}
+
+U0 HLPresent()
+{//copy the finished back canvas once. draw_it only ever sees a complete frame
+	I64 n;
+
+	if (!hl_canvas || !hl_canvas->pixels || !hl_present)
+		return;
+
+	if (hl_canvas->width != hl_present_w || hl_canvas->height != hl_present_h)
+		return;
+
+	n = hl_present_w * hl_present_h * sizeof(U32);
+	MemCopy(hl_present, hl_canvas->pixels, n);
+}
 
 F64	 hl_origin[3];		//player origin, what physics moves
 F64	 hl_view[3];			//eye position, origin plus the view height
@@ -72,22 +117,77 @@ Bool hl_loading = FALSE;		//SCR_BeginLoadingPlaque / scr_drawloading
 U0 HLDrawIt(CTask *task, CDC *dc)
 {//window manager task: copy only. Every pointer is cleared before the owner
  //frees it; these guards keep teardown out of an in-flight blit.
-	//A map load blocks the game task but not this one, and hl_vis stays NULL
-	//throughout, so blit the plaque the loader painted.
-	if (hl_loading && hl_ready && hl_canvas)
-	{
-		HLDrawBlitFit(hl_canvas, dc, hl_blit_x, hl_blit_y, hl_blit_w, hl_blit_h);
+ //
+ //Blit rect is derived from dc every frame (Diablo D1DrawIt), not from a
+ //stale HLCenterView snapshot - WinMax / DE can change pix size under us.
+ //Fullscreen fills the window; windowed keeps aspect. Letterbox is painted
+ //black so Doc spam (ENT trace, etc.) cannot show through.
+ //
+ //Source is hl_present when allocated: the live canvas is still being written
+ //(fade composite especially) while this callback runs on another tick.
+	CHLCanvas present;
+	CHLCanvas *src;
+	I64 w;
+	I64 h;
+	I64 cw;
+	I64 ch;
+	I64 bw;
+	I64 bh;
+
+	no_warn task;
+
+	if ((!hl_ready && !hl_loading) || !hl_canvas)
 		return;
+
+	w  = dc->width;
+	h  = dc->height;
+	cw = hl_canvas->width;
+	ch = hl_canvas->height;
+
+	if (w < 1 || h < 1 || cw < 1 || ch < 1)
+		return;
+
+	//Kill Doc bleed before the stretch - uncovered pixels otherwise show
+	//whatever "%s" printed into the put-doc since the last DocClear.
+	dc->color = BLACK;
+	GrRect(dc, 0, 0, w, h);
+
+	if (hl_opt_fullscreen)
+	{//fill the window; canvas aspect may stretch a few pixels on a text-grid
+	 //that is not an exact multiple of the chosen res
+		bw = w;
+		bh = h;
+	}
+	else
+	{
+		bw = w;
+		bh = (w * ch) / cw;
+		if (bh > h)
+		{
+			bh = h;
+			bw = (h * cw) / ch;
+		}
 	}
 
-	if (!hl_ready || !hl_canvas)
-		return;
+	if (bw < 1) bw = 1;
+	if (bh < 1) bh = 1;
 
-	HLDrawBlitFit(hl_canvas, dc, hl_blit_x, hl_blit_y, hl_blit_w, hl_blit_h);
+	hl_blit_w = bw;
+	hl_blit_h = bh;
+	hl_blit_x = (w - bw) / 2;
+	hl_blit_y = (h - bh) / 2;
 
+	src = hl_canvas;
+	if (hl_present && hl_present_w == cw && hl_present_h == ch)
+	{
+		MemSet(&present, 0, sizeof(CHLCanvas));
+		present.pixels = hl_present;
+		present.width  = hl_present_w;
+		present.height = hl_present_h;
+		src = &present;
+	}
 
-	//No HUD text here: Sbar draws it into the canvas, through the game's own
-	//art and palette.
+	HLDrawBlitFit(src, dc, hl_blit_x, hl_blit_y, hl_blit_w, hl_blit_h);
 }
 
 //--- deferred translucent pass ----------------------------------------------
@@ -167,9 +267,13 @@ U0 HLRenderEntities()
 	F64		  dist[3];
 	F64		  center[3];
 	F64		  cycle;
+	F64		  scale;
+	F64		  wave;
+	F64		  scroll;
 	I64		  i;
 	I64		  amt;
 	I64		  frame;
+	I64		  code;
 
 	hl_ent_drawn   = 0;
 	hl_trans_count = 0;
@@ -199,17 +303,34 @@ U0 HLRenderEntities()
 				goto qde_next_brush;
 			}
 
+			//WaveHeight → pev->scale. scroll*: UpdateSpeed packs |speed|*16
+			//into rendercolor g:b (sign in r); else pev->speed; else 35.
+			wave = e->scale;
+			code = (ToI64(e->rendercolor[1]) << 8) | ToI64(e->rendercolor[2]);
+			if (code > 0)
+			{
+				scroll = ToF64(code) / 16.0;
+				if (e->rendercolor[0] != 0.0)
+					scroll = -scroll;
+			}
+			else if (e->speed != 0.0)
+				scroll = e->speed;
+			else
+				scroll = 35.0;
+
 			//Same registry the trace uses, so draw and collide agree.
 			//e->angles is not a valid signal: HLTrainNext writes yaw into
 			//angles[1] every frame as bookkeeping.
 			if (HLClipIsRotatingDraw(i))
 				HLDrawBrushModel(hl_canvas, hl_map, e->brush_model,
 					e->origin, e->frame, e->angles,
-					e->rendermode, ToI64(e->renderamt));
+					e->rendermode, ToI64(e->renderamt), hl_vis,
+					wave, scroll);
 			else
 				HLDrawBrushModel(hl_canvas, hl_map, e->brush_model,
 					e->origin, e->frame, NULL,
-					e->rendermode, ToI64(e->renderamt));
+					e->rendermode, ToI64(e->renderamt), hl_vis,
+					wave, scroll);
 			hl_ent_drawn++;
 		}
 		else if (e->ent_class == HLC_SPRITE && e->spr && e->visible)
@@ -260,6 +381,14 @@ qde_next_brush:
 				e->seq, cycle, e->blending[0], e->body, e->skin,
 				HLEntLightPoint(hl_map, e), e->controllers,
 				e->blending[1], i);
+
+			//xen_plantlight: CXenPLight hangs sprites/flare3.spr on attachment 1.
+			//No bone attachment here; mid-hull glow and the deferred pass.
+			if (e->spr)
+			{
+				HLTransCenter(e, center);
+				HLTransAdd(i, center);
+			}
 		}
 		else
 			HLMdlDraw(hl_canvas, e->mdl, e->frame, e->origin,
@@ -290,12 +419,44 @@ qde_next:
 			HLSprDrawEntity(hl_canvas, e->spr, frame, e->origin, e->angles,
 				HLEntLightPoint(hl_map, e), e->rendermode, amt, e->scale);
 		}
-		else if (HLClipIsRotatingDraw(hl_trans_ent[i]))
-			HLDrawBrushModel(hl_canvas, hl_map, e->brush_model,
-				e->origin, e->frame, e->angles, e->rendermode, amt);
+		else if (e->spr && e->studio)
+		{
+			//plantlight glow: origin + (0,0,(mins.z+maxs.z)*0.5), xen.cpp:105
+			center[0] = e->origin[0];
+			center[1] = e->origin[1];
+			center[2] = e->origin[2] + (e->mins[2] + e->maxs[2]) * 0.5;
+			if (amt <= 0)
+				amt = 255;
+			scale = e->scale;
+			if (scale <= 0.0)
+				scale = 1.0;
+			HLSprDrawEntity(hl_canvas, e->spr, 0, center, e->angles,
+				HLEntLightPoint(hl_map, e), HLRENDER_GLOW, amt, scale);
+		}
 		else
-			HLDrawBrushModel(hl_canvas, hl_map, e->brush_model,
-				e->origin, e->frame, NULL, e->rendermode, amt);
+		{
+			wave = e->scale;
+			code = (ToI64(e->rendercolor[1]) << 8) | ToI64(e->rendercolor[2]);
+			if (code > 0)
+			{
+				scroll = ToF64(code) / 16.0;
+				if (e->rendercolor[0] != 0.0)
+					scroll = -scroll;
+			}
+			else if (e->speed != 0.0)
+				scroll = e->speed;
+			else
+				scroll = 35.0;
+
+			if (HLClipIsRotatingDraw(hl_trans_ent[i]))
+				HLDrawBrushModel(hl_canvas, hl_map, e->brush_model,
+					e->origin, e->frame, e->angles, e->rendermode, amt,
+					hl_vis, wave, scroll);
+			else
+				HLDrawBrushModel(hl_canvas, hl_map, e->brush_model,
+					e->origin, e->frame, NULL, e->rendermode, amt,
+					hl_vis, wave, scroll);
+		}
 
 		hl_ent_drawn++;
 	}
@@ -1064,16 +1225,22 @@ U0 HLHudDrawFrame(CHLCanvas *c)
 {//HL HUD in place of Quake's status bar: none of Sbar's art (SBAR, IBAR, the
  //big digits) exists in valve/.
  //
- //With a VM the numbers come from the player edict; without one, from the
- //native entity world.
+ //Client/demo: numbers come from hl_cl (clientdata + Battery usermsg).
+ //Listen host / solo: native entity world.
 	I64 health  = 100;
 	I64 battery = 0;
 	I64 ammo    = -1;
 
-	//The entity world owns the player's health and armour. HLPlayerHealth and
-	//HLPlayerArmor read the same globals, so there is no second path.
-	health  = ToI64(HLPlayerHealth);
-	battery = ToI64(HLPlayerArmor);
+	if (HLClientMode)
+	{
+		health  = hl_cl.health;
+		battery = hl_cl.armorvalue;
+	}
+	else
+	{
+		health  = ToI64(HLPlayerHealth);
+		battery = ToI64(HLPlayerArmor);
+	}
 
 	ammo = HLWeaponAmmo;
 
@@ -1560,6 +1727,11 @@ U0 HLRenderFrame()
 	//layer run on it; HLHud.ZC compiles before HLGame.ZC and cannot name it.
 	hl_hud_time = hl_game_time;
 
+	//gDisplayTitle → GameTitle, once, then clear. Save loads clear the flag
+	//in HLLoadGame so this is a no-op after restore.
+	if (hl_world_active)
+		HLEntGameTitleDrain;
+
 	//Light styles step at 10Hz off the game clock; ambients retrigger as their
 	//previous instance runs out.
 	HLLightAnimate(hl_game_time);
@@ -1634,6 +1806,7 @@ U0 HLRenderFrame()
 	if (!HLMapValid(hl_map, "HLRenderFrame") || !hl_vis)
 	{
 		HLHudDrawFrame(hl_canvas);
+		HLPresent;
 		return;
 	}
 
@@ -1779,6 +1952,8 @@ U0 HLRenderFrame()
 		HLConDraw(hl_canvas);
 	else
 		HLConDrawNotify(hl_canvas);
+
+	HLPresent;
 }
 
 U0 HLCenterView(CTask *task)
@@ -1812,13 +1987,62 @@ U0 HLCenterView(CTask *task)
 	hl_blit_y = (h - hl_blit_h) / 2;
 }
 
+U0 HLWindowApply()
+{//window geometry only - Diablo D1WindowApply / Quake windowed half.
+ //WinMax, WinHorz and WinVert are synchronous (TaskDerivedValsUpdate), so
+ //pix_width / pix_height are current on return. No canvas rebuild: toggling
+ //fullscreen must not free planes the compositor may still be reading.
+	I64 w;
+	I64 h;
+
+	if (!hl_canvas)
+		return;
+
+	w = hl_canvas->width;
+	h = hl_canvas->height;
+
+	//NO_BORDER before sizing: bordered WinMax leaves col 0 / taskbar rows as
+	//wallpaper (the strip on the left of a "fullscreen" shot). WinVert also
+	//reserves DE_BAR_ROWS only while bordered.
+	WinBorder(OFF);
+
+	if (hl_opt_fullscreen)
+	{//Edge-to-edge - stock WinMax still skips row 0 and the last row
+	 //(`1-nb .. TR-2+nb`). On a 1280x720 text grid that costs a full scanline
+	 //band and breaks 1:1 with a 1280x720 canvas.
+		WinHorz(0, TEXT_COLS - 1);
+		WinVert(0, TEXT_ROWS - 1);
+	}
+	else
+	{//windowed sizes to the render target, landing close to 1:1. WinHorz /
+	 //WinVert clamp to the text grid.
+		WinHorz(2, 2 + (w / FONT_WIDTH));
+		WinVert(2, 2 + (h / FONT_HEIGHT));
+	}
+
+	WinToTop;
+	HLCenterView(Fs);
+}
+
 U0 HLApplyVideo()
-{//rebuild the render target and resize the window. The compositor reads the
- //canvas through draw_it, so the drain-before-free that teardown needs applies
- //here too, or a resolution change frees memory mid-blit.
+{//rebuild the render target when the res index changed; otherwise only
+ //resize the window (windowed toggle). The compositor reads the canvas
+ //through draw_it, so a res change drains before free.
 	CHLCanvas *old;
 	I64		  w = hl_res_w[hl_opt_res];
 	I64		  h = hl_res_h[hl_opt_res];
+
+	//Same canvas size: only window geometry. Matches Diablo's path so a
+	//fullscreen toggle does not pay the drain/realloc tax or risk a blank
+	//frame if alloc fails at the current size.
+	if (hl_canvas && hl_opt_res == hl_res_applied)
+	{
+		HLLog("video: window only\n");
+		HLLogFlush;
+		HLWindowApply;
+		hl_res_dirty = FALSE;
+		return;
+	}
 
 	//Breadcrumbs to the log, not the console: if the machine wedges here the
 	//console is never composited again, but HL1LOG.TXT survives a reboot. The
@@ -1836,13 +2060,14 @@ U0 HLApplyVideo()
 	old      = hl_canvas;
 	hl_canvas = NULL;
 	HLDrawFree(old);
+	HLPresentFree;
 
 	hl_canvas = HLDrawNew(w, h);
 
 	//12 bytes per pixel across the colour and depth planes, so 800x600 needs
-	//5.8MB against 320x240's 0.9MB, on top of the wads and the loaded map. A
-	//refused allocation must not leave a NULL canvas: every draw path and the
-	//compositor dereference it unguarded.
+	//5.8MB, 1280x720 ~11MB, against 320x240's 0.9MB, on top of the wads and
+	//the loaded map. A refused allocation must not leave a NULL canvas: every
+	//draw path and the compositor dereference it unguarded.
 	if (!hl_canvas)
 	{
 		"HL1: %d x %d canvas refused, staying at %d x %d\n",
@@ -1877,28 +2102,18 @@ U0 HLApplyVideo()
 		return;
 	}
 
+	if (!HLPresentAlloc(hl_canvas->width, hl_canvas->height))
+		"HL1: present buffer refused; blit falls back to live canvas\n";
+
 	hl_res_applied = hl_opt_res;
 
 	HLLog("video: canvas ok, resizing window\n");
 	HLLogFlush;
 
-	//Windowed sizes to the render target, landing close to 1:1.
-	if (hl_opt_fullscreen)
-		WinMax;
-	else
-	{
-		WinHorz(2, 2 + (w / FONT_WIDTH));
-		WinVert(2, 2 + (h / FONT_HEIGHT));
-	}
+	HLWindowApply;
 
 	HLLog("video: window resized, restoring draw_it\n");
 	HLLogFlush;
-
-	//WinMax, WinHorz and WinVert are synchronous. Each ends in
-	//TaskDerivedValsUpdate, which calls WinDerivedValsUpdate and writes
-	//pix_width and pix_height before returning, so centring reads the new size
-	//with no sleep in between.
-	HLCenterView(Fs);
 
 	Fs->draw_it  = &HLDrawIt;
 	hl_res_dirty = FALSE;
@@ -1992,6 +2207,12 @@ Bool HLLoadMap(U8 *mapname)
 		//After the spawn pass: HLEntSpawnAll resets this to -1 as part of its
 		//per-map reset, and the pusher rider check needs it set.
 		hl_ent_player = 0;
+
+		//Fresh map: empty hands. Save/transition restore overwrites this when
+		//the load path continues into HLSaveRestore / HLSaveTransitionRestore.
+		HLWeaponPlayerSpawn;
+		hl_wpn_spawned   = TRUE;
+		hl_wpn_last_time = hl_ent_time;
 
 		HLEntReport;
 
@@ -2124,6 +2345,14 @@ Bool HLLoadGame()
 		HLLog("load: restore failed\n");
 		return FALSE;
 	}
+
+	//HLLoadMap ran worldspawn spawn: gametitle set gDisplayTitle and
+	//startdark started a black hold. That is New Game only. A restore is
+	//mid-chapter - kill both before the first play frame drains the title.
+	hl_ent_display_title = FALSE;
+	HLHudTitleInit;
+	hl_fade_mode = HLFADE_NONE;
+	hl_fade_a    = 0;
 
 	//A restored world is a new world to the protocol: every entity would
 	//otherwise delta against a reference that no longer describes it.
@@ -2329,6 +2558,7 @@ Bool HLChangeLevel(U8 *mapname)
 	//The inventory is native now; nothing to pack out of a QuakeC world.
 	HLGameShutdown;
 	HLEntFree;
+	HLMortarPendClear;
 
 	if (hl_vis)
 	{
@@ -2349,6 +2579,7 @@ Bool HLChangeLevel(U8 *mapname)
 		if (hl_pic_conback.pixels)
 			HLPicDrawFill(hl_canvas, &hl_pic_conback);
 		HLSbarLoadingPlaque(hl_canvas);
+		HLPresent;
 		hl_loading = TRUE;
 	}
 
@@ -2917,6 +3148,7 @@ U0 HLGameLoop()
 				else if (hl_state == HLST_PLAYING)
 				{
 					hl_state = HLST_MENU;
+					HLMenuMsReset;
 					HLMenuSound(HLMSND_ENTER);
 				}
 				else if (hl_state == HLST_CONSOLE)
@@ -2924,6 +3156,7 @@ U0 HLGameLoop()
 					//Key_Console passes ESC straight to M_ToggleMenu_f.
 					hl_state     = HLST_MENU;
 					hl_menu_page = HLPAGE_MAIN;
+					HLMenuMsReset;
 					HLMenuSound(HLMSND_ENTER);
 				}
 				//The keyboard page owns ESC: it cancels an armed SetNewKey and
@@ -2992,6 +3225,7 @@ U0 HLGameLoop()
 		{
 			HLMenuDraw(hl_canvas);
 			HLConDraw(hl_canvas);
+			HLPresent;
 			HLCenterView(Fs);
 			hl_ready = TRUE;
 
@@ -3062,6 +3296,21 @@ U0 HLGameLoop()
 			}
 			last_menu_sc = menu_sc;
 
+			//VGUI mouse: raw mode freezes mouse.pos, so dx/dy feed a soft
+			//cursor; hover arms the same rows keyboard nav uses.
+			if (HLMenuMouse(hl_canvas, dx, dy, hl_blit_w, hl_blit_h,
+				mouse1, wheel_dz, &start_game))
+			{
+				if (start_game)
+				{
+					HLDemoStop;
+					hl_demo_loop = FALSE;
+
+					hl_menu_ingame = TRUE;
+					hl_state       = HLST_PLAYING;
+				}
+			}
+
 			//Multiplayer new game: the map must restart so items spawn with
 			//deathmatch already active. Flipping it on a live level leaves the
 			//existing ones wrong.
@@ -3090,6 +3339,8 @@ U0 HLGameLoop()
 				HLRenderFrame;
 
 			HLMenuDraw(hl_canvas);
+			HLMenuMsDraw(hl_canvas);
+			HLPresent;
 			HLCenterView(Fs);
 			hl_ready = TRUE;
 
@@ -3415,11 +3666,12 @@ U0 HLGameLoop()
 			//the player's own orientation
 			HLEntFrame(hl_map, HLSERVER_STEP, hl_origin, hl_angles);
 
-			//Demo playback owns the frame: no input, no move, no think. Vanilla
-			//has no prediction either - V_CalcRefdef puts the view on
-			//cl_entities[cl.viewentity], and the angles are the three floats
-			//recorded beside every demo message.
-			if (hl_demo_playing)
+		//Demo playback owns the frame: no input, no move, no think. Vanilla
+		//has no prediction either - V_CalcRefdef puts the view on
+		//cl_entities[cl.viewentity], and the angles are the three floats
+		//recorded beside every demo message. Guest move is HLPredApply after
+		//CL_SendMove, not the free-running HLPlayerMove below.
+		if (hl_demo_playing)
 			{
 				if (hl_cl_viewent > 0 && hl_cl_viewent < HLNET_MAX_ENTS)
 					HLVecCopy(hl_net_cl[hl_cl_viewent].origin, hl_origin);
@@ -3427,6 +3679,11 @@ U0 HLGameLoop()
 				HLVecCopy(hl_demo_angles, hl_angles);
 				HLVecSet(hl_velocity, 0.0, 0.0, 0.0);
 				hl_on_ground = TRUE;
+			}
+			else if (hl_udp_ready && !hl_udp_server)
+			{
+				//Guest: authoritative origin is the wire; HLPredApply after
+				//SendMove replays unacked cmds on top of the last snap.
 			}
 			else if (!hl_noclip)
 			{
@@ -3664,13 +3921,28 @@ U0 HLGameLoop()
 		//the wire wants units/sec, which is the same speed the local move used.
 		//upmove is rebuilt from the keys rather than taken from move[2], which
 		//HLVecNormalize has already turned into a fraction of the wish vector.
+		//
+		//HLPredApply: snap from the last view-entity state and replay the
+		//unacked cmd ring. Runs after SendMove so this frame's cmd is in the
+		//ring.
 		if (hl_udp_ready && !hl_udp_server && hl_cl_signon >= 4)
+		{
 			HLNetClientSendMove(hl_angles, net_fwd * speed, net_side * speed,
 				ToF64(HLSvFlagI(HLInDown(HLIN_MOVEUP)) -
 					HLSvFlagI(HLInDown(HLIN_MOVEDOWN))) * speed,
 				attack,
 				ToBool(HLInDown(HLIN_JUMP) && !hl_ent_input_locked),
-				impulse, hl_game_time);
+				impulse, hl_game_time,
+				ToBool(HLInDown(HLIN_DUCK) && !hl_ent_input_locked),
+				dt);
+			HLPredApply(hl_map, hl_origin, hl_velocity, &hl_on_ground);
+			//Predicted punch: hl_punch lives here; Pred seeds from wire.
+			HLVecCopy(hl_pred_punch, hl_punch);
+		}
+
+		HLTrainPlayerDriveFrame(
+			ToBool(HLInDown(HLIN_FORWARD) && !hl_ent_input_locked),
+			ToBool(HLInDown(HLIN_BACK) && !hl_ent_input_locked));
 
 		//player_weaponstrip. CBasePlayer::RemoveAllItems(FALSE): weapons and
 		//ammo only, the suit and the long jump stay.
@@ -3680,14 +3952,20 @@ U0 HLGameLoop()
 			HLWeaponRemoveAll;
 		}
 
-		//player_loadsaved. CRevertSaved reloads the last save; with no save
-		//system the honest equivalent is a reload of the current map.
+		//player_loadsaved and SP death: client.cpp respawn() → "reload" =
+		//last save. Fresh HLChangeLevel only if no save file exists yet.
 		if (hl_ent_loadsaved_pending)
 		{
 			hl_ent_loadsaved_pending = FALSE;
 
-			if (hl_map_name[0])
-				HLChangeLevel(hl_map_name);
+			if (!HLLoadGame)
+			{
+				HLLog("reload: no save - remounting map\n");
+
+				if (hl_map_name[0])
+					HLChangeLevel(hl_map_name);
+			}
+			goto ql_next_frame;
 		}
 
 		//trigger_endsection hands the section name back to the menu.
@@ -3855,6 +4133,7 @@ U0 HLTaskEndCB()
 	Fs->draw_it = NULL;
 	Sleep(100);
 	hl_canvas = NULL;
+	HLPresentFree;
 
 	//By handle, then by voice table: HLSndStopAll releases the handles this app
 	//knows about, AudioSFXStopAll covers anything started outside it.
@@ -4067,6 +4346,9 @@ U0 HL1(U8 *mapname = HLDEFAULT_MAP)
 		return;
 	}
 
+	if (!HLPresentAlloc(hl_canvas->width, hl_canvas->height))
+		"HL1: present buffer refused; blit falls back to live canvas\n";
+
 	hl_res_applied = hl_opt_res;
 
 	//hud.txt carries one row per element per resolution, so the table can only be
@@ -4089,12 +4371,12 @@ U0 HL1(U8 *mapname = HLDEFAULT_MAP)
 		Fs->win_inhibit = WIG_TASK_DEFAULT - WIF_SELF_FOCUS -
 						  WIF_SELF_GRAB_SCROLL - WIF_FOCUS_TASK_MENU;
 		AutoComplete;
-		WinBorder;
-		WinMax;
+		WinBorder(OFF);
+		//HLWindowApply does edge-to-edge WinHorz/WinVert when fullscreen;
+		//stock WinMax leaves row 0 and a wallpaper gutter.
+		HLWindowApply;
 		DocCursor;
 		DocClear;
-
-		HLCenterView(Fs);
 
 		//Armed before the first voice can start. A kill between here and the
 		//teardown lands in HLTaskEndCB.
@@ -4151,6 +4433,7 @@ U0 HL1(U8 *mapname = HLDEFAULT_MAP)
 	//Clear each global before releasing it, so a late HLDrawIt sees NULL.
 	canvas   = hl_canvas;
 	hl_canvas = NULL;
+	HLPresentFree;
 	vis      = hl_vis;
 	hl_vis    = NULL;
 	map      = hl_map;

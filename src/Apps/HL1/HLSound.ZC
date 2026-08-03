@@ -97,13 +97,14 @@ F64		 hl_snd_right[3];		//listener_right, for stereo separation
 
 //--- channels ---------------------------------------------------------------
 //
-// SND_PickChannel. Eight dynamic channels. A sound from an entity replaces what
+// SND_PickChannel. Dynamic channel table. A sound from an entity replaces what
 // that entity already has on the same channel, so repeat fire is one weapon
 // rather than a stack of overlapping copies.
 
 //Quake's 8. HL routes far more through this pool: every weapon report, footstep,
-//door, machine and monster voice line, on top of the entity/channel replacement
-//rules. At 8, a firefight in a corridor drops everything but the gunfire.
+//door, machine, ambient_generic cue-loop and monster voice line. At 8 a
+//firefight drops everything but the gunfire; 16 still fills under c1a0e's
+//ambient load, so PickChannel steals loops when the table is full.
 #define HLSND_DYNAMIC_CHANNELS	16
 
 class CHLSndChan
@@ -130,6 +131,12 @@ class CHLSndChan
 
 CHLSndChan	hl_snd_chan[HLSND_DYNAMIC_CHANNELS];
 I64			hl_snd_viewent = 0;
+
+//ambient_generic cue-loops use entnum = -(slot+1). Stealing one for a one-shot
+//(flashlight, gun, speech) must re-arm that source - next_time is otherwise
+//1e30 and the loop never returns. Set in HLSndPickChannel; drained in
+//HLSndAmbientUpdate (ambient table compiles later).
+I64 hl_snd_kick_ambient = -1;
 
 //S_StartDynamicSound records entnum/entchannel and the mixer re-derives the
 //spatialisation from that entity's current origin every mix; only
@@ -368,12 +375,15 @@ qsp_match_next:
 				AudioSFXPlaying(ch->voice))
 				goto qsp_next;
 
-			//DEVIATION. SND_PickChannel has no such rule; it steals whatever is
-			//closest to finishing. A held loop - a machine, the egon hum - runs
-			//until its owner stops it by handle, and nothing re-issues the
-			//event that started it, so a stolen loop is silent for good. Pass 1
-			//still replaces a loop with another sound from the same entity on
-			//the same channel, which is how a loop is meant to end
+			//Prefer not to steal held loops (egon hum, ambient_generic cue
+			//loops): nothing re-issues them, so a steal is permanent silence.
+			//Pass 1 still replaces a loop on the same (ent, channel).
+			//
+			//c1a0e registers many looping ambients; HLSND_AMBIENT_VOICES of
+			//them sit on dynamic channels. Skipping every loop here left no
+			//slot for CHAN_VOICE, so !SC_LOCK* queued then dropped - scientists
+			//idle, jaw shut. GoldSrc SND_PickChannel steals freely; keep the
+			//loop shield for weapons/world, but fall through below for speech.
 			if (ch->loop && AudioSFXPlaying(ch->voice))
 				goto qsp_next;
 
@@ -389,13 +399,54 @@ qsp_next:
 		}
 	}
 
+	//Table full of held loops (ambient_generic cue loops park up to
+	//HLSND_AMBIENT_VOICES of the 16 dynamic slots forever). GoldSrc
+	//SND_PickChannel steals freely; pass 2 above keeps the shield for egon /
+	//machine hum so a random footstep does not kill them. When nothing else
+	//is free, any caller - CHAN_AUTO flashlight included - must steal, or
+	//the whole map goes silent under ambient load (c1a0e airlock).
+	if (first_to_die < 0)
+	{
+		life_left = 1000000.0;
+
+		for (i = 0; i < HLSND_DYNAMIC_CHANNELS; i++)
+		{
+			ch = &hl_snd_chan[i];
+
+			if (ch->entnum == hl_snd_viewent && entnum != hl_snd_viewent &&
+				AudioSFXPlaying(ch->voice))
+				goto qsp_steal_next;
+
+			if (!ch->loop || !AudioSFXPlaying(ch->voice))
+				goto qsp_steal_next;
+
+			life = HLSndChanLifeLeft(ch);
+
+			if (life < life_left)
+			{
+				life_left    = life;
+				first_to_die = i;
+			}
+
+qsp_steal_next:
+		}
+	}
+
 	if (first_to_die < 0)
 		return -1;
 
-	if (AudioSFXPlaying(hl_snd_chan[first_to_die].voice))
-		AudioSFXStop(hl_snd_chan[first_to_die].voice);
+	ch = &hl_snd_chan[first_to_die];
 
-	hl_snd_chan[first_to_die].voice = -1;
+	//ambient_generic: entnum -(slot+1). Re-arm so AmbientUpdate re-issues
+	//the cue loop after this one-shot finishes.
+	if (ch->entnum < 0)
+		hl_snd_kick_ambient = -ch->entnum - 1;
+
+	if (AudioSFXPlaying(ch->voice))
+		AudioSFXStop(ch->voice);
+
+	ch->voice = -1;
+	ch->loop  = FALSE;
 
 	return first_to_die;
 }
@@ -403,270 +454,28 @@ qsp_next:
 //--- room reverb ------------------------------------------------------------
 //
 // env_sound. CEnvSound::Think picks the nearest visible env_sound to the player
-// and sends its roomtype to the client; the reverb itself lives in the closed
-// engine, so only the entity half is in the SDK. HLEntity.ZC does that half and
-// publishes hl_ent_roomtype, which is handed here.
+// and sends its roomtype to the client; the reverb itself lived in the closed
+// engine (SX_RoomFX). This port runs that DSP on the SFX mix bus in AC97.ZC
+// (AudioDSPRoomSet) - delay/reverb on the voice sum, streams dry. Voice-clone
+// "echo taps" were removed: they filled AUDIO_MAX_SFX_VOICES and silenced
+// scripted speech under a live roomtype (c1a0e !SC_LOCK*).
 //
-// The mixer has no filter chain and is not this file's to change, so the room is
-// built out of what a voice pool can do: each dry sound is followed by two or
-// three quieter delayed copies of itself. That is an early-reflection tap
-// pattern, the front half of a reverb, and it is what carries the impression of
-// room size.
-//
-// The roomtype numbering is the env_sound "Room type" list: 0 off, then triples
-// of small/medium/large - 1 generic, 4 metallic, 7 tunnel, 10 chamber,
-// 13 bright, 16 water, 19 concrete, 22 outside, 25 cavern - and 28..30 weirdo.
-//
-// Only "0 is off" is citable: dlls/sound.cpp:840 reads the roomtype key and
-// world.cpp:489 clears room_type to 0. The grouping above comes from the
-// level editor's choice list, and the DSP each number selects is inside the
-// engine, which is not in the SDK checkout. Every tap count, spacing, decay and
-// send level below is therefore chosen by ear, not transcribed.
+// roomtype numbering is the env_sound list: 0 off, then size triples through
+// cavern, then weirdo 28. Presets match Xash rgsxpre[].
 
 I64 hl_snd_roomtype;
-
-//taps are fire and forget voices with no channel. Cut off below the pool so a
-//reverberant room can never starve gunfire of a voice
-#define HLSND_MAX_ECHOES		32
-//8 of AUDIO_MAX_SFX_VOICES held back for the dry mix. 16 dynamic channels, 12
-//ambient sources, 4 leaf ambients and the music track already reach 33
-#define HLSND_ECHO_VOICE_LIMIT	(AUDIO_MAX_SFX_VOICES - 8)
-
-//A tap is a whole second copy of the sample, not a delay line: the mixer has no
-//delay path. On a transient that reads as an early reflection. On anything with
-//sustain the copy beats against the dry signal and reads as flanging, so only
-//short sounds are sent.
-#define HLSND_ECHO_MAX_LEN		1.5		//seconds
-
-class CHLSndEcho
-{
-	U32	*frames;		//borrowed from the cache, which never evicts
-	I64	 count;
-	I64	 rate;
-	I64	 vol_l;
-	I64	 vol_r;
-	F64	 when;			//seconds, tS
-	Bool used;
-};
-
-CHLSndEcho	hl_snd_echo[HLSND_MAX_ECHOES];
-
-U0 HLSndEchoClear()
-{
-	I64 i;
-
-	for (i = 0; i < HLSND_MAX_ECHOES; i++)
-	{
-		hl_snd_echo[i].used   = FALSE;
-		hl_snd_echo[i].frames = NULL;
-		hl_snd_echo[i].count  = 0;
-		hl_snd_echo[i].rate   = HLSND_RATE;
-		hl_snd_echo[i].vol_l  = 0;
-		hl_snd_echo[i].vol_r  = 0;
-		hl_snd_echo[i].when   = 0.0;
-	}
-}
-
-Bool HLSndRoomParams(I64 rt, I64 *_taps, F64 *_delay, F64 *_decay, F64 *_wet)
-{//tap count, spacing, per-tap falloff and send level for one roomtype.
- //FALSE when the room is dry
-	I64 family;
-	I64 size;
-
-	*_taps  = 0;
-	*_delay = 0.0;
-	*_decay = 0.0;
-	*_wet   = 0.0;
-
-	if (rt <= 0 || rt > 30)
-		return FALSE;
-
-	if (rt >= 28)
-	{
-		//the three "weirdo" rooms are not a size triple
-		if (rt == 28)
-		{
-			*_taps = 3;	*_delay = 0.25;	*_decay = 0.80;	*_wet = 0.45;
-		}
-		else if (rt == 29)
-		{
-			*_taps = 2;	*_delay = 0.50;	*_decay = 0.70;	*_wet = 0.40;
-		}
-		else
-		{
-			*_taps = 3;	*_delay = 0.02;	*_decay = 0.90;	*_wet = 0.50;
-		}
-
-		return TRUE;
-	}
-
-	family = (rt - 1) / 3;
-	size   = (rt - 1) % 3;
-
-	//small, medium, large. Spacing is the room's dimension expressed as the
-	//time a reflection takes to come back
-	if (size == 0)
-		*_delay = 0.035;
-	else if (size == 1)
-		*_delay = 0.075;
-	else
-		*_delay = 0.140;
-
-	if (family == 0)			//generic
-	{
-		*_taps = 2;	*_decay = 0.50;	*_wet = 0.22;
-	}
-	else if (family == 1)		//metallic
-	{
-		*_taps = 3;	*_decay = 0.65;	*_wet = 0.30;
-	}
-	else if (family == 2)		//tunnel
-	{
-		*_taps = 3;	*_decay = 0.60;	*_wet = 0.35;
-	}
-	else if (family == 3)		//chamber
-	{
-		*_taps = 3;	*_decay = 0.70;	*_wet = 0.30;
-	}
-	else if (family == 4)		//bright
-	{
-		*_taps = 3;	*_decay = 0.75;	*_wet = 0.35;
-	}
-	else if (family == 5)		//water
-	{
-		//a muffled room: the taps are close and die fast
-		*_taps  = 2;	*_decay = 0.45;	*_wet = 0.40;
-		*_delay = *_delay * 0.6;
-	}
-	else if (family == 6)		//concrete
-	{
-		*_taps = 3;	*_decay = 0.60;	*_wet = 0.28;
-	}
-	else if (family == 7)		//outside
-	{
-		//open air has no early reflections, only a distant slap
-		*_taps  = 2;	*_decay = 0.35;	*_wet = 0.20;
-		*_delay = *_delay * 3.0;
-	}
-	else						//cavern
-	{
-		*_taps  = 3;	*_decay = 0.75;	*_wet = 0.40;
-		*_delay = *_delay * 2.0;
-	}
-
-	return TRUE;
-}
-
-U0 HLSndEchoPush(U32 *frames, I64 count, I64 rate, I64 vol_l, I64 vol_r,
-	F64 now)
-{//queue the reflections of one dry sound. No mixer support for a start delay,
- //so each tap is a whole voice fired later
-	I64 taps;
-	I64 slot;
-	I64 i;
-	I64 t;
-	F64 delay;
-	F64 decay;
-	F64 wet;
-	F64 gain;
-
-	if (!frames || count < 1)
-		return;
-
-	if (hl_snd_room_off)
-		return;
-
-	if (rate > 0 && ToF64(count) / ToF64(rate) > HLSND_ECHO_MAX_LEN)
-		return;
-
-	if (!HLSndRoomParams(hl_snd_roomtype, &taps, &delay, &decay, &wet))
-		return;
-
-	//a room must never cost the dry mix a voice.
-	//
-	//PARENTHESISE: a no-argument call written bare yields the function's
-	//address, which is far above any limit, so this test was unconditionally
-	//true and no tap was ever queued. The reverb made no sound at all
-	if (AudioSFXVoicesActive() >= HLSND_ECHO_VOICE_LIMIT)
-		return;
-
-	gain = wet;
-
-	for (t = 1; t <= taps; t++)
-	{
-		slot = -1;
-
-		for (i = 0; i < HLSND_MAX_ECHOES; i++)
-		{
-			if (!hl_snd_echo[i].used)
-			{
-				slot = i;
-				break;
-			}
-		}
-
-		//the queue is full: the room is already dense, drop the rest
-		if (slot < 0)
-			return;
-
-		hl_snd_echo[slot].frames = frames;
-		hl_snd_echo[slot].count  = count;
-		hl_snd_echo[slot].rate   = rate;
-		hl_snd_echo[slot].vol_l  = ToI64(ToF64(vol_l) * gain);
-		hl_snd_echo[slot].vol_r  = ToI64(ToF64(vol_r) * gain);
-		hl_snd_echo[slot].when   = now + delay * ToF64(t);
-		hl_snd_echo[slot].used   = TRUE;
-
-		//below one part in 256 the tap is inaudible and the rest are quieter
-		if (hl_snd_echo[slot].vol_l < 2 && hl_snd_echo[slot].vol_r < 2)
-		{
-			hl_snd_echo[slot].used = FALSE;
-			return;
-		}
-
-		gain = gain * decay;
-	}
-}
-
-U0 HLSndEchoRun(F64 now)
-{//fire the taps that have come due
-	I64 i;
-
-	for (i = 0; i < HLSND_MAX_ECHOES; i++)
-	{
-		if (!hl_snd_echo[i].used || now < hl_snd_echo[i].when)
-			goto qer_next;
-
-		hl_snd_echo[i].used = FALSE;
-
-		//a stale tap left by a level change would play into the new map
-		if (now > hl_snd_echo[i].when + 1.0)
-			goto qer_next;
-
-		//parens: see HLSndEchoPush
-		if (AudioSFXVoicesActive() < HLSND_ECHO_VOICE_LIMIT)
-			AudioSFXPlayRef(hl_snd_echo[i].frames, hl_snd_echo[i].count,
-				hl_snd_echo[i].rate, hl_snd_echo[i].vol_l,
-				hl_snd_echo[i].vol_r);
-
-qer_next:
-	}
-}
 
 U0 HLSndRoomtypeSet(I64 rt)
 {//the "room_type" cvar, dlls/world.cpp:489. HLEntity.ZC calls this with
  //hl_ent_roomtype once the nearest visible env_sound changes
-	if (rt < 0 || rt > 30)
+	if (rt < 0 || rt > 28)
 		rt = 0;
 
 	if (rt == hl_snd_roomtype)
 		return;
 
 	hl_snd_roomtype = rt;
-
-	//taps queued under the old room carry its spacing and gain. Firing them
-	//after the change stacks two rooms for as long as the longest delay
-	HLSndEchoClear;
+	AudioDSPRoomSet(rt);
 }
 
 //--- deferred tables --------------------------------------------------------
@@ -701,7 +510,7 @@ U0 HLSndTablesReset()
 	hl_snd_talk_wait  = 0.0;
 
 	hl_snd_roomtype   = 0;
-	HLSndEchoClear;
+	AudioDSPRoomSet(0);
 }
 
 //--- voice census -----------------------------------------------------------
@@ -728,13 +537,6 @@ U0 HLSndVoiceReport()
 	I64			 live   = 0;
 	I64			 sum_l  = 0;
 	I64			 sum_r  = 0;
-	I64			 echoes = 0;
-
-	for (i = 0; i < HLSND_MAX_ECHOES; i++)
-	{
-		if (hl_snd_echo[i].used)
-			echoes++;
-	}
 
 	for (i = 0; i < HLSND_DYNAMIC_CHANNELS; i++)
 	{
@@ -758,9 +560,9 @@ qsvr_next:
 	}
 
 	StrPrint(hl_snd_dbg_line,
-		"snd: voices %d/%d chans %d/%d taps %d room %d sum %d/%d of %d\n",
+		"snd: voices %d/%d chans %d/%d room %d sum %d/%d of %d\n",
 		AudioSFXVoicesActive(), AUDIO_MAX_SFX_VOICES, live,
-		HLSND_DYNAMIC_CHANNELS, echoes, hl_snd_roomtype, sum_l, sum_r,
+		HLSND_DYNAMIC_CHANNELS, hl_snd_roomtype, sum_l, sum_r,
 		AUDIO_VOL_UNITY);
 	HLLog(hl_snd_dbg_line);
 
@@ -806,10 +608,6 @@ U0 HLSndUpdate()
 
 qsu_next:
 	}
-
-	//the room's delayed taps are due on a wall clock, not a frame count: a
-	//frame hitch must not stretch the reflections with it
-	HLSndEchoRun(tS);
 
 	if (hl_snd_debug && tS >= hl_snd_debug_next)
 	{
@@ -865,12 +663,16 @@ U0 HLSndInit()
 	hl_snd_master  = 0.7;
 	hl_snd_suitvol = 0.25;
 	hl_snd_room_off = FALSE;
+	hl_snd_roomtype = 0;
+	AudioDSPRoomOff(FALSE);
+	AudioDSPRoomSet(0);
 
 	//same reason: a garbage hl_snd_enabled silences the game outright, and a
 	//garbage report counter either floods the log or suppresses it entirely
 	hl_snd_enabled = TRUE;
 	hl_snd_reports = 0;
 	hl_snd_silent  = 0;
+	hl_snd_kick_ambient = -1;
 
 	hl_snd_debug      = FALSE;
 	hl_snd_debug_next = 0.0;
@@ -1695,6 +1497,67 @@ U0 HLMusicUpdate(F64 now)
 	HLLogFlush;
 }
 
+U0 HLSndReclaimOrphanVoices()
+{//Stop mixer voices that no channel / ambient / music owns. Leftover from the
+ //old room tap path; still useful if a PlayRef loses its channel bookkeeping.
+	Bool	kept[AUDIO_MAX_SFX_VOICES];
+	I64		i;
+	I64		slot;
+	I64		handle;
+
+	for (i = 0; i < AUDIO_MAX_SFX_VOICES; i++)
+		kept[i] = FALSE;
+
+	for (i = 0; i < HLSND_DYNAMIC_CHANNELS; i++)
+	{
+		handle = hl_snd_chan[i].voice;
+
+		if (handle < 0)
+			goto qsrov_ch;
+
+		slot = handle & ((1 << AUDIO_VOICE_SHIFT) - 1);
+
+		if (slot >= 0 && slot < AUDIO_MAX_SFX_VOICES)
+			kept[slot] = TRUE;
+
+qsrov_ch:
+	}
+
+	for (i = 0; i < HLNUM_AMBIENTS; i++)
+	{
+		handle = hl_ambient_voice[i];
+
+		if (handle < 0)
+			goto qsrov_amb;
+
+		slot = handle & ((1 << AUDIO_VOICE_SHIFT) - 1);
+
+		if (slot >= 0 && slot < AUDIO_MAX_SFX_VOICES)
+			kept[slot] = TRUE;
+
+qsrov_amb:
+	}
+
+	if (hl_music_voice >= 0)
+	{
+		slot = hl_music_voice & ((1 << AUDIO_VOICE_SHIFT) - 1);
+
+		if (slot >= 0 && slot < AUDIO_MAX_SFX_VOICES)
+			kept[slot] = TRUE;
+	}
+
+	for (i = 0; i < AUDIO_MAX_SFX_VOICES; i++)
+	{
+		if (!audio.voice[i].active || kept[i])
+			goto qsrov_next;
+
+		handle = i | (audio.voice[i].serial << AUDIO_VOICE_SHIFT);
+		AudioSFXStop(handle);
+
+qsrov_next:
+	}
+}
+
 U0 HLSndPlayAt(U8 *name, F64 *origin, F64 volume, F64 attenuation,
 	I64 entnum = 0, I64 entchannel = 0, I64 pitch = HLPITCH_NORM,
 	Bool loop = FALSE)
@@ -1806,6 +1669,16 @@ U0 HLSndPlayAt(U8 *name, F64 *origin, F64 volume, F64 attenuation,
 	//evicts, and HLSndFree stops every voice before releasing frames
 	stream = AudioSFXPlayRef(s->frames + first, count, rate, vol_l, vol_r,
 				loop);
+
+	//reverb taps leave untracked voices; reclaim them once and retry so speech
+	//is not silent under a busy roomtype
+	if (stream < 0)
+	{
+		HLSndReclaimOrphanVoices;
+		stream = AudioSFXPlayRef(s->frames + first, count, rate, vol_l, vol_r,
+					loop);
+	}
+
 	ch->voice = stream;
 
 	//kept for HLSndVoiceAmplitude, which drives bone controller 4
@@ -1813,11 +1686,6 @@ U0 HLSndPlayAt(U8 *name, F64 *origin, F64 volume, F64 attenuation,
 	ch->pcm_count  = count;
 	ch->pcm_rate   = rate;
 	ch->start_time = tS;
-
-	//the room's reflections follow the dry sound. Sent after the voice is taken
-	//so a full pool costs the taps and not the sound itself
-	if (stream >= 0 && !loop)
-		HLSndEchoPush(s->frames + first, count, rate, vol_l, vol_r, tS);
 
 	//dropped, not queued, when every voice is busy
 	if (stream < 0)
@@ -2394,6 +2262,40 @@ U0 HLSndDpvInit()
 	HLSndDpvRow(27,	128,  90, 10, 10, 10, 1, 20, 40, 1,   5,  10,  20, 0);
 }
 
+U0 HLSndAmbientChanStop(I64 slot)
+{//Silence the dynamic channel HLSndAmbientUpdate uses for this slot.
+ //entnum is -(slot+1) on channel 1. HLSndStop lives further down the file
+ //(ZealC single-pass), so the table is walked here the same way Clear does.
+	I64 i;
+	I64 entnum;
+
+	if (slot < 0 || slot >= HLSND_MAX_AMBIENT)
+		return;
+
+	entnum = -(slot + 1);
+
+	for (i = 0; i < HLSND_DYNAMIC_CHANNELS; i++)
+	{
+		if (hl_snd_chan[i].entnum != entnum || hl_snd_chan[i].entchannel != 1)
+			goto qacs_next;
+
+		if (hl_snd_chan[i].voice >= 0)
+			AudioSFXStop(hl_snd_chan[i].voice);
+
+		hl_snd_chan[i].voice      = -1;
+		hl_snd_chan[i].entnum     = 0;
+		hl_snd_chan[i].entchannel = 0;
+		hl_snd_chan[i].master_vol = 0.0;
+		hl_snd_chan[i].fixed      = TRUE;
+		hl_snd_chan[i].loop       = FALSE;
+		hl_snd_chan[i].pcm        = NULL;
+		hl_snd_chan[i].pcm_count  = 0;
+		return;
+
+qacs_next:
+	}
+}
+
 U0 HLSndAmbientClear()
 {//stop and forget every ambient_generic source.
  //
@@ -2767,6 +2669,7 @@ U0 HLSndAmbientRamp(F64 now)
 				a->spindown = 0;
 				a->active = FALSE;
 				a->fading = FALSE;
+				HLSndAmbientChanStop(i);
 				goto qar_next;
 			}
 
@@ -2798,6 +2701,7 @@ U0 HLSndAmbientRamp(F64 now)
 				a->fadeout = 0;
 				a->active  = FALSE;
 				a->fading  = FALSE;
+				HLSndAmbientChanStop(i);
 				goto qar_next;
 			}
 
@@ -2929,6 +2833,7 @@ U0 HLSndAmbientToggle(I64 slot, Bool on, F64 now)
 
 		a->active = FALSE;
 		a->fading = FALSE;
+		HLSndAmbientChanStop(slot);
 		return;
 	}
 
@@ -3077,6 +2982,7 @@ U0 HLSndAmbientRemove(U8 *name, F64 *origin)
 U0 HLSndAmbientUpdate(F64 time)
 {//keep the nearest ambient sources playing
 	CHLAmbient	*a;
+	CHLSound	*snd;
 	F64			 d[3];
 	F64			 dist;
 	F64			 gain;
@@ -3085,6 +2991,17 @@ U0 HLSndAmbientUpdate(F64 time)
 	I64			 voices;
 	I64			 i;
 	Bool		 used[HLSND_MAX_AMBIENT];
+	Bool		 has_cue;
+	Bool		 needs_reissue;
+
+	//HLSndPickChannel stole this cue-loop for a one-shot. next_time was 1e30;
+	//without a kick the source never sounded again and the slot stayed "busy"
+	//in the ambient sense while the dynamic channel was already gone.
+	if (hl_snd_kick_ambient >= 0 && hl_snd_kick_ambient < hl_ambient_count)
+	{
+		hl_ambient[hl_snd_kick_ambient].next_time = 0.0;
+		hl_snd_kick_ambient = -1;
+	}
 
 	//the pitch and volume envelopes step here, once per frame, and gate their
 	//own 5hz rate internally
@@ -3129,21 +3046,52 @@ qa_next:
 			return;			//nothing audible is waiting
 
 		a = &hl_ambient[best];
-		used[best]   = TRUE;
-		a->next_time = time + a->duration;
+		used[best] = TRUE;
 
-		//each source has its own entnum on a fixed channel, so a re-trigger
-		//replaces its own previous instance instead of stacking
-		//send_pitch, not pitch: the LFO's modulation lives there and the
-		//envelope's own level in pitch. A re-issue is the only place pitch can
-		//change - the mixer fixes a voice's resample step at start - so the
-		//modulation is sampled once per loop period, no faster.
-		HLSndPlayAt(a->name, a->origin, a->volume, a->attenuation,
-			-(best + 1), 1, a->send_pitch);
+		//GoldSrc UTIL_EmitAmbientSound once; the engine loops only when the WAV
+		//carries a cue mark. Re-firing every duration without loop made uncued
+		//"looping" ambients (c1a0 doorunlock2 doorstop) clank forever.
+		snd = HLSndLoad(a->name);
+		has_cue = FALSE;
+		if (snd && snd->loop_start > 0 && snd->loop_start < snd->count)
+			has_cue = TRUE;
 
-		//a non-looping ambient_generic sounds once per trigger
-		if (!a->looping)
-			a->active = FALSE;
+		if (a->looping && has_cue)
+		{
+			//each source has its own entnum on a fixed channel, so a re-trigger
+			//replaces its own previous instance instead of stacking
+			//send_pitch, not pitch: the LFO's modulation lives there and the
+			//envelope's own level in pitch. A re-issue is the only place pitch
+			//can change - the mixer fixes a voice's resample step at start
+			HLSndPlayAt(a->name, a->origin, a->volume, a->attenuation,
+				-(best + 1), 1, a->send_pitch, TRUE);
+
+			needs_reissue = FALSE;
+			if (a->dyn)
+			{
+				if (a->spinup || a->spindown || a->fadein || a->fadeout)
+					needs_reissue = TRUE;
+				else if (a->lfotype && (a->lfomodpitch || a->lfomodvol))
+					needs_reissue = TRUE;
+			}
+
+			if (needs_reissue)
+				a->next_time = time + a->duration;
+			else
+				a->next_time = time + 1.0e30;
+		}
+		else
+		{
+			HLSndPlayAt(a->name, a->origin, a->volume, a->attenuation,
+				-(best + 1), 1, a->send_pitch, FALSE);
+
+			//NOT_LOOPING: one shot then inert. Looping-without-cue: stay active
+			//for Use toggle (GoldSrc m_fActive) but never re-attack
+			if (!a->looping)
+				a->active = FALSE;
+			else
+				a->next_time = time + 1.0e30;
+		}
 	}
 }
 
@@ -3235,11 +3183,9 @@ U0 HLSndMusicVolumeSet(F64 v)
 }
 
 U0 HLSndRoomOffSet(Bool off)
-{//"room_off". Taps already queued belong to the room being switched off
+{//"room_off". Non-zero disables the roomtype DSP entirely
 	hl_snd_room_off = off;
-
-	if (off)
-		HLSndEchoClear;
+	AudioDSPRoomOff(off);
 }
 
 //--- surface materials ------------------------------------------------------
@@ -4343,6 +4289,8 @@ U0 HLSndStopAll(Bool stop_music = TRUE)
  //afterwards: a second stop of a stale handle would otherwise be aimed at
  //whichever voice has since taken the slot
 	I64 i;
+	I64 keep_slot;
+	I64 slot;
 
 	for (i = 0; i < HLSND_DYNAMIC_CHANNELS; i++)
 	{
@@ -4367,12 +4315,34 @@ U0 HLSndStopAll(Bool stop_music = TRUE)
 	hl_ambient_last = 0.0;
 
 	HLSndAmbientClear;
-	HLSndEchoClear;
+	AudioDSPRoomSet(0);
+	hl_snd_roomtype = 0;
 	HLSndSentQueueClear;
 	HLSndSpeakerClear;
 
 	if (stop_music)
 		HLMusicFree;
+	else
+	{
+		//HLSndLoopHold and any one-shot that lost its channel entry are not in
+		//the tables above. A death "ugh" still in the mixer plays under New
+		//Game's tram. Kill every voice except the kept music handle.
+		keep_slot = -1;
+
+		if (hl_music_voice >= 0)
+			keep_slot = hl_music_voice & ((1 << AUDIO_VOICE_SHIFT) - 1);
+
+		for (i = 0; i < AUDIO_MAX_SFX_VOICES; i++)
+		{
+			if (i == keep_slot)
+				goto qsna_next;
+
+			slot = i | (audio.voice[i].serial << AUDIO_VOICE_SHIFT);
+			AudioSFXStop(slot);
+
+qsna_next:
+		}
+	}
 
 	hl_snd_roomtype  = 0;
 	hl_snd_step_skip = 0;

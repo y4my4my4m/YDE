@@ -18,6 +18,9 @@
 #define AC97_RESET				0x00
 #define AC97_MASTER_VOL			0x02
 #define AC97_PCM_VOL			0x18
+#define AC97_EXT_AUDIO			0x28	//ext audio ID (VRA support bit 0)
+#define AC97_EXT_AUDIO_CTL		0x2A	//ext audio ctrl (VRA enable bit 0)
+#define AC97_PCM_FRONT_DAC_RATE	0x2C	//front DAC sample rate when VRA on
 
 //--- native audio bus master registers ---
 #define AC97_PCM_OUTPUT_REG_BOX	0x10
@@ -118,6 +121,331 @@ class CAudio
 	I64			 voice_lock;
 } audio;
 
+//--- room DSP (GoldSrc / Xash SX_RoomFX, SFX bus only) ----------------------
+//
+// env_sound publishes a roomtype; the closed HL engine ran SX_RoomFX on the
+// SFX paint buffer. Streams (CD/MP3) stay dry. Voice-clone "echo taps" are
+// gone - they starved the 48-voice pool and silenced scripted speech.
+//
+// Presets from Xash rgsxpre[] (s_dsp.c). Delays scaled to QSND_MIX_RATE wall
+// time. Deviation: no modulation/xfade; one-pole LP instead of 3-tap average.
+
+#define AUDIO_DSP_MONO_MAX	19200	//MAX_MONO_DELAY 0.4s @ 48k
+#define AUDIO_DSP_RVB_MAX	4800	//MAX_REVERB_DELAY 0.1s
+#define AUDIO_DSP_STE_MAX	4800	//MAX_STEREO_DELAY 0.1s
+#define AUDIO_DSP_PRESETS	29
+
+class CAudioDSPPreset
+{//scaled Xash sx_preset_t at mix rate
+	I64	 size;		//reverb delay samples
+	I64	 refl;		//reverb feedback 0..255
+	I64	 rvblp;		//reverb lowpass on
+	I64	 delay;		//mono delay samples
+	I64	 delay_fb;	//mono feedback 0..255
+	I64	 dlylp;		//mono lowpass on
+	I64	 ste;		//stereo delay samples
+	I64	 room_lp;	//global lowpass on dry+wet (water)
+};
+
+class CAudioDSPLine
+{
+	I64	*buf;
+	I64	 max;
+	I64	 len;		//active delay in samples
+	I64	 in;
+	I64	 out;
+	I64	 fb;		//0..255
+	I64	 lp;		//bool
+	I64	 lp0;
+};
+
+CAudioDSPPreset	audio_dsp_pre[AUDIO_DSP_PRESETS];
+CAudioDSPLine	audio_dsp_mono;
+CAudioDSPLine	audio_dsp_rvb0;
+CAudioDSPLine	audio_dsp_rvb1;
+CAudioDSPLine	audio_dsp_ste;
+I64				audio_dsp_mono_buf[AUDIO_DSP_MONO_MAX];
+I64				audio_dsp_rvb0_buf[AUDIO_DSP_RVB_MAX];
+I64				audio_dsp_rvb1_buf[AUDIO_DSP_RVB_MAX];
+I64				audio_dsp_ste_buf[AUDIO_DSP_STE_MAX];
+I64				audio_dsp_room	= 0;
+Bool			audio_dsp_off	= FALSE;
+Bool			audio_dsp_room_lp = FALSE;
+I64				audio_dsp_glp0	= 0;
+
+I64 AudioDSPClip16(I64 v)
+{
+	if (v >  32767)	return  32767;
+	if (v < -32768)	return -32768;
+	return v;
+}
+
+U0 AudioDSPLineClear(CAudioDSPLine *d)
+{
+	I64 i;
+
+	for (i = 0; i < d->max; i++)
+		d->buf[i] = 0;
+
+	d->lp0 = 0;
+}
+
+U0 AudioDSPLineSetup(CAudioDSPLine *d, I64 samples, I64 fb, I64 lp)
+{
+	if (samples < 1)
+		samples = 0;
+
+	if (samples >= d->max)
+		samples = d->max - 1;
+
+	d->len = samples;
+	d->fb  = fb;
+	d->lp  = lp;
+
+	AudioDSPLineClear(d);
+
+	//out trails in by `len` samples. Clear must not zero these - that left
+	//in==out and the stereo path read-then-overwrite the same cell, so L was
+	//always 0 and every spatialised voice collapsed to the right ear.
+	d->in = 0;
+
+	if (samples > 0)
+		d->out = d->max - samples;
+	else
+		d->out = 0;
+}
+
+U0 AudioDSPLineAdvance(CAudioDSPLine *d)
+{
+	d->in++;
+	if (d->in >= d->max)
+		d->in = 0;
+
+	d->out++;
+	if (d->out >= d->max)
+		d->out = 0;
+}
+
+I64 AudioDSPLineTap(CAudioDSPLine *d, I64 vlr)
+{//write vlr+feedback*tap into line; return stored value (Xash RVB path)
+	I64 delay;
+	I64 val;
+
+	if (d->len < 1)
+		return 0;
+
+	delay = d->buf[d->out];
+	val   = vlr + ((d->fb * delay) >> 8);
+	val   = AudioDSPClip16(val);
+
+	if (d->lp)
+	{
+		val    = (d->lp0 + val) >> 1;
+		d->lp0 = val;
+	}
+
+	d->buf[d->in] = val;
+	AudioDSPLineAdvance(d);
+	return val;
+}
+
+U0 AudioDSPPresetsInit()
+{//rgsxpre[], Xash s_dsp.c. Float delays -> samples at QSND_MIX_RATE.
+ //Columns: size, refl, rvblp, delay, feedback, dlylp, left(ste)
+	I64 i;
+
+	//zero all, then fill non-off rooms
+	for (i = 0; i < AUDIO_DSP_PRESETS; i++)
+	{
+		audio_dsp_pre[i].size     = 0;
+		audio_dsp_pre[i].refl     = 0;
+		audio_dsp_pre[i].rvblp    = 1;
+		audio_dsp_pre[i].delay    = 0;
+		audio_dsp_pre[i].delay_fb = 0;
+		audio_dsp_pre[i].dlylp    = 0;
+		audio_dsp_pre[i].ste      = 0;
+		audio_dsp_pre[i].room_lp  = 0;
+	}
+
+	//1 generic
+	audio_dsp_pre[1].delay = 3120;	audio_dsp_pre[1].delay_fb = 25;
+	audio_dsp_pre[1].ste = 480;
+	//2-4 metal
+	audio_dsp_pre[2].delay = 960;	audio_dsp_pre[2].delay_fb = 191;	audio_dsp_pre[2].ste = 480;
+	audio_dsp_pre[3].delay = 1440;	audio_dsp_pre[3].delay_fb = 198;	audio_dsp_pre[3].ste = 960;
+	audio_dsp_pre[4].delay = 2880;	audio_dsp_pre[4].delay_fb = 196;	audio_dsp_pre[4].ste = 1440;
+	//5-7 tunnel
+	audio_dsp_pre[5].size = 2400; audio_dsp_pre[5].refl = 216; audio_dsp_pre[5].delay = 384;
+	audio_dsp_pre[5].delay_fb = 244; audio_dsp_pre[5].dlylp = 1; audio_dsp_pre[5].ste = 480;
+	audio_dsp_pre[6].size = 2400; audio_dsp_pre[6].refl = 224; audio_dsp_pre[6].delay = 480;
+	audio_dsp_pre[6].delay_fb = 249; audio_dsp_pre[6].dlylp = 1; audio_dsp_pre[6].ste = 960;
+	audio_dsp_pre[7].size = 2400; audio_dsp_pre[7].refl = 234; audio_dsp_pre[7].delay = 720;
+	audio_dsp_pre[7].delay_fb = 253; audio_dsp_pre[7].dlylp = 1; audio_dsp_pre[7].ste = 1920;
+	//8-10 chamber
+	audio_dsp_pre[8].size = 2400;  audio_dsp_pre[8].refl = 214;  audio_dsp_pre[8].ste = 576;
+	audio_dsp_pre[9].size = 2400;  audio_dsp_pre[9].refl = 229;  audio_dsp_pre[9].ste = 384;
+	audio_dsp_pre[10].size = 2400; audio_dsp_pre[10].refl = 242; audio_dsp_pre[10].ste = 192;
+	//11-13 bright (rvblp off)
+	audio_dsp_pre[11].size = 2400; audio_dsp_pre[11].refl = 178; audio_dsp_pre[11].rvblp = 0; audio_dsp_pre[11].ste = 576;
+	audio_dsp_pre[12].size = 2640; audio_dsp_pre[12].refl = 198; audio_dsp_pre[12].rvblp = 0; audio_dsp_pre[12].ste = 384;
+	audio_dsp_pre[13].size = 2400; audio_dsp_pre[13].refl = 219; audio_dsp_pre[13].rvblp = 0; audio_dsp_pre[13].ste = 96;
+	//14-16 water
+	audio_dsp_pre[14].room_lp = 1; audio_dsp_pre[14].ste = 480;
+	audio_dsp_pre[15].room_lp = 1; audio_dsp_pre[15].delay = 2880; audio_dsp_pre[15].delay_fb = 216;
+	audio_dsp_pre[15].dlylp = 1; audio_dsp_pre[15].ste = 960;
+	audio_dsp_pre[16].room_lp = 1; audio_dsp_pre[16].delay = 9600; audio_dsp_pre[16].delay_fb = 153;
+	audio_dsp_pre[16].dlylp = 1; audio_dsp_pre[16].ste = 2400;
+	//17-19 concrete
+	audio_dsp_pre[17].size = 2400; audio_dsp_pre[17].refl = 204; audio_dsp_pre[17].delay_fb = 122;
+	audio_dsp_pre[17].dlylp = 1; audio_dsp_pre[17].ste = 768;
+	audio_dsp_pre[18].size = 2880; audio_dsp_pre[18].refl = 229; audio_dsp_pre[18].delay_fb = 132;
+	audio_dsp_pre[18].dlylp = 1; audio_dsp_pre[18].ste = 480;
+	audio_dsp_pre[19].size = 3360; audio_dsp_pre[19].refl = 239; audio_dsp_pre[19].delay = 14400;
+	audio_dsp_pre[19].delay_fb = 153; audio_dsp_pre[19].dlylp = 1; audio_dsp_pre[19].ste = 384;
+	//20-22 outside / big
+	audio_dsp_pre[20].delay = 14400; audio_dsp_pre[20].delay_fb = 107; audio_dsp_pre[20].dlylp = 1;
+	audio_dsp_pre[21].delay = 16800; audio_dsp_pre[21].delay_fb = 122; audio_dsp_pre[21].dlylp = 1;
+	audio_dsp_pre[22].delay = 18240; audio_dsp_pre[22].delay_fb = 153; audio_dsp_pre[22].dlylp = 1;
+	//23-25 cavern
+	audio_dsp_pre[23].size = 2400; audio_dsp_pre[23].refl = 229; audio_dsp_pre[23].delay = 9600;
+	audio_dsp_pre[23].delay_fb = 71;
+	audio_dsp_pre[24].size = 3360; audio_dsp_pre[24].refl = 229; audio_dsp_pre[24].delay = 14400;
+	audio_dsp_pre[24].delay_fb = 102;
+	audio_dsp_pre[25].size = 4320; audio_dsp_pre[25].refl = 229; audio_dsp_pre[25].delay = 16800;
+	audio_dsp_pre[25].delay_fb = 127;
+	//26-28 weirdo
+	audio_dsp_pre[26].size = 480;  audio_dsp_pre[26].refl = 229; audio_dsp_pre[26].rvblp = 0;
+	audio_dsp_pre[26].ste = 2400;
+	audio_dsp_pre[27].delay = 432; audio_dsp_pre[27].delay_fb = 254; audio_dsp_pre[27].dlylp = 1;
+	audio_dsp_pre[27].ste = 1920;
+	audio_dsp_pre[28].size = 48; audio_dsp_pre[28].refl = 254; audio_dsp_pre[28].rvblp = 0;
+	audio_dsp_pre[28].delay = 9600; audio_dsp_pre[28].delay_fb = 204; audio_dsp_pre[28].dlylp = 1;
+	audio_dsp_pre[28].ste = 2400;
+}
+
+U0 AudioDSPApplyRoom(I64 rt)
+{
+	CAudioDSPPreset *p;
+	I64				 size2;
+
+	if (rt < 0 || rt >= AUDIO_DSP_PRESETS)
+		rt = 0;
+
+	audio_dsp_room = rt;
+	audio_dsp_glp0 = 0;
+
+	if (rt == 0 || audio_dsp_off)
+	{
+		audio_dsp_mono.len = 0;
+		audio_dsp_rvb0.len = 0;
+		audio_dsp_rvb1.len = 0;
+		audio_dsp_ste.len  = 0;
+		audio_dsp_room_lp  = FALSE;
+		AudioDSPLineClear(&audio_dsp_mono);
+		AudioDSPLineClear(&audio_dsp_rvb0);
+		AudioDSPLineClear(&audio_dsp_rvb1);
+		AudioDSPLineClear(&audio_dsp_ste);
+		return;
+	}
+
+	p = &audio_dsp_pre[rt];
+	audio_dsp_room_lp = ToBool(p->room_lp);
+
+	AudioDSPLineSetup(&audio_dsp_mono, p->delay, p->delay_fb, p->dlylp);
+	AudioDSPLineSetup(&audio_dsp_rvb0, p->size, p->refl, p->rvblp);
+
+	size2 = (p->size * 71) / 100;
+	AudioDSPLineSetup(&audio_dsp_rvb1, size2, p->refl, p->rvblp);
+	AudioDSPLineSetup(&audio_dsp_ste, p->ste, 0, 0);
+}
+
+public U0 AudioDSPRoomSet(I64 roomtype)
+{//room_type cvar / env_sound. 0 = off.
+	if (roomtype < 0 || roomtype >= AUDIO_DSP_PRESETS)
+		roomtype = 0;
+
+	if (roomtype == audio_dsp_room && !audio_dsp_off)
+		return;
+
+	AudioDSPApplyRoom(roomtype);
+}
+
+public U0 AudioDSPRoomOff(Bool off)
+{//room_off. Non-zero disables DSP entirely.
+	audio_dsp_off = off;
+	AudioDSPApplyRoom(audio_dsp_room);
+}
+
+U0 AudioDSPProcess(I64 *_l, I64 *_r)
+{//SX_RoomFX on one SFX sample pair: reverb + mono delay + stereo slap, in place.
+	I64 l = *_l;
+	I64 r = *_r;
+	I64 vlr;
+	I64 wet;
+	I64 delay;
+	I64 val;
+
+	if (audio_dsp_off || audio_dsp_room == 0)
+		return;
+
+	vlr = (l + r) >> 1;
+
+	//reverb: average of two delay lines, add quarter gain (Xash >>= 2 path)
+	wet = 0;
+	if (audio_dsp_rvb0.len > 0)
+		wet += AudioDSPLineTap(&audio_dsp_rvb0, vlr);
+	if (audio_dsp_rvb1.len > 0)
+		wet += AudioDSPLineTap(&audio_dsp_rvb1, vlr);
+	wet >>= 2;
+
+	l = AudioDSPClip16(l + wet);
+	r = AudioDSPClip16(r + wet);
+
+	//mono delay with feedback
+	if (audio_dsp_mono.len > 0)
+	{
+		delay = audio_dsp_mono.buf[audio_dsp_mono.out];
+		val   = vlr + ((audio_dsp_mono.fb * delay) >> 8);
+		val   = AudioDSPClip16(val);
+
+		if (audio_dsp_mono.lp)
+		{
+			val = (audio_dsp_mono.lp0 + val) >> 1;
+			audio_dsp_mono.lp0 = val;
+		}
+
+		audio_dsp_mono.buf[audio_dsp_mono.in] = val;
+		AudioDSPLineAdvance(&audio_dsp_mono);
+
+		//Xash DLY path is >>= 2. Delay-only rooms (preset 1 generic, etc.)
+		//have no reverb lines - that quarter gain is near inaudible next to the
+		//old voice-clone taps. Half gain when rvb empty so roomtype still
+		//reads; keep >>= 2 when reverb already contributes.
+		if (audio_dsp_rvb0.len < 1 && audio_dsp_rvb1.len < 1)
+			val >>= 1;
+		else
+			val >>= 2;
+
+		l = AudioDSPClip16(l + val);
+		r = AudioDSPClip16(r + val);
+	}
+
+	//Deviation: Xash DLY_DoStereoDelay replaces paint->left with a delayed
+	//copy. That runs on a near-mono DMA paint; our bus is already spatialised,
+	//so replacing L zeros/collapses pan. Skip ste - mono delay + reverb carry
+	//the room.
+
+	if (audio_dsp_room_lp)
+	{
+		l = (audio_dsp_glp0 + l) >> 1;
+		r = (audio_dsp_glp0 + r) >> 1;
+		audio_dsp_glp0 = (l + r) >> 1;
+	}
+
+	*_l = l;
+	*_r = r;
+}
+
 U0 AudioInit()
 {
 	I64 i;
@@ -136,6 +464,20 @@ U0 AudioInit()
 		audio.voice[i].step_fp = 1 << 16;
 		audio.voice[i].loop    = FALSE;
 	}
+
+	audio_dsp_mono.buf = audio_dsp_mono_buf;
+	audio_dsp_mono.max = AUDIO_DSP_MONO_MAX;
+	audio_dsp_rvb0.buf = audio_dsp_rvb0_buf;
+	audio_dsp_rvb0.max = AUDIO_DSP_RVB_MAX;
+	audio_dsp_rvb1.buf = audio_dsp_rvb1_buf;
+	audio_dsp_rvb1.max = AUDIO_DSP_RVB_MAX;
+	audio_dsp_ste.buf  = audio_dsp_ste_buf;
+	audio_dsp_ste.max  = AUDIO_DSP_STE_MAX;
+
+	AudioDSPPresetsInit;
+	audio_dsp_room = 0;
+	audio_dsp_off  = FALSE;
+	AudioDSPApplyRoom(0);
 }
 
 public I64 AudioSFXPlayRef(U32 *frames, I64 count, I64 rate = QSND_MIX_RATE,
@@ -420,8 +762,10 @@ U0 AC97OutputMix(U32 *buf, I64 length)
  //  streams - averaged, so a continuous feed keeps constant loudness
  //  voices  - SUMMED then clamped; averaging would make every effect quieter
  //            as more played, and a second gunshot must not halve the first
+ //  room DSP - applied to the voice sum only (GoldSrc SX_RoomFX); streams dry
 	CAudioVoice *vp;
 	I64 i, j, acc_l, acc_r, acc_streams;
+	I64 sfx_l, sfx_r;
 	I64 sample;
 	I64 vsamp;
 
@@ -448,6 +792,9 @@ U0 AC97OutputMix(U32 *buf, I64 length)
 			acc_r = ToI64(acc_r / Sqrt(acc_streams));
 		}
 
+		sfx_l = 0;
+		sfx_r = 0;
+
 		for (j = 0; j < AUDIO_MAX_SFX_VOICES; j++)
 		{
 			vp = &audio.voice[j];
@@ -459,8 +806,8 @@ U0 AC97OutputMix(U32 *buf, I64 length)
 				vsamp = vp->frames[vp->pos_fp >> 16];
 
 				//PARENTHESISE: ZealC shift/multiply precedence differs from C
-				acc_l += (vsamp.i16[0] * vp->vol_l) / AUDIO_VOL_UNITY;
-				acc_r += (vsamp.i16[1] * vp->vol_r) / AUDIO_VOL_UNITY;
+				sfx_l += (vsamp.i16[0] * vp->vol_l) / AUDIO_VOL_UNITY;
+				sfx_r += (vsamp.i16[1] * vp->vol_r) / AUDIO_VOL_UNITY;
 
 				vp->pos_fp += vp->step_fp;
 				if ((vp->pos_fp >> 16) >= vp->count)
@@ -480,6 +827,12 @@ U0 AC97OutputMix(U32 *buf, I64 length)
 				}
 			}
 		}
+
+		//roomtype DSP on the SFX bus only - music/streams stay dry
+		AudioDSPProcess(&sfx_l, &sfx_r);
+
+		acc_l += sfx_l;
+		acc_r += sfx_r;
 
 		//clamp, do not wrap: a wrapped sum inverts the waveform and cracks
 		if (acc_l >  32767)	acc_l =  32767;
@@ -514,12 +867,13 @@ U0 AC97BufferFill()
 	//otherwise spin here filling the entire ring
 	while (lead < AC97_TARGET_LEAD && guard < AC97_MAX_BDLS)
 	{
-		//fill then advance: mix into the entry reported last-valid, only
-		//then move the register on
+		//fill the NEXT descriptor, then mark it valid. filling entries[lvi]
+		//(already valid) and advancing left the newly-valid buffer stale,
+		//so any lag played an unwritten buffer - dropped frames that noise
+		//broadband audio while steady tones survived.
+		lvi = (lvi + 1) & (AC97_MAX_BDLS - 1);
 		buf = ac97.bdl->entries[lvi].addr;
 		AC97OutputMix(buf, AC97_BDL_BUF_SIZE);
-
-		lvi = (lvi + 1) & (AC97_MAX_BDLS - 1);
 		OutU8(ac97.nabm + AC97_PCM_OUTPUT_REG_BOX + AC97_LAST_VALID_ENTRY, lvi);
 
 		lead++;
@@ -533,12 +887,10 @@ U0 AC97MixTask()
 
 	while (TRUE)
 	{
+		AC97BufferFill;
 		status = InU16(ac97.nabm + AC97_PCM_OUTPUT_REG_BOX + AC97_TRANSFER_STS);
 		if (status & AC97_INT_IOC)
-		{
-			AC97BufferFill;
 			OutU16(ac97.nabm + AC97_PCM_OUTPUT_REG_BOX + AC97_TRANSFER_STS, 0x1C);
-		}
 		Sleep(1);
 	}
 }
@@ -574,6 +926,16 @@ I64 AC97Init()
 	OutU32(ac97.nabm + AC97_GLOBAL_CTL, 0x03);
 	OutU16(ac97.nam + AC97_RESET, 0xFFFF);
 	OutU16(ac97.nam + AC97_PCM_VOL, 0x0000); //PCM out: max.
+
+	//pin the codec to the mixer rate. without VRA the codec runs a fixed
+	//default that need not be 48kHz; enabling VRA and writing the rate makes
+	//the DMA consume at exactly QSND_MIX_RATE, so playback speed is correct.
+	if (InU16(ac97.nam + AC97_EXT_AUDIO) & 1)
+	{
+		OutU16(ac97.nam + AC97_EXT_AUDIO_CTL,
+			InU16(ac97.nam + AC97_EXT_AUDIO_CTL) | 1);
+		OutU16(ac97.nam + AC97_PCM_FRONT_DAC_RATE, QSND_MIX_RATE);
+	}
 
 	ac97.bdl = CAllocAligned(sizeof(CAC97BDL), 4096, sys_task->code_heap);
 	for (i = 0; i < AC97_MAX_BDLS; i++)

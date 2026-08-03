@@ -1,0 +1,810 @@
+// D1Obj.ZC - dungeon objects: barrels, chests, doors
+//
+// barrels/chests: unclipped CELs, one facing: Barrel 9 frames (1 whole,
+// 2-8 shatter, rest empty), Chest1-3 6 frames (1 closed, opening). they
+// block their tile until broken or opened, then free it and may drop loot.
+//
+// doors (objects.cpp AddL1Objs/AddL2Objs/AddL1Door/AddL2Door/DoorSet,
+// OperateL1LDoor/OperateL1RDoor/OperateL2LDoor/OperateL2RDoor): door cells
+// are found by dPiece scan after generation. L1Doors.CEL / L2Doors.CEL are
+// clipped CELs, 64 wide, 4 frames: 1/2 closed L/R, 3/4 open L/R. operate
+// swaps the dPiece and steps the frame by 2 - there is no swing anim.
+// dPiece ids, 1-based (raw TIL value + 1, as Pass3 stores):
+//   L1 L (vertical)   closed 44/51/214   open 393 (408 when closed is 214)
+//   L1 R (horizontal) closed 46/56       open 395
+//   L2 L (vertical)   scan 13/541  closed 538  open 13
+//   L2 R (horizontal) scan 17/542  closed 540  open 17
+// L1 doors also swap the companion wall cell (x,y-1 for L, x-1,y for R)
+// through the DoorSet table. companion 50 is the corner a dual-door tile
+// (TIL 28) shares: 411 = L open, 412 = R open, 396 = both open.
+// SOL marks every closed piece solid and every open piece clear, so
+// terrain walkability follows the swap; D1ObjBlocks mirrors it for player
+// and monster pathing. an open door closes only while its tile is free of
+// monsters and items (upstream also checks dDead; no corpse grid here).
+// deviations: door jam (_oVar4 == 2) and objects_set_door_piece micros
+// are absent; dSpecial arches / open-door frames are filled by D1Special*.
+// barrels are breakable (_oBreak == 1): player.cpp ACTION_OPERATE starts an
+// attack, DoAttack/PlrHitObj calls BreakObject - not Operate-on-arrive.
+
+#define D1_MAXOBJ		128
+#define D1OB_BARREL		0
+#define D1OB_CHEST		1
+#define D1OB_DOOR		2
+#define D1OB_URN		3
+#define D1OB_CRUX		4
+
+class CD1Obj
+{
+	I64	 type;
+	I64	 gfx;			//chest 0-2; door art; crux 0-2; urn unused
+	I64	 x;
+	I64	 y;
+	I64	 frame;
+	I64	 dor;			//door orientation: 0 = L (vertical), 1 = R (horizontal)
+	I64	 var1;			//door closed piece at (x,y) (_oVar1)
+	I64	 var2;			//L1 door closed companion piece (_oVar2)
+	I64	 trapk;			//chest _oVar4: 0 arrow, 1 fire arrow, 2 nova
+	Bool opened;
+	Bool trapped;
+	Bool jammed;		//_oVar4 == 2: close blocked by occupant
+	Bool active;
+};
+
+CD1Obj d1_objs[D1_MAXOBJ];
+I64	 d1_nobjs = 0;
+Bool d1_obj_init = FALSE;
+
+//D1Mis hooks after Obj in Run.ZC — OperateChest AddMissile TARGET_PLAYERS
+U0 (*d1_chest_trap_cb)(I64 ox, I64 oy, I64 trapk, I64 level) = NULL;
+
+U8	*d1_gfx_barrel = NULL;
+U8	*d1_gfx_chest[3];
+U8	*d1_gfx_doors[3];
+U8	*d1_gfx_urn = NULL;
+U8	*d1_gfx_crux[3];
+
+U0 D1ObjInit()
+{
+	I64 size;
+
+	if (!d1_obj_init)
+	{
+		d1_gfx_barrel   = D1MpqRead("Objects\\Barrel.CEL", &size);
+		d1_gfx_chest[0] = D1MpqRead("Objects\\Chest1.CEL", &size);
+		d1_gfx_chest[1] = D1MpqRead("Objects\\Chest2.CEL", &size);
+		d1_gfx_chest[2] = D1MpqRead("Objects\\Chest3.CEL", &size);
+		d1_gfx_doors[0] = D1MpqRead("Objects\\L1Doors.CEL", &size);
+		d1_gfx_doors[1] = D1MpqRead("Objects\\L2Doors.CEL", &size);
+		d1_gfx_doors[2] = D1MpqRead("Objects\\L3Doors.CEL", &size);
+		d1_gfx_urn      = D1MpqRead("Objects\\Urn.CEL", &size);
+		d1_gfx_crux[0]  = D1MpqRead("Objects\\Cruxsk1.CEL", &size);
+		d1_gfx_crux[1]  = D1MpqRead("Objects\\Cruxsk2.CEL", &size);
+		d1_gfx_crux[2]  = D1MpqRead("Objects\\Cruxsk3.CEL", &size);
+		d1_obj_init = TRUE;
+	}
+}
+
+U0 D1ObjClear()
+{
+	I64 i;
+
+	D1ObjInit;
+	d1_nobjs = 0;
+	for (i = 0; i < D1_MAXOBJ; i++)
+		d1_objs[i].active = FALSE;
+	for (i = 0; i < D1_MAXDUN * D1_MAXDUN; i++)
+		d1_dobj[i] = 0;
+}
+
+U0 D1ObjSetPiece(I64 x, I64 y, I64 pn)
+{//ObjSetMicro. micros are per piece, so the dPiece write is the whole swap.
+	if (x >= 0 && x < D1_MAXDUN && y >= 0 && y < D1_MAXDUN)
+		d1_dpiece[x + y * D1_MAXDUN] = pn;
+}
+
+U0 D1ObjDoorSet(I64 x, I64 y, I64 dor)
+{//DoorSet: L1 companion wall cell -> its door-open variant
+	I64 pn = D1Piece(x, y);
+
+	switch (pn)
+	{
+		case 43:	D1ObjSetPiece(x, y, 392);	break;
+		case 45:	D1ObjSetPiece(x, y, 394);	break;
+		case 50:
+			if (dor == 0)
+				D1ObjSetPiece(x, y, 411);
+			else
+				D1ObjSetPiece(x, y, 412);
+			break;
+		case 54:	D1ObjSetPiece(x, y, 397);	break;
+		case 55:	D1ObjSetPiece(x, y, 398);	break;
+		case 61:	D1ObjSetPiece(x, y, 399);	break;
+		case 67:	D1ObjSetPiece(x, y, 400);	break;
+		case 68:	D1ObjSetPiece(x, y, 401);	break;
+		case 69:	D1ObjSetPiece(x, y, 403);	break;
+		case 70:	D1ObjSetPiece(x, y, 404);	break;
+		case 72:	D1ObjSetPiece(x, y, 406);	break;
+		case 212:	D1ObjSetPiece(x, y, 407);	break;
+		case 354:	D1ObjSetPiece(x, y, 409);	break;
+		case 355:	D1ObjSetPiece(x, y, 410);	break;
+		case 411:	D1ObjSetPiece(x, y, 396);	break;
+		case 412:	D1ObjSetPiece(x, y, 396);	break;
+	}
+}
+
+U0 D1ObjAddDoor(I64 x, I64 y, I64 dor, I64 art)
+{//AddL1Door / AddL2Door. art 0 = cathedral, 1 = catacombs.
+	CD1Obj *o;
+
+	if (d1_nobjs >= D1_MAXOBJ)
+		return;
+	if (d1_dobj[x + y * D1_MAXDUN])
+		return;
+
+	o = &d1_objs[d1_nobjs];
+	o->type   = D1OB_DOOR;
+	o->gfx    = art;
+	o->x      = x;
+	o->y      = y;
+	o->dor    = dor;
+	o->frame  = 1 + dor;
+	o->opened = FALSE;
+	o->trapped = FALSE;
+	o->trapk  = 0;
+	o->jammed = FALSE;
+	o->active = TRUE;
+	if (art == 0)
+	{//closed piece already in place; save it and the companion
+		o->var1 = D1Piece(x, y);
+		if (dor == 0)
+			o->var2 = D1Piece(x, y - 1);
+		else
+			o->var2 = D1Piece(x - 1, y);
+	}
+	else if (art == 1)
+	{//L2 grid holds the open piece; force closed
+		o->var2 = 0;
+		if (dor == 0)
+			o->var1 = 538;
+		else
+			o->var1 = 540;
+		D1ObjSetPiece(x, y, o->var1);
+	}
+	else
+	{//L3: closed pieces already scanned (530 / 533)
+		o->var1 = D1Piece(x, y);
+		o->var2 = 0;
+	}
+	d1_dobj[x + y * D1_MAXDUN] = d1_nobjs + 1;
+	d1_nobjs++;
+}
+
+U0 D1ObjPlaceDoors()
+{//AddL1Objs (levels 1-4) / AddL2Objs (5-8): dPiece scan, doors closed.
+ //idempotent: occupied cells skip, closed L2 pieces no longer match.
+	I64 x;
+	I64 y;
+	I64 pn;
+
+	if (d1_currlevel >= 1 && d1_currlevel <= 4)
+	{
+		for (y = 0; y < D1_MAXDUN; y++)
+			for (x = 0; x < D1_MAXDUN; x++)
+			{
+				pn = D1Piece(x, y);
+				if (pn == 44 || pn == 51 || pn == 214)
+					D1ObjAddDoor(x, y, 0, 0);
+				if (pn == 46 || pn == 56)
+					D1ObjAddDoor(x, y, 1, 0);
+			}
+	}
+	else if (d1_currlevel >= 5 && d1_currlevel <= 8)
+	{
+		for (y = 0; y < D1_MAXDUN; y++)
+			for (x = 0; x < D1_MAXDUN; x++)
+			{
+				pn = D1Piece(x, y);
+				if (pn == 13 || pn == 541)
+					D1ObjAddDoor(x, y, 0, 1);
+				if (pn == 17 || pn == 542)
+					D1ObjAddDoor(x, y, 1, 1);
+			}
+	}
+	else if (d1_currlevel >= 9 && d1_currlevel <= 12)
+	{//AddL3Objs: caves doors
+		for (y = 0; y < D1_MAXDUN; y++)
+			for (x = 0; x < D1_MAXDUN; x++)
+			{
+				pn = D1Piece(x, y);
+				if (pn == 530)
+					D1ObjAddDoor(x, y, 0, 2);
+				if (pn == 533)
+					D1ObjAddDoor(x, y, 1, 2);
+			}
+	}
+}
+
+U0 D1ObjThemeFill()
+{//themes.cpp InitThemes reduced: barrels inside theme-room interiors
+	I64 t;
+	I64 x;
+	I64 y;
+	I64 wx;
+	I64 wy;
+	I64 xx;
+	I64 yy;
+	CD1Obj *o;
+
+	for (t = 0; t < d1_theme_n; t++)
+	{
+		for (y = 1; y < d1_theme_h[t] - 1; y++)
+			for (x = 1; x < d1_theme_w[t] - 1; x++)
+			{
+				if (d1_nobjs >= D1_MAXOBJ)
+					return;
+				if (D1Rnd(3) == 0)
+				{
+					wx = 2 * (d1_theme_x[t] + x) + 16;
+					wy = 2 * (d1_theme_y[t] + y) + 16;
+					for (yy = 0; yy < 2; yy++)
+						for (xx = 0; xx < 2; xx++)
+						{
+							if (d1_nobjs >= D1_MAXOBJ)
+								return;
+							if (D1WalkableM(wx + xx, wy + yy) &&
+								!d1_dobj[(wx + xx) + (wy + yy) * D1_MAXDUN] &&
+								D1Rnd(2) == 0)
+							{
+								o = &d1_objs[d1_nobjs];
+								o->type = D1OB_BARREL;
+								o->gfx = 0;
+								o->x = wx + xx;
+								o->y = wy + yy;
+								o->frame = 1;
+								o->opened = FALSE;
+								o->trapped = FALSE;
+								o->trapk  = 0;
+								o->jammed = FALSE;
+								o->active = TRUE;
+								d1_dobj[o->x + o->y * D1_MAXDUN] =
+									d1_nobjs + 1;
+								d1_nobjs++;
+							}
+						}
+				}
+			}
+	}
+}
+
+U0 D1ObjSpawnLevel(I64 level)
+{//doors first (before barrels can squat a door cell), then scatter
+	I64 want = 12 + D1Rnd(8);
+	I64 tries = 0;
+	I64 x;
+	I64 y;
+	I64 roll;
+	CD1Obj *o;
+
+	D1ObjClear;
+	D1ObjPlaceDoors;
+	if (level < 5 || level == 16)
+		d1_theme_n = 0;		//no PlaceThemeRooms on cathedral / diab
+
+	while (want > 0 && tries < 2000 && d1_nobjs < D1_MAXOBJ)
+	{
+		tries++;
+		x = D1Rnd(D1_MAXDUN);
+		y = D1Rnd(D1_MAXDUN);
+		if (D1WalkableM(x, y) && !d1_dobj[x + y * D1_MAXDUN] &&
+			!d1_ditem[x + y * D1_MAXDUN])
+		{
+			o = &d1_objs[d1_nobjs];
+			o->x      = x;
+			o->y      = y;
+			o->frame  = 1;
+			o->opened = FALSE;
+			o->trapped = FALSE;
+			o->trapk  = 0;
+			o->jammed = FALSE;
+			o->active = TRUE;
+			o->gfx = 0;
+			roll = D1Rnd(10);
+			if (roll == 0)
+			{
+				o->type = D1OB_CHEST;
+				o->gfx  = D1Rnd(3);
+				//AddChestTraps: ~10% trapped; catacombs arrow/farrow only
+				if (D1Rnd(100) < 10)
+				{
+					o->trapped = TRUE;
+					if (level >= 5 && level <= 8)
+						o->trapk = D1Rnd(2);
+					else
+						o->trapk = D1Rnd(3);
+				}
+			}
+			else if (level >= 9 && level <= 12 && roll < 5)
+			{//caves: urns
+				o->type = D1OB_URN;
+			}
+			else if (level >= 5 && level <= 8 && roll < 3)
+			{//catacombs: crux
+				o->type = D1OB_CRUX;
+				o->gfx  = D1Rnd(3);
+			}
+			else
+			{
+				o->type = D1OB_BARREL;
+			}
+			d1_dobj[x + y * D1_MAXDUN] = d1_nobjs + 1;
+			d1_nobjs++;
+			want--;
+		}
+	}
+	D1ObjThemeFill;
+}
+
+Bool D1ObjBlocks(I64 x, I64 y)
+{
+	I64 oi = d1_dobj[x + y * D1_MAXDUN];
+
+	if (!oi)
+		return FALSE;
+	return !d1_objs[oi - 1].opened;
+}
+
+Bool D1ObjDoorOperate(CD1Obj *o)
+{//Operate L1/L2 L/R Door: swap piece(s), step the leaf frame by 2
+	I64 x = o->x;
+	I64 y = o->y;
+	I64 cx;
+	I64 cy;
+
+	if (!o->opened)
+	{
+		if (o->gfx == 0)
+		{
+			if (o->dor == 0)
+			{
+				if (o->var1 == 214)
+					D1ObjSetPiece(x, y, 408);
+				else
+					D1ObjSetPiece(x, y, 393);
+				D1ObjDoorSet(x, y - 1, o->dor);
+			}
+			else
+			{
+				D1ObjSetPiece(x, y, 395);
+				D1ObjDoorSet(x - 1, y, o->dor);
+			}
+		}
+		else if (o->gfx == 1)
+		{
+			if (o->dor == 0)
+				D1ObjSetPiece(x, y, 13);
+			else
+				D1ObjSetPiece(x, y, 17);
+		}
+		else
+		{//L3 open micros
+			if (o->dor == 0)
+				D1ObjSetPiece(x, y, 537);
+			else
+				D1ObjSetPiece(x, y, 540);
+		}
+		o->frame += 2;
+		o->opened = TRUE;
+		//objects.cpp SetDoorStateOpen: L1 L/R -> special 7/8, L2 -> 5/6
+		if (o->gfx == 0)
+		{
+			if (o->dor == 0)
+				D1SpecialSet(x, y, 7);
+			else
+				D1SpecialSet(x, y, 8);
+		}
+		else if (o->gfx == 1)
+		{
+			if (o->dor == 0)
+				D1SpecialSet(x, y, 5);
+			else
+				D1SpecialSet(x, y, 6);
+		}
+		if (d1_opt_sfx)
+			D1SndPlay("Sfx\\Items\\Dooropen.wav");
+		return TRUE;
+	}
+
+	//close, refused while the tile is occupied → door jams open (_oVar4=2)
+	if (d1_dmon[x + y * D1_MAXDUN] || d1_ditem[x + y * D1_MAXDUN])
+	{
+		o->jammed = TRUE;
+		if (d1_opt_sfx)
+			D1SndPlay("Sfx\\Items\\Doorclos.wav");
+		return FALSE;
+	}
+	o->jammed = FALSE;
+
+	D1ObjSetPiece(x, y, o->var1);
+	if (o->gfx == 0)
+	{
+		if (o->dor == 0)
+		{
+			cx = x;
+			cy = y - 1;
+		}
+		else
+		{
+			cx = x - 1;
+			cy = y;
+		}
+		if (o->var2 != 50)
+			D1ObjSetPiece(cx, cy, o->var2);
+		else
+		{//dual-door corner: keep the other leaf's open state
+			if (D1Piece(cx, cy) == 396)
+			{
+				if (o->dor == 0)
+					D1ObjSetPiece(cx, cy, 412);
+				else
+					D1ObjSetPiece(cx, cy, 411);
+			}
+			else
+				D1ObjSetPiece(cx, cy, 50);
+		}
+	}
+	o->frame -= 2;
+	o->opened = FALSE;
+	D1SpecialSet(x, y, 0);
+	return TRUE;
+}
+
+Bool D1ObjOperate(I64 x, I64 y, I64 level)
+{//toggle a door / break a barrel / open a chest next to the player.
+ //TRUE = did something. barrels normally reach here from PlrHitObj (attack
+ //hit frame), not from the walk-arrive latch - see D1ObjIsBreakable.
+	I64	 oi = d1_dobj[x + y * D1_MAXDUN];
+	CD1Obj *o;
+	I64	 r;
+	I64	 tdmg;
+
+	if (!oi)
+		return FALSE;
+	o = &d1_objs[oi - 1];
+	if (!o->active)
+		return FALSE;
+
+	if (o->type == D1OB_DOOR)
+		return D1ObjDoorOperate(o);
+
+	if (o->opened)
+		return FALSE;
+
+	o->opened = TRUE;
+	o->frame  = 2;
+	if (d1_opt_sfx)
+	{
+		if (o->type == D1OB_CHEST)
+			D1SndPlay("Sfx\\Items\\Chest.wav");
+		else
+			D1SndPlay("Sfx\\Items\\Barrel.wav");
+	}
+	//OperateChest: AddMissile toward player (anim), not raw HP chop
+	if (o->trapped)
+	{
+		o->trapped = FALSE;
+		if (d1_chest_trap_cb)
+			(*d1_chest_trap_cb)(x, y, o->trapk, level);
+		else
+		{//Mis not hooked yet — last-resort retail-ish fallthrough
+			tdmg = (10 + level * 2) << 6;
+			d1_plr_hp -= tdmg;
+			d1_plr_hitpend = tdmg;
+			if (d1_plr_hp <= 0)
+			{
+				d1_plr_hp = 0;
+				d1_plr_dead = TRUE;
+			}
+		}
+	}
+
+	//loot roll
+	r = D1Rnd(4);
+	if (o->type == D1OB_CHEST || r == 0)
+	{
+		r = D1Rnd(3);
+		if (r == 0)
+			D1ItemDrop(D1IT_GOLD, x, y, 10 + D1Rnd(20 * level + 20));
+		else if (r == 1)
+			D1ItemDrop(D1IT_HEAL, x, y, 0);
+		else
+			D1ItemDrop(D1IT_MANA, x, y, 0);
+	}
+
+	return TRUE;
+}
+
+Bool D1ObjIsBreakable(I64 oi)
+{//objects.cpp _oBreak == 1: barrels, urns, crux (pods = Hellfire)
+	if (oi < 0 || oi >= d1_nobjs)
+		return FALSE;
+	if (!d1_objs[oi].active || d1_objs[oi].opened)
+		return FALSE;
+	return d1_objs[oi].type == D1OB_BARREL ||
+		d1_objs[oi].type == D1OB_URN ||
+		d1_objs[oi].type == D1OB_CRUX;
+}
+
+U0 D1ObjTickAll()
+{//run open/shatter anims to their last frame. doors hold their frame.
+	I64 i;
+	I64 nf;
+	CD1Obj *o;
+
+	for (i = 0; i < d1_nobjs; i++)
+	{
+		o = &d1_objs[i];
+		if (o->active && o->opened && o->type != D1OB_DOOR)
+		{
+			nf = 9;
+			if (o->type == D1OB_CHEST)
+				nf = 6;
+			if (o->frame < nf)
+				o->frame++;
+		}
+	}
+}
+
+U0 D1ObjDrawDoor(I64 x, I64 y, I64 sx, I64 sy)
+{//door leaf only. drawn BEFORE the player so standing in the doorway
+ //does not put the warrior under the wood.
+	I64	 oi = d1_dobj[x + y * D1_MAXDUN];
+	CD1Obj *o;
+	U8	*buf;
+
+	if (!oi)
+		return;
+	o = &d1_objs[oi - 1];
+	if (!o->active || o->type != D1OB_DOOR)
+		return;
+	buf = d1_gfx_doors[o->gfx];
+	if (!buf)
+		return;
+	//tile shares the player's TransList region: dither so the warrior
+	//stays visible when the door cell is painted later in the iso sweep
+	if (D1CelTransAt(x, y))
+		d1_cel_trans = TRUE;
+	if (oi - 1 == d1_hover_oi)
+		D1CelDrawOutline(sx, sy, buf, o->frame, 64, D1_OUTLINE_OBJ);
+	D1CelDrawClipped(sx, sy, buf, o->frame, 64);
+	d1_cel_trans = FALSE;
+}
+
+U0 D1ObjDrawProp(I64 x, I64 y, I64 sx, I64 sy)
+{//chests / barrels AFTER the player so an open lid can cover the feet
+	I64	 oi = d1_dobj[x + y * D1_MAXDUN];
+	CD1Obj *o;
+	U8	*buf;
+
+	if (!oi)
+		return;
+	o = &d1_objs[oi - 1];
+	if (!o->active || o->type == D1OB_DOOR)
+		return;
+
+	if (o->type == D1OB_BARREL)
+		buf = d1_gfx_barrel;
+	else if (o->type == D1OB_URN)
+		buf = d1_gfx_urn;
+	else if (o->type == D1OB_CRUX)
+		buf = d1_gfx_crux[o->gfx];
+	else
+		buf = d1_gfx_chest[o->gfx];
+	if (buf)
+	{
+		if (oi - 1 == d1_hover_oi)
+			D1CelDrawOutline(sx - 16, sy, buf, o->frame, 96,
+				D1_OUTLINE_OBJ);
+		D1CelDraw(sx - 16, sy, buf, o->frame, 96);
+	}
+}
+
+U0 D1ObjDrawCell(I64 x, I64 y, I64 sx, I64 sy)
+{//full object pass (tests / callers that do not split door vs prop)
+	D1ObjDrawDoor(x, y, sx, sy);
+	D1ObjDrawProp(x, y, sx, sy);
+}
+
+I64 D1ObjAtTile(I64 x, I64 y)
+{//operable object index at tile, -1 none. opened chests/barrels are spent;
+ //doors stay selectable so they can close.
+	I64 oi;
+	CD1Obj *o;
+
+	if (x < 0 || x >= D1_MAXDUN || y < 0 || y >= D1_MAXDUN)
+		return -1;
+	oi = d1_dobj[x + y * D1_MAXDUN];
+	if (!oi)
+		return -1;
+	o = &d1_objs[oi - 1];
+	if (!o->active)
+		return -1;
+	if (o->type != D1OB_DOOR && o->opened)
+		return -1;
+	return oi - 1;
+}
+
+Bool D1ObjHitAt(I64 x, I64 y)
+{//DoAttack PlrHitObj: breakable on the facing tile
+	I64 oi;
+
+	oi = D1ObjAtTile(x, y);
+	if (!D1ObjIsBreakable(oi))
+		return FALSE;
+	return D1ObjOperate(d1_objs[oi].x, d1_objs[oi].y, d1_currlevel);
+}
+
+I64 D1ObjAtCurs(I64 x, I64 y)
+{//object under the cursor. CheckCursMove's object scan: tile, then the
+ //one above (my-1), then the one below - sprites hang above their foot.
+	I64 oi = D1ObjAtTile(x, y);
+
+	if (oi >= 0)
+		return oi;
+	oi = D1ObjAtTile(x, y - 1);
+	if (oi >= 0)
+		return oi;
+	oi = D1ObjAtTile(x + 1, y);
+	if (oi >= 0)
+		return oi;
+	oi = D1ObjAtTile(x, y + 1);
+	if (oi >= 0)
+		return oi;
+	return D1ObjAtTile(x + 1, y + 1);
+}
+
+U8 *D1ObjHoverName(I64 oi)
+{//label for the hover nameplate
+	if (oi < 0 || oi >= d1_nobjs)
+		return NULL;
+	if (d1_objs[oi].type == D1OB_DOOR)
+		return "Door";
+	if (d1_objs[oi].type == D1OB_CHEST)
+		return "Chest";
+	if (d1_objs[oi].type == D1OB_BARREL)
+		return "Barrel";
+	if (d1_objs[oi].type == D1OB_URN)
+		return "Urn";
+	if (d1_objs[oi].type == D1OB_CRUX)
+		return "Crucified Skeleton";
+	return "Object";
+}
+
+//--- per-level object stash (SaveLevel/LoadLevel object half) -------------
+//leave/reenter and SAVE*.LV keep broken barrels / open chests / door state.
+//dungeon tiles regen from seed; open doors re-apply their piece swaps.
+
+class CD1ObjLvl
+{
+	Bool valid;
+	I64	 nobjs;
+	CD1Obj objs[D1_MAXOBJ];
+};
+
+CD1ObjLvl d1_obj_lvl[17];
+
+U0 D1ObjStashClear()
+{
+	I64 i;
+
+	for (i = 0; i < 17; i++)
+	{
+		d1_obj_lvl[i].valid = FALSE;
+		d1_obj_lvl[i].nobjs = 0;
+	}
+}
+
+U0 D1ObjCopy(CD1Obj *dst, CD1Obj *src)
+{//ZealC: no class `=` assign
+	dst->type   = src->type;
+	dst->gfx    = src->gfx;
+	dst->x      = src->x;
+	dst->y      = src->y;
+	dst->frame  = src->frame;
+	dst->dor    = src->dor;
+	dst->var1   = src->var1;
+	dst->var2   = src->var2;
+	dst->trapk  = src->trapk;
+	dst->opened = src->opened;
+	dst->trapped = src->trapped;
+	dst->jammed = src->jammed;
+	dst->active = src->active;
+}
+
+U0 D1ObjStash(I64 level)
+{//snapshot live objects for this dungeon level
+	I64 i;
+
+	if (level < 1 || level > 16)
+		return;
+	d1_obj_lvl[level].valid = TRUE;
+	d1_obj_lvl[level].nobjs = d1_nobjs;
+	for (i = 0; i < D1_MAXOBJ; i++)
+		D1ObjCopy(&d1_obj_lvl[level].objs[i], &d1_objs[i]);
+}
+
+U0 D1ObjDoorApplyOpen(CD1Obj *o)
+{//silent open-piece apply for a restored open door (map regen is closed)
+	I64 x = o->x;
+	I64 y = o->y;
+
+	if (o->gfx == 0)
+	{
+		if (o->dor == 0)
+		{
+			if (o->var1 == 214)
+				D1ObjSetPiece(x, y, 408);
+			else
+				D1ObjSetPiece(x, y, 393);
+			D1ObjDoorSet(x, y - 1, o->dor);
+			D1SpecialSet(x, y, 7);
+		}
+		else
+		{
+			D1ObjSetPiece(x, y, 395);
+			D1ObjDoorSet(x - 1, y, o->dor);
+			D1SpecialSet(x, y, 8);
+		}
+	}
+	else
+	{
+		if (o->dor == 0)
+		{
+			D1ObjSetPiece(x, y, 13);
+			D1SpecialSet(x, y, 5);
+		}
+		else
+		{
+			D1ObjSetPiece(x, y, 17);
+			D1SpecialSet(x, y, 6);
+		}
+	}
+}
+
+U0 D1ObjDoorResync()
+{//after Special*Fill: re-open doors that were open when stashed
+	I64 i;
+	CD1Obj *o;
+
+	for (i = 0; i < d1_nobjs; i++)
+	{
+		o = &d1_objs[i];
+		if (o->active && o->type == D1OB_DOOR && o->opened)
+			D1ObjDoorApplyOpen(o);
+	}
+}
+
+Bool D1ObjRestore(I64 level)
+{//TRUE = stashed state installed (skip D1ObjSpawnLevel)
+	I64 i;
+	CD1Obj *o;
+
+	if (level < 1 || level > 16)
+		return FALSE;
+	if (!d1_obj_lvl[level].valid)
+		return FALSE;
+
+	D1ObjClear;
+	d1_nobjs = d1_obj_lvl[level].nobjs;
+	if (d1_nobjs > D1_MAXOBJ)
+		d1_nobjs = D1_MAXOBJ;
+	for (i = 0; i < D1_MAXOBJ; i++)
+		D1ObjCopy(&d1_objs[i], &d1_obj_lvl[level].objs[i]);
+	for (i = 0; i < d1_nobjs; i++)
+	{
+		o = &d1_objs[i];
+		if (o->active && o->x >= 0 && o->x < D1_MAXDUN &&
+			o->y >= 0 && o->y < D1_MAXDUN)
+			d1_dobj[o->x + o->y * D1_MAXDUN] = i + 1;
+	}
+	return TRUE;
+}

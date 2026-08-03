@@ -1,4 +1,4 @@
-// HLDemo.ZC - .dem playback.
+// HLDemo.ZC - .dem playback and record.
 //
 // a demo is a recorded server-to-client stream. ASCII cd track + newline,
 // then repeated to EOF:
@@ -10,8 +10,12 @@
 // not a separate game mode: the normal client parser fed from a file instead of a
 // socket, as CL_ReadDemoMessage does. the map comes up because svc_serverinfo is
 // in the stream like any other command.
+//
+// record writes the same layout. start before connect for a self-contained dem;
+// mid-session record omits signon and will not load a map on play.
 
 #define HLDEMO_MAX_NAME	64
+#define HLDEMO_BUF_START	(256 * 1024)
 
 
 U8	*hl_demo_data	= NULL;		//whole file, owned here
@@ -32,6 +36,15 @@ U8	 hl_demo_name[HLDEMO_MAX_NAME];
 //attract cycle played behind the menu
 U8 *hl_demo_loop_names[3];
 I64 hl_demo_loop_index = 0;
+
+//--- record -----------------------------------------------------------------
+
+Bool	 hl_demo_recording	= FALSE;
+U8		*hl_demo_rec_buf	= NULL;
+I64		 hl_demo_rec_cap	= 0;
+I64		 hl_demo_rec_len	= 0;
+U8		 hl_demo_rec_name[HLDEMO_MAX_NAME];
+F64		 hl_demo_rec_angles[3];
 
 //during playback the demo is the server: no local QuakeC, entities from the client
 //tables, camera on the recorded view entity. same shape as being someone else's
@@ -57,6 +70,13 @@ U0 HLDemoInit()
 	hl_demo_loop_names[0] = "demo1.dem";
 	hl_demo_loop_names[1] = "demo2.dem";
 	hl_demo_loop_names[2] = "demo3.dem";
+
+	hl_demo_recording = FALSE;
+	hl_demo_rec_buf   = NULL;
+	hl_demo_rec_cap   = 0;
+	hl_demo_rec_len   = 0;
+	hl_demo_rec_name[0] = 0;
+	HLVecSet(hl_demo_rec_angles, 0.0, 0.0, 0.0);
 }
 
 U0 HLDemoStop()
@@ -70,11 +90,184 @@ U0 HLDemoStop()
 	hl_demo_playing = FALSE;
 }
 
+U0 HLDemoRecNeed(I64 n)
+{//grow the record buffer to hold n more bytes
+	U8	*nb;
+	I64	 cap;
+
+	if (!hl_demo_recording || !hl_demo_rec_buf)
+		return;
+	if (hl_demo_rec_len + n <= hl_demo_rec_cap)
+		return;
+
+	cap = hl_demo_rec_cap;
+	if (cap < HLDEMO_BUF_START)
+		cap = HLDEMO_BUF_START;
+	while (cap < hl_demo_rec_len + n)
+		cap = cap * 2;
+
+	nb = MAlloc(cap);
+	if (!nb)
+	{
+		HLLog("demo: record buffer grow failed\n");
+		HLLogFlush;
+		return;
+	}
+
+	if (hl_demo_rec_len > 0)
+		MemCopy(nb, hl_demo_rec_buf, hl_demo_rec_len);
+	Free(hl_demo_rec_buf);
+	hl_demo_rec_buf = nb;
+	hl_demo_rec_cap = cap;
+}
+
+U0 HLDemoRecPutI32(I64 v)
+{
+	U8 *p;
+
+	HLDemoRecNeed(4);
+	if (!hl_demo_rec_buf || hl_demo_rec_len + 4 > hl_demo_rec_cap)
+		return;
+
+	p = hl_demo_rec_buf + hl_demo_rec_len;
+	p[0] = v & 0xFF;
+	p[1] = (v >> 8) & 0xFF;
+	p[2] = (v >> 16) & 0xFF;
+	p[3] = (v >> 24) & 0xFF;
+	hl_demo_rec_len += 4;
+}
+
+U0 HLDemoRecPutF32(F64 f)
+{
+	U32 bits;
+	U8	*p;
+
+	HLDemoRecNeed(4);
+	if (!hl_demo_rec_buf || hl_demo_rec_len + 4 > hl_demo_rec_cap)
+		return;
+
+	bits = HLWrF32(f);
+	p = hl_demo_rec_buf + hl_demo_rec_len;
+	p[0] = bits & 0xFF;
+	p[1] = (bits >> 8) & 0xFF;
+	p[2] = (bits >> 16) & 0xFF;
+	p[3] = (bits >> 24) & 0xFF;
+	hl_demo_rec_len += 4;
+}
+
+U0 HLDemoSetRecordAngles(F64 *angles)
+{//viewangles written beside the next message. CL_WriteDemoMessage uses
+ //cl.viewangles; the send path supplies the slot's angles instead.
+	if (!angles)
+		return;
+
+	HLVecCopy(angles, hl_demo_rec_angles);
+}
+
+U0 HLDemoWriteMessage(CHLMsg *m)
+{//CL_WriteDemoMessage. one server message into the growing dem buffer.
+	I64 j;
+
+	if (!hl_demo_recording || !m || m->len < 1 || m->overflowed)
+		return;
+	if (m->len > HLNET_MAX_MSG)
+		return;
+
+	HLDemoRecNeed(16 + m->len);
+	if (!hl_demo_rec_buf)
+		return;
+
+	HLDemoRecPutI32(m->len);
+	for (j = 0; j < 3; j++)
+		HLDemoRecPutF32(hl_demo_rec_angles[j]);
+
+	HLDemoRecNeed(m->len);
+	if (!hl_demo_rec_buf || hl_demo_rec_len + m->len > hl_demo_rec_cap)
+		return;
+
+	MemCopy(hl_demo_rec_buf + hl_demo_rec_len, m->data, m->len);
+	hl_demo_rec_len += m->len;
+}
+
+Bool HLDemoRecordStop()
+{//CL_Stop_f record half. flush buffer to disk. FALSE if nothing to write.
+	U8	 path[HLDEMO_MAX_NAME + 32];
+	Bool ok;
+
+	if (!hl_demo_recording)
+		return FALSE;
+
+	ok = FALSE;
+	if (hl_demo_rec_buf && hl_demo_rec_len > 2 && hl_disk_writes)
+	{
+		StrPrint(path, "%s/%s", hl_game_root, hl_demo_rec_name);
+		if (FileWrite(path, hl_demo_rec_buf, hl_demo_rec_len) >= 1)
+			ok = TRUE;
+	}
+
+	if (hl_demo_rec_buf)
+		Free(hl_demo_rec_buf);
+
+	hl_demo_rec_buf   = NULL;
+	hl_demo_rec_cap   = 0;
+	hl_demo_rec_len   = 0;
+	hl_demo_recording = FALSE;
+	hl_demo_rec_name[0] = 0;
+
+	return ok;
+}
+
+Bool HLDemoRecordStart(U8 *name)
+{//CL_Record_f. name may or may not carry .dem. stops playback first.
+	U8	 hdr[16];
+	I64	 n;
+	I64	 hlen;
+
+	if (!name || !name[0])
+		return FALSE;
+
+	if (hl_demo_recording)
+		HLDemoRecordStop;
+
+	HLDemoStop;
+
+	HLStrCopy(hl_demo_rec_name, name, HLDEMO_MAX_NAME);
+	n = StrLen(hl_demo_rec_name);
+	if (n < 4 || StrICompare(hl_demo_rec_name + n - 4, ".dem"))
+		StrPrint(hl_demo_rec_name, "%s.dem", name);
+
+	hl_demo_rec_buf = MAlloc(HLDEMO_BUF_START);
+	if (!hl_demo_rec_buf)
+		return FALSE;
+
+	hl_demo_rec_cap   = HLDEMO_BUF_START;
+	hl_demo_rec_len   = 0;
+	hl_demo_recording = TRUE;
+	HLVecSet(hl_demo_rec_angles, 0.0, 0.0, 0.0);
+
+	//cd track line. 0 = no track, same as an empty playdemo header.
+	StrPrint(hdr, "%d\n", hl_demo_track);
+	hlen = StrLen(hdr);
+	HLDemoRecNeed(hlen);
+	if (!hl_demo_rec_buf)
+	{
+		hl_demo_recording = FALSE;
+		return FALSE;
+	}
+	MemCopy(hl_demo_rec_buf, hdr, hlen);
+	hl_demo_rec_len = hlen;
+
+	return TRUE;
+}
+
 Bool HLDemoStart(U8 *name, Bool loop = FALSE)
 {//CL_PlayDemo_f. name may or may not carry .dem
 	U8	 path[HLDEMO_MAX_NAME + 16];
 	I64	 size = 0;
 	I64	 n;
+
+	if (hl_demo_recording)
+		HLDemoRecordStop;
 
 	HLDemoStop;
 

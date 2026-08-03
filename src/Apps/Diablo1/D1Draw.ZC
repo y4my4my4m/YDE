@@ -1,0 +1,671 @@
+// D1Draw.ZC - variable-size 8bpp back buffer and the window blit
+//
+// game code writes palette indices into d1_screen; the compositor reads it
+// through draw_it and expands through d1_argb (QDrawBlitFit pattern).
+//
+// the buffer is allocated once at D1_W_MAX x D1_H_MAX. the row stride is the
+// CONSTANT D1_W_MAX, never d1_w: d1_w and d1_h are the ACTIVE canvas size
+// and only clip, so a size change needs no realloc and no restride. every
+// plot, blit and readback in this port indexes rows by D1_W_MAX.
+//
+// UI art is 640x480 at every canvas size. it draws in the centered band at
+// D1UiOrgX()/D1UiOrgY() (devilutionX display.cpp CalculateUIRectangle). the
+// control panel is the exception: it anchors to the BOTTOM edge at
+// D1PanelTop() (control_panel.cpp CalculatePanelAreas). the world renderer
+// centers on (d1_w / 2, d1_vp_h / 2) instead, so a larger canvas shows more
+// dungeon on every side (devilutionX widescreen).
+//
+// blit rect preserves the canvas aspect d1_w : d1_h inside the window, or
+// fills the window when d1_opt_fit is on, or snaps to a whole-pixel multiple
+// when d1_opt_int is on; input maps mouse coordinates back through it.
+
+#define D1_W_MAX	1280		//allocation width and row stride
+#define D1_H_MAX	960			//allocation height
+#define D1_UI_W		640			//width of every piece of UI art
+#define D1_UI_H		480			//height of every piece of UI art
+#define D1_PANEL_H	128			//control panel height, Panel8.CEL
+#define D1_ZOOM_ONE		65536			//16.16 magnification, 1.00x
+#define D1_ZOOM_RECIP	0x100000000		//2^32, the reciprocal numerator
+#define D1_ZOOM_N		19				//entries in d1_zoom_tbl
+#define D1_ZOOM_1X		4				//d1_zoom_tbl index of 1.00x
+#define D1_ZOOM_2X		12				//d1_zoom_tbl index of 2.00x
+
+U8	*d1_screen  = NULL;
+I64	 d1_w       = D1_UI_W;		//active canvas width, [D1_UI_W, D1_W_MAX]
+I64	 d1_h       = D1_UI_H;		//active canvas height, [D1_UI_H, D1_H_MAX]
+Bool d1_ready   = FALSE;		//draw_it gate
+I64	 d1_vp_h    = D1_UI_H;		//world viewport height; d1_h - D1_PANEL_H
+								//with the panel up
+
+//options
+Bool d1_zoom       = FALSE;		//world scale transform on; scale != 1.00x
+I64	 d1_zoom_idx   = D1_ZOOM_1X;	//index into d1_zoom_tbl
+I64	 d1_zoom_scale = 65536;		//16.16, always d1_zoom_tbl[d1_zoom_idx]
+Bool d1_opt_jog    = TRUE;		//fast town walk
+Bool d1_opt_sfx    = TRUE;
+Bool d1_opt_music  = TRUE;
+Bool d1_opt_full   = TRUE;		//WinMax, versus a window sized to the canvas
+Bool d1_opt_fit    = FALSE;		//fill the window, drop the canvas aspect
+Bool d1_opt_int    = FALSE;		//blit at a whole-pixel multiple only
+Bool d1_opt_apgold = TRUE;		//devilutionX auto gold pickup
+Bool d1_opt_apitem = FALSE;		//devilutionX auto item pickup
+Bool d1_opt_enemyhp = TRUE;		//devilutionX hover HP bar
+Bool d1_opt_floatdmg = FALSE;	//devilutionX floating damage / +EXP
+U8	*d1_zoom_buf   = NULL;
+
+//--- floating combat text (devilutionX QOL; off by default) ---------------
+#define D1_MAXFLOAT		32
+#define D1_FLOAT_LIFE	40		//ticks at 20Hz (~2s)
+
+class CD1Float
+{
+	I64	 x;			//tile
+	I64	 y;
+	I64	 oy;		//pixel rise accumulated
+	I64	 val;		//display number (positive)
+	I64	 life;
+	I64	 col;		//D1COL_* for Clr, or -1 = solid brightest
+	Bool exp;		//"+ N EXP" instead of plain number
+	Bool active;
+};
+
+CD1Float d1_floats[D1_MAXFLOAT];
+
+U0 D1FloatSpawn(I64 x, I64 y, I64 val, I64 col, Bool exp)
+{//val is the shown figure (already >>6 for hp damage)
+	I64 i;
+
+	if (!d1_opt_floatdmg || val == 0)
+		return;
+	if (val < 0)
+		val = -val;
+	for (i = 0; i < D1_MAXFLOAT; i++)
+	{
+		if (!d1_floats[i].active)
+		{
+			d1_floats[i].x      = x;
+			d1_floats[i].y      = y;
+			d1_floats[i].oy     = 0;
+			d1_floats[i].val    = val;
+			d1_floats[i].life   = D1_FLOAT_LIFE;
+			d1_floats[i].col    = col;
+			d1_floats[i].exp    = exp;
+			d1_floats[i].active = TRUE;
+			return;
+		}
+	}
+}
+
+U0 D1FloatTick()
+{
+	I64 i;
+
+	for (i = 0; i < D1_MAXFLOAT; i++)
+	{
+		if (d1_floats[i].active)
+		{
+			d1_floats[i].oy += 1;
+			d1_floats[i].life--;
+			if (d1_floats[i].life <= 0)
+				d1_floats[i].active = FALSE;
+		}
+	}
+}
+
+//D1FloatDraw lives in Diablo1.ZC - needs TileToScreen + TextDrawClr
+
+//16.16 magnification ladder. devilutionX has 1x and 2x only - its
+//GraphicsOptions.zoom is a Bool - so the intermediate steps are a port
+//addition: eighths from 0.50x to 2.00x, then quarters to 3.00x, then
+//halves. Entries below 1.00x render the world larger than the canvas and
+//minify (zoom-out; neither retail nor devilutionX has it). The reachable
+//floor is bounded by the allocation - D1ZoomRecalc clamps per resolution.
+I64 d1_zoom_tbl[19] = {32768, 40960, 49152, 57344,
+	65536, 73728, 81920, 90112, 98304, 106496, 114688,
+	122880, 131072, 147456, 163840, 180224, 196608, 229376, 262144};
+
+//blit rect inside the window, written by the blit, read by input mapping
+I64	 d1_blit_x = 0;
+I64	 d1_blit_y = 0;
+I64	 d1_blit_w = D1_UI_W;
+I64	 d1_blit_h = D1_UI_H;
+
+I64 D1UiOrgX()
+{//left edge of the centered 640-wide UI band
+	return (d1_w - D1_UI_W) / 2;
+}
+
+I64 D1UiOrgY()
+{//top edge of the centered 480-tall UI band (CalculateUIRectangle). the
+ //320x352 side panels also sit at this origin: upstream centers them at
+ //(h - 352 - 128) / 2, which equals (h - 480) / 2.
+	return (d1_h - D1_UI_H) / 2;
+}
+
+I64 D1PanelTop()
+{//top row of the bottom-anchored control panel (CalculatePanelAreas
+ //MainPanel). the world viewport with the panel up ends here.
+	return d1_h - D1_PANEL_H;
+}
+
+U0 D1ScreenInit()
+{
+	if (!d1_screen)
+		d1_screen = CAlloc(D1_W_MAX * D1_H_MAX);
+	MemSet(d1_screen, 0, D1_W_MAX * D1_H_MAX);
+}
+
+U0 D1Clear(I64 color)
+{//whole allocation, so the area outside d1_w x d1_h never holds stale pixels
+	MemSet(d1_screen, color, D1_W_MAX * D1_H_MAX);
+}
+
+U0 D1SetWidth(I64 w)
+{//active width, clamped and rounded to 4 so d1_w / 4 (the 2x zoom window
+ //origin) is exact
+	if (w < D1_UI_W)
+		w = D1_UI_W;
+	if (w > D1_W_MAX)
+		w = D1_W_MAX;
+	w -= w % 4;
+	d1_w = w;
+	if (d1_screen)
+		D1Clear(0);
+}
+
+U0 D1SetHeight(I64 h)
+{//active height, same clamp and rounding as D1SetWidth
+	if (h < D1_UI_H)
+		h = D1_UI_H;
+	if (h > D1_H_MAX)
+		h = D1_H_MAX;
+	h -= h % 4;
+	d1_h = h;
+	if (d1_screen)
+		D1Clear(0);
+}
+
+U0 D1Pix(I64 x, I64 y, I64 color)
+{
+	if (x >= 0 && x < d1_w && y >= 0 && y < d1_h)
+		d1_screen[y * D1_W_MAX + x] = color;
+}
+
+U0 D1FillRect(I64 x, I64 y, I64 w, I64 h, I64 color)
+{
+	I64 i;
+	I64 j;
+
+	for (j = 0; j < h; j++)
+		for (i = 0; i < w; i++)
+			D1Pix(x + i, y + j, color);
+}
+
+//--- zoom ------------------------------------------------------------------
+//
+// magnification is about the camera center (d1_w / 2, d1_vp_h / 2), which is
+// where D1WorldDraw puts the player: that point is the transform's fixed
+// point, so changing the scale does not slide the player across the screen.
+//
+//   screen = (canvas - org) * scale        org = center * (1 - 1 / scale)
+//   canvas = org + screen / scale
+//
+// at scale 2.00x, org is (d1_w / 4, d1_vp_h / 4) - the window the port used
+// before the ladder existed, so the inline halving in Diablo1.ZC and
+// D1Render.ZC still agrees with the magnifier at that one scale.
+
+U0 D1ZoomSync()
+{//the shell still owns the d1_zoom flag and toggles it directly. a flag
+ //raised without a scale means the 2.00x it used to imply.
+	if (d1_zoom && d1_zoom_scale == D1_ZOOM_ONE)
+	{
+		d1_zoom_idx   = D1_ZOOM_2X;
+		d1_zoom_scale = d1_zoom_tbl[D1_ZOOM_2X];
+	}
+	if (!d1_zoom && d1_zoom_scale != D1_ZOOM_ONE)
+	{
+		d1_zoom_idx   = D1_ZOOM_1X;
+		d1_zoom_scale = D1_ZOOM_ONE;
+	}
+}
+
+I64 D1ZoomInv()
+{//65536 / d1_zoom_scale in 16.16. the magnifier and every coordinate
+ //transform share this reciprocal, so they agree at every scale.
+ //rounded, not truncated: a truncated reciprocal walks the source window
+ //origin off the camera center and the view slides on a scale change.
+ //above 1.00x this is below ONE; below 1.00x above it (0.50x -> 131072).
+	D1ZoomSync;
+	if (d1_zoom_scale == D1_ZOOM_ONE)
+		return D1_ZOOM_ONE;
+	return (D1_ZOOM_RECIP + d1_zoom_scale / 2) / d1_zoom_scale;
+}
+
+I64 D1ZoomMinScale()
+{//16.16 floor for the current canvas. the render extent d1_w/scale x
+ //d1_h/scale must fit the D1_W_MAX x D1_H_MAX allocation, so the floor is
+ //max(d1_w/D1_W_MAX, d1_h/D1_H_MAX): 0.50x at 640x480, 1.00x at 1280 wide.
+	I64 mw = (d1_w << 16) / D1_W_MAX;
+	I64 mh = (d1_h << 16) / D1_H_MAX;
+
+	if (mh > mw)
+		mw = mh;
+	if (mw > D1_ZOOM_ONE)
+		mw = D1_ZOOM_ONE;
+	return mw;
+}
+
+I64 D1ZoomOrgX()
+{//left edge of the magnified source window, canvas coords
+	I64 c = d1_w / 2;
+
+	D1ZoomSync;
+	if (!d1_zoom)
+		return 0;
+	return c - ((c * D1ZoomInv() + 32768) >> 16);
+}
+
+I64 D1ZoomOrgY()
+{//top edge of the magnified source window, canvas coords
+	I64 c = d1_vp_h / 2;
+
+	D1ZoomSync;
+	if (!d1_zoom)
+		return 0;
+	return c - ((c * D1ZoomInv() + 32768) >> 16);
+}
+
+I64 D1ZoomToWorldX(I64 sx)
+{//screen x -> canvas x. what a click is pointing at.
+	if (!d1_zoom)
+		return sx;
+	return D1ZoomOrgX() + ((sx * D1ZoomInv()) >> 16);
+}
+
+I64 D1ZoomToWorldY(I64 sy)
+{
+	if (!d1_zoom)
+		return sy;
+	return D1ZoomOrgY() + ((sy * D1ZoomInv()) >> 16);
+}
+
+I64 D1ZoomToScreenX(I64 wx)
+{//canvas x -> screen x. where a world sprite ends up.
+	if (!d1_zoom)
+		return wx;
+	return ((wx - D1ZoomOrgX()) * d1_zoom_scale) >> 16;
+}
+
+I64 D1ZoomToScreenY(I64 wy)
+{
+	if (!d1_zoom)
+		return wy;
+	return ((wy - D1ZoomOrgY()) * d1_zoom_scale) >> 16;
+}
+
+I64 D1ZoomLen(I64 n)
+{//a world length in screen pixels, for sprite heights and name offsets
+	if (!d1_zoom)
+		return n;
+	return (n * d1_zoom_scale) >> 16;
+}
+
+U0 D1ZoomRecalc()
+{//scale follows the index, clamped to the per-resolution floor; the flag
+ //follows the scale
+	I64 min = D1ZoomMinScale();
+
+	if (d1_zoom_idx < 0)
+		d1_zoom_idx = 0;
+	if (d1_zoom_idx >= D1_ZOOM_N)
+		d1_zoom_idx = D1_ZOOM_N - 1;
+	while (d1_zoom_idx < D1_ZOOM_1X && d1_zoom_tbl[d1_zoom_idx] < min)
+		d1_zoom_idx++;
+	d1_zoom_scale = d1_zoom_tbl[d1_zoom_idx];
+	if (d1_zoom_scale != D1_ZOOM_ONE)
+		d1_zoom = TRUE;
+	else
+		d1_zoom = FALSE;
+}
+
+U0 D1ZoomStep(I64 dir)
+{//one ladder step, clamped at both ends. the mouse wheel drives this.
+	D1ZoomSync;
+	d1_zoom_idx += dir;
+	D1ZoomRecalc;
+}
+
+U0 D1ZoomToggle()
+{//1.00x <-> 2.00x, the devilutionX Graphics.zoom binding on 'z'
+	D1ZoomSync;
+	if (d1_zoom_scale != D1_ZOOM_ONE)
+		d1_zoom_idx = D1_ZOOM_1X;
+	else
+		d1_zoom_idx = D1_ZOOM_2X;
+	D1ZoomRecalc;
+}
+
+U0 D1ZoomApply()
+{//magnify the world by d1_zoom_scale. UI draws after.
+ //
+ //the destination is the whole canvas, [0, d1_w) x [0, d1_h), not the
+ //[0, d1_vp_h) viewport: the control panel is 640 wide at every canvas
+ //width, so from 800 up it leaves strips of world either side of itself in
+ //the panel rows. magnifying only the viewport left those strips at 1x -
+ //an unzoomed band along the bottom at every width above 640.
+ //
+ //mirrors scrollrt.cpp Zoom(), which doubles the top-left quadrant of a
+ //render already made at half scale. this resamples a full-resolution frame
+ //instead, so the scale need not be 2.
+	I64	 inv;
+	I64	 ox;
+	I64	 oy;
+	I64	 sw;
+	I64	 sh;
+	I64	 x;
+	I64	 y;
+	I64	 sx;
+	I64	 sy;
+	I64	 sxf;
+	I64	 syf;
+	I64	 prev;
+	U8	*src;
+	U8	*dst;
+
+	D1ZoomSync;
+	if (d1_zoom_scale <= D1_ZOOM_ONE)
+		return;					//scale < 1 minifies through D1ZoomOutApply
+
+	inv = D1ZoomInv();
+	ox  = D1ZoomOrgX();
+	oy  = D1ZoomOrgY();
+	sw  = (d1_w * inv) >> 16;
+	sh  = (d1_h * inv) >> 16;
+
+	//the window is inside the canvas for every scale at or above 1.00x: its
+	//right edge is d1_w / 2 + (d1_w / 2) / scale and its bottom
+	//d1_vp_h / 2 + (d1_h - d1_vp_h / 2) / scale. clamped regardless.
+	if (ox < 0)
+		ox = 0;
+	if (oy < 0)
+		oy = 0;
+	if (sw > d1_w - ox)
+		sw = d1_w - ox;
+	if (sh > d1_h - oy)
+		sh = d1_h - oy;
+	if (sw < 1)
+		sw = 1;
+	if (sh < 1)
+		sh = 1;
+
+	if (!d1_zoom_buf)
+		d1_zoom_buf = CAlloc(D1_W_MAX * D1_H_MAX);
+
+	//source first: the destination overwrites rows the source still needs
+	for (y = 0; y < sh; y++)
+	{
+		src = d1_screen + (y + oy) * D1_W_MAX + ox;
+		dst = d1_zoom_buf + y * D1_W_MAX;
+		MemCopy(dst, src, sw);
+	}
+
+	//magnification repeats source rows; copying the row already resampled
+	//costs one MemCopy instead of d1_w index steps. at 2.00x that is half
+	//the destination rows.
+	syf  = 0;
+	prev = -1;
+	for (y = 0; y < d1_h; y++)
+	{
+		sy = syf >> 16;
+		if (sy >= sh)
+			sy = sh - 1;
+		dst = d1_screen + y * D1_W_MAX;
+		if (sy == prev)
+			MemCopy(dst, dst - D1_W_MAX, d1_w);
+		else
+		{
+			src = d1_zoom_buf + sy * D1_W_MAX;
+			sxf = 0;
+			for (x = 0; x < d1_w; x++)
+			{
+				sx = sxf >> 16;
+				if (sx >= sw)
+					sx = sw - 1;
+				dst[x] = src[sx];
+				sxf += inv;
+			}
+			prev = sy;
+		}
+		syf += inv;
+	}
+}
+
+I64 D1ZoomOutW()
+{//render extent width at scale < 1, clamped to the allocation
+	I64 w = (d1_w * D1ZoomInv()) >> 16;
+
+	if (w > D1_W_MAX)
+		w = D1_W_MAX;
+	if (w < d1_w)
+		w = d1_w;
+	return w;
+}
+
+I64 D1ZoomOutH()
+{
+	I64 h = (d1_h * D1ZoomInv()) >> 16;
+
+	if (h > D1_H_MAX)
+		h = D1_H_MAX;
+	if (h < d1_h)
+		h = d1_h;
+	return h;
+}
+
+U0 D1ZoomOutApply()
+{//minify a frame rendered at the D1ZoomOutW x D1ZoomOutH extent into the
+ //d1_w x d1_h canvas. Port addition - neither retail nor devilutionX zooms
+ //out. The camera center is the fixed point: the extent center (rw/2, rh/2)
+ //lands on the canvas center, the same offset-from-center map the mouse
+ //inverse D1ZoomToWorldX/Y applies, so clicks and pixels agree.
+	I64	 inv = D1ZoomInv();
+	I64	 rw  = D1ZoomOutW();
+	I64	 rh  = D1ZoomOutH();
+	I64	 x;
+	I64	 y;
+	I64	 sx;
+	I64	 sy;
+	I64	 sxf;
+	I64	 syf;
+	U8	*src;
+	U8	*dst;
+
+	D1ZoomSync;
+	if (d1_zoom_scale >= D1_ZOOM_ONE)
+		return;
+
+	if (!d1_zoom_buf)
+		d1_zoom_buf = CAlloc(D1_W_MAX * D1_H_MAX);
+
+	//source first: the destination rows are inside the source rows
+	for (y = 0; y < rh; y++)
+		MemCopy(d1_zoom_buf + y * D1_W_MAX, d1_screen + y * D1_W_MAX, rw);
+
+	syf = 0;
+	for (y = 0; y < d1_h; y++)
+	{
+		sy = syf >> 16;
+		if (sy >= rh)
+			sy = rh - 1;
+		src = d1_zoom_buf + sy * D1_W_MAX;
+		dst = d1_screen + y * D1_W_MAX;
+		sxf = 0;
+		for (x = 0; x < d1_w; x++)
+		{
+			sx = sxf >> 16;
+			if (sx >= rw)
+				sx = rw - 1;
+			dst[x] = src[sx];
+			sxf += inv;
+		}
+		syf += inv;
+	}
+}
+
+//--- window ----------------------------------------------------------------
+
+U0 D1WindowApply()
+{//window geometry for the current mode, as Quake.ZC QApplyVideo and
+ //HL1.ZC HLApplyVideo do it. WinMax, WinHorz and WinVert are synchronous -
+ //each ends in TaskDerivedValsUpdate - so pix_width and pix_height are
+ //current on return. D1DrawIt derives the blit rect from dc->width every
+ //frame, so nothing else needs recentring.
+ //
+ //no drain around this. Quake and HL1 stop draw_it and sleep before their
+ //resize because they free and rebuild the canvas; this one is fixed at
+ //D1_W_MAX x D1_H_MAX and never reallocated, and GrScreen.ZC hands draw_it a
+ //fresh DCAlias of gr.dc2 each frame, so a geometry change frees nothing
+ //the compositor is reading.
+	if (d1_opt_full)
+		WinMax;
+	else
+	{//windowed sizes to the canvas, landing close to 1:1. WinHorz and
+	 //WinVert clamp their own arguments to the text grid.
+		WinHorz(2, 2 + (d1_w / FONT_WIDTH));
+		WinVert(2, 2 + (d1_h / FONT_HEIGHT));
+	}
+}
+
+U0 D1BlitFit(CDC *dc, I64 dst_x, I64 dst_y, I64 dst_w, I64 dst_h)
+{//stretch the indexed buffer into a destination rect, one palette lookup
+ //per pixel. 16.16 fixed point source step. source is d1_w x d1_h out of
+ //a D1_W_MAX-strided buffer.
+	U8	*src;
+	U32	*dst;
+	I64	 sx_step;
+	I64	 sy_step;
+	I64	 sxf;
+	I64	 sy;
+	I64	 x;
+	I64	 y;
+	I64	 py;
+	I64	 pitch = dc->width_internal;
+
+	if (dst_w < 1 || dst_h < 1)
+		return;
+
+	//parenthesised - shifts bind tighter than divide in this compiler
+	sx_step = (d1_w << 16) / dst_w;
+	sy_step = (d1_h << 16) / dst_h;
+
+	for (y = 0; y < dst_h; y++)
+	{
+		py = dst_y + y;
+		if (py >= 0 && py < dc->height)
+		{
+			sy = (y * sy_step) >> 16;
+			if (sy >= d1_h)
+				sy = d1_h - 1;
+
+			src = d1_screen + sy * D1_W_MAX;
+			dst = dc->body + py * pitch;
+			sxf = 0;
+
+			for (x = 0; x < dst_w; x++)
+			{
+				if (dst_x + x >= 0 && dst_x + x < dc->width)
+					dst[dst_x + x] = d1_argb[src[sxf >> 16]];
+				sxf += sx_step;
+			}
+		}
+	}
+}
+
+U0 D1DrawIt(CTask *task, CDC *dc)
+{//window manager task: copy only
+	I64 w;
+	I64 h;
+	I64 bw;
+	I64 bh;
+	I64 k;
+	I64 kx;
+	I64 ky;
+
+	no_warn task;
+
+	if (!d1_ready || !d1_screen || !d1_pal_loaded)
+		return;
+
+	w = dc->width;
+	h = dc->height;
+
+	if (d1_opt_fit)
+	{//devilutionX GraphicsOptions.fitToScreen: fill the window and let the
+	 //canvas aspect go
+		bw = w;
+		bh = h;
+	}
+	else
+	{//largest rect of the canvas aspect d1_w : d1_h that fits, centered
+		bw = w;
+		bh = (w * d1_h) / d1_w;
+		if (bh > h)
+		{
+			bh = h;
+			bw = (h * d1_w) / d1_h;
+		}
+
+		if (d1_opt_int)
+		{//devilutionX GraphicsOptions.integerScaling: whole-pixel ratio.
+		 //a window smaller than the canvas has no whole multiple, so the
+		 //aspect fit stands.
+			kx = w / d1_w;
+			ky = h / d1_h;
+			k  = kx;
+			if (ky < k)
+				k = ky;
+			if (k >= 1)
+			{
+				bw = d1_w * k;
+				bh = d1_h * k;
+			}
+		}
+	}
+
+	d1_blit_x = (w - bw) / 2;
+	d1_blit_y = (h - bh) / 2;
+	d1_blit_w = bw;
+	d1_blit_h = bh;
+
+	D1BlitFit(dc, d1_blit_x, d1_blit_y, bw, bh);
+}
+
+I64 D1MouseX()
+{//window mouse -> canvas x, clamped
+	I64 mx = mouse.pos.x - Fs->pix_left - Fs->scroll_x;
+	I64 v;
+
+	if (d1_blit_w < 1)
+		return 0;
+	v = ((mx - d1_blit_x) * d1_w) / d1_blit_w;
+	if (v < 0)
+		v = 0;
+	if (v >= d1_w)
+		v = d1_w - 1;
+	return v;
+}
+
+I64 D1MouseY()
+{
+	I64 my = mouse.pos.y - Fs->pix_top - Fs->scroll_y;
+	I64 v;
+
+	if (d1_blit_h < 1)
+		return 0;
+	v = ((my - d1_blit_y) * d1_h) / d1_blit_h;
+	if (v < 0)
+		v = 0;
+	if (v >= d1_h)
+		v = d1_h - 1;
+	return v;
+}

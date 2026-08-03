@@ -1,0 +1,674 @@
+// D1Auto.ZC - automap overlay (automap.cpp)
+//
+// AMP file: U16 LE per entry, no header. entry i describes dungeon tile
+// id i+1; automaptype[0] stays 0 (automap.cpp:126-130). low byte bits 0-3
+// are the shape type, high byte is the flag set (automap.cpp:41-50):
+//   0x01 VERTDOOR  0x02 HORZDOOR  0x04 VERTARCH  0x08 HORZARCH
+//   0x10 VERTGRATE 0x20 HORZGRATE 0x40 DIRT      0x80 STAIRS
+// entry counts: L1 206, L2 160, L3 156, L4 137.
+//
+// the automap is indexed by the 40x40 dungeon tile grid d1_dun, not by
+// dPiece. dungeon cell (i,j) expands to dPiece (2i+16, 2j+16)..(+1,+1)
+// in every Pass3.
+//
+// shape types (automap.cpp:260-301): 1 column, 2/5 vertical wall,
+// 3/6 horizontal wall, 4 both, 7 inner corner, 8 vert + cave horz,
+// 9 horz + cave vert, 10 cave horz, 11 cave vert, 12 both cave.
+// caves swap the door flag meaning against the wall direction
+// (automap.cpp:369).
+//
+// deviations from DrawAutomap:
+//  - cells walk the 40x40 grid directly with a screen reject instead of
+//    the AmShiftTab diagonal band. the screen transform is unchanged, so
+//    output geometry matches.
+//  - exploration is a Chebyshev radius in dPiece space around the player,
+//    not the SetAutomapView reveal driven by lighting; wall cells adjacent
+//    to walked floor fall inside the radius.
+//  - zoom is four fixed scales instead of 5% steps.
+//  - town has no AMP; walkable dPiece tiles plot as dots.
+//  - no scroll offsets; the map stays centered on the player.
+
+#define D1_AM_TYPE			0x0F
+#define D1_AM_VERTDOOR		0x01
+#define D1_AM_HORZDOOR		0x02
+#define D1_AM_VERTARCH		0x04
+#define D1_AM_HORZARCH		0x08
+#define D1_AM_VERTGRATE		0x10
+#define D1_AM_HORZGRATE		0x20
+#define D1_AM_DIRT			0x40
+#define D1_AM_STAIRS		0x80
+
+//PAL8_ORANGE+1, PAL8_YELLOW, PAL16_YELLOW+8 (defs.h:163-169)
+#define D1_AM_PLAYER		153
+#define D1_AM_BRIGHT		144
+#define D1_AM_DIM			200
+
+#define D1_AM_ZOOMS			4
+#define D1_AM_RADIUS		6		//dPiece tiles revealed around the player
+
+Bool d1_auto_open  = FALSE;
+U16	 d1_amp[256];					//automaptype, tile id -> shape + flags
+I64	 d1_amp_lvl    = -1;			//level type the table was loaded for
+I64	 d1_auto_zoom  = 0;				//index into d1_auto_scales
+U8	 d1_automap_seen[D1_MAXDUN * D1_MAXDUN];
+
+//AutoMapScale steps; AmLine64 = (scale << 6) / 100 (automap.cpp:194)
+I64 d1_auto_scales[D1_AM_ZOOMS] = {50, 75, 100, 150};
+
+I64 d1_am_l64 = 32;
+I64 d1_am_l32 = 16;
+I64 d1_am_l16 = 8;
+I64 d1_am_l8  = 4;
+I64 d1_am_l4  = 2;
+
+U0 D1AutoScale()
+{//AutomapZoomReset
+	I64 s = d1_auto_scales[d1_auto_zoom];
+
+	d1_am_l64 = (s << 6) / 100;
+	d1_am_l32 = d1_am_l64 >> 1;
+	d1_am_l16 = d1_am_l32 >> 1;
+	d1_am_l8  = d1_am_l16 >> 1;
+	d1_am_l4  = d1_am_l8  >> 1;
+}
+
+U0 D1AutoZoom(I64 delta)
+{
+	d1_auto_zoom += delta;
+	if (d1_auto_zoom < 0)
+		d1_auto_zoom = 0;
+	if (d1_auto_zoom >= D1_AM_ZOOMS)
+		d1_auto_zoom = D1_AM_ZOOMS - 1;
+	D1AutoScale;
+}
+
+U0 D1AutoPix(I64 x, I64 y, I64 color)
+{//clipped to the world viewport; the panel owns everything below
+	if (x >= 0 && x < d1_w && y >= 0 && y < d1_vp_h)
+		d1_screen[y * D1_W_MAX + x] = color;
+}
+
+U0 D1AutoLine(I64 x0, I64 y0, I64 x1, I64 y1, I64 color)
+{//integer Bresenham; the original DrawLine is a fixed-step DDA
+	I64 dx;
+	I64 dy;
+	I64 sx;
+	I64 sy;
+	I64 err;
+	I64 e2;
+	I64 guard = 0;
+
+	dx = x1 - x0;
+	if (dx < 0)
+		dx = -dx;
+	dy = y1 - y0;
+	if (dy < 0)
+		dy = -dy;
+	dy = -dy;
+
+	if (x0 < x1)
+		sx = 1;
+	else
+		sx = -1;
+	if (y0 < y1)
+		sy = 1;
+	else
+		sy = -1;
+
+	err = dx + dy;
+	while (guard < 4096)
+	{
+		D1AutoPix(x0, y0, color);
+		if (x0 == x1 && y0 == y1)
+			break;
+		e2 = err << 1;
+		if (e2 >= dy)
+		{
+			err += dy;
+			x0  += sx;
+		}
+		if (e2 <= dx)
+		{
+			err += dx;
+			y0  += sy;
+		}
+		guard++;
+	}
+}
+
+U0 D1AutoAmpLoad()
+{//InitAutomap: pick the AMP by level type, entry i -> tile id i+1
+	I64	 size = 0;
+	U8	*p    = NULL;
+	I64	 n;
+	I64	 i;
+
+	for (i = 0; i < 256; i++)
+		d1_amp[i] = 0;
+	d1_amp_lvl = d1_currlevel;
+
+	if (d1_currlevel < 1 || d1_currlevel > 16)
+		return;
+
+	if (d1_currlevel <= 4)
+		p = D1MpqRead("Levels\\L1Data\\L1.AMP", &size);
+	else if (d1_currlevel <= 8)
+		p = D1MpqRead("Levels\\L2Data\\L2.AMP", &size);
+	else if (d1_currlevel <= 12)
+		p = D1MpqRead("Levels\\L3Data\\L3.AMP", &size);
+	else
+		p = D1MpqRead("Levels\\L4Data\\L4.AMP", &size);
+
+	if (!p)
+	{
+		"D1Auto: no AMP for level %d\n", d1_currlevel;
+		return;
+	}
+
+	n = size / 2;
+	if (n > 255)
+		n = 255;
+	for (i = 1; i <= n; i++)
+		d1_amp[i] = D1RdU16(p + (i - 1) * 2);
+	Free(p);
+}
+
+U0 D1AutoClear()
+{//InitAutomap: forget the explored set, reload the table for this level
+	I64 i;
+
+	for (i = 0; i < D1_MAXDUN * D1_MAXDUN; i++)
+		d1_automap_seen[i] = 0;
+	D1AutoAmpLoad;
+	D1AutoScale;
+}
+
+U0 D1AutoToggle()
+{//StartAutomap
+	if (d1_amp_lvl != d1_currlevel)
+		D1AutoAmpLoad;
+	d1_auto_open = !d1_auto_open;
+}
+
+U0 D1AutoMark(I64 x, I64 y)
+{//SetAutomapView reduced to a square reveal in dPiece space
+	I64 i;
+	I64 j;
+
+	for (j = y - D1_AM_RADIUS; j <= y + D1_AM_RADIUS; j++)
+	{
+		if (j >= 0 && j < D1_MAXDUN)
+		{
+			for (i = x - D1_AM_RADIUS; i <= x + D1_AM_RADIUS; i++)
+			{
+				if (i >= 0 && i < D1_MAXDUN)
+					d1_automap_seen[i + j * D1_MAXDUN] = 1;
+			}
+		}
+	}
+}
+
+Bool D1AutoCellSeen(I64 i, I64 j)
+{//a dungeon cell is explored once any of its four dPiece tiles is
+	I64 bx = 2 * i + 16;
+	I64 by = 2 * j + 16;
+
+	if (bx < 0 || by < 0 || bx + 1 >= D1_MAXDUN || by + 1 >= D1_MAXDUN)
+		return FALSE;
+	if (d1_automap_seen[bx     +  by      * D1_MAXDUN])
+		return TRUE;
+	if (d1_automap_seen[bx + 1 +  by      * D1_MAXDUN])
+		return TRUE;
+	if (d1_automap_seen[bx     + (by + 1) * D1_MAXDUN])
+		return TRUE;
+	if (d1_automap_seen[bx + 1 + (by + 1) * D1_MAXDUN])
+		return TRUE;
+	return FALSE;
+}
+
+I64 D1AutoTypeAt(I64 x, I64 y, Bool view)
+{//GetAutomapType. the x==-1 / y==-1 arms give the explored border its
+ //dirt fringe; type 7 collapses to a column between two arches.
+	I64 rv;
+
+	if (view && x == -1 && y >= 0 && y < D1_DMAX)
+	{
+		if (D1AutoCellSeen(0, y))
+		{
+			if (D1AutoTypeAt(0, y, FALSE) & (D1_AM_DIRT << 8))
+				return 0;
+			return D1_AM_DIRT << 8;
+		}
+	}
+
+	if (view && y == -1 && x >= 0 && x < D1_DMAX)
+	{
+		if (D1AutoCellSeen(x, 0))
+		{
+			if (D1AutoTypeAt(x, 0, FALSE) & (D1_AM_DIRT << 8))
+				return 0;
+			return D1_AM_DIRT << 8;
+		}
+	}
+
+	if (x < 0 || x >= D1_DMAX)
+		return 0;
+	if (y < 0 || y >= D1_DMAX)
+		return 0;
+	if (view && !D1AutoCellSeen(x, y))
+		return 0;
+
+	rv = d1_amp[D1DunGet(x, y) & 0xFF];
+	if (rv == 7)
+	{
+		if ((D1AutoTypeAt(x - 1, y, FALSE) >> 8) & D1_AM_HORZARCH)
+		{
+			if ((D1AutoTypeAt(x, y - 1, FALSE) >> 8) & D1_AM_VERTARCH)
+				rv = 1;
+		}
+	}
+	return rv;
+}
+
+U0 D1AutoDiamond(I64 sx, I64 sy, I64 color)
+{//the arch / column glyph: a half-height diamond above the cell center
+	I64 x1 = sx - d1_am_l16;
+	I64 y1 = sy - d1_am_l16;
+	I64 x2 = x1 + d1_am_l32;
+	I64 y2 = sy - d1_am_l8;
+
+	D1AutoLine(sx, y1, x1, y2, color);
+	D1AutoLine(sx, y1, x2, y2, color);
+	D1AutoLine(sx, sy, x1, y2, color);
+	D1AutoLine(sx, sy, x2, y2, color);
+}
+
+U0 D1AutoTile(I64 sx, I64 sy, I64 amtype)
+{//DrawAutomapTile. sx,sy is the cell center; the diamond spans
+ //+-AmLine32 across and +-AmLine16 down.
+	Bool do_vert      = FALSE;
+	Bool do_horz      = FALSE;
+	Bool do_cave_horz = FALSE;
+	Bool do_cave_vert = FALSE;
+	I64	 flags        = (amtype >> 8) & 0xFF;
+	I64	 x1;
+	I64	 y1;
+	I64	 x2;
+	I64	 y2;
+
+	if (flags & D1_AM_DIRT)
+	{
+		D1AutoPix(sx, sy, D1_AM_DIM);
+		D1AutoPix(sx - d1_am_l8, sy - d1_am_l4, D1_AM_DIM);
+		D1AutoPix(sx - d1_am_l8, sy + d1_am_l4, D1_AM_DIM);
+		D1AutoPix(sx + d1_am_l8, sy - d1_am_l4, D1_AM_DIM);
+		D1AutoPix(sx + d1_am_l8, sy + d1_am_l4, D1_AM_DIM);
+		D1AutoPix(sx - d1_am_l16, sy, D1_AM_DIM);
+		D1AutoPix(sx + d1_am_l16, sy, D1_AM_DIM);
+		D1AutoPix(sx, sy - d1_am_l8, D1_AM_DIM);
+		D1AutoPix(sx, sy + d1_am_l8, D1_AM_DIM);
+		D1AutoPix(sx + d1_am_l8 - d1_am_l32, sy + d1_am_l4, D1_AM_DIM);
+		D1AutoPix(sx - d1_am_l8 + d1_am_l32, sy + d1_am_l4, D1_AM_DIM);
+		D1AutoPix(sx - d1_am_l16, sy + d1_am_l8, D1_AM_DIM);
+		D1AutoPix(sx + d1_am_l16, sy + d1_am_l8, D1_AM_DIM);
+		D1AutoPix(sx - d1_am_l8, sy + d1_am_l16 - d1_am_l4, D1_AM_DIM);
+		D1AutoPix(sx + d1_am_l8, sy + d1_am_l16 - d1_am_l4, D1_AM_DIM);
+		D1AutoPix(sx, sy + d1_am_l16, D1_AM_DIM);
+	}
+
+	if (flags & D1_AM_STAIRS)
+	{
+		D1AutoLine(sx - d1_am_l8, sy - d1_am_l8 - d1_am_l4,
+			sx + d1_am_l8 + d1_am_l16, sy + d1_am_l4, D1_AM_BRIGHT);
+		D1AutoLine(sx - d1_am_l16, sy - d1_am_l8,
+			sx + d1_am_l16, sy + d1_am_l8, D1_AM_BRIGHT);
+		D1AutoLine(sx - d1_am_l16 - d1_am_l8, sy - d1_am_l4,
+			sx + d1_am_l8, sy + d1_am_l8 + d1_am_l4, D1_AM_BRIGHT);
+		D1AutoLine(sx - d1_am_l32, sy, sx, sy + d1_am_l16, D1_AM_BRIGHT);
+	}
+
+	switch (amtype & D1_AM_TYPE)
+	{
+		case 1:
+			D1AutoDiamond(sx, sy, D1_AM_DIM);
+			break;
+		case 2:
+		case 5:
+			do_vert = TRUE;
+			break;
+		case 3:
+		case 6:
+			do_horz = TRUE;
+			break;
+		case 4:
+			do_vert = TRUE;
+			do_horz = TRUE;
+			break;
+		case 8:
+			do_vert      = TRUE;
+			do_cave_horz = TRUE;
+			break;
+		case 9:
+			do_horz      = TRUE;
+			do_cave_vert = TRUE;
+			break;
+		case 10:
+			do_cave_horz = TRUE;
+			break;
+		case 11:
+			do_cave_vert = TRUE;
+			break;
+		case 12:
+			do_cave_horz = TRUE;
+			do_cave_vert = TRUE;
+			break;
+	}
+
+	if (do_vert)
+	{//right-facing obstacle
+		if (flags & D1_AM_VERTDOOR)
+		{//two stubs with a door lozenge between them
+			x1 = sx - d1_am_l32;
+			x2 = sx - d1_am_l16;
+			y1 = sy - d1_am_l16;
+			y2 = sy - d1_am_l8;
+
+			D1AutoLine(sx, y1, sx - d1_am_l8, y1 + d1_am_l4, D1_AM_DIM);
+			D1AutoLine(x1, sy, x1 + d1_am_l8, sy - d1_am_l4, D1_AM_DIM);
+			D1AutoLine(x2, y1, x1, y2, D1_AM_BRIGHT);
+			D1AutoLine(x2, y1, sx, y2, D1_AM_BRIGHT);
+			D1AutoLine(x2, sy, x1, y2, D1_AM_BRIGHT);
+			D1AutoLine(x2, sy, sx, y2, D1_AM_BRIGHT);
+		}
+		if (flags & D1_AM_VERTGRATE)
+		{
+			D1AutoLine(sx - d1_am_l16, sy - d1_am_l8, sx - d1_am_l32, sy,
+				D1_AM_DIM);
+			flags |= D1_AM_VERTARCH;
+		}
+		if (flags & D1_AM_VERTARCH)
+			D1AutoDiamond(sx, sy, D1_AM_DIM);
+		if ((flags & (D1_AM_VERTDOOR | D1_AM_VERTGRATE | D1_AM_VERTARCH)) == 0)
+			D1AutoLine(sx, sy - d1_am_l16, sx - d1_am_l32, sy, D1_AM_DIM);
+	}
+
+	if (do_horz)
+	{//left-facing obstacle
+		if (flags & D1_AM_HORZDOOR)
+		{
+			x1 = sx + d1_am_l16;
+			x2 = sx + d1_am_l32;
+			y1 = sy - d1_am_l16;
+			y2 = sy - d1_am_l8;
+
+			D1AutoLine(sx, y1, sx + d1_am_l8, y1 + d1_am_l4, D1_AM_DIM);
+			D1AutoLine(x2, sy, x2 - d1_am_l8, sy - d1_am_l4, D1_AM_DIM);
+			D1AutoLine(x1, y1, sx, y2, D1_AM_BRIGHT);
+			D1AutoLine(x1, y1, x2, y2, D1_AM_BRIGHT);
+			D1AutoLine(x1, sy, sx, y2, D1_AM_BRIGHT);
+			D1AutoLine(x1, sy, x2, y2, D1_AM_BRIGHT);
+		}
+		if (flags & D1_AM_HORZGRATE)
+		{
+			D1AutoLine(sx + d1_am_l16, sy - d1_am_l8, sx + d1_am_l32, sy,
+				D1_AM_DIM);
+			flags |= D1_AM_HORZARCH;
+		}
+		if (flags & D1_AM_HORZARCH)
+			D1AutoDiamond(sx, sy, D1_AM_DIM);
+		if ((flags & (D1_AM_HORZDOOR | D1_AM_HORZGRATE | D1_AM_HORZARCH)) == 0)
+			D1AutoLine(sx, sy - d1_am_l16, sx + d1_am_l32, sy, D1_AM_DIM);
+	}
+
+	//caves read the vert/horz door flags against the opposite wall
+	if (do_cave_horz)
+	{
+		if (flags & D1_AM_VERTDOOR)
+		{
+			x1 = sx - d1_am_l32;
+			x2 = sx - d1_am_l16;
+			y1 = sy + d1_am_l16;
+			y2 = sy + d1_am_l8;
+
+			D1AutoLine(sx, y1, sx - d1_am_l8, y1 - d1_am_l4, D1_AM_DIM);
+			D1AutoLine(x1, sy, x1 + d1_am_l8, sy + d1_am_l4, D1_AM_DIM);
+			D1AutoLine(x2, y1, x1, y2, D1_AM_BRIGHT);
+			D1AutoLine(x2, y1, sx, y2, D1_AM_BRIGHT);
+			D1AutoLine(x2, sy, x1, y2, D1_AM_BRIGHT);
+			D1AutoLine(x2, sy, sx, y2, D1_AM_BRIGHT);
+		}
+		else
+			D1AutoLine(sx, sy + d1_am_l16, sx - d1_am_l32, sy, D1_AM_DIM);
+	}
+
+	if (do_cave_vert)
+	{
+		if (flags & D1_AM_HORZDOOR)
+		{
+			x1 = sx + d1_am_l16;
+			x2 = sx + d1_am_l32;
+			y1 = sy + d1_am_l16;
+			y2 = sy + d1_am_l8;
+
+			D1AutoLine(sx, y1, sx + d1_am_l8, y1 - d1_am_l4, D1_AM_DIM);
+			D1AutoLine(x2, sy, x2 - d1_am_l8, sy + d1_am_l4, D1_AM_DIM);
+			D1AutoLine(x1, y1, sx, y2, D1_AM_BRIGHT);
+			D1AutoLine(x1, y1, x2, y2, D1_AM_BRIGHT);
+			D1AutoLine(x1, sy, sx, y2, D1_AM_BRIGHT);
+			D1AutoLine(x1, sy, x2, y2, D1_AM_BRIGHT);
+		}
+		else
+			D1AutoLine(sx, sy + d1_am_l16, sx + d1_am_l32, sy, D1_AM_DIM);
+	}
+}
+
+U0 D1AutoTileScreen(I64 tx, I64 ty, I64 *sx, I64 *sy)
+{//dPiece tile -> automap screen pixel. same transform as DrawAutomapPlr:
+ //half-steps are AmLine16 across and AmLine8 down.
+	I64 px = tx - d1_view_x;
+	I64 py = ty - d1_view_y;
+
+	*sx = d1_w / 2 + (px - py) * d1_am_l16;
+	*sy = d1_vp_h / 2 + (px + py) * d1_am_l8;
+}
+
+U0 D1AutoStair(I64 tx, I64 ty, Bool down)
+{//trigger marker; the AMP stairs flag only covers the art tiles
+	I64 sx;
+	I64 sy;
+	I64 c = D1_AM_BRIGHT;
+
+	if (tx < 0 || ty < 0)
+		return;
+	if (!d1_automap_seen[tx + ty * D1_MAXDUN])
+		return;
+	if (down)
+		c = D1_AM_PLAYER;
+
+	D1AutoTileScreen(tx, ty, &sx, &sy);
+	D1AutoLine(sx, sy - d1_am_l8, sx + d1_am_l16, sy, c);
+	D1AutoLine(sx + d1_am_l16, sy, sx, sy + d1_am_l8, c);
+	D1AutoLine(sx, sy + d1_am_l8, sx - d1_am_l16, sy, c);
+	D1AutoLine(sx - d1_am_l16, sy, sx, sy - d1_am_l8, c);
+	D1AutoLine(sx - d1_am_l8, sy, sx + d1_am_l8, sy, c);
+}
+
+U0 D1AutoPlr()
+{//DrawAutomapPlr: an arrow pointing along the facing
+	I64 x;
+	I64 y;
+
+	D1AutoTileScreen(d1_plr_x, d1_plr_y, &x, &y);
+	y -= d1_am_l8;
+
+	switch (d1_plr_dir)
+	{
+		case 4:		//N
+			D1AutoLine(x, y, x, y - d1_am_l16, D1_AM_PLAYER);
+			D1AutoLine(x, y - d1_am_l16, x - d1_am_l4, y - d1_am_l8,
+				D1_AM_PLAYER);
+			D1AutoLine(x, y - d1_am_l16, x + d1_am_l4, y - d1_am_l8,
+				D1_AM_PLAYER);
+			break;
+		case 5:		//NE
+			D1AutoLine(x, y, x + d1_am_l16, y - d1_am_l8, D1_AM_PLAYER);
+			D1AutoLine(x + d1_am_l16, y - d1_am_l8, x + d1_am_l8,
+				y - d1_am_l8, D1_AM_PLAYER);
+			D1AutoLine(x + d1_am_l16, y - d1_am_l8, x + d1_am_l8 + d1_am_l4,
+				y, D1_AM_PLAYER);
+			break;
+		case 6:		//E
+			D1AutoLine(x, y, x + d1_am_l16, y, D1_AM_PLAYER);
+			D1AutoLine(x + d1_am_l16, y, x + d1_am_l8, y - d1_am_l4,
+				D1_AM_PLAYER);
+			D1AutoLine(x + d1_am_l16, y, x + d1_am_l8, y + d1_am_l4,
+				D1_AM_PLAYER);
+			break;
+		case 7:		//SE
+			D1AutoLine(x, y, x + d1_am_l16, y + d1_am_l8, D1_AM_PLAYER);
+			D1AutoLine(x + d1_am_l16, y + d1_am_l8, x + d1_am_l8 + d1_am_l4,
+				y, D1_AM_PLAYER);
+			D1AutoLine(x + d1_am_l16, y + d1_am_l8, x + d1_am_l8,
+				y + d1_am_l8, D1_AM_PLAYER);
+			break;
+		case 0:		//S
+			D1AutoLine(x, y, x, y + d1_am_l16, D1_AM_PLAYER);
+			D1AutoLine(x, y + d1_am_l16, x + d1_am_l4, y + d1_am_l8,
+				D1_AM_PLAYER);
+			D1AutoLine(x, y + d1_am_l16, x - d1_am_l4, y + d1_am_l8,
+				D1_AM_PLAYER);
+			break;
+		case 1:		//SW
+			D1AutoLine(x, y, x - d1_am_l16, y + d1_am_l8, D1_AM_PLAYER);
+			D1AutoLine(x - d1_am_l16, y + d1_am_l8, x - d1_am_l4 - d1_am_l8,
+				y, D1_AM_PLAYER);
+			D1AutoLine(x - d1_am_l16, y + d1_am_l8, x - d1_am_l8,
+				y + d1_am_l8, D1_AM_PLAYER);
+			break;
+		case 2:		//W
+			D1AutoLine(x, y, x - d1_am_l16, y, D1_AM_PLAYER);
+			D1AutoLine(x - d1_am_l16, y, x - d1_am_l8, y - d1_am_l4,
+				D1_AM_PLAYER);
+			D1AutoLine(x - d1_am_l16, y, x - d1_am_l8, y + d1_am_l4,
+				D1_AM_PLAYER);
+			break;
+		case 3:		//NW
+			D1AutoLine(x, y, x - d1_am_l16, y - d1_am_l8, D1_AM_PLAYER);
+			D1AutoLine(x - d1_am_l16, y - d1_am_l8, x - d1_am_l8,
+				y - d1_am_l8, D1_AM_PLAYER);
+			D1AutoLine(x - d1_am_l16, y - d1_am_l8, x - d1_am_l4 - d1_am_l8,
+				y, D1_AM_PLAYER);
+			break;
+	}
+}
+
+U0 D1AutoTown()
+{//no AMP for the town: one dash per explored walkable dPiece tile
+	I64 x;
+	I64 y;
+	I64 sx;
+	I64 sy;
+
+	for (y = 0; y < D1_MAXDUN; y++)
+		for (x = 0; x < D1_MAXDUN; x++)
+		{
+			if (d1_automap_seen[x + y * D1_MAXDUN] && D1Walkable(x, y))
+			{
+				D1AutoTileScreen(x, y, &sx, &sy);
+				if (sx > -8 && sx < d1_w + 8 && sy > -8 && sy < d1_vp_h + 8)
+				{
+					D1AutoPix(sx, sy, D1_AM_DIM);
+					D1AutoPix(sx + 1, sy, D1_AM_DIM);
+				}
+			}
+		}
+}
+
+U8 d1_auto_txt[32];
+
+U0 D1AutoText()
+{//DrawAutomapText, reduced to the level line
+	if (d1_currlevel == 0)
+		StrPrint(d1_auto_txt, "Tristram");
+	else
+		StrPrint(d1_auto_txt, "Level: %d", d1_currlevel);
+	D1TextDrawSolid(8, 24, d1_auto_txt, D1PalBrightest());
+}
+
+U0 D1AutoDraw()
+{//DrawAutomap: walk the dungeon grid, plot every explored cell
+	I64 i;
+	I64 j;
+	I64 sx;
+	I64 sy;
+	I64 t;
+
+	if (!d1_auto_open)
+		return;
+
+	if (d1_currlevel == 0)
+	{
+		D1AutoTown;
+		D1AutoPlr;
+		D1AutoText;
+		return;
+	}
+
+	for (j = -1; j < D1_DMAX; j++)
+		for (i = -1; i < D1_DMAX; i++)
+		{
+			D1AutoTileScreen(2 * i + 16, 2 * j + 16, &sx, &sy);
+			if (sx > -d1_am_l64 && sx < d1_w + d1_am_l64 &&
+				sy > -d1_am_l32 && sy < d1_vp_h + d1_am_l32)
+			{
+				t = D1AutoTypeAt(i, j, TRUE);
+				if (t)
+					D1AutoTile(sx, sy, t);
+			}
+		}
+
+	D1AutoStair(d1_trig_up_x, d1_trig_up_y, FALSE);
+	D1AutoStair(d1_trig_down_x, d1_trig_down_y, TRUE);
+	D1AutoPlr;
+	D1AutoText;
+}
+
+d1_map_mark = &D1AutoMark;
+
+//--- per-level automap fog stash --------------------------------------------
+
+class CD1AmapLvl
+{
+	Bool valid;
+	U8	 seen[D1_MAXDUN * D1_MAXDUN];
+};
+
+CD1AmapLvl d1_amap_lvl[17];
+
+U0 D1AutoStashClear()
+{
+	I64 i;
+
+	for (i = 0; i < 17; i++)
+		d1_amap_lvl[i].valid = FALSE;
+}
+
+U0 D1AutoStash(I64 level)
+{
+	if (level < 0 || level > 16)
+		return;
+	d1_amap_lvl[level].valid = TRUE;
+	MemCopy(d1_amap_lvl[level].seen, d1_automap_seen, D1_MAXDUN * D1_MAXDUN);
+}
+
+Bool D1AutoRestore(I64 level)
+{//TRUE = fog restored. still need AmpLoad for the shape table.
+	if (level < 0 || level > 16)
+		return FALSE;
+	if (!d1_amap_lvl[level].valid)
+		return FALSE;
+	MemCopy(d1_automap_seen, d1_amap_lvl[level].seen, D1_MAXDUN * D1_MAXDUN);
+	D1AutoAmpLoad;
+	D1AutoScale;
+	return TRUE;
+}
