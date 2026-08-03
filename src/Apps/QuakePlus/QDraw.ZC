@@ -32,10 +32,24 @@ class CQScreenVert
 	F64	t_over_z;
 };
 
+//truecolor render path. the world stays 8bpp indexed; sources that own real
+//RGB (external skybox) write a parallel plane instead of quantizing down.
+//QDrawNew reads this, so a change needs a canvas rebuild
+Bool	q_opt_truecolor = TRUE;
+
+//TRUE only while a truecolor source is actually feeding the overlay. declared
+//here because the span writers below run before the sky code is defined
+Bool	q_rgb_active	= FALSE;
+
+#define QRGB_SET	0x80000000	//bit 31 marks the overlay pixel as live
+
 class CQCanvas
 {
 	U8	*pixels;		//width * height palette indices
 	F64	*depth;			//1/z, larger is nearer
+	//truecolor overlay, NULL unless q_opt_truecolor. bit 31 set means this
+	//pixel holds a literal 0xRRGGBB and the index plane is ignored at blit
+	U32	*rgb;
 	I64	 width;
 	I64	 height;
 
@@ -728,6 +742,9 @@ CQCanvas *QDrawNew(I64 w, I64 h)
 	c->pixels = CAlloc(w * h);
 	c->depth  = CAlloc(w * h * sizeof(F64));
 
+	if (q_opt_truecolor)
+		c->rgb = CAlloc(w * h * sizeof(U32));
+
 	return c;
 }
 
@@ -738,6 +755,7 @@ U0 QDrawFree(CQCanvas *c)
 
 	if (c->pixels)	Free(c->pixels);
 	if (c->depth)	Free(c->depth);
+	if (c->rgb)		Free(c->rgb);
 
 	Free(c);
 }
@@ -746,8 +764,19 @@ U0 QDrawClear(CQCanvas *c, I64 color_index)
 {
 	MemSet(c->pixels, color_index, c->width * c->height);
 	MemSet(c->depth, 0, c->width * c->height * sizeof(F64));
+
+	if (c->rgb)
+		MemSet(c->rgb, 0, c->width * c->height * sizeof(U32));
+
 	c->faces_drawn = 0;
 	c->spans_drawn = 0;
+}
+
+U0 QRGBDrop(CQCanvas *c, I64 x, I64 y)
+{//an index was written at this pixel, so the truecolor overlay under it is
+ //stale. every writer that is not the sky must call this
+	if (c->rgb && q_rgb_active)
+		c->rgb[y * c->width + x] = 0;
 }
 
 U0 QDrawSetViewRect(CQCanvas *c, F64 viewsize, I64 sbar_h)
@@ -1362,6 +1391,10 @@ U0 QDrawSpan(CQCanvas *c, I64 y, I64 x1, I64 x2,
 	I64	 n;
 	I64	 mins_s_i;
 	I64	 mins_t_i;
+	I64	 ufx;
+	I64	 vfx;
+	I64	 dufx;
+	I64	 dvfx;
 	F64	 iz_e;
 	F64	 soz_e;
 	F64	 toz_e;
@@ -1439,6 +1472,12 @@ U0 QDrawSpan(CQCanvas *c, I64 y, I64 x1, I64 x2,
 	row  = c->pixels + y * c->width;
 	zrow = c->depth + y * c->width;
 
+	//sky writes depth 0, so world always wins the test here and a rejected
+	//pixel was taken by other world geometry that already dropped the overlay.
+	//clearing the whole run in one go keeps the branch out of the pixel loop
+	if (c->rgb && q_rgb_active && x2 > x1)
+		MemSet(c->rgb + y * c->width + x1, 0, (x2 - x1) * sizeof(U32));
+
 	iz  = iz1;
 	soz = soz1;
 	toz = toz1;
@@ -1487,8 +1526,14 @@ U0 QDrawSpan(CQCanvas *c, I64 y, I64 x1, I64 x2,
 		ds = (s_e - s) / ToF64(n);
 		dt = (t_e - t) / ToF64(n);
 
-		//light steps like s and t - one bilinear fetch per block, not per pixel
-		if (lightmap && lm_w > 0 && lm_h > 0)
+		//a cached surface carries its own light, so the bilinear fetches and
+		//the per-pixel light step below are dead work on that path
+		if (surf)
+		{
+			lightv = 0.0;
+			dlight = 0.0;
+		}
+		else if (lightmap && lm_w > 0 && lm_h > 0)
 		{
 			lightv  = QLightBilinear(lightmap, lm_w, lm_h,
 						(s - mins_s) / 16.0, (t - mins_t) / 16.0);
@@ -1500,6 +1545,36 @@ U0 QDrawSpan(CQCanvas *c, I64 y, I64 x1, I64 x2,
 		{
 			lightv = ToF64(flat_light);
 			dlight = 0.0;
+		}
+
+		//cached surface: texel coords are surface space and already clamped,
+		//so the whole per-pixel float path collapses to 16.16 integer steps.
+		//mins_s_i is integral, so Floor(s) - mins_s_i == Floor(s - mins_s_i)
+		if (surf)
+		{
+			ufx  = ToI64((s - ToF64(mins_s_i)) * 65536.0);
+			vfx  = ToI64((t - ToF64(mins_t_i)) * 65536.0);
+			dufx = ToI64(ds * 65536.0);
+			dvfx = ToI64(dt * 65536.0);
+
+			while (x < xe)
+			{
+				if (iz > zrow[x])
+				{
+					tx = ClampI64((ufx >> 16) >> mip, 0, tw - 1);
+					ty = ClampI64((vfx >> 16) >> mip, 0, th - 1);
+
+					row[x]  = texels[ty * tw + tx];
+					zrow[x] = iz;
+				}
+
+				ufx += dufx;
+				vfx += dvfx;
+				iz  += d_iz;
+				x++;
+			}
+
+			goto qds_block_end;
 		}
 
 		while (x < xe)
@@ -1580,6 +1655,7 @@ U0 QDrawSpan(CQCanvas *c, I64 y, I64 x1, I64 x2,
 			x++;
 		}
 
+qds_block_end:
 		//resync exact, don't carry stepping error into the next block
 		iz  = iz_e;
 		soz = soz_e;
@@ -1714,7 +1790,8 @@ U0 QDrawPolygon(CQCanvas *c, CQScreenVert *v, I64 count,
 #define QSKY_UP			4
 #define QSKY_DN			5
 
-U8	*q_sky_pix[QSKY_FACES];
+U8	*q_sky_pix[QSKY_FACES];		//quantized, used when truecolor is off
+U32	*q_sky_rgb[QSKY_FACES];		//source 0xRRGGBB, kept so the toggle is live
 I64	 q_sky_w[QSKY_FACES];
 I64	 q_sky_h[QSKY_FACES];
 U8	 q_sky_name[64];
@@ -1740,12 +1817,16 @@ U0 QSkyFree()
 	{
 		if (q_sky_pix[i])
 			Free(q_sky_pix[i]);
+		if (q_sky_rgb[i])
+			Free(q_sky_rgb[i]);
 		q_sky_pix[i] = NULL;
+		q_sky_rgb[i] = NULL;
 		q_sky_w[i]   = 0;
 		q_sky_h[i]   = 0;
 	}
 
 	q_sky_ready   = FALSE;
+	q_rgb_active  = FALSE;
 	q_sky_loaded  = 0;
 	q_sky_name[0] = 0;
 }
@@ -1757,11 +1838,13 @@ U0 QSkyInit()
 	for (i = 0; i < QSKY_FACES; i++)
 	{
 		q_sky_pix[i] = NULL;
+		q_sky_rgb[i] = NULL;
 		q_sky_w[i]   = 0;
 		q_sky_h[i]   = 0;
 	}
 
 	q_sky_ready   = FALSE;
+	q_rgb_active  = FALSE;
 	q_sky_loaded  = 0;
 	q_sky_name[0] = 0;
 	q_sky_solid   = 0;
@@ -1771,6 +1854,7 @@ Bool QSkyLoadFace(U8 *name, I64 face)
 {
 	U8	*data;
 	U8	*out;
+	U32	*rgb;
 	U8	*sfx;
 	CDC	*dc;
 	U8	 path[96];
@@ -1802,8 +1886,11 @@ Bool QSkyLoadFace(U8 *name, I64 face)
 	}
 
 	out = MAlloc(w * h);
-	if (!out)
+	rgb = MAlloc(w * h * sizeof(U32));
+	if (!out || !rgb)
 	{
+		if (out)	Free(out);
+		if (rgb)	Free(rgb);
 		DCDel(dc);
 		return FALSE;
 	}
@@ -1813,6 +1900,7 @@ Bool QSkyLoadFace(U8 *name, I64 face)
 		for (x = 0; x < w; x++)
 		{
 			pix = dc->body[y * dc->width_internal + x] & 0x00FFFFFF;
+			rgb[y * w + x] = pix | QRGB_SET;
 			out[y * w + x] = QPalNearestRGB(
 				(pix >> 16) & 255, (pix >> 8) & 255, pix & 255);
 		}
@@ -1820,6 +1908,7 @@ Bool QSkyLoadFace(U8 *name, I64 face)
 
 	DCDel(dc);
 	q_sky_pix[face] = out;
+	q_sky_rgb[face] = rgb;
 	q_sky_w[face]   = w;
 	q_sky_h[face]   = h;
 	return TRUE;
@@ -1843,7 +1932,10 @@ U0 QSkyLoad(U8 *name)
 
 	q_sky_loaded = ok;
 	if (ok > 0)
-		q_sky_ready = TRUE;
+	{
+		q_sky_ready  = TRUE;
+		q_rgb_active = q_opt_truecolor;
+	}
 	else
 		q_sky_name[0] = 0;
 
@@ -2029,9 +2121,36 @@ U8 QSkyTexel(I64 face, F64 u, F64 v)
 	return p[iv * w + iu];
 }
 
+U32 QSkyTexelRGB(I64 face, F64 u, F64 v)
+{//0 when this face has no RGB source; caller falls back to the index plane
+	U32 *p;
+	I64	 w;
+	I64	 h;
+	I64	 iu;
+	I64	 iv;
+
+	if (!q_sky_ready || face < 0 || face >= QSKY_FACES)
+		return 0;
+	p = q_sky_rgb[face];
+	if (!p)
+		return 0;
+
+	w = q_sky_w[face];
+	h = q_sky_h[face];
+	iu = ToI64(u);
+	iv = ToI64(v);
+	if (iu < 0) iu = 0;
+	if (iu >= w) iu = w - 1;
+	if (iv < 0) iv = 0;
+	if (iv >= h) iv = h - 1;
+	return p[iv * w + iu];
+}
+
 U0 QDrawSkyBoxSpan(CQCanvas *c, I64 y, I64 x1, I64 x2, F64 iz1, F64 iz2)
 {
 	U8	*row;
+	U32	*crow;
+	U32	 texel;
 	F64	*zrow;
 	F64	 dir[3];
 	F64	 step[3];
@@ -2083,6 +2202,9 @@ U0 QDrawSkyBoxSpan(CQCanvas *c, I64 y, I64 x1, I64 x2, F64 iz1, F64 iz2)
 
 	row = c->pixels + y * c->width;
 	zrow = c->depth + y * c->width;
+	crow = NULL;
+	if (c->rgb)
+		crow = c->rgb + y * c->width;
 	iz = iz1;
 	x = x1;
 	while (x < x2)
@@ -2111,7 +2233,17 @@ U0 QDrawSkyBoxSpan(CQCanvas *c, I64 y, I64 x1, I64 x2, F64 iz1, F64 iz2)
 			{
 				if (iz >= zrow[x])
 				{
-					row[x] = QSkyTexel(fc, u, v);
+					texel = 0;
+					if (crow)
+						texel = QSkyTexelRGB(fc, u, v);
+					if (texel)
+						crow[x] = texel;
+					else
+					{
+						row[x] = QSkyTexel(fc, u, v);
+						if (crow)
+							crow[x] = 0;
+					}
 					zrow[x] = 0.0;
 				}
 				iz += d_iz;
@@ -2129,7 +2261,17 @@ U0 QDrawSkyBoxSpan(CQCanvas *c, I64 y, I64 x1, I64 x2, F64 iz1, F64 iz2)
 				if (iz >= zrow[x])
 				{
 					QSkyRay(dir, &fc, &u, &v);
-					row[x] = QSkyTexel(fc, u, v);
+					texel = 0;
+					if (crow)
+						texel = QSkyTexelRGB(fc, u, v);
+					if (texel)
+						crow[x] = texel;
+					else
+					{
+						row[x] = QSkyTexel(fc, u, v);
+						if (crow)
+							crow[x] = 0;
+					}
 					zrow[x] = 0.0;
 				}
 				iz += d_iz;
@@ -2647,7 +2789,10 @@ U0 QDrawFadeScreen(CQCanvas *c)
 		for (x = 0; x < c->width; x++)
 		{
 			if (((x / step) & 3) != t)
+			{
 				row[x] = 0;
+				QRGBDrop(c, x, y);
+			}
 		}
 	}
 }
@@ -2660,6 +2805,7 @@ U0 QDrawBlitFit(CQCanvas *c, CDC *dc, I64 dst_x, I64 dst_y, I64 dst_w,
  //fixed-point source step lets any render size fill the same rectangle
 	U8	*src;
 	U32	*dst;
+	U32	*crow;
 	I64	 sx_step;
 	I64	 sy_step;
 	I64	 sxf;
@@ -2690,6 +2836,9 @@ U0 QDrawBlitFit(CQCanvas *c, CDC *dc, I64 dst_x, I64 dst_y, I64 dst_w,
 			sy = c->height - 1;
 
 		src = c->pixels + sy * c->width;
+		crow = NULL;
+		if (c->rgb && q_rgb_active)
+			crow = c->rgb + sy * c->width;
 		dst = dc->body + py * pitch;
 
 		//underwater warp - shear each row along a travelling sine. a view
@@ -2713,7 +2862,12 @@ U0 QDrawBlitFit(CQCanvas *c, CDC *dc, I64 dst_x, I64 dst_y, I64 dst_w,
 				sx = c->width - 1;
 
 			if (dst_x + x >= 0 && dst_x + x < dc->width)
-				dst[dst_x + x] = qpal_argb[src[sx]];
+			{
+				if (crow && (crow[sx] & QRGB_SET))
+					dst[dst_x + x] = crow[sx] & 0x00FFFFFF;
+				else
+					dst[dst_x + x] = qpal_argb[src[sx]];
+			}
 
 			sxf += sx_step;
 		}
@@ -2727,6 +2881,7 @@ U0 QDrawBlit(CQCanvas *c, CDC *dc, I64 dst_x, I64 dst_y, I64 scale)
  //per source pixel
 	U8	*src;
 	U32	*dst;
+	U32	*crow;
 	U32	 color;
 	I64	 x;
 	I64	 y;
@@ -2739,6 +2894,10 @@ U0 QDrawBlit(CQCanvas *c, CDC *dc, I64 dst_x, I64 dst_y, I64 scale)
 	for (y = 0; y < c->height; y++)
 	{
 		src = c->pixels + y * c->width;
+		crow = NULL;
+		if (c->rgb && q_rgb_active)
+			crow = c->rgb + y * c->width;
+
 		for (sy = 0; sy < scale; sy++)
 		{
 			py = dst_y + y * scale + sy;
@@ -2749,8 +2908,11 @@ U0 QDrawBlit(CQCanvas *c, CDC *dc, I64 dst_x, I64 dst_y, I64 scale)
 
 			for (x = 0; x < c->width; x++)
 			{
-				color = qpal_argb[src[x]];
-				px    = dst_x + x * scale;
+				if (crow && (crow[x] & QRGB_SET))
+					color = crow[x] & 0x00FFFFFF;
+				else
+					color = qpal_argb[src[x]];
+				px = dst_x + x * scale;
 
 				for (sx = 0; sx < scale; sx++)
 				{
