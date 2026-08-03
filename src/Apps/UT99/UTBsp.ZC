@@ -66,6 +66,17 @@ class CUTBspSurf
 	I64	actor;			//object ref
 };
 
+class CUTLightMapIdx
+{//FLightMapIndex — UnObj.h. SoftDrv samples LightBits[DataOffset+…]
+	I64	 data_offset;
+	F64	 pan[3];
+	I64	 u_clamp;
+	I64	 v_clamp;
+	F64	 u_scale;
+	F64	 v_scale;
+	I64	 i_light_actors;
+};
+
 class CUTBspVert
 {//FVert: compact point index + side
 	I64 p_vertex;
@@ -90,9 +101,21 @@ class CUTBsp
 	CUTBspVert	*verts;
 	I64			 num_verts;
 	CUTTex		**surf_tex;	//per-surf resolved Texture*; owned as pointer table
+	CUTLightMapIdx	*light_maps;
+	I64			 num_light_maps;
+	U8			*light_bits;
+	I64			 light_bits_n;
 };
 
 CUTBsp *ut_bsp = NULL;	//active world BSP; here so UTMap/UTWeap/UTGame see it before UT99
+
+extern Bool	ut_zone_in_water;
+extern Bool	ut_zone_in_hurt;
+extern Bool	ut_draw_lm_on;
+
+//SoftDrv SampleLight bind — facet sets these; span fill samples
+CUTBsp		*ut_lm_bsp	= NULL;
+CUTBspSurf	*ut_lm_surf	= NULL;
 
 CUTBsp *UTBspNew()
 {
@@ -110,6 +133,8 @@ U0 UTBspFree(CUTBsp *b)
 	if (b->surfs)   Free(b->surfs);
 	if (b->verts)   Free(b->verts);
 	if (b->surf_tex) Free(b->surf_tex);
+	if (b->light_maps) Free(b->light_maps);
+	if (b->light_bits) Free(b->light_bits);
 	Free(b);
 }
 
@@ -396,9 +421,141 @@ Bool UTBspLoadModel(CUTPackage *pkg, I64 exp_i, CUTBsp *b)
 		i++;
 	}
 
-	UTLog("UTBsp: Model vectors=%d points=%d nodes=%d surfs=%d verts=%d\n",
-		b->num_vectors, b->num_points, b->num_nodes, b->num_surfs, b->num_verts);
-	return !ar.err && b->num_nodes > 0;
+	//Polys UObject* — skip one index (UModel::Serialize)
+	if (ar.pos < endpos)
+		UTArcIndex(&ar);
+
+	//LightMap TArray<FLightMapIndex>
+	b->num_light_maps = 0;
+	b->light_maps = NULL;
+	b->light_bits_n = 0;
+	b->light_bits = NULL;
+	if (!ar.err && ar.pos < endpos)
+	{
+		n = UTArcIndex(&ar);
+		if (!ar.err && n > 0 && n < 65536)
+		{
+			b->num_light_maps = n;
+			b->light_maps = CAlloc(n * sizeof(CUTLightMapIdx));
+			i = 0;
+			while (i < n && !ar.err)
+			{
+				b->light_maps[i].data_offset = UTArcI32(&ar);
+				b->light_maps[i].pan[0] = UTArcF32(&ar);
+				b->light_maps[i].pan[1] = UTArcF32(&ar);
+				b->light_maps[i].pan[2] = UTArcF32(&ar);
+				b->light_maps[i].u_clamp = UTArcIndex(&ar);
+				b->light_maps[i].v_clamp = UTArcIndex(&ar);
+				b->light_maps[i].u_scale = UTArcF32(&ar);
+				b->light_maps[i].v_scale = UTArcF32(&ar);
+				b->light_maps[i].i_light_actors = UTArcI32(&ar);
+				if (b->light_maps[i].u_clamp < 1)
+					b->light_maps[i].u_clamp = 1;
+				if (b->light_maps[i].v_clamp < 1)
+					b->light_maps[i].v_clamp = 1;
+				if (b->light_maps[i].u_scale < 0.0001)
+					b->light_maps[i].u_scale = 1.0;
+				if (b->light_maps[i].v_scale < 0.0001)
+					b->light_maps[i].v_scale = 1.0;
+				i++;
+			}
+		}
+	}
+	//LightBits TArray<BYTE>
+	if (!ar.err && ar.pos < endpos)
+	{
+		n = UTArcIndex(&ar);
+		if (!ar.err && n > 0 && n < (1 << 26))
+		{
+			b->light_bits_n = n;
+			b->light_bits = CAlloc(n);
+			i = 0;
+			while (i < n && ar.pos < endpos)
+			{
+				b->light_bits[i] = UTArcU8(&ar) & 255;
+				i++;
+			}
+		}
+	}
+
+	UTLog("UTBsp: Model vectors=%d points=%d nodes=%d surfs=%d verts=%d lm=%d bits=%d\n",
+		b->num_vectors, b->num_points, b->num_nodes, b->num_surfs, b->num_verts,
+		b->num_light_maps, b->light_bits_n);
+	return b->num_nodes > 0;
+}
+
+F64 UTBspSampleLightMap(CUTBsp *b, CUTBspSurf *s, F64 u, F64 v)
+{//SoftDrv SampleLight stand-in: LightBits byte → 0..1 shade.
+ //UV: SoftDrv LightMip.UScale = TexUScale/LightUScale; pan delta applied.
+ //Host stores world texels already pan-adjusted; divide by LM scale + LM pan.
+	CUTLightMapIdx *lm;
+	I64 lu;
+	I64 lv;
+	I64 uw;
+	I64 vh;
+	I64 off;
+	I64 idx;
+	U8 byte;
+
+	if (!b || !s || !b->light_bits || b->light_bits_n < 1)
+		return -1.0;
+	if (s->i_light_map < 0 || s->i_light_map >= b->num_light_maps)
+		return -1.0;
+	lm = &b->light_maps[s->i_light_map];
+	uw = lm->u_clamp;
+	vh = lm->v_clamp;
+	if (uw < 1) uw = 1;
+	if (vh < 1) vh = 1;
+	lu = ToI64((u - lm->pan[0]) / lm->u_scale);
+	lv = ToI64((v - lm->pan[1]) / lm->v_scale);
+	if (lu < 0) lu = 0;
+	if (lv < 0) lv = 0;
+	if (lu >= uw) lu = uw - 1;
+	if (lv >= vh) lv = vh - 1;
+	off = lm->data_offset;
+	if (off < 0)
+		off = 0;
+	idx = off + lv * uw + lu;
+	if (idx < 0 || idx >= b->light_bits_n)
+	{
+		//Bit-packed fallback: one bit per texel
+		idx = off + (lv * uw + lu) / 8;
+		if (idx < 0 || idx >= b->light_bits_n)
+			return 0.55;
+		byte = b->light_bits[idx];
+		if (byte & (1 << ((lv * uw + lu) & 7)))
+			return 0.95;
+		return 0.35;
+	}
+	byte = b->light_bits[idx];
+	return ToF64(byte) / 255.0;
+}
+
+F64 UTBspSampleLightMapActive(F64 u, F64 v)
+{//per-texel SoftDrv SampleLight from bound facet
+	F64 s;
+
+	if (!ut_draw_lm_on || !ut_lm_bsp || !ut_lm_surf)
+		return -1.0;
+	s = UTBspSampleLightMap(ut_lm_bsp, ut_lm_surf, u, v);
+	return s;
+}
+
+F64 UTBspSampleFogMap(CUTBsp *b, CUTBspSurf *s, F64 u, F64 v)
+{//SoftDrv FogMap when present. Package FogMap textures built by Engine
+ //light manager — absent here. Zone fog stand-in: dim when in hurt/water.
+	F64 shade;
+
+	no_warn b;
+	no_warn s;
+	no_warn u;
+	no_warn v;
+	shade = 1.0;
+	if (ut_zone_in_water)
+		shade = 0.72;
+	if (ut_zone_in_hurt)
+		shade = 0.55;
+	return shade;
 }
 
 U0 UTBspSurfUV(CUTBsp *b, CUTBspSurf *s, F64 *pos, F64 *u, F64 *v)
@@ -482,6 +639,8 @@ U0 UTBspDrawFacet(CUTCanvas *c, CUTBsp *b, CUTBspNode *n, F64 *eye,
 	F64 *nrm;
 	F64 facing;
 	F64 centroid[3];
+	F64 lm_s;
+	F64 fog_s;
 	I64 pv;
 	I64 zone;
 	U32 pf;
@@ -538,6 +697,28 @@ U0 UTBspDrawFacet(CUTCanvas *c, CUTBsp *b, CUTBspNode *n, F64 *eye,
 	centroid[1] /= ToF64(n->num_vertices);
 	centroid[2] /= ToF64(n->num_vertices);
 	ut_draw_shade = UTLightShadeAt(centroid);
+	//SoftDrv DrawSurf: if Surface.LightMap sample photons; else unlit path.
+	//Facet bind LM for per-texel SampleLight in UTDrawSpanTexRun.
+	ut_lm_bsp = b;
+	ut_lm_surf = s;
+	ut_draw_lm_on = FALSE;
+	if (s->i_light_map >= 0 && b->num_light_maps > 0 && b->light_bits)
+	{
+		ut_draw_lm_on = TRUE;
+		lm_s = UTBspSampleLightMap(b, s, u0, v0);
+		if (lm_s >= 0.0)
+		{
+			ut_draw_shade = lm_s * 0.65 + ut_draw_shade * 0.35;
+			if (ut_draw_shade > 1.0)
+				ut_draw_shade = 1.0;
+			if (ut_draw_shade < 0.12)
+				ut_draw_shade = 0.12;
+		}
+	}
+	fog_s = UTBspSampleFogMap(b, s, u0, v0);
+	ut_draw_shade = ut_draw_shade * fog_s;
+	if (ut_draw_shade > 1.0)
+		ut_draw_shade = 1.0;
 	vi = 1;
 	while (vi + 1 < n->num_vertices)
 	{
@@ -558,6 +739,9 @@ U0 UTBspDrawFacet(CUTCanvas *c, CUTBsp *b, CUTBspNode *n, F64 *eye,
 		vi++;
 	}
 	ut_draw_shade = 1.0;
+	ut_draw_lm_on = FALSE;
+	ut_lm_bsp = NULL;
+	ut_lm_surf = NULL;
 }
 
 U0 UTBspDrawCoplanars(CUTCanvas *c, CUTBsp *b, I64 ni, F64 *eye,

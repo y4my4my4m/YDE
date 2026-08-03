@@ -16,9 +16,16 @@ Reference: https://github.com/andrei-drexler/ironwail
 | Mod without pak0 | yes (qbj3-style tree) |
 | Max edicts / net ents | 8192 |
 | Precache models+sounds | 2048 |
-| CSQC / `.lit` / MD3 | not yet — stock sbar |
+| `.lit` (luminance → mono lightmaps) | yes |
+| External skybox (`gfx/env`) | not yet — classic `sky*` miptex only |
+| CSQC / MD3 | not yet — stock sbar |
 
-Mods in-tree (gitignored data): `alkaline/`, `qbj3/`. Console: `game alkaline` or `game qbj3`, then `map start`.
+Mods in-tree (gitignored data): `alkaline/`, `qbj3/`. Console:
+
+    game qbj3
+    map start
+
+`map` drops the attract loop and enters play. `demoloop` defaults off.
 
 
 ## Game data
