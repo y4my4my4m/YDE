@@ -17,7 +17,7 @@ Reference: https://github.com/andrei-drexler/ironwail
 | Max edicts / net ents | 8192 |
 | Precache models+sounds | 2048 |
 | `.lit` (luminance → mono lightmaps) | yes |
-| External skybox (`gfx/env`) | not yet — classic `sky*` miptex only |
+| External skybox (`gfx/env`) | yes (worldspawn `sky` / `skyname`) |
 | CSQC / MD3 | not yet — stock sbar |
 
 Mods in-tree (gitignored data): `alkaline/`, `qbj3/`. Console:
