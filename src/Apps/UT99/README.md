@@ -42,9 +42,24 @@ Not present: hardware devices, fog maps, DXT, lightmaps, portals.
 
 ## Game data
 
-Copy any UT99 `.u` / `.utx` / `.unr` under `System/` or `data/` to exercise
-`UTPkgLoad`. Tag `0x9E2A83C1`, version 69. Object serial payloads undocumented
-in the public tree.
+Retail tree under `::/Apps/UT99/` (same as `Default.ini` `Paths=`):
+
+| Dir | Ext | Role |
+|---|---|---|
+| `System/` | `*.u` `*.ini` `*.int` | classes + config |
+| `Maps/` | `*.unr` | levels |
+| `Textures/` | `*.utx` | P8 mips, fonts (`UWindowFonts.utx`) |
+| `Sounds/` | `*.uax` | SFX |
+| `Music/` | `*.umx` | music |
+| `SystemLocalized/` | locale stubs | `LangPaths` |
+| `data/` | optional | ad-hoc package drops for `UTPkgLoad` |
+
+Path roots: `UT99_*_DIR` in `UTFmt.ZC`. `UTTest` probes `System/Engine.u`,
+`Textures/UWindowFonts.utx`, `Maps/DM-Codex.unr`. Tag `0x9E2A83C1`, version 69.
+Object serial payloads undocumented in the public tree.
+
+Not copied: `*.dll` / `*.exe` / SoftDrv / OpenGL / D3D / Movies (none in this
+install). Game data is gitignored — sync host → VM for the binary packages.
 
 ## Files
 
