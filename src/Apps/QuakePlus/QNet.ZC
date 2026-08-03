@@ -1,0 +1,692 @@
+// QNet.ZC - message buffers and the loopback link
+//
+// wire format, exact - demos and other Quake clients depend on it:
+//   coord  16-bit signed, 1/8 unit    (MSG_WriteCoord: (int)(f*8))
+//   angle  8-bit, 256 units per turn  (MSG_WriteAngle: (int)(f*256/360) & 255)
+//   short  16-bit little endian
+//   long   32-bit little endian
+//
+// a coord spans +/-4096 units at eighth resolution, which is why the original
+// nudges the view by 1/32 to keep it off node planes
+
+#define QNET_MAX_MSG		8192	//signon / reliable ceiling (MAX_MSGLEN)
+//unreliable datagrams MUST fit one Ethernet frame - no IP fragmentation here,
+//and RTL8139/QEMU drops a multi-kB UDP blob outright
+#define QNET_MAX_DATAGRAM	1400
+#define QNET_MAX_BACKLOG	4		//loopback messages held before dropping
+
+//WinQuake net.h NETFLAG_* and control opcodes, big-endian on the wire
+#define QNETFLAG_LENGTH_MASK	0x0000FFFF
+#define QNETFLAG_DATA		0x00010000
+#define QNETFLAG_ACK		0x00020000
+#define QNETFLAG_NAK		0x00040000
+#define QNETFLAG_EOM		0x00080000
+#define QNETFLAG_UNRELIABLE	0x00100000
+#define QNETFLAG_CTL		0x80000000
+#define QNET_HEADERSIZE		8
+#define QNET_CTL_VERSION	3
+
+#define QCCREQ_CONNECT		0x01
+#define QCCREQ_SERVER_INFO	0x02
+#define QCCREP_ACCEPT		0x81
+#define QCCREP_REJECT		0x82
+#define QCCREP_SERVER_INFO	0x83
+
+U32 QNetBigLong(U32 v)
+{
+	return EndianU32(v);
+}
+
+U0 QNetWriteBigLong(U8 *p, U32 v)
+{
+	U32 be = EndianU32(v);
+	MemCopy(p, &be, 4);
+}
+
+U32 QNetReadBigLong(U8 *p)
+{
+	U32 be;
+	MemCopy(&be, p, 4);
+	return EndianU32(be);
+}
+
+//--- svc_: server to client -------------------------------------------------
+#define QSVC_BAD			0
+#define QSVC_NOP			1
+#define QSVC_DISCONNECT		2
+#define QSVC_UPDATESTAT		3
+#define QSVC_VERSION		4
+#define QSVC_SETVIEW		5
+#define QSVC_SOUND			6
+#define QSVC_TIME			7
+#define QSVC_PRINT			8
+#define QSVC_STUFFTEXT		9
+#define QSVC_SETANGLE		10
+#define QSVC_SERVERINFO		11
+#define QSVC_LIGHTSTYLE		12
+#define QSVC_UPDATENAME		13
+#define QSVC_UPDATEFRAGS	14
+#define QSVC_CLIENTDATA		15
+#define QSVC_STOPSOUND		16
+#define QSVC_UPDATECOLORS	17
+#define QSVC_PARTICLE		18
+#define QSVC_DAMAGE			19
+#define QSVC_SPAWNSTATIC	20
+#define QSVC_SPAWNBASELINE	22
+#define QSVC_TEMPENTITY_	23
+#define QSVC_SETPAUSE		24
+#define QSVC_SIGNONNUM		25
+#define QSVC_CENTERPRINT	26
+#define QSVC_KILLEDMONSTER	27
+#define QSVC_FOUNDSECRET	28
+#define QSVC_SPAWNSTATICSOUND 29
+#define QSVC_INTERMISSION_	30
+#define QSVC_FINALE_		31
+#define QSVC_CDTRACK		32
+#define QSVC_SELLSCREEN		33
+#define QSVC_CUTSCENE_		34
+
+//svc_sound field_mask bits (WinQuake protocol.h)
+#define QSND_VOLUME			1		//(1<<0) - followed by volume byte
+#define QSND_ATTENUATION	2		//(1<<1) - followed by atten*64 byte
+#define QSND_DEFAULT_VOL	255
+#define QSND_DEFAULT_ATTEN	1.0
+
+//--- clc_: client to server -------------------------------------------------
+#define QCLC_BAD			0
+#define QCLC_NOP			1
+#define QCLC_DISCONNECT		2
+#define QCLC_MOVE			3
+#define QCLC_STRINGCMD		4
+
+class CQMsg
+{
+	U8	 data[QNET_MAX_MSG];
+	I64	 len;			//bytes written
+	I64	 read;			//read cursor
+	Bool overflowed;	//a write did not fit, the message is unusable
+	Bool badread;		//a read ran past the end
+};
+
+//sv.datagram - TE, sounds, particles. QuakeC Write* and sound() append here,
+//remotes get a copy in their packet. cleared each SV_SendClientMessages.
+//MUST sit after class CQMsg
+CQMsg	q_sv_datagram;
+
+//--- writing ----------------------------------------------------------------
+
+U0 QMsgClear(CQMsg *m)
+{
+	m->len        = 0;
+	m->read       = 0;
+	m->overflowed = FALSE;
+	m->badread    = FALSE;
+}
+
+U0 QMsgWriteByte(CQMsg *m, I64 v)
+{//overflow is RECORDED, never silently truncated - a half-written message
+ //resyncs the reader mid-field and corrupts everything after it
+	if (m->len + 1 > QNET_MAX_MSG)
+	{
+		m->overflowed = TRUE;
+		return;
+	}
+
+	m->data[m->len] = v & 0xFF;
+	m->len++;
+}
+
+U0 QMsgWriteShort(CQMsg *m, I64 v)
+{//little endian, as the wire is
+	QMsgWriteByte(m, v & 0xFF);
+	QMsgWriteByte(m, (v >> 8) & 0xFF);
+}
+
+U0 QMsgWriteLong(CQMsg *m, I64 v)
+{
+	QMsgWriteByte(m, v & 0xFF);
+	QMsgWriteByte(m, (v >> 8) & 0xFF);
+	QMsgWriteByte(m, (v >> 16) & 0xFF);
+	QMsgWriteByte(m, (v >> 24) & 0xFF);
+}
+
+U0 QMsgWriteChar(CQMsg *m, I64 v)
+{//MSG_WriteChar - same byte as MSG_WriteByte, the READER sign extends it
+	QMsgWriteByte(m, v & 0xFF);
+}
+
+U0 QMsgWriteFloat(CQMsg *m, F64 f)
+{//MSG_WriteFloat - raw IEEE-754 binary32, only svc_time and svc_version
+ //need more range than a coord
+	QMsgWriteLong(m, QWrF32(f));
+}
+
+U0 QMsgWriteCoord(CQMsg *m, F64 f)
+{//MSG_WriteCoord - eighths of a unit in a signed short
+	QMsgWriteShort(m, ToI64(f * 8.0));
+}
+
+U0 QMsgWriteAngle(CQMsg *m, F64 f)
+{//MSG_WriteAngle - a whole turn in 256 steps, coarse on purpose
+	QMsgWriteByte(m, ToI64(f * 256.0 / 360.0) & 255);
+}
+
+U0 QMsgWriteString(CQMsg *m, U8 *s)
+{//NUL terminated, as the reader expects
+	I64 i = 0;
+
+	if (s)
+	{
+		while (s[i])
+		{
+			QMsgWriteByte(m, s[i]);
+			i++;
+		}
+	}
+
+	QMsgWriteByte(m, 0);
+}
+
+U0 QMsgAppend(CQMsg *dst, CQMsg *src)
+{//copy src onto the end of dst, no-op if src is empty or either is bad
+	I64 i;
+
+	if (!dst || !src || src->len < 1 || dst->overflowed || src->overflowed)
+		return;
+
+	for (i = 0; i < src->len; i++)
+		QMsgWriteByte(dst, src->data[i]);
+}
+
+U0 QMsgAppendIfRoom(CQMsg *dst, CQMsg *src, I64 max_len)
+{//append only if the result still fits max_len, the MTU budget
+	if (!dst || !src || src->len < 1)
+		return;
+	if (dst->len + src->len > max_len)
+		return;
+	QMsgAppend(dst, src);
+}
+
+//--- reading ----------------------------------------------------------------
+//
+// every read is bounds checked and sets badread - a truncated or corrupt
+// message must not walk off the buffer. the original sets msg_badread
+
+I64 QMsgReadByte(CQMsg *m)
+{
+	I64 v;
+
+	if (m->read + 1 > m->len)
+	{
+		m->badread = TRUE;
+		return -1;
+	}
+
+	v = m->data[m->read];
+	m->read++;
+
+	return v;
+}
+
+I64 QMsgReadShort(CQMsg *m)
+{//sign extended, coordinates are signed
+	I64 v;
+
+	if (m->read + 2 > m->len)
+	{
+		m->badread = TRUE;
+		return -1;
+	}
+
+	v = m->data[m->read] | (m->data[m->read + 1] << 8);
+	m->read += 2;
+
+	if (v & 0x8000)
+		v -= 0x10000;
+
+	return v;
+}
+
+I64 QMsgReadLong(CQMsg *m)
+{
+	I64 v;
+
+	if (m->read + 4 > m->len)
+	{
+		m->badread = TRUE;
+		return -1;
+	}
+
+	v = m->data[m->read] | (m->data[m->read + 1] << 8) |
+		(m->data[m->read + 2] << 16) | (m->data[m->read + 3] << 24);
+	m->read += 4;
+
+	//MSG_ReadLong returns a signed int - svc_updatestat and frag counts go
+	//negative
+	if (v & 0x80000000)
+		v -= 0x100000000;
+
+	return v;
+}
+
+I64 QMsgReadChar(CQMsg *m)
+{//MSG_ReadChar - one byte, sign extended
+	I64 v = QMsgReadByte(m);
+
+	if (v < 0)
+		return -1;			//badread already recorded
+
+	if (v & 0x80)
+		v -= 0x100;
+
+	return v;
+}
+
+F64 QMsgReadFloat(CQMsg *m)
+{
+	U8 b[4];
+	I64 i;
+
+	for (i = 0; i < 4; i++)
+	{
+		b[i] = QMsgReadByte(m) & 0xFF;
+		if (m->badread)
+			return 0.0;
+	}
+
+	return QRdF32(b);
+}
+
+F64 QMsgReadCoord(CQMsg *m)
+{
+	return ToF64(QMsgReadShort(m)) * 0.125;
+}
+
+F64 QMsgReadAngle(CQMsg *m)
+{//MSG_ReadAngle reads a CHAR, so this lands in -180..178.6, not 0..358.6.
+ //equivalent modulo a turn, kept signed to match the original byte for byte
+	return ToF64(QMsgReadChar(m)) * 360.0 / 256.0;
+}
+
+U0 QMsgReadString(CQMsg *m, U8 *out, I64 max)
+{//always NUL terminates, never writes past max
+	I64 i = 0;
+	I64 c;
+
+	while (i < max - 1)
+	{
+		c = QMsgReadByte(m);
+		if (c <= 0)
+			break;
+
+		out[i] = c;
+		i++;
+	}
+
+	out[i] = 0;
+}
+
+//--- loopback link ----------------------------------------------------------
+//
+// a queue of WHOLE messages. server writes its send buffer and calls
+// QNetSendToClient, client drains with QNetGetMessage. a UDP socket replaces
+// those two functions and nothing else
+
+class CQNetLink
+{
+	CQMsg	queue[QNET_MAX_BACKLOG];
+	I64		head;			//next slot to write
+	I64		tail;			//next slot to read
+	I64		count;
+	I64		dropped;		//messages lost to a full queue
+};
+
+//TWO queues - the protocol is not one-way. entity updates go down q_net_s2c,
+//client moves come back up q_net_c2s
+CQNetLink	q_net_s2c;
+CQNetLink	q_net_c2s;
+CQMsg		q_net_send;		//server's scratch message being built
+CQMsg		q_net_cmd;		//client's scratch message being built
+Bool		q_net_active = FALSE;
+
+U0 QNetLinkClear(CQNetLink *l)
+{
+	I64 i;
+
+	l->head    = 0;
+	l->tail    = 0;
+	l->count   = 0;
+	l->dropped = 0;
+
+	for (i = 0; i < QNET_MAX_BACKLOG; i++)
+		QMsgClear(&l->queue[i]);
+}
+
+U0 QNetInit()
+{//globals aren't zeroed
+	QNetLinkClear(&q_net_s2c);
+	QNetLinkClear(&q_net_c2s);
+
+	QMsgClear(&q_net_send);
+	QMsgClear(&q_net_cmd);
+	QMsgClear(&q_sv_datagram);
+	q_net_active = TRUE;
+}
+
+Bool QNetLinkSend(CQNetLink *l, CQMsg *m)
+{//queue a finished message, FALSE if it was dropped
+	CQMsg *slot;
+
+	if (!q_net_active || m->overflowed || m->len < 1)
+		return FALSE;
+
+	if (l->count >= QNET_MAX_BACKLOG)
+	{
+		//drop a WHOLE message, a partial one desyncs the reader
+		l->dropped++;
+		return FALSE;
+	}
+
+	slot = &l->queue[l->head];
+	QMsgClear(slot);
+	MemCopy(slot->data, m->data, m->len);
+	slot->len = m->len;
+
+	l->head = (l->head + 1) % QNET_MAX_BACKLOG;
+	l->count++;
+
+	return TRUE;
+}
+
+Bool QNetLinkGet(CQNetLink *l, CQMsg *out)
+{//take the next queued message, if any
+	CQMsg *slot;
+
+	if (!q_net_active || l->count < 1)
+		return FALSE;
+
+	slot = &l->queue[l->tail];
+
+	QMsgClear(out);
+	MemCopy(out->data, slot->data, slot->len);
+	out->len = slot->len;
+
+	l->tail = (l->tail + 1) % QNET_MAX_BACKLOG;
+	l->count--;
+
+	return TRUE;
+}
+
+Bool QNetSendToClient(CQMsg *m)
+{//server -> client
+	return QNetLinkSend(&q_net_s2c, m);
+}
+
+Bool QNetGetMessage(CQMsg *out)
+{//client reads what the server sent
+	return QNetLinkGet(&q_net_s2c, out);
+}
+
+Bool QNetSendToServer(CQMsg *m)
+{//client -> server
+	return QNetLinkSend(&q_net_c2s, m);
+}
+
+Bool QNetServerGetMessage(CQMsg *out)
+{//server reads what the client sent
+	return QNetLinkGet(&q_net_c2s, out);
+}
+
+#define QNET_MAX_ENTS	600
+
+//bits in an svc_update byte, U_MOREBITS chains a second
+#define QU_MOREBITS		1
+#define QU_ORIGIN1		2
+#define QU_ORIGIN2		4
+#define QU_ORIGIN3		8
+#define QU_ANGLE2		16
+#define QU_NOLERP		32
+#define QU_FRAME		64
+#define QU_SIGNAL		128
+#define QU_ANGLE1		256
+#define QU_ANGLE3		512
+#define QU_MODEL		1024
+#define QU_COLORMAP		2048
+#define QU_SKIN			4096
+#define QU_EFFECTS		8192
+#define QU_LONGENTITY	16384
+
+class CQEntState
+{
+	F64	 origin[3];
+	F64	 angles[3];
+	I64	 modelindex;
+	I64	 frame;
+	I64	 colormap;
+	I64	 skin;
+	I64	 effects;
+	Bool step;			//MOVETYPE_STEP, the client must not interpolate it
+	Bool active;		//the client has been told about this entity
+	F64	 msgtime;		//server time of the message that last described it
+
+	//CL_RelinkEntities lays a trail along last frame's segment, so the old
+	//position must survive the update that overwrites origin
+	F64	 trail_org[3];
+	Bool trail_valid;	//FALSE until the entity has been seen twice
+
+	//msg_origins[1] / msg_angles[1] - the PREVIOUS update. origin and angles
+	//above are msg_origins[0]; the drawn position lerps between the two
+	F64	 prev_origin[3];
+	F64	 prev_angles[3];
+	Bool forcelink;		//no previous update, snap instead of lerping
+};
+
+//cl.mtime[0] from svc_time. entity updates are stamped with it - anything not
+//in the LATEST message has left the PVS
+//hostname. a string, so it cannot live in the F64 cvar table - declared here
+//because QNetSv answers CCREP_SERVER_INFO with it and compiles before the menu
+U8	q_host_name[32];
+
+U0 QHostNameInit()
+{//globals aren't zeroed
+	QStrCopy(q_host_name, "UNNAMED", 32);
+}
+
+F64 q_net_msgtime = 0.0;
+
+//cl.mtime[1], the update before. the pair brackets the lerp interval
+F64 q_net_msgtime_prev = 0.0;
+
+//cl.time for a client that is not also the server - advances in real time and
+//is pulled back into the [mtime1, mtime0] window by the lerp
+F64 q_cl_clock = 0.0;
+F64 q_cl_clock_last = 0.0;	//real time at the previous advance
+
+U0 QNetClockInit()
+{//globals aren't zeroed, and a garbage clock pins the lerp out of range
+	q_net_msgtime      = 0.0;
+	q_net_msgtime_prev = 0.0;
+	q_cl_clock         = 0.0;
+	q_cl_clock_last    = 0.0;
+}
+
+//THREE tables - NQ deltas against the BASELINE, not the last packet sent.
+//svc_spawnbaseline gives every entity a starting state at signon and every
+//svc_update is measured from it. costs bandwidth against QuakeWorld's
+//delta-vs-last-sent, buys statelessness - a lost packet can't desync
+CQEntState	q_net_baseline[QNET_MAX_ENTS];
+CQEntState	q_net_sent[QNET_MAX_ENTS];
+CQEntState	q_net_cl[QNET_MAX_ENTS];
+I64			q_net_num_ents = 0;
+
+U0 QNetStateClear(CQEntState *e)
+{
+	QVecSet(e->origin, 0.0, 0.0, 0.0);
+	QVecSet(e->angles, 0.0, 0.0, 0.0);
+	e->modelindex = 0;
+	e->frame      = 0;
+	e->colormap   = 0;
+	e->skin       = 0;
+	e->effects    = 0;
+	e->step       = FALSE;
+	e->active     = FALSE;
+	e->msgtime    = 0.0;
+	QVecSet(e->trail_org, 0.0, 0.0, 0.0);
+	e->trail_valid = FALSE;
+	QVecSet(e->prev_origin, 0.0, 0.0, 0.0);
+	QVecSet(e->prev_angles, 0.0, 0.0, 0.0);
+	e->forcelink = TRUE;
+}
+
+U0 QNetStatesClear()
+{//globals aren't zeroed
+	I64 i;
+
+	for (i = 0; i < QNET_MAX_ENTS; i++)
+	{
+		QNetStateClear(&q_net_baseline[i]);
+		QNetStateClear(&q_net_sent[i]);
+		QNetStateClear(&q_net_cl[i]);
+	}
+
+	q_net_num_ents = 0;
+}
+
+Bool QNetOriginDiffers(F64 a, F64 b)
+{//SV_WriteEntitiesToClient's own 0.1 tolerance - a coord round-tripped
+ //through the eighth-unit wire format never compares equal exactly
+	F64 miss = a - b;
+
+	return ToBool(miss < -0.1 || miss > 0.1);
+}
+
+U0 QNetWriteEntityUpdate(CQMsg *m, I64 num, CQEntState *now,
+	CQEntState *baseline)
+{//one delta-compressed entity update, in the original's field order
+ //the mask is built FIRST and written first - svc_update puts it ahead of the
+ //fields it describes and the reader has no other way to know what follows
+	I64 bits = 0;
+
+	if (QNetOriginDiffers(now->origin[0], baseline->origin[0]))
+		bits |= QU_ORIGIN1;
+	if (QNetOriginDiffers(now->origin[1], baseline->origin[1]))
+		bits |= QU_ORIGIN2;
+	if (QNetOriginDiffers(now->origin[2], baseline->origin[2]))
+		bits |= QU_ORIGIN3;
+
+	if (now->angles[0] != baseline->angles[0])	bits |= QU_ANGLE1;
+	if (now->angles[1] != baseline->angles[1])	bits |= QU_ANGLE2;
+	if (now->angles[2] != baseline->angles[2])	bits |= QU_ANGLE3;
+
+	//U_NOLERP is a property of the entity, not a delta - a MOVETYPE_STEP mover
+	//teleports between fixed positions and lerping smears the step
+	if (now->step)
+		bits |= QU_NOLERP;
+
+	if (now->frame      != baseline->frame)		bits |= QU_FRAME;
+	if (now->modelindex != baseline->modelindex)	bits |= QU_MODEL;
+	if (now->colormap   != baseline->colormap)	bits |= QU_COLORMAP;
+	if (now->skin       != baseline->skin)		bits |= QU_SKIN;
+	if (now->effects    != baseline->effects)	bits |= QU_EFFECTS;
+
+	//NO early-out on an empty mask - the mask byte IS the "here and visible"
+	//signal, and suppressing it makes an unchanged entity look like one that
+	//left the PVS
+	if (num >= 256)
+		bits |= QU_LONGENTITY;
+	if (bits >= 256)
+		bits |= QU_MOREBITS;
+
+	//U_SIGNAL is the high bit of byte 0 and is ALWAYS set - it is how the
+	//client's loop tells an entity update from an svc_ opcode
+	QMsgWriteByte(m, (bits | QU_SIGNAL) & 255);
+
+	if (bits & QU_MOREBITS)
+		QMsgWriteByte(m, (bits >> 8) & 255);
+
+	if (bits & QU_LONGENTITY)
+		QMsgWriteShort(m, num);
+	else
+		QMsgWriteByte(m, num);
+
+	if (bits & QU_MODEL)	QMsgWriteByte(m, now->modelindex);
+	if (bits & QU_FRAME)	QMsgWriteByte(m, now->frame);
+	if (bits & QU_COLORMAP)	QMsgWriteByte(m, now->colormap);
+	if (bits & QU_SKIN)		QMsgWriteByte(m, now->skin);
+	if (bits & QU_EFFECTS)	QMsgWriteByte(m, now->effects);
+
+	if (bits & QU_ORIGIN1)	QMsgWriteCoord(m, now->origin[0]);
+	if (bits & QU_ANGLE1)	QMsgWriteAngle(m, now->angles[0]);
+	if (bits & QU_ORIGIN2)	QMsgWriteCoord(m, now->origin[1]);
+	if (bits & QU_ANGLE2)	QMsgWriteAngle(m, now->angles[1]);
+	if (bits & QU_ORIGIN3)	QMsgWriteCoord(m, now->origin[2]);
+	if (bits & QU_ANGLE3)	QMsgWriteAngle(m, now->angles[2]);
+}
+
+Bool QNetReadEntityUpdate(CQMsg *m, I64 bits)
+{//CL_ParseUpdate - the low mask byte is already read, that is what identified
+ //this as an update
+	CQEntState	*e;
+	I64			 num;
+
+	if (bits & QU_MOREBITS)
+		bits |= QMsgReadByte(m) << 8;
+
+	if (bits & QU_LONGENTITY)
+		num = QMsgReadShort(m);
+	else
+		num = QMsgReadByte(m);
+
+	if (num < 0 || num >= QNET_MAX_ENTS || m->badread)
+		return FALSE;
+
+	e = &q_net_cl[num];
+
+	//a first sighting starts from the baseline, not from zero - CL_ParseUpdate
+	//copies ent->baseline in, else omitted fields read back as 0
+	if (!e->active)
+	{
+		MemCopy(e, &q_net_baseline[num], sizeof(CQEntState));
+		e->forcelink = TRUE;
+	}
+
+	//absent from the last message means it just reappeared - snap, don't
+	//slide in from wherever it was last seen
+	if (e->msgtime != q_net_msgtime_prev)
+		e->forcelink = TRUE;
+
+	//msg_origins[0] becomes msg_origins[1], the bytes below overwrite [0]
+	QVecCopy(e->origin, e->prev_origin);
+	QVecCopy(e->angles, e->prev_angles);
+
+	e->step = ToBool((bits & QU_NOLERP) != 0);
+
+	//anything NOT in the mask keeps its previous value - the client's copy is
+	//an accumulation of every update applied, not a snapshot
+	if (bits & QU_MODEL)	e->modelindex = QMsgReadByte(m);
+	if (bits & QU_FRAME)	e->frame      = QMsgReadByte(m);
+	if (bits & QU_COLORMAP)	e->colormap   = QMsgReadByte(m);
+	if (bits & QU_SKIN)		e->skin       = QMsgReadByte(m);
+	if (bits & QU_EFFECTS)	e->effects    = QMsgReadByte(m);
+
+	if (bits & QU_ORIGIN1)	e->origin[0] = QMsgReadCoord(m);
+	if (bits & QU_ANGLE1)	e->angles[0] = QMsgReadAngle(m);
+	if (bits & QU_ORIGIN2)	e->origin[1] = QMsgReadCoord(m);
+	if (bits & QU_ANGLE2)	e->angles[1] = QMsgReadAngle(m);
+	if (bits & QU_ORIGIN3)	e->origin[2] = QMsgReadCoord(m);
+	if (bits & QU_ANGLE3)	e->angles[2] = QMsgReadAngle(m);
+
+	if (e->forcelink)
+	{
+		QVecCopy(e->origin, e->prev_origin);
+		QVecCopy(e->angles, e->prev_angles);
+	}
+
+	e->active  = TRUE;
+	e->msgtime = q_net_msgtime;
+
+	if (num >= q_net_num_ents)
+		q_net_num_ents = num + 1;
+
+	return ToBool(!m->badread);
+}

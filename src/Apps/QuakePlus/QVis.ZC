@@ -1,0 +1,302 @@
+// QVis.ZC - pvs and world traversal
+//
+//   1. leaf for the eye, decompress its pvs row, flag faces off the
+//      marksurface lists of visible leafs
+//   2. node walk front-to-back, cull subtrees against the frustum, emit
+//      flagged faces in that order
+//
+// HACK: the walk must be direct self-recursion - a recursive call routed
+// through a forward-declared second function loses arguments on this compiler
+
+#define QVIS_MAX_FACES	32768
+
+class CQVisState
+{
+	CQMap	*map;
+
+	U8		*pvs;			//decompressed row, one bit per leaf
+	I64		 pvs_bytes;
+
+	I64		*face_frame;	//per-face frame stamp, avoids re-emitting
+	I64		 frame;
+
+	I64		*face_list;		//emitted face indices, front to back
+	I64		 face_count;
+
+	F64		 origin[3];
+	F64		 frustum_n[12];	//four inward-pointing plane normals
+	F64		 frustum_d[4];
+
+	I64		 view_leaf;
+	I64		 nodes_visited;
+	I64		 nodes_culled;
+};
+
+CQVisState *QVisNew(CQMap *map)
+{
+	CQVisState *vs = CAlloc(sizeof(CQVisState));
+
+	vs->map        = map;
+	vs->pvs_bytes  = (map->num_leafs + 7) / 8;
+	vs->pvs        = CAlloc(vs->pvs_bytes);
+	vs->face_frame = CAlloc(map->num_faces * sizeof(I64));
+	vs->face_list  = CAlloc(QVIS_MAX_FACES * sizeof(I64));
+	vs->frame      = 0;
+	vs->face_count = 0;
+	vs->view_leaf  = 0;
+
+	return vs;
+}
+
+U0 QVisFree(CQVisState *vs)
+{
+	if (!vs)
+		return;
+
+	if (vs->pvs)		Free(vs->pvs);
+	if (vs->face_frame)	Free(vs->face_frame);
+	if (vs->face_list)	Free(vs->face_list);
+
+	Free(vs);
+}
+
+I64 QVisLeafForPoint(CQMap *map, F64 *point)
+{//descend until a child index goes negative, leaf 0 is the solid leaf
+ //
+ //every index is range checked - this can run mid-swap, a demo's
+ //svc_serverinfo frees the map out from under a frame
+	CQNode	*node;
+	CQPlane	*plane;
+	I64		 index = 0;		//head node of the world model
+	I64		 guard = 0;
+	F64		 d;
+
+	//a freed CQMap* isn't NULL, it faults on the first field read - checking
+	//->nodes alone is not enough
+	if (!QMapValid(map, "QVisLeafForPoint"))
+		return 0;
+
+	if (!map->nodes || !map->planes || map->num_nodes < 1)
+		return 0;
+
+	while (index >= 0)
+	{
+		if (index >= map->num_nodes)
+			return 0;
+
+		//a cycle in the tree would spin forever
+		guard++;
+		if (guard > map->num_nodes)
+			return 0;
+
+		node = &map->nodes[index];
+
+		if (node->plane_num < 0 || node->plane_num >= map->num_planes)
+			return 0;
+
+		plane = &map->planes[node->plane_num];
+		d     = QVecDot(point, plane->normal) - plane->dist;
+
+		if (d >= 0.0)
+			index = node->children[0];
+		else
+			index = node->children[1];
+	}
+
+	if (-1 - index >= map->num_leafs)
+		return 0;
+
+	return -1 - index;
+}
+
+U0 QVisDecompress(CQMap *map, I64 vis_offset, U8 *out, I64 out_bytes)
+{//Mod_DecompressVis - zero byte is followed by a count of further zero
+ //bytes, offset -1 means all visible
+	U8	*in;
+	I64	 written = 0;
+	I64	 count;
+
+	if (vis_offset < 0 || !map->visdata || map->visdata_size <= 0)
+	{
+		MemSet(out, 0xFF, out_bytes);
+		return;
+	}
+
+	in = map->visdata + vis_offset;
+
+	while (written < out_bytes)
+	{
+		//truncated or corrupt vis lump
+		if (in >= map->visdata + map->visdata_size)
+		{
+			while (written < out_bytes)
+			{
+				out[written] = 0;
+				written++;
+			}
+			return;
+		}
+
+		if (*in)
+		{
+			out[written] = *in;
+			written++;
+			in++;
+		}
+		else
+		{
+			count = in[1];
+			in += 2;
+			while (count > 0 && written < out_bytes)
+			{
+				out[written] = 0;
+				written++;
+				count--;
+			}
+		}
+	}
+}
+
+U0 QVisMarkLeaves(CQVisState *vs)
+{//flag faces in every potentially visible leaf
+	CQMap	*map = vs->map;
+	CQLeaf	*leaf;
+	I64		 i;
+	I64		 j;
+	I64		 face;
+
+	vs->view_leaf = QVisLeafForPoint(map, vs->origin);
+	QVisDecompress(map, map->leafs[vs->view_leaf].vis_offset,
+		vs->pvs, vs->pvs_bytes);
+
+	vs->frame++;
+
+	//pvs bit 0 is leaf 1, leaf 0 is solid and never drawn
+	for (i = 1; i < map->num_leafs; i++)
+	{
+		if (vs->pvs[(i - 1) >> 3] & (1 << ((i - 1) & 7)))
+		{
+			leaf = &map->leafs[i];
+			for (j = 0; j < leaf->num_marksurfaces; j++)
+			{
+				face = map->marksurfaces[leaf->first_marksurface + j];
+				if (face >= 0 && face < map->num_faces)
+					vs->face_frame[face] = vs->frame;
+			}
+		}
+	}
+}
+
+Bool QVisBoxInFrustum(CQVisState *vs, F64 *mins, F64 *maxs)
+{//conservative, rejects only when fully behind one plane
+	I64 i;
+
+	for (i = 0; i < 4; i++)
+	{
+		if (QBoxOnPlaneSide(mins, maxs, &vs->frustum_n[i * 3],
+				vs->frustum_d[i]) == 2)
+			return FALSE;
+	}
+
+	return TRUE;
+}
+
+U0 QVisRecurse(CQVisState *vs, I64 index)
+{//front-to-back node walk, direct self-recursion only, see file header
+	CQMap	*map = vs->map;
+	CQNode	*node;
+	CQPlane	*plane;
+	CQFace	*f;
+	F64		 d;
+	I64		 side;
+	I64		 i;
+	I64		 face;
+
+	//negative index is a leaf, faces come from the nodes
+	if (index < 0)
+		return;
+
+	if (index >= map->num_nodes)
+		return;
+
+	node = &map->nodes[index];
+	vs->nodes_visited++;
+
+	if (!QVisBoxInFrustum(vs, node->mins, node->maxs))
+	{
+		vs->nodes_culled++;
+		return;
+	}
+
+	plane = &map->planes[node->plane_num];
+	d     = QVecDot(vs->origin, plane->normal) - plane->dist;
+
+	if (d >= 0.0)
+		side = 0;
+	else
+		side = 1;
+
+	//near side first
+	QVisRecurse(vs, node->children[side]);
+
+	for (i = 0; i < node->num_faces; i++)
+	{
+		face = node->first_face + i;
+		if (face >= 0 && face < map->num_faces &&
+			vs->face_frame[face] == vs->frame)
+		{
+			f = &map->faces[face];
+
+			//backface cull, f->side is the face's sense on its plane
+			if ((d < 0.0) == ToBool(f->side))
+			{
+				if (vs->face_count < QVIS_MAX_FACES)
+				{
+					vs->face_list[vs->face_count] = face;
+					vs->face_count++;
+				}
+			}
+		}
+	}
+
+	QVisRecurse(vs, node->children[side ^ 1]);
+}
+
+U0 QVisSetupFrustum(CQVisState *vs, F64 *origin, F64 *forward, F64 *right,
+	F64 *up, F64 fov_x, F64 fov_y)
+{//four planes through the eye, normals inward
+ //for half-angle h the left edge runs forward*cos(h) - right*sin(h), so the
+ //inward normal is right*cos(h) + forward*sin(h)
+	F64 hx = fov_x * 0.5 * QDEG2RAD;
+	F64 hy = fov_y * 0.5 * QDEG2RAD;
+	F64 cx = Cos(hx);
+	F64 sx = Sin(hx);
+	F64 cy = Cos(hy);
+	F64 sy = Sin(hy);
+	I64 i;
+
+	QVecCopy(origin, vs->origin);
+
+	for (i = 0; i < 3; i++)
+	{
+		vs->frustum_n[i]     =  right[i] * cx + forward[i] * sx;	//left
+		vs->frustum_n[3 + i] = -right[i] * cx + forward[i] * sx;	//right
+		vs->frustum_n[6 + i] =     up[i] * cy + forward[i] * sy;	//bottom
+		vs->frustum_n[9 + i] =    -up[i] * cy + forward[i] * sy;	//top
+	}
+
+	for (i = 0; i < 4; i++)
+		vs->frustum_d[i] = QVecDot(origin, &vs->frustum_n[i * 3]);
+}
+
+U0 QVisBuildList(CQVisState *vs, F64 *origin, F64 *forward, F64 *right,
+	F64 *up, F64 fov_x, F64 fov_y)
+{//one frame - mark, then gather
+	vs->face_count    = 0;
+	vs->nodes_visited = 0;
+	vs->nodes_culled  = 0;
+
+	QVisSetupFrustum(vs, origin, forward, right, up, fov_x, fov_y);
+	QVisMarkLeaves(vs);
+	QVisRecurse(vs, vs->map->models[0].head_node[0]);
+}

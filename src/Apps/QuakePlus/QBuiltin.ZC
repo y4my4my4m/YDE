@@ -1,0 +1,2661 @@
+// QBuiltin.ZC - the engine services QuakeC calls into.
+//
+// a QuakeC function with a negative first_statement is a builtin, the negated
+// value is its number. shareware progs references 65 of them, 1..78.
+//
+// args arrive in the reserved parameter cells, results go in the return cell.
+// anything unimplemented is a no-op returning zero - degrade, don't halt the
+// VM mid-frame.
+
+#define QBI_MAX_PRECACHE	256
+
+//NOTE: must be a function. ZealC #define substitutes a bare token only, so a
+//function-like macro parses its "(n)" as code and fails with "Invalid class".
+
+CQMap	*q_bi_map		= NULL;		//set by the app before the VM runs
+Bool	 q_bi_dprint	= FALSE;	//dprint is noisy, off by default
+
+//globals aren't zeroed, and the precache free walks every slot - garbage here
+//becomes a wild Free()
+U8		*q_precache_model[QBI_MAX_PRECACHE];
+
+//backing store for the world entry and its "*N" submodel names - the precache
+//table holds borrowed pointers and these have to outlive the map
+U8		 q_world_model_name[96];
+U8		 q_submodel_names[QBI_MAX_PRECACHE * 8];
+CQMdl	*q_precache_mdl[QBI_MAX_PRECACHE];
+CQMap	*q_precache_bsp[QBI_MAX_PRECACHE];	//external .bsp models
+CQSpr	*q_precache_spr[QBI_MAX_PRECACHE];	//.spr sprite models
+I64		 q_precache_model_count = 0;
+U8		*q_precache_sound[QBI_MAX_PRECACHE];
+I64		 q_precache_sound_count = 0;
+
+//trace result globals, resolved by name at init
+I64 q_ofs_trace_allsolid	= -1;
+I64 q_ofs_trace_startsolid	= -1;
+I64 q_ofs_trace_fraction	= -1;
+I64 q_ofs_trace_endpos		= -1;
+I64 q_ofs_trace_plane_normal = -1;
+I64 q_ofs_trace_plane_dist	= -1;
+I64 q_ofs_trace_ent			= -1;
+I64 q_ofs_trace_inopen		= -1;
+I64 q_ofs_trace_inwater		= -1;
+
+U8 q_bi_err_line[256];
+
+//--- cvars -----------------------------------------------------------------
+//
+//progs.dat queries exactly ten: registered, skill, deathmatch, coop, teamplay,
+//samelevel, noexit, fraglimit, timelimit, temp1. registered gates
+//trigger_onlyregistered_touch, so a hardcoded 0 gives the shareware nag.
+
+#define QCVAR_MAX	32
+
+class CQCvar
+{
+	U8	name[24];
+	F64	value;
+};
+
+CQCvar	q_cvars[QCVAR_MAX];
+I64		q_cvar_count = 0;
+
+U0 QCvarDefine(U8 *name, F64 value)
+{
+	if (q_cvar_count >= QCVAR_MAX)
+		return;
+
+	QStrCopy(q_cvars[q_cvar_count].name, name, 24);
+	q_cvars[q_cvar_count].value = value;
+	q_cvar_count++;
+}
+
+I64 QCvarIndex(U8 *name)
+{
+	I64 i;
+
+	for (i = 0; i < q_cvar_count; i++)
+		if (!StrICompare(q_cvars[i].name, name))
+			return i;
+
+	return -1;
+}
+
+F64 QCvarGet(U8 *name)
+{//unknown names read as 0, as Cvar_VariableValue does
+	I64 i = QCvarIndex(name);
+
+	if (i < 0)
+		return 0.0;
+
+	return q_cvars[i].value;
+}
+
+U0 QCvarSet(U8 *name, F64 value)
+{//an unknown name is created, as Cvar_Set does for cvar_set from progs
+	I64 i = QCvarIndex(name);
+
+	if (i < 0)
+		QCvarDefine(name, value);
+	else
+		q_cvars[i].value = value;
+}
+
+U0 QCvarInit()
+{//the original's own registration defaults
+	q_cvar_count = 0;
+
+	QCvarDefine("r_ambient",	0.0);
+	QCvarDefine("crosshair",	0.0);
+	QCvarDefine("cl_nolerp",	0.0);
+	QCvarDefine("cl_crossx",	0.0);
+	QCvarDefine("cl_crossy",	0.0);
+	QCvarDefine("ambient_level", 0.3);
+	QCvarDefine("ambient_fade", 100.0);
+	QCvarDefine("viewsize",		100.0);
+	QCvarDefine("demoloop",		1.0);
+	QCvarDefine("cl_forwardspeed", 400.0);
+	QCvarDefine("cl_backspeed",	400.0);
+	QCvarDefine("m_pitch",		0.022);
+	QCvarDefine("lookspring",	0.0);
+	QCvarDefine("lookstrafe",	0.0);
+	QCvarDefine("registered",	0.0);
+	QCvarDefine("skill",		1.0);
+	QCvarDefine("deathmatch",	0.0);
+	QCvarDefine("coop",			0.0);
+	QCvarDefine("teamplay",		0.0);
+	QCvarDefine("samelevel",	0.0);
+	QCvarDefine("noexit",		0.0);
+	QCvarDefine("fraglimit",	0.0);
+	QCvarDefine("timelimit",	0.0);
+	QCvarDefine("temp1",		0.0);
+	QCvarDefine("developer",	0.0);
+
+	//NOTE: not an NQ cvar - cheats there are ungated commands (god, noclip,
+	//fly, give, impulse 9). registered anyway so it reads back.
+	QCvarDefine("sv_cheats",	1.0);
+
+	//draw from the client's reconstructed table instead of the server edicts
+	QCvarDefine("cl_netdraw",	0.0); // host draws edicts; guest forces wire path
+
+	QCvarDefine("sv_gravity",	800.0);
+
+	//chase camera. chase_active pulls the eye back behind the player, the
+	//other three are the offset in V_CalcRefdef's own units
+	QCvarDefine("chase_active",	0.0);
+	QCvarDefine("chase_back",	100.0);
+	QCvarDefine("chase_up",		16.0);
+	QCvarDefine("chase_right",	0.0);
+
+	//SCR_DrawCenterString types at this rate during an intermission
+	QCvarDefine("scr_printspeed", 8.0);
+	QCvarDefine("con_notifytime", 3.0);
+}
+
+//--- helpers ---------------------------------------------------------------
+
+I64 QBiArg(I64 n)
+{//global offset of arg n - slots are three cells wide so vectors fit
+	return QPR_OFS_PARM0 + n * QPR_PARM_STRIDE;
+}
+
+F64 QBiArgF(I64 n)
+{
+	return QPrGetF(QBiArg(n));
+}
+
+I64 QBiArgI(I64 n)
+{
+	return QPrGetI(QBiArg(n));
+}
+
+U0 QBiArgV(I64 n, F64 *out)
+{
+	QPrGetV(QBiArg(n), out);
+}
+
+U8 *QBiArgS(I64 n)
+{
+	return QPrStr(QPrGetI(QBiArg(n)));
+}
+
+I64 QBiArgEnt(I64 n)
+{
+	return QPrEdictNum(QPrGetI(QBiArg(n)));
+}
+
+U0 QBiRetF(F64 v)
+{
+	QPrSetF(QPR_OFS_RETURN, v);
+}
+
+U0 QBiRetV(F64 *v)
+{
+	QPrSetV(QPR_OFS_RETURN, v);
+}
+
+U0 QBiRetEnt(I64 num)
+{
+	QPrSetI(QPR_OFS_RETURN, QPrEdictValue(num));
+}
+
+U0 QBiGetFieldV(I64 ent, I64 fld, F64 *out)
+{
+	out[0] = QPrFieldF(ent, fld);
+	out[1] = QPrFieldF(ent, fld + 1);
+	out[2] = QPrFieldF(ent, fld + 2);
+}
+
+U0 QBiSetFieldV(I64 ent, I64 fld, F64 *v)
+{
+	QPrSetFieldF(ent, fld, v[0]);
+	QPrSetFieldF(ent, fld + 1, v[1]);
+	QPrSetFieldF(ent, fld + 2, v[2]);
+}
+
+U0 QBiPrecacheWorld(CQMap *map, U8 *mapname)
+{//SV_SpawnServer's fixed reservation: slot 1 is the world, 2..N its inline
+ //submodels "*1".."*(n-1)", before any QuakeC spawn precaches anything
+ //
+ //order is not cosmetic - the client builds its model table from this list
+ //and resolves "*N" against the world at entry 1. filling it lazily puts "*1"
+ //at index 1 and the client fails with "Model *1 not found".
+	I64	 i;
+	I64	 n;
+	U8	*s;
+
+	if (!mapname || !mapname[0])
+		return;
+
+	q_precache_model[0]    = NULL;
+	q_precache_mdl[0]      = NULL;
+	q_precache_model_count = 1;
+
+	//slot 1: the world. copied - the caller's buffer is reused per map.
+	QStrCopy(q_world_model_name, mapname, 96);
+	q_precache_model[1] = q_world_model_name;
+	q_precache_mdl[1]   = NULL;
+	q_precache_model_count = 2;
+
+	if (!map)
+		return;
+
+	//q_precache_model is the smaller table, so it sets the bound
+	n = map->num_models;
+	if (n > QBI_MAX_PRECACHE - 2)
+		n = QBI_MAX_PRECACHE - 2;
+
+	for (i = 1; i < n; i++)
+	{
+		if (q_precache_model_count >= QBI_MAX_PRECACHE)
+			break;
+
+		s = q_submodel_names + (i - 1) * 8;
+		StrPrint(s, "*%d", i);
+
+		q_precache_model[q_precache_model_count] = s;
+		q_precache_mdl[q_precache_model_count]   = NULL;
+		q_precache_bmodel[q_precache_model_count] = i;
+		q_precache_model_count++;
+	}
+}
+
+//--- external brush models --------------------------------------------------
+//
+// ammo boxes, health boxes and the exploding crate are whole .bsp files in the
+// PAK, loaded with setmodel("maps/b_shell0.bsp") - not alias models and not
+// "*N" submodels. no bounds means droptofloor has nothing to stand on.
+
+#define QBSP_CACHE_MAX	24
+#define QBSP_NAME_MAX	64
+
+U8		 q_bsp_cache_name[QBSP_CACHE_MAX * QBSP_NAME_MAX];
+CQMap	*q_bsp_cache_map[QBSP_CACHE_MAX];
+I64		 q_bsp_cache_count = 0;
+
+#define QSPR_CACHE_MAX	16
+
+U8		 q_spr_cache_name[QSPR_CACHE_MAX * QBSP_NAME_MAX];
+CQSpr	*q_spr_cache_spr[QSPR_CACHE_MAX];
+I64		 q_spr_cache_count = 0;
+
+Bool QBiIsSprName(U8 *name)
+{
+	I64 n;
+
+	if (!name || name[0] == '*')
+		return FALSE;
+
+	n = StrLen(name);
+	if (n < 5)
+		return FALSE;
+
+	return ToBool(!StrICompare(name + n - 4, ".spr"));
+}
+
+CQSpr *QBiSprCacheGet(U8 *name)
+{//one copy of each sprite, loaded on first request
+	I64 i;
+
+	if (!QBiIsSprName(name))
+		return NULL;
+
+	for (i = 0; i < q_spr_cache_count; i++)
+	{
+		if (!StrICompare(&q_spr_cache_name[i * QBSP_NAME_MAX], name))
+			return q_spr_cache_spr[i];
+	}
+
+	if (q_spr_cache_count >= QSPR_CACHE_MAX)
+		return NULL;
+
+	i = q_spr_cache_count;
+	QStrCopy(&q_spr_cache_name[i * QBSP_NAME_MAX], name, QBSP_NAME_MAX);
+	q_spr_cache_spr[i] = QSprLoad(name);
+	q_spr_cache_count++;
+
+	return q_spr_cache_spr[i];
+}
+
+U0 QBiSprCacheFree()
+{
+	I64 i;
+
+	for (i = 0; i < q_spr_cache_count && i < QSPR_CACHE_MAX; i++)
+	{
+		if (q_spr_cache_spr[i])
+			QSprFree(q_spr_cache_spr[i]);
+
+		q_spr_cache_spr[i] = NULL;
+		q_spr_cache_name[i * QBSP_NAME_MAX] = 0;
+	}
+
+	q_spr_cache_count = 0;
+
+	for (i = 0; i < QBI_MAX_PRECACHE; i++)
+		q_precache_spr[i] = NULL;
+}
+
+U0 QBiBspCacheInit()
+{//globals aren't zeroed - a stale count sends QBiBspCacheFree through garbage
+ //pointers and faults inside the allocator, nowhere near this file
+	I64 i;
+
+	q_bsp_cache_count = 0;
+
+	for (i = 0; i < QBSP_CACHE_MAX; i++)
+	{
+		q_bsp_cache_map[i] = NULL;
+		q_bsp_cache_name[i * QBSP_NAME_MAX] = 0;
+	}
+
+	for (i = 0; i < QBI_MAX_PRECACHE; i++)
+		q_precache_bsp[i] = NULL;
+
+	q_spr_cache_count = 0;
+	for (i = 0; i < QSPR_CACHE_MAX; i++)
+	{
+		q_spr_cache_spr[i] = NULL;
+		q_spr_cache_name[i * QBSP_NAME_MAX] = 0;
+	}
+
+	for (i = 0; i < QBI_MAX_PRECACHE; i++)
+		q_precache_spr[i] = NULL;
+}
+
+Bool QBiIsBspName(U8 *name)
+{
+	I64 n;
+
+	if (!name || name[0] == '*')
+		return FALSE;
+
+	n = StrLen(name);
+	if (n < 5)
+		return FALSE;
+
+	return ToBool(!StrICompare(name + n - 4, ".bsp"));
+}
+
+CQMap *QBiBspCacheGet(U8 *name)
+{//one copy of each external brush model, loaded on first request
+	I64 i;
+
+	if (!QBiIsBspName(name))
+		return NULL;
+
+	for (i = 0; i < q_bsp_cache_count; i++)
+	{
+		if (!StrICompare(&q_bsp_cache_name[i * QBSP_NAME_MAX], name))
+			return q_bsp_cache_map[i];
+	}
+
+	if (q_bsp_cache_count >= QBSP_CACHE_MAX)
+		return NULL;
+
+	i = q_bsp_cache_count;
+	QStrCopy(&q_bsp_cache_name[i * QBSP_NAME_MAX], name, QBSP_NAME_MAX);
+	q_bsp_cache_map[i] = QBSPLoad(name);
+	q_bsp_cache_count++;
+
+	return q_bsp_cache_map[i];
+}
+
+U0 QBiBspCacheFree()
+{//released with the map, nothing else may free these
+	I64 i;
+
+	for (i = 0; i < q_bsp_cache_count && i < QBSP_CACHE_MAX; i++)
+	{
+		if (q_bsp_cache_map[i])
+			QBSPFree(q_bsp_cache_map[i]);
+
+		q_bsp_cache_map[i] = NULL;
+		q_bsp_cache_name[i * QBSP_NAME_MAX] = 0;
+	}
+
+	q_bsp_cache_count = 0;
+
+	//these pointed at the maps just released
+	for (i = 0; i < QBI_MAX_PRECACHE; i++)
+		q_precache_bsp[i] = NULL;
+}
+
+I64 QBiPrecacheModel(U8 *name)
+{//index 0 is "no model", real entries start at 1
+	I64 i;
+
+	for (i = 1; i < q_precache_model_count; i++)
+	{
+		if (!StrCompare(q_precache_model[i], name))
+			return i;
+	}
+
+	if (q_precache_model_count >= QBI_MAX_PRECACHE)
+		return 0;
+
+	if (!q_precache_model_count)
+	{
+		//slot 0 is "no model" - explicitly empty, globals aren't zeroed
+		q_precache_model[0] = NULL;
+		q_precache_mdl[0]   = NULL;
+		q_precache_model_count = 1;
+	}
+
+	i = q_precache_model_count;
+	q_precache_model_count++;
+
+	q_precache_model[i] = name;
+	q_precache_mdl[i]   = NULL;
+
+	//"*N" brush models live in the map, only alias models load here
+	if (name[0] != '*' && StrLen(name) > 4 &&
+		!StrICompare(name + StrLen(name) - 4, ".mdl"))
+		q_precache_mdl[i] = QMdlCacheGet(name);
+
+	//an external .bsp is a brush model in its own file, a .spr is a sprite
+	q_precache_bsp[i] = QBiBspCacheGet(name);
+	q_precache_spr[i] = QBiSprCacheGet(name);
+
+	//collision needs the translation: .modelindex is this slot, not the BSP
+	//model number
+	if (name[0] == '*' && i < QCLIP_MAX_PRECACHE)
+		q_precache_bmodel[i] = ToI64(QAtoF(name + 1));
+
+	return i;
+}
+
+CQMdl *QBiFindModel(U8 *name)
+{//an already-precached alias model. the view-model renderer learns the
+ //weapon's name from QuakeC rather than loading it itself.
+	I64 i;
+
+	if (!name || !name[0])
+		return NULL;
+
+	for (i = 1; i < q_precache_model_count; i++)
+	{
+		if (q_precache_model[i] && !StrICompare(q_precache_model[i], name))
+			return q_precache_mdl[i];
+	}
+
+	return NULL;
+}
+
+//--- static entities -------------------------------------------------------
+//
+// makestatic() hands an entity that will never move, think or be touched to
+// the client permanently, then frees the edict - that is the point, a large
+// map does not burn hundreds of slots on scenery.
+
+#define QBI_MAX_STATIC	256
+
+class CQStaticEnt
+{
+	CQMdl	*mdl;
+	F64		 origin[3];
+	F64		 angles[3];
+	I64		 frame;
+};
+
+CQStaticEnt	q_static_ent[QBI_MAX_STATIC];
+I64			q_static_count = 0;
+
+U0 QBiStaticClear()
+{
+	q_static_count = 0;
+}
+
+#define QMSG_BROADCAST	0
+#define QMSG_ONE		1
+#define QMSG_ALL		2
+#define QMSG_INIT		3
+
+CQMsg *QBiWriteDest()
+{//WriteDest: arg 0 of every Write* names the destination. MSG_ONE reads
+ //msg_entity, which QuakeC assigns before writing.
+	I64 dest;
+	I64 entnum;
+
+	dest = ToI64(QBiArgF(0));
+
+	switch (dest)
+	{
+		case QMSG_BROADCAST:
+			return &q_sv_datagram;
+
+		case QMSG_ONE:
+			if (q_ofs_msg_entity < 0)
+				return NULL;
+			entnum = QPrGetI(q_ofs_msg_entity);
+			entnum = QPrEdictNum(entnum);
+			if (entnum < 1 || entnum > QSV_MAX_CLIENTS)
+				return NULL;	//WriteDest: not a client
+			return &q_sv_client_msg[entnum - 1];
+
+		case QMSG_ALL:
+			return &q_sv_reliable_datagram;
+
+		case QMSG_INIT:
+			return &q_sv_signon;
+	}
+
+	return NULL;
+}
+
+Bool QBiWireRoom(CQMsg *m, I64 need)
+{//sv.datagram is capped at the unreliable size; reliable buffers run to
+ //MAX_MSGLEN because they are chunked on the way out
+	I64 cap;
+
+	if (!m)
+		return FALSE;
+
+	if (m == &q_sv_datagram)
+		cap = QNET_MAX_DATAGRAM;
+	else
+		cap = QNET_MAX_MSG;
+
+	return ToBool(m->len < cap - need);
+}
+
+U0 QBiWireByte(CQMsg *m, I64 value)
+{
+	if (!QBiWireRoom(m, 4))
+		return;
+	QMsgWriteByte(m, value);
+}
+
+U0 QBiWireChar(CQMsg *m, I64 value)
+{
+	if (!QBiWireRoom(m, 4))
+		return;
+	QMsgWriteChar(m, value);
+}
+
+U0 QBiWireCoord(CQMsg *m, F64 value)
+{
+	if (!QBiWireRoom(m, 4))
+		return;
+	QMsgWriteCoord(m, value);
+}
+
+U0 QBiWireShort(CQMsg *m, I64 value)
+{
+	if (!QBiWireRoom(m, 4))
+		return;
+	QMsgWriteShort(m, value);
+}
+
+U0 QBiWireLong(CQMsg *m, I64 value)
+{
+	if (!QBiWireRoom(m, 8))
+		return;
+	QMsgWriteLong(m, value);
+}
+
+U0 QBiWireAngle(CQMsg *m, F64 value)
+{
+	if (!QBiWireRoom(m, 4))
+		return;
+	QMsgWriteAngle(m, value);
+}
+
+U0 QBiWireString(CQMsg *m, U8 *str)
+{
+	if (!QBiWireRoom(m, 64))
+		return;
+	QMsgWriteString(m, str);
+}
+
+
+U0 QBiParticleWire(F64 *org, F64 *dir, I64 color, I64 count)
+{//PF_particle's other half: svc_particle on sv.datagram, or remotes see no
+ //blood, sparks or gunshot puffs at all
+	I64 j;
+	I64 d;
+
+	if (count > 255)
+		count = 255;
+	if (count < 0)
+		count = 0;
+
+	QBiWireByte(&q_sv_datagram, QSVC_PARTICLE);
+	for (j = 0; j < 3; j++)
+		QBiWireCoord(&q_sv_datagram, org[j]);
+
+	//direction is a signed byte in 1/16ths, so it clamps hard
+	for (j = 0; j < 3; j++)
+	{
+		d = ToI64(dir[j] * 16.0);
+		if (d > 127)
+			d = 127;
+		if (d < -128)
+			d = -128;
+		QBiWireByte(&q_sv_datagram, d & 255);
+	}
+
+	//SV_StartParticle writes COUNT THEN COLOUR. reversing them is invisible
+	//against our own parser, which had the same pair the same way round, but
+	//any other client reads the colour as a count and the count as a colour -
+	//blood came out grey in ironwail while looking right here
+	QBiWireByte(&q_sv_datagram, count);
+	QBiWireByte(&q_sv_datagram, color);
+}
+
+CQMsg *QBiClientMsg(I64 ent)
+{//reliable channel for a client edict, NULL for the local one. edicts
+ //1..maxclients are reserved per slot, so the slot is ent - 1.
+	I64 slot;
+
+	if (ent <= 0 || ent == q_player_edict)
+		return NULL;
+
+	slot = ent - 1;
+	if (slot < 0 || slot >= QSV_MAX_CLIENTS)
+		return NULL;
+
+	return &q_sv_client_msg[slot];
+}
+
+U0 QBiMakeStatic()
+{//builtin 69
+	CQStaticEnt	*se;
+	I64			 ent = QBiArgEnt(0);
+	I64			 idx;
+	I64			 j;
+
+	if (ent <= 0)
+		return;
+
+	if (q_static_count < QBI_MAX_STATIC)
+	{
+		se  = &q_static_ent[q_static_count];
+		idx = ToI64(QPrFieldF(ent, q_fld_modelindex));
+
+		se->mdl = NULL;
+		if (idx > 0 && idx < q_precache_model_count)
+			se->mdl = q_precache_mdl[idx];
+
+		for (j = 0; j < 3; j++)
+		{
+			se->origin[j] = QPrFieldF(ent, q_fld_origin + j);
+			se->angles[j] = QPrFieldF(ent, q_fld_angles + j);
+		}
+
+		se->frame = ToI64(QPrFieldF(ent, q_fld_frame));
+
+		//a static entity with no model would hold a slot for nothing
+		if (se->mdl)
+			q_static_count++;
+	}
+
+	//svc_spawnstatic into sv.signon so a joining client hears about the
+	//torches during prespawn. never sent again - no edict to update.
+	idx = ToI64(QPrFieldF(ent, q_fld_modelindex));
+	if (idx > 0)
+	{
+		QBiWireByte(&q_sv_signon, QSVC_SPAWNSTATIC);
+		QBiWireByte(&q_sv_signon, idx);
+		QBiWireByte(&q_sv_signon, ToI64(QPrFieldF(ent, q_fld_frame)));
+
+		if (q_fld_colormap >= 0)
+			QBiWireByte(&q_sv_signon,
+				ToI64(QPrFieldF(ent, q_fld_colormap)));
+		else
+			QBiWireByte(&q_sv_signon, 0);
+
+		if (q_fld_skin >= 0)
+			QBiWireByte(&q_sv_signon, ToI64(QPrFieldF(ent, q_fld_skin)));
+		else
+			QBiWireByte(&q_sv_signon, 0);
+
+		for (j = 0; j < 3; j++)
+		{
+			QBiWireCoord(&q_sv_signon, QPrFieldF(ent, q_fld_origin + j));
+			QBiWireAngle(&q_sv_signon, QPrFieldF(ent, q_fld_angles + j));
+		}
+	}
+
+	//freed either way, that is what makestatic means
+	QPrFreeEdict(ent);
+}
+
+U0 QBiFreePrecache()
+{
+	//the brush-model translation table is per-map too
+	QClipPrecacheReset;
+
+	I64 i;
+
+	for (i = 0; i < q_precache_model_count; i++)
+	{
+		if (q_precache_mdl[i])
+		{
+			//the cache owns these, freeing here would double free
+			q_precache_mdl[i] = NULL;
+		}
+	}
+
+	q_precache_model_count = 0;
+	q_precache_sound_count = 0;
+}
+
+U0 QBiSetMinMaxSize(I64 ent, F64 *mins, F64 *maxs)
+{//SetMinMaxSize, which ends with SV_LinkEdict
+ //
+ //the link is not optional - absmin/absmax are derived there and FireBullets
+ //takes its muzzle height straight from them:
+ //
+ //    src_z = self.absmin_z + self.size_z * 0.7;
+	F64 size[3];
+
+	QBiSetFieldV(ent, q_fld_mins, mins);
+	QBiSetFieldV(ent, q_fld_maxs, maxs);
+	QVecSub(maxs, mins, size);
+	QBiSetFieldV(ent, q_fld_size, size);
+
+	QGameLinkEdict(ent);
+}
+
+F64 QSvFlagF(Bool b)
+{//widen a Bool to the 1.0/0.0 QuakeC tests against
+	if (b)
+		return 1.0;
+	return 0.0;
+}
+
+U0 QBiStoreTrace(CQTrace *tr, I64 hit_ent)
+{//publish a trace into the globals QuakeC reads afterwards
+	QPrSetF(q_ofs_trace_allsolid, ToF64(tr->all_solid));
+	QPrSetF(q_ofs_trace_startsolid, ToF64(tr->start_solid));
+	QPrSetF(q_ofs_trace_fraction, tr->fraction);
+	QPrSetV(q_ofs_trace_endpos, tr->end_pos);
+	QPrSetV(q_ofs_trace_plane_normal, tr->plane_normal);
+	QPrSetF(q_ofs_trace_plane_dist, tr->plane_dist);
+	QPrSetI(q_ofs_trace_ent, QPrEdictValue(hit_ent));
+	//visible() rejects a sight line that crossed both - this is what stops a
+	//monster tracking the player through the surface of a pool
+	QPrSetF(q_ofs_trace_inopen, QSvFlagF(tr->in_open));
+	QPrSetF(q_ofs_trace_inwater, QSvFlagF(tr->in_water));
+}
+
+//--- temp entities ---------------------------------------------------------
+//
+// effects are broadcast, not spawned: QuakeC writes SVC_TEMPENTITY, a type,
+// then coordinates. reassembled here and handed to the particle system.
+
+#define QSVC_TEMPENTITY		23
+#define QSVC_INTERMISSION	30
+#define QSVC_FINALE			31
+#define QSVC_CUTSCENE		34
+
+//--- intermission and finale -----------------------------------------------
+//
+// QuakeC broadcasts svc_intermission, or svc_finale plus the episode text.
+// it has already parked the camera on an info_intermission, so the engine
+// owes only the overlay - IntermissionThink watches button0 for the exit.
+Bool q_intermission	= FALSE;
+
+//cl.completed_time - the clock STOPS when the intermission starts
+F64	 q_completed_time	= 0.0;
+Bool q_finale		= FALSE;
+//SCR_CenterPrint's buffer is 1024. the longest string sent is the episode
+//finale at 265 chars; match the original rather than the observed maximum.
+#define QCENTER_MAX	1024
+
+U8	 q_finale_text[QCENTER_MAX];
+
+U0 QBiIntermissionClear()
+{
+	q_intermission   = FALSE;
+	q_finale         = FALSE;
+	q_completed_time = 0.0;
+	q_finale_text[0] = 0;
+}
+
+#define QTE_SPIKE			0
+#define QTE_SUPERSPIKE		1
+#define QTE_GUNSHOT			2
+#define QTE_EXPLOSION		3
+#define QTE_TAREXPLOSION	4
+#define QTE_LIGHTNING1		5
+#define QTE_LIGHTNING2		6
+#define QTE_WIZSPIKE		7
+#define QTE_KNIGHTSPIKE		8
+#define QTE_LIGHTNING3		9
+#define QTE_LAVASPLASH		10
+#define QTE_TELEPORT		11
+#define QTE_EXPLOSION2		12
+#define QTE_BEAM			13
+
+#define QMSG_IDLE			0
+#define QMSG_WANT_TYPE		1
+#define QMSG_WANT_COORDS	2
+#define QMSG_WANT_BEAM_ENT	3
+
+I64 q_msg_beam_ent = 0;	//owner of the beam being reassembled
+#define QMSG_WANT_BEAM		4
+#define QMSG_WANT_TEXT		5
+
+//beams are self-illuminated in the original
+#define QBEAM_LIGHT			240
+
+//movement diagnostics. failures dominating means the step geometry refuses
+//legal moves; successes dominating means the steering choice is wrong.
+I64 q_move_ok	= 0;
+I64 q_move_fail	= 0;
+I64 q_yaw_reports = 0;
+U8  q_yaw_line[128];
+
+//FL_ONGROUND - the move step sets it directly and physics keys gravity off it
+#define QFL_ONGROUND_MOVE	512
+#define QFL_SWIM_			2		//defs.qc: FL_SWIM
+#define QFL_FLY_			1		//defs.qc: FL_FLY
+
+//solidity values, duplicated from the game layer - this file compiles first
+//and traceline needs them
+#define QBI_SOLID_NOT		0
+#define QBI_SOLID_TRIGGER	1
+#define QBI_SOLID_BBOX		2
+#define QBI_SOLID_SLIDEBOX	3
+#define QBI_SOLID_BSP		4
+
+I64 q_msg_state	= QMSG_IDLE;
+I64 q_msg_type	= 0;
+I64 q_msg_axis	= 0;
+F64 q_msg_org[3];
+F64 q_msg_end[3];
+I64 q_te_count	= 0;
+
+U0 QBiRicochet(F64 *org)
+{//CL_ParseTEnt's impact sound - rand()%5 means the tink wins four in five
+	I64 r;
+
+	if (QPartRandI(5))
+	{
+		QSndPlayAt("weapons/tink1.wav", org, 1.0, 1.0);
+		return;
+	}
+
+	r = QPartRandI(4);
+
+	if (r == 1)
+		QSndPlayAt("weapons/ric1.wav", org, 1.0, 1.0);
+	else if (r == 2)
+		QSndPlayAt("weapons/ric2.wav", org, 1.0, 1.0);
+	else
+		QSndPlayAt("weapons/ric3.wav", org, 1.0, 1.0);
+}
+
+U0 QBiTempEntity(I64 type, F64 *org)
+{//a decoded temp entity into particles AND sound
+ //
+ //the sounds are not decoration - QuakeC never plays them. GrenadeExplode
+ //writes TE_EXPLOSION and nothing else; CL_ParseTEnt turns that into
+ //weapons/r_exp3.wav, and CL_InitTEnts is what precaches it.
+	F64 zero[3];
+
+	QVecSet(zero, 0.0, 0.0, 0.0);
+	q_te_count++;
+
+	switch (type)
+	{
+		case QTE_EXPLOSION:
+		case QTE_TAREXPLOSION:
+			QPartExplosion(org, tS);
+			//the flash that lights the room, the original's figures
+			QDlightAdd(org, 350.0, 0.5, 300.0, tS);
+			QSndPlayAt("weapons/r_exp3.wav", org, 1.0, 1.0);
+			break;
+
+		case QTE_GUNSHOT:
+			//colour 0 is the dark-to-grey ramp. no sound, the weapon made one.
+			QPartEffect(org, zero, 0, 20, tS);
+			break;
+
+		case QTE_SPIKE:
+			QPartEffect(org, zero, 0, 10, tS);
+			QBiRicochet(org);
+			break;
+
+		case QTE_SUPERSPIKE:
+			QPartEffect(org, zero, 0, 20, tS);
+			QBiRicochet(org);
+			break;
+
+		//own colours, not the nail's: 20 is the Scrag's green ramp, 226 the
+		//Death Knight's orange
+		case QTE_WIZSPIKE:
+			QPartEffect(org, zero, 20, 30, tS);
+			QSndPlayAt("wizard/hit.wav", org, 1.0, 1.0);
+			break;
+
+		case QTE_KNIGHTSPIKE:
+			QPartEffect(org, zero, 226, 20, tS);
+			QSndPlayAt("hknight/hit.wav", org, 1.0, 1.0);
+			break;
+
+		case QTE_LAVASPLASH:
+			QPartLavaSplash(org, tS);
+			break;
+
+		case QTE_TELEPORT:
+			QPartTeleport(org, tS);
+			break;
+
+		default:
+			//the lightning types need a line renderer, not particles
+			break;
+	}
+}
+
+//--- lightning beams -------------------------------------------------------
+//
+// TE_LIGHTNING1/2/3 carry an entity index and TWO points where every other
+// temp entity carries one - six coordinates into a three-coordinate parser
+// would corrupt the following effect too.
+//
+// the original tiles the bolt model along the vector every 30 units, random
+// roll per segment so it crackles.
+
+#define QBI_MAX_BEAMS	16
+#define QBEAM_SEGMENT	30.0
+#define QBEAM_LIFE		0.2		//seconds, matching the original
+
+class CQBeam
+{
+	F64		 start[3];
+	F64		 end[3];
+	F64		 die_time;
+	I64		 entity;		//owner; a beam from the view entity follows it
+	CQMdl	*mdl;
+};
+
+CQBeam	q_beam[QBI_MAX_BEAMS];
+I64		q_beam_count = 0;
+
+U0 QBiBeamsClear()
+{
+	q_beam_count = 0;
+}
+
+U0 QBiBeamAdd(I64 type, F64 *start, F64 *end, F64 time, I64 entity = 0)
+{//beams are short lived, so the oldest is recycled when full
+ //
+ //CL_ParseBeam replaces an existing beam from the same entity rather than
+ //stacking, which keeps a firing lightning gun to a single bolt
+	CQBeam	*b;
+	U8		*name;
+	I64		 i;
+	I64		 slot = -1;
+
+	if (type == QTE_LIGHTNING1)
+		name = "progs/bolt.mdl";
+	else if (type == QTE_LIGHTNING2)
+		name = "progs/bolt2.mdl";
+	else
+		name = "progs/bolt3.mdl";
+
+	//an entity that already has a beam gets it replaced
+	if (entity)
+	{
+		for (i = 0; i < q_beam_count; i++)
+		{
+			if (q_beam[i].entity == entity)
+			{
+				slot = i;
+				break;
+			}
+		}
+	}
+
+	//otherwise prefer an expired slot
+	if (slot < 0)
+	{
+		for (i = 0; i < q_beam_count; i++)
+		{
+			if (q_beam[i].die_time <= time)
+			{
+				slot = i;
+				break;
+			}
+		}
+	}
+
+	if (slot < 0)
+	{
+		if (q_beam_count < QBI_MAX_BEAMS)
+		{
+			slot = q_beam_count;
+			q_beam_count++;
+		}
+		else
+			slot = 0;
+	}
+
+	b = &q_beam[slot];
+	QVecCopy(start, b->start);
+	QVecCopy(end, b->end);
+	b->die_time = time + QBEAM_LIFE;
+	b->entity   = entity;
+	b->mdl      = QBiFindModel(name);
+}
+
+U0 QBiBeamsFollow(I64 view_entity)
+{//CL_UpdateTEnts: snap a view-entity beam's START to the current origin every
+ //frame, or the bolt hangs where it was fired from
+	I64 i;
+	I64 j;
+
+	if (view_entity <= 0)
+		return;
+
+	for (i = 0; i < q_beam_count; i++)
+	{
+		if (q_beam[i].entity != view_entity)
+			goto qbf_next;
+
+		for (j = 0; j < 3; j++)
+			q_beam[i].start[j] = QPrFieldF(view_entity, q_fld_origin + j);
+
+qbf_next:
+	}
+}
+
+U0 QBiDrawBeams(CQCanvas *c, F64 time)
+{//tile each live beam's model along its length
+	CQBeam	*b;
+	F64		 dir[3];
+	F64		 org[3];
+	F64		 ang[3];
+	F64		 len;
+	I64		 i;
+	I64		 seg;
+	I64		 steps;
+
+	for (i = 0; i < q_beam_count; i++)
+	{
+		b = &q_beam[i];
+
+		if (b->die_time <= time || !b->mdl)
+			goto qb_next;
+
+		QVecSub(b->end, b->start, dir);
+		len = QVecLength(dir);
+
+		if (len < 1.0)
+			goto qb_next;
+
+		QVecScale(dir, 1.0 / len, dir);
+
+		//pitch and yaw point down the beam; the roll is random so segments
+		//do not line up into a smooth tube
+		QVecToAngles(dir, ang);
+
+		steps = ToI64(len / QBEAM_SEGMENT) + 1;
+		QVecCopy(b->start, org);
+
+		for (seg = 0; seg < steps; seg++)
+		{
+			ang[2] = ToF64(RandU32() % 360);
+
+			QMdlDrawAngles(c, b->mdl, 0, org, ang, QBEAM_LIGHT);
+
+			org[0] += dir[0] * QBEAM_SEGMENT;
+			org[1] += dir[1] * QBEAM_SEGMENT;
+			org[2] += dir[2] * QBEAM_SEGMENT;
+		}
+
+qb_next:
+	}
+}
+
+//--- centerprint -----------------------------------------------------------
+//
+// "you need the silver key", the skill signs in start.bsp. SUB_UseTargets
+// calls this then plays misc/talk.wav.
+//
+// dismissal is purely TIME based - scr_centertime, 2.0s, counted down in
+// SCR_CheckDrawCenterString. no key or click clears it.
+//
+// NOTE: a message that never goes away is being RE-SENT, not stuck - a
+// trigger_multiple re-fires every .wait seconds while something stands in it.
+#define QCENTER_TIME	2.0
+
+U8  q_center_text[QCENTER_MAX];
+F64 q_center_until	= 0.0;
+F64 q_center_start	= 0.0;	//when the string was posted - the typing origin
+
+//--- localcmd ---------------------------------------------------------------
+//
+// QuakeC pushes console commands at the engine here, and single-player death
+// depends on it:
+//
+//     void() respawn = { ... localcmd ("restart\n"); };
+//
+// a no-op stalls the whole death cycle. only the commands QuakeC issues are
+// honoured; anything else is reported once rather than dropped silently.
+Bool q_restart_pending	= FALSE;
+I64  q_localcmd_reports	= 0;
+
+U0 QBiLocalCmd(U8 *cmd)
+{
+	if (!cmd || !cmd[0])
+		return;
+
+	//restart reloads the map: same level, fresh start, no carried items
+	if (!StrNICompare(cmd, "restart", 7))
+	{
+		q_restart_pending = TRUE;
+		return;
+	}
+
+	//level exit goes through the changelevel builtin, not here
+	if (q_localcmd_reports < 8)
+	{
+		q_localcmd_reports++;
+		"QBi: unhandled localcmd '%s'\n", cmd;
+	}
+}
+
+U0 QBiCenterClear()
+{
+	q_center_text[0] = 0;
+	q_center_until   = 0.0;
+	q_center_start   = 0.0;
+}
+
+U0 QBiCenterPrint(I64 ent, U8 *str)
+{//PF_centerprint - arg 0 names the client, ignoring it puts a remote's
+ //objective message on the host's screen
+	CQMsg *m;
+
+	if (!str || !str[0])
+		return;
+
+	m = QBiClientMsg(ent);
+	if (m)
+	{
+		QBiWireByte(m, QSVC_CENTERPRINT);
+		QBiWireString(m, str);
+		return;
+	}
+
+	QStrCopy(q_center_text, str, QCENTER_MAX);
+	q_center_until = tS + QCENTER_TIME;
+	q_center_start = tS;
+}
+
+//--- checkclient ------------------------------------------------------------
+//
+//PF_checkclient. monsters ask this whether a player is worth noticing - both
+//the round-robin and the PVS test matter, a fixed edict makes the whole level
+//hunt one body.
+
+//MAX_MAP_LEAFS is 8192 in BSP29, so a PVS row never exceeds 1024 bytes
+#define QBI_MAX_LEAFS	8192
+#define QBI_PVS_BYTES	(QBI_MAX_LEAFS / 8)
+#define QBI_FL_NOTARGET	128
+
+U8	 q_checkpvs[QBI_PVS_BYTES];
+I64	 q_sv_lastcheck		= 1;
+F64	 q_sv_lastchecktime	= 0.0;
+
+U0 QBiCheckClientReset()
+{//SV_SpawnServer clears these with the sv struct; here they are globals and
+ //globals aren't zeroed - a garbage lastchecktime never passes the 0.1s test
+ //and checkclient hands every monster the world
+	q_sv_lastcheck     = 1;
+	q_sv_lastchecktime = 0.0;
+
+	MemSet(q_checkpvs, 0, QBI_PVS_BYTES);
+}
+
+I64 QBiNewCheckClient(I64 check)
+{//PF_newcheckclient: step to the next live client and cache its PVS row
+	I64 i;
+	I64 leaf;
+	F64 org[3];
+	F64 ofs[3];
+
+	if (check < 1)
+		check = 1;
+	if (check > QSV_MAX_CLIENTS)
+		check = QSV_MAX_CLIENTS;
+
+	if (check == QSV_MAX_CLIENTS)
+		i = 1;
+	else
+		i = check + 1;
+
+	while (TRUE)
+	{
+		if (i == QSV_MAX_CLIENTS + 1)
+			i = 1;
+
+		if (i == check)
+			break;			//nothing else to look at
+
+		if (!q_pr_edict_free[i] && QPrFieldF(i, q_fld_health) > 0.0)
+		{
+			if (q_fld_flags < 0 ||
+				!(ToI64(QPrFieldF(i, q_fld_flags)) & QBI_FL_NOTARGET))
+				break;
+		}
+
+		i++;
+	}
+
+	//PVS from the client's eyes, not its feet
+	QBiGetFieldV(i, q_fld_origin, org);
+	if (q_fld_view_ofs >= 0)
+	{
+		QBiGetFieldV(i, q_fld_view_ofs, ofs);
+		org[0] += ofs[0];
+		org[1] += ofs[1];
+		org[2] += ofs[2];
+	}
+
+	leaf = -1;
+	if (q_bi_map)
+		leaf = QVisLeafForPoint(q_bi_map, org);
+
+	if (leaf >= 0 && leaf < q_bi_map->num_leafs)
+		QVisDecompress(q_bi_map, q_bi_map->leafs[leaf].vis_offset,
+			q_checkpvs, QBI_PVS_BYTES);
+	else
+		MemSet(q_checkpvs, 0xFF, QBI_PVS_BYTES);
+
+	return i;
+}
+
+U0 QBiCheckClient()
+{
+	I64 ent;
+	I64 self;
+	I64 leaf;
+	I64 l;
+	F64 view[3];
+	F64 ofs[3];
+	F64 now;
+
+	if (q_ofs_self < 0 || q_fld_health < 0 || !q_pr_edict_free)
+	{
+		QBiRetEnt(0);
+		return;
+	}
+
+	now = QPrGetF(q_ofs_time);
+
+	//one new pick per 0.1s, shared by every monster asking this frame
+	if (now - q_sv_lastchecktime >= 0.1)
+	{
+		q_sv_lastcheck     = QBiNewCheckClient(q_sv_lastcheck);
+		q_sv_lastchecktime = now;
+	}
+
+	ent = q_sv_lastcheck;
+
+	//never index the free list out of range
+	if (ent < 1 || ent >= q_pr_num_edicts)
+	{
+		q_sv_lastcheck = 1;
+		ent            = 1;
+	}
+
+	if (q_pr_edict_free[ent] || QPrFieldF(ent, q_fld_health) <= 0.0)
+	{
+		QBiRetEnt(q_player_edict);
+		return;
+	}
+
+	self = QPrEdictNum(QPrGetI(q_ofs_self));
+	QBiGetFieldV(self, q_fld_origin, view);
+	if (q_fld_view_ofs >= 0)
+	{
+		QBiGetFieldV(self, q_fld_view_ofs, ofs);
+		view[0] += ofs[0];
+		view[1] += ofs[1];
+		view[2] += ofs[2];
+	}
+
+	//leaf 0 is the solid leaf, so PVS bit 0 is leaf 1
+	l = -1;
+	if (q_bi_map)
+	{
+		leaf = QVisLeafForPoint(q_bi_map, view);
+		if (leaf >= 0 && leaf < q_bi_map->num_leafs)
+			l = leaf - 1;
+	}
+
+	if (l < 0 || l >= QBI_MAX_LEAFS ||
+		!(q_checkpvs[l >> 3] & (1 << (l & 7))))
+	{
+		QBiRetEnt(0);		//world: cannot possibly see the check entity
+		return;
+	}
+
+	QBiRetEnt(ent);
+}
+
+I64 QBiSoundIndex(U8 *sample)
+{//1-based index into the sound precache (wire: byte sound_num), 0 = miss
+	I64 i;
+
+	if (!sample || !sample[0])
+		return 0;
+
+	for (i = 0; i < q_precache_sound_count; i++)
+	{
+		if (q_precache_sound[i] && !StrCompare(q_precache_sound[i], sample))
+			return i + 1;
+	}
+
+	return 0;
+}
+
+U0 QBiAmbientSignon(F64 *pos, U8 *sample, F64 vol, F64 attenuation)
+{//PF_ambientsound's other half: svc_spawnstaticsound into sv.signon, so a
+ //joining client starts the same water and torch loops
+	I64 num;
+	I64 j;
+
+	num = QBiSoundIndex(sample);
+	if (num < 1)
+		return;
+
+	QBiWireByte(&q_sv_signon, QSVC_SPAWNSTATICSOUND);
+	for (j = 0; j < 3; j++)
+		QBiWireCoord(&q_sv_signon, pos[j]);
+	QBiWireByte(&q_sv_signon, num);
+	QBiWireByte(&q_sv_signon, ToI64(vol * 255.0));
+	QBiWireByte(&q_sv_signon, ToI64(attenuation * 64.0));
+}
+
+U0 QSvStartSound(I64 ent, I64 channel, U8 *sample, I64 volume, F64 attenuation)
+{//SV_StartSound -> svc_sound on sv.datagram. local play is the caller's job.
+	I64 sound_num;
+	I64 field_mask;
+	I64 packed;
+	F64 org[3];
+	F64 mins[3];
+	F64 maxs[3];
+	I64 j;
+
+	if (!sample || !sample[0])
+		return;
+	if (q_sv_datagram.len > QNET_MAX_DATAGRAM - 16)
+		return;
+
+	sound_num = QBiSoundIndex(sample);
+	if (sound_num < 1)
+		return;
+
+	if (volume < 0)
+		volume = 0;
+	if (volume > 255)
+		volume = 255;
+	if (attenuation < 0.0)
+		attenuation = 0.0;
+	if (attenuation > 4.0)
+		attenuation = 4.0;
+	if (channel < 0)
+		channel = 0;
+	if (channel > 7)
+		channel = 7;
+	if (ent < 0)
+		ent = 0;
+
+	packed = (ent << 3) | channel;
+
+	field_mask = 0;
+	if (volume != QSND_DEFAULT_VOL)
+		field_mask |= QSND_VOLUME;
+	if (attenuation != QSND_DEFAULT_ATTEN)
+		field_mask |= QSND_ATTENUATION;
+
+	QMsgWriteByte(&q_sv_datagram, QSVC_SOUND);
+	QMsgWriteByte(&q_sv_datagram, field_mask);
+	if (field_mask & QSND_VOLUME)
+		QMsgWriteByte(&q_sv_datagram, volume);
+	if (field_mask & QSND_ATTENUATION)
+		QMsgWriteByte(&q_sv_datagram, ToI64(attenuation * 64.0));
+	QMsgWriteShort(&q_sv_datagram, packed);
+	QMsgWriteByte(&q_sv_datagram, sound_num);
+
+	QBiGetFieldV(ent, q_fld_origin, org);
+	QBiGetFieldV(ent, q_fld_mins, mins);
+	QBiGetFieldV(ent, q_fld_maxs, maxs);
+	for (j = 0; j < 3; j++)
+		org[j] += 0.5 * (mins[j] + maxs[j]);
+
+	for (j = 0; j < 3; j++)
+		QMsgWriteCoord(&q_sv_datagram, org[j]);
+}
+
+U0 QBiWriteByte(CQMsg *m, I64 value)
+{//emit to the routed destination and drive the local reassembler, so the host
+ //sees its own temp entities without a round trip
+	QBiWireByte(m, value);
+
+	if (q_msg_state == QMSG_IDLE)
+	{
+		if (value == QSVC_TEMPENTITY)
+			q_msg_state = QMSG_WANT_TYPE;
+		else if (value == QSVC_INTERMISSION)
+		{
+			q_intermission   = TRUE;
+			q_completed_time = QPrGetF(q_ofs_time);
+		}
+		else if (value == QSVC_FINALE || value == QSVC_CUTSCENE)
+		{
+			//the text arrives as the next WriteString
+			q_intermission   = TRUE;
+			q_finale         = TRUE;
+			q_completed_time = QPrGetF(q_ofs_time);
+			q_finale_text[0] = 0;
+			q_msg_state      = QMSG_WANT_TEXT;
+		}
+		return;
+	}
+
+	if (q_msg_state == QMSG_WANT_TYPE)
+	{
+		q_msg_type = value;
+		q_msg_axis = 0;
+
+		//a beam carries an entity index then SIX coordinates, start and end
+		if (q_msg_type == QTE_LIGHTNING1 || q_msg_type == QTE_LIGHTNING2 ||
+			q_msg_type == QTE_LIGHTNING3)
+			q_msg_state = QMSG_WANT_BEAM_ENT;
+		else
+			q_msg_state = QMSG_WANT_COORDS;
+	}
+}
+
+U0 QBiWriteString(CQMsg *m, U8 *str)
+{//only the finale text is consumed locally, the wire copy always goes out
+	QBiWireString(m, str);
+
+	if (q_msg_state == QMSG_WANT_TEXT)
+	{
+		if (str)
+		{
+			QStrCopy(q_finale_text, str, QCENTER_MAX);
+
+			//svc_finale is SCR_CenterPrint - centerprint owns wrap and typing
+			QStrCopy(q_center_text, str, QCENTER_MAX);
+			q_center_until = tS + QCENTER_TIME;
+			q_center_start = tS;
+		}
+		q_msg_state = QMSG_IDLE;
+	}
+}
+
+U0 QBiWriteEntity(CQMsg *m, I64 value)
+{//the beam's owner. the coordinates that follow are where it was fired, but
+ //CL_UpdateTEnts re-anchors a view-entity beam every frame so it tracks.
+	QBiWireShort(m, value);
+
+	if (q_msg_state == QMSG_WANT_BEAM_ENT)
+	{
+		q_msg_beam_ent = value;
+		q_msg_state    = QMSG_WANT_BEAM;
+	}
+}
+
+U0 QBiWriteCoord(CQMsg *m, F64 value)
+{
+	QBiWireCoord(m, value);
+
+	if (q_msg_state == QMSG_WANT_BEAM)
+	{
+		//six coordinates: start then end
+		if (q_msg_axis < 3)
+			q_msg_org[q_msg_axis] = value;
+		else if (q_msg_axis < 6)
+			q_msg_end[q_msg_axis - 3] = value;
+
+		q_msg_axis++;
+
+		if (q_msg_axis >= 6)
+		{
+			QBiBeamAdd(q_msg_type, q_msg_org, q_msg_end, tS,
+				q_msg_beam_ent);
+			q_msg_state = QMSG_IDLE;
+		}
+
+		return;
+	}
+
+	if (q_msg_state != QMSG_WANT_COORDS)
+		return;
+
+	if (q_msg_axis < 3)
+	{
+		q_msg_org[q_msg_axis] = value;
+		q_msg_axis++;
+	}
+
+	if (q_msg_axis >= 3)
+	{
+		QBiTempEntity(q_msg_type, q_msg_org);
+		q_msg_state = QMSG_IDLE;
+	}
+}
+
+//--- individual builtins ---------------------------------------------------
+
+U0 QBiMakeVectors()
+{
+	F64 angles[3];
+	F64 forward[3];
+	F64 right[3];
+	F64 up[3];
+
+	QBiArgV(0, angles);
+	QAngleVectors(angles, forward, right, up);
+
+	QPrSetV(q_ofs_v_forward, forward);
+	QPrSetV(q_ofs_v_right, right);
+	QPrSetV(q_ofs_v_up, up);
+}
+
+U0 QBiSetOrigin()
+{
+	I64 ent = QBiArgEnt(0);
+	F64 org[3];
+
+	QBiArgV(1, org);
+	QBiSetFieldV(ent, q_fld_origin, org);
+}
+
+U0 QBiSetModel()
+{
+	I64 ent  = QBiArgEnt(0);
+	U8 *name = QBiArgS(1);
+	I64 idx  = QBiPrecacheModel(name);
+	I64 bm;
+	F64 mins[3];
+	F64 maxs[3];
+
+	QPrSetFieldI(ent, q_fld_model, QPrGetI(QBiArg(1)));
+	QPrSetFieldF(ent, q_fld_modelindex, ToF64(idx));
+
+	//an external .bsp carries its bounds in its worldmodel entry - without
+	//them the entity keeps a zero box and droptofloor fails
+	if (idx > 0 && idx < QBI_MAX_PRECACHE && q_precache_bsp[idx])
+	{
+		QVecCopy(q_precache_bsp[idx]->models[0].mins, mins);
+		QVecCopy(q_precache_bsp[idx]->models[0].maxs, maxs);
+		QBiSetMinMaxSize(ent, mins, maxs);
+		return;
+	}
+
+	//a brush model takes its bounds straight from the BSP
+	if (name[0] == '*' && q_bi_map)
+	{
+		bm = ToI64(QAtoF(name + 1));
+		if (0 <= bm < q_bi_map->num_models)
+		{
+			QVecCopy(q_bi_map->models[bm].mins, mins);
+			QVecCopy(q_bi_map->models[bm].maxs, maxs);
+			QBiSetMinMaxSize(ent, mins, maxs);
+		}
+	}
+}
+
+U0 QBiSetSize()
+{
+	I64 ent = QBiArgEnt(0);
+	F64 mins[3];
+	F64 maxs[3];
+
+	QBiArgV(1, mins);
+	QBiArgV(2, maxs);
+	QBiSetMinMaxSize(ent, mins, maxs);
+}
+
+U0 QBiTraceEnt(I64 ent, F64 *start, F64 *end, CQTrace *tr)
+{//SV_Move with the mover's own mins/maxs - what droptofloor, movestep and the
+ //AI floor check all use. world-only tracing makes brush entities invisible
+ //to the AI: monsters walk through closed doors and plats are not floor.
+	F64 mins[3];
+	F64 maxs[3];
+	I64 j;
+
+	for (j = 0; j < 3; j++)
+	{
+		mins[j] = QPrFieldF(ent, q_fld_mins + j);
+		maxs[j] = QPrFieldF(ent, q_fld_maxs + j);
+	}
+
+	QTraceEntity(q_bi_map, start, end, mins, maxs, ent, FALSE, tr);
+}
+
+U0 QBiTraceLine()
+{//traceline(v1, v2, nomonsters, ignore). PF_traceline is just
+ //
+ //    SV_Move (v1, vec3_origin, vec3_origin, v2, nomonsters, ent)
+ //
+ //world AND every solid entity, with a ZERO-SIZED box - a point trace through
+ //hull 0. hull 1 would report the world 16 units early in every direction.
+	CQTrace	tr;
+	F64		v1[3];
+	F64		v2[3];
+	F64		zero[3];
+	I64		ignore;
+	Bool	nomonsters;
+
+	QBiArgV(0, v1);
+	QBiArgV(1, v2);
+	nomonsters = ToBool(QBiArgF(2) != 0.0);
+	ignore     = QBiArgEnt(3);
+
+	QVecSet(zero, 0.0, 0.0, 0.0);
+
+	if (!q_bi_map)
+	{
+		//no map: a clean miss, don't leave the trace globals stale
+		QTraceInit(&tr, v2);
+		tr.all_solid = FALSE;
+		QBiStoreTrace(&tr, 0);
+		return;
+	}
+
+	QTraceEntity(q_bi_map, v1, v2, zero, zero, ignore, nomonsters, &tr);
+
+	//trace_ent is what was struck, or the world
+	if (tr.ent > 0)
+		QBiStoreTrace(&tr, tr.ent);
+	else
+		QBiStoreTrace(&tr, 0);
+}
+
+U0 QBiPointContents()
+{
+	F64 p[3];
+	I64 c = QCONTENTS_EMPTY;
+
+	QBiArgV(0, p);
+
+	if (q_bi_map)
+		c = QHullPointContents(q_bi_map, q_bi_map->models[0].head_node[1], p);
+
+	QBiRetF(ToF64(c));
+}
+
+U0 QBiDropToFloor()
+{//drop up to 256 units, report whether it landed
+	I64		ent = QPrEdictNum(QPrGetI(q_ofs_self));
+	CQTrace	tr;
+	F64		start[3];
+	F64		end[3];
+
+	QBiGetFieldV(ent, q_fld_origin, start);
+	QVecCopy(start, end);
+	end[2] -= 256.0;
+
+	if (!q_bi_map)
+	{
+		QBiRetF(0.0);
+		return;
+	}
+
+	QBiTraceEnt(ent, start, end, &tr);
+
+	if (tr.fraction == 1.0 || tr.all_solid)
+		QBiRetF(0.0);
+	else
+	{
+		QBiSetFieldV(ent, q_fld_origin, tr.end_pos);
+
+		//SV_LinkEdict after the move, or absmin/absmax still describe where
+		//the item was before it dropped
+		QGameLinkEdict(ent);
+
+		//PF_droptofloor marks it as resting on what it hit - SUB_regen and
+		//the AI floor checks read these back
+		if (q_fld_flags >= 0)
+			QPrSetFieldF(ent, q_fld_flags,
+				ToF64(ToI64(QPrFieldF(ent, q_fld_flags)) | QFL_ONGROUND_MOVE));
+
+		if (q_fld_groundentity >= 0 && tr.ent >= 0)
+			QPrSetFieldI(ent, q_fld_groundentity, QPrEdictValue(tr.ent));
+
+		QBiRetF(1.0);
+	}
+}
+
+Bool QBiCheckBottomEnt(I64 ent)
+{//SV_CheckBottom: real floor under the WHOLE box, not just part of it. stops
+ //a monster walking off a ledge, and into deep water - water is not solid so
+ //the corner test falls through to the trace, which finds no floor.
+	CQTrace	tr;
+	F64		org[3];
+	F64		mins[3];
+	F64		maxs[3];
+	F64		zero[3];
+	F64		start[3];
+	F64		stop[3];
+	F64		mid;
+	F64		bottom;
+	I64		x;
+	I64		y;
+	I64		j;
+
+	if (!q_bi_map)
+		return TRUE;
+
+	QBiGetFieldV(ent, q_fld_origin, org);
+	QBiGetFieldV(ent, q_fld_mins, mins);
+	QBiGetFieldV(ent, q_fld_maxs, maxs);
+
+	for (j = 0; j < 3; j++)
+	{
+		mins[j] += org[j];
+		maxs[j] += org[j];
+	}
+
+	QVecSet(zero, 0.0, 0.0, 0.0);
+
+	//fast out: solid world under all four corners
+	start[2] = mins[2] - 1.0;
+	for (x = 0; x <= 1; x++)
+	{
+		for (y = 0; y <= 1; y++)
+		{
+			if (x)	start[0] = maxs[0];
+			else	start[0] = mins[0];
+			if (y)	start[1] = maxs[1];
+			else	start[1] = mins[1];
+
+			if (QHullPointContents(q_bi_map,
+					q_bi_map->models[0].head_node[1], start) !=
+				QCONTENTS_SOLID)
+				goto qcb_real;
+		}
+	}
+
+	return TRUE;
+
+qcb_real:
+	//the midpoint must find floor within two step heights
+	start[2] = mins[2];
+	start[0] = (mins[0] + maxs[0]) * 0.5;
+	start[1] = (mins[1] + maxs[1]) * 0.5;
+	QVecCopy(start, stop);
+	stop[2] = start[2] - QPHYS_STEPSIZE * 2.0;
+
+	QTraceEntity(q_bi_map, start, stop, zero, zero, ent, TRUE, &tr);
+
+	if (tr.fraction == 1.0)
+		return FALSE;
+
+	mid    = tr.end_pos[2];
+	bottom = mid;
+
+	//and every corner within one step of that midpoint, or it's overhanging
+	for (x = 0; x <= 1; x++)
+	{
+		for (y = 0; y <= 1; y++)
+		{
+			if (x)	start[0] = maxs[0];
+			else	start[0] = mins[0];
+			if (y)	start[1] = maxs[1];
+			else	start[1] = mins[1];
+
+			stop[0] = start[0];
+			stop[1] = start[1];
+
+			QTraceEntity(q_bi_map, start, stop, zero, zero, ent, TRUE, &tr);
+
+			if (tr.fraction != 1.0 && tr.end_pos[2] > bottom)
+				bottom = tr.end_pos[2];
+
+			if (tr.fraction == 1.0 ||
+				mid - tr.end_pos[2] > QPHYS_STEPSIZE)
+				return FALSE;
+		}
+	}
+
+	return TRUE;
+}
+
+Bool QBiMoveStep(I64 ent, F64 yaw, F64 dist)
+{//SV_movestep: walk one step along a heading
+ //
+ //this does NOT sweep horizontally. project to the destination raised by one
+ //step height, then trace DOWNWARD for floor: walls make that trace start
+ //solid, ledges find no floor within two step heights.
+ //
+ //a horizontal sweep refuses essentially every move - the start point is
+ //already inside the expanded hull.
+	CQTrace	tr;
+	F64		origin[3];
+	F64		neworg[3];
+	F64		end[3];
+	F64		rad;
+	F64		dz;
+	I64		flags;
+	I64		enemy;
+	I64		attempt;
+
+	if (!q_bi_map)
+		return FALSE;
+
+	QBiGetFieldV(ent, q_fld_origin, origin);
+	rad = yaw * QDEG2RAD;
+
+	flags = ToI64(QPrFieldF(ent, q_fld_flags));
+
+	//swimmers and fliers don't step - they move in three dimensions and nudge
+	//toward the target's height. as walkers, a fish needs floor to move.
+	if (flags & (QFL_SWIM_ | QFL_FLY_))
+	{
+		enemy = 0;
+		if (q_fld_enemy >= 0)
+			enemy = QPrEdictNum(QPrFieldI(ent, q_fld_enemy));
+
+		for (attempt = 0; attempt < 2; attempt++)
+		{
+			neworg[0] = origin[0] + Cos(rad) * dist;
+			neworg[1] = origin[1] + Sin(rad) * dist;
+			neworg[2] = origin[2];
+
+			//first attempt closes the height gap, the second retries flat in
+			//case the climb was what blocked it
+			if (attempt == 0 && enemy > 0)
+			{
+				dz = origin[2] - QPrFieldF(enemy, q_fld_origin + 2);
+				if (dz > 40.0)
+					neworg[2] -= 8.0;
+				if (dz < 30.0)
+					neworg[2] += 8.0;
+			}
+
+			QBiTraceEnt(ent, origin, neworg, &tr);
+
+			if (tr.fraction == 1.0)
+			{
+				//a swimmer must not leave its water
+				if ((flags & QFL_SWIM_) &&
+					QHullPointContents(q_bi_map,
+						q_bi_map->models[0].head_node[1], tr.end_pos) ==
+					QCONTENTS_EMPTY)
+					return FALSE;
+
+				QBiSetFieldV(ent, q_fld_origin, tr.end_pos);
+				QGameLinkEdict(ent);
+				return TRUE;
+			}
+
+			if (enemy <= 0)
+				break;
+		}
+
+		return FALSE;
+	}
+
+	//destination, lifted to clear ordinary steps and thresholds
+	neworg[0] = origin[0] + Cos(rad) * dist;
+	neworg[1] = origin[1] + Sin(rad) * dist;
+	neworg[2] = origin[2] + QPHYS_STEPSIZE;
+
+	QVecCopy(neworg, end);
+	end[2] -= QPHYS_STEPSIZE * 2.0;
+
+	QBiTraceEnt(ent, neworg, end, &tr);
+
+	if (tr.all_solid)
+		return FALSE;
+
+	//start solid means the lift hit a ceiling, retry unlifted
+	if (tr.start_solid)
+	{
+		neworg[2] -= QPHYS_STEPSIZE;
+		QBiTraceEnt(ent, neworg, end, &tr);
+
+		if (tr.all_solid || tr.start_solid)
+			return FALSE;
+	}
+
+	//nothing within two step heights - that's a ledge
+	if (tr.fraction == 1.0)
+		return FALSE;
+
+	if (tr.plane_normal[2] < 0.7)
+		return FALSE;			//too steep to stand on
+
+	QBiSetFieldV(ent, q_fld_origin, tr.end_pos);
+
+	//the downward trace only proves SOMETHING is under the destination;
+	//SV_CheckBottom proves the whole box is supported
+	if (!QBiCheckBottomEnt(ent))
+	{
+		QBiSetFieldV(ent, q_fld_origin, origin);
+		return FALSE;
+	}
+
+	//standing on something now, so gravity has to stop pulling
+	flags = ToI64(QPrFieldF(ent, q_fld_flags));
+	QPrSetFieldF(ent, q_fld_flags, ToF64(flags | QFL_ONGROUND_MOVE));
+	QGameLinkEdict(ent);
+
+	return TRUE;
+}
+
+U0 QBiWalkMove()
+{//walkmove(yaw, dist) - move along an explicit heading
+	I64 ent = QPrEdictNum(QPrGetI(q_ofs_self));
+
+	QBiRetF(ToF64(QBiMoveStep(ent, QBiArgF(0), QBiArgF(1))));
+}
+
+U0 QBiMoveToGoal()
+{//movetogoal(dist) - head for goalentity, steering around obstacles
+ //
+ //NOTE: movetogoal takes ONLY a distance. it is not walkmove renamed; taking
+ //that distance as a yaw marches every monster into the nearest wall.
+	I64	ent		= QPrEdictNum(QPrGetI(q_ofs_self));
+	F64	dist	= QBiArgF(0);
+	I64	goal;
+	F64	origin[3];
+	F64	gorigin[3];
+	F64	d[3];
+	F64	ideal;
+	F64	turn;
+	I64	i;
+
+	if (!q_bi_map)
+	{
+		QBiRetF(0.0);
+		return;
+	}
+
+	QBiGetFieldV(ent, q_fld_origin, origin);
+	goal = QPrEdictNum(QPrFieldI(ent, q_fld_goalentity));
+
+	if (goal > 0 && goal < q_pr_num_edicts && !q_pr_edict_free[goal])
+	{
+		QBiGetFieldV(goal, q_fld_origin, gorigin);
+		QVecSub(gorigin, origin, d);
+
+		if (d[0] == 0.0 && d[1] == 0.0)
+			ideal = QPrFieldF(ent, q_fld_ideal_yaw);
+		else
+		{
+			ideal = Arg(d[0], d[1]) / QDEG2RAD;
+			if (ideal < 0.0)
+				ideal += 360.0;
+		}
+	}
+	else
+		ideal = QPrFieldF(ent, q_fld_ideal_yaw);
+
+	//straight at the goal, then wider detours either side - this is how a
+	//monster rounds a corner instead of stalling on it
+	for (i = 0; i < 5; i++)
+	{
+		switch (i)
+		{
+			case 0:	turn = 0.0;		break;
+			case 1:	turn = 45.0;	break;
+			case 2:	turn = -45.0;	break;
+			case 3:	turn = 90.0;	break;
+			default: turn = -90.0;	break;
+		}
+
+		if (QBiMoveStep(ent, QAngleNorm(ideal + turn), dist))
+		{
+			//face the way it actually went, so ChangeYaw turns the body to
+			//match and the walk animation reads right
+			QPrSetFieldF(ent, q_fld_ideal_yaw, QAngleNorm(ideal + turn));
+			q_move_ok++;
+			QBiRetF(1.0);
+			return;
+		}
+	}
+
+	q_move_fail++;
+
+	//boxed in - report failure so the AI picks a new goal
+	QBiRetF(0.0);
+}
+
+U0 QBiChangeYaw()
+{//turn toward ideal_yaw at yaw_speed, the short way round
+	I64 ent		= QPrEdictNum(QPrGetI(q_ofs_self));
+	F64 current	= QAngleNorm(QPrFieldF(ent, q_fld_angles + 1));
+	F64 ideal	= QPrFieldF(ent, q_fld_ideal_yaw);
+	F64 speed	= QPrFieldF(ent, q_fld_yaw_speed);
+	F64 move;
+
+	if (current == ideal)
+		return;
+
+	move = ideal - current;
+
+	if (ideal > current)
+	{
+		if (move >= 180.0)
+			move -= 360.0;
+	}
+	else
+	{
+		if (move <= -180.0)
+			move += 360.0;
+	}
+
+	if (move > 0.0)
+	{
+		if (move > speed)
+			move = speed;
+	}
+	else
+	{
+		if (move < -speed)
+			move = -speed;
+	}
+
+	QPrSetFieldF(ent, q_fld_angles + 1, QAngleNorm(current + move));
+
+	//turn state sample: yaw_speed 0 means it can never turn, a static
+	//ideal_yaw means the AI isn't tracking, both fine means the fault is in
+	//the draw-time rotation
+	if (q_yaw_reports < 3)
+	{
+		q_yaw_reports++;
+		StrPrint(q_yaw_line,
+			"yaw: %s cur=%.0f ideal=%.0f speed=%.0f -> %.0f\n",
+			QPrStr(QPrFieldI(ent, q_fld_classname)),
+			current, ideal, speed, QAngleNorm(current + move));
+		QLog(q_yaw_line);
+	}
+}
+
+//find() diagnostics.
+//
+//SUB_UseTargets and LinkDoors both walk entities with
+//    do { t = find(t, field, value); if (!t) return; ... } while (1);
+//which ONLY terminates because find resumes AFTER the entity handed to it -
+//return the same entity twice and the loop never ends.
+//
+//so count consecutive calls that fail to advance, log the first few.
+#define QFIND_MAX_REPORTS	12
+I64 q_find_last_start	= -1;
+I64 q_find_last_result	= -1;
+I64 q_find_repeats		= 0;
+I64 q_find_reports		= 0;
+U8  q_find_line[160];
+
+U0 QBiFind()
+{//linear scan from a start entity for a string field match
+	I64  start = QBiArgEnt(0);
+	I64  fld   = QPrGetI(QBiArg(1));
+	U8  *match = QBiArgS(2);
+	I64  found = 0;
+	I64  i;
+	U8  *s;
+
+	for (i = start + 1; i < q_pr_num_edicts; i++)
+	{
+		if (!q_pr_edict_free[i])
+		{
+			s = QPrStr(QPrFieldI(i, fld));
+			if (s[0] && !StrCompare(s, match))
+			{
+				found = i;
+				goto qf_done;
+			}
+		}
+	}
+
+qf_done:
+	//same start, same answer: a caller's walk is not progressing
+	if (start == q_find_last_start && found == q_find_last_result && found != 0)
+		q_find_repeats++;
+	else
+		q_find_repeats = 0;
+
+	if (q_find_repeats == 8 && q_find_reports < QFIND_MAX_REPORTS)
+	{
+		q_find_reports++;
+
+		StrPrint(q_find_line,
+			"find: NOT ADVANCING start=%d -> %d field=%d match='%s'\n",
+			start, found, fld, match);
+		QLog(q_find_line);
+		QPrStackDump;
+		QLogFlush;
+	}
+
+	q_find_last_start  = start;
+	q_find_last_result = found;
+
+	QBiRetEnt(found);
+}
+
+U0 QBiSetSpawnParms()
+{//PF_setspawnparms - the arg names WHICH client, and edicts 1..maxclients are
+ //the client slots, so edict number is slot plus one
+	I64	ent;
+	I64	slot;
+	I64	ofs;
+	I64	i;
+
+	ent  = QBiArgEnt(0);
+	slot = ent - 1;
+
+	//a hard error in the original. leaving the globals alone is the safe
+	//equivalent - ClientConnect sees SetNewParms' output, not another
+	//player's kit.
+	if (slot < 0 || slot >= QSV_MAX_CLIENTS)
+		return;
+
+	if (!q_client_parms_set[slot])
+		return;
+
+	for (i = 0; i < QPR_MAX_PARM_GLOBALS; i++)
+	{
+		ofs = q_ofs_parms[i];
+		if (ofs >= 0)
+			QPrSetF(ofs, q_client_parms[slot * QPR_MAX_PARM_GLOBALS + i]);
+	}
+}
+
+U0 QBiFindRadius()
+{//PF_findradius: a .chain-linked list of every solid edict whose BOX CENTRE is
+ //inside the sphere. T_RadiusDamage and GrenadeExplode walk the whole list;
+ //returning just the first hit makes splash damage a no-op.
+	F64 org[3];
+	F64 rad;
+	F64 eorg[3];
+	F64 mins[3];
+	F64 maxs[3];
+	F64 d[3];
+	I64 i;
+	I64 j;
+	I64 chain;
+
+	QBiArgV(0, org);
+	rad = QBiArgF(1);
+	chain = 0;		//world terminates the list, as in the original
+
+	if (q_fld_chain < 0)
+	{
+		QBiRetEnt(0);
+		return;
+	}
+
+	for (i = 1; i < q_pr_num_edicts; i++)
+	{
+		if (q_pr_edict_free[i])
+			goto qfr_next;
+
+		if (QPrFieldF(i, q_fld_solid) == 0.0)
+			goto qfr_next;
+
+		QBiGetFieldV(i, q_fld_origin, eorg);
+		QBiGetFieldV(i, q_fld_mins, mins);
+		QBiGetFieldV(i, q_fld_maxs, maxs);
+
+		for (j = 0; j < 3; j++)
+			eorg[j] = eorg[j] + (mins[j] + maxs[j]) * 0.5;
+
+		QVecSub(eorg, org, d);
+		if (QVecLength(d) > rad)
+			goto qfr_next;
+
+		QPrSetFieldI(i, q_fld_chain, QPrEdictValue(chain));
+		chain = i;
+
+qfr_next:
+	}
+
+	QBiRetEnt(chain);
+}
+
+U0 QBiNextEnt()
+{
+	I64 i = QBiArgEnt(0) + 1;
+
+	while (i < q_pr_num_edicts)
+	{
+		if (!q_pr_edict_free[i])
+		{
+			QBiRetEnt(i);
+			return;
+		}
+		i++;
+	}
+
+	QBiRetEnt(0);
+}
+
+U0 QBiVecToYaw()
+{
+	F64 v[3];
+	F64 yaw;
+
+	QBiArgV(0, v);
+
+	if (v[0] == 0.0 && v[1] == 0.0)
+		yaw = 0.0;
+	else
+	{
+		yaw = Arg(v[0], v[1]) / QDEG2RAD;
+		if (yaw < 0.0)
+			yaw += 360.0;
+	}
+
+	QBiRetF(yaw);
+}
+
+U0 QBiVecToAngles()
+{
+	F64 v[3];
+	F64 out[3];
+
+	QBiArgV(0, v);
+	QVecToAngles(v, out);
+	QBiRetV(out);
+}
+
+U0 QBiVtos()
+{//PF_vtos: "%5.1f %5.1f %5.1f"
+	F64 v[3];
+	U8  buf[64];
+
+	QBiArgV(0, v);
+	StrPrint(buf, "%5.1f %5.1f %5.1f", v[0], v[1], v[2]);
+
+	QPrSetI(QPR_OFS_RETURN, QPrTempString(buf));
+}
+
+U0 QBiFtos()
+{//PF_ftos: whole numbers as integers, everything else %5.1f
+	F64 v = QBiArgF(0);
+	U8  buf[32];
+
+	if (v == ToF64(ToI64(v)))
+		StrPrint(buf, "%d", ToI64(v));
+	else
+		StrPrint(buf, "%5.1f", v);
+
+	QPrSetI(QPR_OFS_RETURN, QPrTempString(buf));
+}
+
+U0 QBiSpawn()
+{
+	QBiRetEnt(QPrSpawnEdict);
+}
+
+U0 QBiRemove()
+{
+	QPrFreeEdict(QBiArgEnt(0));
+}
+
+//text QuakeC printed, waiting for the console to collect it. the console is
+//in QMenu.ZC, compiled after this file, so it is parked here and drained
+//there - same arrangement as the fov and cheat requests.
+//
+//W_ChangeWeapon answers a key with no weapon behind it via sprint("no
+//weapon.\n"); dropped, that is indistinguishable from a dead key.
+#define QBI_PRINT_MAX	1024
+
+U8	q_bi_print_buf[QBI_PRINT_MAX];
+I64	q_bi_print_len = 0;
+
+U0 QBiPrintAppend(U8 *s)
+{
+	I64 n;
+
+	if (!s)
+		return;
+
+	n = StrLen(s);
+
+	//dropped, not truncated - a half line is worse than a missing one
+	if (q_bi_print_len + n + 1 >= QBI_PRINT_MAX)
+		return;
+
+	MemCopy(q_bi_print_buf + q_bi_print_len, s, n);
+	q_bi_print_len += n;
+	q_bi_print_buf[q_bi_print_len] = 0;
+}
+
+//commands QuakeC pushed at the client with stuffcmd, waiting to run.
+//
+//stuffcmd is Cbuf_AddText - a CONSOLE COMMAND run as if typed. "bf" is
+//V_BonusFlash_f, fired on every item pickup and every tick of a powerup
+//running out, so a stub here kills the pickup flash and the powerup warning.
+#define QBI_STUFF_MAX	512
+
+U8	q_bi_stuff_buf[QBI_STUFF_MAX];
+I64	q_bi_stuff_len = 0;
+
+U0 QBiStuffCmd(I64 ent, U8 *s)
+{//stuffcmd(client, text) - arg 0 names WHICH client runs it, or the host
+ //flashes when a remote picks something up
+	I64 n;
+	I64 slot;
+
+	if (!s || !s[0])
+		return;
+
+	//remote client: svc_stufftext on its own reliable channel
+	if (ent > 0 && ent != q_player_edict)
+	{
+		slot = ent - 1;		//edicts 1..maxclients are reserved per slot
+		if (slot >= 0 && slot < QSV_MAX_CLIENTS)
+		{
+			QBiWireByte(&q_sv_client_msg[slot], QSVC_STUFFTEXT);
+			QBiWireString(&q_sv_client_msg[slot], s);
+		}
+		return;
+	}
+
+	n = StrLen(s);
+
+	if (q_bi_stuff_len + n + 1 >= QBI_STUFF_MAX)
+		return;
+
+	MemCopy(q_bi_stuff_buf + q_bi_stuff_len, s, n);
+	q_bi_stuff_len += n;
+	q_bi_stuff_buf[q_bi_stuff_len] = 0;
+}
+
+U0 QBiPrint(I64 first_arg, I64 dest = 0)
+{//bprint/sprint/dprint all funnel here
+ //dest: 0 = this machine only (dprint), 1 = every client (bprint), or a
+ //client edict for sprint
+	I64		 i;
+	I64		 argc = q_pr_argc;
+	CQMsg	*m;
+
+	//bounded by pr_argc, not by hunting for a zero slot: the OFS_PARM globals
+	//keep whatever the previous call left, so sprint would trail off into the
+	//sound name a sound() passed moments earlier. PF_VarString does the same.
+	if (argc > QPR_MAX_PARMS)
+		argc = QPR_MAX_PARMS;
+
+	//sprint to a remote: svc_print on its own channel, nowhere else
+	m = QBiClientMsg(dest);
+	if (m)
+	{
+		QBiWireByte(m, QSVC_PRINT);
+		for (i = first_arg; i < argc; i++)
+			QBiWireString(m, QBiArgS(i));
+		return;
+	}
+
+	//bprint reaches everyone through the protocol INCLUDING this machine - the
+	//listen server's own client parses svc_print like any other, so printing
+	//locally too doubles every join and obituary
+	if (dest == 1)
+	{
+		QBiWireByte(&q_sv_reliable_datagram, QSVC_PRINT);
+		for (i = first_arg; i < argc; i++)
+			QBiWireString(&q_sv_reliable_datagram, QBiArgS(i));
+		return;
+	}
+
+	for (i = first_arg; i < argc; i++)
+	{
+		QBiPrintAppend(QBiArgS(i));
+
+		if (q_bi_dprint)
+			"%s", QBiArgS(i);
+	}
+}
+
+//--- dispatch --------------------------------------------------------------
+
+U0 QBiDispatch(I64 num)
+{
+	F64		v[3];
+	F64		a[3];
+	F64		bmax[3];
+	I64		ent;
+	CQTrace	bi_trace;
+
+	switch (num)
+	{
+		case 1:		QBiMakeVectors;		break;
+		case 2:		QBiSetOrigin;		break;
+		case 3:		QBiSetModel;		break;
+		case 4:		QBiSetSize;			break;
+
+		case 6:		break;				//break: debugger hook, ignored
+
+		case 7:		QBiRetF(ToF64(RandU32 & 0xFFFF) / 65536.0);	break;
+
+		case 8:
+			//sound(entity, channel, sample, volume, attenuation) - play local
+			//AND write svc_sound so remotes hear it
+			ent = QBiArgEnt(0);
+			QBiGetFieldV(ent, q_fld_origin, v);
+
+			//a brush entity's origin is often 0,0,0 with the geometry in its
+			//bounds, so use the box centre
+			QBiGetFieldV(ent, q_fld_mins, a);
+			if (a[0] != 0.0 || a[1] != 0.0 || a[2] != 0.0)
+			{
+				QBiGetFieldV(ent, q_fld_maxs, bmax);
+				v[0] += (a[0] + bmax[0]) * 0.5;
+				v[1] += (a[1] + bmax[1]) * 0.5;
+				v[2] += (a[2] + bmax[2]) * 0.5;
+			}
+
+			QSndPlayAt(QBiArgS(2), v, QBiArgF(3), QBiArgF(4),
+				ent, ToI64(QBiArgF(1)));
+			QSvStartSound(ent, ToI64(QBiArgF(1)), QBiArgS(2),
+				ToI64(QBiArgF(3) * 255.0), QBiArgF(4));
+			break;
+
+		case 9:
+			QBiArgV(0, v);
+			QVecNormalize(v);
+			QBiRetV(v);
+			break;
+
+		case 10:
+		case 11:
+			//PF_objerror prints the edict then Host_Errors, never benign -
+			//dump who and where. NOTE: the edict is NOT freed, unlike the
+			//original - ED_Free here deletes the door and its whole chain.
+			"QuakeC error: %s\n", QBiArgS(0);
+			StrPrint(q_bi_err_line, "QuakeC error: %s\n", QBiArgS(0));
+			QLog(q_bi_err_line);
+			QPrChainDump;
+			QPrStackDump;
+			QLogFlush;
+			q_pr_error = TRUE;
+			break;
+
+		case 12:
+			QBiArgV(0, v);
+			QBiRetF(QVecLength(v));
+			break;
+
+		case 13:	QBiVecToYaw;		break;
+		case 14:	QBiSpawn;			break;
+		case 15:	QBiRemove;			break;
+		case 16:	QBiTraceLine;		break;
+
+		case 17:	QBiCheckClient;		break;	//checkclient
+
+		case 18:	QBiFind;			break;
+
+		case 19:	//precache_sound
+		case 76:
+			if (q_precache_sound_count < QBI_MAX_PRECACHE)
+			{
+				q_precache_sound[q_precache_sound_count] = QBiArgS(0);
+				q_precache_sound_count++;
+			}
+			QPrSetI(QPR_OFS_RETURN, QPrGetI(QBiArg(0)));
+			break;
+
+		case 20:	//precache_model
+		case 75:
+			QBiPrecacheModel(QBiArgS(0));
+			QPrSetI(QPR_OFS_RETURN, QPrGetI(QBiArg(0)));
+			break;
+
+		case 21:	//stuffcmd(client, text) - Cbuf_AddText on the client
+			QBiStuffCmd(QBiArgEnt(0), QBiArgS(1));
+			break;
+		case 22:	QBiFindRadius;		break;
+		case 23:	QBiPrint(0, 1);					break;	//bprint: everyone
+		case 24:	QBiPrint(1, QBiArgEnt(0));		break;	//sprint: one client
+		case 25:	QBiPrint(0);					break;	//dprint: local only
+		case 26:	QBiFtos;			break;
+
+		case 27:	QBiVtos;			break;	//vtos
+		case 28:	break;				//coredump
+		case 29:	q_pr_trace = TRUE;	break;
+		case 30:	q_pr_trace = FALSE;	break;
+		case 31:	break;				//eprint
+
+		case 32:	QBiWalkMove;		break;
+		case 34:	QBiDropToFloor;		break;
+		case 35:	QLightStyleSet(ToI64(QBiArgF(0)), QBiArgS(1));	break;
+
+		case 36:	QBiRetF(Round(QBiArgF(0)));	break;
+		case 37:	QBiRetF(Floor(QBiArgF(0)));	break;
+		case 38:	QBiRetF(Ceil(QBiArgF(0)));	break;
+
+		case 40:
+			//checkbottom(entity) - a blind "yes" tells the AI every ledge is
+			//safe to walk off
+			ent = QBiArgEnt(0);
+			QBiGetFieldV(ent, q_fld_origin, v);
+			QVecCopy(v, bmax);
+			bmax[2] -= QPHYS_STEPSIZE * 2.0;
+
+			if (!q_bi_map)
+				QBiRetF(1.0);
+			else
+			{
+				QBiTraceEnt(ent, v, bmax, &bi_trace);
+				QBiRetF(ToF64(bi_trace.fraction < 1.0));
+			}
+			break;
+		case 41:	QBiPointContents;	break;
+		case 43:	QBiRetF(Abs(QBiArgF(0)));	break;
+
+		case 44:
+			//aim(entity, speed) - where the shooter is actually facing.
+			//v_forward belongs to whoever last called makevectors, usually a
+			//monster, so shots would fly along its heading.
+			ent = QPrEdictNum(QPrGetI(q_ofs_self));
+			QBiGetFieldV(ent, q_fld_v_angle, a);
+
+			//clients aim along v_angle, everything else its body angles
+			if (a[0] == 0.0 && a[1] == 0.0 && a[2] == 0.0)
+				QBiGetFieldV(ent, q_fld_angles, a);
+
+			QAngleVectors(a, v, NULL, NULL);
+			QBiRetV(v);
+			break;
+
+		case 45:	QBiRetF(QCvarGet(QBiArgS(0)));	break;	//cvar
+		case 46:	QBiLocalCmd(QBiArgS(0));	break;	//localcmd
+		case 47:	QBiNextEnt;			break;
+		case 48:	//particle(origin, dir, color, count)
+			QBiArgV(0, v);
+			QBiArgV(1, a);
+			QPartEffect(v, a, ToI64(QBiArgF(2)), ToI64(QBiArgF(3)), tS);
+			QBiParticleWire(v, a, ToI64(QBiArgF(2)), ToI64(QBiArgF(3)));
+			break;
+		case 49:	QBiChangeYaw;		break;
+		case 51:	QBiVecToAngles;		break;
+
+		//the byte and coord writers also feed the local temp-entity
+		//reassembler, so the host sees its own effects
+		case 52:	QBiWriteByte(QBiWriteDest, ToI64(QBiArgF(1)));	break;
+		case 53:	QBiWriteByte(QBiWriteDest, ToI64(QBiArgF(1)));	break;
+		case 54:	QBiWireShort(QBiWriteDest, ToI64(QBiArgF(1)));	break;
+		case 55:	QBiWireLong(QBiWriteDest, ToI64(QBiArgF(1)));	break;
+		case 56:	QBiWriteCoord(QBiWriteDest, QBiArgF(1));		break;
+		case 57:	QBiWireAngle(QBiWriteDest, QBiArgF(1));			break;
+		case 58:	QBiWriteString(QBiWriteDest, QBiArgS(1));		break;
+		case 59:	QBiWriteEntity(QBiWriteDest, QBiArgEnt(1));		break;
+
+		case 67:	QBiMoveToGoal;		break;	//movetogoal(dist)
+
+		case 68:
+		case 77:
+			QPrSetI(QPR_OFS_RETURN, QPrGetI(QBiArg(0)));	break;	//precache_file
+
+		case 69:	QBiMakeStatic;		break;
+		case 70:
+			//changelevel(mapname) - recorded, not acted on. tearing the world
+			//down inside a think frees the running bytecode; the app services
+			//this between frames.
+			QStrCopy(q_change_map, QBiArgS(0), 64);
+			q_change_pending = TRUE;
+			break;
+		case 72:	//cvar_set(name, value) - the value arrives as a string
+			QCvarSet(QBiArgS(0), QAtoF(QBiArgS(1)));
+			break;
+		case 73:	QBiCenterPrint(QBiArgEnt(0), QBiArgS(1));	break;
+		case 74:
+			//ambientsound(pos, sample, volume, attenuation) - a permanent
+			//looping source, not a one-shot at load
+			QBiArgV(0, v);
+			QSndAmbientAdd(v, QBiArgS(1), QBiArgF(2), QBiArgF(3));
+			QBiAmbientSignon(v, QBiArgS(1), QBiArgF(2), QBiArgF(3));
+			break;
+
+		case 78:
+			//PF_setspawnparms(client): stored parms into parm1..parm16 so
+			//ClientConnect rebuilds the loadout they arrived with. per client,
+			//on a level change.
+			QBiSetSpawnParms;
+			break;
+
+		default:
+			//unknown builtins return zero rather than stopping the VM
+			QPrSetI(QPR_OFS_RETURN, 0);
+			break;
+	}
+}
+
+U0 QBiInit()
+{//install the dispatcher, resolve the trace globals
+	I64 i;
+
+	//clear the precache tables before anything walks them, or teardown frees
+	//heap garbage
+	for (i = 0; i < QBI_MAX_PRECACHE; i++)
+	{
+		q_precache_model[i] = NULL;
+		q_precache_mdl[i]   = NULL;
+		q_precache_sound[i] = NULL;
+	}
+	q_precache_model_count = 0;
+	q_precache_sound_count = 0;
+
+	//the precache->BSP-model table is the same state and resets with it. stale
+	//mappings against reassigned indices make QClipBrushModel return -1, and
+	//collision skips a brush entity with no model number - doors go non-solid.
+	QClipPrecacheReset;
+
+	q_pr_builtin_call = &QBiDispatch;
+
+	q_ofs_trace_allsolid		= QPrFindGlobal("trace_allsolid");
+	q_ofs_trace_startsolid		= QPrFindGlobal("trace_startsolid");
+	q_ofs_trace_fraction		= QPrFindGlobal("trace_fraction");
+	q_ofs_trace_endpos			= QPrFindGlobal("trace_endpos");
+	q_ofs_trace_plane_normal	= QPrFindGlobal("trace_plane_normal");
+	q_ofs_trace_plane_dist		= QPrFindGlobal("trace_plane_dist");
+	q_ofs_trace_ent				= QPrFindGlobal("trace_ent");
+	q_ofs_trace_inopen			= QPrFindGlobal("trace_inopen");
+	q_ofs_trace_inwater			= QPrFindGlobal("trace_inwater");
+
+	QBiCheckClientReset;
+}

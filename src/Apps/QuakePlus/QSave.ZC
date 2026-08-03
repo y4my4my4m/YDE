@@ -1,0 +1,506 @@
+// QSave.ZC - Host_Savegame_f / Host_Loadgame_f
+//
+// NOTE: this is a binary container, not id's text .sav - there is no ftos or
+// tokenizer here, and round-tripping physics state through decimal loses
+// precision. not interchangeable with id's files
+//
+// everything the VM cannot rebuild:
+//   - the global pool
+//   - the entity field block and the free list
+//   - the string heap, map keys were appended to it at load and entity
+//     fields hold offsets into it
+//   - the precache lists, .modelindex is an index into them
+//   - light styles, carried parms, engine-side player state
+//
+// load runs the map and bytecode up but NOT the spawn functions, then
+// overwrites the world
+
+// version 2 appends a spawn parm block for every client slot. it is a TRAILER,
+// past everything version 1 wrote, because CQSaveHeader's size is baked into
+// every v1 file on disk - growing the class would shift the whole body and
+// misread them. a v1 file simply has no trailer, and loads as one client
+#define QSAVE_MAGIC			0x56535A51	//"QZSV" little-endian
+#define QSAVE_VERSION		2
+#define QSAVE_VERSION_MIN	1
+
+//I64 slot count, I64 parms per slot, then per slot an I64 set flag and its
+//parms - counts are in the trailer, not the frozen header
+#define QSAVE_PARM_BYTES	(16 + QSV_MAX_CLIENTS * (8 + QPR_MAX_PARM_GLOBALS * 8))
+
+class CQSaveHeader
+{
+	U32	magic;
+	U32	version;
+	U8	mapname[96];
+	F64	game_time;
+	F64	origin[3];
+	F64	velocity[3];
+	F64	angles[3];
+	I64	on_ground;
+	I64	water_level;
+	I64	water_type;
+	I64	num_edicts;
+	I64	edict_stride;
+	I64	num_globals;
+	I64	strings_size;
+	I64	string_alloc;
+	I64	num_models;
+	I64	num_sounds;
+	F64	saved_parms[QGAME_MAX_PARMS];
+	F64	saved_serverflags;
+};
+
+U8 *QSaveAppend(U8 *dst, U8 *src, I64 bytes)
+{//append and return the new write point
+	MemCopy(dst, src, bytes);
+	return dst + bytes;
+}
+
+U0 QSaveSpawnParms()
+{//SV_SaveSpawnparms: run SetChangeParms once per ACTIVE client with self set
+ //to that client's body, and keep what it leaves in parm1..parm16
+ //
+ //the QuakeC side is untouched - this is the same call the changelevel path
+ //makes, only over every slot instead of the local player alone. without it a
+ //coop save carries one inventory and the other players respawn empty
+	I64	fn;
+	I64	ofs;
+	I64	ent;
+	I64	i;
+	I64	j;
+	F64	value;
+
+	fn = QPrFindFunction("SetChangeParms");
+	if (fn <= 0)
+		return;
+
+	for (i = 0; i < QSV_MAX_CLIENTS; i++)
+	{
+		if (!q_sv_clients[i].active)
+			goto qsp_next;
+
+		ent = q_sv_clients[i].edict;
+		if (ent < 1 || ent >= q_pr_num_edicts || q_pr_edict_free[ent])
+			goto qsp_next;
+
+		QPrSetI(q_ofs_self, QPrEdictValue(ent));
+		QPrExecute(fn);
+		q_pr_error = FALSE;
+
+		for (j = 0; j < QPR_MAX_PARM_GLOBALS; j++)
+		{
+			ofs = q_ofs_parms[j];
+			if (ofs < 0)
+				goto qsp_next_parm;
+
+			//via a temp - this compiler computes the slot address before
+			//evaluating the call and can lose the store
+			value = QPrGetF(ofs);
+			q_client_parms[i * QPR_MAX_PARM_GLOBALS + j] = value;
+
+qsp_next_parm:
+		}
+
+		q_client_parms_set[i] = TRUE;
+
+qsp_next:
+	}
+}
+
+Bool QSaveWrite(U8 *path, U8 *mapname, F64 game_time, F64 *origin,
+	F64 *velocity, F64 *angles, Bool on_ground, I64 water_level,
+	I64 water_type)
+{//Host_Savegame_f
+	CQSaveHeader	 hdr;
+	U8				*buf;
+	U8				*p;
+	I64				 total;
+	I64				 edict_bytes;
+	I64				 ofs;
+	I64				 i;
+	I64				 j;
+
+	//guard the counts the buffer size is computed from - a save against a torn
+	//down world sized from stale counts, and the bad block only faulted in Free
+	if (!q_game_active || !q_pr_edicts || !q_pr_globals || !q_pr_strings)
+	{
+		"QSave: no game in progress\n";
+		return FALSE;
+	}
+
+	if (q_pr_num_edicts < 1 || q_pr_edict_stride < 1 ||
+		q_pr_num_globals < 1 || q_pr_strings_size < 1)
+	{
+		"QSave: world is not loaded\n";
+		return FALSE;
+	}
+
+	if (q_intermission)
+	{
+		"QSave: can't save in intermission\n";
+		return FALSE;
+	}
+
+	//Host_Savegame_f: deathmatch is out, there is nothing coherent to restore
+	//when the level is a scoreboard. coop is fine and keeps every inventory
+	if (QCvarGet("deathmatch") != 0.0)
+	{
+		"QSave: can't save a deathmatch game\n";
+		return FALSE;
+	}
+
+	//refresh every active client's parms first, they are written below
+	QSaveSpawnParms;
+
+	MemSet(&hdr, 0, sizeof(CQSaveHeader));
+
+	hdr.magic        = QSAVE_MAGIC;
+	hdr.version      = QSAVE_VERSION;
+	QStrCopy(hdr.mapname, mapname, 96);
+	hdr.game_time    = game_time;
+	//NOT ToI64(), that is the F64->I64 intrinsic and would reinterpret the
+	//Bool's bits as a double
+	hdr.on_ground    = on_ground;
+	hdr.water_level  = water_level;
+	hdr.water_type   = water_type;
+	hdr.num_edicts   = q_pr_num_edicts;
+	hdr.edict_stride = q_pr_edict_stride;
+	hdr.num_globals  = q_pr_num_globals;
+	hdr.strings_size = q_pr_strings_size;
+	hdr.string_alloc = q_pr_string_alloc;
+	hdr.num_models   = q_precache_model_count;
+	hdr.num_sounds   = q_precache_sound_count;
+
+	for (j = 0; j < 3; j++)
+	{
+		hdr.origin[j]   = origin[j];
+		hdr.velocity[j] = velocity[j];
+		hdr.angles[j]   = angles[j];
+	}
+
+	for (j = 0; j < QGAME_MAX_PARMS; j++)
+		hdr.saved_parms[j] = q_saved_parms[j];
+	hdr.saved_serverflags = q_saved_serverflags;
+
+	edict_bytes = q_pr_num_edicts * q_pr_edict_stride;
+
+	total = sizeof(CQSaveHeader)
+		+ q_pr_num_globals * 4
+		+ edict_bytes
+		+ q_pr_num_edicts			//one free flag per edict
+		+ q_pr_strings_size
+		+ QMAX_LIGHTSTYLES * QLIGHTSTYLE_LEN
+		+ (q_precache_model_count + q_precache_sound_count) * 8
+		+ QSAVE_PARM_BYTES;
+
+	if (total < 1)
+	{
+		"QSave: refusing a %d byte save\n", total;
+		return FALSE;
+	}
+
+	buf = MAlloc(total);
+	if (!buf)
+	{
+		"QSave: out of memory for %d bytes\n", total;
+		return FALSE;
+	}
+
+	p = buf;
+
+	p = QSaveAppend(p, &hdr, sizeof(CQSaveHeader));
+	p = QSaveAppend(p, q_pr_globals, q_pr_num_globals * 4);
+	p = QSaveAppend(p, q_pr_edicts, edict_bytes);
+
+	//Bool is wider than a byte, pack the free list down
+	for (i = 0; i < q_pr_num_edicts; i++)
+	{
+		if (q_pr_edict_free[i])
+			p[0] = 1;
+		else
+			p[0] = 0;
+		p++;
+	}
+
+	p = QSaveAppend(p, q_pr_strings, q_pr_strings_size);
+	p = QSaveAppend(p, q_lightstyle, QMAX_LIGHTSTYLES * QLIGHTSTYLE_LEN);
+
+	//precache names as offsets into the heap, not copies - the heap is in this
+	//file already so an offset can't drift from the entity string fields
+	for (i = 0; i < q_precache_model_count; i++)
+	{
+		ofs = 0;
+		if (q_precache_model[i])
+			ofs = q_precache_model[i] - q_pr_strings;
+		MemCopy(p, &ofs, 8);
+		p += 8;
+	}
+
+	for (i = 0; i < q_precache_sound_count; i++)
+	{
+		ofs = 0;
+		if (q_precache_sound[i])
+			ofs = q_precache_sound[i] - q_pr_strings;
+		MemCopy(p, &ofs, 8);
+		p += 8;
+	}
+
+	//--- version 2 trailer: per client spawn parms ---
+	ofs = QSV_MAX_CLIENTS;
+	MemCopy(p, &ofs, 8);
+	p += 8;
+
+	ofs = QPR_MAX_PARM_GLOBALS;
+	MemCopy(p, &ofs, 8);
+	p += 8;
+
+	for (i = 0; i < QSV_MAX_CLIENTS; i++)
+	{
+		ofs = 0;
+		if (q_client_parms_set[i])
+			ofs = 1;
+		MemCopy(p, &ofs, 8);
+		p += 8;
+
+		MemCopy(p, &q_client_parms[i * QPR_MAX_PARM_GLOBALS],
+			QPR_MAX_PARM_GLOBALS * 8);
+		p += QPR_MAX_PARM_GLOBALS * 8;
+	}
+
+	if (FileWrite(path, buf, total) < 1)
+	{
+		"QSave: could not write %s\n", path;
+		Free(buf);
+		return FALSE;
+	}
+
+	Free(buf);
+
+	"QSave: wrote %s (%d bytes, %d edicts)\n", path, total, q_pr_num_edicts;
+	return TRUE;
+}
+
+//load is two halves - only the shell knows how to bring a map up
+//
+//QSaveReadHeader reports which map is needed, the shell loads it,
+//QSaveRestore pours the saved state into the fresh world
+U8	*q_save_buf		= NULL;
+I64	 q_save_size	= 0;
+CQSaveHeader q_save_hdr;
+
+U0 QSaveDiscard()
+{
+	if (q_save_buf)
+	{
+		Free(q_save_buf);
+		q_save_buf = NULL;
+	}
+	q_save_size = 0;
+}
+
+Bool QSaveReadHeader(U8 *path, U8 *_mapname)
+{//read the file, report the map it belongs to
+	I64 size = 0;
+
+	QSaveDiscard;
+
+	q_save_buf = FileRead(path, &size);
+	if (!q_save_buf)
+	{
+		"QSave: %s not found\n", path;
+		return FALSE;
+	}
+
+	q_save_size = size;
+
+	if (size < sizeof(CQSaveHeader))
+	{
+		"QSave: %s is truncated\n", path;
+		QSaveDiscard;
+		return FALSE;
+	}
+
+	MemCopy(&q_save_hdr, q_save_buf, sizeof(CQSaveHeader));
+
+	//a version 1 file is still perfectly readable, it just stops after the
+	//precache lists. reject only what is not ours or is from the future
+	if (q_save_hdr.magic != QSAVE_MAGIC ||
+		q_save_hdr.version < QSAVE_VERSION_MIN ||
+		q_save_hdr.version > QSAVE_VERSION)
+	{
+		"QSave: %s is not a version %d..%d save\n", path,
+			QSAVE_VERSION_MIN, QSAVE_VERSION;
+		QSaveDiscard;
+		return FALSE;
+	}
+
+	QStrCopy(_mapname, q_save_hdr.mapname, 96);
+	return TRUE;
+}
+
+Bool QSaveRestore(F64 *_game_time, F64 *origin, F64 *velocity, F64 *angles,
+	Bool *_on_ground, I64 *_water_level, I64 *_water_type)
+{//Host_Loadgame_f second half - overwrite the fresh world
+	CQSaveHeader	*hdr = &q_save_hdr;
+	U8				*p;
+	I64				 edict_bytes;
+	I64				 ofs;
+	I64				 i;
+	I64				 j;
+	I64				 slots;
+	I64				 nparm;
+	I64				 flag;
+	I64				 remaining;
+	F64				 value;
+
+	if (!q_save_buf)
+		return FALSE;
+
+	//layouts must match exactly or the field block is misread, they only
+	//differ if the bytecode changed under the save
+	if (hdr->edict_stride != q_pr_edict_stride ||
+		hdr->num_globals != q_pr_num_globals ||
+		hdr->strings_size != q_pr_strings_size)
+	{
+		"QSave: save does not match this progs.dat\n";
+		QSaveDiscard;
+		return FALSE;
+	}
+
+	if (hdr->num_edicts < 1 || hdr->num_edicts > q_pr_max_edicts)
+	{
+		"QSave: edict count out of range\n";
+		QSaveDiscard;
+		return FALSE;
+	}
+
+	edict_bytes = hdr->num_edicts * hdr->edict_stride;
+	p           = q_save_buf + sizeof(CQSaveHeader);
+
+	MemCopy(q_pr_globals, p, hdr->num_globals * 4);
+	p += hdr->num_globals * 4;
+
+	MemCopy(q_pr_edicts, p, edict_bytes);
+	p += edict_bytes;
+
+	for (i = 0; i < hdr->num_edicts; i++)
+	{
+		q_pr_edict_free[i] = ToBool(p[0]);
+		p++;
+	}
+
+	q_pr_num_edicts = hdr->num_edicts;
+
+	//entity string fields are offsets into this
+	MemCopy(q_pr_strings, p, hdr->strings_size);
+	p += hdr->strings_size;
+	q_pr_string_alloc = hdr->string_alloc;
+
+	MemCopy(q_lightstyle, p, QMAX_LIGHTSTYLES * QLIGHTSTYLE_LEN);
+	p += QMAX_LIGHTSTYLES * QLIGHTSTYLE_LEN;
+
+	//rebuild in index order - re-precaching by name returns the same indices,
+	//so every .modelindex still means what it did at save time
+	for (i = 0; i < hdr->num_models; i++)
+	{
+		MemCopy(&ofs, p, 8);
+		p += 8;
+
+		if (i > 0 && ofs > 0 && ofs < q_pr_strings_size)
+			QBiPrecacheModel(QPrStr(ofs));
+	}
+
+	for (i = 0; i < hdr->num_sounds; i++)
+	{
+		MemCopy(&ofs, p, 8);
+		p += 8;
+
+		if (ofs > 0 && ofs < q_pr_strings_size &&
+			q_precache_sound_count < QBI_MAX_PRECACHE)
+		{
+			q_precache_sound[q_precache_sound_count] = QPrStr(ofs);
+			q_precache_sound_count++;
+		}
+	}
+
+	for (j = 0; j < QGAME_MAX_PARMS; j++)
+		q_saved_parms[j] = hdr->saved_parms[j];
+	q_saved_serverflags = hdr->saved_serverflags;
+	q_have_saved_parms  = TRUE;
+
+	//--- per client spawn parms ---
+	//
+	//seed every slot from the header first. that is all a version 1 file has,
+	//and it is exactly the old single client behaviour - slot 0 holds the
+	//player's kit and nobody else is set
+	for (i = 0; i < QSV_MAX_CLIENTS; i++)
+		q_client_parms_set[i] = FALSE;
+
+	for (j = 0; j < QPR_MAX_PARM_GLOBALS; j++)
+		q_client_parms[j] = hdr->saved_parms[j];
+	q_client_parms_set[0] = TRUE;
+
+	remaining = q_save_size - (p - q_save_buf);
+
+	if (hdr->version >= 2 && remaining >= 16)
+	{
+		//counts live here, not in the header - the header is frozen at its
+		//version 1 size and a wider QSV_MAX_CLIENTS must still read old files
+		MemCopy(&slots, p, 8);
+		p += 8;
+		MemCopy(&nparm, p, 8);
+		p += 8;
+		remaining -= 16;
+
+		if (slots >= 0 && nparm >= 0 &&
+			remaining >= slots * (8 + nparm * 8))
+		{
+			for (i = 0; i < slots; i++)
+			{
+				MemCopy(&flag, p, 8);
+				p += 8;
+
+				//read every parm the file has, keep the ones this build has
+				//room for - a save from a bigger progs must not walk off
+				for (j = 0; j < nparm; j++)
+				{
+					MemCopy(&value, p, 8);
+					p += 8;
+
+					if (i < QSV_MAX_CLIENTS && j < QPR_MAX_PARM_GLOBALS)
+						q_client_parms[i * QPR_MAX_PARM_GLOBALS + j] = value;
+				}
+
+				if (i < QSV_MAX_CLIENTS)
+					q_client_parms_set[i] = ToBool(flag);
+			}
+		}
+		else
+			"QSave: parm block is malformed, keeping one client\n";
+	}
+
+	for (j = 0; j < 3; j++)
+	{
+		origin[j]   = hdr->origin[j];
+		velocity[j] = hdr->velocity[j];
+		angles[j]   = hdr->angles[j];
+	}
+
+	*_game_time   = hdr->game_time;
+	*_on_ground   = ToBool(hdr->on_ground);
+	*_water_level = hdr->water_level;
+	*_water_type  = hdr->water_type;
+
+	//the VM clock must agree with the restored time or every scheduled think
+	//fires at once, or never
+	QPrSetF(q_ofs_time, hdr->game_time);
+	q_game_time = hdr->game_time;
+
+	//absmin/absmax are derived, rebuild rather than trust
+	QGameLinkAll;
+
+	"QSave: restored %d edicts at t=%.1f\n", q_pr_num_edicts, hdr->game_time;
+
+	QSaveDiscard;
+	return TRUE;
+}

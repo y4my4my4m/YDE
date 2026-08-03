@@ -5,6 +5,9 @@ Contract: `docs/Apps/UT99/PORT.md`.
 Boot = Engine Client (`UTClient`) + SoftDrv `URenderDevice`.
 UWindow from retail `System/UWindow.u` / `UMenu.u` / `UTMenu.u`.
 Start Match → `UTClientTravel` → Level Model SoftDrv + PlayerStart possess.
+SoftDrv world draw uses Z-buffer (FSpan off: first-seg clip + seg cap sealed the view).
+Cursor = `Texture'MouseCursor'` from UWindow.u (exact name) or poly arrow — UWindow only.
+Menu music = `utmenu23.umx`; map travel falls back to Cannon.
 
 ## SoftDrv
 
@@ -15,7 +18,7 @@ Start Match → `UTClientTravel` → Level Model SoftDrv + PlayerStart possess.
 
 ## Resolution
 
-SoftDrv canvas (not GR letterbox) defaults **640×480**. Blit letterboxes into the WinMax window (`ut_blit_*`).
+SoftDrv canvas defaults **640×480**. Present blit stretches to fill the WinMax window (`ut_blit_*` = full `dc`; no letterbox).
 
 | Slot | Size |
 |------|------|

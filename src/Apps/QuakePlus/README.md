@@ -1,13 +1,14 @@
-# Quake for ZealOS
+# QuakePlus for ZealOS
 
-A Quake engine written natively in ZealC. No C source is translated from id's
-release: everything here is written against the published file format specs
-(PAK, BSP29, MDL, SPR, WAD2, progs.dat) and the NetQuake protocol.
+Fork of `::/Apps/Quake` aimed at FitzQuake / QuakeSpasm / Ironwail-class mods
+(Alkaline, qbj3, …). Stock WinQuake stays in `Quake/`; this tree takes the
+raised limits, BSP2, loose gamedir files, `.lit`, and related engine work.
 
-It plays: software rasterizer, QuakeC VM, save/load, demos, sound, and UDP
-multiplayer against other ZealOS boxes or a stock NetQuake client.
+Base today is still the NetQuake-shaped ZealC port (software rasterizer,
+QuakeC VM, protocol 15). Ironwail features land here; reference:
+https://github.com/andrei-drexler/ironwail
 
-FitzQuake / QuakeSpasm / Ironwail-class mods live in `::/Apps/QuakePlus`.
+Mods in-tree (gitignored data): `alkaline/`, `qbj3/`. Select with `game <dir>`.
 
 
 ## Game data
@@ -18,7 +19,7 @@ It is gitignored - fetch it separately:
     curl -O https://ftp.gwdg.de/pub/misc/ftp.idsoftware.com/idstuff/quake/quake106.zip
     unzip quake106.zip                 # yields resource.1, an LHA self-extractor
     7z x -oout resource.1              # yields out/ID1/PAK0.PAK
-    cp out/ID1/PAK0.PAK src/Apps/Quake/id1/
+    cp out/ID1/PAK0.PAK src/Apps/QuakePlus/id1/
 
 Expected: 18689235 bytes, md5 `5906e5998fc3d896ddaf5e6a62e03abb`, 339 entries.
 
@@ -34,10 +35,10 @@ what you get out of an archive depends on where it came from.
 
 ## Running
 
-    Cd("::/Apps/Quake");;ExeFile("Run");        // single player
-    Cd("::/Apps/Quake");;ExeFile("RunNet");     // single player + UDP
+    Cd("::/Apps/QuakePlus");;ExeFile("Run");        // single player
+    Cd("::/Apps/QuakePlus");;ExeFile("RunNet");     // single player + UDP
 
-Or pick **Quake** from the YDE launcher menu.
+Or pick **QuakePlus** from the YDE launcher menu.
 
 `RunNet.ZC` is a separate entry point rather than a runtime switch because the
 binding is compile-time: the compiler is single-pass, so `UDPSocket` has to
@@ -134,7 +135,7 @@ These are silent-failure traps, not style preferences:
 
 ## Verifying the data layer
 
-    Cd("::/Apps/Quake");;ExeFile("Run");
+    Cd("::/Apps/QuakePlus");;ExeFile("Run");
 
 `QTest` is not run automatically - Quake clears the document on startup and would
 wipe anything printed first. Run `QTest;` from the prompt after quitting. It
@@ -164,7 +165,7 @@ exponent mistake shows up there immediately.
 
 ## Debugging
 
-Everything the engine has to say goes to `::/Apps/Quake/QUAKELOG.TXT`, flushed
+Everything the engine has to say goes to `::/Apps/QuakePlus/QUAKELOG.TXT`, flushed
 eagerly so a crash still leaves the evidence on disk. Teardown is breadcrumbed
 step by step - the last line in the file names the step that was running.
 
