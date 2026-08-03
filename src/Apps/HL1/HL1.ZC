@@ -43,9 +43,54 @@
 CHLVisState	*hl_vis		= NULL;
 CHLCanvas	*hl_canvas	= NULL;
 
+//Finished-frame colour plane. draw_it blit reads this, not the live canvas:
+//HLHudFadeDraw walks every pixel and a compositor mid-pass shows a torn fade.
+U32			*hl_present		= NULL;
+I64			 hl_present_w	= 0;
+I64			 hl_present_h	= 0;
+
 //Resolution the canvas was actually built at. hl_opt_res is what the menu asked
 //for, which is not the same thing once an allocation has been refused.
 I64			 hl_res_applied = 0;
+
+U0 HLPresentFree()
+{
+	if (hl_present)
+		Free(hl_present);
+	hl_present   = NULL;
+	hl_present_w = 0;
+	hl_present_h = 0;
+}
+
+Bool HLPresentAlloc(I64 w, I64 h)
+{//colour plane only; depth stays on the back canvas
+	HLPresentFree;
+
+	if (w < 1 || h < 1)
+		return FALSE;
+
+	hl_present = CAlloc(w * h * sizeof(U32));
+	if (!hl_present)
+		return FALSE;
+
+	hl_present_w = w;
+	hl_present_h = h;
+	return TRUE;
+}
+
+U0 HLPresent()
+{//copy the finished back canvas once. draw_it only ever sees a complete frame
+	I64 n;
+
+	if (!hl_canvas || !hl_canvas->pixels || !hl_present)
+		return;
+
+	if (hl_canvas->width != hl_present_w || hl_canvas->height != hl_present_h)
+		return;
+
+	n = hl_present_w * hl_present_h * sizeof(U32);
+	MemCopy(hl_present, hl_canvas->pixels, n);
+}
 
 F64	 hl_origin[3];		//player origin, what physics moves
 F64	 hl_view[3];			//eye position, origin plus the view height
@@ -77,6 +122,11 @@ U0 HLDrawIt(CTask *task, CDC *dc)
  //stale HLCenterView snapshot - WinMax / DE can change pix size under us.
  //Fullscreen fills the window; windowed keeps aspect. Letterbox is painted
  //black so Doc spam (ENT trace, etc.) cannot show through.
+ //
+ //Source is hl_present when allocated: the live canvas is still being written
+ //(fade composite especially) while this callback runs on another tick.
+	CHLCanvas present;
+	CHLCanvas *src;
 	I64 w;
 	I64 h;
 	I64 cw;
@@ -127,7 +177,17 @@ U0 HLDrawIt(CTask *task, CDC *dc)
 	hl_blit_x = (w - bw) / 2;
 	hl_blit_y = (h - bh) / 2;
 
-	HLDrawBlitFit(hl_canvas, dc, hl_blit_x, hl_blit_y, hl_blit_w, hl_blit_h);
+	src = hl_canvas;
+	if (hl_present && hl_present_w == cw && hl_present_h == ch)
+	{
+		MemSet(&present, 0, sizeof(CHLCanvas));
+		present.pixels = hl_present;
+		present.width  = hl_present_w;
+		present.height = hl_present_h;
+		src = &present;
+	}
+
+	HLDrawBlitFit(src, dc, hl_blit_x, hl_blit_y, hl_blit_w, hl_blit_h);
 }
 
 //--- deferred translucent pass ----------------------------------------------
@@ -207,6 +267,7 @@ U0 HLRenderEntities()
 	F64		  dist[3];
 	F64		  center[3];
 	F64		  cycle;
+	F64		  scale;
 	I64		  i;
 	I64		  amt;
 	I64		  frame;
@@ -300,6 +361,14 @@ qde_next_brush:
 				e->seq, cycle, e->blending[0], e->body, e->skin,
 				HLEntLightPoint(hl_map, e), e->controllers,
 				e->blending[1], i);
+
+			//xen_plantlight: CXenPLight hangs sprites/flare3.spr on attachment 1.
+			//No bone attachment here; mid-hull glow and the deferred pass.
+			if (e->spr)
+			{
+				HLTransCenter(e, center);
+				HLTransAdd(i, center);
+			}
 		}
 		else
 			HLMdlDraw(hl_canvas, e->mdl, e->frame, e->origin,
@@ -329,6 +398,20 @@ qde_next:
 
 			HLSprDrawEntity(hl_canvas, e->spr, frame, e->origin, e->angles,
 				HLEntLightPoint(hl_map, e), e->rendermode, amt, e->scale);
+		}
+		else if (e->spr && e->studio)
+		{
+			//plantlight glow: origin + (0,0,(mins.z+maxs.z)*0.5), xen.cpp:105
+			center[0] = e->origin[0];
+			center[1] = e->origin[1];
+			center[2] = e->origin[2] + (e->mins[2] + e->maxs[2]) * 0.5;
+			if (amt <= 0)
+				amt = 255;
+			scale = e->scale;
+			if (scale <= 0.0)
+				scale = 1.0;
+			HLSprDrawEntity(hl_canvas, e->spr, 0, center, e->angles,
+				HLEntLightPoint(hl_map, e), HLRENDER_GLOW, amt, scale);
 		}
 		else if (HLClipIsRotatingDraw(hl_trans_ent[i]))
 			HLDrawBrushModel(hl_canvas, hl_map, e->brush_model,
@@ -1104,16 +1187,22 @@ U0 HLHudDrawFrame(CHLCanvas *c)
 {//HL HUD in place of Quake's status bar: none of Sbar's art (SBAR, IBAR, the
  //big digits) exists in valve/.
  //
- //With a VM the numbers come from the player edict; without one, from the
- //native entity world.
+ //Client/demo: numbers come from hl_cl (clientdata + Battery usermsg).
+ //Listen host / solo: native entity world.
 	I64 health  = 100;
 	I64 battery = 0;
 	I64 ammo    = -1;
 
-	//The entity world owns the player's health and armour. HLPlayerHealth and
-	//HLPlayerArmor read the same globals, so there is no second path.
-	health  = ToI64(HLPlayerHealth);
-	battery = ToI64(HLPlayerArmor);
+	if (HLClientMode)
+	{
+		health  = hl_cl.health;
+		battery = hl_cl.armorvalue;
+	}
+	else
+	{
+		health  = ToI64(HLPlayerHealth);
+		battery = ToI64(HLPlayerArmor);
+	}
 
 	ammo = HLWeaponAmmo;
 
@@ -1674,6 +1763,7 @@ U0 HLRenderFrame()
 	if (!HLMapValid(hl_map, "HLRenderFrame") || !hl_vis)
 	{
 		HLHudDrawFrame(hl_canvas);
+		HLPresent;
 		return;
 	}
 
@@ -1819,6 +1909,8 @@ U0 HLRenderFrame()
 		HLConDraw(hl_canvas);
 	else
 		HLConDrawNotify(hl_canvas);
+
+	HLPresent;
 }
 
 U0 HLCenterView(CTask *task)
@@ -1925,6 +2017,7 @@ U0 HLApplyVideo()
 	old      = hl_canvas;
 	hl_canvas = NULL;
 	HLDrawFree(old);
+	HLPresentFree;
 
 	hl_canvas = HLDrawNew(w, h);
 
@@ -1965,6 +2058,9 @@ U0 HLApplyVideo()
 		Fs->draw_it = &HLDrawIt;
 		return;
 	}
+
+	if (!HLPresentAlloc(hl_canvas->width, hl_canvas->height))
+		"HL1: present buffer refused; blit falls back to live canvas\n";
 
 	hl_res_applied = hl_opt_res;
 
@@ -2405,6 +2501,7 @@ Bool HLChangeLevel(U8 *mapname)
 	//The inventory is native now; nothing to pack out of a QuakeC world.
 	HLGameShutdown;
 	HLEntFree;
+	HLMortarPendClear;
 
 	if (hl_vis)
 	{
@@ -2425,6 +2522,7 @@ Bool HLChangeLevel(U8 *mapname)
 		if (hl_pic_conback.pixels)
 			HLPicDrawFill(hl_canvas, &hl_pic_conback);
 		HLSbarLoadingPlaque(hl_canvas);
+		HLPresent;
 		hl_loading = TRUE;
 	}
 
@@ -2993,6 +3091,7 @@ U0 HLGameLoop()
 				else if (hl_state == HLST_PLAYING)
 				{
 					hl_state = HLST_MENU;
+					HLMenuMsReset;
 					HLMenuSound(HLMSND_ENTER);
 				}
 				else if (hl_state == HLST_CONSOLE)
@@ -3000,6 +3099,7 @@ U0 HLGameLoop()
 					//Key_Console passes ESC straight to M_ToggleMenu_f.
 					hl_state     = HLST_MENU;
 					hl_menu_page = HLPAGE_MAIN;
+					HLMenuMsReset;
 					HLMenuSound(HLMSND_ENTER);
 				}
 				//The keyboard page owns ESC: it cancels an armed SetNewKey and
@@ -3068,6 +3168,7 @@ U0 HLGameLoop()
 		{
 			HLMenuDraw(hl_canvas);
 			HLConDraw(hl_canvas);
+			HLPresent;
 			HLCenterView(Fs);
 			hl_ready = TRUE;
 
@@ -3138,6 +3239,21 @@ U0 HLGameLoop()
 			}
 			last_menu_sc = menu_sc;
 
+			//VGUI mouse: raw mode freezes mouse.pos, so dx/dy feed a soft
+			//cursor; hover arms the same rows keyboard nav uses.
+			if (HLMenuMouse(hl_canvas, dx, dy, hl_blit_w, hl_blit_h,
+				mouse1, wheel_dz, &start_game))
+			{
+				if (start_game)
+				{
+					HLDemoStop;
+					hl_demo_loop = FALSE;
+
+					hl_menu_ingame = TRUE;
+					hl_state       = HLST_PLAYING;
+				}
+			}
+
 			//Multiplayer new game: the map must restart so items spawn with
 			//deathmatch already active. Flipping it on a live level leaves the
 			//existing ones wrong.
@@ -3166,6 +3282,8 @@ U0 HLGameLoop()
 				HLRenderFrame;
 
 			HLMenuDraw(hl_canvas);
+			HLMenuMsDraw(hl_canvas);
+			HLPresent;
 			HLCenterView(Fs);
 			hl_ready = TRUE;
 
@@ -3491,11 +3609,12 @@ U0 HLGameLoop()
 			//the player's own orientation
 			HLEntFrame(hl_map, HLSERVER_STEP, hl_origin, hl_angles);
 
-			//Demo playback owns the frame: no input, no move, no think. Vanilla
-			//has no prediction either - V_CalcRefdef puts the view on
-			//cl_entities[cl.viewentity], and the angles are the three floats
-			//recorded beside every demo message.
-			if (hl_demo_playing)
+		//Demo playback owns the frame: no input, no move, no think. Vanilla
+		//has no prediction either - V_CalcRefdef puts the view on
+		//cl_entities[cl.viewentity], and the angles are the three floats
+		//recorded beside every demo message. Guest move is HLPredApply after
+		//CL_SendMove, not the free-running HLPlayerMove below.
+		if (hl_demo_playing)
 			{
 				if (hl_cl_viewent > 0 && hl_cl_viewent < HLNET_MAX_ENTS)
 					HLVecCopy(hl_net_cl[hl_cl_viewent].origin, hl_origin);
@@ -3503,6 +3622,11 @@ U0 HLGameLoop()
 				HLVecCopy(hl_demo_angles, hl_angles);
 				HLVecSet(hl_velocity, 0.0, 0.0, 0.0);
 				hl_on_ground = TRUE;
+			}
+			else if (hl_udp_ready && !hl_udp_server)
+			{
+				//Guest: authoritative origin is the wire; HLPredApply after
+				//SendMove replays unacked cmds on top of the last snap.
 			}
 			else if (!hl_noclip)
 			{
@@ -3740,13 +3864,28 @@ U0 HLGameLoop()
 		//the wire wants units/sec, which is the same speed the local move used.
 		//upmove is rebuilt from the keys rather than taken from move[2], which
 		//HLVecNormalize has already turned into a fraction of the wish vector.
+		//
+		//HLPredApply: snap from the last view-entity state and replay the
+		//unacked cmd ring. Runs after SendMove so this frame's cmd is in the
+		//ring.
 		if (hl_udp_ready && !hl_udp_server && hl_cl_signon >= 4)
+		{
 			HLNetClientSendMove(hl_angles, net_fwd * speed, net_side * speed,
 				ToF64(HLSvFlagI(HLInDown(HLIN_MOVEUP)) -
 					HLSvFlagI(HLInDown(HLIN_MOVEDOWN))) * speed,
 				attack,
 				ToBool(HLInDown(HLIN_JUMP) && !hl_ent_input_locked),
-				impulse, hl_game_time);
+				impulse, hl_game_time,
+				ToBool(HLInDown(HLIN_DUCK) && !hl_ent_input_locked),
+				dt);
+			HLPredApply(hl_map, hl_origin, hl_velocity, &hl_on_ground);
+			//Predicted punch: hl_punch lives here; Pred seeds from wire.
+			HLVecCopy(hl_pred_punch, hl_punch);
+		}
+
+		HLTrainPlayerDriveFrame(
+			ToBool(HLInDown(HLIN_FORWARD) && !hl_ent_input_locked),
+			ToBool(HLInDown(HLIN_BACK) && !hl_ent_input_locked));
 
 		//player_weaponstrip. CBasePlayer::RemoveAllItems(FALSE): weapons and
 		//ammo only, the suit and the long jump stay.
@@ -3931,6 +4070,7 @@ U0 HLTaskEndCB()
 	Fs->draw_it = NULL;
 	Sleep(100);
 	hl_canvas = NULL;
+	HLPresentFree;
 
 	//By handle, then by voice table: HLSndStopAll releases the handles this app
 	//knows about, AudioSFXStopAll covers anything started outside it.
@@ -4143,6 +4283,9 @@ U0 HL1(U8 *mapname = HLDEFAULT_MAP)
 		return;
 	}
 
+	if (!HLPresentAlloc(hl_canvas->width, hl_canvas->height))
+		"HL1: present buffer refused; blit falls back to live canvas\n";
+
 	hl_res_applied = hl_opt_res;
 
 	//hud.txt carries one row per element per resolution, so the table can only be
@@ -4227,6 +4370,7 @@ U0 HL1(U8 *mapname = HLDEFAULT_MAP)
 	//Clear each global before releasing it, so a late HLDrawIt sees NULL.
 	canvas   = hl_canvas;
 	hl_canvas = NULL;
+	HLPresentFree;
 	vis      = hl_vis;
 	hl_vis    = NULL;
 	map      = hl_map;

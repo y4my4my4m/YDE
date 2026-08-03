@@ -23,16 +23,27 @@ comments. Deviations are deliberate and marked.
 - **WAD3** - archives named in worldspawn's `wad` key. Per-miptex 256-colour
   palettes; the renderer composites in RGB, no shared colormap.
 - **Truecolor canvas** - `0x00RRGGBB`. Gamma and damage/water tint applied in
-  the blit. Video menu: 320x240 … 800x600 plus **1280x720**; fullscreen is
+  the blit. A present colour plane is composited once per frame after fades.
+  Video menu: 320x240 … 800x600 plus 1280x720; fullscreen is
   edge-to-edge (`WinBorder(OFF)` + full text grid, fill-blit); windowed
   toggle resizes via `HLWindowApply` (no canvas rebuild).
 - **Studio MDL v10** - bones, RLE channels, slerp, blends, bodygroups, skin
-  families, embedded or `<name>T.mdl` textures. Software rasterised through
-  the world span loop.
-- **SPR v2** - own palette, ADDITIVE and INDEXALPHA.
+  families, embedded or `<name>T.mdl` textures. Demand-loaded sequence groups
+  (`<name>NN.mdl` / IDSQ). Per-normal light with screen-space Gouraud spans;
+  `STUDIO_NF_CHROME` environment UVs from view-space normals. Software
+  rasterised through the world span loop. Local-pose bone cache when
+  seq+frame unchanged.
+- **SPR v2** - own palette, ADDITIVE and INDEXALPHA. `HLLightPoint` results
+  for NORMAL sprites are grid-cached.
 - **Mip selection** - texels per screen pixel via texinfo vector length, as
   Quake `mipadjust`. Distance alone costs one to two levels on HL's texture
   scales.
+- **Spans** - opaque `surf32` fast path behind `hl_r_spanfast`; view-rect
+  clear; 1:1 blit when canvas matches window.
+- **Brush models** - unrotated faces backface-culled by eye-vs-plane (not view
+  forward); world uses PVS.
+- **Dlights** - keyed rocket/muzzle/explosion/flashlight entries feed the
+  surface-cache key.
 - **Sound** - 48 mixer voices (`AUDIO_MAX_SFX_VOICES`, `src/System/AC97.ZC`),
   twelve ambient loops, sixteen dynamic channels, reverb by room type,
   `sentences.txt` word scheduler, distance-cadenced footsteps.
@@ -41,6 +52,11 @@ comments. Deviations are deliberate and marked.
   MPEG-1 Layer III decoder, sliced on the game task, one pass per trigger.
 - **Console/HUD font** - WAD3 `qfont_t` variable-width glyphs; kernel-font
   fallback without `gfx.wad`.
+- **Net / demo** - protocol 48 client parse, signon (serverinfo / resourcelist /
+  usermsg decls / signonnum stages), and server frame send with entity +
+  clientdata deltas; `record` / `stop` write the same S2C stream playback
+  reads. Client prediction: punch from clientdata, platform basevelocity,
+  exponential origin error lerp (~100ms).
 
 ## Game
 
@@ -48,46 +64,54 @@ comments. Deviations are deliberate and marked.
   letter, ladders, water, waterjump, fall damage, conveyors. Duck `c`,
   use `e`.
 - **Entities** - native, no QuakeC. All 125 shipped maps spawn every
-  classname. Doors, buttons, trains, tracktrains with path-fire, triggers,
-  multi_manager/multisource, breakables, pushables, chargers, pickups
-  (world_items included), momentary brushes, env_* effects, game_text,
-  changelevels with player carry.
+  classname. Runtime slots via `HLEntAlloc`/`HLEntRelease`. Doors, buttons,
+  trains, tracktrains with path-fire, rotating hull, and bank roll from the
+  `bank` key, triggers, multi_manager/multisource, breakables, pushables,
+  chargers, pickups (world_items included), momentary brushes, env_* effects,
+  game_text, changelevels with player carry. `func_monsterclip` is solid to
+  monster hulls only (`hl_clip_for_monster`). `func_mortar_field`,
+  `trigger_monsterjump`, and `xen_plantlight` glow are live.
 - **Weapons** - hitscan table with real `VECTOR_CONE_*` and `gSkillData`;
   projectiles: grenades, MP5 M203, RPG, crossbow, satchel, tripmine, snark,
-  hornet, egon.
-- **AI** - schedule/task interpreter, node-graph routing from the shipped
-  `.nod` files (maps without one run straight-line), scripted_sequence and
+  hornet, egon. Autoaim HUD reticle; gauss glow sprites; RPG designator
+  glow.
+- **AI** - schedule/task interpreter, node-graph routing from shipped `.nod`
+  files (maps without one run straight-line), lateral + hint-node cover,
+  scent conditions over carcass/meat/garbage sounds, scripted_sequence and
   scripted_sentence, per-monster HandleAnimEvent, monstermaker, talk
-  monsters with follow.
+  monsters with follow, squad slotting. AI spit/hornet/controller ball/
+  grunt and assassin grenade use the shared `hl_proj` pool; gargantua flame
+  is `HLPRJ_FLAME` cone damage; apache/osprey rockets are `HLPRJ_ROCKET`.
+  Headcrab leap flight; babycrab aliases headcrab with tiny hull. Turret /
+  miniturret share the sentry think path (`orientation` 0 floor / 1 ceiling).
+  Tentacle (Listen + melee), nihilanth (ctrlball), apache/osprey, leech,
+  cockroach, assassin, gargantua, ichthyosaur, bigmomma register as AI kinds.
+  Death sequences pick forward/back/head/gut takes from attack direction and
+  hitgroup when the model carries them.
+- **Mounted guns** - `func_tank` / `func_tankcontrols` / laser / rocket /
+  mortar: use mounts, view yaw/pitch within map limits, primary fire
+  hitscan or rocket via `hl_proj` (func_tank.cpp).
+- **weaponbox** - MP death packs the active weapon (`PackDeadPlayerItems`);
+  touch gives. SP drops nothing (`DeadPlayerWeapons` = NO).
+- **info_bigmomma** - path nodes for `monster_bigmomma`. Momma walks the chain
+  as non-combat goals; combat is chase+melee (+mortar range from skill).
+- **func_guntarget** - brush path_corner target; Use starts, damage kills and
+  fires `message` (plats.cpp CGunTarget).
+- **func_traincontrols** - mounts player to linked `func_tracktrain`; +forward
+  / +back edges set speed (plats.cpp CFuncTrainControls / Use USE_SET).
 - **Save/load** - native entity serialisation, eight slots, field census
-  checked by `utils/hl1-savefields.py`.
+  checked by `utils/hl1-savefields.py`. `HLEntMakeDormant` holds changelevel
+  destination copies inert until restore merge.
 - **Menu** - built from shipped `resource/` files: GameMenu.res, .res dialog
-  layouts, ClientScheme colours, TGA backdrop tiles. Keyboard navigation
-  only.
+  layouts, ClientScheme colours, TGA backdrop tiles. Keyboard and mouse
+  navigation.
 - **Skill** - all `sk_` constants from `valve/skill.cfg`.
 
 ## Not done
 
-- Remaining fauna beyond leech (assassin, garg, ichthyosaur stay model-only).
-- Protocol 48 server send loop; field encoding and delta.lst are done.
-- Present buffer for the frame; fades can flicker.
-- Node cover / scent / scripted death poses (Wave L).
-- `func_tracktrain` bank key still unused; rotating hull is on.
-- VGUI mouse input; menus are keyboard-only.
-- Sequence groups (`<name>NN.mdl`), chrome, per-vertex model lighting / Gouraud.
-- Client prediction, demo record (Wave C).
-- Optional hand-asm span (C fast path via `hl_r_spanfast` landed).
-
-## Recently landed (Wave A/B start)
-
-- AI projectiles via `hl_proj` queue (spit, hornet, ctrl ball, grunt grenade).
-- `func_monsterclip` solid to monsters only (`hl_clip_for_monster`).
-- Headcrab leap flight + leech AI row.
-- Autoaim HUD reticle, gauss glow sprites, RPG spot glow.
-- Soft-raster: `HLLightPoint` grid cache; unrotated brush backface cull;
-  opaque `surf32` span fast path (`hl_r_spanfast`); view-rect clear;
-  1:1 blit path; studio local-pose bone cache; keyed rocket/muzzle/explosion
-  dlights.
+- Protocol 48: unverified vs stock GoldSrc peer (usercmd_t deltas, several
+  svc payloads). Same-engine listen/dedicated 48 signon path is wired.
+- Client weapon prediction, voice options UI, brass shell ejections.
 
 ## Game data
 

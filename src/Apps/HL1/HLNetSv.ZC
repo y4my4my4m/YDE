@@ -17,21 +17,18 @@
 //   HLNetClientParse     router - dispatches on hl_net_protocol.
 //
 // The writers (HLNetWriteServerInfo, HLNetWriteClientdata, the player sweep via
-// HLNetWriteEntityUpdate) are protocol 15. The signon writers under "PROTOCOL
-// 48: the write side" at the end of this file are unreferenced; the entity
-// stream is not - HLNetServerFrame routes a slot whose netchan negotiated 48 to
-// HLSv48SendFrame, which captures a frame per server step and emits
-// svc_packetentities or svc_deltapacketentities.
+// HLNetWriteEntityUpdate) are protocol 15. Protocol 48 signon writers live under
+// "PROTOCOL 48: the write side"; Accept48 and HLSvSendClientSignon drive them.
+// HLNetServerFrame routes a slot whose netchan negotiated 48 to HLSv48SendFrame
+// once signon reaches 4.
 //
-// That send is unreachable today: it is gated on signon 4, and no path drives a
-// 48 slot through the signon, because the 48 signon writers have no caller and
-// HLNetServerReadClient decodes the protocol 15 clc_ table, which 48 renumbers.
+// HLNetParseFromClient selects the clc_ table from HLNetSlotIs48. Same-engine
+// peers keep the protocol-15 clc_move payload layout on the 48 opcodes; stock
+// GoldSrc usercmd_t deltas are unverified.
 //
-// The 48 reader cannot carry a game: HLNetParse48Unverified refuses 17 opcodes,
-// among them svc_sound, svc_event and svc_temp_entity. The entity stream -
-// svc_spawnbaseline, svc_packetentities, svc_deltapacketentities - decodes, on
-// an inferred framing that round trips against its own writer and has never met
-// a GoldSrc server.
+// The 48 reader still refuses several unverified opcodes via
+// HLNetParse48Unverified (svc_sound, svc_event, svc_temp_entity among them).
+// Entity stream codecs round-trip against this writer; stock peer untested.
 //
 // The protocol 15 side is a complete listen server - CTL handshake, reliable
 // NETFLAG framing, signon stages, entity deltas - and reaches Ironwail over UDP
@@ -296,9 +293,42 @@ class CHLNetPlayer
 	I64		frame;
 	I64		colormap;		//(top << 4) | bottom, as HLNetDrawEntities decodes it
 	F64		health;
+
+	//entity_state_t / clientdata_t fields snapped after HLPlayerMove. Remotes
+	//and the host share those globals, so the snapshot must run on the slot the
+	//move just finished for.
+	I64		sequence;
+	I64		gaitsequence;
+	I64		body;
+	I64		controller[4];
+	I64		blending[2];
+	I64		rendermode;
+	F64		renderamt;
+	I64		renderfx;
+	F64		rendercolor[3];
+	F64		scale;
+	I64		aiment;
+	F64		basevelocity[3];
+	F64		friction;
+	I64		usehull;		//0 stand, 1 duck
+	F64		view_ofs_z;
+	I64		waterlevel;
+	Bool	in_duck;		//bInDuck
+	F64		duck_msec;
+	F64		waterjump_msec;
+	F64		punchangle[3];	//shell-owned; left 0 unless a caller fills it
 };
 
 CHLNetPlayer	hl_net_pl[HLSV_MAX_CLIENTS];
+
+//Per-slot previous clientdata for protocol 48 deltas. Cleared on activate.
+CHLClData48	hl_sv_cd48_prev[HLSV_MAX_CLIENTS];
+Bool		hl_sv_cd48_sent[HLSV_MAX_CLIENTS];
+
+//Last Health/Battery bytes sent on the 48 unreliable stream; -1 = never.
+I64			hl_sv_um_health[HLSV_MAX_CLIENTS];
+I64			hl_sv_um_battery[HLSV_MAX_CLIENTS];
+Bool		hl_sv_um_decl[HLSV_MAX_CLIENTS];
 
 //Precache slot of the player model, resolved once per level. 0 means not
 //precached; an entity update with modelindex 0 is dropped by the client.
@@ -313,6 +343,88 @@ I64			 hl_net_pl_seq    = 0;		//"walk", or 0 when the model has none
 //Slot held by the listen host itself, or -1. HLSvFindLocalSlot does the same
 //search but is declared far below; the datagram builder needs it above.
 I64		hl_sv_local_slot = -1;
+
+U0 HLNetPlayerClearExtras(CHLNetPlayer *pl)
+{//Defaults for fields that have no studio/render source yet.
+	I64 j;
+
+	if (!pl)
+		return;
+
+	pl->sequence     = 0;
+	pl->gaitsequence = 0;
+	pl->body         = 0;
+	pl->rendermode   = 0;		//kRenderNormal
+	pl->renderamt    = 0.0;
+	pl->renderfx     = 0;
+	pl->scale        = 1.0;
+	pl->aiment       = 0;
+	pl->friction     = 1.0;
+	pl->usehull      = 0;
+	pl->view_ofs_z   = HLDEFAULT_VIEWHEIGHT;
+	pl->waterlevel   = 0;
+	pl->in_duck      = FALSE;
+	pl->duck_msec    = 0.0;
+	pl->waterjump_msec = 0.0;
+
+	for (j = 0; j < 4; j++)
+		pl->controller[j] = 0;
+	for (j = 0; j < 2; j++)
+		pl->blending[j] = 0;
+	for (j = 0; j < 3; j++)
+	{
+		pl->rendercolor[j]  = 0.0;
+		pl->basevelocity[j] = 0.0;
+		pl->punchangle[j]   = 0.0;
+	}
+}
+
+U0 HLNetPlayerSnapMove(I64 slot, I64 water_level)
+{//HLPlayerMove leaves duck/basevel/friction/view on shared shell globals. Copy
+ //onto the slot that move belonged to before the next body overwrites them.
+	CHLNetPlayer *pl;
+	I64			 j;
+
+	if (slot < 0 || slot >= HLSV_MAX_CLIENTS)
+		return;
+
+	pl = &hl_net_pl[slot];
+	if (!pl->active)
+		return;
+
+	//Studio walk index is shared; no per-slot gait source yet.
+	if (hl_net_pl_seq > 0)
+	{
+		pl->sequence     = hl_net_pl_seq;
+		pl->gaitsequence = hl_net_pl_seq;
+	}
+
+	for (j = 0; j < 3; j++)
+		pl->basevelocity[j] = hl_base_velocity[j];
+
+	pl->friction = hl_surface_friction;
+	if (pl->friction <= 0.0)
+		pl->friction = 1.0;
+
+	if (hl_ducking)
+		pl->usehull = 1;
+	else
+		pl->usehull = 0;
+
+	pl->view_ofs_z = hl_view_ofs_z;
+	pl->waterlevel = water_level;
+	if (pl->waterlevel < 0)
+		pl->waterlevel = hl_pm_waterlevel;
+
+	pl->in_duck = hl_duck_pending;
+	pl->duck_msec = hl_duck_time * 1000.0;
+	if (pl->duck_msec < 0.0)
+		pl->duck_msec = 0.0;
+
+	pl->waterjump_msec = hl_waterjump_time * 1000.0;
+	if (pl->waterjump_msec < 0.0)
+		pl->waterjump_msec = 0.0;
+}
 
 U0 HLNetPlayersInit()
 {//ZealC does not zero globals.
@@ -331,6 +443,12 @@ U0 HLNetPlayersInit()
 		hl_net_pl[i].frame     = 0;
 		hl_net_pl[i].colormap  = 0;
 		hl_net_pl[i].health    = 0.0;
+		HLNetPlayerClearExtras(&hl_net_pl[i]);
+		HLClData48Clear(&hl_sv_cd48_prev[i]);
+		hl_sv_cd48_sent[i] = FALSE;
+		hl_sv_um_health[i]  = -1;
+		hl_sv_um_battery[i] = -1;
+		hl_sv_um_decl[i]    = FALSE;
 
 		for (j = 0; j < 3; j++)
 		{
@@ -377,10 +495,9 @@ U0 HLNetCaptureState48(I64 ent, CHLEntState48 *st, Bool is_player)
  //HLNetWriteNativePlayers uses; only players are replicated, because every peer
  //runs the same deterministic world.
  //
- //Incomplete by construction. sequence, gaitsequence, body, controller[],
- //blending[], rendermode/amt/fx/color, scale, aiment, basevelocity, friction,
- //usehull and the user slots are not filled. Slots left untouched keep their
- //previous value, which a delta encodes as no change.
+ //Studio controllers/blending/body and render fields stay at the activate
+ //defaults until a per-slot studio source exists. Sequence, gait, hull,
+ //basevelocity and friction come from HLNetPlayerSnapMove.
 	CHLNetPlayer	*pl;
 	I64			 slot;
 	I64			 j;
@@ -399,11 +516,20 @@ U0 HLNetCaptureState48(I64 ent, CHLEntState48 *st, Bool is_player)
 		st->v[HLES_ORIGIN + j] = pl->origin[j];
 		st->v[HLES_MINS + j]   = -16.0;
 		st->v[HLES_MAXS + j]   = 16.0;
+		st->v[HLES_BASEVELOCITY + j] = pl->basevelocity[j];
+		st->v[HLES_RENDERCOLOR + j]  = pl->rendercolor[j];
 	}
 
-	//Standing hull; the duck hull is not replicated.
-	st->v[HLES_MINS + 2] = HLPHYS_MINS_Z;
-	st->v[HLES_MAXS + 2] = HLPHYS_MAXS_Z;
+	if (pl->usehull == 1)
+	{
+		st->v[HLES_MINS + 2] = HLPHYS_DUCK_MINS_Z;
+		st->v[HLES_MAXS + 2] = HLPHYS_DUCK_MAXS_Z;
+	}
+	else
+	{
+		st->v[HLES_MINS + 2] = HLPHYS_MINS_Z;
+		st->v[HLES_MAXS + 2] = HLPHYS_MAXS_Z;
+	}
 
 	//SV_ClientThink stores body pitch as view pitch / 3, negated, and zero roll.
 	st->v[HLES_ANGLES]     = -pl->angles[0] / 3.0;
@@ -426,28 +552,45 @@ U0 HLNetCaptureState48(I64 ent, CHLEntState48 *st, Bool is_player)
 	st->v[HLES_GRAVITY] = 1.0;
 	st->v[HLES_TEAM]    = ToF64(hl_sv_clients[slot].team);
 
+	st->v[HLES_SEQUENCE]     = ToF64(pl->sequence);
+	st->v[HLES_GAITSEQUENCE] = ToF64(pl->gaitsequence);
+	st->v[HLES_BODY]         = ToF64(pl->body);
+	st->v[HLES_CONTROLLER + 0] = ToF64(pl->controller[0]);
+	st->v[HLES_CONTROLLER + 1] = ToF64(pl->controller[1]);
+	st->v[HLES_CONTROLLER + 2] = ToF64(pl->controller[2]);
+	st->v[HLES_CONTROLLER + 3] = ToF64(pl->controller[3]);
+	st->v[HLES_BLENDING + 0]   = ToF64(pl->blending[0]);
+	st->v[HLES_BLENDING + 1]   = ToF64(pl->blending[1]);
+	st->v[HLES_RENDERMODE]     = ToF64(pl->rendermode);
+	st->v[HLES_RENDERAMT]      = pl->renderamt;
+	st->v[HLES_RENDERFX]       = ToF64(pl->renderfx);
+	st->v[HLES_SCALE]          = pl->scale;
+	st->v[HLES_AIMENT]         = ToF64(pl->aiment);
+	st->v[HLES_FRICTION]       = pl->friction;
+	st->v[HLES_USEHULL]        = ToF64(pl->usehull);
+
 	st->player = is_player;
 	st->active = TRUE;
 }
+
+//FL_* bits from const.h, for clientdata_t.flags
+#define HLFL_INWATER	16
+#define HLFL_ONGROUND	512
+#define HLFL_DUCKING	16384
 
 U0 HLNetCaptureClientData48(I64 ent, CHLClData48 *cd)
 {//A native player slot into clientdata_t slots; counterpart of
  //HLNetWriteClientdata, which is protocol 15's fixed-mask version of the same
  //job.
  //
- //Unreferenced: HLSv48SendFrame sends no svc_clientdata, for the reason stated
- //there. Kept in step with the protocol 15 writer.
- //
- //The gaps mirror those in HLNetClientData48ToHud: HL's clientdata_t has no
- //.items, and fov/weapons/weaponanim/maxspeed/pushmsec/physinfo have no native
- //per-remote source. Those keep their previous value, which for a delta encodes
- //no change.
- //
- //Ammo, view weapon and deadflag are the guest's own simulation and never
- //cross the wire; they are not written here.
+ //Ammo, view weapon, weapons bitfield and fov stay guest-local: the native
+ //world has no per-remote inventory. physinfo is empty. punchangle is 0 unless
+ //the slot's punchangle[] was filled by the shell - hl_punch lives in HL1.ZC
+ //after this file.
 	CHLNetPlayer	*pl;
 	I64			 slot;
 	I64			 j;
+	I64			 flags;
 
 	if (!cd)
 		return;
@@ -462,18 +605,83 @@ U0 HLNetCaptureClientData48(I64 ent, CHLClData48 *cd)
 	{
 		cd->v[HLCD_ORIGIN + j]     = pl->origin[j];
 		cd->v[HLCD_VELOCITY + j]   = pl->velocity[j];
-		cd->v[HLCD_PUNCHANGLE + j] = 0.0;
+		cd->v[HLCD_PUNCHANGLE + j] = pl->punchangle[j];
 	}
 
-	cd->v[HLCD_VIEW_OFS + 2] = HLDEFAULT_VIEWHEIGHT;
+	cd->v[HLCD_VIEW_OFS + 2] = pl->view_ofs_z;
 	cd->v[HLCD_HEALTH]       = pl->health;
-	cd->v[HLCD_WATERLEVEL]   = 0.0;
+	cd->v[HLCD_WATERLEVEL]   = ToF64(pl->waterlevel);
+	cd->v[HLCD_MAXSPEED]     = HLPHYS_MAXSPEED;
+	cd->v[HLCD_INDUCK]       = ToF64(pl->in_duck);
+	cd->v[HLCD_DUCKTIME]     = pl->duck_msec;
+	cd->v[HLCD_WATERJUMPTIME] = pl->waterjump_msec;
 
-	//FL_ONGROUND, const.h:32
-	if (pl->on_ground)
-		cd->v[HLCD_FLAGS] = 512.0;
+	if (hl_ent_player_dead && slot == hl_sv_local_slot)
+		cd->v[HLCD_DEADFLAG] = 1.0;
 	else
-		cd->v[HLCD_FLAGS] = 0.0;
+		cd->v[HLCD_DEADFLAG] = 0.0;
+
+	flags = 0;
+	if (pl->on_ground)
+		flags = flags | HLFL_ONGROUND;
+	if (pl->usehull == 1)
+		flags = flags | HLFL_DUCKING;
+	if (pl->waterlevel > 0)
+		flags = flags | HLFL_INWATER;
+	cd->v[HLCD_FLAGS] = ToF64(flags);
+
+	cd->physinfo[0] = 0;
+}
+
+Bool HLNetWriteClientdata48(CHLMsg *m, I64 slot, F64 timebase)
+{//svc_clientdata for protocol 48: clientdata_t delta, then no weapon_data_t.
+ //Delta against the last one this slot was sent, or zero on the first.
+	CHLClData48	cd;
+	F64			*from;
+	U8			 from_phys[256];
+	I64			 i;
+
+	if (!m || slot < 0 || slot >= HLSV_MAX_CLIENTS)
+		return FALSE;
+	if (!hl_net_pl[slot].active)
+		return FALSE;
+
+	HLClData48Clear(&cd);
+	HLNetCaptureClientData48(slot + 1, &cd);
+
+	if (hl_sv_cd48_sent[slot])
+	{
+		from = hl_sv_cd48_prev[slot].v;
+		HLStrCopy(from_phys, hl_sv_cd48_prev[slot].physinfo, 256);
+	}
+	else
+	{
+		from = hl_pe_zero.v;
+		from_phys[0] = 0;
+	}
+
+	HLMsgWriteByte(m, HLSVC_CLIENTDATA);
+	HLBitWriteStart(m);
+
+	//No delta-sequence select: one previous state per slot.
+	HLBitWriteBits(m, 0, 1);
+
+	HLDeltaWrite(m, &hl_delta_clientdata, from, cd.v, from_phys, cd.physinfo,
+		timebase);
+
+	//No weapon_data_t: inventory is guest-local.
+	HLBitWriteBits(m, 0, 1);
+	HLBitWriteEnd(m);
+
+	if (m->overflowed)
+		return FALSE;
+
+	for (i = 0; i < HLDELTA_MAX_SLOTS; i++)
+		hl_sv_cd48_prev[slot].v[i] = cd.v[i];
+	HLStrCopy(hl_sv_cd48_prev[slot].physinfo, cd.physinfo, 256);
+	hl_sv_cd48_sent[slot] = TRUE;
+
+	return TRUE;
 }
 
 //--- protocol 48 frame send -------------------------------------------------
@@ -536,6 +744,329 @@ qc48_next:
 	}
 }
 
+U0 HLNetWriteUserMsgDecl(CHLMsg *m, I64 num, I64 size, U8 *name)
+{//svc_newusermsg: publishes one pfnRegUserMsg pairing.
+ //
+ //The name is exactly 16 bytes, NUL-padded and unterminated when it fills them.
+ //HLMsgWriteString cannot be used, nor the reader's string path: a 16 character
+ //message name would swallow the next field.
+	I64 i;
+	I64 n;
+
+	HLMsgWriteByte(m, HLSVC_NEWUSERMSG);
+	HLMsgWriteByte(m, num);
+
+	//-1, variable length, goes on the wire as 0xFF.
+	if (size < 0)
+		HLMsgWriteByte(m, 255);
+	else
+		HLMsgWriteByte(m, size);
+
+	n = 0;
+	if (name)
+		n = StrLen(name);
+	if (n > 16)
+		n = 16;
+
+	for (i = 0; i < 16; i++)
+	{
+		if (i < n)
+			HLMsgWriteByte(m, name[i]);
+		else
+			HLMsgWriteByte(m, 0);
+	}
+
+	HLUserMsgRegister(num, size, name);
+}
+
+U0 HLSv48EnsureUserMsgDecls(I64 slot)
+{//One-shot reliable svc_newusermsg for Health/Battery/Damage/SayText.
+	CHLMsg *m;
+
+	if (slot < 0 || slot >= HLSV_MAX_CLIENTS)
+		return;
+	if (hl_sv_um_decl[slot])
+		return;
+
+	m = &hl_net_send;
+	HLMsgClear(m);
+	HLNetWriteUserMsgDecl(m, HLUM_HEALTH, 1, "Health");
+	HLNetWriteUserMsgDecl(m, HLUM_BATTERY, 2, "Battery");
+	HLNetWriteUserMsgDecl(m, HLUM_DAMAGE, 12, "Damage");
+	HLNetWriteUserMsgDecl(m, HLUM_SAYTEXT, -1, "SayText");
+
+	if (m->overflowed)
+		return;
+
+	if (!HLNetSendReliable(slot, m))
+		return;
+
+	hl_sv_um_decl[slot] = TRUE;
+}
+
+//============================================================================
+// PROTOCOL 48: the write side
+//============================================================================
+//
+// Driven by HLNetSendServerInfo48 / HLSvSendClientSignon48 (below Lightstyles).
+// Codecs also round-trip without a peer: HLNetWriteResourceList feeds
+// HLResourceListParse, HLNetWriteUserInfo48 feeds HLNetParseUserInfo48.
+
+#define HLNET_PROTOCOL48	48		//PROTOCOL_VERSION, GoldSrc
+
+//Resource types + flags. Must sit above HLNetWriteResourceList (single-pass).
+//Models/sounds map onto the precache lists; the rest are new in HL.
+#define HLRES_MODEL			0
+#define HLRES_SOUND			1
+#define HLRES_DECAL			2
+#define HLRES_SKIN			3
+#define HLRES_GENERIC		4
+#define HLRES_EVENTSCRIPT	5
+#define HLRES_WORLD			6
+
+#define HLRES_FATALIFMISSING	1
+#define HLRES_WASMISSING		2
+#define HLRES_CUSTOM			4
+
+#define HLRES_MAX			512
+#define HLRES_NAME			64
+
+U0 HLNetWriteResourceList(CHLMsg *m)
+{//svc_resourcelist from the two precache tables. See HLResourceListParse for the
+ //bit layout and which parts are inferred.
+ //
+ //Model 1 is the map and goes out as t_world, not t_model. That is the slot
+ //protocol 15 gave the bsp, so index numbering is unchanged and only the type
+ //field differs.
+	I64	i;
+	I64	total;
+
+	HLMsgWriteByte(m, HLSVC_RESOURCELIST);
+
+	total = 0;
+	for (i = 1; i < hl_precache_model_count; i++)
+	{
+		if (hl_precache_model[i] && hl_precache_model[i][0])
+			total++;
+	}
+	for (i = 0; i < hl_precache_sound_count; i++)
+	{
+		if (hl_precache_sound[i] && hl_precache_sound[i][0])
+			total++;
+	}
+
+	HLBitWriteStart(m);
+	HLBitWriteBits(m, total, 12);
+
+	for (i = 1; i < hl_precache_model_count; i++)
+	{
+		if (!hl_precache_model[i] || !hl_precache_model[i][0])
+			goto qwr_mdl;
+
+		if (i == 1)
+			HLBitWriteBits(m, HLRES_WORLD, 4);
+		else
+			HLBitWriteBits(m, HLRES_MODEL, 4);
+
+		HLBitWriteBitString(m, hl_precache_model[i]);
+		HLBitWriteBits(m, i, 12);
+		//Size 0 means the client already has the file. No downloads are served,
+		//so a client lacking it must fetch out of band.
+		HLBitWriteBits(m, 0, 24);
+		HLBitWriteBits(m, 0, 3);
+
+qwr_mdl:
+	}
+
+	for (i = 0; i < hl_precache_sound_count; i++)
+	{
+		if (!hl_precache_sound[i] || !hl_precache_sound[i][0])
+			goto qwr_snd;
+
+		HLBitWriteBits(m, HLRES_SOUND, 4);
+		HLBitWriteBitString(m, hl_precache_sound[i]);
+		//Local sound table is 0-based, wire number is i+1, the same offset
+		//protocol 15's precache run used.
+		HLBitWriteBits(m, i + 1, 12);
+		HLBitWriteBits(m, 0, 24);
+		HLBitWriteBits(m, 0, 3);
+
+qwr_snd:
+	}
+
+	//No consistency list: sv_consistency off, the listen server default, and the
+	//reader cannot decode one.
+	HLBitWriteBits(m, 0, 1);
+	HLBitWriteEnd(m);
+}
+
+U0 HLNetWriteServerInfo48(CHLMsg *m, I64 slot)
+{//svc_serverinfo, protocol 48. Field for field the mirror of
+ //HLNetParseServerInfo48, including the unverified trailing byte.
+ //
+ //The precache lists are not here. Protocol 15 packed both string runs into this
+ //message, so its serverinfo could reach tens of kilobytes on a busy map; 48
+ //sends svc_resourcelist separately, leaving this message around 100 bytes and
+ //the resource list fragmentable independently of the signon.
+	U8	*mapname;
+	I64	 i;
+
+	HLMsgWriteByte(m, HLSVC_SERVERINFO);
+	HLMsgWriteLong(m, HLNET_PROTOCOL48);
+
+	//spawncount identifies this map instance. A client echoes it back in its
+	//"spawn" command so a late reply from the previous map is discarded rather
+	//than spawning a body into the new one. This engine has no generation
+	//counter, so 1 goes out and the check is not enforced.
+	HLMsgWriteLong(m, 1);
+	HLMsgWriteLong(m, 0);			//map crc, not computed
+
+	//Client dll md5. HL uses it to refuse a mismatched client dll; there is no
+	//client dll here, so zeros. Written a byte at a time rather than MemSet into
+	//data[]: HLMsgWriteByte records overflow, a MemSet past the end would corrupt
+	//the next buffer silently.
+	for (i = 0; i < 16; i++)
+		HLMsgWriteByte(m, 0);
+
+	HLMsgWriteByte(m, hl_sv_maxclients);
+
+	//The receiving client's own index, so this message cannot be broadcast.
+	//Protocol 15's serverinfo was identical for everyone and the view entity
+	//arrived separately in svc_setview.
+	if (slot >= 0)
+		HLMsgWriteByte(m, slot);
+	else
+		HLMsgWriteByte(m, 0);
+
+	HLGameApplyModeCvars;
+	if (!hl_coop_active && HLCvarGet("deathmatch") != 0.0)
+		HLMsgWriteByte(m, 1);
+	else
+		HLMsgWriteByte(m, 0);
+
+	HLMsgWriteString(m, "valve");	//gamedir
+	HLMsgWriteString(m, hl_host_name);
+
+	//Map file name, not worldspawn .message. Protocol 15 sent the display name
+	//here and the map arrived as precache model 1; 48 names the map outright and
+	//the client loads this string.
+	mapname = hl_map_name;
+	if (!mapname || !mapname[0])
+		mapname = "";
+	HLMsgWriteString(m, mapname);
+
+	HLMsgWriteString(m, "");		//map cycle list
+	HLMsgWriteByte(m, 0);			//trailing byte, see the parse note
+}
+
+U0 HLNetWriteUserInfo48(CHLMsg *m, I64 slot, U8 *name, I64 top, I64 bottom)
+{//svc_updateuserinfo. Protocol 48's replacement for the svc_updatename plus
+ //svc_updatecolors pair. svc_updatefrags has no equivalent: HL scores travel as
+ //the game DLL's own ScoreInfo user message.
+ //
+ //An empty infostring announces the slot empty; there is no "player left"
+ //message.
+	U8	info[192];
+	I64	i;
+
+	if (slot < 0 || slot >= HLSV_MAX_CLIENTS)
+		return;
+
+	HLMsgWriteByte(m, HLSVC_UPDATEUSERINFO);
+	HLMsgWriteByte(m, slot);
+
+	//userid. Unique for the life of the server, unlike the slot, which is reused
+	//when a player leaves. slot+1 is only stable for the connection; nothing here
+	//reads it further.
+	HLMsgWriteLong(m, slot + 1);
+
+	if (!name || !name[0])
+		name = "player";
+
+	StrPrint(info, "\\name\\%s\\topcolor\\%d\\bottomcolor\\%d",
+		name, top & 15, bottom & 15);
+	HLMsgWriteString(m, info);
+
+	//cd key hash
+	for (i = 0; i < 16; i++)
+		HLMsgWriteByte(m, 0);
+
+	HLStrCopy(hl_scores[slot].name, name, 16);
+	hl_scores[slot].colors = ((top & 15) << 4) | (bottom & 15);
+	hl_scores[slot].active = TRUE;
+}
+
+U0 HLSv48WriteHudUserMsgs(CHLMsg *m, I64 slot)
+{//Health/Battery/Damage on the unreliable frame. Native state is the source.
+ //clientdata_t carries health too; these messages keep a stock HUD fed.
+	I64 health;
+	I64 battery;
+	I64 dmg;
+	I64 armor_byte;
+	F64 src[3];
+
+	if (!m || slot < 0 || slot >= HLSV_MAX_CLIENTS)
+		return;
+	if (!hl_net_pl[slot].active)
+		return;
+
+	health = ToI64(hl_net_pl[slot].health);
+	if (health < 0)
+		health = 0;
+	if (health > 255)
+		health = 255;
+
+	if (health != hl_sv_um_health[slot])
+	{
+		HLMsgWriteByte(m, HLUM_HEALTH);
+		HLMsgWriteByte(m, health);
+		hl_sv_um_health[slot] = health;
+	}
+
+	//Armour is local-native only; remotes own their inventory.
+	if (slot == hl_sv_local_slot)
+		battery = ToI64(hl_ent_player_armor);
+	else
+		battery = 0;
+	if (battery < 0)
+		battery = 0;
+	if (battery > 65535)
+		battery = 65535;
+
+	if (battery != hl_sv_um_battery[slot])
+	{
+		HLMsgWriteByte(m, HLUM_BATTERY);
+		HLMsgWriteShort(m, battery);
+		hl_sv_um_battery[slot] = battery;
+	}
+
+	//Damage compass: only the local player records hits in hl_ent_*.
+	if (slot == hl_sv_local_slot && hl_ent_dmg_usermsg)
+	{
+		dmg = ToI64(hl_ent_last_dmg);
+		if (dmg < 0)
+			dmg = 0;
+		if (dmg > 255)
+			dmg = 255;
+
+		armor_byte = 0;
+		if (hl_hud_pain_have)
+			HLVecCopy(hl_hud_pain_src, src);
+		else
+			HLVecSet(src, 0.0, 0.0, 0.0);
+
+		HLMsgWriteByte(m, HLUM_DAMAGE);
+		HLMsgWriteByte(m, armor_byte);
+		HLMsgWriteByte(m, dmg);
+		HLMsgWriteLong(m, hl_ent_last_dmg_type);
+		HLMsgWriteCoord(m, src[0]);
+		HLMsgWriteCoord(m, src[1]);
+		HLMsgWriteCoord(m, src[2]);
+
+		hl_ent_dmg_usermsg = FALSE;
+	}
+}
+
 Bool HLSv48SendFrame(I64 slot, F64 time)
 {//one client's unreliable frame packet
 	CHLNet48Chan	*c;
@@ -546,6 +1077,8 @@ Bool HLSv48SendFrame(I64 slot, F64 time)
 	c = HLNet48ChanFor(slot);
 	if (!c || !c->active)
 		return FALSE;
+
+	HLSv48EnsureUserMsgDecls(slot);
 
 	HLSv48CaptureFrame(&hl_pe_sv_stage, time);
 
@@ -566,13 +1099,18 @@ Bool HLSv48SendFrame(I64 slot, F64 time)
 	HLMsgWriteByte(&hl_net_datagram, HLSVC_TIME);
 	HLMsgWriteFloat(&hl_net_datagram, time);
 
-	//No svc_clientdata. Its delta reference is the last one the peer accepted,
-	//which a netchan acknowledgement cannot identify, and every field it carries
-	//is the guest's own simulation - the same omission the protocol 15 datagram
-	//makes, for the same reason.
-	//
-	//No hl_sv_datagram either: it holds protocol 15 svc_sound and
-	//svc_temp_entity, which the 48 reader refuses.
+	//svc_clientdata: origin/vel/health/view_ofs/duck/water/flags from the
+	//recipient's native slot. Inventory fields stay zero; the guest owns those.
+	if (!HLNetWriteClientdata48(&hl_net_datagram, slot, time))
+	{
+		hl_net_dropped++;
+		return FALSE;
+	}
+
+	HLSv48WriteHudUserMsgs(&hl_net_datagram, slot);
+
+	//No hl_sv_datagram: it holds protocol 15 svc_sound and svc_temp_entity,
+	//which the 48 reader refuses.
 	if (!HLNetWritePacketEntities(&hl_net_datagram, from, &hl_pe_sv_stage,
 		from_seq, time))
 	{
@@ -646,6 +1184,12 @@ U0 HLNetPlayerActivate(I64 slot, F64 *origin, F64 *angles, I64 top, I64 bottom)
 	hl_net_pl[slot].frame     = 0;
 	hl_net_pl[slot].colormap  = ((top & 15) << 4) | (bottom & 15);
 	hl_net_pl[slot].health    = 100.0;
+	HLNetPlayerClearExtras(&hl_net_pl[slot]);
+	HLClData48Clear(&hl_sv_cd48_prev[slot]);
+	hl_sv_cd48_sent[slot] = FALSE;
+	hl_sv_um_health[slot]  = -1;
+	hl_sv_um_battery[slot] = -1;
+	hl_sv_um_decl[slot]    = FALSE;
 
 	HLVecCopy(origin, hl_net_pl[slot].origin);
 	HLVecCopy(angles, hl_net_pl[slot].angles);
@@ -665,6 +1209,8 @@ U0 HLNetPlayerDeactivate(I64 slot)
 		return;
 
 	hl_net_pl[slot].active = FALSE;
+	hl_sv_cd48_sent[slot]  = FALSE;
+	hl_sv_um_decl[slot]    = FALSE;
 }
 
 U0 HLNetPublishPlayer(I64 slot, F64 *origin, F64 *angles, F64 *velocity,
@@ -684,6 +1230,10 @@ U0 HLNetPublishPlayer(I64 slot, F64 *origin, F64 *angles, F64 *velocity,
 		HLVecCopy(angles, hl_net_pl[slot].angles);
 	if (velocity)
 		HLVecCopy(velocity, hl_net_pl[slot].velocity);
+
+	//Local move just ran in the shell; snap duck/basevel/view off the shared
+	//globals before a remote HLSvRunClients overwrites them.
+	HLNetPlayerSnapMove(slot, hl_pm_waterlevel);
 }
 
 U0 HLNetCapturePlayerState(I64 slot, CHLEntState *st)
@@ -711,6 +1261,341 @@ U0 HLNetCapturePlayerState(I64 slot, CHLEntState *st)
 	st->effects    = 0;
 	st->step       = FALSE;
 	st->active     = TRUE;
+}
+
+//--- client prediction ----------------------------------------------------
+//
+// Guest only. Solo and listen host run HLPlayerMove on the native body; that
+// is simulation, not prediction.
+//
+// Ring holds sent usercmds. On a new svc entity/clientdata for the view
+// entity, origin/vel/onground snap from that state, then unacked cmds replay
+// through HLPlayerMove. Between updates the same replay runs from the last
+// snap so the view leads the wire.
+//
+// Deviation from stock GoldSrc prediction:
+//   - Protocol 15 has no usercmd sequence ack; on msgtime advance, ack is
+//     outgoing minus HLPRED_INFLIGHT (coarse in-flight estimate).
+//   - Server applies the latest clc_move once per tick; the ring still stores
+//     every sent frame and replays each with its msec.
+//   - Duck is predicted locally; stock clc_move here has no duck bit.
+//   - Weapon prediction is absent. Punch uses hl_cl.punchangle (hl_punch lives
+//     in HL1.ZC after this file). Basevelocity from hl_platform_velocity /
+//     protocol-48 entity basevelocity when present.
+//   - Error smoothing: exponential pull of predicted origin toward the server
+//     snap over ~100ms (HLPRED_ERR_TAU).
+
+#define HLPRED_BACKUP		64
+#define HLPRED_MASK		63
+#define HLPRED_INFLIGHT		2	// protocol 15 coarse keep-alive cmds
+#define HLPRED_HZ		72.0
+#define HLPRED_STEP		(1.0 / HLPRED_HZ)
+#define HLPRED_ERR_TAU		0.1	// seconds; origin error lerp time constant
+
+class CHLPredCmd
+{
+	I64		seq;			// local monotonic id
+	I64		packet_seq;		// netchan seq at send, -1 unknown
+	F64		angles[3];
+	F64		forward;
+	F64		side;
+	F64		up;
+	Bool	jump;
+	Bool	duck;
+	F64		msec;			// seconds for this cmd
+	Bool	valid;
+};
+
+CHLPredCmd	hl_pred_cmds[HLPRED_BACKUP];
+I64		hl_pred_seq		= 0;	// next local seq to assign
+I64		hl_pred_ack		= 0;	// highest local seq treated applied
+F64		hl_pred_org[3];			// last acknowledged server origin
+F64		hl_pred_vel[3];
+F64		hl_pred_basevel[3];		// platform / wire basevelocity at snap
+F64		hl_pred_punch[3];		// from hl_cl.punchangle; shell reads after Pred
+F64		hl_pred_err[3];			// predicted - server, decayed toward 0
+F64		hl_pred_err_time	= 0.0;	// tS when error was last refreshed
+F64		hl_pred_shown[3];		// last Apply output, for error on next snap
+Bool	hl_pred_shown_ok	= FALSE;
+Bool	hl_pred_onground	= TRUE;
+Bool	hl_pred_have		= FALSE;
+F64		hl_pred_msgtime		= -1.0;
+
+U0 HLPredClear()
+{//globals are not zeroed; join and map load must wipe the ring
+	I64 i;
+
+	for (i = 0; i < HLPRED_BACKUP; i++)
+	{
+		hl_pred_cmds[i].seq        = 0;
+		hl_pred_cmds[i].packet_seq = -1;
+		hl_pred_cmds[i].forward    = 0.0;
+		hl_pred_cmds[i].side       = 0.0;
+		hl_pred_cmds[i].up         = 0.0;
+		hl_pred_cmds[i].jump       = FALSE;
+		hl_pred_cmds[i].duck       = FALSE;
+		hl_pred_cmds[i].msec       = HLPRED_STEP;
+		hl_pred_cmds[i].valid      = FALSE;
+		HLVecSet(hl_pred_cmds[i].angles, 0.0, 0.0, 0.0);
+	}
+
+	hl_pred_seq      = 0;
+	hl_pred_ack      = 0;
+	hl_pred_have     = FALSE;
+	hl_pred_msgtime  = -1.0;
+	hl_pred_onground = TRUE;
+	hl_pred_err_time = 0.0;
+	HLVecSet(hl_pred_org, 0.0, 0.0, 0.0);
+	HLVecSet(hl_pred_vel, 0.0, 0.0, 0.0);
+	HLVecSet(hl_pred_basevel, 0.0, 0.0, 0.0);
+	HLVecSet(hl_pred_punch, 0.0, 0.0, 0.0);
+	HLVecSet(hl_pred_err, 0.0, 0.0, 0.0);
+	HLVecSet(hl_pred_shown, 0.0, 0.0, 0.0);
+	hl_pred_shown_ok = FALSE;
+}
+
+HLPredClear;
+
+U0 HLPredCmdPush(F64 *view_angles, F64 forward, F64 side, F64 up,
+	Bool jump, Bool duck, F64 msec, I64 packet_seq)
+{//Park one sent usercmd. Guest SendMove is the only caller.
+	CHLPredCmd	*c;
+	I64			 slot;
+	I64			 i;
+
+	hl_pred_seq++;
+	slot = hl_pred_seq & HLPRED_MASK;
+	c    = &hl_pred_cmds[slot];
+
+	c->seq        = hl_pred_seq;
+	c->packet_seq = packet_seq;
+	c->forward    = forward;
+	c->side       = side;
+	c->up         = up;
+	c->jump       = jump;
+	c->duck       = duck;
+	c->valid      = TRUE;
+
+	if (msec > 0.0)
+		c->msec = msec;
+	else
+		c->msec = HLPRED_STEP;
+
+	for (i = 0; i < 3; i++)
+	{
+		if (view_angles)
+			c->angles[i] = view_angles[i];
+		else
+			c->angles[i] = 0.0;
+	}
+}
+
+U0 HLPredSnapFromNet()
+{//Copy view-entity origin and clientdata vel/onground into the ack state.
+	CHLEntState	*e;
+	CHLEntState48	*e48;
+	I64			 i;
+
+	if (hl_cl_viewent <= 0 || hl_cl_viewent >= HLNET_MAX_ENTS)
+		return;
+
+	e = &hl_net_cl[hl_cl_viewent];
+	if (!e->active)
+		return;
+
+	for (i = 0; i < 3; i++)
+	{
+		hl_pred_org[i]   = e->origin[i];
+		hl_pred_vel[i]   = hl_cl.velocity[i];
+		hl_pred_punch[i] = hl_cl.punchangle[i];
+	}
+	hl_pred_onground = hl_cl.on_ground;
+	hl_pred_have     = TRUE;
+	hl_pred_msgtime  = e->msgtime;
+
+	//Basevelocity: protocol 48 entity_state, else the last platform sample.
+	HLVecSet(hl_pred_basevel, 0.0, 0.0, 0.0);
+	if (hl_net_protocol == 48)
+	{
+		e48 = &hl_net_cl48[hl_cl_viewent];
+		if (e48->active)
+		{
+			for (i = 0; i < 3; i++)
+				hl_pred_basevel[i] = e48->v[HLES_BASEVELOCITY + i];
+		}
+	}
+	else
+	{
+		for (i = 0; i < 3; i++)
+			hl_pred_basevel[i] = hl_platform_velocity[i];
+	}
+}
+
+U0 HLPredUpdateAck()
+{//Advance hl_pred_ack from the netchan or a coarse msgtime rule.
+	I64			 ack_packet;
+	I64			 best;
+	I64			 i;
+	I64			 s;
+	CHLPredCmd	*c;
+
+	if (hl_net_protocol == 48 && hl_net48_cl.active)
+	{
+		ack_packet = hl_net48_cl.incoming_acknowledged;
+		best       = hl_pred_ack;
+		for (i = 0; i < HLPRED_BACKUP; i++)
+		{
+			c = &hl_pred_cmds[i];
+			if (!c->valid)
+				goto qpred_ack48_next;
+			if (c->packet_seq < 0)
+				goto qpred_ack48_next;
+			if (c->packet_seq > ack_packet)
+				goto qpred_ack48_next;
+			if (c->seq > best)
+				best = c->seq;
+qpred_ack48_next:
+		}
+		hl_pred_ack = best;
+		return;
+	}
+
+	//Deviation: protocol 15 unreliable carries no cmd ack. Keep HLPRED_INFLIGHT
+	//cmds past the snap as unacked.
+	s = hl_pred_seq - HLPRED_INFLIGHT;
+	if (s < 0)
+		s = 0;
+	if (s > hl_pred_ack)
+		hl_pred_ack = s;
+}
+
+U0 HLPredReconcile()
+{//On a new view-entity stamp: snap, then refresh ack. Error is predicted
+ //origin minus the new server origin, decayed later in HLPredApply.
+	CHLEntState *e;
+	I64			 i;
+	F64			 pred_org[3];
+
+	if (hl_cl_viewent <= 0 || hl_cl_viewent >= HLNET_MAX_ENTS)
+		return;
+
+	e = &hl_net_cl[hl_cl_viewent];
+	if (!e->active)
+		return;
+
+	if (hl_pred_have && e->msgtime == hl_pred_msgtime)
+		return;
+
+	//Capture where prediction left the body before overwriting the snap.
+	for (i = 0; i < 3; i++)
+		pred_org[i] = hl_pred_shown[i];
+
+	HLPredSnapFromNet;
+	HLPredUpdateAck;
+
+	if (hl_pred_have && hl_pred_shown_ok)
+	{
+		for (i = 0; i < 3; i++)
+			hl_pred_err[i] = pred_org[i] - hl_pred_org[i];
+		hl_pred_err_time = tS;
+	}
+	else
+	{
+		HLVecSet(hl_pred_err, 0.0, 0.0, 0.0);
+		hl_pred_err_time = tS;
+	}
+}
+
+U0 HLPredApply(CHLMap *map, F64 *origin, F64 *velocity, Bool *_on_ground)
+{//CL_PredictMove shape: snap on new server state, replay unacked cmds.
+	F64			 org[3];
+	F64			 vel[3];
+	F64			 ang[3];
+	F64			 forward[3];
+	F64			 right[3];
+	F64			 upv[3];
+	F64			 wish_move[3];
+	F64			 wishspeed;
+	F64			 msec;
+	F64			 fade;
+	F64			 elapsed;
+	I64			 water_level;
+	I64			 water_type;
+	I64			 seq;
+	I64			 i;
+	Bool		 on_ground;
+	CHLPredCmd	*c;
+
+	if (!map || !origin || !velocity)
+		return;
+
+	HLPredReconcile;
+
+	if (!hl_pred_have)
+		return;
+
+	HLVecCopy(hl_pred_org, org);
+	HLVecCopy(hl_pred_vel, vel);
+	on_ground = hl_pred_onground;
+
+	//pm_shared: basevelocity rides with the move for this tick.
+	HLVecAdd(vel, hl_pred_basevel, vel);
+
+	seq = hl_pred_ack + 1;
+	while (seq <= hl_pred_seq)
+	{
+		c = &hl_pred_cmds[seq & HLPRED_MASK];
+		if (!c->valid || c->seq != seq)
+			goto qpred_next;
+
+		HLVecCopy(c->angles, ang);
+		HLAngleVectors(ang, forward, right, upv);
+
+		wish_move[0] = forward[0] * c->forward + right[0] * c->side;
+		wish_move[1] = forward[1] * c->forward + right[1] * c->side;
+		wish_move[2] = forward[2] * c->forward + right[2] * c->side + c->up;
+
+		water_level = 0;
+		water_type  = 0;
+		water_level = HLWaterLevelGet(map, org, &water_type);
+		if (water_level < 2)
+			wish_move[2] = 0.0;
+
+		wishspeed = HLVecLength(wish_move);
+		if (wishspeed > 0.0)
+			HLVecNormalize(wish_move);
+
+		msec = c->msec;
+		if (msec <= 0.0)
+			msec = HLPRED_STEP;
+
+		HLPlayerMove(map, org, vel, wish_move, wishspeed, c->jump, msec,
+			&on_ground, water_level, FALSE, ang, 0, c->duck);
+
+		//Punch decay matches the shell's 10 * dt falloff (HL1.ZC).
+		for (i = 0; i < 3; i++)
+			hl_pred_punch[i] -= hl_pred_punch[i] * 10.0 * msec;
+
+qpred_next:
+		seq++;
+	}
+
+	HLVecSub(vel, hl_pred_basevel, vel);
+
+	//Exponential pull of the shown origin toward the server snap.
+	elapsed = tS - hl_pred_err_time;
+	if (elapsed < 0.0)
+		elapsed = 0.0;
+	fade = Exp(-elapsed / HLPRED_ERR_TAU);
+	for (i = 0; i < 3; i++)
+		org[i] += hl_pred_err[i] * fade;
+
+	HLVecCopy(org, origin);
+	HLVecCopy(vel, velocity);
+	HLVecCopy(org, hl_pred_shown);
+	hl_pred_shown_ok = TRUE;
+	if (_on_ground)
+		*_on_ground = on_ground;
 }
 
 U0 HLNetClientClear()
@@ -767,6 +1652,8 @@ U0 HLNetClientClear()
 	hl_net_damage_save    = 0;
 	hl_net_damage_take    = 0;
 	HLVecSet(hl_net_damage_from, 0.0, 0.0, 0.0);
+
+	HLPredClear;
 
 	hl_net_moves_sent = 0;
 	hl_net_moves_read = 0;
@@ -1202,12 +2089,32 @@ Bool HLNetServerFrame(I64 client_ent, F64 time)
 				hl_net_dropped++;
 				ok = FALSE;
 			}
+			//Record on the client drain (HLNetGetMessage), not here: writing on
+			//both send and receive would double every loopback message.
 		}
 	}
 	else if (local_slot >= 0)
 	{
 		//Nothing carries it: SV_ClientPrintf already routed local text into the
 		//print buffer, and the scoreboard is rebuilt from the slots below.
+		//
+		//Record still wants the host's own S2C stream. Build a full protocol 48
+		//frame for the local slot and write it without transmitting - the host
+		//has no netchan to itself.
+		if (hl_demo_recording && hl_net_pl[local_slot].active)
+		{
+			HLDemoSetRecordAngles(hl_net_pl[local_slot].angles);
+			HLSv48CaptureFrame(&hl_pe_sv_stage, time);
+			HLMsgClear(&hl_net_datagram);
+			HLMsgWriteByte(&hl_net_datagram, HLSVC_TIME);
+			HLMsgWriteFloat(&hl_net_datagram, time);
+			if (HLNetWriteClientdata48(&hl_net_datagram, local_slot, time) &&
+				HLNetWritePacketEntities(&hl_net_datagram, NULL,
+					&hl_pe_sv_stage, 0, time) &&
+				!hl_net_datagram.overflowed)
+				HLDemoWriteMessage(&hl_net_datagram);
+		}
+
 		HLMsgClear(&hl_sv_client_msg[local_slot]);
 	}
 
@@ -1583,25 +2490,8 @@ U0 HLNetParseTempEntity(CHLMsg *m)
 // sv_consistency makes the server demand a file's checksum from the client
 // before allowing spawn, which blocks modified wall textures.
 //
-// Resource types. Models and sounds map onto the two lists this engine already
-// keeps; the rest are new in HL.
-#define HLRES_MODEL			0
-#define HLRES_SOUND			1
-#define HLRES_DECAL			2
-#define HLRES_SKIN			3
-#define HLRES_GENERIC		4
-#define HLRES_EVENTSCRIPT	5
-#define HLRES_WORLD			6
-
-//Resource flags. Only 3 bits travel in svc_resourcelist: RES_CUSTOM is bit 2,
-//the highest the wire can carry, and it is the flag the trailing md5 is
-//conditioned on. The rest are client-side bookkeeping.
-#define HLRES_FATALIFMISSING	1
-#define HLRES_WASMISSING		2
-#define HLRES_CUSTOM			4
-
-#define HLRES_MAX			512
-#define HLRES_NAME			64
+//Resource flags: only 3 bits on the wire; RES_CUSTOM (bit 2) gates trailing md5.
+//HLRES_* type/flag #defines live above HLNetWriteResourceList (single-pass).
 
 class CHLResource
 {
@@ -1793,17 +2683,16 @@ Bool HLResourceListParse(CHLMsg *m)
 U0 HLUserMsgDispatch(I64 num, U8 *body, I64 len)
 {//Destination for a registered user message.
  //
- //No function pointer table, unlike the original engine, which dispatches to
- //whatever the client DLL hooked. There is no client DLL here - the HUD is native
- //and compiles into the same binary - and ZealC is single-pass: HLHud compiles
- //before this file so it cannot register, and this file cannot name a handler
- //declared later.
- //
- //Instead the most recent payload is parked on the registration record and the
- //HUD polls it. Costs at most one frame of latency, and an unrecognised message
- //is stored rather than dropped.
+ //No function pointer table: the HUD is native and compiles before this file.
+ //Known HUD messages are applied here; the payload is also parked for netstat.
 	CHLUserMsg	*u;
 	I64			 n;
+	I64			 sx;
+	I64			 sy;
+	I64			 sz;
+	F64			 src[3];
+	U8			 text[128];
+	I64			 i;
 
 	u = HLUserMsgGet(num);
 	if (!u)
@@ -1821,6 +2710,52 @@ U0 HLUserMsgDispatch(I64 num, U8 *body, I64 len)
 
 	u->body_len = n;
 	u->count++;
+
+	if (!body || n < 1)
+		return;
+
+	if (!StrCompare(u->name, "Health"))
+	{
+		hl_cl.health = body[0] & 0xFF;
+		return;
+	}
+
+	if (!StrCompare(u->name, "Battery") && n >= 2)
+	{
+		hl_cl.armorvalue = (body[0] & 0xFF) | ((body[1] & 0xFF) << 8);
+		return;
+	}
+
+	if (!StrCompare(u->name, "Damage") && n >= 12)
+	{
+		//armor@0 damage@1 bits@2..5 coords@6..11 as MSG_WriteCoord shorts
+		sx = (body[6] & 0xFF) | ((body[7] & 0xFF) << 8);
+		sy = (body[8] & 0xFF) | ((body[9] & 0xFF) << 8);
+		sz = (body[10] & 0xFF) | ((body[11] & 0xFF) << 8);
+		if (sx > 32767) sx -= 65536;
+		if (sy > 32767) sy -= 65536;
+		if (sz > 32767) sz -= 65536;
+		src[0] = ToF64(sx) / 8.0;
+		src[1] = ToF64(sy) / 8.0;
+		src[2] = ToF64(sz) / 8.0;
+		if (sx || sy || sz)
+			HLHudDamageSource(src);
+		return;
+	}
+
+	if (!StrCompare(u->name, "SayText") && n >= 2)
+	{
+		//byte client index, then NUL-terminated text
+		i = 0;
+		while (i < n - 1 && i < 127 && body[1 + i])
+		{
+			text[i] = body[1 + i];
+			i++;
+		}
+		text[i] = 0;
+		if (text[0])
+			HLBiPrintAppend(text);
+	}
 }
 
 Bool HLNetParseUserMsg(CHLMsg *m, I64 num)
@@ -1916,8 +2851,8 @@ U0 HLNetClientData48ToHud()
 	}
 
 	//Armour and current ammo are not in clientdata_t. HL sends them as the
-	//Battery and CurWeapon user messages, so they are left as the HUD last saw
-	//them rather than zeroed here.
+	//Battery and CurWeapon user messages; Battery lands in hl_cl.armorvalue
+	//via HLUserMsgDispatch.
 }
 
 Bool HLNetParseClientData48(CHLMsg *m, F64 timebase)
@@ -3151,7 +4086,20 @@ U0 HLHostSay(I64 from_slot, U8 *msg, Bool teamonly)
 				goto qhs_next;
 		}
 
-		HLSvClientPrintf(i, text);
+		if (HLNetSlotIs48(i))
+		{
+			HLSv48EnsureUserMsgDecls(i);
+			//SayText usermsg on the unreliable stream (gmsgSayText).
+			HLMsgClear(&hl_net_datagram);
+			HLMsgWriteByte(&hl_net_datagram, HLUM_SAYTEXT);
+			HLMsgWriteByte(&hl_net_datagram, 1 + StrLen(text) + 1);
+			HLMsgWriteByte(&hl_net_datagram, from_slot + 1);
+			HLMsgWriteString(&hl_net_datagram, text);
+			if (!hl_net_datagram.overflowed)
+				HLNetSendUnreliable(i, &hl_net_datagram);
+		}
+		else
+			HLSvClientPrintf(i, text);
 
 qhs_next:
 	}
@@ -3244,11 +4192,18 @@ qht_next:
 
 U0 HLNetClientSendStringCmd(U8 *s)
 {//Cmd_ForwardToServer: the whole command line as clc_stringcmd.
+	I64 clc;
+
 	if (!hl_net_active || !s || !s[0])
 		return;
 
+	clc = HLCLC15_STRINGCMD;
+	if (hl_net_protocol == 48 || hl_net_want48 ||
+		HLNetSlotIs48(HLNET_CLIENT_SLOT))
+		clc = HLCLC_STRINGCMD;
+
 	HLMsgClear(&hl_net_cmd);
-	HLMsgWriteByte(&hl_net_cmd, HLCLC15_STRINGCMD);
+	HLMsgWriteByte(&hl_net_cmd, clc);
 	HLMsgWriteString(&hl_net_cmd, s);
 
 	//Guest: framed unreliable to the host (QuakeSpasm clc_stringcmd).
@@ -3976,6 +4931,136 @@ U0 HLNetWriteLightstyles(CHLMsg *m)
 	}
 }
 
+U0 HLNetSendServerInfo48(I64 slot)
+{//Protocol 48 SV_SendServerinfo: serverinfo + cdtrack + setview + userinfos +
+ //signonnum 1. Resource list waits for "prespawn".
+	I64 edict;
+	I64 i;
+	U8  *name;
+	U8  line[96];
+
+	edict = 0;
+	if (slot >= 0 && slot < HLSV_MAX_CLIENTS)
+		edict = hl_sv_clients[slot].edict;
+
+	HLMsgClear(&hl_net_send);
+	HLNetWriteServerInfo48(&hl_net_send, slot);
+	HLNetWriteCDTrack(&hl_net_send);
+
+	if (edict > 0)
+	{
+		HLMsgWriteByte(&hl_net_send, HLSVC_SETVIEW);
+		HLMsgWriteShort(&hl_net_send, edict);
+	}
+
+	for (i = 0; i < HLSV_MAX_CLIENTS; i++)
+	{
+		if (!hl_sv_clients[i].active)
+			goto qsi48_next;
+
+		name = hl_sv_clients[i].name;
+		if (!name[0])
+			name = "player";
+		HLNetWriteUserInfo48(&hl_net_send, i, name,
+			hl_sv_clients[i].top, hl_sv_clients[i].bottom);
+
+qsi48_next:
+	}
+
+	HLMsgWriteByte(&hl_net_send, HLSVC_SIGNONNUM);
+	HLMsgWriteByte(&hl_net_send, 1);
+
+	if (slot >= 0 && slot < HLSV_MAX_CLIENTS)
+		hl_sv_clients[slot].signon = 1;
+
+	StrPrint(line, "net48: svc_serverinfo slot %d (%d bytes)\n",
+		slot, hl_net_send.len);
+	HLLog(line);
+	HLLogFlush;
+
+	if (!HLNetSendReliable(slot, &hl_net_send))
+	{
+		HLLog("net48: svc_serverinfo send FAILED\n");
+		HLLogFlush;
+		return;
+	}
+
+	HLSv48EnsureUserMsgDecls(slot);
+}
+
+U0 HLSvSendClientSignon48(I64 slot, I64 stage)
+{//Protocol 48 signon stages after serverinfo: prespawn->2, spawn->3, begin->4.
+	I64  edict;
+	I64  i;
+	U8  *name;
+	U8   line[80];
+
+	if (slot < 0 || slot >= HLSV_MAX_CLIENTS || !hl_sv_clients[slot].active)
+		return;
+	if (hl_sv_clients[slot].local)
+		return;
+
+	edict = hl_sv_clients[slot].edict;
+	HLMsgClear(&hl_net_send);
+
+	if (stage == 2)
+	{
+		HLNetWriteLightstyles(&hl_net_send);
+		HLNetWriteResourceList(&hl_net_send);
+		//Empty baseline table: hl_net_bl48 is not filled by the host yet.
+			HLNetWriteSpawnBaseline(&hl_net_send, hl_net_bl48, HLNET_MAX_ENTS,
+				0.0);
+		HLMsgWriteByte(&hl_net_send, HLSVC_SIGNONNUM);
+		HLMsgWriteByte(&hl_net_send, 2);
+		hl_sv_clients[slot].signon = 2;
+	}
+	else if (stage == 3)
+	{
+		for (i = 0; i < HLSV_MAX_CLIENTS; i++)
+		{
+			if (!hl_sv_clients[i].active)
+				goto qsso48_ui;
+
+			name = hl_sv_clients[i].name;
+			if (!name[0])
+				name = "player";
+			HLNetWriteUserInfo48(&hl_net_send, i, name,
+				hl_sv_clients[i].top, hl_sv_clients[i].bottom);
+
+qsso48_ui:
+		}
+
+		if (edict > 0)
+		{
+			HLMsgWriteByte(&hl_net_send, HLSVC_SETVIEW);
+			HLMsgWriteShort(&hl_net_send, edict);
+			HLNetWriteClientdata48(&hl_net_send, slot, 0.0);
+		}
+		HLMsgWriteByte(&hl_net_send, HLSVC_SIGNONNUM);
+		HLMsgWriteByte(&hl_net_send, 3);
+		hl_sv_clients[slot].signon = 3;
+	}
+	else if (stage == 4)
+	{
+		HLMsgWriteByte(&hl_net_send, HLSVC_SIGNONNUM);
+		HLMsgWriteByte(&hl_net_send, 4);
+		hl_sv_clients[slot].signon = 4;
+	}
+	else
+		return;
+
+	StrPrint(line, "net48: signon stage %d -> slot %d (%d bytes)\n",
+		stage, slot, hl_net_send.len);
+	HLLog(line);
+	HLLogFlush;
+
+	if (!HLNetSendReliable(slot, &hl_net_send))
+	{
+		HLLog("net48: signon send FAILED\n");
+		HLLogFlush;
+	}
+}
+
 U0 HLSvSendClientSignon(I64 slot, I64 stage)
 {//Reliable signon stages after serverinfo: prespawn->2, spawn->3, begin->4.
 	I64  edict;
@@ -3985,6 +5070,12 @@ U0 HLSvSendClientSignon(I64 slot, I64 stage)
 		return;
 	if (hl_sv_clients[slot].local)
 		return;
+
+	if (HLNetSlotIs48(slot))
+	{
+		HLSvSendClientSignon48(slot, stage);
+		return;
+	}
 
 	edict = hl_sv_clients[slot].edict;
 	HLMsgClear(&hl_net_send);
@@ -4141,7 +5232,12 @@ Bool HLNetServerExecStringCmd(I64 slot, U8 *line)
 					hl_sv_clients[slot].top, hl_sv_clients[slot].bottom);
 				//serverinfo normally went out on CTL ACCEPT
 				if (hl_sv_clients[slot].signon < 1)
-					HLNetSendServerInfo(slot);
+				{
+					if (HLNetSlotIs48(slot))
+						HLNetSendServerInfo48(slot);
+					else
+						HLNetSendServerInfo(slot);
+				}
 			}
 			else
 			{
@@ -4252,17 +5348,26 @@ Bool HLNetServerExecStringCmd(I64 slot, U8 *line)
 //SV_ReadClientMove.
 
 U0 HLNetClientSendMove(F64 *view_angles, F64 forward, F64 side, F64 up,
-	Bool attack, Bool jump, I64 impulse, F64 time)
+	Bool attack, Bool jump, I64 impulse, F64 time,
+	Bool duck = FALSE, F64 msec = 0.0)
 {//CL_SendMove, stock clc_move. forward/side/up are view-relative units/sec; the
  //server builds wishvel from the angles (SV_ClientThink). No trailing origin.
+ //duck/msec are local prediction only; the wire layout is unchanged.
 	I64 bits = 0;
+	I64 packet_seq = -1;
+	I64 clc;
 
 	if (!hl_net_active)
 		return;
 
+	clc = HLCLC15_MOVE;
+	if (hl_net_protocol == 48 || hl_net_want48 ||
+		HLNetSlotIs48(HLNET_CLIENT_SLOT))
+		clc = HLCLC_MOVE;
+
 	HLMsgClear(&hl_net_cmd);
 
-	HLMsgWriteByte(&hl_net_cmd, HLCLC15_MOVE);
+	HLMsgWriteByte(&hl_net_cmd, clc);
 
 	//Echoed so the server can measure the round trip. This is the client's
 	//clock, not the server's, and is never used as a time.
@@ -4286,12 +5391,22 @@ U0 HLNetClientSendMove(F64 *view_angles, F64 forward, F64 side, F64 up,
 
 	//A joined client sends its move to the remote server and to its own loopback
 	//queue: it still runs a local world to render from, and that local server
-	//reads its input off the loopback queue. The local half goes away once the
+	//reads its input off the loopback void. The local half goes away once the
 	//renderer draws purely from the client tables.
 	if (hl_udp_ready && !hl_udp_server)
 	{
 		if (HLNetSendUnreliable(HLNET_CLIENT_SLOT, &hl_net_cmd))
+		{
 			hl_net_moves_sent++;
+
+			if (HLNetSlotIs48(HLNET_CLIENT_SLOT))
+				packet_seq = hl_net48_cl.outgoing_sequence - 1;
+			else
+				packet_seq = hl_net_client_sock.unrel_send_seq - 1;
+
+			HLPredCmdPush(view_angles, forward, side, up, jump, duck, msec,
+				packet_seq);
+		}
 
 		HLNetSendToServer(&hl_net_cmd);
 		return;
@@ -4363,12 +5478,17 @@ Bool HLNetParseFromClient(CHLMsg *in, I64 slot, F64 server_time)
 {//One client's message, from any transport.
 	I64 cmd;
 	I64 ent = 0;
+	Bool is48;
 
 	if (slot >= 0 && slot < HLSV_MAX_CLIENTS)
 		hl_sv_clients[slot].last_msg = server_time;
 
 	if (slot >= 0)
 		ent = hl_sv_clients[slot].edict;
+
+	is48 = FALSE;
+	if (slot >= 0)
+		is48 = HLNetSlotIs48(slot);
 
 	in->read    = 0;
 	in->badread = FALSE;
@@ -4378,6 +5498,26 @@ Bool HLNetParseFromClient(CHLMsg *in, I64 slot, F64 server_time)
 		cmd = HLMsgReadByte(in);
 		if (in->badread)
 			return FALSE;
+
+		if (is48)
+		{
+			if (cmd == HLCLC_NOP)
+				goto qpf_next;
+			if (cmd == HLCLC_MOVE)
+			{
+				if (!HLNetServerReadMove(in, ent, server_time, slot))
+					return FALSE;
+				goto qpf_next;
+			}
+			if (cmd == HLCLC_STRINGCMD)
+			{
+				HLMsgReadString(in, hl_net_cmd_line, 128);
+				HLNetServerExecStringCmd(slot, hl_net_cmd_line);
+				goto qpf_next;
+			}
+			//No clc_disconnect in 48; drop / silence ends the slot.
+			return FALSE;
+		}
 
 		switch (cmd)
 		{
@@ -4403,6 +5543,8 @@ Bool HLNetParseFromClient(CHLMsg *in, I64 slot, F64 server_time)
 			default:
 				return FALSE;
 		}
+
+qpf_next:
 	}
 
 	return TRUE;
@@ -4467,6 +5609,10 @@ U0 HLNetServerAccept48(U32 from_ip)
 		slot, hl_scores[slot].name, top, bottom);
 	HLLog(line);
 	HLLogFlush;
+
+	//Drive the 48 signon: guest replies with prespawn/spawn/begin stringcmds.
+	if (hl_sv_clients[slot].signon < 1)
+		HLNetSendServerInfo48(slot);
 }
 
 Bool HLNetServerReadClient(I64 ent, F64 server_time)
@@ -4648,6 +5794,7 @@ U0 HLSvRunClients(F64 dt, F64 now)
 			HLVecCopy(vel, hl_net_pl[i].velocity);
 			HLVecCopy(ang, hl_net_pl[i].angles);
 			hl_net_pl[i].on_ground = on_ground;
+			HLNetPlayerSnapMove(i, water_level);
 
 			for (j = 0; j < 3; j++)
 			{
@@ -5139,6 +6286,8 @@ Bool HLNetClientFrame()
 	while (HLNetGetMessage(in))
 	{
 		hl_net_parsed++;
+		HLDemoSetRecordAngles(hl_cl.view_angles);
+		HLDemoWriteMessage(in);
 		if (!HLNetClientParse(in))
 			ok = FALSE;
 	}
@@ -5180,6 +6329,8 @@ Bool HLNetClientFrame()
 			in->badread    = FALSE;
 			in->overflowed = FALSE;
 			hl_net_parsed++;
+			HLDemoSetRecordAngles(hl_cl.view_angles);
+			HLDemoWriteMessage(in);
 			if (!HLNetClientParse(in))
 				ok = FALSE;
 
@@ -5214,218 +6365,4 @@ qcf_next:
 	}
 
 	return ok;
-}
-
-//============================================================================
-// PROTOCOL 48: the write side
-//============================================================================
-//
-// The signon writers below have no caller; see the protocol note at the top of
-// this file. The per-frame entity send does - HLSv48SendFrame, up beside the
-// native player slots, where HLNetServerFrame can reach it.
-//
-// These exist so each codec has a round trip without a peer:
-// HLNetWriteResourceList feeds HLResourceListParse, HLNetWriteUserInfo48 feeds
-// HLNetParseUserInfo48, and the delta writers in HLNet.ZC feed HLDeltaRead.
-
-#define HLNET_PROTOCOL48	48		//PROTOCOL_VERSION, GoldSrc
-
-U0 HLNetWriteResourceList(CHLMsg *m)
-{//svc_resourcelist from the two precache tables. See HLResourceListParse for the
- //bit layout and which parts are inferred.
- //
- //Model 1 is the map and goes out as t_world, not t_model. That is the slot
- //protocol 15 gave the bsp, so index numbering is unchanged and only the type
- //field differs.
-	I64	i;
-	I64	total;
-
-	HLMsgWriteByte(m, HLSVC_RESOURCELIST);
-
-	total = 0;
-	for (i = 1; i < hl_precache_model_count; i++)
-	{
-		if (hl_precache_model[i] && hl_precache_model[i][0])
-			total++;
-	}
-	for (i = 0; i < hl_precache_sound_count; i++)
-	{
-		if (hl_precache_sound[i] && hl_precache_sound[i][0])
-			total++;
-	}
-
-	HLBitWriteStart(m);
-	HLBitWriteBits(m, total, 12);
-
-	for (i = 1; i < hl_precache_model_count; i++)
-	{
-		if (!hl_precache_model[i] || !hl_precache_model[i][0])
-			goto qwr_mdl;
-
-		if (i == 1)
-			HLBitWriteBits(m, HLRES_WORLD, 4);
-		else
-			HLBitWriteBits(m, HLRES_MODEL, 4);
-
-		HLBitWriteBitString(m, hl_precache_model[i]);
-		HLBitWriteBits(m, i, 12);
-		//Size 0 means the client already has the file. No downloads are served,
-		//so a client lacking it must fetch out of band.
-		HLBitWriteBits(m, 0, 24);
-		HLBitWriteBits(m, 0, 3);
-
-qwr_mdl:
-	}
-
-	for (i = 0; i < hl_precache_sound_count; i++)
-	{
-		if (!hl_precache_sound[i] || !hl_precache_sound[i][0])
-			goto qwr_snd;
-
-		HLBitWriteBits(m, HLRES_SOUND, 4);
-		HLBitWriteBitString(m, hl_precache_sound[i]);
-		//Local sound table is 0-based, wire number is i+1, the same offset
-		//protocol 15's precache run used.
-		HLBitWriteBits(m, i + 1, 12);
-		HLBitWriteBits(m, 0, 24);
-		HLBitWriteBits(m, 0, 3);
-
-qwr_snd:
-	}
-
-	//No consistency list: sv_consistency off, the listen server default, and the
-	//reader cannot decode one.
-	HLBitWriteBits(m, 0, 1);
-	HLBitWriteEnd(m);
-}
-
-U0 HLNetWriteServerInfo48(CHLMsg *m, I64 slot)
-{//svc_serverinfo, protocol 48. Field for field the mirror of
- //HLNetParseServerInfo48, including the unverified trailing byte.
- //
- //The precache lists are not here. Protocol 15 packed both string runs into this
- //message, so its serverinfo could reach tens of kilobytes on a busy map; 48
- //sends svc_resourcelist separately, leaving this message around 100 bytes and
- //the resource list fragmentable independently of the signon.
-	U8	*mapname;
-	I64	 i;
-
-	HLMsgWriteByte(m, HLSVC_SERVERINFO);
-	HLMsgWriteLong(m, HLNET_PROTOCOL48);
-
-	//spawncount identifies this map instance. A client echoes it back in its
-	//"spawn" command so a late reply from the previous map is discarded rather
-	//than spawning a body into the new one. This engine has no generation
-	//counter, so 1 goes out and the check is not enforced.
-	HLMsgWriteLong(m, 1);
-	HLMsgWriteLong(m, 0);			//map crc, not computed
-
-	//Client dll md5. HL uses it to refuse a mismatched client dll; there is no
-	//client dll here, so zeros. Written a byte at a time rather than MemSet into
-	//data[]: HLMsgWriteByte records overflow, a MemSet past the end would corrupt
-	//the next buffer silently.
-	for (i = 0; i < 16; i++)
-		HLMsgWriteByte(m, 0);
-
-	HLMsgWriteByte(m, hl_sv_maxclients);
-
-	//The receiving client's own index, so this message cannot be broadcast.
-	//Protocol 15's serverinfo was identical for everyone and the view entity
-	//arrived separately in svc_setview.
-	if (slot >= 0)
-		HLMsgWriteByte(m, slot);
-	else
-		HLMsgWriteByte(m, 0);
-
-	HLGameApplyModeCvars;
-	if (!hl_coop_active && HLCvarGet("deathmatch") != 0.0)
-		HLMsgWriteByte(m, 1);
-	else
-		HLMsgWriteByte(m, 0);
-
-	HLMsgWriteString(m, "valve");	//gamedir
-	HLMsgWriteString(m, hl_host_name);
-
-	//Map file name, not worldspawn .message. Protocol 15 sent the display name
-	//here and the map arrived as precache model 1; 48 names the map outright and
-	//the client loads this string.
-	mapname = hl_map_name;
-	if (!mapname || !mapname[0])
-		mapname = "";
-	HLMsgWriteString(m, mapname);
-
-	HLMsgWriteString(m, "");		//map cycle list
-	HLMsgWriteByte(m, 0);			//trailing byte, see the parse note
-}
-
-U0 HLNetWriteUserInfo48(CHLMsg *m, I64 slot, U8 *name, I64 top, I64 bottom)
-{//svc_updateuserinfo. Protocol 48's replacement for the svc_updatename plus
- //svc_updatecolors pair. svc_updatefrags has no equivalent: HL scores travel as
- //the game DLL's own ScoreInfo user message.
- //
- //An empty infostring announces the slot empty; there is no "player left"
- //message.
-	U8	info[192];
-	I64	i;
-
-	if (slot < 0 || slot >= HLSV_MAX_CLIENTS)
-		return;
-
-	HLMsgWriteByte(m, HLSVC_UPDATEUSERINFO);
-	HLMsgWriteByte(m, slot);
-
-	//userid. Unique for the life of the server, unlike the slot, which is reused
-	//when a player leaves. slot+1 is only stable for the connection; nothing here
-	//reads it further.
-	HLMsgWriteLong(m, slot + 1);
-
-	if (!name || !name[0])
-		name = "player";
-
-	StrPrint(info, "\\name\\%s\\topcolor\\%d\\bottomcolor\\%d",
-		name, top & 15, bottom & 15);
-	HLMsgWriteString(m, info);
-
-	//cd key hash
-	for (i = 0; i < 16; i++)
-		HLMsgWriteByte(m, 0);
-
-	HLStrCopy(hl_scores[slot].name, name, 16);
-	hl_scores[slot].colors = ((top & 15) << 4) | (bottom & 15);
-	hl_scores[slot].active = TRUE;
-}
-
-U0 HLNetWriteUserMsgDecl(CHLMsg *m, I64 num, I64 size, U8 *name)
-{//svc_newusermsg: publishes one pfnRegUserMsg pairing.
- //
- //The name is exactly 16 bytes, NUL-padded and unterminated when it fills them.
- //HLMsgWriteString cannot be used, nor the reader's string path: a 16 character
- //message name would swallow the next field.
-	I64 i;
-	I64 n;
-
-	HLMsgWriteByte(m, HLSVC_NEWUSERMSG);
-	HLMsgWriteByte(m, num);
-
-	//-1, variable length, goes on the wire as 0xFF.
-	if (size < 0)
-		HLMsgWriteByte(m, 255);
-	else
-		HLMsgWriteByte(m, size);
-
-	n = 0;
-	if (name)
-		n = StrLen(name);
-	if (n > 16)
-		n = 16;
-
-	for (i = 0; i < 16; i++)
-	{
-		if (i < n)
-			HLMsgWriteByte(m, name[i]);
-		else
-			HLMsgWriteByte(m, 0);
-	}
-
-	HLUserMsgRegister(num, size, name);
 }
