@@ -1,0 +1,739 @@
+// UTLod.ZC - UMesh / ULodMesh serial + GetFrame skin anim (SoftDrv).
+//
+// Ver>61 TLazyArray: SeekPos INT, TArray (INDEX count + count*elem), Seek(SeekPos).
+// FMeshVert DWORD X:11 Y:11 Z:10. AnimSeq: Name Group Start Num Notifys Rate.
+// FrameVerts/AnimFrames sit after AndFlags=FFFFFFFF OrFlags=0 marker.
+// LodMesh: CollapsePointThus[fv] FaceLevel[faces] Faces CollapseWedge Wedges
+// Materials SpecialFaces ModelVerts SpecialVerts — Faces may be empty on some.
+
+#define UT_LOD_MAX_VERTS	8192
+#define UT_LOD_MAX_TRIS		16384
+#define UT_LOD_MAX_FRAMES	1024
+#define UT_LOD_MAX_SEQ		128
+#define UT_LOD_MAX_SEQ_FILE	512
+
+class CUTLodSeq
+{
+	U8	 name[32];
+	I64	 start;
+	I64	 num;
+	F64	 rate;
+};
+
+class CUTLodMesh
+{
+	F64	*verts;			//AnimFrames * FrameVerts * 3
+	I64	 frame_verts;
+	I64	 anim_frames;
+	I64	 *tri_i;		//num_tris * 3 (frame-local indices)
+	I64	 num_tris;
+	F64	 scale[3];
+	F64	 origin[3];
+	I64	 rot_yaw;		//RotOrigin.Yaw (Unreal rot units)
+	F64	 draw_origin[3];
+	I64	 draw_yaw;
+	F64	 frame;
+	I64	 seq_i;
+	CUTLodSeq seq[UT_LOD_MAX_SEQ];
+	I64	 n_seq;
+	Bool loaded;
+	Bool faces_ok;		//TRUE if Faces/Wedges or classic Tris
+	U8	 name[64];
+};
+
+CUTLodMesh	ut_lod_player;
+CUTLodMesh	ut_lod_weapon;
+Bool		ut_lod_ready	= FALSE;
+
+U0 UTLodFree(CUTLodMesh *m)
+{
+	if (!m)
+		return;
+	if (m->verts)
+		Free(m->verts);
+	if (m->tri_i)
+		Free(m->tri_i);
+	m->verts = NULL;
+	m->tri_i = NULL;
+	m->loaded = FALSE;
+	m->faces_ok = FALSE;
+	m->n_seq = 0;
+	m->rot_yaw = 0;
+	m->draw_yaw = 0;
+}
+
+U0 UTLodUnpackVert(U32 pack, F64 *out)
+{//FMeshVert: X:11 Y:11 Z:10 signed
+	I64 x;
+	I64 y;
+	I64 z;
+
+	x = pack & 0x7FF;
+	y = (pack >> 11) & 0x7FF;
+	z = (pack >> 22) & 0x3FF;
+	if (x & 0x400)
+		x -= 0x800;
+	if (y & 0x400)
+		y -= 0x800;
+	if (z & 0x200)
+		z -= 0x400;
+	out[0] = ToF64(x);
+	out[1] = ToF64(y);
+	out[2] = ToF64(z);
+}
+
+Bool UTLodReadLazyElems(CUTArc *ar, U8 **out, I64 *out_n, I64 elem_size)
+{//TLazyArray<T> ver>61 eager: SeekPos, INDEX n, n*elem, Seek(SeekPos).
+	I64 seekpos;
+	I64 n;
+	I64 bytes;
+	U8 *p;
+	U8 *dst;
+
+	*out = NULL;
+	*out_n = 0;
+	if (elem_size < 1)
+		return FALSE;
+	if (ar->ver > 61)
+	{
+		seekpos = UTArcI32(ar);
+		n = UTArcIndex(ar);
+		if (ar->err || n < 0 || n > (1 << 24))
+			return FALSE;
+		bytes = n * elem_size;
+		if (bytes < 0 || ar->pos + bytes > ar->size)
+			return FALSE;
+		p = ar->data + ar->pos;
+		dst = CAlloc(bytes + 1);
+		MemCopy(dst, p, bytes);
+		ar->pos += bytes;
+		if (seekpos > 0 && seekpos <= ar->size)
+			ar->pos = seekpos;
+		*out = dst;
+		*out_n = n;
+		return TRUE;
+	}
+	n = UTArcIndex(ar);
+	if (ar->err || n < 0 || n > (1 << 24))
+		return FALSE;
+	bytes = n * elem_size;
+	p = UTArcPtr(ar, bytes);
+	if (!p)
+		return FALSE;
+	dst = CAlloc(bytes + 1);
+	MemCopy(dst, p, bytes);
+	*out = dst;
+	*out_n = n;
+	return TRUE;
+}
+
+Bool UTLodSkipTArrayWords(CUTArc *ar)
+{
+	I64 n;
+
+	n = UTArcIndex(ar);
+	if (ar->err || n < 0 || n > 200000)
+		return FALSE;
+	if (ar->pos + n * 2 > ar->size)
+		return FALSE;
+	ar->pos += n * 2;
+	return TRUE;
+}
+
+Bool UTLodReadFacesAsTris(CUTArc *ar, CUTLodMesh *m, I64 fv)
+{//Faces + CollapseWedge + Wedges → tri indices into frame verts.
+	I64 nf;
+	I64 nc;
+	I64 nw;
+	I64 i;
+	I64 w0;
+	I64 w1;
+	I64 w2;
+	I64 iv0;
+	I64 iv1;
+	I64 iv2;
+	U8 *faces;
+	U8 *wedges;
+	I64 *tri;
+	I64 nt;
+
+	nf = UTArcIndex(ar);
+	if (ar->err || nf < 1 || nf > UT_LOD_MAX_TRIS)
+		return FALSE;
+	if (ar->pos + nf * 8 > ar->size)
+		return FALSE;
+	faces = ar->data + ar->pos;
+	ar->pos += nf * 8;
+	nc = UTArcIndex(ar);
+	if (ar->err || nc < 0 || ar->pos + nc * 2 > ar->size)
+		return FALSE;
+	ar->pos += nc * 2;
+	nw = UTArcIndex(ar);
+	if (ar->err || nw < 3 || nw > 200000)
+		return FALSE;
+	if (ar->pos + nw * 4 > ar->size)
+		return FALSE;
+	wedges = ar->data + ar->pos;
+	ar->pos += nw * 4;
+
+	tri = CAlloc(nf * 3 * sizeof(I64));
+	nt = 0;
+	i = 0;
+	while (i < nf)
+	{
+		w0 = UTRdU16(faces + i * 8);
+		w1 = UTRdU16(faces + i * 8 + 2);
+		w2 = UTRdU16(faces + i * 8 + 4);
+		if (w0 < nw && w1 < nw && w2 < nw)
+		{
+			iv0 = UTRdU16(wedges + w0 * 4);
+			iv1 = UTRdU16(wedges + w1 * 4);
+			iv2 = UTRdU16(wedges + w2 * 4);
+			if (iv0 < fv && iv1 < fv && iv2 < fv)
+			{
+				tri[nt * 3] = iv0;
+				tri[nt * 3 + 1] = iv1;
+				tri[nt * 3 + 2] = iv2;
+				nt++;
+			}
+		}
+		i++;
+	}
+	if (nt < 1)
+	{
+		Free(tri);
+		return FALSE;
+	}
+	m->tri_i = tri;
+	m->num_tris = nt;
+	return TRUE;
+}
+
+Bool UTLodFindFrameHeader(CUTArc *ar, I64 nv, I64 *fv, I64 *af)
+{//scan for FrameVerts AnimFrames AndFlags=FFFFFFFF OrFlags=0 with product==nv
+	I64 i;
+	I64 end;
+	I64 f;
+	I64 a;
+	U32 andf;
+	U32 orf;
+
+	*fv = 0;
+	*af = 0;
+	end = ar->size - 24;
+	i = ar->pos;
+	while (i < end)
+	{
+		f = UTRdI32(ar->data + i);
+		a = UTRdI32(ar->data + i + 4);
+		andf = UTRdU32(ar->data + i + 8);
+		orf = UTRdU32(ar->data + i + 12);
+		if (andf == 0xFFFFFFFF && orf == 0 && f > 0 && a > 0 &&
+			f <= UT_LOD_MAX_VERTS && a <= UT_LOD_MAX_FRAMES && f * a == nv)
+		{
+			*fv = f;
+			*af = a;
+			ar->pos = i + 16;
+			return TRUE;
+		}
+		i++;
+	}
+	return FALSE;
+}
+
+Bool UTLodParseAnimSeqs(CUTArc *ar, CUTPackage *pkg, CUTLodMesh *m)
+{
+	I64 nseq;
+	I64 i;
+	I64 ni;
+	I64 nn;
+	I64 j;
+	U8 *nm;
+
+	nseq = UTArcIndex(ar);
+	if (ar->err || nseq < 0 || nseq > UT_LOD_MAX_SEQ_FILE)
+		return FALSE;
+	m->n_seq = 0;
+	i = 0;
+	while (i < nseq)
+	{
+		ni = UTArcIndex(ar);
+		UTArcIndex(ar); //Group
+		if (m->n_seq < UT_LOD_MAX_SEQ)
+		{
+			nm = UTPkgNameStr(pkg, ni);
+			StrPrint(m->seq[m->n_seq].name, "%s", nm);
+			m->seq[m->n_seq].start = UTArcI32(ar);
+			m->seq[m->n_seq].num = UTArcI32(ar);
+		}
+		else
+		{
+			UTArcI32(ar);
+			UTArcI32(ar);
+		}
+		nn = UTArcIndex(ar);
+		if (ar->err || nn < 0 || nn > 64)
+			return FALSE;
+		j = 0;
+		while (j < nn)
+		{
+			UTArcF32(ar);
+			UTArcIndex(ar);
+			j++;
+		}
+		if (m->n_seq < UT_LOD_MAX_SEQ)
+		{
+			m->seq[m->n_seq].rate = UTArcF32(ar);
+			m->n_seq++;
+		}
+		else
+			UTArcF32(ar);
+		i++;
+	}
+	return !ar->err;
+}
+
+Bool UTLodBuildTrisFromClassic(U8 *tri_bytes, I64 nt, CUTLodMesh *m, I64 fv)
+{
+	I64 i;
+	I64 a;
+	I64 b;
+	I64 c;
+	I64 *tri;
+	I64 n;
+
+	if (nt < 1 || nt > UT_LOD_MAX_TRIS)
+		return FALSE;
+	tri = CAlloc(nt * 3 * sizeof(I64));
+	n = 0;
+	i = 0;
+	while (i < nt)
+	{
+		a = UTRdU16(tri_bytes + i * 20);
+		b = UTRdU16(tri_bytes + i * 20 + 2);
+		c = UTRdU16(tri_bytes + i * 20 + 4);
+		if (a < fv && b < fv && c < fv)
+		{
+			tri[n * 3] = a;
+			tri[n * 3 + 1] = b;
+			tri[n * 3 + 2] = c;
+			n++;
+		}
+		i++;
+	}
+	if (n < 1)
+	{
+		Free(tri);
+		return FALSE;
+	}
+	m->tri_i = tri;
+	m->num_tris = n;
+	return TRUE;
+}
+
+Bool UTLodSynthTris(CUTLodMesh *m, I64 fv)
+{//fan from vert0 when face tables absent
+	I64 i;
+	I64 n;
+	I64 *tri;
+
+	if (fv < 3)
+		return FALSE;
+	n = fv - 2;
+	if (n > UT_LOD_MAX_TRIS)
+		n = UT_LOD_MAX_TRIS;
+	tri = CAlloc(n * 3 * sizeof(I64));
+	i = 0;
+	while (i < n)
+	{
+		tri[i * 3] = 0;
+		tri[i * 3 + 1] = i + 1;
+		tri[i * 3 + 2] = i + 2;
+		i++;
+	}
+	m->tri_i = tri;
+	m->num_tris = n;
+	return TRUE;
+}
+
+Bool UTLodSeekCollapse(CUTArc *ar, I64 fv)
+{//after CurPoly/CurVertex: preamble then CollapsePointThus count≈ModelVerts≈fv
+	I64 saved;
+	I64 i;
+	I64 n;
+	I64 end;
+	I64 best_i;
+	I64 best_n;
+	I64 best_diff;
+
+	saved = ar->pos;
+	end = ar->pos + 128;
+	if (end > ar->size)
+		end = ar->size;
+	best_i = -1;
+	best_n = 0;
+	best_diff = fv + 1;
+	i = saved;
+	while (i < end)
+	{
+		ar->pos = i;
+		ar->err = FALSE;
+		n = UTArcIndex(ar);
+		if (!ar->err && n > 0 && n <= fv + 8 && ar->pos + n * 2 <= ar->size)
+		{
+			if (n == fv)
+			{
+				ar->pos += n * 2;
+				return TRUE;
+			}
+			if (n >= fv / 2)
+			{
+				if (fv - n < best_diff)
+				{
+					best_diff = fv - n;
+					best_i = i;
+					best_n = n;
+				}
+			}
+		}
+		i++;
+	}
+	if (best_i >= 0)
+	{
+		ar->pos = best_i;
+		ar->err = FALSE;
+		n = UTArcIndex(ar);
+		ar->pos += n * 2;
+		return TRUE;
+	}
+	ar->pos = saved;
+	ar->err = FALSE;
+	return FALSE;
+}
+
+Bool UTLodLoadExport(CUTPackage *pkg, I64 exp_i, CUTLodMesh *m)
+{
+	CUTArc ar;
+	CUTExport *e;
+	U8 *vbytes;
+	U8 *tbytes;
+	I64 nv;
+	I64 nt;
+	I64 fv;
+	I64 af;
+	I64 i;
+	F64 tmp[3];
+	Bool got_faces;
+
+	UTLodFree(m);
+	if (!pkg || !m || exp_i < 0 || exp_i >= pkg->export_count)
+		return FALSE;
+	e = &pkg->exports[exp_i];
+	if (!UTPkgArcExport(pkg, exp_i, &ar))
+		return FALSE;
+	UTPropSkipStack(&ar, e->object_flags);
+	if (!UTPropSkipAll(&ar, pkg))
+		ar.err = FALSE;
+
+	//UPrimitive: FBox(25) + FSphere(16)
+	if (ar.pos + 41 <= ar.size)
+		ar.pos += 41;
+
+	vbytes = NULL;
+	nv = 0;
+	if (!UTLodReadLazyElems(&ar, &vbytes, &nv, 4) || nv < 3)
+	{
+		if (vbytes) Free(vbytes);
+		return FALSE;
+	}
+	tbytes = NULL;
+	nt = 0;
+	if (!UTLodReadLazyElems(&ar, &tbytes, &nt, 20))
+	{
+		tbytes = NULL;
+		nt = 0;
+		ar.err = FALSE;
+	}
+
+	if (!UTLodParseAnimSeqs(&ar, pkg, m))
+	{
+		ar.err = FALSE;
+		m->n_seq = 0;
+	}
+
+	//Connects / BoundingBoxes / BoundingSpheres / VertLinks / Textures skipped
+	//via FrameVerts marker scan (closed Engine serialize order).
+	if (!UTLodFindFrameHeader(&ar, nv, &fv, &af))
+	{
+		//fallback: All seq length
+		if (m->n_seq > 0 && m->seq[0].num > 0 && (nv % m->seq[0].num) == 0)
+		{
+			af = m->seq[0].num;
+			fv = nv / af;
+		}
+		else
+		{
+			Free(vbytes);
+			if (tbytes) Free(tbytes);
+			return FALSE;
+		}
+	}
+	else
+	{
+		//Scale Origin RotOrigin CurPoly CurVertex
+		m->scale[0] = UTArcF32(&ar);
+		m->scale[1] = UTArcF32(&ar);
+		m->scale[2] = UTArcF32(&ar);
+		m->origin[0] = UTArcF32(&ar);
+		m->origin[1] = UTArcF32(&ar);
+		m->origin[2] = UTArcF32(&ar);
+		UTArcI32(&ar); //pitch
+		m->rot_yaw = UTArcI32(&ar);
+		UTArcI32(&ar); //roll
+		UTArcI32(&ar); UTArcI32(&ar); //CurPoly CurVertex
+	}
+	if (m->scale[0] == 0.0) m->scale[0] = 1.0;
+	if (m->scale[1] == 0.0) m->scale[1] = 1.0;
+	if (m->scale[2] == 0.0) m->scale[2] = 1.0;
+
+	m->frame_verts = fv;
+	m->anim_frames = af;
+	m->verts = CAlloc(nv * 3 * sizeof(F64));
+	i = 0;
+	while (i < nv)
+	{
+		UTLodUnpackVert(UTRdU32(vbytes + i * 4), tmp);
+		m->verts[i * 3] = tmp[0];
+		m->verts[i * 3 + 1] = tmp[1];
+		m->verts[i * 3 + 2] = tmp[2];
+		i++;
+	}
+	Free(vbytes);
+
+	got_faces = FALSE;
+	m->faces_ok = FALSE;
+	if (nt > 0 && tbytes)
+		got_faces = UTLodBuildTrisFromClassic(tbytes, nt, m, fv);
+	if (tbytes)
+		Free(tbytes);
+
+	if (!got_faces)
+	{
+		if (UTLodSeekCollapse(&ar, fv))
+		{
+			if (UTLodSkipTArrayWords(&ar))
+				got_faces = UTLodReadFacesAsTris(&ar, m, fv);
+		}
+	}
+	if (got_faces)
+		m->faces_ok = TRUE;
+	else
+		UTLodSynthTris(m, fv);
+
+	StrPrint(m->name, "%s", UTPkgNameStr(pkg, e->name_index));
+	m->frame = 0.0;
+	m->seq_i = 0;
+	m->draw_yaw = 0;
+	i = 0;
+	while (i < m->n_seq)
+	{
+		if (!StrCompare(m->seq[i].name, "WalkLg") ||
+			!StrCompare(m->seq[i].name, "WalkLgFr") ||
+			!StrCompare(m->seq[i].name, "Walk") ||
+			!StrCompare(m->seq[i].name, "RunLg") ||
+			!StrCompare(m->seq[i].name, "Still") ||
+			!StrCompare(m->seq[i].name, "All"))
+		{
+			m->seq_i = i;
+			m->frame = ToF64(m->seq[i].start);
+			break;
+		}
+		i++;
+	}
+	m->loaded = TRUE;
+	UTLog("UTLod: %s verts=%d frames=%d tris=%d fv=%d seqs=%d faces=%d\n",
+		m->name, nv, af, m->num_tris, fv, m->n_seq, m->faces_ok);
+	return TRUE;
+}
+
+Bool UTLodLoadNamed(U8 *pkg_path, U8 *mesh_name, CUTLodMesh *m)
+{
+	CUTPackage *pkg;
+	I64 i;
+	Bool ok;
+
+	pkg = UTPkgLoad(pkg_path);
+	if (!pkg)
+		return FALSE;
+	i = UTPkgFindExport(pkg, "LodMesh", mesh_name);
+	if (i < 0)
+		i = UTPkgFindExport(pkg, "Mesh", mesh_name);
+	if (i < 0)
+		i = UTPkgFindExportClass(pkg, "LodMesh");
+	ok = FALSE;
+	if (i >= 0)
+		ok = UTLodLoadExport(pkg, i, m);
+	UTPkgFree(pkg);
+	return ok;
+}
+
+U0 UTLodSetSeq(CUTLodMesh *m, U8 *name)
+{
+	I64 i;
+
+	if (!m || !m->loaded || !name)
+		return;
+	i = 0;
+	while (i < m->n_seq)
+	{
+		if (!StrCompare(m->seq[i].name, name))
+		{
+			m->seq_i = i;
+			m->frame = ToF64(m->seq[i].start);
+			return;
+		}
+		i++;
+	}
+}
+
+U0 UTLodGetFrameVert(CUTLodMesh *m, I64 frame, I64 vi, F64 *out)
+{
+	I64 base;
+	F64 *p;
+	F64 x;
+	F64 y;
+	F64 z;
+	F64 yaw;
+	F64 cy;
+	F64 sy;
+	F64 rx;
+	F64 ry;
+
+	if (!m || !m->loaded || vi < 0 || vi >= m->frame_verts)
+	{
+		UTVecSet(out, 0, 0, 0);
+		return;
+	}
+	if (frame < 0) frame = 0;
+	if (frame >= m->anim_frames)
+		frame = m->anim_frames - 1;
+	base = (frame * m->frame_verts + vi) * 3;
+	p = m->verts + base;
+	x = p[0] * m->scale[0];
+	y = p[1] * m->scale[1];
+	z = p[2] * m->scale[2];
+	//RotOrigin.Yaw then actor draw_yaw (Unreal rot → rad)
+	yaw = ToF64((m->rot_yaw + m->draw_yaw) & 0xFFFF) * UT_ROT2RAD;
+	cy = Cos(yaw);
+	sy = Sin(yaw);
+	rx = x * cy - y * sy;
+	ry = x * sy + y * cy;
+	out[0] = rx + m->origin[0] + m->draw_origin[0];
+	out[1] = ry + m->origin[1] + m->draw_origin[1];
+	out[2] = z + m->origin[2] + m->draw_origin[2];
+}
+
+U0 UTLodTick(CUTLodMesh *m, F64 dt, F64 fps)
+{
+	CUTLodSeq *s;
+	F64 rate;
+	F64 endf;
+
+	if (!m || !m->loaded || m->anim_frames < 2)
+		return;
+	rate = fps;
+	if (m->seq_i >= 0 && m->seq_i < m->n_seq)
+	{
+		s = &m->seq[m->seq_i];
+		if (s->rate > 0.0)
+			rate = s->rate;
+		m->frame += dt * rate;
+		endf = ToF64(s->start + s->num);
+		if (s->num > 0)
+		{
+			while (m->frame >= endf)
+				m->frame -= ToF64(s->num);
+			if (m->frame < ToF64(s->start))
+				m->frame = ToF64(s->start);
+			return;
+		}
+	}
+	m->frame += dt * rate;
+	while (m->frame >= ToF64(m->anim_frames))
+		m->frame -= ToF64(m->anim_frames);
+}
+
+U0 UTLodDraw(CUTCanvas *c, CUTLodMesh *m, I64 color)
+{
+	I64 i;
+	I64 fr;
+	I64 a;
+	I64 b;
+	I64 cc;
+	F64 pa[3];
+	F64 pb[3];
+	F64 pc[3];
+
+	if (!c || !m || !m->loaded)
+		return;
+	fr = ToI64(m->frame);
+	i = 0;
+	while (i < m->num_tris)
+	{
+		a = m->tri_i[i * 3];
+		b = m->tri_i[i * 3 + 1];
+		cc = m->tri_i[i * 3 + 2];
+		if (a >= 0 && a < m->frame_verts &&
+			b >= 0 && b < m->frame_verts &&
+			cc >= 0 && cc < m->frame_verts)
+		{
+			UTLodGetFrameVert(m, fr, a, pa);
+			UTLodGetFrameVert(m, fr, b, pb);
+			UTLodGetFrameVert(m, fr, cc, pc);
+			UTDrawTri3(c, pa, pb, pc, color);
+		}
+		i++;
+	}
+}
+
+U0 UTLodInit()
+{
+	UTLodFree(&ut_lod_player);
+	UTLodFree(&ut_lod_weapon);
+	ut_lod_ready = FALSE;
+	if (UTLodLoadNamed("::/Apps/UT99/System/Botpack.u", "Soldier",
+		&ut_lod_player))
+		ut_lod_ready = TRUE;
+	else if (UTLodLoadNamed("::/Apps/UT99/System/Botpack.u", "Commando",
+		&ut_lod_player))
+		ut_lod_ready = TRUE;
+	else if (UTLodLoadNamed("::/Apps/UT99/System/UnrealShare.u", "Male3",
+		&ut_lod_player))
+		ut_lod_ready = TRUE;
+	else if (UTLodLoadNamed("::/Apps/UT99/System/UnrealShare.u", "Nali1",
+		&ut_lod_player))
+		ut_lod_ready = TRUE;
+
+	if (ut_lod_player.loaded)
+		UTLodSetSeq(&ut_lod_player, "WalkLg");
+
+	UTLodLoadNamed("::/Apps/UT99/System/Botpack.u", "PulseGun3rd",
+		&ut_lod_weapon);
+	if (!ut_lod_weapon.loaded)
+		UTLodLoadNamed("::/Apps/UT99/System/Botpack.u", "ASMD2M",
+			&ut_lod_weapon);
+	if (!ut_lod_weapon.loaded)
+		UTLodLoadNamed("::/Apps/UT99/System/UnrealShare.u", "ASMDM",
+			&ut_lod_weapon);
+	if (ut_lod_weapon.loaded)
+		UTLodSetSeq(&ut_lod_weapon, "Still");
+	UTLog("UTLod: player=%d weapon=%d\n",
+		ut_lod_player.loaded, ut_lod_weapon.loaded);
+}
+
+U0 UTLodExit()
+{
+	UTLodFree(&ut_lod_player);
+	UTLodFree(&ut_lod_weapon);
+	ut_lod_ready = FALSE;
+}
