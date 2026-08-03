@@ -1,49 +1,32 @@
-# Unreal Tournament 99 for ZealOS
+# UT99 for ZealOS
 
-Native ZealC SoftDrv port. Formats from FaultyRAM/Ut99PubSrc + retail packages.
+Contract: `docs/Apps/UT99/PORT.md`.
 
-## SoftDrv vs menu
+Boot = Engine Client (`UTClient`) + SoftDrv `URenderDevice`.
+UWindow from retail `System/UWindow.u` / `UMenu.u` / `UTMenu.u`.
+Start Match → `UTClientTravel` → Level Model SoftDrv + PlayerStart possess.
 
-- **SoftDrv** = CPU `URenderDevice` only (P8 Lock/Unlock/DrawTile → ARGB blit).
-- **Menu** = UnrealScript **UWindow** from retail `System/UWindow.u`, `UMenu.u`, `UTMenu.u`.
-- Paint path = Engine **Canvas** `DrawTile` / `DrawText` (iNative 465–469 / 472–474) → SoftDrv P8.
-- PubSrc has `Window/` (Win32) + Engine Canvas headers. **No** `UWindow.uc` in pubsrc — class bodies live as ScriptText + bytecode inside retail `.u`.
+## SoftDrv
 
-## Runs
+- SoftDrv = CPU `URenderDevice` (P8 Lock/Unlock/DrawTile → ARGB blit).
+- Level = `.unr` Model1 via `UTBspDrawModel` after ClientTravel bind.
+- Menu = UWindow host; cursor = `Texture'MouseCursor'` SoftDrv DrawTile.
+- GameInfo / ChallengeHUD object Exec incomplete (PORT.md).
+
+## Run
 
 ```
 Cd("::/Apps/UT99");;ExeFile("Run");
 ```
 
-Boot = `UTUWin` package client:
-- Object graph: `UMenuRootWindow` + `UMenuMenuBar` + `UTGameMenu` pulldown (CreateRootWindow host)
-- Art: `UMenu.u` Texture exports (`MenuBlack`, `Bg11`–`Bg43`, `BlueBar*`, `BlueMenu*`)
-- Paint: mirrors `UMenuRootWindow.Paint` + `UMenuBlueLookAndFeel.Menu_Draw*` via Canvas DrawTile
-- Input: mouse / keys → menubar + Game pulldown (`UTGameMenu` items from `UTMenu.int`)
+WASD move, mouse look, Space jump, ESC = UWindow, Q = quit.
 
-Enter or **Start Practice Session** = start match. ESC/Q = quit. In-game ESC returns to UWindow.
-
-Debug SoftDrv LAF clone: `ut_menu_fake_laf=TRUE` before `UT99` (not default).
-
-WASD mouse SPACE jump LMB/RMB fire `[` `]` weapons Tab scores K suicide.
-Maps: 1–4 favorites, `n`/`b` cycle.
-
-## Present
-
-- SoftDrv P8 + FTB BSP + FSpan; per-surf `.utx`
-- **UTWin**: UCanvas DrawTile / DrawText
-- **UTUWin**: RootWindow graph + package Texture paint + Canvas iNative bind
-- **UTVM**: Canvas natives 465–469 / 472–474 skip-parms + cmd flags
-- ChallengeHUD-style HUD via Canvas/TTF
-- Zone-0 volume solid; bots; Botpack weapons; CTF/DOM
+Level load fail → **"Engine Client incomplete"** + gap note.
+Level ok, GameInfo/ChallengeHUD missing → corner overlay, walkable.
 
 ## Gaps
 
-- Full UScript object `New` / property linker for every widget still thin — host graph covers Root/MenuBar/Game menu
-- DrawTile iNative does not yet pop Texture object refs from bytecode (host Paint drives tiles)
-- Latent UScript / IpDrv net
-- Lightmaps absent; SoftDrv index-shade only
-
-## Modules
-
-`UTPal` `UTFont` `UTWin` `UTUWin` `UTMenu` (debug LAF) `UTSoft` `UTBsp` `UTGame` `UTHUD` `UTVM` …
+- UObject New + property linker for widget/actor graph
+- GameInfo / DeathMatchPlus from Botpack Exec
+- ChallengeHUD PostRender via Canvas natives
+- Full UWindow RootWindow object Tick/Paint
