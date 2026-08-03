@@ -8,18 +8,41 @@ Start Match → `UTClientTravel` → Level Model SoftDrv + PlayerStart possess.
 
 ## SoftDrv
 
-- SoftDrv = CPU `URenderDevice` (P8 Lock/Unlock/DrawTile → ARGB blit).
+- SoftDrv = CPU `URenderDevice` (P8 Lock/Unlock/DrawTile → ARGB blit via `ut_pal_argb`).
 - Level = `.unr` Model1 via `UTBspDrawModel` after ClientTravel bind.
-- Menu = UWindow host; cursor = `Texture'MouseCursor'` SoftDrv DrawTile.
+- Menu = UWindow host; cursor = SoftDrv glyph (`Texture'MouseCursor'` or pen). `MouseRaw` hides OS pointer — soft cursor integrates `mouse_hard.raw_data`.
 - GameInfo / ChallengeHUD object Exec incomplete (PORT.md).
 
+## Resolution
+
+SoftDrv canvas (not GR letterbox) defaults **640×480**. Blit letterboxes into the WinMax window (`ut_blit_*`).
+
+| Slot | Size |
+|------|------|
+| 0 | 320×240 |
+| 1 | 400×300 |
+| 2 | 512×384 |
+| 3 | 640×480 (boot) |
+| 4 | 800×600 |
+| 5 | match window (`Fs->pix_*`, clamped) |
+
+Cycle in-game: **F5** or **=**. Or set `ut_opt_res` then `ut_res_dirty=TRUE` before/while running.
+
 ## Run
+
+Quit QEMU if disk mounted. Sync host → guest:
+
+```
+cd /home/y4my4m/gits/y4mOS/build && ./sync.sh vm
+```
+
+Guest:
 
 ```
 Cd("::/Apps/UT99");;ExeFile("Run");
 ```
 
-WASD move, mouse look, Space jump, ESC = UWindow, Q = quit.
+WASD move, mouse look, Space jump, ESC = UWindow, Q = quit, F5/= = SoftDrv res.
 
 Level load fail → **"Engine Client incomplete"** + gap note.
 Level ok, GameInfo/ChallengeHUD missing → corner overlay, walkable.
