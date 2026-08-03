@@ -23,7 +23,9 @@ comments. Deviations are deliberate and marked.
 - **WAD3** - archives named in worldspawn's `wad` key. Per-miptex 256-colour
   palettes; the renderer composites in RGB, no shared colormap.
 - **Truecolor canvas** - `0x00RRGGBB`. Gamma and damage/water tint applied in
-  the blit.
+  the blit. Video menu: 320x240 … 800x600 plus **1280x720**; fullscreen is
+  edge-to-edge (`WinBorder(OFF)` + full text grid, fill-blit); windowed
+  toggle resizes via `HLWindowApply` (no canvas rebuild).
 - **Studio MDL v10** - bones, RLE channels, slerp, blends, bodygroups, skin
   families, embedded or `<name>T.mdl` textures. Software rasterised through
   the world span loop.
@@ -80,7 +82,6 @@ comments. Deviations are deliberate and marked.
 
 - AI projectiles via `hl_proj` queue (spit, hornet, ctrl ball, grunt grenade).
 - `func_monsterclip` solid to monsters only (`hl_clip_for_monster`).
-- `MakeDormant` for off-map globalname copies.
 - Headcrab leap flight + leech AI row.
 - Autoaim HUD reticle, gauss glow sprites, RPG spot glow.
 - Soft-raster: `HLLightPoint` grid cache; unrotated brush backface cull;
