@@ -69,6 +69,11 @@ CHLSentChan	hl_ai_sentch[HLAI_SENT_CHANS];
 //scratch directory buffer for a word lookup made outside any channel
 U8	hl_ai_sent_dir[HLAI_WORD_MAX];
 
+//CTalkMonster::g_talkWaitTime, talkmonster.cpp:30. Declared here (before the
+//word ticker) because ZealC is single-pass - an earlier use saw an undefined
+//name and reported Invalid lval. Only one character starts a line at a time.
+F64	hl_ai_talk_wait = 0.0;
+
 U0 HLAIInit()
 {//globals aren't zeroed and a declaration initialiser on one is unreliable
 	I64 i;
@@ -76,6 +81,7 @@ U0 HLAIInit()
 	hl_ai_sent_count  = 0;
 	hl_ai_sent_raw    = NULL;
 	hl_ai_sent_dir[0] = 0;
+	hl_ai_talk_wait   = 0.0;
 
 	for (i = 0; i < HLAI_SENT_CHANS; i++)
 	{
@@ -1111,7 +1117,6 @@ F64 HLAIEntityCycle(CHLEntity *e)
 //                          line in the SDK. A bit nothing raises.
 //   bits_COND_SEE_NEMESIS  needs R_NM, which HLAIRelationship's chain has no
 //                          row for; IRelationship never returns it either.
-//   bits_COND_SEE_CLIENT   read only by SF_MONSTER_WAIT_TILL_SEEN, absent.
 //   bits_COND_SMELL/_FOOD  scent via HLAISmell over CARCASS/MEAT/GARBAGE sounds.
 //   bits_COND_SPECIAL1/2   per-monster, and every monster here is a table row.
 #define HLCOND_NONE				0x00000000
@@ -1134,7 +1139,16 @@ F64 HLAIEntityCycle(CHLEntity *e)
 #define HLCOND_HEAR_SOUND		0x00020000
 #define HLCOND_ENEMY_FACING_ME	0x00080000
 #define HLCOND_ENEMY_DEAD		0x00100000
+#define HLCOND_SEE_CLIENT		0x00200000
 #define HLCOND_TASK_FAILED		0x40000000
+
+//SF_MONSTER_WAIT_TILL_SEEN, monsters.h:44. Monster spawnflag bit 0: stay
+//unaware of the player until the player faces the monster.
+#define HLAI_SF_MONSTER_WAIT_TILL_SEEN	1
+
+//SCRIPT_FINISHSCHED_*, scripted.h. aiscripted_sequence m_iFinishSchedule.
+#define HLAI_FINISH_DEFAULT		0
+#define HLAI_FINISH_AMBUSH		1
 
 //bits_COND_CAN_ATTACK
 #define HLCOND_CAN_ATTACK		0x00003C00
@@ -2500,6 +2514,7 @@ class CHLCineState
 	I64	actor;		//m_hTargetEnt as an entity index, -1 for none
 	I64	owner;		//m_pCine of THIS entity as a script index, -1 for none
 	F64	blocked;	//when the walk to the mark first failed, 0 while it moves
+	Bool	interrupt;	//m_interruptable; AE 1001/1002 and SF_SCRIPT_NOINTERRUPT
 };
 
 CHLCineState	hl_ai_cine[HLENT_MAX];
@@ -2520,6 +2535,7 @@ U0 HLAICineResetRow(I64 i)
 	hl_ai_cine[i].actor    = -1;
 	hl_ai_cine[i].owner    = -1;
 	hl_ai_cine[i].blocked  = 0.0;
+	hl_ai_cine[i].interrupt = TRUE;
 }
 
 //--- talk monster state -----------------------------------------------------
@@ -2589,11 +2605,8 @@ class CHLTalkState
 
 CHLTalkState	hl_ai_talk[HLENT_MAX];
 
-//CTalkMonster::g_talkWaitTime, talkmonster.cpp:30. One global for the whole
-//map: only one character starts a line at a time, which is what keeps a room of
-//scientists from all speaking at once. It gates the START of a line, not the
-//line itself, so two already-running sentences still overlap.
-F64	hl_ai_talk_wait = 0.0;
+//hl_ai_talk_wait lives with the sentence globals at the top of this file
+//(single-pass: the word ticker writes it before this point).
 
 U0 HLAITalkResetRow(I64 i)
 {//globals are not zeroed and the whole table is walked every tick
@@ -5518,6 +5531,26 @@ Bool HLAIInViewCone(I64 s, F64 *point)
 		hl_ai_mon_info[hl_ai_mon[s].kind].fov);
 }
 
+Bool HLAIPlayerSees(F64 *point)
+{//player's FInViewCone(monster): yaw from hl_ent_player_ang vs the point.
+ //VIEW_FIELD_NARROW (0.7) matches a player who has not been given a monster
+ //FOV; WAIT_TILL_SEEN only needs "facing us", not combat FOV.
+	F64 forward[3];
+	F64 ang[3];
+	F64 dir[3];
+
+	HLVecSet(ang, 0.0, hl_ent_player_ang[1], 0.0);
+	HLAngleVectors(ang, forward, NULL, NULL);
+
+	HLVecSub(point, hl_ent_player_org, dir);
+	dir[2] = 0.0;
+
+	if (HLVecNormalize(dir) <= 0.0)
+		return TRUE;
+
+	return ToBool(HLVecDot(dir, forward) >= 0.7);
+}
+
 Bool HLAIVisible(I64 s, F64 *target_eye)
 {//FVisible: a point trace from eye to eye. Anything in the way blocks it
  //
@@ -5564,12 +5597,13 @@ U0 HLAILook(I64 s)
 	I64			 target;
 	I64			 i;
 	Bool		 found     = FALSE;
+	Bool		 is_player;
 
 	//"DON'T let visibility information from last frame sit around", monsters.
 	//cpp:310. Cleared before the early return: a monster that has lost sight of
 	//everything must not keep last pass's SEE_ bits
 	HLAIClearCond(s, HLCOND_SEE_HATE | HLCOND_SEE_DISLIKE | HLCOND_SEE_FEAR |
-		HLCOND_SEE_ENEMY);
+		HLCOND_SEE_ENEMY | HLCOND_SEE_CLIENT);
 
 	if (!e)
 		return;
@@ -5585,22 +5619,33 @@ U0 HLAILook(I64 s)
 	while (i < hl_num_entities)
 	{
 		target = i;
+		is_player = FALSE;
 
 		if (i >= 0)
 		{
 			if (hl_ai_mon_of[i] < 0 || i == hl_ai_mon[s].ent)
 				goto qal_next;
 		}
-		else if (hl_ent_notarget)
+		else
 		{
-			//FL_NOTARGET: CBaseMonster::Look skips the player entirely, so it
-			//is never seen and never becomes m_hEnemy.
-			goto qal_next;
+			is_player = TRUE;
+
+			if (hl_ent_notarget)
+			{
+				//FL_NOTARGET: CBaseMonster::Look skips the player entirely, so it
+				//is never seen and never becomes m_hEnemy.
+				goto qal_next;
+			}
 		}
 
 		rel = HLAIRelationship(mi->classify, HLAITargetClass(target));
 
-		if (rel == HLREL_NONE || rel == HLREL_ALLY)
+		//R_NO is skipped. R_AL (ally) still runs for the player so SEE_CLIENT
+		//and SF_MONSTER_WAIT_TILL_SEEN fire; allies are not enemy-scored below
+		if (rel == HLREL_NONE)
+			goto qal_next;
+
+		if (rel == HLREL_ALLY && !is_player)
 			goto qal_next;
 
 		if (!HLAITargetPos(target, feet, eye))
@@ -5616,6 +5661,25 @@ U0 HLAILook(I64 s)
 			goto qal_next;
 
 		if (!HLAIVisible(s, eye))
+			goto qal_next;
+
+		if (is_player)
+		{
+			//SF_MONSTER_WAIT_TILL_SEEN, monsters.cpp:339: ignore the player
+			//until they face us, then clear the flag and become normal
+			if (e->spawnflags & HLAI_SF_MONSTER_WAIT_TILL_SEEN)
+			{
+				if (!HLAIPlayerSees(e->origin))
+					goto qal_next;
+
+				e->spawnflags = e->spawnflags & ~HLAI_SF_MONSTER_WAIT_TILL_SEEN;
+			}
+
+			sighted = sighted | HLCOND_SEE_CLIENT;
+		}
+
+		//allies (barney/scientist vs player) raise SEE_CLIENT only
+		if (rel == HLREL_ALLY)
 			goto qal_next;
 
 		//iSighted, monsters.cpp:358-397. Accumulated over every visible
@@ -7822,12 +7886,27 @@ Bool HLAISharedEvent(I64 s, CHLEntity *e, I64 self, I64 code, U8 *options)
 		return TRUE;
 	}
 
-	//1001, 1002, 1006 and 1007 control a scripted_sequence's interruptibility
-	//and its exit animation. Scripts here are not interruptible and CineCleanup
-	//drops the actor straight into IDLE, so all four are no-ops rather than
-	//unhandled.
-	if (code == HLAI_EV_NOINTERRUPT || code == HLAI_EV_CANINTERRUPT ||
-		code == HLAI_EV_INAIR || code == HLAI_EV_ENDANIMATION)
+	//SCRIPT_EVENT_NOINTERRUPT / CANINTERRUPT, monsters.cpp:2679-2685
+	if (code == HLAI_EV_NOINTERRUPT)
+	{
+		if (hl_ai_cine[self].owner >= 0)
+			hl_ai_cine[hl_ai_cine[self].owner].interrupt = FALSE;
+		return TRUE;
+	}
+
+	if (code == HLAI_EV_CANINTERRUPT)
+	{
+		if (hl_ai_cine[self].owner >= 0)
+		{
+			if (!(hl_entities[hl_ai_cine[self].owner].spawnflags &
+				HLAI_SF_NOINTERRUPT))
+				hl_ai_cine[hl_ai_cine[self].owner].interrupt = TRUE;
+		}
+		return TRUE;
+	}
+
+	//INAIR / ENDANIMATION: exit pose bookkeeping not ported; consume quietly
+	if (code == HLAI_EV_INAIR || code == HLAI_EV_ENDANIMATION)
 		return TRUE;
 
 	return FALSE;
@@ -9985,10 +10064,9 @@ U0 HLAISetState(I64 s, I64 state)
 //   GOING_UP    m_iszPlay running.
 //   AT_TOP      retired. The SDK removes the entity instead.
 //
-// Not reproduced: SF_SCRIPT_WAITTILLSEEN, m_flRepeat, m_iFinishSchedule, and
-// the root-bone query CineCleanup uses to find where a sequence left the
-// actor. The last means an actor whose play take walks it forward snaps back
-// to the mark's floor position on release rather than to where it ended.
+// Not reproduced: SF_SCRIPT_WAITTILLSEEN (FGD bit, unread in SDK scripted.cpp),
+// CCineMonster m_flRepeat (parsed, never read - sentence refire uses it).
+// Root-bone cleanup and aiscripted m_iFinishSchedule are below.
 
 U0 HLAICineLog(I64 self, U8 *what, F64 a, F64 b)
 {//one line per script state change, behind `scriptlog 1`. ALERT(at_aiconsole)
@@ -10182,6 +10260,10 @@ U0 HLAICineRelease(I64 self)
 	CHLEntity	*script = HLEntGet(self);
 	CHLEntity	*actor;
 	F64			 floor[3];
+	F64			 bone[3];
+	F64			 old[3];
+	F64			 dx;
+	F64			 dy;
 	I64			 t;
 	I64			 s;
 
@@ -10211,13 +10293,39 @@ U0 HLAICineRelease(I64 self)
 	if (s < 0)
 		return;
 
-	//SF_SCRIPT_NOSCRIPTMOVEMENT leaves the actor where the take ended. The SDK
-	//otherwise reads bone 0 to find that position and drops from there; there
-	//is no bone query outside the renderer here, so only the drop is done.
-	if (!(script->spawnflags & HLAI_SF_NOSCRIPTMOVEMENT))
+	//SF_SCRIPT_NOSCRIPTMOVEMENT leaves the actor where the take ended.
+	//Otherwise GetBonePosition(0) + DROP_TO_FLOOR, scripted.cpp:846-885.
+	//Only when a play take ran: idle-only possession must not yank the actor.
+	if (script->ai_play[0] &&
+		!(script->spawnflags & HLAI_SF_NOSCRIPTMOVEMENT))
 	{
+		HLVecCopy(actor->origin, old);
+
+		if (actor->studio)
+		{
+			HLStudioPose(actor->studio, actor->origin, actor->angles,
+				actor->seq, HLAIEntityCycle(actor), actor->blending[0],
+				actor->controllers, actor->blending[1]);
+
+			if (HLStudioBonePos(actor->studio, 0, bone))
+			{
+				dx = old[0] - bone[0];
+				dy = old[1] - bone[1];
+
+				//"don't move monster if they don't seem to move", < 8 units 2D
+				if (dx * dx + dy * dy >= 64.0)
+				{
+					actor->origin[0] = bone[0];
+					actor->origin[1] = bone[1];
+					actor->origin[2] = bone[2] + 1.0;
+				}
+			}
+		}
+
 		if (HLAIDropToFloorHard(actor, actor->mins, actor->maxs, floor))
 			HLVecCopy(floor, actor->origin);
+		else
+			HLVecCopy(old, actor->origin);
 
 		HLEntSetAbsBox(actor);
 	}
@@ -10240,13 +10348,30 @@ U0 HLAICineDone(I64 self)
  //the targets fire: firing hands it straight to the next script in the chain,
  //which is how the walking scientists in c0a0 bounce between two marks.
 	CHLEntity *script = HLEntGet(self);
+	I64			 t;
+	I64			 s;
 
 	if (!script)
 		return;
 
 	HLAICineLog(self, "done", 0.0, 0.0);
 
+	t = hl_ai_cine[self].actor;
+
 	HLAICineRelease(self);
+
+	//CCineAI::FixScriptMonsterSchedule, scripted.cpp:610. Ordinary
+	//scripted_sequence just clears (Release already did). aiscripted may
+	//force AMBUSH from m_iFinishSchedule.
+	if (!StrCompare(script->classname, "aiscripted_sequence") &&
+		script->ai_finish == HLAI_FINISH_AMBUSH &&
+		t >= 0 && t < HLENT_MAX)
+	{
+		s = hl_ai_mon_of[t];
+
+		if (s >= 0 && hl_ai_mon[s].state != HLMSTATE_DEAD)
+			HLAISetSchedule(s, HLSCHED_AMBUSH);
+	}
 
 	hl_ai_cine[self].start   = hl_ent_time + HLAI_CINE_NEVER;
 	hl_ai_cine[self].delay   = 0;
@@ -10294,6 +10419,12 @@ U0 HLAICinePossess(I64 self)
 	hl_ai_cine[self].solid    = actor->solid;
 	hl_ai_cine[self].retry    = -1.0;
 	hl_ai_cine[t].owner       = self;
+
+	//Spawn sets m_interruptable from SF_SCRIPT_NOINTERRUPT, scripted.cpp:151
+	if (script->spawnflags & HLAI_SF_NOINTERRUPT)
+		hl_ai_cine[self].interrupt = FALSE;
+	else
+		hl_ai_cine[self].interrupt = TRUE;
 
 	s = hl_ai_mon_of[t];
 
@@ -11537,14 +11668,13 @@ Bool HLAITalkCanFollow(I64 ent)
 
 	s = hl_ai_mon_of[ent];
 
-	//in a script that cannot be interrupted
+	//in a script that cannot be interrupted (CanInterrupt, scripted.cpp:654)
 	if (s >= 0 && hl_ai_mon[s].state == HLMSTATE_SCRIPT)
 	{
 		if (hl_ai_cine[ent].owner < 0)
 			return FALSE;
 
-		if (hl_entities[hl_ai_cine[ent].owner].spawnflags &
-			HLAI_SF_NOINTERRUPT)
+		if (!hl_ai_cine[hl_ai_cine[ent].owner].interrupt)
 			return FALSE;
 	}
 
