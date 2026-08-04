@@ -1457,6 +1457,7 @@ Bool QGameInit(CQMap *map, Bool spawn_entities = TRUE)
 	//edict numbers are reused across maps, so a box left from the last one
 	//would reject a real impact until the entity first relinks
 	QClipLinkClear;
+	QLightCacheClear;
 
 	QPrCacheOffsets;
 	QBiInit;
@@ -1587,8 +1588,10 @@ U0 QGameDrawStatics(CQCanvas *c, CQMap *map)
 		if (QVecLength(d) > QGAME_STATIC_DIST)
 			goto qds_next;
 
+		//statics never move, so they are the best cache tenants. keys sit
+		//above any edict number so the two spaces cannot collide
 		QMdlDraw(c, se->mdl, se->frame, se->origin, se->angles[1],
-			QLightPoint(map, se->origin));
+			QLightPoint(map, se->origin, QLPC_STATIC + i));
 
 qds_next:
 	}
@@ -1751,6 +1754,117 @@ Bool QClientSpawnAt(I64 ent, F64 *origin, F64 *angles, U8 *player_name)
 #define QEPASS_BRUSH	1
 #define QEPASS_POINT	2
 
+//alpha brush entities, deferred out of the opaque pass. drawn after every
+//opaque entity, far to near - an alpha surface writes no depth, so draw order
+//IS its depth order
+#define QALPHA_MAX	64
+I64	q_alpha_ent[QALPHA_MAX];
+I64	q_alpha_count = 0;
+
+I64 q_alpha_drawn = 0;	//r_speeds: panes that reached QDrawBrushModel
+
+U0 QGameDrawAlphaEnts(CQCanvas *c, CQMap *map, F64 *view_origin)
+{
+	F64	eorg[3];
+	F64	d[3];
+	F64	dist[QALPHA_MAX];
+	I64	i;
+	I64	j;
+	I64	k;
+	I64	ent;
+	I64	bm;
+	F64	ealpha;
+
+	for (i = 0; i < q_alpha_count; i++)
+	{
+		QBiGetFieldV(q_alpha_ent[i], q_fld_origin, eorg);
+		QVecSub(eorg, view_origin, d);
+		dist[i] = QVecLength(d);
+	}
+
+	//insertion sort, far first - the list is a handful of panes
+	for (i = 1; i < q_alpha_count; i++)
+	{
+		ent = q_alpha_ent[i];
+		for (j = i - 1; j >= 0 && dist[j] < dist[j + 1]; j--)
+		{
+			k                 = q_alpha_ent[j];
+			q_alpha_ent[j]    = q_alpha_ent[j + 1];
+			q_alpha_ent[j + 1] = k;
+			ealpha            = dist[j];
+			dist[j]           = dist[j + 1];
+			dist[j + 1]       = ealpha;
+		}
+	}
+
+	for (i = 0; i < q_alpha_count; i++)
+	{
+		ent = q_alpha_ent[i];
+		bm  = QClipBrushModel(ToI64(QPrFieldF(ent, q_fld_modelindex)));
+		if (bm <= 0)
+			goto qgae_next;
+
+		QBiGetFieldV(ent, q_fld_origin, eorg);
+
+		q_draw_alpha = ClampI64(
+			ToI64(QPrFieldF(ent, q_fld_alpha) * 255.0), 1, 255);
+		QDrawBrushModel(c, map, bm, eorg,
+			ToI64(QPrFieldF(ent, q_fld_frame)));
+		q_draw_alpha = 255;
+		q_alpha_drawn++;
+
+qgae_next:
+	}
+
+	q_alpha_count = 0;
+}
+
+//model bounds can reach past the collision box - a monster's arms, a raised
+//weapon. widened so the cull never clips a limb off at the screen edge
+#define QENT_CULL_PAD	24.0
+
+Bool QEntCulled(CQCanvas *c, I64 ent, F64 *eorg)
+{//frustum, then the depth buffer. absmin/absmax are maintained by
+ //QGameLinkEdict, so this is the entity's real extent, not a fixed radius
+	F64 mins[3];
+	F64 maxs[3];
+	I64 j;
+
+	if (ent > 0 && ent < QCLIP_MAX_LINK && q_link_set[ent])
+	{
+		for (j = 0; j < 3; j++)
+		{
+			mins[j] = q_link_min[ent * 3 + j] - QENT_CULL_PAD;
+			maxs[j] = q_link_max[ent * 3 + j] + QENT_CULL_PAD;
+		}
+	}
+	else
+	{
+		//never linked: a fixed radius still covers a point entity's model
+		for (j = 0; j < 3; j++)
+		{
+			mins[j] = eorg[j] - 64.0;
+			maxs[j] = eorg[j] + 64.0;
+		}
+	}
+
+	if (q_draw_vis && !QVisBoxInFrustum(q_draw_vis, mins, maxs))
+		return TRUE;
+
+	//gl_farclip culls world faces; an entity past it hung against the sky
+	if (q_draw_vis)
+	{
+		for (j = 0; j < 3; j++)
+		{
+			if (mins[j] > q_draw_vis->origin[j] + q_far_clip ||
+				maxs[j] < q_draw_vis->origin[j] - q_far_clip)
+				return TRUE;
+		}
+	}
+
+	return QOccBoxHidden(c, mins, maxs);
+}
+
 U0 QGameDrawEntities(CQCanvas *c, CQMap *map, F64 *view_origin, F64 max_dist,
 	I64 pass = QEPASS_ALL)
 {//every live entity with a model
@@ -1762,11 +1876,17 @@ U0 QGameDrawEntities(CQCanvas *c, CQMap *map, F64 *view_origin, F64 max_dist,
 	I64		 idx;
 	I64		 frame;
 	I64		 bm;
+	F64		 ealpha;
 	I64		 top;
 	I64		 bottom;
 	I64		 cmap;
 	U8		*name;
 	U8		*mstr;
+
+	//statements must not precede declarations in a ZealC block. stale panes
+	//from a frame whose alpha pass never ran must not accumulate
+	if (pass == QEPASS_BRUSH || pass == QEPASS_ALL)
+		q_alpha_count = 0;
 
 	for (i = 1; i < q_pr_num_edicts; i++)
 	{
@@ -1812,10 +1932,31 @@ U0 QGameDrawEntities(CQCanvas *c, CQMap *map, F64 *view_origin, F64 max_dist,
 			QEntReport(name, eorg);
 			bm = QClipBrushModel(idx);
 			if (bm > 0)
-				//.frame selects the alternate texture chain - a button lit
-				//while pressed, a door with its lamp on
-				QDrawBrushModel(c, map, bm, eorg,
-					ToI64(QPrFieldF(i, q_fld_frame)));
+			{
+				//ENTALPHA_DECODE: 0 means unset, which is opaque. glass in a
+				//mod is a func_wall or func_illusionary carrying .alpha
+				//
+				//an alpha entity writes no depth, so anything drawn after it
+				//paints OVER the blend - it must go after every opaque draw,
+				//back to front. deferred to QGameDrawAlphaEnts
+				ealpha = 0.0;
+				if (q_fld_alpha >= 0)
+					ealpha = QPrFieldF(i, q_fld_alpha);
+
+				if (ealpha > 0.0 && ealpha < 1.0)
+				{
+					if (q_alpha_count < QALPHA_MAX)
+					{
+						q_alpha_ent[q_alpha_count] = i;
+						q_alpha_count++;
+					}
+				}
+				else
+					//.frame selects the alternate texture chain - a button
+					//lit while pressed, a door with its lamp on
+					QDrawBrushModel(c, map, bm, eorg,
+						ToI64(QPrFieldF(i, q_fld_frame)));
+			}
 			goto qg_next;
 		}
 
@@ -1831,16 +1972,15 @@ U0 QGameDrawEntities(CQCanvas *c, CQMap *map, F64 *view_origin, F64 max_dist,
 				!QVisPointVisible(q_draw_vis, eorg))
 				goto qg_next;
 
-			//frustum reject before any triangle work - 64 covers a point
-			//entity's model bounds without needing the model loaded
-			if (!QVisPointInFrustum(q_draw_vis, eorg, 64.0))
+			//frustum and depth reject before any triangle work
+			if (QEntCulled(c, i, eorg))
 				goto qg_next;
 
 			QEntReport(name, eorg);
 			q_ent_drawn++;
 			QSprDraw(c, q_precache_spr[idx],
 				ToI64(QPrFieldF(i, q_fld_frame)), eorg,
-				QLightPoint(map, eorg));
+				QLightPoint(map, eorg, i));
 			goto qg_next;
 		}
 
@@ -1853,9 +1993,8 @@ U0 QGameDrawEntities(CQCanvas *c, CQMap *map, F64 *view_origin, F64 max_dist,
 				!QVisPointVisible(q_draw_vis, eorg))
 				goto qg_next;
 
-			//frustum reject before any triangle work - 64 covers a point
-			//entity's model bounds without needing the model loaded
-			if (!QVisPointInFrustum(q_draw_vis, eorg, 64.0))
+			//frustum and depth reject before any triangle work
+			if (QEntCulled(c, i, eorg))
 				goto qg_next;
 
 			QEntReport(name, eorg);
@@ -1879,9 +2018,8 @@ U0 QGameDrawEntities(CQCanvas *c, CQMap *map, F64 *view_origin, F64 max_dist,
 			!QVisPointVisible(q_draw_vis, eorg))
 			goto qg_next;
 
-		//frustum reject before any triangle work - 64 covers a point
-		//entity's model bounds without needing the model loaded
-		if (!QVisPointInFrustum(q_draw_vis, eorg, 64.0))
+		//frustum and depth reject before any triangle work
+		if (QEntCulled(c, i, eorg))
 			goto qg_next;
 
 		QEntReport(name, eorg);
@@ -1923,7 +2061,7 @@ U0 QGameDrawEntities(CQCanvas *c, CQMap *map, F64 *view_origin, F64 max_dist,
 		//by a third of their view pitch and the yaw-only call threw it away,
 		//so remote players always looked level here while other engines
 		//rendered them correctly off the same wire data
-		QMdlDrawAngles(c, mdl, frame, eorg, eang, QLightPoint(map, eorg));
+		QMdlDrawAngles(c, mdl, frame, eorg, eang, QLightPoint(map, eorg, i));
 
 qg_next:
 	}

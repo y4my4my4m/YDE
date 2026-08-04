@@ -248,12 +248,34 @@ I64			q_surf_btex		= 0;
 //same face count, which face and build totals alone cannot show
 I64			q_px_rgb		= 0;	//cached truecolor
 I64			q_px_slow		= 0;	//uncached, lit per pixel
+I64			q_px_occ		= 0;	//skipped whole, block failed the depth bound
+
+//.alpha for the surface being drawn, 0..255. set around a brush entity and
+//restored after, as q_draw_vis is. 255 is opaque and costs nothing extra
+I64			q_draw_alpha	= 255;
+
+//runtime occlusion, both switchable from the console: r_occents for the
+//per-entity depth query, r_occworld for the tiled node rejection
+I64			q_occ_tested	= 0;
+I64			q_occ_rejected	= 0;
+I64			q_hiz_culled	= 0;
+I64			q_bm_drawn		= 0;	//brush models submitted
+I64			q_bm_faces		= 0;	//and their faces
+F64			q_t_brush		= 0.0;	//QEPASS_BRUSH alone
+Bool		q_occ_enable	= TRUE;
+Bool		q_hiz_enable	= TRUE;
+
+//the node walk runs BEFORE the world is drawn, so it tests against the
+//PREVIOUS frame's tiles. approximate between frames - the camera moves a
+//little - and separately switchable from the entity query so the two can be
+//told apart
+Bool		q_occworld		= TRUE;
 
 //wall clock per phase, seconds, this frame. face and pixel totals say what
 //was submitted, not where the time went - three perf theories died on that
 //gap. accumulated, not sampled: entities draw in two passes
 F64			q_t_vis			= 0.0;	//pvs mark and node walk
-F64			q_t_world		= 0.0;	//QDrawWorld
+F64			q_t_world		= 0.0;	//the world walk, which now also draws
 F64			q_t_ents		= 0.0;	//brush models, alias models, particles
 F64			q_t_hud			= 0.0;	//sbar, menu, console
 F64			q_t_blit		= 0.0;	//canvas -> DC, includes fog and palette
@@ -881,7 +903,35 @@ U8 *QLightDlightMap(CQMap *map, CQFace *f, I64 lm_w, I64 lm_h, F64 time)
 	return q_light_dyn;
 }
 
-I64 QLightPoint(CQMap *map, F64 *point)
+//--- alias model light cache -----------------------------------------------
+//
+// QLightPoint runs a 2048 unit hull trace and then scans the landing leaf's
+// marksurfaces. That is the single most expensive thing done per entity, and
+// most entities do not move: items, ammo, corpses, static models.
+//
+// keyed by edict, invalidated on movement or after QLPC_AGE frames so an
+// animated lightstyle still reaches the model.
+
+#define QLPC_MAX	8192
+#define QLPC_MOVE	4.0		//world units before the sample is stale
+#define QLPC_AGE	16		//frames before a resample regardless
+#define QLPC_STATIC	4096	//key base for static entities, above any edict
+
+F64		q_lpc_org[QLPC_MAX * 3];
+I64		q_lpc_val[QLPC_MAX];
+I64		q_lpc_frame[QLPC_MAX];
+Bool	q_lpc_set[QLPC_MAX];
+I64		q_lpc_frame_now	= 0;
+I64		q_lpc_hits		= 0;
+I64		q_lpc_miss		= 0;
+
+U0 QLightCacheClear()
+{//globals aren't zeroed, and a stale entry is a wrongly lit model
+	MemSet(q_lpc_set, 0, QLPC_MAX);
+	q_lpc_frame_now = 0;
+}
+
+I64 QLightPointStatic(CQMap *map, F64 *point)
 {//R_LightPoint - sample the lightmap of the surface below a point
  //
  //alias models carry no lightmap, this is their only shading input
@@ -960,6 +1010,53 @@ qlp_next:
 
 	if (best < 0)
 		best = QLIGHT_FALLBACK;
+
+	return best;
+}
+
+I64 QLightPoint(CQMap *map, F64 *point, I64 ent = -1)
+{//static sample plus every live dlight
+ //
+ //only the static half is cached: a dlight moves and dies on its own clock,
+ //and a muzzle flash that lit a monster one frame late would be visible
+	F64 dl[3];
+	F64 add;
+	F64 d0, d1, d2;
+	I64 best;
+	I64 i;
+	Bool fresh = FALSE;
+
+	if (ent > 0 && ent < QLPC_MAX && q_lpc_set[ent])
+	{
+		d0 = point[0] - q_lpc_org[ent * 3];
+		d1 = point[1] - q_lpc_org[ent * 3 + 1];
+		d2 = point[2] - q_lpc_org[ent * 3 + 2];
+
+		if (d0 * d0 + d1 * d1 + d2 * d2 <= QLPC_MOVE * QLPC_MOVE &&
+			q_lpc_frame_now - q_lpc_frame[ent] < QLPC_AGE)
+			fresh = TRUE;
+	}
+
+	if (fresh)
+	{
+		best = q_lpc_val[ent];
+		q_lpc_hits++;
+	}
+	else
+	{
+		best = QLightPointStatic(map, point);
+		q_lpc_miss++;
+
+		if (ent > 0 && ent < QLPC_MAX)
+		{
+			q_lpc_org[ent * 3]     = point[0];
+			q_lpc_org[ent * 3 + 1] = point[1];
+			q_lpc_org[ent * 3 + 2] = point[2];
+			q_lpc_val[ent]         = best;
+			q_lpc_frame[ent]       = q_lpc_frame_now;
+			q_lpc_set[ent]         = TRUE;
+		}
+	}
 
 	//dlights reach models too, radius minus distance from the origin.
 	//R_DrawAliasModel does this before the shading setup
@@ -1078,6 +1175,13 @@ U0 QDrawClear(CQCanvas *c, I64 color_index)
 	q_surf_btex         = 0;
 	q_px_rgb            = 0;
 	q_px_slow           = 0;
+	q_px_occ            = 0;
+	q_occ_tested        = 0;
+	q_occ_rejected      = 0;
+	q_hiz_culled        = 0;
+	q_bm_drawn          = 0;
+	q_bm_faces          = 0;
+	q_t_brush           = 0.0;
 	q_t_vis             = 0.0;
 	q_t_world           = 0.0;
 	q_t_ents            = 0.0;
@@ -1085,6 +1189,193 @@ U0 QDrawClear(CQCanvas *c, I64 color_index)
 	q_t_blit            = 0.0;
 	q_showents_n        = 0;
 	q_ent_drawn         = 0;
+}
+
+//--- occlusion query -------------------------------------------------------
+//
+// vis is precomputed on static geometry, so a shut door cannot be in it. what
+// answers "is this behind something" at runtime is the depth buffer the world
+// already wrote. project the box, take its NEAREST depth, and if every sample
+// under its screen rect is nearer still, nothing of it can survive the depth
+// test and the whole model is skipped before any triangle work.
+//
+// conservative in one direction only: a box may be reported visible when it is
+// not, never hidden when it is not.
+
+#define QOCC_STEP	4		//sample every 4th pixel, both axes
+
+//--- hierarchical depth ----------------------------------------------------
+//
+// one FARTHEST depth per screen tile. a box whose nearest depth loses to every
+// tile it covers cannot contribute a pixel. FARTHEST, not nearest: the test
+// must only reject when the tile is fully covered by something nearer, so one
+// distant pixel in a tile keeps it alive.
+//
+// this is both the node-walk rejection and the entity query - the entity
+// version used to walk raw depth and cost pixels-covered per box.
+
+#define QHIZ_SHIFT	4					//16x16 pixel tiles
+#define QHIZ_MAX	(2048 >> QHIZ_SHIFT) * (1152 >> QHIZ_SHIFT)
+
+I32		q_hiz[QHIZ_MAX];
+I64		q_hiz_w		= 0;
+I64		q_hiz_h		= 0;
+Bool	q_hiz_ready	= FALSE;
+CQCanvas *q_hiz_c	= NULL;
+
+U0 QHizBuild(CQCanvas *c)
+{//farthest depth per tile over the view rect
+	I64	 tx, ty, x, y, x0, y0, x1, y1;
+	I32	*zrow;
+	I32	 far_iz;
+
+	q_hiz_ready = FALSE;
+	q_hiz_c     = c;
+	if (!q_hiz_enable || !c || !c->depth)
+		return;
+
+	q_hiz_w = (c->vw + (1 << QHIZ_SHIFT) - 1) >> QHIZ_SHIFT;
+	q_hiz_h = (c->vh + (1 << QHIZ_SHIFT) - 1) >> QHIZ_SHIFT;
+
+	if (q_hiz_w < 1 || q_hiz_h < 1 || q_hiz_w * q_hiz_h > QHIZ_MAX)
+		return;
+
+	for (ty = 0; ty < q_hiz_h; ty++)
+	{
+		y0 = c->vy + (ty << QHIZ_SHIFT);
+		y1 = y0 + (1 << QHIZ_SHIFT);
+		if (y1 > c->vy + c->vh) y1 = c->vy + c->vh;
+
+		for (tx = 0; tx < q_hiz_w; tx++)
+		{
+			x0 = c->vx + (tx << QHIZ_SHIFT);
+			x1 = x0 + (1 << QHIZ_SHIFT);
+			if (x1 > c->vx + c->vw) x1 = c->vx + c->vw;
+
+			far_iz = 0x7FFFFFFF;
+			for (y = y0; y < y1; y++)
+			{
+				zrow = c->depth + y * c->width;
+				for (x = x0; x < x1; x++)
+				{
+					if (zrow[x] < far_iz)
+						far_iz = zrow[x];
+				}
+			}
+
+			q_hiz[ty * q_hiz_w + tx] = far_iz;
+		}
+	}
+
+	q_hiz_ready = TRUE;
+}
+
+Bool QHizBoxHidden(CQCanvas *c, F64 *mins, F64 *maxs)
+{//TRUE when every tile the box covers is already filled nearer than it
+	F64	 rel[3];
+	F64	 pt[3];
+	F64	 cam[3];
+	F64	 inv_z, sx, sy, near_z;
+	I64	 sx0, sy0, sx1, sy1;
+	I64	 i, tx, ty, t0x, t0y, t1x, t1y;
+	I32	 izi;
+
+	if (!q_hiz_ready || !c)
+		return FALSE;
+
+	sx0 = c->vx + c->vw;
+	sy0 = c->vy + c->vh;
+	sx1 = c->vx;
+	sy1 = c->vy;
+	near_z = 1.0e30;
+
+	for (i = 0; i < 8; i++)
+	{
+		if (i & 1) pt[0] = maxs[0]; else pt[0] = mins[0];
+		if (i & 2) pt[1] = maxs[1]; else pt[1] = mins[1];
+		if (i & 4) pt[2] = maxs[2]; else pt[2] = mins[2];
+
+		QVecSub(pt, c->origin, rel);
+		cam[0] = QVecDot(rel, c->right);
+		cam[1] = QVecDot(rel, c->up);
+		cam[2] = QVecDot(rel, c->forward);
+
+		//straddles the near plane: not testable, keep it
+		if (cam[2] < QNEAR_CLIP)
+			return FALSE;
+
+		if (cam[2] < near_z)
+			near_z = cam[2];
+
+		inv_z = 1.0 / cam[2];
+		sx    = c->center_x + cam[0] * c->x_scale * inv_z;
+		sy    = c->center_y - cam[1] * c->y_scale * inv_z;
+
+		if (ToI64(sx) < sx0) sx0 = ToI64(sx);
+		if (ToI64(sx) > sx1) sx1 = ToI64(sx);
+		if (ToI64(sy) < sy0) sy0 = ToI64(sy);
+		if (ToI64(sy) > sy1) sy1 = ToI64(sy);
+	}
+
+	if (sx0 < c->vx)			sx0 = c->vx;
+	if (sy0 < c->vy)			sy0 = c->vy;
+	if (sx1 >= c->vx + c->vw)	sx1 = c->vx + c->vw - 1;
+	if (sy1 >= c->vy + c->vh)	sy1 = c->vy + c->vh - 1;
+
+	if (sx0 > sx1 || sy0 > sy1)
+		return FALSE;
+
+	izi = ToI64(QDEPTH_SCALE / near_z);
+
+	t0x = (sx0 - c->vx) >> QHIZ_SHIFT;
+	t1x = (sx1 - c->vx) >> QHIZ_SHIFT;
+	t0y = (sy0 - c->vy) >> QHIZ_SHIFT;
+	t1y = (sy1 - c->vy) >> QHIZ_SHIFT;
+
+	for (ty = t0y; ty <= t1y && ty < q_hiz_h; ty++)
+	{
+		for (tx = t0x; tx <= t1x && tx < q_hiz_w; tx++)
+		{
+			if (izi > q_hiz[ty * q_hiz_w + tx])
+				return FALSE;
+		}
+	}
+
+	return TRUE;
+}
+
+Bool QHizNodeHidden(F64 *mins, F64 *maxs)
+{//q_vis_occ signature: the walk has no canvas
+	if (!q_occworld)
+		return FALSE;
+
+	if (QHizBoxHidden(q_hiz_c, mins, maxs))
+	{
+		q_hiz_culled++;
+		return TRUE;
+	}
+
+	return FALSE;
+}
+
+Bool QOccBoxHidden(CQCanvas *c, F64 *mins, F64 *maxs)
+{//entity-level query. defers to the tiles rather than walking the depth buffer
+ //
+ //sampling raw depth over the box cost pixels-covered per entity: a large box
+ //ran into the thousands of reads, and 365 brush models a frame made the query
+ //more expensive than the geometry it was meant to skip. the tiles hold the
+ //FARTHEST depth per cell, which is conservative, and cost cells-covered
+	if (!q_occ_enable)
+		return FALSE;
+
+	q_occ_tested++;
+
+	if (!QHizBoxHidden(c, mins, maxs))
+		return FALSE;
+
+	q_occ_rejected++;
+
+	return TRUE;
 }
 
 U0 QRGBDrop(CQCanvas *c, I64 x, I64 y)
@@ -2200,6 +2491,34 @@ qsc_next_texel:
 	return out;
 }
 
+U32 QRGBBlend(U32 src, U32 dst, U8 idx, I64 a)
+{//src over dst, a is 0..255
+ //
+ //dst is the truecolor overlay where one was written; where it was not, the
+ //visible pixel is the palette index underneath, so that is the backdrop
+	I64 dr, dg, db;
+	I64 r, g, b;
+
+	if (dst & QRGB_SET)
+	{
+		dr = (dst >> 16) & 255;
+		dg = (dst >> 8) & 255;
+		db = dst & 255;
+	}
+	else
+	{
+		dr = qpal_rgb[idx * 3];
+		dg = qpal_rgb[idx * 3 + 1];
+		db = qpal_rgb[idx * 3 + 2];
+	}
+
+	r = (((src >> 16) & 255) * a + dr * (255 - a)) / 255;
+	g = (((src >> 8) & 255)  * a + dg * (255 - a)) / 255;
+	b = ((src & 255)         * a + db * (255 - a)) / 255;
+
+	return QRGB_SET | (r << 16) | (g << 8) | b;
+}
+
 U32 QRGBAddLight(U32 argb, U32 raw, I64 add)
 {//R_AddDynamicLights over a cached surface. argb is texture * shade(lightmap),
  //raw the same texel unlit, add the dlight luxel 0..255
@@ -2280,6 +2599,10 @@ U0 QDrawSpan(CQCanvas *c, I64 y, I64 x1, I64 x2,
 	I64	 pend_cmap;
 	I64	 izi;
 	I64	 d_izi;
+	I64	 izi_hi;
+	I64	 izi_lo;
+	I64	 k;
+	Bool blocked;
 	U32	*crow;
 	U32	 argb;
 
@@ -2442,6 +2765,32 @@ U0 QDrawSpan(CQCanvas *c, I64 y, I64 x1, I64 x2,
 			t_e = t;
 		}
 
+		//block level occlusion. iz is linear across the block, so whichever
+		//end is larger bounds every pixel in it. if that bound still loses to
+		//the depth already present, no pixel here can win and everything
+		//below - two divides, the lightmap fetches, the pixel loop - is waste
+		izi_hi = ToI64(iz * QDEPTH_SCALE);
+		izi_lo = ToI64(iz_e * QDEPTH_SCALE);
+		if (izi_lo > izi_hi)
+			izi_hi = izi_lo;
+
+		blocked = TRUE;
+		for (k = x; k < xe; k++)
+		{
+			if (izi_hi > zrow[k])
+			{
+				blocked = FALSE;
+				break;
+			}
+		}
+
+		if (blocked)
+		{
+			q_px_occ += n;
+			x         = xe;
+			goto qds_block_end;
+		}
+
 		ds = (s_e - s) / ToF64(n);
 		dt = (t_e - t) / ToF64(n);
 
@@ -2511,8 +2860,22 @@ U0 QDrawSpan(CQCanvas *c, I64 y, I64 x1, I64 x2,
 							argb = QRGBAddLight(argb,
 									surf_raw[ty * tw + tx], dl >> 8);
 
-						crow[x] = argb;
-						zrow[x] = izi;
+						//.alpha: blend over what is already there and leave
+						//depth alone, as GL_DepthMask(FALSE) does for an
+						//alpha entity. the world is drawn first, so the
+						//backdrop is present
+						if (q_draw_alpha < 255)
+						{
+							argb    = QRGBBlend(argb, crow[x],
+										c->pixels[y * c->width + x],
+										q_draw_alpha);
+							crow[x] = argb;
+						}
+						else
+						{
+							crow[x] = argb;
+							zrow[x] = izi;
+						}
 						if (x == q_probe_x)
 						{
 							q_probe_own    = izi;
@@ -4214,6 +4577,7 @@ U0 QDrawBrushModel(CQCanvas *c, CQMap *map, I64 model_index,
 		return;
 
 	m = &map->models[model_index];
+	q_bm_drawn++;
 
 	//no vis state means no frustum, so everything is submitted
 	if (q_draw_vis)
@@ -4231,6 +4595,11 @@ U0 QDrawBrushModel(CQCanvas *c, CQMap *map, I64 model_index,
 		}
 
 		if (!QVisBoxInFrustum(q_draw_vis, wmins, wmaxs))
+			return;
+
+		//the depth buffer answers what vis cannot: a door two rooms away is
+		//in the frustum and behind a wall
+		if (QOccBoxHidden(c, wmins, wmaxs))
 			return;
 
 		//R_DrawBrushModel moves the eye into model space; the model itself
@@ -4252,7 +4621,10 @@ U0 QDrawBrushModel(CQCanvas *c, CQMap *map, I64 model_index,
 		if (face >= 0 && face < map->num_faces)
 		{
 			if (!q_draw_vis)
+			{
+				q_bm_faces++;
 				QDrawFace(c, map, face, origin, ent_frame);
+			}
 			else
 			{
 				f = &map->faces[face];
@@ -4261,7 +4633,10 @@ U0 QDrawBrushModel(CQCanvas *c, CQMap *map, I64 model_index,
 
 				//f->side is the face's sense on its plane, as in QVisRecurse
 				if (ToBool(d < 0.0) == ToBool(f->side))
+				{
+					q_bm_faces++;
 					QDrawFace(c, map, face, origin, ent_frame);
+				}
 			}
 		}
 	}
