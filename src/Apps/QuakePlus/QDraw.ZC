@@ -897,6 +897,11 @@ U0 QRGBDrop(CQCanvas *c, I64 x, I64 y)
  //stale. every writer that is not the sky must call this
 	if (c->rgb && q_rgb_active)
 		c->rgb[y * c->width + x] = 0;
+
+	//and mark it out of the world so fog leaves it alone. a 3D caller that
+	//writes real depth AFTER this call simply overwrites the mark
+	if (c->depth)
+		c->depth[y * c->width + x] = QDEPTH_2D;
 }
 
 U0 QDrawSetViewRect(CQCanvas *c, F64 viewsize, I64 sbar_h)
@@ -1443,6 +1448,36 @@ U0 QLitBilinearRGB(U8 *lit, I64 lm_w, I64 lm_h, F64 s, F64 t,
 		else if (k == 1)	*_g = ToI64(acc);
 		else				*_b = ToI64(acc);
 	}
+}
+
+Bool QSurfCacheWouldHit(CQMap *map, CQFace *f, I64 face_index, I64 mip,
+	I64 tex_key, Bool want_rgb)
+{//the cache key is built from lighting STATE, not from the lightmap itself,
+ //so a hit can be predicted before spending QLightFaceMap on the face. that
+ //call is per visible face per frame and dominates when a dlight is live
+	CQSurfCache	*sc;
+	I64			 slot;
+	I64			 key;
+
+	if (map != q_surf_map || !q_face_surf)
+		return FALSE;
+	if (face_index < 0 || face_index >= q_face_surf_n)
+		return FALSE;
+
+	slot = q_face_surf[face_index];
+	if (slot < 0 || slot >= QSURF_SLOTS)
+		return FALSE;
+
+	sc  = &q_surf[slot];
+	key = QSurfLightKey(f);
+
+	//mirrors the hit test in QSurfCacheGet exactly, including the stale
+	//reuse once the frame has spent its rebuild budget
+	return ToBool(sc->face == face_index && sc->mip == mip &&
+		sc->texture == tex_key && sc->pixels &&
+		ToBool(sc->rgb != NULL) == want_rgb &&
+		(sc->light_key == key ||
+		 q_surf_builds_frame >= q_surf_build_max));
 }
 
 U8 *QSurfCacheGet(CQMap *map, CQFace *f, I64 face_index, CQTexture *tex,
@@ -2379,6 +2414,16 @@ U8	 q_sky_solid	= 0;
 //iz at z=64. nearer than that is unfogged, so the table spends its resolution
 //on the mid and far range where fog actually varies
 #define QFOG_IZ_MAX		0.015625
+
+//QDEPTH_SCALE is 2^32 and QFOG_IZ_MAX is 2^-6, so converting a depth value
+//into a LUT index is (izi * (QFOG_LUT-1)) >> 26 - no divide, no float.
+//this runs per blitted pixel, where a divide cost ~15 fps at 720p
+#define QFOG_IZ_SHIFT	26
+
+//stamped into the depth plane by 2D writers. nearer than any real geometry,
+//so the fog blend skips it - the HUD and console are not in the world and
+//must not be fogged. depth 0 alone cannot say this: that is also the sky
+#define QDEPTH_2D		0x7FFFFFFF
 
 Bool	q_opt_fog		= TRUE;
 Bool	q_fog_on		= FALSE;
@@ -3424,6 +3469,7 @@ U0 QDrawFace(CQCanvas *c, CQMap *map, I64 face_index, F64 *offset = NULL,
 	U8			*lightmap = NULL;
 	U8			*surf = NULL;
 	U32			*surf_rgb = NULL;
+	Bool		 lm_pending = FALSE;
 	I64			 sw = 0;
 	I64			 sh = 0;
 	F64			 rel[3];
@@ -3547,7 +3593,7 @@ U0 QDrawFace(CQCanvas *c, CQMap *map, I64 face_index, F64 *offset = NULL,
 			lm_h = 0;
 		}
 		else
-			lightmap = QLightFaceMap(map, f, lm_w, lm_h, q_light_time);
+			lm_pending = TRUE;
 	}
 
 	if (tex->is_sky)
@@ -3587,9 +3633,29 @@ U0 QDrawFace(CQCanvas *c, CQMap *map, I64 face_index, F64 *offset = NULL,
 
 		//D_CacheSurface. turb warps every frame and sky is drawn by direction,
 		//so neither caches
+		//the lightmap is only needed to BUILD a surface. asking the cache
+		//first skips QLightFaceMap entirely on a hit, which is most faces
+		//most frames - and all of them while a muzzle flash is lit
 		if (!tex->is_turb && !tex->clamp)
+		{
+			if (lm_pending &&
+				!QSurfCacheWouldHit(map, f, face_index, mip, anim_tex,
+					ToBool(q_opt_truecolor)))
+			{
+				lightmap   = QLightFaceMap(map, f, lm_w, lm_h, q_light_time);
+				lm_pending = FALSE;
+			}
+
 			surf = QSurfCacheGet(map, f, face_index, tex, mip,
 					lightmap, lm_w, lm_h, &sw, &sh, anim_tex, &surf_rgb);
+		}
+
+		//the uncached path reads it per pixel, so it must exist by here
+		if (!surf && lm_pending)
+		{
+			lightmap   = QLightFaceMap(map, f, lm_w, lm_h, q_light_time);
+			lm_pending = FALSE;
+		}
 
 		//NULL lightmap means fullbright, and by here that is only turb
 		QDrawPolygon(c, scr, count, tex, lightmap, lm_w, lm_h,
@@ -3679,8 +3745,7 @@ U32 QFogApply(U32 rgb, I64 izi)
 		a = q_fog_sky_alpha;
 	else
 	{
-		idx = ToI64(ToF64(izi) / QDEPTH_SCALE *
-				ToF64(QFOG_LUT - 1) / QFOG_IZ_MAX);
+		idx = (izi * (QFOG_LUT - 1)) >> QFOG_IZ_SHIFT;
 		if (idx > QFOG_LUT - 1)
 			return rgb;			//nearer than the table starts, no fog
 		if (idx < 0)
@@ -3695,9 +3760,12 @@ U32 QFogApply(U32 rgb, I64 izi)
 	sg = (rgb >> 8) & 255;
 	sb = rgb & 255;
 
-	sr = sr + ((q_fog_r - sr) * a) / 255;
-	sg = sg + ((q_fog_g - sg) * a) / 255;
-	sb = sb + ((q_fog_b - sb) * a) / 255;
+	//a+1 makes the range 1..256 so the blend is a shift, not a divide. the
+	//half-step error is invisible against an 8 bit channel
+	a++;
+	sr = sr + (((q_fog_r - sr) * a) >> 8);
+	sg = sg + (((q_fog_g - sg) * a) >> 8);
+	sb = sb + (((q_fog_b - sb) * a) >> 8);
 
 	return (ClampI64(sr, 0, 255) << 16) | (ClampI64(sg, 0, 255) << 8) |
 			ClampI64(sb, 0, 255);
