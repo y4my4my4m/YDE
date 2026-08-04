@@ -163,6 +163,12 @@ class CQTexture
 	//QBSPFenceMips and no longer point into the map lump
 	Bool mips_owned;
 
+	//RGB mip chain, levels 1-3 only. the compiler builds its mips by
+	//averaging PALETTE INDICES and re-quantizing, which bakes dither noise
+	//into every level below 0. these are filtered in RGB from mip 0 instead.
+	//level 0 is absent: the original art needs no reconstruction
+	U32	*rgb_mips[4];
+
 	//Mod_LoadTextures anim chains. "+0button" is frame 0, "+abutton".."+jbutton"
 	//are the alternate chain an entity picks with .frame
 	I64	 anim_total;	//frames * ANIM_CYCLE, 0 when not animated
@@ -271,6 +277,12 @@ U0 QBSPFree(CQMap *map)
 		{
 			if (map->textures[i].ext_rgb)
 				Free(map->textures[i].ext_rgb);
+
+			for (j = 1; j < 4; j++)
+			{
+				if (map->textures[i].rgb_mips[j])
+					Free(map->textures[i].rgb_mips[j]);
+			}
 
 			if (map->textures[i].mips_owned)
 			{
@@ -518,6 +530,147 @@ Bool QExtTexTry(CQTexture *t, U8 *path)
 	return TRUE;
 }
 
+//RGB mips are the largest allocation the renderer makes. ZealOS has the RAM,
+//but a runaway map should still hit a wall rather than the allocator
+#define QRGBMIP_BUDGET	402653184		//384MB
+
+I64  q_rgbmip_bytes = 0;
+I64  q_rgbmip_count = 0;
+Bool q_opt_rgbmips  = TRUE;
+
+U0 QBSPBuildRGBMips(CQMap *map)
+{//filter the mip chain in RGB from mip 0. the source is the artist's texture;
+ //every level below it in the BSP is a palette re-quantization of a palette
+ //average, which is what makes distant surfaces look noisy
+	CQTexture	*t;
+	U8			*base;
+	U32			*prev;
+	U32			*cur;
+	I64			 i;
+	I64			 m;
+	I64			 x;
+	I64			 y;
+	I64			 j;
+	I64			 sw;
+	I64			 sh;
+	I64			 dw;
+	I64			 dh;
+	I64			 sx;
+	I64			 sy;
+	I64			 texel;
+	I64			 opaque;
+	I64			 r;
+	I64			 g;
+	I64			 b;
+	U32			 px;
+	I64			 need;
+
+	q_rgbmip_bytes = 0;
+	q_rgbmip_count = 0;
+
+	if (!map || !map->textures || !q_opt_rgbmips)
+		return;
+
+	for (i = 0; i < map->num_textures; i++)
+	{
+		t = &map->textures[i];
+
+		if (t->width <= 0 || t->height <= 0 || t->is_sky)
+			goto qrm_next;
+
+		base = t->texels[0];
+		if (!base)
+			goto qrm_next;
+
+		prev = NULL;
+
+		for (m = 1; m < 4; m++)
+		{
+			sw = t->width  >> (m - 1);
+			sh = t->height >> (m - 1);
+			dw = t->width  >> m;
+			dh = t->height >> m;
+
+			if (dw < 1 || dh < 1 || sw < 2 || sh < 2)
+				break;
+
+			need = dw * dh * sizeof(U32);
+			if (q_rgbmip_bytes + need > QRGBMIP_BUDGET)
+				break;
+
+			cur = MAlloc(need);
+			if (!cur)
+				break;
+
+			for (y = 0; y < dh; y++)
+			{
+				for (x = 0; x < dw; x++)
+				{
+					opaque = 0;
+					r = 0;
+					g = 0;
+					b = 0;
+
+					for (j = 0; j < 4; j++)
+					{
+						sx = x * 2 + (j & 1);
+						sy = y * 2 + (j >> 1);
+						if (sx >= sw || sy >= sh)
+							goto qrm_next_tap;
+
+						//level 1 reads the palette source, deeper levels
+						//read the RGB level above so error does not compound
+						if (m == 1)
+						{
+							texel = base[sy * sw + sx];
+							if (t->is_fence && texel == 255)
+								goto qrm_next_tap;
+
+							r += qpal_rgb[texel * 3];
+							g += qpal_rgb[texel * 3 + 1];
+							b += qpal_rgb[texel * 3 + 2];
+							opaque++;
+						}
+						else
+						{
+							px = prev[sy * sw + sx];
+							if (!px)
+								goto qrm_next_tap;
+
+							r += (px >> 16) & 255;
+							g += (px >> 8) & 255;
+							b += px & 255;
+							opaque++;
+						}
+
+qrm_next_tap:
+					}
+
+					if (opaque < 2)
+						cur[y * dw + x] = 0;		//cutout
+					else
+						cur[y * dw + x] = (((r / opaque) & 255) << 16) |
+										  (((g / opaque) & 255) << 8) |
+										   ((b / opaque) & 255) | 0x80000000;
+				}
+			}
+
+			t->rgb_mips[m] = cur;
+			q_rgbmip_bytes += need;
+			prev = cur;
+		}
+
+		if (t->rgb_mips[1])
+			q_rgbmip_count++;
+
+qrm_next:
+	}
+
+	if (q_rgbmip_count)
+		"QBSP: %d rgb mip chains (%d MB)\n", q_rgbmip_count,
+			q_rgbmip_bytes / 1048576;
+}
+
 U0 QBSPExtTextures(CQMap *map, U8 *bsp_name)
 {//Ironwail layout: textures/<mapname>/<texture>.tga wins over textures/<texture>.tga
 	CQTexture	*t;
@@ -605,6 +758,8 @@ U0 QBSPFenceMips(CQMap *map)
 	I64			 b;
 	I64			 lo;
 	I64			 hi;
+	Bool		 need_fix;
+	Bool		 base255;
 	I64			 sa;
 	I64			 da;
 	U8			*nb;
@@ -622,8 +777,59 @@ U0 QBSPFenceMips(CQMap *map)
 	{
 		t = &map->textures[i];
 
-		if (!t->is_fence || t->width <= 0 || t->height <= 0)
+		if (t->width <= 0 || t->height <= 0)
 			goto qfm_next_tex;
+
+		//a '{' texture always rebuilds: its cutout is averaged away by the
+		//compiler. any OTHER texture rebuilds only if a mip gained index 255
+		//that mip 0 does not have - that is compiler damage, and 255 is
+		//fullbright so it bypasses the colormap and draws raw salmon
+		if (!t->is_fence)
+		{
+			need_fix = FALSE;
+
+			src = t->texels[0];
+			if (!src)
+				goto qfm_next_tex;
+
+			base255 = FALSE;
+			sw = t->width;
+			sh = t->height;
+			for (j = 0; j < sw * sh; j++)
+			{
+				if (src[j] == 255)
+				{
+					base255 = TRUE;
+					break;
+				}
+			}
+
+			if (base255)
+				goto qfm_next_tex;		//255 is genuine art here
+
+			for (m = 1; m < 4; m++)
+			{
+				dst = t->texels[m];
+				if (!dst)
+					break;
+
+				dw = t->width  >> m;
+				dh = t->height >> m;
+				for (j = 0; j < dw * dh; j++)
+				{
+					if (dst[j] == 255)
+					{
+						need_fix = TRUE;
+						break;
+					}
+				}
+				if (need_fix)
+					break;
+			}
+
+			if (!need_fix)
+				goto qfm_next_tex;
+		}
 
 		q_fence_fixed++;
 
@@ -685,7 +891,13 @@ qfm_next_sample:
 					//half coverage stays solid, so thin foliage and grates
 					//keep their shape instead of eroding one level per mip
 					if (opaque < 2)
-						nb[y * dw + x] = 255;
+					{
+						//only a real cutout texture may keep 255
+						if (t->is_fence)
+							nb[y * dw + x] = 255;
+						else
+							nb[y * dw + x] = 0;
+					}
 					else
 					{
 						r /= opaque;
@@ -1407,6 +1619,7 @@ CQMap *QBSPLoad(U8 *name)
 	q_ext_bytes  = 0;
 	q_ext_loaded = 0;
 	QBSPExtTextures(map, name);
+	QBSPBuildRGBMips(map);
 
 	for (i = 0; i < map->num_faces; i++)
 		QBSPCalcSurfaceExtents(map, &map->faces[i]);

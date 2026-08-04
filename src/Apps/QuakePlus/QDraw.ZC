@@ -37,8 +37,9 @@ class CQScreenVert
 //QDrawNew reads this, so a change needs a canvas rebuild
 Bool	q_opt_truecolor = TRUE;
 
-//light world surfaces in RGB instead of snapping through the 64-row colormap.
-//removes both the 64-step quantization and the palette snap that follows it
+//sample the colormap ramp between rows instead of snapping to one. only the
+//smoothness of the light gradient - the RGB plane itself is not conditional
+//on this, it follows q_opt_truecolor
 Bool	q_opt_tclight	= TRUE;
 
 //2x2 filter over the lit surface cache. trades sharpness for the palette
@@ -81,6 +82,11 @@ U8		q_probe_line1[96];
 U8		q_probe_line2[96];
 I64		q_probe_show	= 0;		//frames left to draw the result on screen
 F64		q_probe_own		= -1.0;		//depth this span left at the probe column
+//what QCfgLoad actually parsed for texfilter: -1 = the key was never seen in
+//the file at all, 0/1 = the value it applied
+I64		q_cfg_texfilter	= -1;
+I64		q_cfg_saves		= 0;		//times QCfgSave reached the FileWrite
+
 I64		q_probe_raw		= -1;		//texel straight out of the texture
 I64		q_probe_cmap	= -1;		//what the colormap turned it into
 I64		q_probe_tw		= -1;
@@ -1032,7 +1038,11 @@ I64 QTextureAnimation(CQMap *map, I64 miptex, I64 frame, F64 time)
 // keyed on mip AND a lighting key, so an animated style or a dlight rebuilds
 // while a static wall never does
 
-#define QSURF_SLOTS			512
+//one slot per cached face. 512 was sized for id1, where a view holds a few
+//hundred faces; a qbj3 view holds thousands, so every face evicted before it
+//was reused and fell to the uncached path - which has no RGB plane, so the
+//truecolor lighting silently turned itself off with distance
+#define QSURF_SLOTS			8192
 //a truecolor surface carries an RGB plane four times the size of its index
 //plane, so the same working set needs five times the room. at 6MB the cache
 //ran dry mid-scene and the faces that missed it lost their colour entirely
@@ -1041,7 +1051,7 @@ I64 QTextureAnimation(CQMap *map, I64 miptex, I64 frame, F64 time)
 class CQSurfCache
 {
 	U8	*pixels;
-	U32	*rgb;			//lit in RGB, NULL unless q_opt_tclight
+	U32	*rgb;			//lit in RGB, NULL unless q_opt_truecolor
 	I64	 bytes;			//charged to the budget, both planes
 	I64	 w;
 	I64	 h;
@@ -1265,6 +1275,7 @@ I64 QSurfLightKey(CQFace *f)
 	//change rather than needing its own flush
 	key = key * 31 + ToI64(q_opt_texfilter);
 	key = key * 31 + ToI64(q_opt_litrgb);
+	key = key * 31 + ToI64(q_opt_rgbmips);
 
 	//a marked face rebuilds every frame, plus once more when the light leaves
 	if (f->dlight_frame == q_dlight_frame && f->dlight_bits)
@@ -1295,6 +1306,12 @@ U0 QLitTexelRGB(I64 texel, F64 lightv, I64 *_r, I64 *_g, I64 *_b)
 	}
 
 	shadef = (255.0 - lightv) / 4.0;
+
+	//q_opt_tclight now selects only how the ramp is sampled: interpolated
+	//between rows, or snapped to one the way the 8bpp path does
+	if (!q_opt_tclight)
+		shadef = ToF64(ToI64(shadef));
+
 	if (shadef < 0.0)
 		shadef = 0.0;
 	if (shadef > ToF64(QPAL_SHADES - 1))
@@ -1441,7 +1458,10 @@ U8 *QSurfCacheGet(CQMap *map, CQFace *f, I64 face_index, CQTexture *tex,
 	need = cw * ch;
 
 	//the RGB plane is four times the index plane, so both are charged
-	want_rgb = ToBool(q_opt_tclight && _rgb != NULL);
+	//the RGB plane carries the mip chain and any replacement texture, not
+	//just lighting. gating it on q_opt_tclight meant turning lighting off
+	//also threw away the texture quality, which are separate choices
+	want_rgb = ToBool(q_opt_truecolor && _rgb != NULL);
 	total    = need;
 	if (want_rgb)
 		total = need * 5;
@@ -1582,9 +1602,31 @@ U8 *QSurfCacheGet(CQMap *map, CQFace *f, I64 face_index, CQTexture *tex,
 				goto qsc_next_texel;
 			}
 
+			//an RGB mip is a clean filter of the artist's texture, where the
+			//BSP level is a re-quantized palette average. same lighting path
+			//as an external replacement, just a different source
+			if (mip > 0 && tex->rgb_mips[mip] && !tex->ext_rgb)
+			{
+				eargb = tex->rgb_mips[mip][ty * tw + tx];
+
+				if (!eargb)
+				{
+					sc->rgb[v * cw + u] = 0;
+					goto qsc_next_texel;
+				}
+
+				QLitTexelRGB(QPAL_GREY_REF, lightv, &wr, &wg, &wb);
+				refv = qpal_rgb[QPAL_GREY_REF * 3];
+				if (refv < 1)
+					refv = 1;
+
+				cr = ((eargb >> 16) & 255) * wr / refv;
+				cg = ((eargb >> 8) & 255) * wg / refv;
+				cb = (eargb & 255) * wb / refv;
+			}
 			//an external replacement supplies real colour; the 8bpp texel
 			//still decides the cutout and still fills the index plane
-			if (tex->ext_rgb && tex->ext_w > 0 && tex->ext_h > 0)
+			else if (tex->ext_rgb && tex->ext_w > 0 && tex->ext_h > 0)
 			{
 				ex = tx * tex->ext_w / tw;
 				ey = ty * tex->ext_h / th;
@@ -1624,7 +1666,8 @@ U8 *QSurfCacheGet(CQMap *map, CQFace *f, I64 face_index, CQTexture *tex,
 			//that dither into colour speckle. lighting is near constant over
 			//a 2x2, so averaging the LIT colours filters the texture without
 			//a divide. the index plane stays point sampled
-			if (q_opt_texfilter && !tex->ext_rgb)
+			if (q_opt_texfilter && !tex->ext_rgb &&
+				!(mip > 0 && tex->rgb_mips[mip]))
 			{
 				acc_r = cr;
 				acc_g = cg;
@@ -2325,7 +2368,9 @@ U0 QFogClear()
 U0 QRGBUpdateActive()
 {//the overlay costs a clear per frame and a branch per blitted pixel, so it
  //stays off unless something is actually feeding it
-	q_rgb_active = ToBool(q_opt_truecolor && (q_sky_ready || q_opt_tclight));
+	//the world feeds the overlay whenever truecolor is on, so the plane is
+	//live independently of the sky or the lighting mode
+	q_rgb_active = q_opt_truecolor;
 }
 
 U8 *QSkySuffix(I64 face)
@@ -2511,6 +2556,45 @@ I64 QFogParseFloats(U8 *sv, F64 *out, I64 max)
 	}
 
 	return n;
+}
+
+U0 QFogCommand(U8 *args)
+{//"<density> [r g b]" - colour omitted keeps the current one, density 0 is
+ //off. QS treats the colour as 0-1, but maps written against the 0-255 form
+ //exist, so the scale is detected the same way the worldspawn parser does
+	F64 fv[4];
+	I64 n;
+	F64 r;
+	F64 g;
+	F64 b;
+
+	n = QFogParseFloats(args, fv, 4);
+	if (n < 1)
+		return;
+
+	if (fv[0] <= 0.0)
+	{
+		QFogClear;
+		return;
+	}
+
+	if (n >= 4)
+	{
+		r = fv[1];
+		g = fv[2];
+		b = fv[3];
+
+		if (r > 1.0 || g > 1.0 || b > 1.0)
+		{
+			r = r / 255.0;
+			g = g / 255.0;
+			b = b / 255.0;
+		}
+
+		QFogSet(fv[0], ToI64(r * 255.0), ToI64(g * 255.0), ToI64(b * 255.0));
+	}
+	else
+		QFogSet(fv[0], q_fog_r, q_fog_g, q_fog_b);
 }
 
 U0 QSkyParseWorldspawn(CQMap *map, U8 *out, I64 max)
