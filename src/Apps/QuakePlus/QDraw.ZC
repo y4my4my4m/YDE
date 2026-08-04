@@ -55,6 +55,11 @@ Bool	q_opt_litrgb	= TRUE;
 //zeroes it well before the fog block below
 I64		q_fog_culled	= 0;
 
+//surface cache work this frame. declared here because QDrawClear zeroes them
+//well before the cache itself is defined
+I64		q_surf_builds_frame	= 0;
+I64		q_surf_hits_frame	= 0;
+
 //--- draw probe -------------------------------------------------------------
 //
 // reports what the rasteriser actually put at one pixel, which names the
@@ -63,7 +68,7 @@ I64		q_fog_culled	= 0;
 Bool	q_probe_req		= FALSE;
 I64		q_probe_x		= 0;
 I64		q_probe_y		= 0;
-F64		q_probe_iz		= -1.0;
+I64		q_probe_iz		= -1;
 U8		q_probe_tex[16];
 I64		q_probe_texel	= -1;
 I64		q_probe_mip		= -1;
@@ -81,7 +86,7 @@ Bool	q_probe_lit		= FALSE;	//.lit chroma reached this surface
 U8		q_probe_line1[96];
 U8		q_probe_line2[96];
 I64		q_probe_show	= 0;		//frames left to draw the result on screen
-F64		q_probe_own		= -1.0;		//depth this span left at the probe column
+I64		q_probe_own		= -1;		//depth this span left at the probe column
 //what QCfgLoad actually parsed for texfilter: -1 = the key was never seen in
 //the file at all, 0/1 = the value it applied
 I64		q_cfg_texfilter	= -1;
@@ -113,6 +118,10 @@ Bool	q_rgb_active	= FALSE;
 //palette index 255 is the cutout key in '{' textures
 #define QFENCE_CUTOUT	255
 
+//1/z is bounded by the near clip: QNEAR_CLIP 4.0 means iz <= 0.25, so 2^32
+//keeps the nearest value near 2^30 and still leaves ~500k steps at z=8192
+#define QDEPTH_SCALE	4294967296.0
+
 //top of the palette's grey ramp. external art has no palette index, so the
 //lighting curve is sampled here and applied as a scale
 #define QPAL_GREY_REF	15
@@ -120,7 +129,9 @@ Bool	q_rgb_active	= FALSE;
 class CQCanvas
 {
 	U8	*pixels;		//width * height palette indices
-	F64	*depth;			//1/z, larger is nearer
+	//1/z in QDEPTH_SCALE fixed point, larger is nearer. 32 bit halves the
+	//bandwidth of the most-touched buffer in the renderer
+	I32	*depth;
 	//truecolor overlay, NULL unless q_opt_truecolor. bit 31 set means this
 	//pixel holds a literal 0xRRGGBB and the index plane is ignored at blit
 	U32	*rgb;
@@ -814,7 +825,7 @@ CQCanvas *QDrawNew(I64 w, I64 h)
 	c->vw = w;
 	c->vh = h;
 	c->pixels = CAlloc(w * h);
-	c->depth  = CAlloc(w * h * sizeof(F64));
+	c->depth  = CAlloc(w * h * sizeof(I32));
 
 	if (q_opt_truecolor)
 		c->rgb = CAlloc(w * h * sizeof(U32));
@@ -854,7 +865,7 @@ U0 QDrawClear(CQCanvas *c, I64 color_index)
 		if (rows > 0)
 		{
 			MemSet(c->depth + c->vy * c->width, 0,
-				rows * c->width * sizeof(F64));
+				rows * c->width * sizeof(I32));
 
 			if (c->rgb)
 				MemSet(c->rgb + c->vy * c->width, 0,
@@ -866,7 +877,7 @@ U0 QDrawClear(CQCanvas *c, I64 color_index)
 		for (y = c->vy; y < c->vy + c->vh && y < c->height; y++)
 		{
 			MemSet(c->depth + y * c->width + c->vx, 0,
-				c->vw * sizeof(F64));
+				c->vw * sizeof(I32));
 
 			if (c->rgb)
 				MemSet(c->rgb + y * c->width + c->vx, 0,
@@ -877,6 +888,8 @@ U0 QDrawClear(CQCanvas *c, I64 color_index)
 	c->faces_drawn = 0;
 	c->spans_drawn = 0;
 	q_fog_culled   = 0;
+	q_surf_builds_frame = 0;
+	q_surf_hits_frame   = 0;
 }
 
 U0 QRGBDrop(CQCanvas *c, I64 x, I64 y)
@@ -1082,11 +1095,23 @@ I64 QTextureAnimation(CQMap *map, I64 miptex, I64 frame, F64 time)
 //hundred faces; a qbj3 view holds thousands, so every face evicted before it
 //was reused and fell to the uncached path - which has no RGB plane, so the
 //truecolor lighting silently turned itself off with distance
-#define QSURF_SLOTS			8192
+//one slot per cached face. turning the view brings a whole new set of faces
+//into frame, and every miss rebuilds a full lit surface - which now carries an
+//RGB plane too, so a miss costs ~5x what it used to. the working set has to
+//fit or rotation stutters while it thrashes
+#define QSURF_SLOTS			32768
 //a truecolor surface carries an RGB plane four times the size of its index
 //plane, so the same working set needs five times the room. at 6MB the cache
 //ran dry mid-scene and the faces that missed it lost their colour entirely
-#define QSURF_BUDGET		41943040	//40MB of lit surfaces
+//runtime settable: the machine has the RAM, and the right size depends on the
+//map. QSurfCacheRelease trims down on the next build if it is lowered
+I64 q_surf_budget = 335544320;		//320MB default
+
+//a face touched by a dynamic light rebuilds EVERY frame, and a rebuild now
+//carries an RGB plane. past this many per frame the stale surface is reused
+//instead: the lighting lags a frame or two rather than the frame stalling
+I64 q_surf_build_max	= 96;
+
 
 class CQSurfCache
 {
@@ -1506,7 +1531,7 @@ U8 *QSurfCacheGet(CQMap *map, CQFace *f, I64 face_index, CQTexture *tex,
 	if (want_rgb)
 		total = need * 5;
 
-	if (total > QSURF_BUDGET / 4)
+	if (total > q_surf_budget / 4)
 		return NULL;			//absurdly large surface, not worth caching
 
 	key  = QSurfLightKey(f);
@@ -1516,9 +1541,13 @@ U8 *QSurfCacheGet(CQMap *map, CQFace *f, I64 face_index, CQTexture *tex,
 	{
 		sc = &q_surf[slot];
 
+		//same face and mip, only the lighting moved on: if the frame has
+		//spent its rebuild budget, hand back what is already built
 		if (sc->face == face_index && sc->mip == mip &&
-			sc->light_key == key && sc->texture == tex_key && sc->pixels &&
-			ToBool(sc->rgb != NULL) == want_rgb)
+			sc->texture == tex_key && sc->pixels &&
+			ToBool(sc->rgb != NULL) == want_rgb &&
+			(sc->light_key == key ||
+			 q_surf_builds_frame >= q_surf_build_max))
 		{
 			sc->frame = q_surf_frame;
 			*_cw = sc->w;
@@ -1526,6 +1555,7 @@ U8 *QSurfCacheGet(CQMap *map, CQFace *f, I64 face_index, CQTexture *tex,
 			if (_rgb)
 				*_rgb = sc->rgb;
 			q_surf_hits++;
+			q_surf_hits_frame++;
 			return sc->pixels;
 		}
 	}
@@ -1543,14 +1573,14 @@ U8 *QSurfCacheGet(CQMap *map, CQFace *f, I64 face_index, CQTexture *tex,
 	if (sc->bytes < total || ToBool(sc->rgb != NULL) != want_rgb)
 	{
 		//release until it fits, give up the moment nothing more can go
-		while (q_surf_bytes + total - sc->bytes > QSURF_BUDGET)
+		while (q_surf_bytes + total - sc->bytes > q_surf_budget)
 		{
 			if (!QSurfCacheRelease)
 				break;
 		}
 
 		//still over budget with nothing left, draw it the slow way
-		if (q_surf_bytes + total - sc->bytes > QSURF_BUDGET)
+		if (q_surf_bytes + total - sc->bytes > q_surf_budget)
 			return NULL;
 
 		if (sc->pixels)
@@ -1779,6 +1809,7 @@ qsc_next_texel:
 
 	q_face_surf[face_index] = slot;
 	q_surf_builds++;
+	q_surf_builds_frame++;
 
 	*_cw = cw;
 	*_ch = ch;
@@ -1795,7 +1826,7 @@ U0 QDrawSpan(CQCanvas *c, I64 y, I64 x1, I64 x2,
  //times a frame, this runs a few hundred thousand
 	U8	*row;
 	U8	*texels;
-	F64	*zrow;
+	I32	*zrow;
 	F64	 span;
 	F64	 d_iz;
 	F64	 d_soz;
@@ -1839,6 +1870,8 @@ U0 QDrawSpan(CQCanvas *c, I64 y, I64 x1, I64 x2,
 	Bool fence;
 	I64	 pend_raw;
 	I64	 pend_cmap;
+	I64	 izi;
+	I64	 d_izi;
 	U32	*crow;
 	U32	 argb;
 
@@ -2005,6 +2038,10 @@ U0 QDrawSpan(CQCanvas *c, I64 y, I64 x1, I64 x2,
 		//mins_s_i is integral, so Floor(s) - mins_s_i == Floor(s - mins_s_i)
 		if (surf)
 		{
+			//one conversion per block; the pixel loop steps integers only
+			izi   = ToI64(iz * QDEPTH_SCALE);
+			d_izi = ToI64(d_iz * QDEPTH_SCALE);
+
 			ufx  = ToI64((s - ToF64(mins_s_i)) * 65536.0);
 			vfx  = ToI64((t - ToF64(mins_t_i)) * 65536.0);
 			dufx = ToI64(ds * 65536.0);
@@ -2012,7 +2049,7 @@ U0 QDrawSpan(CQCanvas *c, I64 y, I64 x1, I64 x2,
 
 			while (x < xe)
 			{
-				if (iz > zrow[x])
+				if (izi > zrow[x])
 				{
 					tx = ClampI64((ufx >> 16) >> mip, 0, tw - 1);
 					ty = ClampI64((vfx >> 16) >> mip, 0, th - 1);
@@ -2040,25 +2077,30 @@ U0 QDrawSpan(CQCanvas *c, I64 y, I64 x1, I64 x2,
 								crow[x] = 0;
 						}
 
-						zrow[x] = iz;
+						zrow[x] = izi;
 						if (x == q_probe_x)
-							q_probe_own = iz;
+							q_probe_own = izi;
 					}
 				}
 
 				ufx += dufx;
 				vfx += dvfx;
 				iz  += d_iz;
+				izi += d_izi;
 				x++;
 			}
 
 			goto qds_block_end;
 		}
 
+		//same block-level conversion for the uncached path
+		izi   = ToI64(iz * QDEPTH_SCALE);
+		d_izi = ToI64(d_iz * QDEPTH_SCALE);
+
 		while (x < xe)
 		{
 			//depth test first, a rejected pixel costs only the adds below
-			if (iz > zrow[x])
+			if (izi > zrow[x])
 			{
 			//Floor, not ToI64 - ToI64 truncates toward zero and leaves a
 			//one-texel seam wherever s or t crosses 0
@@ -2129,10 +2171,10 @@ U0 QDrawSpan(CQCanvas *c, I64 y, I64 x1, I64 x2,
 			if (crow)
 				crow[x] = 0;
 
-			zrow[x] = iz;
+			zrow[x] = izi;
 			if (x == q_probe_x)
 			{
-				q_probe_own = iz;
+				q_probe_own = izi;
 				pend_raw    = texel;
 				pend_cmap   = row[x];
 			}
@@ -2143,6 +2185,7 @@ qds_next_pixel:
 			t      += dt;
 			lightv += dlight;
 			iz     += d_iz;
+			izi    += d_izi;
 			x++;
 		}
 
@@ -2161,13 +2204,13 @@ qds_block_end:
 	if (q_probe_req && y == q_probe_y &&
 		q_probe_x >= x1 && q_probe_x < x2)
 	{
-		iz = c->depth[y * c->width + q_probe_x];
+		izi = c->depth[y * c->width + q_probe_x];
 
-		//iz_probe is what THIS span left at that pixel; anything else means
-		//another surface won and this one has nothing to say
-		if (iz > 0.0 && iz == q_probe_own && iz >= q_probe_iz)
+		//what THIS span left at that pixel; anything else means another
+		//surface won and this one has nothing to say
+		if (izi > 0 && izi == q_probe_own && izi >= q_probe_iz)
 		{
-			q_probe_iz    = iz;
+			q_probe_iz    = izi;
 			q_probe_hit   = TRUE;
 			q_probe_sky   = FALSE;
 			q_probe_texel = row[q_probe_x];
@@ -2915,7 +2958,7 @@ U0 QDrawSkyBoxSpan(CQCanvas *c, I64 y, I64 x1, I64 x2, F64 iz1, F64 iz2)
 	U8	*row;
 	U32	*crow;
 	U32	 texel;
-	F64	*zrow;
+	I32	*zrow;
 	F64	 dir[3];
 	F64	 step[3];
 	F64	 cur[3];
@@ -2995,7 +3038,7 @@ U0 QDrawSkyBoxSpan(CQCanvas *c, I64 y, I64 x1, I64 x2, F64 iz1, F64 iz2)
 			fc = f0;
 			while (x < xe)
 			{
-				if (iz >= zrow[x])
+				if (ToI64(iz * QDEPTH_SCALE) >= zrow[x])
 				{
 					//the index plane is filled either way: if anything
 					//later drops the overlay at this pixel, the 8bpp
@@ -3008,7 +3051,7 @@ U0 QDrawSkyBoxSpan(CQCanvas *c, I64 y, I64 x1, I64 x2, F64 iz1, F64 iz2)
 						texel = QSkyTexelRGB(fc, u, v);
 						crow[x] = texel;
 					}
-					zrow[x] = 0.0;
+					zrow[x] = 0;
 				}
 				iz += d_iz;
 				u += du;
@@ -3022,7 +3065,7 @@ U0 QDrawSkyBoxSpan(CQCanvas *c, I64 y, I64 x1, I64 x2, F64 iz1, F64 iz2)
 		{
 			while (x < xe)
 			{
-				if (iz >= zrow[x])
+				if (ToI64(iz * QDEPTH_SCALE) >= zrow[x])
 				{
 					QSkyRay(dir, &fc, &u, &v);
 					//the index plane is filled either way: if anything
@@ -3036,7 +3079,7 @@ U0 QDrawSkyBoxSpan(CQCanvas *c, I64 y, I64 x1, I64 x2, F64 iz1, F64 iz2)
 						texel = QSkyTexelRGB(fc, u, v);
 						crow[x] = texel;
 					}
-					zrow[x] = 0.0;
+					zrow[x] = 0;
 				}
 				iz += d_iz;
 				for (i = 0; i < 3; i++)
@@ -3094,7 +3137,7 @@ U0 QDrawSkySpan(CQCanvas *c, I64 y, I64 x1, I64 x2, F64 iz1, F64 iz2,
 {//env cube when ready, else classic dual-layer dome
 	U8	*row;
 	U8	*texels;
-	F64	*zrow;
+	I32	*zrow;
 	F64	 dir[3];
 	F64	 step[3];
 	F64	 sxf;
@@ -3225,7 +3268,7 @@ U0 QDrawSkySpan(CQCanvas *c, I64 y, I64 x1, I64 x2, F64 iz1, F64 iz2,
 
 		while (x < xe)
 		{
-			if (iz > zrow[x])
+			if (ToI64(iz * QDEPTH_SCALE) > zrow[x])
 			{
 				//clouds in front, index 0 there lets the starfield show
 				s2    = ToI64(Floor(fg + dx)) & QSKY_MASK;
@@ -3243,7 +3286,7 @@ U0 QDrawSkySpan(CQCanvas *c, I64 y, I64 x1, I64 x2, F64 iz1, F64 iz2,
 
 				//sky is emissive, never shaded by the colormap
 				row[x]  = texel;
-				zrow[x] = iz;
+				zrow[x] = ToI64(iz * QDEPTH_SCALE);
 			}
 
 			dx += ddx;
@@ -3499,14 +3542,25 @@ U0 QDrawFace(CQCanvas *c, CQMap *map, I64 face_index, F64 *offset = NULL,
 		QDrawSkyPolygon(c, scr, count, tex);
 	else
 	{
-		//mip from the nearest part of the surface, measured against the
-		//projection scale so the choice holds at any render resolution
-		near_z = 1.0e30;
-		for (i = 0; i < count; i++)
+		//mip from EYE DISTANCE, not camera-space Z. cam[2] is dot(rel,
+		//forward), so a face at a fixed distance sweeps across the mip
+		//thresholds purely from turning the view - and every crossing
+		//changes the cache key and rebuilds the surface. that is the
+		//rotation stutter: the geometry never moved, the mip did
+		cull_d[0] = f->center[0] - c->origin[0];
+		cull_d[1] = f->center[1] - c->origin[1];
+		cull_d[2] = f->center[2] - c->origin[2];
+
+		if (offset)
 		{
-			if (clipped[i].cam[2] < near_z)
-				near_z = clipped[i].cam[2];
+			cull_d[0] += offset[0];
+			cull_d[1] += offset[1];
+			cull_d[2] += offset[2];
 		}
+
+		near_z = QVecLength(cull_d) - f->radius;
+		if (near_z < QNEAR_CLIP)
+			near_z = QNEAR_CLIP;
 
 		ratio = near_z / c->x_scale;
 
@@ -3600,19 +3654,21 @@ U0 QDrawFadeScreen(CQCanvas *c)
 	}
 }
 
-U32 QFogApply(U32 rgb, F64 iz)
-{//blend toward the fog colour by depth. iz is 1/z, and 0 means sky
+U32 QFogApply(U32 rgb, I64 izi)
+{//blend toward the fog colour by depth. izi is 1/z in QDEPTH_SCALE fixed
+ //point, and 0 means sky
 	I64 a;
 	I64 idx;
 	I64 sr;
 	I64 sg;
 	I64 sb;
 
-	if (iz <= 0.0)
+	if (izi <= 0)
 		a = q_fog_sky_alpha;
 	else
 	{
-		idx = ToI64(iz * ToF64(QFOG_LUT - 1) / QFOG_IZ_MAX);
+		idx = ToI64(ToF64(izi) / QDEPTH_SCALE *
+				ToF64(QFOG_LUT - 1) / QFOG_IZ_MAX);
 		if (idx > QFOG_LUT - 1)
 			return rgb;			//nearer than the table starts, no fog
 		if (idx < 0)
@@ -3644,7 +3700,7 @@ U0 QDrawBlitFit(CQCanvas *c, CDC *dc, I64 dst_x, I64 dst_y, I64 dst_w,
 	U8	*src;
 	U32	*dst;
 	U32	*crow;
-	F64	*zrow;
+	I32	*zrow;
 	U32	 col;
 	Bool fog = ToBool(q_opt_fog && q_fog_on);
 	I64	 sx_step;
@@ -3738,7 +3794,7 @@ U0 QDrawBlit(CQCanvas *c, CDC *dc, I64 dst_x, I64 dst_y, I64 scale)
 	U8	*src;
 	U32	*dst;
 	U32	*crow;
-	F64	*zrow;
+	I32	*zrow;
 	U32	 color;
 	Bool fog = ToBool(q_opt_fog && q_fog_on);
 	I64	 x;
