@@ -41,6 +41,33 @@ Bool	q_opt_truecolor = TRUE;
 //removes both the 64-step quantization and the palette snap that follows it
 Bool	q_opt_tclight	= TRUE;
 
+//2x2 filter over the lit surface cache. trades a little sharpness for the
+//palette dither that point sampling turns into colour speckle
+Bool	q_opt_texfilter	= TRUE;
+
+//faces skipped by the fog cull this frame. declared here because QDrawClear
+//zeroes it well before the fog block below
+I64		q_fog_culled	= 0;
+
+//--- draw probe -------------------------------------------------------------
+//
+// reports what the rasteriser actually put at one pixel, which names the
+// texture and the path a stray colour came from. checked per span, never per
+// pixel, so it costs nothing in the inner loop
+Bool	q_probe_req		= FALSE;
+I64		q_probe_x		= 0;
+I64		q_probe_y		= 0;
+F64		q_probe_iz		= -1.0;
+U8		q_probe_tex[16];
+I64		q_probe_texel	= -1;
+I64		q_probe_mip		= -1;
+Bool	q_probe_fence	= FALSE;
+Bool	q_probe_surf	= FALSE;
+Bool	q_probe_rgb		= FALSE;
+Bool	q_probe_sky		= FALSE;
+Bool	q_probe_hit		= FALSE;
+U8		q_probe_msg[128];
+
 //TRUE only while a truecolor source is actually feeding the overlay. declared
 //here because the span writers below run before the sky code is defined
 Bool	q_rgb_active	= FALSE;
@@ -777,6 +804,7 @@ U0 QDrawClear(CQCanvas *c, I64 color_index)
 
 	c->faces_drawn = 0;
 	c->spans_drawn = 0;
+	q_fog_culled   = 0;
 }
 
 U0 QRGBDrop(CQCanvas *c, I64 x, I64 y)
@@ -1204,11 +1232,59 @@ I64 QSurfLightKey(CQFace *f)
 
 	key = key * 31 + q_ambient_light;
 
+	//a filter change alters every cached texel, so it rebuilds like a light
+	//change rather than needing its own flush
+	key = key * 31 + ToI64(q_opt_texfilter);
+
 	//a marked face rebuilds every frame, plus once more when the light leaves
 	if (f->dlight_frame == q_dlight_frame && f->dlight_bits)
 		key = key * 31 + q_dlight_frame + 1;
 
 	return key;
+}
+
+U0 QLitTexelRGB(I64 texel, F64 lightv, I64 *_r, I64 *_g, I64 *_b)
+{//raw palette RGB for one texel at a fractional light level. walks the
+ //colormap in fractional rows instead of snapping to one: the rows carry
+ //Quake's intensity curve, so tone is unchanged while the 64 steps and the
+ //palette snap between them both go away
+	F64 shadef;
+	F64 frac;
+	I64 row0;
+	I64 row1;
+	I64 c0;
+	I64 c1;
+
+	//fullbrights ignore lighting
+	if (texel >= QPAL_FULLBRIGHT)
+	{
+		*_r = qpal_rgb[texel * 3];
+		*_g = qpal_rgb[texel * 3 + 1];
+		*_b = qpal_rgb[texel * 3 + 2];
+		return;
+	}
+
+	shadef = (255.0 - lightv) / 4.0;
+	if (shadef < 0.0)
+		shadef = 0.0;
+	if (shadef > ToF64(QPAL_SHADES - 1))
+		shadef = ToF64(QPAL_SHADES - 1);
+
+	row0 = ToI64(shadef);
+	row1 = row0 + 1;
+	if (row1 > QPAL_SHADES - 1)
+		row1 = QPAL_SHADES - 1;
+	frac = shadef - ToF64(row0);
+
+	c0 = qpal_colormap[row0 * QPAL_COLORS + texel];
+	c1 = qpal_colormap[row1 * QPAL_COLORS + texel];
+
+	*_r = ToI64(ToF64(qpal_rgb[c0 * 3]) +
+			(ToF64(qpal_rgb[c1 * 3]) - ToF64(qpal_rgb[c0 * 3])) * frac);
+	*_g = ToI64(ToF64(qpal_rgb[c0 * 3 + 1]) +
+			(ToF64(qpal_rgb[c1 * 3 + 1]) - ToF64(qpal_rgb[c0 * 3 + 1])) * frac);
+	*_b = ToI64(ToF64(qpal_rgb[c0 * 3 + 2]) +
+			(ToF64(qpal_rgb[c1 * 3 + 2]) - ToF64(qpal_rgb[c0 * 3 + 2])) * frac);
 }
 
 U0 QLitBilinearRGB(U8 *lit, I64 lm_w, I64 lm_h, F64 s, F64 t,
@@ -1281,12 +1357,17 @@ U8 *QSurfCacheGet(CQMap *map, CQFace *f, I64 face_index, CQTexture *tex,
 	U32			 argb;
 	I64			 total;
 	Bool		 want_rgb;
-	F64			 shadef;
-	F64			 frac;
-	I64			 row0;
-	I64			 row1;
-	I64			 c0;
-	I64			 c1;
+	I64			 acc_r;
+	I64			 acc_g;
+	I64			 acc_b;
+	I64			 acc_n;
+	I64			 fi;
+	I64			 ftx;
+	I64			 fty;
+	I64			 ftex;
+	I64			 fr2;
+	I64			 fg2;
+	I64			 fb2;
 	I64			 cr;
 	I64			 cg;
 	I64			 cb;
@@ -1466,41 +1547,41 @@ U8 *QSurfCacheGet(CQMap *map, CQFace *f, I64 face_index, CQTexture *tex,
 
 			//RAW palette RGB, before gamma and tint: those are applied to the
 			//overlay at blit, so a tint change costs no cache rebuild
-			if (texel >= QPAL_FULLBRIGHT)
+			QLitTexelRGB(texel, lightv, &cr, &cg, &cb);
+
+			//the 512x512 art is palette-dithered, and point sampling turns
+			//that dither into colour speckle. lighting is near constant over
+			//a 2x2, so averaging the LIT colours filters the texture without
+			//a divide. the index plane stays point sampled
+			if (q_opt_texfilter)
 			{
-				cr = qpal_rgb[texel * 3];
-				cg = qpal_rgb[texel * 3 + 1];
-				cb = qpal_rgb[texel * 3 + 2];
-			}
-			else
-			{
-				//walk the colormap in fractional rows instead of snapping to
-				//one. the rows carry Quake's intensity curve, so the tone is
-				//unchanged while the 64 steps and the palette snap between
-				//them both go away
-				shadef = (255.0 - lightv) / 4.0;
-				if (shadef < 0.0)
-					shadef = 0.0;
-				if (shadef > ToF64(QPAL_SHADES - 1))
-					shadef = ToF64(QPAL_SHADES - 1);
+				acc_r = cr;
+				acc_g = cg;
+				acc_b = cb;
+				acc_n = 1;
 
-				row0 = ToI64(shadef);
-				row1 = row0 + 1;
-				if (row1 > QPAL_SHADES - 1)
-					row1 = QPAL_SHADES - 1;
-				frac = shadef - ToF64(row0);
+				for (fi = 1; fi < 4; fi++)
+				{
+					ftx = QTexWrap(tx + (fi & 1), tw);
+					fty = QTexWrap(ty + (fi >> 1), th);
+					ftex = texels[fty * tw + ftx];
 
-				c0 = qpal_colormap[row0 * QPAL_COLORS + texel];
-				c1 = qpal_colormap[row1 * QPAL_COLORS + texel];
+					//a cutout carries no colour and would halo the edge
+					if (tex->is_fence && ftex == QFENCE_CUTOUT)
+						goto qsc_next_tap;
 
-				cr = ToI64(ToF64(qpal_rgb[c0 * 3]) + (ToF64(qpal_rgb[c1 * 3])
-						- ToF64(qpal_rgb[c0 * 3])) * frac);
-				cg = ToI64(ToF64(qpal_rgb[c0 * 3 + 1]) +
-						(ToF64(qpal_rgb[c1 * 3 + 1])
-						- ToF64(qpal_rgb[c0 * 3 + 1])) * frac);
-				cb = ToI64(ToF64(qpal_rgb[c0 * 3 + 2]) +
-						(ToF64(qpal_rgb[c1 * 3 + 2])
-						- ToF64(qpal_rgb[c0 * 3 + 2])) * frac);
+					QLitTexelRGB(ftex, lightv, &fr2, &fg2, &fb2);
+					acc_r += fr2;
+					acc_g += fg2;
+					acc_b += fb2;
+					acc_n++;
+
+qsc_next_tap:
+				}
+
+				cr = acc_r / acc_n;
+				cg = acc_g / acc_n;
+				cb = acc_b / acc_n;
 			}
 
 			//.lit carries the colour the mono plane averaged away. the mono
@@ -1899,6 +1980,26 @@ qds_block_end:
 		t   = t_e;
 	}
 
+	//probe: the span that owns the pixel is the one with the nearest depth
+	if (q_probe_req && y == q_probe_y &&
+		q_probe_x >= x1 && q_probe_x < x2)
+	{
+		iz = c->depth[y * c->width + q_probe_x];
+		if (iz >= q_probe_iz)
+		{
+			q_probe_iz    = iz;
+			q_probe_hit   = TRUE;
+			q_probe_sky   = FALSE;
+			q_probe_texel = row[q_probe_x];
+			q_probe_mip   = mip;
+			q_probe_fence = fence;
+			q_probe_surf  = ToBool(surf != NULL);
+			q_probe_rgb   = ToBool(crow != NULL &&
+								(crow[q_probe_x] & QRGB_SET) != 0);
+			QStrCopy(q_probe_tex, tex->name, 16);
+		}
+	}
+
 	c->spans_drawn++;
 }
 
@@ -2060,6 +2161,9 @@ U8		q_fog_lut[QFOG_LUT];	//fog alpha 0-255 by quantized iz
 //unless the map asks for it with _skyfog
 I64		q_fog_sky_alpha	= 0;
 
+//0 disables the cull. set from density, see QFogSet
+F64		q_fog_cull_dist	= 0.0;
+
 U0 QFogBuild()
 {//f = 1 - exp(-(density * z)^2), the exp2 curve GLQuake and Ironwail use
 	F64 iz;
@@ -2079,7 +2183,10 @@ U0 QFogBuild()
 		}
 
 		z = 1.0 / iz;
-		f = q_fog_density * z;
+
+		//GLQuake and Ironwail feed GL_FOG_DENSITY density/64, so map values
+		//are in those units. using the raw value fogs solid within ~80 units
+		f = q_fog_density * z / 64.0;
 		f = 1.0 - Exp(-(f * f));
 
 		q_fog_lut[i] = ClampI64(ToI64(f * 255.0 + 0.5), 0, 255);
@@ -2091,6 +2198,14 @@ qfb_next:
 U0 QFogSet(F64 density, I64 r, I64 g, I64 b)
 {
 	q_fog_density = density;
+
+	//distance where the blend is 99% fog: beyond it geometry cannot show, so
+	//the face walk skips it. -ln(0.01) = 4.605, sqrt = 2.146
+	if (density > 0.0)
+		q_fog_cull_dist = 2.146 * 64.0 / density;
+	else
+		q_fog_cull_dist = 0.0;
+
 	q_fog_r       = ClampI64(r, 0, 255);
 	q_fog_g       = ClampI64(g, 0, 255);
 	q_fog_b       = ClampI64(b, 0, 255);
@@ -2105,6 +2220,7 @@ U0 QFogClear()
 	q_fog_on        = FALSE;
 	q_fog_density   = 0.0;
 	q_fog_sky_alpha = 0;
+	q_fog_cull_dist = 0.0;
 }
 
 U0 QRGBUpdateActive()
@@ -2703,6 +2819,20 @@ U0 QDrawSkyBoxSpan(CQCanvas *c, I64 y, I64 x1, I64 x2, F64 iz1, F64 iz2)
 
 qsb_adv:
 	}
+	if (q_probe_req && y == q_probe_y &&
+		q_probe_x >= x1 && q_probe_x < x2)
+	{
+		if (!q_probe_hit)
+		{
+			q_probe_hit   = TRUE;
+			q_probe_sky   = TRUE;
+			q_probe_texel = row[q_probe_x];
+			q_probe_rgb   = ToBool(crow != NULL &&
+								(crow[q_probe_x] & QRGB_SET) != 0);
+			QStrCopy(q_probe_tex, "<skybox>", 16);
+		}
+	}
+
 	c->spans_drawn++;
 }
 
@@ -3026,9 +3156,33 @@ U0 QDrawFace(CQCanvas *c, CQMap *map, I64 face_index, F64 *offset = NULL,
 	F64			 near_z;
 	F64			 ratio;
 	F64		   shifted[3];
+	F64		   cull_d[3];
 
 	if (f->num_edges < 3 || f->num_edges > QMAX_POLY_VERTS)
 		return;
+
+	//fog cull: past the distance where the blend saturates, a face cannot
+	//show through. rejecting here skips the transform, clip and raster.
+	//the sphere is world space, so a brush model's offset shifts it too
+	if (q_opt_fog && q_fog_on && q_fog_cull_dist > 0.0)
+	{
+		cull_d[0] = f->center[0] - c->origin[0];
+		cull_d[1] = f->center[1] - c->origin[1];
+		cull_d[2] = f->center[2] - c->origin[2];
+
+		if (offset)
+		{
+			cull_d[0] += offset[0];
+			cull_d[1] += offset[1];
+			cull_d[2] += offset[2];
+		}
+
+		if (QVecLength(cull_d) - f->radius > q_fog_cull_dist)
+		{
+			q_fog_culled++;
+			return;
+		}
+	}
 
 	ti = &map->texinfo[f->tex_info];
 	if (ti->miptex < 0 || ti->miptex >= map->num_textures)
