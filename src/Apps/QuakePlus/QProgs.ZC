@@ -20,8 +20,13 @@
 
 #define QPR_MAX_STACK	64		//call frames
 #define QPR_MAX_LOCALS	2048	//saved local cells across nested calls
-#define QPR_MAX_RUNAWAY	500000	//statements before assuming an infinite loop
-#define QPR_SOFT_RUNAWAY	50000	//statements before complaining, no abort
+//0x1000000, PR_ExecuteProgram's own limit. 500000 was 33x lower and mod
+//load-time thinks are legitimately huge: alkaline's LinkDoors2 links EVERY
+//door on the map in ONE execute. the abort cut that chain partway - doors
+//linked before the cutoff worked, after it each pair had one panel missing
+//its .enemy, and half a door opened. id1 links per-door and never came close
+#define QPR_MAX_RUNAWAY	16777216
+#define QPR_SOFT_RUNAWAY	1000000	//statements before complaining, no abort
 #define QPR_STRING_HEAP	1048576	//mod maps append many keys; 64K fills on qbj3 start
 
 //opcodes, in emit order
@@ -169,6 +174,7 @@ I64			 q_pr_slow_said		= 0;
 //r_speeds reads them: 150ms of server step with 28 edicts is the VM, and the
 //count says whether it is one runaway function or many ordinary ones
 I64			 q_pr_stmts			= 0;
+I64			 q_pr_execs			= 0;	//QPrExecute entries, an epoch for loop detectors
 I64			 q_pr_stmts_worst	= 0;
 I64			 q_pr_worst_fn		= 0;
 Bool		 q_pr_error			= FALSE;
@@ -180,6 +186,18 @@ Bool		 q_pr_error			= FALSE;
 I64	 q_pr_errors	= 0;		//total, including suppressed
 I64	 q_pr_reported	= 0;		//how many actually printed
 U8	 q_pr_detail[128];			//scratch for a diagnostic string
+
+I64 QPrJump(I64 v)
+{//jump operands are the one signed use of a statement cell
+	if (v > 32767)
+		return v - 65536;
+
+	return v;
+}
+
+//the console lives in a later file. without this a report reaches the
+//terminal document behind the game window and nothing on screen
+U0 (*q_pr_print)(U8 *s) = NULL;
 
 U0 QPrReport2(U8 *msg, U8 *detail)
 {//one line, only while under the cap. logged too - console lines scroll away
@@ -199,6 +217,8 @@ U0 QPrReport2(U8 *msg, U8 *detail)
 		StrPrint(line, "QProgs: %s\n", msg);
 
 	QLog(line);
+	if (q_pr_print)
+		q_pr_print(line);
 
 	if (q_pr_reported == QPR_MAX_REPORTS)
 		QLog("QProgs: further errors suppressed\n");
@@ -206,10 +226,6 @@ U0 QPrReport2(U8 *msg, U8 *detail)
 
 //builtins live in a later file, single-pass compiler can't forward reference
 U0 (*q_pr_builtin_call)(I64 num) = NULL;
-
-//the console lives in a later file too. without this a report reaches the
-//terminal document behind the game window and nothing on screen
-U0 (*q_pr_print)(U8 *s) = NULL;
 
 //pr_argc. variadic builtins (bprint/sprint/dprint/centerprint) must use it -
 //the OFS_PARM slots are never cleared, so scanning for a zero prints leftovers
@@ -271,6 +287,8 @@ I64 q_fld_ltime		= -1;
 I64 q_fld_alpha		= -1;
 I64 q_fld_touch		= -1;
 I64 q_fld_use		= -1;
+I64 q_fld_targetname	= -1;	//edict dump only
+I64 q_fld_target		= -1;
 I64 q_fld_blocked	= -1;
 I64 q_fld_chain		= -1;	//findradius list, T_RadiusDamage walks it
 
@@ -531,12 +549,31 @@ F64 QPrPtrGetF(I64 byte_ofs)
 	return QRdF32(q_pr_edicts + byte_ofs);
 }
 
+//watchpoint: one edict field cell, byte offset into the edict block. every
+//pointer store that hits it logs the writing function - the door-link chain
+//was diagnosed by exactly this
+I64 q_pr_watch_ent		= -1;
+U8	q_pr_watch_fname[24];
+I64 q_pr_watch_lo		= -1;
+
 U0 QPrPtrSetI(I64 byte_ofs, I64 v)
 {
 	U8 *p;
+	U8	wline[160];
 
 	if (!q_pr_edicts)
 		return;
+
+	if (byte_ofs == q_pr_watch_lo)
+	{
+		StrPrint(wline, "watch: %s stmt %d wrote ent %d -> %d.%s\n",
+			QPrFuncName(q_pr_xfunction), q_pr_xstatement,
+			QPrEdictNum(v), q_pr_watch_ent, q_pr_watch_fname);
+		QLog(wline);
+		if (q_pr_print)
+			q_pr_print(wline);
+	}
+
 	if (byte_ofs < 0 || byte_ofs + 4 > q_pr_max_edicts * q_pr_edict_stride)
 		return;
 
@@ -698,6 +735,110 @@ U0 QPrProfile(I64 top = 10)
 	QLogFlush;
 }
 
+U0 QPrEdictDump(I64 ent)
+{//one edict, the fields the door and item chains run on
+	U8	line[192];
+	I64	fn;
+
+	if (ent < 0 || ent >= q_pr_num_edicts || !q_pr_edicts)
+	{
+		if (q_pr_print) q_pr_print("no such edict\n");
+		return;
+	}
+
+	StrPrint(line, "edict %d %s%s\n", ent,
+		QPrStr(QPrFieldI(ent, q_fld_classname)),
+		"");
+	if (q_pr_edict_free[ent])
+		StrPrint(line, "edict %d FREE\n", ent);
+	if (q_pr_print) q_pr_print(line);
+	QLog(line);
+
+	StrPrint(line,
+		"  org %d %d %d  model '%s' idx %d  solid %d move %d hp %d\n",
+		ToI64(QPrFieldF(ent, q_fld_origin)),
+		ToI64(QPrFieldF(ent, q_fld_origin + 1)),
+		ToI64(QPrFieldF(ent, q_fld_origin + 2)),
+		QPrStr(QPrFieldI(ent, q_fld_model)),
+		ToI64(QPrFieldF(ent, q_fld_modelindex)),
+		ToI64(QPrFieldF(ent, q_fld_solid)),
+		ToI64(QPrFieldF(ent, q_fld_movetype)),
+		ToI64(QPrFieldF(ent, q_fld_health)));
+	if (q_pr_print) q_pr_print(line);
+	QLog(line);
+
+	StrPrint(line,
+		"  tn '%s' -> '%s'  spawnflags %d  flags %d  alpha %d.%03d (fld %d)\n",
+		QPrStr(QPrFieldI(ent, q_fld_targetname)),
+		QPrStr(QPrFieldI(ent, q_fld_target)),
+		ToI64(QPrFieldF(ent, q_fld_spawnflags)),
+		ToI64(QPrFieldF(ent, q_fld_flags)),
+		ToI64(QPrFieldF(ent, q_fld_alpha)),
+		ToI64(QPrFieldF(ent, q_fld_alpha) * 1000.0) % 1000,
+		q_fld_alpha);
+	if (q_pr_print) q_pr_print(line);
+	QLog(line);
+
+	StrPrint(line, "  owner %d  enemy %d  ltime %d.%03d\n",
+		QPrEdictNum(QPrFieldI(ent, q_fld_owner)),
+		QPrEdictNum(QPrFieldI(ent, q_fld_enemy)),
+		ToI64(QPrFieldF(ent, q_fld_ltime)),
+		ToI64(QPrFieldF(ent, q_fld_ltime) * 1000.0) % 1000);
+	if (q_pr_print) q_pr_print(line);
+	QLog(line);
+
+	fn = QPrFieldI(ent, q_fld_think);
+	StrPrint(line, "  think %s @%d.%03d  touch %s  use %s\n",
+		QPrFuncName(fn),
+		ToI64(QPrFieldF(ent, q_fld_nextthink)),
+		ToI64(QPrFieldF(ent, q_fld_nextthink) * 1000.0) % 1000,
+		QPrFuncName(QPrFieldI(ent, q_fld_touch)),
+		QPrFuncName(QPrFieldI(ent, q_fld_use)));
+	if (q_pr_print) q_pr_print(line);
+	QLog(line);
+	QLogFlush;
+}
+
+U0 QPrEdictFind(U8 *match)
+{//every live edict whose classname or targetname contains the string
+	I64	i;
+	I64	shown = 0;
+	U8	*cn;
+	U8	*tn;
+	U8	line[128];
+
+	for (i = 0; i < q_pr_num_edicts; i++)
+	{
+		if (q_pr_edict_free[i])
+			goto qed_next;
+
+		cn = QPrStr(QPrFieldI(i, q_fld_classname));
+		tn = QPrStr(QPrFieldI(i, q_fld_targetname));
+
+		if (!StrFind(match, cn, SFF_IGNORE_CASE) &&
+			!StrFind(match, tn, SFF_IGNORE_CASE))
+			goto qed_next;
+
+		StrPrint(line, "%5d %s '%s' -> '%s'\n", i, cn, tn,
+			QPrStr(QPrFieldI(i, q_fld_target)));
+		if (q_pr_print) q_pr_print(line);
+		QLog(line);
+
+		shown++;
+		if (shown >= 20)
+		{
+			if (q_pr_print) q_pr_print("...\n");
+			return;
+		}
+
+qed_next:
+	}
+
+	StrPrint(line, "%d matched\n", shown);
+	if (q_pr_print) q_pr_print(line);
+	QLogFlush;
+}
+
 Bool QPrLoad(U8 *name, I64 max_edicts)
 {
 	U8	*d;
@@ -752,10 +893,14 @@ Bool QPrLoad(U8 *name, I64 max_edicts)
 		rec = d + ofs_statements + i * 8;
 		q_pr_statements[i].op = QRdU16(rec);
 
-		//signed, jumps are relative and go backwards for loops
-		q_pr_statements[i].a = QRdI16(rec + 2);
-		q_pr_statements[i].b = QRdI16(rec + 4);
-		q_pr_statements[i].c = QRdI16(rec + 6);
+		//UNSIGNED. a mod's global pool exceeds 32767 cells and a signed read
+		//turned every high offset negative - the bounds check then ate the
+		//access, so those stores vanished SILENTLY. QuakeSpasm reads these
+		//unsigned for the same reason. only the jump ops carry signed values,
+		//sign-extended at the branch
+		q_pr_statements[i].a = QRdU16(rec + 2);
+		q_pr_statements[i].b = QRdU16(rec + 4);
+		q_pr_statements[i].c = QRdU16(rec + 6);
 	}
 
 	//--- defs ---
@@ -802,7 +947,10 @@ Bool QPrLoad(U8 *name, I64 max_edicts)
 	MemCopy(q_pr_strings, d + ofs_strings, QRdI32(d + 44));
 	q_pr_string_alloc = QRdI32(d + 44);
 
-	q_pr_globals = CAlloc(q_pr_num_globals * 4);
+	//padded to the full 16-bit operand range: any statement cell then indexes
+	//in-bounds BY CONSTRUCTION, and the hot opcodes skip the per-operand
+	//bounds check entirely. 256KB against a VM that was all call overhead
+	q_pr_globals = CAlloc(65538 * 4);
 	for (i = 0; i < q_pr_num_globals; i++)
 		q_pr_globals[i] = QRdU32(d + ofs_globals + i * 4);
 
@@ -996,6 +1144,7 @@ U0 QPrExecute(I64 fnum)
 	I64				 i;
 	I64				 ptr;
 	I64				 ent;
+	U32				*g = q_pr_globals;	//pool padded to 64K cells, see QPrLoad
 	I64				 fld;
 	I64				 newfnum;
 	I64				 caller;
@@ -1012,6 +1161,7 @@ U0 QPrExecute(I64 fnum)
 	//would carry q_pr_xfunction from the PREVIOUS execute and show a bogus
 	//outermost frame in every abort dump
 	q_pr_xfunction = 0;
+	q_pr_execs++;
 
 	QPrEnterFunction(fnum);
 
@@ -1085,54 +1235,61 @@ U0 QPrExecute(I64 fnum)
 
 			//--- arithmetic ---
 			case OP_MUL_F:
-				QPrSetF(st->c, QPrGetF(st->a) * QPrGetF(st->b));
+				g[st->c] = QWrF32(QF32Bits(g[st->a]) * QF32Bits(g[st->b]));
 				break;
 			case OP_MUL_V:
-				QPrGetV(st->a, va);
-				QPrGetV(st->b, vb);
-				QPrSetF(st->c, va[0] * vb[0] + va[1] * vb[1] + va[2] * vb[2]);
+				g[st->c] = QWrF32(
+					QF32Bits(g[st->a])     * QF32Bits(g[st->b]) +
+					QF32Bits(g[st->a + 1]) * QF32Bits(g[st->b + 1]) +
+					QF32Bits(g[st->a + 2]) * QF32Bits(g[st->b + 2]));
 				break;
 			case OP_MUL_FV:
-				fa = QPrGetF(st->a);
-				QPrGetV(st->b, vb);
-				QVecScale(vb, fa, vc);
-				QPrSetV(st->c, vc);
+				fa = QF32Bits(g[st->a]);
+				g[st->c]     = QWrF32(fa * QF32Bits(g[st->b]));
+				g[st->c + 1] = QWrF32(fa * QF32Bits(g[st->b + 1]));
+				g[st->c + 2] = QWrF32(fa * QF32Bits(g[st->b + 2]));
 				break;
 			case OP_MUL_VF:
-				QPrGetV(st->a, va);
-				fb = QPrGetF(st->b);
-				QVecScale(va, fb, vc);
-				QPrSetV(st->c, vc);
+				fb = QF32Bits(g[st->b]);
+				g[st->c]     = QWrF32(QF32Bits(g[st->a]) * fb);
+				g[st->c + 1] = QWrF32(QF32Bits(g[st->a + 1]) * fb);
+				g[st->c + 2] = QWrF32(QF32Bits(g[st->a + 2]) * fb);
 				break;
 			case OP_DIV_F:
-				fb = QPrGetF(st->b);
+				fb = QF32Bits(g[st->b]);
 				if (fb == 0.0)
-					QPrSetF(st->c, 0.0);
+					g[st->c] = 0;
 				else
-					QPrSetF(st->c, QPrGetF(st->a) / fb);
+					g[st->c] = QWrF32(QF32Bits(g[st->a]) / fb);
 				break;
 			case OP_ADD_F:
-				QPrSetF(st->c, QPrGetF(st->a) + QPrGetF(st->b));
+				g[st->c] = QWrF32(QF32Bits(g[st->a]) + QF32Bits(g[st->b]));
 				break;
 			case OP_ADD_V:
-				QPrGetV(st->a, va);
-				QPrGetV(st->b, vb);
-				QVecAdd(va, vb, vc);
-				QPrSetV(st->c, vc);
+				g[st->c]     = QWrF32(QF32Bits(g[st->a]) + QF32Bits(g[st->b]));
+				g[st->c + 1] = QWrF32(QF32Bits(g[st->a + 1]) +
+									  QF32Bits(g[st->b + 1]));
+				g[st->c + 2] = QWrF32(QF32Bits(g[st->a + 2]) +
+									  QF32Bits(g[st->b + 2]));
 				break;
 			case OP_SUB_F:
-				QPrSetF(st->c, QPrGetF(st->a) - QPrGetF(st->b));
+				g[st->c] = QWrF32(QF32Bits(g[st->a]) - QF32Bits(g[st->b]));
 				break;
 			case OP_SUB_V:
-				QPrGetV(st->a, va);
-				QPrGetV(st->b, vb);
-				QVecSub(va, vb, vc);
-				QPrSetV(st->c, vc);
+				g[st->c]     = QWrF32(QF32Bits(g[st->a]) - QF32Bits(g[st->b]));
+				g[st->c + 1] = QWrF32(QF32Bits(g[st->a + 1]) -
+									  QF32Bits(g[st->b + 1]));
+				g[st->c + 2] = QWrF32(QF32Bits(g[st->a + 2]) -
+									  QF32Bits(g[st->b + 2]));
 				break;
 
 			//--- comparison ---
 			case OP_EQ_F:
-				QPrSetF(st->c, ToF64(QPrGetF(st->a) == QPrGetF(st->b)));
+				//1.0f is 0x3F800000; the compare needs no store helper
+				if (QF32Bits(g[st->a]) == QF32Bits(g[st->b]))
+					g[st->c] = 0x3F800000;
+				else
+					g[st->c] = 0;
 				break;
 			case OP_EQ_V:
 				QPrGetV(st->a, va);
@@ -1146,10 +1303,16 @@ U0 QPrExecute(I64 fnum)
 				break;
 			case OP_EQ_E:
 			case OP_EQ_FNC:
-				QPrSetF(st->c, ToF64(QPrGetI(st->a) == QPrGetI(st->b)));
+				if (g[st->a] == g[st->b])
+					g[st->c] = 0x3F800000;
+				else
+					g[st->c] = 0;
 				break;
 			case OP_NE_F:
-				QPrSetF(st->c, ToF64(QPrGetF(st->a) != QPrGetF(st->b)));
+				if (QF32Bits(g[st->a]) != QF32Bits(g[st->b]))
+					g[st->c] = 0x3F800000;
+				else
+					g[st->c] = 0;
 				break;
 			case OP_NE_V:
 				QPrGetV(st->a, va);
@@ -1163,19 +1326,34 @@ U0 QPrExecute(I64 fnum)
 				break;
 			case OP_NE_E:
 			case OP_NE_FNC:
-				QPrSetF(st->c, ToF64(QPrGetI(st->a) != QPrGetI(st->b)));
+				if (g[st->a] != g[st->b])
+					g[st->c] = 0x3F800000;
+				else
+					g[st->c] = 0;
 				break;
 			case OP_LE:
-				QPrSetF(st->c, ToF64(QPrGetF(st->a) <= QPrGetF(st->b)));
+				if (QF32Bits(g[st->a]) <= QF32Bits(g[st->b]))
+					g[st->c] = 0x3F800000;
+				else
+					g[st->c] = 0;
 				break;
 			case OP_GE:
-				QPrSetF(st->c, ToF64(QPrGetF(st->a) >= QPrGetF(st->b)));
+				if (QF32Bits(g[st->a]) >= QF32Bits(g[st->b]))
+					g[st->c] = 0x3F800000;
+				else
+					g[st->c] = 0;
 				break;
 			case OP_LT:
-				QPrSetF(st->c, ToF64(QPrGetF(st->a) < QPrGetF(st->b)));
+				if (QF32Bits(g[st->a]) < QF32Bits(g[st->b]))
+					g[st->c] = 0x3F800000;
+				else
+					g[st->c] = 0;
 				break;
 			case OP_GT:
-				QPrSetF(st->c, ToF64(QPrGetF(st->a) > QPrGetF(st->b)));
+				if (QF32Bits(g[st->a]) > QF32Bits(g[st->b]))
+					g[st->c] = 0x3F800000;
+				else
+					g[st->c] = 0;
 				break;
 
 			//--- field loads: a is the entity, b the field index ---
@@ -1209,12 +1387,14 @@ U0 QPrExecute(I64 fnum)
 			case OP_STORE_ENT:
 			case OP_STORE_FLD:
 			case OP_STORE_FNC:
-				QPrSetI(st->b, QPrGetI(st->a));
+				g[st->b] = g[st->a];
 				break;
 			case OP_STORE_V:
-				QPrSetI(st->b, QPrGetI(st->a));
-				QPrSetI(st->b + 1, QPrGetI(st->a + 1));
-				QPrSetI(st->b + 2, QPrGetI(st->a + 2));
+				//a vector's third cell can sit at 65535+2: the pad covers it,
+				//sized 65538 in QPrLoad
+				g[st->b]     = g[st->a];
+				g[st->b + 1] = g[st->a + 1];
+				g[st->b + 2] = g[st->a + 2];
 				break;
 
 			//--- pointer stores ---
@@ -1235,16 +1415,13 @@ U0 QPrExecute(I64 fnum)
 
 			//--- logic ---
 			case OP_NOT_F:
-				//explicit compare against 0.0. ZealC ! on an F64 does not
-				//behave like C, and this opcode carries half of QuakeC:
-				//  if (!self.yaw_speed) -> monsters that never turn
-				//  if (!targ.takedamage) -> the world becomes damageable
-				//  if (!self.speed) -> zero-speed doors, divide by zero in
-				//    SUB_CalcMove, a think at zero delay that locks the frame
-				if (QPrGetF(st->a) == 0.0)
-					QPrSetF(st->c, 1.0);
+				//same denormal rule as AND/OR: !x is true only for +-0.0.
+				//the bits-sans-sign test preserves denormal truth where a
+				//float conversion flushed it
+				if (g[st->a] & 0x7FFFFFFF)
+					g[st->c] = 0;
 				else
-					QPrSetF(st->c, 0.0);
+					g[st->c] = 0x3F800000;
 				break;
 			case OP_NOT_V:
 				QPrGetV(st->a, va);
@@ -1278,17 +1455,23 @@ U0 QPrExecute(I64 fnum)
 					QPrSetF(st->c, 0.0);
 				break;
 			case OP_AND:
-				//ToBool takes an I64, an F64 arrives as raw bits
-				if (QPrGetF(st->a) != 0.0 && QPrGetF(st->b) != 0.0)
-					QPrSetF(st->c, 1.0);
+				//C float truth: false ONLY for +0.0 and -0.0, so the test is
+				//the bits sans sign. QF32Bits flushes denormals - and every
+				//ENTITY value is one: a byte offset like 16000 is 2e-41 as a
+				//float32. qcc emits AND/OR for && on any type, so
+				//    if (d1.owner && d2.owner)
+				//read false for every linked door and alkaline's LinkDoors
+				//re-linked and stomped its own chains. half the door opened
+				if ((g[st->a] & 0x7FFFFFFF) && (g[st->b] & 0x7FFFFFFF))
+					g[st->c] = 0x3F800000;
 				else
-					QPrSetF(st->c, 0.0);
+					g[st->c] = 0;
 				break;
 			case OP_OR:
-				if (QPrGetF(st->a) != 0.0 || QPrGetF(st->b) != 0.0)
-					QPrSetF(st->c, 1.0);
+				if ((g[st->a] & 0x7FFFFFFF) || (g[st->b] & 0x7FFFFFFF))
+					g[st->c] = 0x3F800000;
 				else
-					QPrSetF(st->c, 0.0);
+					g[st->c] = 0;
 				break;
 			case OP_BITAND:
 				QPrSetF(st->c, ToF64(ToI64(QPrGetF(st->a)) &
@@ -1310,15 +1493,15 @@ U0 QPrExecute(I64 fnum)
 			//and float tests agree on most bit patterns, not all: negative
 			//zero equals 0.0 while its _int is non-zero
 			case OP_IF:
-				if (QPrGetI(st->a))
-					q_pr_xstatement += st->b - 1;
+				if (g[st->a])
+					q_pr_xstatement += QPrJump(st->b) - 1;
 				break;
 			case OP_IFNOT:
-				if (!QPrGetI(st->a))
-					q_pr_xstatement += st->b - 1;
+				if (!g[st->a])
+					q_pr_xstatement += QPrJump(st->b) - 1;
 				break;
 			case OP_GOTO:
-				q_pr_xstatement += st->a - 1;
+				q_pr_xstatement += QPrJump(st->a) - 1;
 				break;
 
 			case OP_STATE:
@@ -1449,8 +1632,31 @@ I64 QPrNewString(U8 *s)
 	return ofs;
 }
 
+U0 QPrWatchResolve()
+{//stride and field offsets change per progs, so the raw address is derived
+	I64 fld;
+
+	q_pr_watch_lo = -1;
+	if (q_pr_watch_ent < 0 || !q_pr_watch_fname[0])
+		return;
+
+	fld = QPrFindField(q_pr_watch_fname);
+	if (fld < 0 || !q_pr_edict_stride)
+		return;
+
+	q_pr_watch_lo = q_pr_watch_ent * q_pr_edict_stride + fld * 4;
+}
+
+U0 QPrWatchSet(I64 ent, U8 *fname)
+{
+	q_pr_watch_ent = ent;
+	QStrCopy(q_pr_watch_fname, fname, 24);
+	QPrWatchResolve;
+}
+
 U0 QPrCacheOffsets()
 {//resolve the hot symbols once. a miss stays -1 and every accessor range
+	QPrWatchResolve;
  //checks, so an unexpected QuakeC build degrades instead of faulting
 
 	q_ofs_self		= QPrFindGlobal("self");
@@ -1507,6 +1713,8 @@ U0 QPrCacheOffsets()
 	q_fld_ltime			= QPrFindField("ltime");
 	q_fld_alpha			= QPrFindField("alpha");
 	q_fld_touch			= QPrFindField("touch");
+	q_fld_targetname	= QPrFindField("targetname");
+	q_fld_target		= QPrFindField("target");
 	q_fld_use			= QPrFindField("use");
 	q_fld_blocked		= QPrFindField("blocked");
 	q_fld_chain			= QPrFindField("chain");
