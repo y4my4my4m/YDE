@@ -344,6 +344,9 @@ U8	q_lightstyle[QMAX_LIGHTSTYLES * QLIGHTSTYLE_LEN];
 I64	q_lightstyle_value[QMAX_LIGHTSTYLES];
 U8	q_light_scratch[QLIGHT_SCRATCH];
 U8	q_light_black[QLIGHT_SCRATCH];	//unlit face lightmap, all zeros
+//dlight contribution alone. a separate buffer because a dlit face holds
+//both this and a static lightmap live at the same time
+U8	q_light_dyn[QLIGHT_SCRATCH];
 
 //counters, so the recombine path can be measured instead of guessed at
 I64	q_light_acc[QLIGHT_SCRATCH];	//per-luxel accumulator, 8 bits of fraction
@@ -734,6 +737,38 @@ U8 *QLightFaceMap(CQMap *map, CQFace *f, I64 lm_w, I64 lm_h, F64 time)
 	}
 
 	return q_light_scratch;
+}
+
+U8 *QLightDlightMap(CQMap *map, CQFace *f, I64 lm_w, I64 lm_h, F64 time)
+{//the dlight term on its own, in luxels, for the additive pass over a cached
+ //surface. QLightFaceMap's dyn branch without the compiled lighting under it
+	I64 size = lm_w * lm_h;
+	I64 acc;
+	I64 i;
+
+	if (size <= 0 || size > QLIGHT_SCRATCH)
+		return NULL;
+
+	if (!q_dlight_any || f->dlight_frame != q_dlight_frame || !f->dlight_bits)
+		return NULL;
+
+	for (i = 0; i < size; i++)
+		q_light_acc[i] = 0;
+
+	QLightAddDynamic(map, f, lm_w, lm_h, time);
+
+	for (i = 0; i < size; i++)
+	{
+		acc = q_light_acc[i] / QLIGHT_UNITY;
+		if (acc > 255)
+			acc = 255;
+		if (acc < 0)
+			acc = 0;
+
+		q_light_dyn[i] = acc;
+	}
+
+	return q_light_dyn;
 }
 
 I64 QLightPoint(CQMap *map, F64 *point)
@@ -1917,11 +1952,26 @@ qsc_next_texel:
 	return out;
 }
 
+U32 QRGBAddLight(U32 argb, I64 add)
+{//brighten an overlay texel by a dlight level. QRGB_SET survives, and the
+ //channels saturate rather than wrapping into each other
+	I64 r = ((argb >> 16) & 255) + add;
+	I64 g = ((argb >> 8) & 255) + add;
+	I64 b = (argb & 255) + add;
+
+	if (r > 255)	r = 255;
+	if (g > 255)	g = 255;
+	if (b > 255)	b = 255;
+
+	return QRGB_SET | (r << 16) | (g << 8) | b;
+}
+
 U0 QDrawSpan(CQCanvas *c, I64 y, I64 x1, I64 x2,
 	F64 iz1, F64 soz1, F64 toz1, F64 iz2, F64 soz2, F64 toz2,
 	CQTexture *tex, U8 *lightmap, I64 lm_w, I64 lm_h,
 	F64 mins_s, F64 mins_t, I64 flat_light, I64 mip,
-	U8 *surf = NULL, I64 sw = 0, I64 sh = 0, U32 *surf_rgb = NULL)
+	U8 *surf = NULL, I64 sw = 0, I64 sh = 0, U32 *surf_rgb = NULL,
+	U8 *dlmap = NULL)
 {//fill one horizontal run. HOT LOOP - everything else runs a few thousand
  //times a frame, this runs a few hundred thousand
 	U8	*row;
@@ -1941,6 +1991,9 @@ U0 QDrawSpan(CQCanvas *c, I64 y, I64 x1, I64 x2,
 	F64	 wt;
 	Bool	 turb;
 	Bool	 rgbonly;
+	I64	 dl;
+	I64	 dl_e;
+	I64	 d_dl;
 	I64	 x;
 	I64	 tw;
 	I64	 th;
@@ -2163,6 +2216,21 @@ U0 QDrawSpan(CQCanvas *c, I64 y, I64 x1, I64 x2,
 			dufx = ToI64(ds * 65536.0);
 			dvfx = ToI64(dt * 65536.0);
 
+			//the dlight term is sampled at the block ends and stepped between,
+			//exactly as the static lightmap is on the uncached path. one add
+			//per pixel instead of a bilinear fetch
+			dl   = 0;
+			d_dl = 0;
+			if (dlmap && lm_w > 0 && lm_h > 0)
+			{
+				dl   = ToI64(QLightBilinear(dlmap, lm_w, lm_h,
+							(s - mins_s) / 16.0, (t - mins_t) / 16.0) * 256.0);
+				dl_e = ToI64(QLightBilinear(dlmap, lm_w, lm_h,
+							(s_e - mins_s) / 16.0, (t_e - mins_t) / 16.0) *
+							256.0);
+				d_dl = (dl_e - dl) / n;
+			}
+
 			while (x < xe)
 			{
 				if (izi > zrow[x])
@@ -2175,6 +2243,10 @@ U0 QDrawSpan(CQCanvas *c, I64 y, I64 x1, I64 x2,
 					//a cutout writes neither color nor depth
 					if (argb)
 					{
+						//R_AddDynamicLights brightens, it never tints
+						if (dl > 0)
+							argb = QRGBAddLight(argb, dl >> 8);
+
 						crow[x] = argb;
 						zrow[x] = izi;
 						if (x == q_probe_x)
@@ -2186,6 +2258,7 @@ U0 QDrawSpan(CQCanvas *c, I64 y, I64 x1, I64 x2,
 				vfx += dvfx;
 				iz  += d_iz;
 				izi += d_izi;
+				dl  += d_dl;
 				x++;
 			}
 
@@ -2395,7 +2468,8 @@ qds_block_end:
 U0 QDrawPolygon(CQCanvas *c, CQScreenVert *v, I64 count,
 	CQTexture *tex, U8 *lightmap, I64 lm_w, I64 lm_h,
 	F64 mins_s, F64 mins_t, I64 flat_light, I64 mip,
-	U8 *surf = NULL, I64 sw = 0, I64 sh = 0, U32 *surf_rgb = NULL)
+	U8 *surf = NULL, I64 sw = 0, I64 sh = 0, U32 *surf_rgb = NULL,
+	U8 *dlmap = NULL)
 {//scanline fill of a convex poly - intersect every edge per row, extremes
  //become the span. O(edges), but rarely more than eight after clipping, and
  //no active edge table to get the winding order wrong in
@@ -2496,7 +2570,7 @@ U0 QDrawPolygon(CQCanvas *c, CQScreenVert *v, I64 count,
 			QDrawSpan(c, y, ToI64(Ceil(xl)), ToI64(Ceil(xr)),
 				izl, sozl, tozl, izr, sozr, tozr,
 				tex, lightmap, lm_w, lm_h, mins_s, mins_t, flat_light, mip,
-				surf, sw, sh, surf_rgb);
+				surf, sw, sh, surf_rgb, dlmap);
 		}
 	}
 }
@@ -3473,7 +3547,12 @@ U0 QDrawSkySpan(CQCanvas *c, I64 y, I64 x1, I64 x2, F64 iz1, F64 iz2,
 
 				//sky is emissive, never shaded by the colormap
 				row[x]  = texel;
-				zrow[x] = ToI64(iz * QDEPTH_SCALE);
+
+				//depth 0, as the skybox spans write: it marks the pixel as
+				//sky so the blit fogs it by _skyfog instead of by distance.
+				//real depth put the classic sky at the far end of the fog
+				//table and washed it to flat fog colour
+				zrow[x] = 0;
 			}
 
 			dx += ddx;
@@ -3601,6 +3680,7 @@ U0 QDrawFace(CQCanvas *c, CQMap *map, I64 face_index, F64 *offset = NULL,
 	U32			*surf_rgb = NULL;
 	Bool		 lm_pending = FALSE;
 	Bool		 dlit;
+	U8			*dlmap;
 	I64			 sw = 0;
 	I64			 sh = 0;
 	F64			 rel[3];
@@ -3750,13 +3830,15 @@ U0 QDrawFace(CQCanvas *c, CQMap *map, I64 face_index, F64 *offset = NULL,
 		//first skips QLightFaceMap entirely on a hit, which is most faces
 		//most frames - and all of them while a muzzle flash is lit
 		//
-		//a dlit face skips the cache outright and is lit per pixel. baking the
-		//dlight in meant rebuilding every surface the light touched, every
-		//frame it touched them; the cached static-lit copy now survives the
-		//flash and is there again the moment it passes
+		//a dlit face keeps its cached static-lit surface and takes the light
+		//as an additive pass at draw time, the way GLQuake blends a second
+		//lightmap over the first. baking it in meant rebuilding every surface
+		//the light touched, every frame it touched them
 		dlit = ToBool(f->dlight_frame == q_dlight_frame && f->dlight_bits);
 
-		if (!tex->is_turb && !tex->clamp && !dlit)
+		//8bpp has no RGB plane to add into, so a dlit face there falls back to
+		//the uncached path and takes the light through its lightmap instead
+		if (!tex->is_turb && !tex->clamp && (q_opt_truecolor || !dlit))
 		{
 			if (lm_pending &&
 				!QSurfCacheWouldHit(map, f, face_index, mip, anim_tex,
@@ -3777,9 +3859,15 @@ U0 QDrawFace(CQCanvas *c, CQMap *map, I64 face_index, F64 *offset = NULL,
 			lm_pending = FALSE;
 		}
 
+		//only the cached truecolor span adds it; the uncached path already has
+		//the dlight folded into the lightmap it just built
+		dlmap = NULL;
+		if (surf && surf_rgb && dlit)
+			dlmap = QLightDlightMap(map, f, lm_w, lm_h, q_light_time);
+
 		//NULL lightmap means fullbright, and by here that is only turb
 		QDrawPolygon(c, scr, count, tex, lightmap, lm_w, lm_h,
-			f->mins_s, f->mins_t, 255, mip, surf, sw, sh, surf_rgb);
+			f->mins_s, f->mins_t, 255, mip, surf, sw, sh, surf_rgb, dlmap);
 	}
 
 	c->faces_drawn++;
