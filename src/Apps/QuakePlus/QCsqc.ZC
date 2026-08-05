@@ -15,8 +15,16 @@ I64			q_cs_scale	= 1;
 
 CQPrVM		q_ssqc_vm;
 CQPrVM		q_cs_vm;
+
+//globals are NOT zeroed: q_cs_vm.raw starts as garbage, and QCsqcFree tested
+//it directly - the first map load handed wild pointers to QPrFree. this flag
+//IS initialized, so it is the only safe thing to branch on
+Bool		q_cs_vm_live	= FALSE;
 Bool		q_cs_ok			= FALSE;
-Bool		q_cs_enable		= TRUE;		//cl_csqc 0 forces the classic bar
+//cl_csqc 0 forces the classic bar AND skips loading csprogs.dat entirely -
+//the second VM is the newest subsystem here, so it has to be switchable off
+//without a rebuild
+Bool		q_cs_enable		= TRUE;
 I64			q_cs_fn_drawhud	= -1;
 I64			q_cs_fn_init	= -1;
 I64			q_cs_ofs_time	= -1;
@@ -41,59 +49,113 @@ I64			q_cs_clip_y1 = 0;
 // ("gfx/foo.lmp"). lmp layout: I32 width, I32 height, bytes. pixels are
 // borrowed from the archive or the wad, freed by neither
 
+//where the HUD time actually goes: draw calls, pixels touched, and cache
+//misses. a miss is a full archive search, so a HUD naming pics dynamically
+//would search the paks on every draw
+I64 q_cs_calls	= 0;
+I64 q_cs_px		= 0;
+I64 q_cs_miss	= 0;
+
 #define QCS_MAX_PICS	128
 
 U8		q_cs_pic_name[QCS_MAX_PICS * 64];
 CQPic	q_cs_pic[QCS_MAX_PICS];
+I64		q_cs_pic_ofs[QCS_MAX_PICS];		//QC string offset, the lookup key
 I64		q_cs_pic_count = 0;
 
-CQPic *QCsPicFind(U8 *name)
-{
+I64 q_cs_missing_said = 0;
+
+U0 QCsPicMissing(U8 *name)
+{//named once: the HUD asks for it every frame and the log would fill
+	U8 line[128];
+
+	if (q_cs_missing_said >= 12)
+		return;
+
+	q_cs_missing_said++;
+	StrPrint(line, "csqc: pic not found '%s'\n", name);
+	QLog(line);
+}
+
+CQPic *QCsPicFind(I64 sofs)
+{//keyed on the QC STRING OFFSET, not the text - the HUD draws dozens of pics
+ //a frame and a StrICompare scan per draw is a kernel call per entry. two
+ //offsets naming the same file take two slots, which is only wasteful
 	I64	 i;
+	U8	*name;
 	U8	*raw;
 	I64	 size;
 	CQPic *pic;
 
-	if (!name || !name[0])
+	if (sofs <= 0)
 		return NULL;
 
 	for (i = 0; i < q_cs_pic_count; i++)
 	{
-		if (!StrICompare(&q_cs_pic_name[i * 64], name))
+		if (q_cs_pic_ofs[i] == sofs)
+		{
+			//negative entry: known absent, do not search again
+			if (!q_cs_pic[i].pixels)
+				return NULL;
+
 			return &q_cs_pic[i];
+		}
 	}
+
+	q_cs_miss++;
+
+	name = QPrStr(sofs);
+	if (!name || !name[0])
+		return NULL;
 
 	if (q_cs_pic_count >= QCS_MAX_PICS)
 		return NULL;
 
-	pic = &q_cs_pic[q_cs_pic_count];
-
-	//wad lump first - the classic art lives there under bare names
-	if (!QWadPic(name, pic))
-	{
-		size = 0;
-		raw  = QPakData(name, &size);
-		if (!raw || size < 8)
-			return NULL;
-
-		pic->width  = QRdI32(raw);
-		pic->height = QRdI32(raw + 4);
-		pic->pixels = raw + 8;
-
-		if (pic->width < 1 || pic->height < 1 ||
-			pic->width * pic->height + 8 > size)
-			return NULL;
-	}
+	//the slot is claimed BEFORE the lookup can fail. a miss walks the whole
+	//search path - on a loose-file gamedir that is FileFind plus FileRead,
+	//milliseconds - and an uncached failure repeated it every single frame.
+	//pixels NULL is the negative entry
+	pic         = &q_cs_pic[q_cs_pic_count];
+	pic->pixels = NULL;
+	pic->width  = 0;
+	pic->height = 0;
 
 	QStrCopy(&q_cs_pic_name[q_cs_pic_count * 64], name, 64);
+	q_cs_pic_ofs[q_cs_pic_count] = sofs;
 	q_cs_pic_count++;
+
+	//wad lump first - the classic art lives there under bare names
+	if (QWadPic(name, pic))
+		return pic;
+
+	size = 0;
+	raw  = QPakData(name, &size);
+	if (!raw || size < 8)
+	{
+		QCsPicMissing(name);
+		pic->pixels = NULL;
+		return NULL;
+	}
+
+	pic->width  = QRdI32(raw);
+	pic->height = QRdI32(raw + 4);
+	pic->pixels = raw + 8;
+
+	if (pic->width < 1 || pic->height < 1 ||
+		pic->width * pic->height + 8 > size)
+	{
+		QCsPicMissing(name);
+		pic->pixels = NULL;
+		return NULL;
+	}
 
 	return pic;
 }
 
 U0 QCsPicsClear()
 {//pixels are borrowed; a gamedir switch invalidates the archives behind them
-	q_cs_pic_count = 0;
+	q_cs_pic_count    = 0;
+	q_cs_missing_said = 0;
 }
 
 //--- draw primitives --------------------------------------------------------
@@ -112,44 +174,80 @@ U0 QCsClipReset()
 U0 QCsBlit(CQPic *pic, I64 dx, I64 dy, I64 dw, I64 dh,
 	I64 sx, I64 sy, I64 sw, I64 sh)
 {//nearest stretch of a pic sub-rect into the canvas, index 255 transparent
+ //
+ //the source walk is 16.16 fixed point and the clip is hoisted. it used to
+ //be a multiply AND a divide per pixel, with the clip tested per pixel and
+ //QRGBDrop called per pixel - the HUD cost 10-15 fps on its own
 	CQCanvas *c = q_cs_canvas;
+	U8	*prow;
+	U8	*drow;
+	U32	*crow;
+	I32	*zrow;
 	I64	 x;
 	I64	 y;
-	I64	 px;
-	I64	 py;
 	I64	 tx;
 	I64	 ty;
+	I64	 x0;
+	I64	 x1;
+	I64	 txf;
+	I64	 dtx;
 	U8	 texel;
 
 	if (!c || !pic || !pic->pixels || dw < 1 || dh < 1 || sw < 1 || sh < 1)
 		return;
 
+	x0 = 0;
+	x1 = dw;
+	if (dx + x0 < q_cs_clip_x0)	x0 = q_cs_clip_x0 - dx;
+	if (dx + x1 > q_cs_clip_x1)	x1 = q_cs_clip_x1 - dx;
+	if (x0 < 0)		x0 = 0;
+	if (x1 > dw)	x1 = dw;
+	if (x0 >= x1)
+		return;
+
+	dtx = (sw << 16) / dw;
+
+	q_cs_calls++;
+	q_cs_px += (x1 - x0) * dh;
+
 	for (y = 0; y < dh; y++)
 	{
-		py = dy + y;
-		if (py < q_cs_clip_y0 || py >= q_cs_clip_y1)
+		if (dy + y < q_cs_clip_y0 || dy + y >= q_cs_clip_y1)
 			goto qcb_next_row;
 
 		ty = sy + y * sh / dh;
 		if (ty < 0 || ty >= pic->height)
 			goto qcb_next_row;
 
-		for (x = 0; x < dw; x++)
-		{
-			px = dx + x;
-			if (px < q_cs_clip_x0 || px >= q_cs_clip_x1)
-				goto qcb_next_px;
+		prow = pic->pixels + ty * pic->width;
+		drow = c->pixels + (dy + y) * c->width;
 
-			tx = sx + x * sw / dw;
+		crow = NULL;
+		if (c->rgb && q_rgb_active)
+			crow = c->rgb + (dy + y) * c->width;
+		zrow = NULL;
+		if (c->depth)
+			zrow = c->depth + (dy + y) * c->width;
+
+		txf = (sx << 16) + dtx * x0;
+
+		for (x = x0; x < x1; x++)
+		{
+			tx   = txf >> 16;
+			txf += dtx;
+
 			if (tx < 0 || tx >= pic->width)
 				goto qcb_next_px;
 
-			texel = pic->pixels[ty * pic->width + tx];
+			texel = prow[tx];
 			if (texel == 255)
 				goto qcb_next_px;
 
-			c->pixels[py * c->width + px] = texel;
-			QRGBDrop(c, px, py);
+			drow[dx + x] = texel;
+
+			//QRGBDrop inlined; it was a call per pixel
+			if (crow)	crow[dx + x] = 0;
+			if (zrow)	zrow[dx + x] = QDEPTH_2D;
 
 qcb_next_px:
 		}
@@ -162,43 +260,57 @@ U0 QCsFill(I64 dx, I64 dy, I64 dw, I64 dh, I64 r, I64 g, I64 b, F64 alpha)
 {//drawfill: nearest palette colour; alpha under half reads as a dim overlay,
  //approximated with the colormap's darker rows
 	CQCanvas *c = q_cs_canvas;
+	U8	*drow;
+	U32	*crow;
+	I32	*zrow;
 	I64	 x;
 	I64	 y;
-	I64	 px;
-	I64	 py;
+	I64	 x0;
+	I64	 x1;
 	U8	 idx;
+	Bool dim;
 
 	if (!c || dw < 1 || dh < 1 || alpha <= 0.0)
 		return;
 
+	x0 = dx;
+	x1 = dx + dw;
+	if (x0 < q_cs_clip_x0)	x0 = q_cs_clip_x0;
+	if (x1 > q_cs_clip_x1)	x1 = q_cs_clip_x1;
+	if (x0 >= x1)
+		return;
+
 	idx = QPalNearestRGB(ClampI64(r, 0, 255), ClampI64(g, 0, 255),
 		ClampI64(b, 0, 255));
+	dim = ToBool(alpha < 0.5);
 
-	for (y = 0; y < dh; y++)
+	q_cs_calls++;
+	q_cs_px += (x1 - x0) * dh;
+
+	for (y = dy; y < dy + dh; y++)
 	{
-		py = dy + y;
-		if (py < q_cs_clip_y0 || py >= q_cs_clip_y1)
+		if (y < q_cs_clip_y0 || y >= q_cs_clip_y1)
 			goto qcf_next_row;
 
-		for (x = 0; x < dw; x++)
+		drow = c->pixels + y * c->width;
+
+		crow = NULL;
+		if (c->rgb && q_rgb_active)
+			crow = c->rgb + y * c->width;
+		zrow = NULL;
+		if (c->depth)
+			zrow = c->depth + y * c->width;
+
+		for (x = x0; x < x1; x++)
 		{
-			px = dx + x;
-			if (px < q_cs_clip_x0 || px >= q_cs_clip_x1)
-				goto qcf_next_px;
-
-			if (alpha < 0.5)
-			{
-				//shade what is there instead of covering it
-				idx = c->pixels[py * c->width + px];
-				c->pixels[py * c->width + px] =
-					qpal_colormap[40 * QPAL_COLORS + idx];
-			}
+			//shade what is there instead of covering it
+			if (dim)
+				drow[x] = qpal_colormap[40 * QPAL_COLORS + drow[x]];
 			else
-				c->pixels[py * c->width + px] = idx;
+				drow[x] = idx;
 
-			QRGBDrop(c, px, py);
-
-qcf_next_px:
+			if (crow)	crow[x] = 0;
+			if (zrow)	zrow[x] = QDEPTH_2D;
 		}
 
 qcf_next_row:
@@ -283,6 +395,12 @@ F64 QCsStat(I64 num)
 
 I64 q_cs_unknown_said = 0;
 
+//statements CSQC_DrawHud alone spent this frame. the mod's HUD versus our own
+//drawing code is otherwise guesswork
+I64 q_cs_stmts	= 0;
+I64 q_cs_stmts0	= 0;
+
+
 U0 QCsDispatch(I64 num)
 {
 	F64	 pos[3];
@@ -301,19 +419,19 @@ U0 QCsDispatch(I64 num)
 	switch (num)
 	{
 		case 317:	//precache_pic(string) -> string
-			QCsPicFind(QBiArgS(0));
+			QCsPicFind(QPrGetI(QBiArg(0)));
 			QPrSetI(QPR_OFS_RETURN, QPrGetI(QBiArg(0)));
 			break;
 
 		case 316:	//iscachedpic
-			if (QCsPicFind(QBiArgS(0)))
+			if (QCsPicFind(QPrGetI(QBiArg(0))))
 				QBiRetF(1.0);
 			else
 				QBiRetF(0.0);
 			break;
 
 		case 318:	//draw_getimagesize -> vector
-			pic = QCsPicFind(QBiArgS(0));
+			pic = QCsPicFind(QPrGetI(QBiArg(0)));
 			QVecSet(v, 0.0, 0.0, 0.0);
 			if (pic)
 			{
@@ -350,7 +468,7 @@ U0 QCsDispatch(I64 num)
 
 		case 322:	//drawpic(pos, pic, size, rgb, alpha)
 			QBiArgV(0, pos);
-			pic = QCsPicFind(QBiArgS(1));
+			pic = QCsPicFind(QPrGetI(QBiArg(1)));
 			QBiArgV(2, size);
 			if (pic)
 				QCsBlit(pic, ToI64(pos[0]) * sc, ToI64(pos[1]) * sc,
@@ -362,7 +480,7 @@ U0 QCsDispatch(I64 num)
 		case 328:	//drawsubpic(pos, size, pic, srcpos, srcsize, rgb, alpha)
 			QBiArgV(0, pos);
 			QBiArgV(1, size);
-			pic = QCsPicFind(QBiArgS(2));
+			pic = QCsPicFind(QPrGetI(QBiArg(2)));
 			QBiArgV(3, spos);
 			QBiArgV(4, ssize);
 			if (pic)
@@ -495,16 +613,18 @@ U0 QCsqcFree()
 	q_cs_ok = FALSE;
 	QCsPicsClear;
 
-	if (q_cs_vm.raw)
-	{
-		//free through the active slots, QPrFree owns the walk
-		QPrVMStore(&q_ssqc_vm);
-		QPrVMLoad(&q_cs_vm);
-		QPrFree;
-		QPrVMClearActive;
-		QPrVMStore(&q_cs_vm);
-		QPrVMLoad(&q_ssqc_vm);
-	}
+	if (!q_cs_vm_live)
+		return;
+
+	//free through the active slots, QPrFree owns the walk
+	QPrVMStore(&q_ssqc_vm);
+	QPrVMLoad(&q_cs_vm);
+	QPrFree;
+	QPrVMClearActive;
+	QPrVMStore(&q_cs_vm);
+	QPrVMLoad(&q_ssqc_vm);
+
+	q_cs_vm_live = FALSE;
 }
 
 U0 QCsqcLoad()
@@ -513,13 +633,18 @@ U0 QCsqcLoad()
 
 	QCsqcFree;
 
+	if (!q_cs_enable)
+		return;
+
 	//stat ammo fields resolve against the SERVER progs, active right now
 	q_cs_fld_shells  = QPrFindField("ammo_shells");
 	q_cs_fld_nails   = QPrFindField("ammo_nails");
 	q_cs_fld_rockets = QPrFindField("ammo_rockets");
 	q_cs_fld_cells   = QPrFindField("ammo_cells");
 
-	if (!QPakFind("csprogs.dat"))
+	//QPakData walks paks AND loose gamedir files - QPakFind was pak-only and
+	//a loose-file mod's csprogs.dat never passed the gate
+	if (!QPakData("csprogs.dat"))
 		return;
 
 	QPrVMStore(&q_ssqc_vm);
@@ -527,6 +652,10 @@ U0 QCsqcLoad()
 
 	if (!QPrLoad("csprogs.dat", 64))
 	{
+		//a partial load left allocations in the active slots; restoring the
+		//server image over them would strand the memory
+		QPrFree;
+		QPrVMClearActive;
 		QPrVMLoad(&q_ssqc_vm);
 		QLog("csqc: csprogs.dat failed to load\n");
 		return;
@@ -556,23 +685,53 @@ U0 QCsqcLoad()
 	QPrVMStore(&q_cs_vm);
 	QPrVMLoad(&q_ssqc_vm);
 
-	q_cs_ok = TRUE;
+	q_cs_vm_live = TRUE;
+	q_cs_ok      = TRUE;
 
 	StrPrint(line, "csqc: HUD loaded, %d functions\n", q_cs_vm.num_functions);
 	QLog(line);
+}
+
+I64	q_cs_frames		= 0;
+I64	q_cs_flap_said	= 0;
+Bool q_cs_last_drew	= FALSE;
+
+U0 QCsFlap(Bool drew)
+{//the classic bar alternating with the HUD means this return is flapping.
+ //name the gate the moment it changes instead of guessing which
+	U8 line[128];
+
+	if (drew == q_cs_last_drew)
+		return;
+
+	q_cs_last_drew = drew;
+	if (q_cs_flap_said >= 8)
+		return;
+
+	q_cs_flap_said++;
+	StrPrint(line, "csqc: hud %d (ok=%d en=%d err=%d frame=%d)\n",
+		drew, q_cs_ok, q_cs_enable, q_pr_error, q_cs_frames);
+	QLog(line);
+	if (q_pr_print)
+		q_pr_print(line);
 }
 
 Bool QCsqcDrawHud(CQCanvas *c, Bool showscores)
 {//TRUE when the client HUD drew this frame - the classic bar then stays away
 	F64 virt[3];
 
-	if (!q_cs_ok || !q_cs_enable || !c)
-		return FALSE;
+	q_cs_frames++;
 
-	//CANVAS_CSQC: s = CLAMP(1, scr_sbarscale, width/320)
-	q_cs_scale = q_opt_hudscale;
-	if (q_cs_scale < 1)
-		q_cs_scale = 1;
+	if (!q_cs_ok || !q_cs_enable || !c)
+	{
+		QCsFlap(FALSE);
+		return FALSE;
+	}
+
+	//CANVAS_CSQC: s = CLAMP(1, scr_sbarscale, width/320). QHudScale carries
+	//the auto rule (hudscale 0), which the raw option value does not - at
+	//scale 1 on an auto-scaled canvas the HUD drew tiny and off to the side
+	q_cs_scale = QHudScale(c);
 	if (q_cs_scale > c->width / 320)
 		q_cs_scale = c->width / 320;
 	if (q_cs_scale < 1)
@@ -594,13 +753,21 @@ Bool QCsqcDrawHud(CQCanvas *c, Bool showscores)
 	QPrSetV(QPR_OFS_PARM0, virt);
 	QPrSetF(QPR_OFS_PARM0 + QPR_PARM_STRIDE, ToF64(showscores));
 
+	q_cs_calls = 0;
+	q_cs_px    = 0;
+	q_cs_miss  = 0;
+
+	q_cs_stmts0       = q_pr_stmts;
 	q_pr_builtin_call = &QCsDispatch;
 	QPrExecute(q_cs_fn_drawhud);
 	q_pr_error        = FALSE;
 	q_pr_builtin_call = &QBiDispatch;
+	q_cs_stmts        = q_pr_stmts - q_cs_stmts0;
 
 	QPrVMStore(&q_cs_vm);
 	QPrVMLoad(&q_ssqc_vm);
+
+	QCsFlap(TRUE);
 
 	return TRUE;
 }

@@ -62,6 +62,75 @@ Bool q_loading = FALSE;		//SCR_BeginLoadingPlaque / scr_drawloading
 F64 q_t_mark		= 0.0;	//phase start, game task
 F64 q_t_blit_mark	= 0.0;	//phase start, wm task
 F64 q_t_srv_mark	= 0.0;
+
+//--- present buffer ---------------------------------------------------------
+//
+// the WM task blits whenever it likes; the game task redraws the canvas every
+// frame. a blit landing mid-redraw shows a frame WITHOUT the menu or with a
+// half-drawn HUD - visible as fast flicker once the CSQC HUD widened the
+// window. the game task snapshots a finished frame here and the blit reads
+// the snapshot, never the canvas. same scheme as HL1's hl_present
+U8	*q_present_pix	= NULL;
+U32	*q_present_rgb	= NULL;
+I32	*q_present_dep	= NULL;
+I64	 q_present_w	= 0;
+I64	 q_present_h	= 0;
+Bool q_present_ok	= FALSE;
+CQCanvas q_present_shell;
+
+U0 QPresentFree()
+{
+	q_present_ok = FALSE;
+	if (q_present_pix)	Free(q_present_pix);
+	if (q_present_rgb)	Free(q_present_rgb);
+	if (q_present_dep)	Free(q_present_dep);
+	q_present_pix = NULL;
+	q_present_rgb = NULL;
+	q_present_dep = NULL;
+}
+
+U0 QPresentFrame()
+{//snapshot the finished canvas. depth rides along - the blit reads it for
+ //anything fog did not already bake
+	I64 n;
+
+	if (!q_canvas)
+		return;
+
+	//fog once per canvas pixel here rather than once per DESTINATION pixel in
+	//the blit. everything is drawn by now, and 2D writers are depth-exempt
+	QFogBakeCanvas(q_canvas);
+
+	n = q_canvas->width * q_canvas->height;
+
+	if (q_present_w != q_canvas->width || q_present_h != q_canvas->height)
+	{
+		//the WM must not read the buffers mid-free. one blit is dropped
+		q_present_ok = FALSE;
+		QPresentFree;
+		q_present_pix = MAlloc(n);
+		q_present_rgb = MAlloc(n * sizeof(U32));
+		q_present_dep = MAlloc(n * sizeof(I32));
+		q_present_w   = q_canvas->width;
+		q_present_h   = q_canvas->height;
+	}
+
+	MemCopy(q_present_pix, q_canvas->pixels, n);
+	if (q_canvas->rgb)
+		MemCopy(q_present_rgb, q_canvas->rgb, n * sizeof(U32));
+	else
+		MemSet(q_present_rgb, 0, n * sizeof(U32));
+	MemCopy(q_present_dep, q_canvas->depth, n * sizeof(I32));
+
+	//the shell copy carries prefogged with it, so the wm task's blit reads a
+	//flag consistent with the pixels it is blitting
+	MemCopy(&q_present_shell, q_canvas, sizeof(CQCanvas));
+	q_present_shell.pixels = q_present_pix;
+	q_present_shell.rgb    = q_present_rgb;
+	q_present_shell.depth  = q_present_dep;
+
+	q_present_ok = TRUE;
+}
 F64 q_t_loop_mark	= 0.0;
 
 U0 QDrawIt(CTask *task, CDC *dc)
@@ -69,20 +138,24 @@ U0 QDrawIt(CTask *task, CDC *dc)
  //frees it, so these guards are what keep teardown out of an in-flight blit.
 	//a map load blocks the game task but not this one, and q_vis stays NULL
 	//throughout - without this the old level sits frozen on screen.
-	if (q_loading && q_ready && q_canvas)
-	{
-		QDrawBlitFit(q_canvas, dc, q_blit_x, q_blit_y, q_blit_w, q_blit_h);
-		return;
-	}
-
 	if (!q_ready || !q_canvas)
 		return;
+
+	if (q_loading)
+	{
+		if (q_present_ok)
+			QDrawBlitFit(&q_present_shell, dc, q_blit_x, q_blit_y,
+				q_blit_w, q_blit_h);
+		return;
+	}
 
 	//the blit runs on the WM task, so its cost is not inside QRenderFrame.
 	//it is charged per DESTINATION pixel, which at a scaled resolution is
 	//several times the canvas
 	q_t_blit_mark = tS;
-	QDrawBlitFit(q_canvas, dc, q_blit_x, q_blit_y, q_blit_w, q_blit_h);
+	if (q_present_ok)
+		QDrawBlitFit(&q_present_shell, dc, q_blit_x, q_blit_y,
+			q_blit_w, q_blit_h);
 	q_t_blit = tS - q_t_blit_mark;
 
 
@@ -1194,8 +1267,10 @@ U0 QRenderFrame()
 	//replaces it entirely.
 	if (!q_intermission)
 	{
+		q_t_mark = tS;
 		QSbarTileClear(q_canvas);
 		QSbarDraw(q_canvas);
+		q_t_hud += tS - q_t_mark;
 	}
 
 	//TAB deathmatch scoreboard (SCR_DrawScoreboard / Sbar_DeathmatchOverlay).
@@ -1319,20 +1394,21 @@ U0 QRenderFrame()
 
 		//px is the real fill cost. slow pixels take a bilinear lightmap fetch
 		//and a colormap walk each, cached ones a load and a store
-		StrPrint(q_fps_line, "px cached %dk  slow %dk  occ %dk  ablend %d  screen %dk",
+		StrPrint(q_fps_line, "px cached %dk  slow %dk  occ %dk  simd %dk  screen %dk",
 			q_px_rgb / 1000, q_px_slow / 1000, q_px_occ / 1000,
-			q_px_alpha,
+			q_px_simd / 1000,
 			q_canvas->vw * q_canvas->vh / 1000);
 		QStrDrawAlt(q_canvas, 8, 40, q_fps_line);
 
 		//tenths of a millisecond. blit is last frame's, measured on the wm
 		//task, and is the only phase not inside this function
 		StrPrint(q_fps_line,
-			"ms vis %d.%d world %d.%d ents %d.%d (bm %d.%d) blit %d.%d",
+			"ms vis %d.%d world %d.%d ents %d.%d (bm %d.%d) hud %d.%d blit %d.%d",
 			ToI64(q_t_vis * 1000.0),   ToI64(q_t_vis * 10000.0) % 10,
 			ToI64(q_t_world * 1000.0), ToI64(q_t_world * 10000.0) % 10,
 			ToI64(q_t_ents * 1000.0),  ToI64(q_t_ents * 10000.0) % 10,
 			ToI64(q_t_brush * 1000.0), ToI64(q_t_brush * 10000.0) % 10,
+			ToI64(q_t_hud * 1000.0),   ToI64(q_t_hud * 10000.0) % 10,
 			ToI64(q_t_blit * 1000.0),  ToI64(q_t_blit * 10000.0) % 10);
 		QStrDrawAlt(q_canvas, 8, 48, q_fps_line);
 
@@ -1348,8 +1424,10 @@ U0 QRenderFrame()
 
 		//QuakeC statements this frame, and the worst single execute with the
 		//function it entered through
-		StrPrint(q_fps_line, "qc %dk stmts  worst %dk in %s",
-			q_pr_stmts / 1000, q_pr_stmts_worst / 1000,
+		StrPrint(q_fps_line, "qc %dk stmts (hud %dk)  hudpx %dk/%d miss %d  worst %dk in %s",
+			q_pr_stmts / 1000, q_cs_stmts / 1000,
+			q_cs_px / 1000, q_cs_calls, q_cs_miss,
+			q_pr_stmts_worst / 1000,
 			QPrFuncName(q_pr_worst_fn));
 		QStrDrawAlt(q_canvas, 8, 64, q_fps_line);
 	}
@@ -1444,8 +1522,9 @@ U0 QApplyVideo()
 	Fs->draw_it = NULL;
 	Sleep(60);
 
-	old      = q_canvas;
-	q_canvas = NULL;
+	old          = q_canvas;
+	q_canvas     = NULL;
+	q_present_ok = FALSE;
 	QDrawFree(old);
 
 	q_canvas = QDrawNew(w, h);
@@ -1886,6 +1965,7 @@ Bool QGameDirSwitch(U8 *dir)
 	q_state       = QST_MENU;
 	q_map_name[0] = 0;
 
+	QPresentFrame;
 	q_ready = TRUE;
 
 	//no ternary in ZealC
@@ -2600,7 +2680,8 @@ U0 QGameLoop()
 			QMenuDraw(q_canvas);
 			QConDraw(q_canvas);
 			QCenterView(Fs);
-			q_ready = TRUE;
+			QPresentFrame;
+	q_ready = TRUE;
 
 			//the console owns the keyboard, not the server
 			QSvHostTick(dt);
@@ -2694,7 +2775,8 @@ U0 QGameLoop()
 
 			QMenuDraw(q_canvas);
 			QCenterView(Fs);
-			q_ready = TRUE;
+			QPresentFrame;
+	q_ready = TRUE;
 
 			//a menu on the host must not freeze the guests
 			QSvHostTick(dt);
@@ -3137,7 +3219,8 @@ U0 QGameLoop()
 
 		QCenterView(Fs);
 		QRenderFrame;
-		q_ready = TRUE;
+		QPresentFrame;
+	q_ready = TRUE;
 
 		q_frame_count++;
 		fps_frames++;
@@ -3534,6 +3617,7 @@ U0 Quake(U8 *mapname = QDEFAULT_MAP)
 	QLog("teardown: QSurfCacheFlush ok\n");
 	QLogFlush;
 
+	QPresentFree;
 	QDrawFree(canvas);
 	QLog("teardown: QDrawFree ok\n");
 	QLogFlush;
