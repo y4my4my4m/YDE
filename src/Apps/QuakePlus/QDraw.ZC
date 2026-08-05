@@ -1492,6 +1492,13 @@ Bool q_opt_fov_adapt = TRUE;
 I64  q_span_sub		= QSPAN_SUB;
 Bool q_mdl_warp		= FALSE;
 
+//TRUE affine, ALIASSHADER_NOPERSP. the caller has put plain s and t in the
+//s_over_z / t_over_z slots instead of s/z and t/z, so the edge walk carries
+//them linearly in SCREEN space and the span uses them directly - no divide
+//anywhere. subdividing the span is not enough on its own: the endpoints stay
+//perspective-correct on every scanline and the error never shows
+Bool q_span_affine	= FALSE;
+
 F64 QDrawAdaptFovX(F64 fov_x, I64 width, I64 height)
 {//AdaptFovx. the 90 in Quake's fov cvar is a 4:3 HORIZONTAL fov; shown as-is
  //on a 16:9 screen it crops the sides off the intended image instead of
@@ -2150,6 +2157,10 @@ Bool q_mip_frozen		= FALSE;
 //cache and is keyed the same way
 #define QLERP_TIME		0.1		//e->lerptime default
 
+//the viewmodel has no edict. slot 0 is the world, which never animates and
+//which the entity loop never reaches - it starts at 1 - so it cannot collide
+#define QLPC_VIEWMODEL	0
+
 Bool q_lerp_models		= TRUE;
 I64	 q_lerp_prev[QLPC_MAX];
 I64	 q_lerp_cur[QLPC_MAX];
@@ -2178,7 +2189,7 @@ F64 QLerpPose(I64 key, I64 frame, F64 now, I64 *_prev)
 
 	*_prev = -1;
 
-	if (!q_lerp_models || key <= 0 || key >= QLPC_MAX)
+	if (!q_lerp_models || key < 0 || key >= QLPC_MAX)
 		return 1.0;
 
 	if (q_lerp_cur[key] != frame)
@@ -2271,9 +2282,23 @@ I64 QMipForRatio(F64 ratio, I64 prev)
 	return mip;
 }
 
+//r_progmips. a face coming into view has to be built before it can be drawn,
+//and at mip 0 that is the full texture - turning to face a new room queues
+//dozens at once and the per-frame build cap turns the backlog into a hitch.
+//building COARSE first costs a sixteenth of the texels and the face is on
+//screen immediately; the wanted mip is recorded and refined on a later frame
+//when the budget allows. the coarse copy is replaced, not kept alongside
+//mip levels coarser on the first build. 2 rather than 3: a level costs a
+//quarter of the one above it, so 3 saves little over 2 against the whole
+//frame while looking markedly worse
+#define QSURF_PROG_STEP	2
+
+Bool q_prog_mips = TRUE;
+
 U8 *QSurfCacheGet(CQMap *map, CQFace *f, I64 face_index, CQTexture *tex,
 	I64 mip, U8 *lightmap, I64 lm_w, I64 lm_h, I64 *_cw, I64 *_ch,
-	I64 tex_key = 0, U32 **_rgb = NULL, U32 **_rgb_raw = NULL)
+	I64 tex_key = 0, U32 **_rgb = NULL, U32 **_rgb_raw = NULL,
+	I64 *_mip = NULL)
 {//R_DrawSurface - texture with lighting applied at the mip being drawn.
  //NULL means not cached, light it per pixel
 	CQSurfCache	*sc;
@@ -2284,6 +2309,8 @@ U8 *QSurfCacheGet(CQMap *map, CQFace *f, I64 face_index, CQTexture *tex,
 	I64			 tw, th;
 	I64			 need;
 	I64			 key;
+	I64			 want_mip;
+	Bool		 have;
 	I64			 u, v;
 	I64			 tx, ty;
 	I64			 s0, t0;
@@ -2335,6 +2362,51 @@ U8 *QSurfCacheGet(CQMap *map, CQFace *f, I64 face_index, CQTexture *tex,
 
 	if (!q_face_surf || face_index < 0 || face_index >= q_face_surf_n)
 		return NULL;
+
+	//the level the caller asked for, kept so a later frame can refine to it.
+	//_mip reports back the level actually BUILT: the span steps surface texel
+	//coordinates as (s - mins_s) >> mip, so a caller drawing a mip 2 surface
+	//while stepping for mip 0 samples four times too far and the texture
+	//comes apart
+	want_mip = mip;
+	if (_mip)
+		*_mip = mip;
+
+	if (q_prog_mips)
+	{
+		slot = q_face_surf[face_index];
+		have = FALSE;
+		if (slot >= 0 && slot < QSURF_SLOTS &&
+			q_surf[slot].face == face_index &&
+			(q_surf[slot].pixels || q_surf[slot].rgb))
+			have = TRUE;
+
+		if (!have)
+		{
+			//first sight of this face: the cheap level, now
+			mip += QSURF_PROG_STEP;
+			if (mip > 2)
+				mip = 2;
+		}
+		else if (q_surf_builds_frame >= q_surf_build_max || q_mip_frozen)
+		{
+			//no budget, or a zoom is ramping - draw whatever is built. the
+			//freeze is the point of r_mipzoomhold: refining mid-ramp is the
+			//rebuild storm it exists to prevent, and progressive was walking
+			//straight through it
+			mip = q_surf[slot].mip;
+		}
+		else if (q_surf[slot].mip > want_mip)
+		{
+			//STRAIGHT to the target, not one level at a time. walking
+			//3 -> 2 -> 1 -> 0 rebuilds the same face four times and spends
+			//three of those builds on a level nobody keeps
+			mip = want_mip;
+		}
+	}
+
+	if (_mip)
+		*_mip = mip;
 
 	texels = tex->texels[mip];
 	tw     = tex->width >> mip;
@@ -2985,7 +3057,9 @@ U0 QDrawStateInit()
 	q_opt_simd      = FALSE;
 	q_opt_fov_adapt = TRUE;
 	q_mipscale      = 0.0;
+	q_prog_mips     = TRUE;
 	q_span_sub      = QSPAN_SUB;
+	q_span_affine   = FALSE;
 	q_mdl_warp      = FALSE;
 	q_mip_zoom_hold = TRUE;
 	q_mip_frozen    = FALSE;
@@ -3223,7 +3297,12 @@ U0 QDrawSpan(CQCanvas *c, I64 y, I64 x1, I64 x2,
 	toz = toz1;
 
 	//exact coords at the start of the run
-	if (iz != 0.0)
+	if (q_span_affine)
+	{
+		s = soz;
+		t = toz;
+	}
+	else if (iz != 0.0)
 	{
 		z = 1.0 / iz;
 		s = soz * z;
@@ -3254,7 +3333,12 @@ U0 QDrawSpan(CQCanvas *c, I64 y, I64 x1, I64 x2,
 		soz_e = soz + d_soz * ToF64(n);
 		toz_e = toz + d_toz * ToF64(n);
 
-		if (iz_e != 0.0)
+		if (q_span_affine)
+		{
+			s_e = soz_e;
+			t_e = toz_e;
+		}
+		else if (iz_e != 0.0)
 		{
 			z   = 1.0 / iz_e;
 			s_e = soz_e * z;
@@ -3868,6 +3952,26 @@ U0 QDrawPolygon(CQCanvas *c, CQScreenVert *v, I64 count,
 
 U8	*q_sky_pix[QSKY_FACES];		//quantized, used when truecolor is off
 U32	*q_sky_rgb[QSKY_FACES];		//source 0xRRGGBB, kept so the toggle is live
+U8	*q_sky_a[QSKY_FACES];		//alpha plane: the cloud layer for skywind
+
+//r_skywind. Ironwail reads gfx/env/<sky>_wind.cfg -
+//    skywind <dist> <yaw> <period> <pitch>
+//and drifts the CLOUD layer, which the skybox alpha channel marks, over a
+//static base. Sky_SetupFrame:
+//    phase = cl.time * 0.5 / period;  phase -= floor(phase) + 0.5
+//    winddir = dist * (cp*sy, sp, -cp*cy)
+//the shader then samples the cube three times and cross-fades the two moving
+//layers against the base
+Bool q_skywind_on	= FALSE;	//a cfg was found for this sky
+Bool q_skywind_en	= TRUE;		//r_skywind
+F64	 q_skywind_dist	= 0.0;
+F64	 q_skywind_yaw	= 45.0;
+F64	 q_skywind_pitch = 0.0;
+F64	 q_skywind_per	= 30.0;
+F64	 q_skywind_dir[3];
+F64	 q_skywind_t1	= 0.0;
+F64	 q_skywind_t2	= 0.0;
+F64	 q_skywind_bl	= 0.0;
 I64	 q_sky_w[QSKY_FACES];
 I64	 q_sky_h[QSKY_FACES];
 U8	 q_sky_name[64];
@@ -3979,9 +4083,11 @@ U0 QFogSet(F64 density, I64 r, I64 g, I64 b)
 	q_fog_b       = ClampI64(b, 0, 255);
 	q_fog_on      = ToBool(density > 0.0);
 
-	//the console/stuffcmd path carries no _skyfog, so it takes the default.
-	//worldspawn overrides this afterwards only when the key was present
-	q_fog_sky_alpha = QFOG_SKY_DEFAULT;
+	//SKY FOG IS NOT RESET HERE. Fog_FogCommand_f sets density and colour and
+	//nothing else - r_skyfog and worldspawn's _skyfog are the only writers.
+	//qbj3 stuffs a "fog" line and an "r_skyfog" line per region, and clearing
+	//it on every fog change put the sky back to the 0.5 default while the
+	//reference kept the map's value
 
 	if (q_fog_on)
 		QFogBuild;
@@ -4021,13 +4127,21 @@ U0 QSkyFree()
 	{
 		if (q_sky_pix[i])
 			Free(q_sky_pix[i]);
+		if (q_sky_a[i])
+			Free(q_sky_a[i]);
+		q_sky_a[i] = NULL;
+
 		if (q_sky_rgb[i])
 			Free(q_sky_rgb[i]);
 		q_sky_pix[i] = NULL;
 		q_sky_rgb[i] = NULL;
+		q_sky_a[i]   = NULL;
 		q_sky_w[i]   = 0;
 		q_sky_h[i]   = 0;
 	}
+
+	q_skywind_on = FALSE;
+	q_skywind_bl = 0.0;
 
 	q_sky_ready   = FALSE;
 	q_sky_loaded  = 0;
@@ -4068,6 +4182,7 @@ Bool QSkyLoadFace(U8 *name, I64 face)
 	I64	 x;
 	I64	 y;
 	U32	 pix;
+	U8	*alpha = NULL;
 
 	sfx = QSkySuffix(face);
 	StrPrint(path, "gfx/env/%s%s.tga", name, sfx);
@@ -4076,7 +4191,7 @@ Bool QSkyLoadFace(U8 *name, I64 face)
 	if (!data)
 		return FALSE;
 
-	dc = TGAReadBuf(data, size);
+	dc = TGAReadBuf(data, size, NULL, &alpha);
 	Free(data);
 	if (!dc)
 		return FALSE;
@@ -4095,6 +4210,7 @@ Bool QSkyLoadFace(U8 *name, I64 face)
 	{
 		if (out)	Free(out);
 		if (rgb)	Free(rgb);
+		if (alpha)	Free(alpha);
 		DCDel(dc);
 		return FALSE;
 	}
@@ -4113,6 +4229,7 @@ Bool QSkyLoadFace(U8 *name, I64 face)
 	DCDel(dc);
 	q_sky_pix[face] = out;
 	q_sky_rgb[face] = rgb;
+	q_sky_a[face]   = alpha;
 	q_sky_w[face]   = w;
 	q_sky_h[face]   = h;
 	return TRUE;
@@ -4395,13 +4512,108 @@ U0 QSkyParseWorldspawn(CQMap *map, U8 *out, I64 max)
 	}
 }
 
+U0 QSkyWindLoad(U8 *name)
+{//Skywind_Load_f. gfx/env/<sky>_wind.cfg, one line:
+ //    skywind <distance> <yaw> <period> <pitch>
+ //absent is the normal case - a still sky
+	U8	 path[96];
+	U8	*buf;
+	I64	 size = 0;
+	F64	 fv[4];
+	I64	 n;
+	I64	 i;
+
+	q_skywind_on = FALSE;
+
+	//SKYWIND_CFG is "wind.cfg" with NO separator - the sky name already ends
+	//in one ("mak_cloudysky4_" + "rt.tga"), so adding another looked for
+	//mak_cloudysky4__wind.cfg and never found it
+	StrPrint(path, "gfx/env/%swind.cfg", name);
+
+	buf = QPakLoad(path, &size);
+	if (!buf)
+		return;
+
+	//skip the leading token, then four numbers. comment lines start with //
+	i = 0;
+	while (i < size && buf[i] != 's')
+		i++;
+
+	if (i + 8 > size || StrNICompare(buf + i, "skywind ", 8))
+	{
+		Free(buf);
+		return;
+	}
+
+	n = QFogParseFloats(buf + i + 8, fv, 4);
+	Free(buf);
+
+	if (n < 4)
+		return;
+
+	q_skywind_dist  = fv[0];
+	q_skywind_yaw   = fv[1];
+	q_skywind_per   = fv[2];
+	q_skywind_pitch = fv[3];
+
+	if (q_skywind_dist < -2.0)	q_skywind_dist = -2.0;
+	if (q_skywind_dist > 2.0)	q_skywind_dist = 2.0;
+
+	if (q_skywind_per <= 0.0 || q_skywind_dist == 0.0)
+		return;
+
+	q_skywind_on = TRUE;
+}
+
+U0 QSkyWindFrame(F64 t)
+{//Sky_SetupFrame. the phase walks [-0.5, 0.5) and the two layers cross-fade
+ //as it passes zero, so the loop has no seam
+	F64 yaw;
+	F64 pitch;
+	F64 sy;
+	F64 sp;
+	F64 cy;
+	F64 cp;
+	F64 phase;
+
+	if (!q_skywind_on || !q_skywind_en)
+	{
+		q_skywind_bl = 0.0;
+		return;
+	}
+
+	yaw   = q_skywind_yaw * QDEG2RAD;
+	pitch = q_skywind_pitch * QDEG2RAD;
+	sy    = Sin(yaw);
+	sp    = Sin(pitch);
+	cy    = Cos(yaw);
+	cp    = Cos(pitch);
+
+	phase  = t * 0.5 / q_skywind_per;
+	phase -= Floor(phase) + 0.5;
+
+	q_skywind_dir[0] =  q_skywind_dist * cp * sy;
+	q_skywind_dir[1] =  q_skywind_dist * sp;
+	q_skywind_dir[2] = -q_skywind_dist * cp * cy;
+
+	//shader: t2 = fract(t1) - 0.5, blend = abs(t1 * 2)
+	q_skywind_t1 = phase;
+	q_skywind_t2 = phase - Floor(phase) - 0.5;
+	q_skywind_bl = phase * 2.0;
+	if (q_skywind_bl < 0.0)
+		q_skywind_bl = -q_skywind_bl;
+}
+
 U0 QSkyNewMap(CQMap *map)
 {
 	U8 name[64];
 
 	QSkyParseWorldspawn(map, name, 64);
 	if (name[0])
+	{
 		QSkyLoad(name);
+		QSkyWindLoad(name);
+	}
 	else
 		QSkyFree;
 }
@@ -4492,6 +4704,34 @@ U8 QSkyTexel(I64 face, F64 u, F64 v)
 	return p[iv * w + iu];
 }
 
+F64 q_sky_tmp[3];		//scratch direction for the wind taps
+
+I64 QSkyTexelA(I64 face, F64 u, F64 v)
+{//alpha at a cube texel. 0 where the face carries no plane, so a sky without
+ //an alpha channel simply never drifts
+	U8	*p;
+	I64	 w;
+	I64	 h;
+	I64	 iu;
+	I64	 iv;
+
+	if (!q_sky_ready || face < 0 || face >= QSKY_FACES)
+		return 0;
+	p = q_sky_a[face];
+	if (!p)
+		return 0;
+
+	w = q_sky_w[face];
+	h = q_sky_h[face];
+	iu = ToI64(u);
+	iv = ToI64(v);
+	if (iu < 0) iu = 0;
+	if (iu >= w) iu = w - 1;
+	if (iv < 0) iv = 0;
+	if (iv >= h) iv = h - 1;
+	return p[iv * w + iu];
+}
+
 U32 QSkyTexelRGB(I64 face, F64 u, F64 v)
 {//0 when this face has no RGB source; caller falls back to the index plane
 	U32 *p;
@@ -4517,6 +4757,73 @@ U32 QSkyTexelRGB(I64 face, F64 u, F64 v)
 	return p[iv * w + iu];
 }
 
+U32 QSkyWindRGB(F64 *d)
+{//base plus the two drifting cloud layers, as the ANIM branch of the sky
+ //shader composites them:
+ //    layer1.a *= 1 - blend;  layer2.a *= blend
+ //    out = base*(1 - combined.a) + combined.rgb
+ //three cube samples per pixel, which is why r_skywind can be turned off
+	F64	 dn[3];
+	F64	 len;
+	F64	 w1;
+	F64	 w2;
+	I64	 f;
+	F64	 u;
+	F64	 v;
+	U32	 base;
+	U32	 l1;
+	U32	 l2;
+	I64	 a1;
+	I64	 a2;
+	I64	 i;
+
+	QSkyRay(d, &f, &u, &v);
+	base = QSkyTexelRGB(f, u, v);
+
+	//the shader normalizes before offsetting, so the drift is angular and
+	//does not stretch toward the cube corners
+	len = Sqrt(d[0] * d[0] + d[1] * d[1] + d[2] * d[2]);
+	if (len < 0.000001)
+		return base;
+
+	for (i = 0; i < 3; i++)
+		dn[i] = d[i] / len;
+
+	for (i = 0; i < 3; i++)
+		q_sky_tmp[i] = dn[i] + q_skywind_t1 * q_skywind_dir[i];
+	QSkyRay(q_sky_tmp, &f, &u, &v);
+	l1 = QSkyTexelRGB(f, u, v);
+	a1 = QSkyTexelA(f, u, v);
+
+	for (i = 0; i < 3; i++)
+		q_sky_tmp[i] = dn[i] + q_skywind_t2 * q_skywind_dir[i];
+	QSkyRay(q_sky_tmp, &f, &u, &v);
+	l2 = QSkyTexelRGB(f, u, v);
+	a2 = QSkyTexelA(f, u, v);
+
+	w1 = ToF64(a1) * (1.0 - q_skywind_bl) / 255.0;
+	w2 = ToF64(a2) * q_skywind_bl / 255.0;
+
+	if (w1 + w2 <= 0.0)
+		return base;
+	if (w1 + w2 > 1.0)
+	{
+		w1 = w1 / (w1 + w2);
+		w2 = 1.0 - w1;
+	}
+
+	return QRGB_SET |
+		(ClampI64(ToI64(ToF64((base >> 16) & 255) * (1.0 - w1 - w2) +
+			ToF64((l1 >> 16) & 255) * w1 +
+			ToF64((l2 >> 16) & 255) * w2), 0, 255) << 16) |
+		(ClampI64(ToI64(ToF64((base >> 8) & 255) * (1.0 - w1 - w2) +
+			ToF64((l1 >> 8) & 255) * w1 +
+			ToF64((l2 >> 8) & 255) * w2), 0, 255) << 8) |
+		 ClampI64(ToI64(ToF64(base & 255) * (1.0 - w1 - w2) +
+			ToF64(l1 & 255) * w1 +
+			ToF64(l2 & 255) * w2), 0, 255);
+}
+
 U0 QDrawSkyBoxSpan(CQCanvas *c, I64 y, I64 x1, I64 x2, F64 iz1, F64 iz2)
 {
 	U8	*row;
@@ -4526,6 +4833,7 @@ U0 QDrawSkyBoxSpan(CQCanvas *c, I64 y, I64 x1, I64 x2, F64 iz1, F64 iz2)
 	F64	 dir[3];
 	F64	 step[3];
 	F64	 cur[3];
+	F64	 pd[3];
 	F64	 sxf;
 	F64	 syf;
 	F64	 span;
@@ -4612,7 +4920,18 @@ U0 QDrawSkyBoxSpan(CQCanvas *c, I64 y, I64 x1, I64 x2, F64 iz1, F64 iz2)
 					texel = 0;
 					if (crow)
 					{
-						texel = QSkyTexelRGB(fc, u, v);
+						if (q_skywind_on && q_skywind_en)
+						{
+							//the wind taps need the real direction, which
+							//the fast path only carries as interpolated u,v
+							pd[0] = dir[0] + step[0] * ToF64(x - x1);
+							pd[1] = dir[1] + step[1] * ToF64(x - x1);
+							pd[2] = dir[2] + step[2] * ToF64(x - x1);
+							texel = QSkyWindRGB(pd);
+						}
+						else
+							texel = QSkyTexelRGB(fc, u, v);
+
 						crow[x] = texel;
 					}
 					zrow[x] = 0;
@@ -4640,7 +4959,18 @@ U0 QDrawSkyBoxSpan(CQCanvas *c, I64 y, I64 x1, I64 x2, F64 iz1, F64 iz2)
 					texel = 0;
 					if (crow)
 					{
-						texel = QSkyTexelRGB(fc, u, v);
+						if (q_skywind_on && q_skywind_en)
+						{
+							//the wind taps need the real direction, which
+							//the fast path only carries as interpolated u,v
+							pd[0] = dir[0] + step[0] * ToF64(x - x1);
+							pd[1] = dir[1] + step[1] * ToF64(x - x1);
+							pd[2] = dir[2] + step[2] * ToF64(x - x1);
+							texel = QSkyWindRGB(pd);
+						}
+						else
+							texel = QSkyTexelRGB(fc, u, v);
+
 						crow[x] = texel;
 					}
 					zrow[x] = 0;
@@ -4985,6 +5315,7 @@ U0 QDrawFace(CQCanvas *c, CQMap *map, I64 face_index, F64 *offset = NULL,
 	Bool		 lm_pending = FALSE;
 	Bool		 dlit;
 	U8			*dlmap;
+	I64			 built_mip = 0;
 	I64			 sw = 0;
 	I64			 sh = 0;
 	F64			 rel[3];
@@ -5158,9 +5489,14 @@ U0 QDrawFace(CQCanvas *c, CQMap *map, I64 face_index, F64 *offset = NULL,
 				lm_pending = FALSE;
 			}
 
+			//the cache may build COARSER than asked - see r_progmips. the
+			//span must step at the level that was built, not the one wanted
 			surf = QSurfCacheGet(map, f, face_index, tex, mip,
 					lightmap, lm_w, lm_h, &sw, &sh, anim_tex, &surf_rgb,
-					&surf_raw);
+					&surf_raw, &built_mip);
+
+			if (surf)
+				mip = built_mip;
 		}
 
 		//the uncached path reads it per pixel, so it must exist by here
@@ -5377,6 +5713,14 @@ I64 QFogAlphaAt(I64 izi)
 		idx = 0;
 
 	return q_fog_lut[idx];
+}
+
+I64 QFogAlphaFor(F64 z)
+{//the blend weight at a world distance, for the "fog" readout
+	if (z <= 0.0)
+		return 0;
+
+	return QFogAlphaAt(ToI64(QDEPTH_SCALE / z));
 }
 
 U32 QFogApply(U32 rgb, I64 izi)

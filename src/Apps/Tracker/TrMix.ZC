@@ -29,6 +29,7 @@ U0 TrChanInit(I64 ch)
 	c->delay_ticks	= -1;
 	c->cut_tick		= -1;
 	c->loop_row		= 0;
+	c->macro_wave	= -1;
 	c->pan			= tr_chan_pan[ClampI64(ch, 0, TR_MAX_VOICES - 1)];
 	c->mix_pan		= c->pan;
 }
@@ -112,6 +113,10 @@ U0 TrChanTrigger(CTrChan *c, I64 offset)
 	c->pos_fp	 = offset << TR_POS_SHIFT;
 	c->backwards = FALSE;
 	c->active	 = TRUE;
+	//The mixer pans by mix_pan, which only the tick recomputes. Note preview
+	//and any other trigger outside the sequencer would otherwise mix with a
+	//stale value.
+	c->mix_pan	 = c->pan;
 }
 
 U0 TrMixFrames(I64 n)
@@ -144,8 +149,8 @@ U0 TrMixFrames(I64 n)
 			lend = lstart + llen;
 			if (lend > slen)
 				lend = slen;
-			vl = c->mix_vol * (255 - c->pan) * tr.master / 256;
-			vr = c->mix_vol * c->pan * tr.master / 256;
+			vl = c->mix_vol * (255 - c->mix_pan) * tr.master / 256;
+			vr = c->mix_vol * c->mix_pan * tr.master / 256;
 			pk = 0;
 			i  = 0;
 			while (i < n && c->active)
@@ -221,15 +226,38 @@ U0 TrMixFrames(I64 n)
 	tr_play.frames_out += n;
 }
 
-U0 TrEffVolSlide(CTrChan *c, I64 param)
-{
-	I64 up = param >> 4, dn = param & 0x0F;
+I64 TrSlideDelta(I64 param, I64 tick)
+{//Dxy-family decode shared by the volume, channel volume, global volume and
+//panning slides. Fine forms act once on tick 0, continuous ones on later
+//ticks only, matching ProTracker's rule that tick 0 never slides.
+	I64 x = param >> 4, y = param & 0x0F;
 
-	if (up)
-		c->vol += up;
-	else
-		c->vol -= dn;
-	c->vol = ClampI64(c->vol, 0, 64);
+	if (tr_song.fine_slides)
+	{
+		if (x == 0x0F && y != 0)
+		{//DFx, fine down.
+			if (!tick)
+				return -y;
+			return 0;
+		}
+		if (y == 0x0F && x != 0)
+		{//DxF, fine up.
+			if (!tick)
+				return x;
+			return 0;
+		}
+	}
+	if (!tick)
+		return 0;
+	if (x)
+		return x;
+
+	return -y;
+}
+
+U0 TrEffVolSlide(CTrChan *c, I64 param, I64 tick)
+{
+	c->vol = ClampI64(c->vol + TrSlideDelta(param, tick), 0, 64);
 }
 
 U0 TrEffTonePorta(CTrChan *c)
@@ -255,10 +283,236 @@ U0 TrEffTonePorta(CTrChan *c)
 								 c->finetune);
 }
 
+I64 TrMacroValue(CTrMacro *m, I64 pos)
+{//Held at the last step once the sequence runs out.
+	if (m->len < 1)
+		return 0;
+
+	return m->val[ClampI64(pos, 0, m->len - 1)];
+}
+
+U0 TrMacroStep(CTrMacro *m, I64 *pos, Bool key_on)
+{//One tick. While the key is down the sequence loops within the section
+//before the release point; after key off it runs to the end and holds.
+	if (m->len < 1)
+		return;
+	*pos = *pos + 1;
+	if (key_on && m->release >= 0 && m->release < m->len)
+	{
+		if (*pos >= m->release)
+		{
+			if (m->loop >= 0 && m->loop < m->release)
+				*pos = m->loop;
+			else
+				*pos = m->release - 1;
+		}
+	}
+	else if (*pos >= m->len)
+	{
+		if (key_on && m->loop >= 0 && m->loop < m->len)
+			*pos = m->loop;
+		else
+			*pos = m->len - 1;
+	}
+}
+
+I64 TrBankSample(CTrInst *ins, I64 entry)
+{//Sample slot for a bank entry, or 0 if the instrument has no bank.
+	if (!ins)
+		return 0;
+	if (ins->bank == TR_BANK_DUTY)
+		return tr_duty_slot[ClampI64(entry, 0, TR_DUTY_COUNT - 1)];
+	if (ins->bank == TR_BANK_WAVE)
+		return tr_wave_slot[ClampI64(entry, 0, TR_WAVE_SLOTS - 1)];
+
+	return 0;
+}
+
+U0 TrMacroApply(CTrChan *c)
+{//Runs after the pattern effects and before the envelopes, so a macro sets
+//the level the envelopes then scale. Every bank wave is TR_WAVE_LEN frames,
+//so switching waveform mid-note keeps the phase.
+	CTrInst	*ins = c->ins;
+	CTrMacro *m;
+	I64		 v, slot;
+
+	if (!ins)
+		return;
+
+	m = &ins->macro[TR_MACRO_VOL];
+	if (m->len > 0)
+	{
+		v = TrMacroValue(m, c->macro_pos[TR_MACRO_VOL]);
+		c->mix_vol = c->mix_vol * ClampI64(v, 0, 64) / 64;
+	}
+
+	m = &ins->macro[TR_MACRO_ARP];
+	if (m->len > 0)
+	{
+		v = TrMacroValue(m, c->macro_pos[TR_MACRO_ARP]);
+		if (m->mode == TR_ARP_FIXED)
+			c->sound_period = TrPitchPeriod(ClampI64(v + 1, 1, TR_NOTES),
+											c->finetune);
+		else
+			c->sound_period = TrPitchPeriod(ClampI64(c->note + v, 1, TR_NOTES),
+											c->finetune);
+	}
+
+	m = &ins->macro[TR_MACRO_PITCH];
+	if (m->len > 0)
+	{
+		//Accumulates: the macro gives a per-tick delta, not a position.
+		c->macro_pitch += TrMacroValue(m, c->macro_pos[TR_MACRO_PITCH]);
+		c->sound_period -= c->macro_pitch;
+	}
+
+	m = &ins->macro[TR_MACRO_DUTY];
+	if (m->len > 0 && ins->bank != TR_BANK_NONE)
+	{
+		v = TrMacroValue(m, c->macro_pos[TR_MACRO_DUTY]);
+		if (v != c->macro_wave)
+		{
+			slot = TrBankSample(ins, v);
+			if (slot > 0 && slot < TR_MAX_SAMPLES && tr_smp[slot].data)
+			{
+				c->smp		= &tr_smp[slot];
+				c->smp_idx	= slot;
+				c->macro_wave = v;
+			}
+		}
+	}
+
+	for (v = 0; v < TR_MACRO_COUNT; v++)
+		TrMacroStep(&ins->macro[v], &c->macro_pos[v], c->key_on);
+}
+
+U0 TrEffRetrigVol(CTrChan *c, I64 x)
+{//Rxy / Qxy volume change applied on each retrigger.
+	switch (x)
+	{
+		case 1:	c->vol -= 1;			break;
+		case 2:	c->vol -= 2;			break;
+		case 3:	c->vol -= 4;			break;
+		case 4:	c->vol -= 8;			break;
+		case 5:	c->vol -= 16;			break;
+		case 6:	c->vol = c->vol * 2 / 3;	break;
+		case 7:	c->vol = c->vol / 2;	break;
+		case 9:	c->vol += 1;			break;
+		case 0xA: c->vol += 2;			break;
+		case 0xB: c->vol += 4;			break;
+		case 0xC: c->vol += 8;			break;
+		case 0xD: c->vol += 16;			break;
+		case 0xE: c->vol = c->vol * 3 / 2;	break;
+		case 0xF: c->vol = c->vol * 2;	break;
+	}
+	c->vol = ClampI64(c->vol, 0, 64);
+}
+
+I64 TrEnvValue(CTrEnvelope *e, I64 pos)
+{//Linear between the bracketing points, held past the last one. -1 means the
+//envelope carries no value and the caller should leave its input alone.
+	I64 i, x0, x1, y0, y1;
+
+	if (e->n_points < 1)
+		return -1;
+	if (pos <= e->tick[0])
+		return e->value[0];
+	for (i = 0; i < e->n_points - 1; i++)
+	{
+		x0 = e->tick[i];
+		x1 = e->tick[i + 1];
+		if (x0 <= pos && pos < x1)
+		{
+			y0 = e->value[i];
+			y1 = e->value[i + 1];
+			if (x1 <= x0)
+				return y0;
+			return y0 + (y1 - y0) * (pos - x0) / (x1 - x0);
+		}
+	}
+
+	return e->value[e->n_points - 1];
+}
+
+I64 TrEnvStep(CTrEnvelope *e, I64 pos, Bool key_on)
+{//One tick of envelope position. Sustain freezes while the key is down; the
+//loop jumps back at its end point. XM increments before the point is read, so
+//callers evaluate first and step after.
+	if (!(e->flags & TR_ENV_ON) || e->n_points < 1)
+		return pos;
+	if (key_on && e->flags & TR_ENV_SUSTAIN && e->sus_start < e->n_points &&
+		pos >= e->tick[e->sus_start])
+		return e->tick[e->sus_start];
+	pos++;
+	if (e->flags & TR_ENV_LOOP && e->loop_end < e->n_points &&
+		e->loop_start < e->n_points && pos >= e->tick[e->loop_end])
+		pos = e->tick[e->loop_start];
+
+	return pos;
+}
+
+I64 TrVoiceAlloc()
+{//A background voice for an IT new-note action: first idle one, else the
+//quietest background voice. Foreground channels are never stolen.
+	I64 i, best = -1, quietest = 0x7FFFFFFF;
+
+	for (i = tr_song.channels; i < TR_MAX_VOICES; i++)
+		if (!tr_ch[i].active)
+			return i;
+	for (i = tr_song.channels; i < TR_MAX_VOICES; i++)
+		if (tr_ch[i].background && tr_ch[i].mix_vol < quietest)
+		{
+			quietest = tr_ch[i].mix_vol;
+			best	 = i;
+		}
+
+	return best;
+}
+
+U0 TrNNA(I64 ch, I64 new_note, I64 new_smp)
+{//Move the sounding note onto a background voice so the pattern channel is
+//free. Note-off and note-fade both clear key_on, which is what starts the
+//fade; they differ only in whether an envelope loop can still hold the note.
+	CTrChan	*c = &tr_ch[ch], *b;
+	I64		 v, i;
+
+	if (!c->active || !c->ins)
+		return;
+	//Duplicate check runs against voices this channel already backgrounded,
+	//before the new one joins them.
+	if (c->ins->dct != TR_DCT_OFF)
+		for (i = tr_song.channels; i < TR_MAX_VOICES; i++)
+		{
+			b = &tr_ch[i];
+			if (b->active && b->background && b->owner == ch &&
+				((c->ins->dct == TR_DCT_NOTE && b->note == new_note) ||
+				 (c->ins->dct == TR_DCT_SAMPLE && b->smp_idx == new_smp) ||
+				 (c->ins->dct == TR_DCT_INST && b->inst == c->inst)))
+			{
+				if (c->ins->dca == TR_DCA_CUT)
+					b->active = FALSE;
+				else
+					b->key_on = FALSE;
+			}
+		}
+	if (c->ins->nna == TR_NNA_CUT)
+		return;
+	v = TrVoiceAlloc();
+	if (v < 0)
+		return;			//Pool exhausted: the old note is cut instead.
+	b = &tr_ch[v];
+	MemCopy(b, c, sizeof(CTrChan));
+	b->background	= TRUE;
+	b->owner		= ch;
+	b->mute			= FALSE;
+	if (c->ins->nna != TR_NNA_CONTINUE)
+		b->key_on = FALSE;
+}
+
 U0 TrRowChannel(I64 ch, CTrCell *cell)
 {//Tick 0 of a row: latch instrument, note and effect.
 	CTrChan	*c = &tr_ch[ch];
-	I64		 note, eff, param, sub, target, off, ft, ins;
+	I64		 note, eff, param, sub, target, off, ft, ins, smp, play_note, n;
 	Bool	 porta;
 
 	note  = cell->note;
@@ -272,22 +526,34 @@ U0 TrRowChannel(I64 ch, CTrCell *cell)
 	c->delay_ticks	= -1;
 	c->cut_tick		= -1;
 
-	//Instrument column selects the sample and resets volume, even with no
-	//note. Amiga behaviour, relied on by countless modules.
+	//Instrument column selects the instrument and resets volume, even with no
+	//note. Amiga behaviour, relied on by countless modules. The sample the
+	//instrument resolves to depends on the note, so that happens at note-on.
 	//Widen to I64 first: comparing a U8 member against a constant that does
 	//not fit in 8 bits makes the whole test false in ZealC.
 	ins = cell->inst;
-	if (ins > 0 && ins < TR_MAX_SAMPLES)
+	if (ins > 0 && ins < TR_MAX_INSTRUMENTS)
 	{
-		c->inst = ins;
-		c->smp	= &tr_smp[ins];
-		if (c->smp->data)
+		c->inst		= ins;
+		c->ins		= tr_inst[ins];
+		c->chan_vol	= 64;
+		//Without an instrument record the slot maps straight to the sample,
+		//which is what MOD and S3M want. Resolve now so a bare instrument
+		//column still latches the default volume.
+		smp = TrInstSample(ins, c->note, &play_note);
+		if (smp > 0 && smp < TR_MAX_SAMPLES && tr_smp[smp].data)
 		{
+			c->smp		= &tr_smp[smp];
+			c->smp_idx	= smp;
 			c->vol		= c->smp->volume;
 			c->finetune	= c->smp->finetune;
+			if (c->smp->pan >= 0)
+				c->pan = c->smp->pan;
 		}
 		else
 			c->smp = NULL;
+		if (c->ins && c->ins->default_pan >= 0)
+			c->pan = c->ins->default_pan;
 	}
 
 	//E5x retunes before the period is computed from the note.
@@ -299,21 +565,57 @@ U0 TrRowChannel(I64 ch, CTrCell *cell)
 		c->finetune = ft;
 	}
 
-	if (note == TR_NOTE_OFF)
+	if (note == TR_NOTE_CUT)
 	{
 		c->vol	  = 0;
 		c->active = FALSE;
 		note	  = 0;
 	}
+	else if (note == TR_NOTE_OFF)
+	{//Release. With no volume envelope there is nothing to fade, so FT2 cuts.
+		c->key_on = FALSE;
+		if (c->ins)
+			for (n = 0; n < TR_MACRO_COUNT; n++)
+				if (c->ins->macro[n].release >= 0)
+					c->macro_pos[n] = c->ins->macro[n].release;
+		if (!c->ins || !(c->ins->vol_env.flags & TR_ENV_ON))
+		{
+			c->vol	  = 0;
+			c->active = FALSE;
+		}
+		note = 0;
+	}
+	else if (note == TR_NOTE_FADE)
+	{
+		c->key_on = FALSE;
+		note	  = 0;
+	}
 
 	if (note)
 	{
+		//Resolve the instrument's sample for THIS note before anything reads
+		//rel_note: XM and IT map each note to a different sample.
+		play_note = note;
+		if (c->inst)
+		{
+			smp = TrInstSample(c->inst, note, &play_note);
+			if (smp > 0 && smp < TR_MAX_SAMPLES && tr_smp[smp].data)
+			{
+				if (!porta)
+				{
+					c->smp		= &tr_smp[smp];
+					c->smp_idx	= smp;
+				}
+			}
+			else if (!porta)
+				c->smp = NULL;
+		}
 		c->note = note;
 		if (c->smp)
-			target = TrNotePeriod(ClampI64(note + c->smp->rel_note,
-										   1, TR_NOTES), c->finetune);
+			target = TrPitchPeriod(ClampI64(play_note + c->smp->rel_note,
+											1, TR_NOTES), c->finetune);
 		else
-			target = TrNotePeriod(note, c->finetune);
+			target = TrPitchPeriod(play_note, c->finetune);
 		if (porta)
 			c->dest_period = target;
 		else if (eff == TRX_EXTENDED && (param >> 4) == 0xD && sub)
@@ -324,6 +626,9 @@ U0 TrRowChannel(I64 ch, CTrCell *cell)
 		}
 		else
 		{
+			//The previous note leaves the channel before the new one lands.
+			//Without an instrument record this is a no-op, so MOD is unchanged.
+			TrNNA(ch, note, smp);
 			c->period		= target;
 			c->dest_period	= target;
 			off				= 0;
@@ -334,6 +639,21 @@ U0 TrRowChannel(I64 ch, CTrCell *cell)
 				off = c->offset_mem * 256;
 			}
 			TrChanTrigger(c, off);
+			c->background	= FALSE;
+			c->owner		= -1;
+			c->key_on		= TRUE;
+			c->fade_vol		= 32768;
+			c->sustained	= FALSE;
+			//Envelope carry is not implemented; every note restarts them.
+			c->vol_env_pos	= 0;
+			c->pan_env_pos	= 0;
+			c->pitch_env_pos = 0;
+			for (n = 0; n < TR_MACRO_COUNT; n++)
+				c->macro_pos[n] = 0;
+			c->macro_pitch	= 0;
+			c->macro_wave	= -1;
+			c->avib_pos		= 0;
+			c->avib_sweep	= 0;
 			if (c->vib_wave < 4)
 				c->vib_pos = 0;
 			if (c->trem_wave < 4)
@@ -412,6 +732,58 @@ U0 TrRowChannel(I64 ch, CTrCell *cell)
 			else
 				tr_song.bpm = param;
 			break;
+		case TRX_SET_TEMPO:
+			//S3M and IT split speed and tempo; below 0x20 is a tempo slide.
+			if (param >= 0x20)
+				tr_song.bpm = param;
+			break;
+		case TRX_GLOBAL_VOL:
+			tr_song.global_vol = ClampI64(param, 0, 128);
+			break;
+		case TRX_CHANNEL_VOL:
+			c->chan_vol = ClampI64(param, 0, 64);
+			break;
+		case TRX_KEY_OFF:
+			if (!param)
+			{
+				c->key_on = FALSE;
+				if (!c->ins || !(c->ins->vol_env.flags & TR_ENV_ON))
+				{
+					c->vol	  = 0;
+					c->active = FALSE;
+				}
+			}
+			break;
+		case TRX_ENV_POS:
+			c->vol_env_pos = param;
+			break;
+		case TRX_PANBRELLO:
+			if (param >> 4)
+				c->pan_speed = param >> 4;
+			if (sub)
+				c->pan_depth = sub;
+			break;
+		case TRX_TREMOR:
+			if (param)
+				c->tremor_mem = param;
+			c->tremor_pos = 0;
+			break;
+		case TRX_MULTI_RETRIG:
+			if (sub)
+				c->retrig_mem = sub;
+			break;
+		case TRX_FINE_VIBRATO:
+			if (param >> 4)
+				c->vib_speed = param >> 4;
+			if (sub)
+				c->vib_depth = sub;
+			break;
+		case TRX_XFINE_PORTA_UP:
+			c->period -= sub * TR_PERIOD_SCALE / 4;
+			break;
+		case TRX_XFINE_PORTA_DN:
+			c->period += sub * TR_PERIOD_SCALE / 4;
+			break;
 		case TRX_EXTENDED:
 			switch (param >> 4)
 			{
@@ -479,7 +851,7 @@ U0 TrRowChannel(I64 ch, CTrCell *cell)
 U0 TrTickChannel(I64 ch, I64 tick)
 {//Ticks 1..speed-1, plus the deferred triggers scheduled on tick 0.
 	CTrChan *c = &tr_ch[ch];
-	I64		 eff = c->eff, param = c->param, sub = param & 0x0F, n;
+	I64		 eff = c->eff, param = c->param, sub = param & 0x0F, n, mv;
 
 	if (c->delay_ticks >= 0 && tick >= c->delay_ticks)
 	{
@@ -522,17 +894,34 @@ U0 TrTickChannel(I64 ch, I64 tick)
 				break;
 			case TRX_PORTA_VOLSLIDE:
 				TrEffTonePorta(c);
-				TrEffVolSlide(c, param);
 				break;
 			case TRX_VIB_VOLSLIDE:
 				c->vib_pos += c->vib_speed;
-				TrEffVolSlide(c, param);
 				break;
 			case TRX_TREMOLO:
 				c->trem_pos += c->trem_speed;
 				break;
 			case TRX_VOLSLIDE:
-				TrEffVolSlide(c, param);
+				break;		//Handled every tick, below.
+			case TRX_GLOBAL_VOLSLIDE:
+			case TRX_CHANNEL_VOLSLIDE:
+			case TRX_PAN_SLIDE:
+				break;		//Handled every tick, including tick 0, below.
+			case TRX_PANBRELLO:
+				c->pan_pos += c->pan_speed;
+				break;
+			case TRX_FINE_VIBRATO:
+				c->vib_pos += c->vib_speed;
+				break;
+			case TRX_TREMOR:
+				c->tremor_pos++;
+				break;
+			case TRX_MULTI_RETRIG:
+				if (c->retrig_mem && tick % c->retrig_mem == 0)
+				{
+					TrChanTrigger(c, 0);
+					TrEffRetrigVol(c, param >> 4);
+				}
 				break;
 			case TRX_EXTENDED:
 				if ((param >> 4) == 0x9 && c->retrig_mem)
@@ -543,6 +932,20 @@ U0 TrTickChannel(I64 ch, I64 tick)
 				}
 				break;
 		}
+
+	//Slides that carry fine forms run on every tick; TrSlideDelta decides
+	//whether this particular tick does anything.
+	if (eff == TRX_VOLSLIDE || eff == TRX_PORTA_VOLSLIDE ||
+		eff == TRX_VIB_VOLSLIDE)
+		TrEffVolSlide(c, param, tick);
+	else if (eff == TRX_GLOBAL_VOLSLIDE)
+		tr_song.global_vol = ClampI64(tr_song.global_vol +
+									  TrSlideDelta(param, tick), 0, 128);
+	else if (eff == TRX_CHANNEL_VOLSLIDE)
+		c->chan_vol = ClampI64(c->chan_vol + TrSlideDelta(param, tick), 0, 64);
+	else if (eff == TRX_PAN_SLIDE)
+		//FT2 inverts the nibbles here, so the sign is flipped against volume.
+		c->pan = ClampI64(c->pan - TrSlideDelta(param, tick), 0, 255);
 
 	c->period		= ClampI64(c->period, TR_PERIOD_MIN, TR_PERIOD_MAX);
 	c->sound_period	= c->period;
@@ -563,6 +966,78 @@ U0 TrTickChannel(I64 ch, I64 tick)
 	if (eff == TRX_TREMOLO)
 		c->mix_vol = ClampI64(c->vol + TrWaveDelta(c->trem_wave, c->trem_pos,
 												   c->trem_depth, 64), 0, 64);
+	if (eff == TRX_FINE_VIBRATO)
+		c->sound_period += TrWaveDelta(c->vib_wave, c->vib_pos,
+									   c->vib_depth, 128) * TR_PERIOD_SCALE / 4;
+	if (eff == TRX_TREMOR && c->tremor_mem)
+	{//On for x+1 ticks, off for y+1, repeating.
+		n = (c->tremor_mem >> 4) + 1;
+		if (c->tremor_pos % (n + (c->tremor_mem & 0x0F) + 1) >= n)
+			c->mix_vol = 0;
+	}
+	if (eff == TRX_PANBRELLO)
+		c->pan = ClampI64(c->pan + TrWaveDelta(c->pan_wave, c->pan_pos,
+											   c->pan_depth, 64), 0, 255);
+	//Instrument layer. Everything above produced the pattern's idea of volume
+	//and pan; envelopes, fadeout and the volume chain scale it. Accumulate at
+	//4096x so six successive divides do not quantise the result to steps of
+	//1/64.
+	TrMacroApply(c);
+	mv			= c->mix_vol * 4096;
+	c->mix_pan	= c->pan;
+	if (c->ins)
+	{
+		if (c->ins->vol_env.flags & TR_ENV_ON)
+		{
+			n = TrEnvValue(&c->ins->vol_env, c->vol_env_pos);
+			if (n >= 0)
+				mv = mv * ClampI64(n, 0, 64) / 64;
+		}
+		c->vol_env_pos = TrEnvStep(&c->ins->vol_env, c->vol_env_pos, c->key_on);
+
+		if (c->ins->pan_env.flags & TR_ENV_ON)
+		{
+			n = TrEnvValue(&c->ins->pan_env, c->pan_env_pos);
+			//Envelope pan is an offset from centre, scaled by the headroom
+			//left on whichever side the channel is already panned toward.
+			if (n >= -32)
+				c->mix_pan = c->pan + (n - 32) *
+							 (128 - AbsI64(c->pan - 128)) / 32;
+		}
+		c->pan_env_pos = TrEnvStep(&c->ins->pan_env, c->pan_env_pos, c->key_on);
+
+		//Auto-vibrato ramps in over the sweep, then holds at full depth.
+		if (c->ins->vib_depth)
+		{
+			if (c->ins->vib_sweep > 0 && c->avib_sweep < c->ins->vib_sweep)
+				c->avib_sweep++;
+			n = c->ins->vib_depth;
+			if (c->ins->vib_sweep > 0)
+				n = n * c->avib_sweep / c->ins->vib_sweep;
+			c->avib_pos += c->ins->vib_rate;
+			c->sound_period += TrWaveDelta(c->ins->vib_type, c->avib_pos / 4,
+										   n, 128) * TR_PERIOD_SCALE;
+		}
+
+		if (!c->key_on && c->ins->fadeout > 0)
+		{
+			c->fade_vol -= c->ins->fadeout;
+			if (c->fade_vol <= 0)
+			{
+				c->fade_vol	= 0;
+				c->active	= FALSE;
+			}
+		}
+		mv = mv * c->fade_vol / 32768;
+		mv = mv * ClampI64(c->ins->global_vol, 0, 128) / 128;
+	}
+	if (c->smp)
+		mv = mv * ClampI64(c->smp->global_vol, 0, 64) / 64;
+	mv = mv * ClampI64(c->chan_vol, 0, 64) / 64;
+	mv = mv * ClampI64(tr_song.global_vol, 0, 128) / 128;
+	c->mix_vol	= ClampI64(mv / 4096, 0, 64);
+	c->mix_pan	= ClampI64(c->mix_pan, 0, 255);
+
 	c->sound_period = ClampI64(c->sound_period, TR_PERIOD_MIN, TR_PERIOD_MAX);
 	TrChanStep(c);
 }

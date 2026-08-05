@@ -1,0 +1,977 @@
+//TrIt.ZC - Impulse Tracker .IT reader. Depends on TrDef, TrSmp.
+//
+//Little-endian throughout.
+//
+//Header, 192 bytes:
+//   0x00    4  "IMPM"
+//   0x04   26  song name
+//   0x20    2  order count
+//   0x22    2  instrument count
+//   0x24    2  sample count
+//   0x26    2  pattern count
+//   0x28    2  created-with version
+//   0x2A    2  compatible-with version (cmwt), selects the instrument layout
+//   0x2C    2  flags: bit2 use instruments, bit3 linear slides
+//   0x2E    2  special
+//   0x30    1  global volume 0..128
+//   0x31    1  mix volume 0..128
+//   0x32    1  initial speed
+//   0x33    1  initial tempo
+//   0x40   64  channel pan
+//   0x80   64  channel volume
+//   0xC0  ...  order bytes, then u32 instrument, sample and pattern offsets
+//
+//The three offset arrays hold ABSOLUTE FILE OFFSETS, not S3M parapointers.
+//A pattern offset of 0 is an implicit empty 64-row pattern occupying no bytes.
+//
+//Sample header, 80 bytes at its offset; instrument header, 554 bytes at its
+//offset; pattern header, u16 packed length, u16 rows, 4 reserved.
+
+#define TRIT_HDR		192
+#define TRIT_INST_LEN	554
+#define TRIT_SMP_LEN	80
+//32 MB of I16 per slot is past any real module and bounds the allocation a
+//hostile length field can request.
+#define TRIT_MAX_POINTS	0x1000000
+
+//Volume-column portamento maps a 0..9 index onto Gxx speeds.
+I64 tr_it_vol_porta[10] = {0, 1, 4, 8, 0x10, 0x20, 0x40, 0x60, 0x80, 0xFF};
+
+I64 TrItU8(U8 *raw, I64 size, I64 off)
+{//Every file read goes through these; out of range reads as zero.
+	if (off < 0 || off >= size)
+		return 0;
+
+	return raw[off];
+}
+
+I64 TrItU16(U8 *raw, I64 size, I64 off)
+{
+	if (off < 0 || off + 2 > size)
+		return 0;
+
+	return TrRdU16LE(raw + off);
+}
+
+I64 TrItU32(U8 *raw, I64 size, I64 off)
+{
+	if (off < 0 || off + 4 > size)
+		return 0;
+
+	return TrRdU32LE(raw + off);
+}
+
+I64 TrItNote(I64 n)
+{//IT pattern notes are 0..119 with 60 = C-5. The engine is 1..120 with note
+//1 = C-0, so the mapping is a shift by one. 254 cut, 255 off, rest fade.
+	if (n <= 119)
+		return n + 1;
+	if (n == 255)
+		return TR_NOTE_OFF;
+	if (n == 254)
+		return TR_NOTE_CUT;
+
+	return TR_NOTE_FADE;
+}
+
+U0 TrItVolCol(I64 v, CTrCell *cell)
+{//IT packs the whole volume column into one 0..212 byte.
+	cell->volcmd	= TRV_NONE;
+	cell->volparam	= 0;
+	if (v <= 64)
+	{
+		cell->volcmd	= TRV_SET;
+		cell->volparam	= v;
+	}
+	else if (v <= 74)
+	{
+		cell->volcmd	= TRV_FINE_UP;
+		cell->volparam	= v - 65;
+	}
+	else if (v <= 84)
+	{
+		cell->volcmd	= TRV_FINE_DOWN;
+		cell->volparam	= v - 75;
+	}
+	else if (v <= 94)
+	{
+		cell->volcmd	= TRV_SLIDE_UP;
+		cell->volparam	= v - 85;
+	}
+	else if (v <= 104)
+	{
+		cell->volcmd	= TRV_SLIDE_DOWN;
+		cell->volparam	= v - 95;
+	}
+	else if (v <= 114)
+	{
+		cell->volcmd	= TRV_PITCH_DOWN;
+		cell->volparam	= (v - 105) * 4;
+	}
+	else if (v <= 124)
+	{
+		cell->volcmd	= TRV_PITCH_UP;
+		cell->volparam	= (v - 115) * 4;
+	}
+	else if (128 <= v <= 192)
+	{//Pan 0..64; the engine widens volparam * 4 to 0..255.
+		cell->volcmd	= TRV_SET_PAN;
+		cell->volparam	= v - 128;
+	}
+	else if (193 <= v <= 202)
+	{
+		cell->volcmd	= TRV_TONE_PORTA;
+		cell->volparam	= tr_it_vol_porta[v - 193];
+	}
+	else if (203 <= v <= 212)
+	{
+		cell->volcmd	= TRV_VIB_DEPTH;
+		cell->volparam	= v - 203;
+	}
+}
+
+U0 TrItEffect(I64 cmd, I64 param, CTrCell *cell)
+{//Command byte 1..26 is A..Z. Unrecognised letters store no effect rather
+//than a wrong one.
+	I64 row;
+
+	cell->eff	= 0;
+	cell->param	= param;
+	switch (cmd)
+	{
+		case 1:		cell->eff = TRX_SET_SPEED;			break;
+		case 2:		cell->eff = TRX_POS_JUMP;			break;
+		case 3:
+			//IT's Cxx row is hexadecimal, but the engine's TRX_PAT_BREAK
+			//decodes the MOD form (param >> 4) * 10 + (param & 0x0F).
+			//Re-encode so the break lands on the row IT names.
+			row			= ClampI64(param, 0, 99);
+			cell->eff	= TRX_PAT_BREAK;
+			cell->param	= (row / 10) * 16 + row % 10;
+			break;
+		case 4:		cell->eff = TRX_VOLSLIDE;			break;
+		case 5:		cell->eff = TRX_PORTA_DOWN;			break;
+		case 6:		cell->eff = TRX_PORTA_UP;			break;
+		case 7:		cell->eff = TRX_TONE_PORTA;			break;
+		case 8:		cell->eff = TRX_VIBRATO;			break;
+		case 9:		cell->eff = TRX_TREMOR;				break;
+		case 10:	cell->eff = TRX_ARPEGGIO;			break;
+		case 11:	cell->eff = TRX_VIB_VOLSLIDE;		break;
+		case 12:	cell->eff = TRX_PORTA_VOLSLIDE;		break;
+		case 13:	cell->eff = TRX_CHANNEL_VOL;		break;
+		case 14:	cell->eff = TRX_CHANNEL_VOLSLIDE;	break;
+		case 15:	cell->eff = TRX_OFFSET;				break;
+		case 16:	cell->eff = TRX_PAN_SLIDE;			break;
+		case 17:	cell->eff = TRX_MULTI_RETRIG;		break;
+		case 18:	cell->eff = TRX_TREMOLO;			break;
+		case 19:
+			//Sxy: the parameter passes through whole; the engine's extended
+			//handler reads the high nibble as the subcommand.
+			cell->eff = TRX_EXTENDED;
+			break;
+		case 20:	cell->eff = TRX_SET_TEMPO;			break;
+		case 21:	cell->eff = TRX_FINE_VIBRATO;		break;
+		case 22:	cell->eff = TRX_GLOBAL_VOL;			break;
+		case 23:	cell->eff = TRX_GLOBAL_VOLSLIDE;	break;
+		case 24:	cell->eff = TRX_SET_PAN;			break;
+		case 25:	cell->eff = TRX_PANBRELLO;			break;
+		//Zxx drives the MIDI macros and the resonant filter. Unimplemented.
+		default:
+			cell->eff	= 0;
+			cell->param	= 0;
+			break;
+	}
+}
+
+I64 TrItPatParse(U8 *raw, I64 size, I64 off, I64 pat, I64 *_rows)
+{//Unpacks one pattern. pat < 0 scans without allocating and returns the
+//channel count the pattern touches; otherwise the pattern is allocated and
+//filled and the return value is the same count.
+//
+//Two per-channel memories persist for the whole pattern: the mask byte and
+//the last note/instrument/volume/command/parameter. A channel byte without
+//bit 7 carries no mask byte and reuses the one stored for that channel,
+//possibly from many rows earlier; a single current-mask variable would
+//desynchronise the byte stream at that point.
+	I64	 len, rows, p, end, row, b, ch, m, used = 0;
+	I64	 e_note, e_ins, e_vol, e_cmd, e_prm, v, n;
+	Bool h_note, h_ins, h_vol, h_cmd;
+	U8	 mask[64], l_note[64], l_ins[64], l_vol[64], l_cmd[64], l_prm[64];
+	CTrCell *cell;
+
+	*_rows = 64;
+	if (off <= 0 || off + 8 > size)
+	{//Offset 0 is an implicit empty 64-row pattern occupying no file bytes.
+		if (pat >= 0)
+			TrPatternAlloc(pat, 64);
+		return 0;
+	}
+	len		= TrRdU16LE(raw + off);
+	rows	= TrRdU16LE(raw + off + 2);
+	//Rows outside 32..200 come from other trackers. Clamp, do not reject.
+	rows	= ClampI64(rows, 1, TR_MAX_ROWS);
+	*_rows	= rows;
+	if (pat >= 0 && !TrPatternAlloc(pat, rows))
+		return 0;
+
+	MemSet(mask, 0, 64);
+	MemSet(l_note, 0, 64);
+	MemSet(l_ins, 0, 64);
+	MemSet(l_vol, 0, 64);
+	MemSet(l_cmd, 0, 64);
+	MemSet(l_prm, 0, 64);
+
+	p	= off + 8;
+	end	= off + 8 + len;
+	if (end > size)
+		end = size;			//Truncated packing plays as far as it reaches.
+	row = 0;
+	while (p < end && row < rows)
+	{
+		b = raw[p];
+		p++;
+		if (!b)
+			row++;
+		else
+		{
+			ch = (b - 1) & 63;
+			if (ch + 1 > used)
+				used = ch + 1;
+			if (b & 0x80)
+			{
+				m = 0;
+				if (p < end)
+					m = raw[p];
+				p++;
+				mask[ch] = m;
+			}
+			m		= mask[ch];
+			h_note	= FALSE;
+			h_ins	= FALSE;
+			h_vol	= FALSE;
+			h_cmd	= FALSE;
+			e_note	= 0;
+			e_ins	= 0;
+			e_vol	= 0;
+			e_cmd	= 0;
+			e_prm	= 0;
+			//Read bits first: each emits a value and updates the memory.
+			if (m & 0x01)
+			{
+				v = 0;
+				if (p < end)
+					v = raw[p];
+				p++;
+				l_note[ch]	= v;
+				e_note		= v;
+				h_note		= TRUE;
+			}
+			if (m & 0x02)
+			{
+				v = 0;
+				if (p < end)
+					v = raw[p];
+				p++;
+				l_ins[ch]	= v;
+				e_ins		= v;
+				h_ins		= TRUE;
+			}
+			if (m & 0x04)
+			{
+				v = 0;
+				if (p < end)
+					v = raw[p];
+				p++;
+				l_vol[ch]	= v;
+				e_vol		= v;
+				h_vol		= TRUE;
+			}
+			if (m & 0x08)
+			{
+				v = 0;
+				if (p < end)
+					v = raw[p];
+				p++;
+				n = 0;
+				if (p < end)
+					n = raw[p];
+				p++;
+				l_cmd[ch]	= v;
+				l_prm[ch]	= n;
+				e_cmd		= v;
+				e_prm		= n;
+				h_cmd		= TRUE;
+			}
+			//Recall bits second: they consume no stream bytes.
+			if (m & 0x10)
+			{
+				e_note	= l_note[ch];
+				h_note	= TRUE;
+			}
+			if (m & 0x20)
+			{
+				e_ins	= l_ins[ch];
+				h_ins	= TRUE;
+			}
+			if (m & 0x40)
+			{
+				e_vol	= l_vol[ch];
+				h_vol	= TRUE;
+			}
+			if (m & 0x80)
+			{//Bit 7 restores command and parameter together.
+				e_cmd	= l_cmd[ch];
+				e_prm	= l_prm[ch];
+				h_cmd	= TRUE;
+			}
+
+			cell = NULL;
+			if (pat >= 0)
+				cell = TrCell(pat, ch, row);
+			if (cell)
+			{
+				if (h_note)
+					cell->note = TrItNote(e_note);
+				if (h_ins)
+					cell->inst = e_ins;
+				if (h_vol)
+					TrItVolCol(e_vol, cell);
+				if (h_cmd)
+					TrItEffect(e_cmd, e_prm, cell);
+			}
+		}
+	}
+
+	return used;
+}
+
+I64 TrItProbe(U8 *raw, I64 size)
+{//Channel count, or 0 if this is not an IT. The count comes from scanning the
+//packed patterns: the header pan array marks channels muted, and effects in
+//muted channels still run, so it cannot bound the count.
+	I64 ordnum, insnum, smpnum, patnum, pat_base, n, i, off, ch, rows;
+	I64 used = 0;
+
+	if (size < TRIT_HDR || MemCompare(raw, "IMPM", 4))
+		return 0;
+	ordnum	= TrItU16(raw, size, 0x20);
+	insnum	= TrItU16(raw, size, 0x22);
+	smpnum	= TrItU16(raw, size, 0x24);
+	patnum	= TrItU16(raw, size, 0x26);
+	//Array bases use the declared counts, not the clamped ones, or the later
+	//arrays land at the wrong place.
+	pat_base = 0xC0 + ordnum + insnum * 4 + smpnum * 4;
+
+	n = patnum;
+	if (n > TR_MAX_PATTERNS)
+		n = TR_MAX_PATTERNS;
+	for (i = 0; i < n; i++)
+	{
+		off = TrItU32(raw, size, pat_base + i * 4);
+		ch	= TrItPatParse(raw, size, off, -1, &rows);
+		if (ch > used)
+			used = ch;
+	}
+	if (used < 1)
+		used = 4;			//No usable pattern data; still a valid IT header.
+
+	return ClampI64(used, 1, TR_MAX_CHANNELS);
+}
+
+U0 TrItEnvNew(CTrEnvelope *e, U8 *raw, I64 size, I64 off, Bool sgn, Bool filter)
+{//Envelope, 82 bytes: flags, node count, loop begin/end, sustain begin/end,
+//then 25 nodes of int8 value followed by u16 tick. Loop and sustain fields
+//are NODE INDICES, not ticks.
+	I64 fl, n, i, v, t;
+
+	MemSet(e, 0, sizeof(CTrEnvelope));
+	if (off < 0 || off + 82 > size)
+		return;
+	fl	= raw[off];
+	n	= ClampI64(raw[off + 1], 0, TR_ENV_POINTS);
+	e->n_points = n;
+	if (fl & 1)
+		e->flags |= TR_ENV_ON;
+	if (fl & 2)
+		e->flags |= TR_ENV_LOOP;
+	if (fl & 4)
+		e->flags |= TR_ENV_SUSTAIN;
+	//Bit 7 on the pitch envelope retargets it at the filter cutoff.
+	if (filter && (fl & 0x80))
+		e->flags |= TR_ENV_FILTER;
+	if (n > 0)
+	{
+		e->loop_start	= ClampI64(raw[off + 2], 0, n - 1);
+		e->loop_end		= ClampI64(raw[off + 3], 0, n - 1);
+		e->sus_start	= ClampI64(raw[off + 4], 0, n - 1);
+		e->sus_end		= ClampI64(raw[off + 5], 0, n - 1);
+	}
+	for (i = 0; i < n; i++)
+	{
+		v = raw[off + 6 + i * 3];
+		//Pan and pitch node values are signed -32..+32; volume is 0..64.
+		if (sgn)
+		{
+			if (v > 127)
+				v -= 256;
+		}
+		else
+			v = ClampI64(v, 0, 64);
+		t = raw[off + 7 + i * 3] | (raw[off + 8 + i * 3] << 8);
+		e->value[i]	= v;
+		e->tick[i]	= t;
+	}
+}
+
+U0 TrItEnvOld(CTrEnvelope *e, U8 *raw, I64 off)
+{//Old instruments carry a volume envelope only: flags at 0x11, loop and
+//sustain node indices at 0x12..0x15, and 25 nodes of (tick, value) at 0x1F8
+//terminated by tick 0xFF. Node order is reversed relative to the new format.
+//The caller has verified off + TRIT_INST_LEN fits the file.
+	I64 fl, i, t, v, n = 0;
+
+	MemSet(e, 0, sizeof(CTrEnvelope));
+	fl = raw[off + 0x11];
+	if (fl & 1)
+		e->flags |= TR_ENV_ON;
+	if (fl & 2)
+		e->flags |= TR_ENV_LOOP;
+	if (fl & 4)
+		e->flags |= TR_ENV_SUSTAIN;
+	for (i = 0; i < TR_ENV_POINTS; i++)
+	{
+		t = raw[off + 0x1F8 + i * 2];
+		v = raw[off + 0x1F8 + i * 2 + 1];
+		if (t == 0xFF)
+			break;
+		e->tick[n]	= t;
+		e->value[n]	= ClampI64(v, 0, 64);
+		n++;
+	}
+	e->n_points = n;
+	if (n > 0)
+	{
+		e->loop_start	= ClampI64(raw[off + 0x12], 0, n - 1);
+		e->loop_end		= ClampI64(raw[off + 0x13], 0, n - 1);
+		e->sus_start	= ClampI64(raw[off + 0x14], 0, n - 1);
+		e->sus_end		= ClampI64(raw[off + 0x15], 0, n - 1);
+	}
+}
+
+U0 TrItLoadInst(U8 *raw, I64 size, I64 off, I64 slot, I64 cmwt)
+{//Instrument header, 554 bytes. cmwt, not cwtv, selects the layout: both are
+//554 bytes, so the wrong choice yields garbage rather than a size error.
+	CTrInst	*p;
+	I64		 i, v, kb, fade, dfp;
+
+	if (off <= 0 || off + TRIT_INST_LEN > size)
+		return;			//Truncated: leave the slot NULL, the identity mapping.
+	p = TrInstAlloc(slot);
+	if (!p)
+		return;
+	for (i = 0; i < 26 && raw[off + 0x20 + i]; i++)
+		p->name[i] = raw[off + 0x20 + i];
+	p->name[i] = 0;
+
+	//Keyboard table at 0x40: 120 pairs of (note, sample) for IT notes 0..119.
+	//IT transposes per key, so the note byte travels with the sample.
+	for (i = 0; i < TR_NOTES; i++)
+	{
+		kb	= raw[off + 0x40 + i * 2];
+		v	= raw[off + 0x40 + i * 2 + 1];
+		if (v >= TR_MAX_SAMPLES)
+			v = 0;
+		p->smp_of_note[i + 1]	= v;
+		p->xpose_of_note[i + 1]	= ClampI64(kb + 1, 1, TR_NOTES);
+	}
+
+	if (cmwt >= 0x0200)
+	{
+		p->nna	= ClampI64(raw[off + 0x11], 0, 3);
+		p->dct	= ClampI64(raw[off + 0x12], 0, 3);
+		p->dca	= ClampI64(raw[off + 0x13], 0, 2);
+		//IT counts the fade down from 1024; the engine counts from 32768.
+		fade	= TrRdU16LE(raw + off + 0x14);
+		p->fadeout		= ClampI64(fade, 0, 1024) * 32;
+		p->global_vol	= ClampI64(raw[off + 0x18], 0, 128);
+		dfp				= raw[off + 0x19];
+		p->default_pan	= -1;
+		//Bit 7 set means do NOT use this pan, the opposite polarity to the
+		//sample header's default-pan bit 7.
+		if (!(dfp & 0x80))
+			p->default_pan = ClampI64(dfp & 0x7F, 0, 64) * 255 / 64;
+		TrItEnvNew(&p->vol_env,   raw, size, off + 0x130, FALSE, FALSE);
+		TrItEnvNew(&p->pan_env,   raw, size, off + 0x182, TRUE,  FALSE);
+		TrItEnvNew(&p->pitch_env, raw, size, off + 0x1D4, TRUE,  TRUE);
+	}
+	else
+	{
+		p->nna	= ClampI64(raw[off + 0x1A], 0, 3);
+		p->dct	= TR_DCT_OFF;
+		p->dca	= TR_DCA_CUT;
+		if (raw[off + 0x1B])
+			p->dct = TR_DCT_NOTE;	//Old files carry a boolean check only.
+		//Old instruments count the fade down from 512.
+		fade	= TrRdU16LE(raw + off + 0x18);
+		p->fadeout		= ClampI64(fade, 0, 512) * 64;
+		p->global_vol	= 128;
+		p->default_pan	= -1;
+		TrItEnvOld(&p->vol_env, raw, off);
+	}
+	//Initial filter cutoff and resonance are not carried: the engine has no
+	//filter. Sample auto-vibrato is likewise dropped.
+}
+
+//--- IT214/215 sample compression -------------------------------------------
+//Bit-packed adaptive-width delta. The stream is a series of blocks, each
+//decompressing to 0x8000 points for 8-bit or 0x4000 for 16-bit and prefixed
+//with its own u16 compressed length. Within a block the code width starts one
+//bit wider than the sample and is changed in-band by three escape forms
+//selected by the current width. IT215 adds a second delta pass.
+//
+//Not optional in practice: whole modules store every sample this way and load
+//silent without it.
+
+//cmwt of the file being loaded. IT215 adds a second delta pass on decode,
+//and the sample loader has no other route to the header.
+I64 tr_it_cmwt		= 0;
+
+I64 tr_it_bitpos	= 0;	//Bit cursor within the current block.
+I64 tr_it_bitend	= 0;
+
+I64 TrItBits(U8 *raw, I64 base, I64 n)
+{//n bits, least significant first. Reads past the block return 0.
+	I64 v = 0, i, bit;
+
+	for (i = 0; i < n; i++)
+	{
+		if (tr_it_bitpos >= tr_it_bitend)
+			return v;
+		bit = (raw[base + (tr_it_bitpos >> 3)] >> (tr_it_bitpos & 7)) & 1;
+		v |= bit << i;
+		tr_it_bitpos++;
+	}
+
+	return v;
+}
+
+I64 TrItDecompress(U8 *raw, I64 size, I64 pos, I16 *out, I64 frames,
+				   I64 bits16, Bool it215)
+{//Returns the file position after the compressed data, or -1 on a bad stream.
+	I64 done = 0, blk, clen, width, v, d1, d2, top, border, sh, need, base;
+
+	while (done < frames)
+	{
+		if (pos + 2 > size)
+			return -1;
+		blk = 0x8000;
+		if (bits16)
+			blk = 0x4000;
+		if (blk > frames - done)
+			blk = frames - done;
+		clen = raw[pos] | (raw[pos + 1] << 8);
+		pos += 2;
+		if (clen < 0 || pos + clen > size)
+			return -1;
+		base			= pos;
+		tr_it_bitpos	= 0;
+		tr_it_bitend	= clen * 8;
+		if (bits16)
+			width = 17;
+		else
+			width = 9;
+		d1 = 0;
+		d2 = 0;
+		while (blk > 0)
+		{
+			if (width < 1 || width > 17)
+				return -1;
+			v = TrItBits(raw, base, width);
+			if (width < 7)
+			{//Short form: a lone high bit selects the next width.
+				if (v == (1 << (width - 1)))
+				{
+					if (bits16)
+						need = TrItBits(raw, base, 4) + 1;
+					else
+						need = TrItBits(raw, base, 3) + 1;
+					if (need < width)
+						width = need;
+					else
+						width = need + 1;
+				}
+				else
+					goto it_emit;
+			}
+			else if ((bits16 && width < 17) || (!bits16 && width < 9))
+			{//Bordered range just above the representable sample values.
+				if (bits16)
+				{
+					top		= 0xFFFF >> (17 - width);
+					border	= top - 8;
+				}
+				else
+				{
+					top		= 0xFF >> (9 - width);
+					border	= top - 4;
+				}
+				if (v > border && v <= border + (8 + bits16 * 8))
+				{
+					need = v - border;
+					if (need < width)
+						width = need;
+					else
+						width = need + 1;
+				}
+				else
+					goto it_emit;
+			}
+			else
+			{//Widest form: the top bit flags a width change.
+				if (bits16)
+				{
+					if (v & 0x10000)
+					{
+						width = (v + 1) & 0xFF;
+						}
+					else
+						goto it_emit;
+				}
+				else if (v & 0x100)
+				{
+					width = (v + 1) & 0xFF;
+				}
+				else
+					goto it_emit;
+			}
+			goto it_next;
+it_emit:
+			//Sign-extend from the code width to the sample width.
+			if (bits16)
+			{
+				if (width < 16)
+				{
+					sh = 16 - width;
+					v  = (v << sh) & 0xFFFF;
+					if (v & 0x8000)
+						v -= 0x10000;
+					v = v / (1 << sh);
+				}
+				else if (v & 0x8000)
+					v -= 0x10000;
+			}
+			else
+			{
+				if (width < 8)
+				{
+					sh = 8 - width;
+					v  = (v << sh) & 0xFF;
+					if (v & 0x80)
+						v -= 0x100;
+					v = v / (1 << sh);
+				}
+				else if (v & 0x80)
+					v -= 0x100;
+			}
+			d1 += v;
+			d2 += d1;
+			if (it215)
+				v = d2;
+			else
+				v = d1;
+			if (bits16)
+				out[done] = v & 0xFFFF;
+			else
+				out[done] = (v & 0xFF) * 256;
+			done++;
+			blk--;
+it_next:;
+		}
+		pos += clen;
+	}
+
+	return pos;
+}
+
+U0 TrItLoadSample(U8 *raw, I64 size, I64 off, I64 slot)
+{//Sample header, 80 bytes. Lengths and loop points are in SAMPLE POINTS.
+	I64	 flags, cvt, gvol, vol, dfp, pan, len, ls, le, ss, se, c5, dat;
+	I64	 width, avail, frames, i, j, q, v, acc;
+	Bool comp, it215;
+	I16	*d;
+	U8	 name[TR_SMP_NAME];
+
+	if (slot < 1 || slot >= TR_MAX_SAMPLES)
+		return;
+	if (off <= 0 || off + TRIT_SMP_LEN > size)
+		return;
+	//"IMPS" at 0x00 is not verified: real IT 2.04 files get it wrong.
+	gvol	= ClampI64(raw[off + 0x11] & 0x7F, 0, 64);
+	flags	= raw[off + 0x12];
+	vol		= ClampI64(raw[off + 0x13], 0, 64);
+	MemSet(name, 0, TR_SMP_NAME);
+	for (i = 0; i < 26 && raw[off + 0x14 + i]; i++)
+		name[i] = raw[off + 0x14 + i];
+	name[i]	= 0;
+	cvt		= raw[off + 0x2E];
+	dfp		= raw[off + 0x2F];
+	len		= TrRdU32LE(raw + off + 0x30);
+	ls		= TrRdU32LE(raw + off + 0x34);
+	le		= TrRdU32LE(raw + off + 0x38);
+	c5		= TrRdU32LE(raw + off + 0x3C);
+	ss		= TrRdU32LE(raw + off + 0x40);
+	se		= TrRdU32LE(raw + off + 0x44);
+	dat		= TrRdU32LE(raw + off + 0x48);
+
+	//Sample default-pan bit 7 set means DO use it, the opposite polarity to
+	//the instrument header's.
+	pan = -1;
+	if (dfp & 0x80)
+		pan = ClampI64(dfp & 0x7F, 0, 64) * 255 / 64;
+
+	//Cvt 0xFF as a whole byte is ModPlug ADPCM4, not a bit field. Silence the
+	//slot rather than decoding the packed nibbles as PCM.
+	frames = 0;
+	comp   = FALSE;
+	if ((flags & 1) && len > 0 && cvt != 0xFF && (flags & 8))
+	{//IT214/215 compressed. The decompressor writes I16 directly, so the
+	//frame count comes from the header rather than the bytes on disk.
+		comp   = TRUE;
+		frames = len;
+		if (frames > TRIT_MAX_POINTS)
+			frames = TRIT_MAX_POINTS;
+	}
+	else if ((flags & 1) && len > 0 && cvt != 0xFF)
+	{
+		width = 1;
+		if (flags & 2)
+			width = 2;
+		if (flags & 4)
+			width *= 2;		//Stereo frames are interleaved; the left half plays.
+		avail = 0;
+		if (dat > 0 && dat < size)
+			avail = (size - dat) / width;
+		frames = len;
+		if (frames > avail)
+			frames = avail;		//Truncated data loads short.
+		if (frames > TRIT_MAX_POINTS)
+			frames = TRIT_MAX_POINTS;
+	}
+	//TrSampleAlloc clears the slot, so the header fields land afterwards.
+	if (frames > 0)
+		TrSampleAlloc(slot, frames);
+	else
+		TrSampleFree(slot);
+	MemCopy(tr_smp[slot].name, name, TR_SMP_NAME);
+	tr_smp[slot].volume		= vol;
+	tr_smp[slot].global_vol	= gvol;
+	tr_smp[slot].pan		= pan;
+	tr_smp[slot].c5speed	= c5;
+	//IT tunes a sample by the Hz of C-5, which is what TrC5StepMul takes.
+	tr_smp[slot].step_mul	= TrC5StepMul(c5);
+	tr_smp[slot].finetune	= 0;
+	tr_smp[slot].rel_note	= 0;
+	tr_smp[slot].synth		= TRI_NONE;
+
+	d = tr_smp[slot].data;
+	if (d && frames > 0 && comp)
+	{//IT215 (cmwt 0x215) applies a second delta pass on decode.
+		it215 = tr_it_cmwt >= 0x0215;
+		if (TrItDecompress(raw, size, dat, d, frames, flags & 2, it215) < 0)
+			MemSet(d, 0, frames * sizeof(I16));
+		TrSampleGuard(&tr_smp[slot]);
+	}
+	else if (d && frames > 0)
+	{
+		width = 1;
+		if (flags & 2)
+			width = 2;
+		if (flags & 4)
+			width *= 2;
+		acc = 0;
+		for (j = 0; j < frames; j++)
+		{
+			q = dat + j * width;
+			if (flags & 2)
+			{
+				v = raw[q] | (raw[q + 1] << 8);
+				if (cvt & 2)
+					v = ((v & 0xFF) << 8) | ((v >> 8) & 0xFF);	//Big-endian.
+				if (cvt & 4)
+				{//Delta encoded: each word is the step from the previous.
+					acc = (acc + v) & 0xFFFF;
+					v	= acc;
+				}
+				else if (!(cvt & 1))
+					v = (v + 32768) & 0xFFFF;	//Cvt bit 0 clear = unsigned.
+				if (v > 32767)
+					v -= 65536;
+			}
+			else
+			{
+				v = raw[q];
+				if (cvt & 4)
+				{
+					acc = (acc + v) & 0xFF;
+					v	= acc;
+				}
+				else if (!(cvt & 1))
+					v = (v + 128) & 0xFF;
+				if (v > 127)
+					v -= 256;
+				//Multiply, not shift: v is signed here.
+				v = v * 256;
+			}
+			d[j] = v;
+		}
+	}
+
+	//Loops are only meaningful when flag bit 0 says the slot holds data;
+	//unused slots carry junk in these fields.
+	avail = tr_smp[slot].len;
+	if ((flags & 1) && avail > 0)
+	{
+		if (flags & 0x10)
+		{
+			if (le > avail)
+				le = avail;
+			if (ls < le)
+			{//Loop end is exclusive.
+				tr_smp[slot].loop_start	= ls;
+				tr_smp[slot].loop_len	= le - ls;
+				tr_smp[slot].loop_type	= TR_LOOP_FWD;
+				if (flags & 0x40)
+					tr_smp[slot].loop_type = TR_LOOP_PINGPONG;
+			}
+		}
+		if (flags & 0x20)
+		{
+			if (se > avail)
+				se = avail;
+			if (ss < se)
+			{//Sustain loop end is exclusive.
+				tr_smp[slot].sus_start	= ss;
+				tr_smp[slot].sus_len	= se - ss;
+				tr_smp[slot].sus_type	= TR_LOOP_FWD;
+				if (flags & 0x80)
+					tr_smp[slot].sus_type = TR_LOOP_PINGPONG;
+			}
+		}
+	}
+	TrSampleGuard(&tr_smp[slot]);
+}
+
+Bool TrItLoad(U8 *raw, I64 size)
+{//Replaces the whole song. Returns FALSE without touching state on reject.
+	I64	 ch, ordnum, insnum, smpnum, patnum, cmwt, flags;
+	I64	 ins_base, smp_base, pat_base;
+	I64	 n_ins, n_smp, n_pat, i, n, v, p, rows, off;
+
+	ch = TrItProbe(raw, size);
+	if (ch < 1)
+		return FALSE;
+
+	ordnum	= TrItU16(raw, size, 0x20);
+	insnum	= TrItU16(raw, size, 0x22);
+	smpnum	= TrItU16(raw, size, 0x24);
+	patnum	= TrItU16(raw, size, 0x26);
+	cmwt	= TrItU16(raw, size, 0x2A);
+	tr_it_cmwt = cmwt;
+	flags	= TrItU16(raw, size, 0x2C);
+	//Absolute offsets, contiguous from 0xC0 in this order. The bases use the
+	//declared counts; the loop bounds below use the clamped ones.
+	ins_base = 0xC0 + ordnum;
+	smp_base = ins_base + insnum * 4;
+	pat_base = smp_base + smpnum * 4;
+
+	n_ins = ClampI64(insnum, 0, TR_MAX_INSTRUMENTS - 1);
+	n_smp = ClampI64(smpnum, 0, TR_MAX_SAMPLES - 1);
+	n_pat = ClampI64(patnum, 0, TR_MAX_PATTERNS);
+	if (n_pat < 1)
+		n_pat = 1;			//A song always holds one pattern to play.
+
+	TrSongFreeAll;
+	MemSet(&tr_song, 0, sizeof(CTrSong));
+	tr_song.channels	= ch;
+	tr_song.n_patterns	= n_pat;
+	tr_song.global_vol	= ClampI64(TrItU8(raw, size, 0x30), 0, 128);
+	tr_song.mix_vol		= ClampI64(TrItU8(raw, size, 0x31), 0, 128);
+	tr_song.speed		= ClampI64(TrItU8(raw, size, 0x32), 1, 255);
+	tr_song.bpm			= ClampI64(TrItU8(raw, size, 0x33), 32, 255);
+	//Flags bit 3 selects linear slides; IT tunes against 8363 Hz either way.
+	tr_song.linear		= (flags & 8) != 0;
+	tr_song.fine_slides = TRUE;	//Dxy carries DFx / DxF fine forms.
+	tr_song.clock		= TR_CLOCK_8363;
+	tr_song.restart		= 0;			//IT has no restart position.
+
+	for (i = 0; i < 26; i++)
+	{
+		v = TrItU8(raw, size, 0x04 + i);
+		if (v < 32)
+			v = ' ';
+		tr_song.title[i] = v;
+	}
+	tr_song.title[26] = 0;
+	for (i = 25; i >= 0 && tr_song.title[i] == ' '; i--)
+		tr_song.title[i] = 0;
+
+	//Order 0xFE is a skip marker and 0xFF ends the song; both are compacted
+	//out rather than stored.
+	n = 0;
+	for (i = 0; i < ordnum && n < TR_ORDER_MAX; i++)
+	{
+		v = TrItU8(raw, size, 0xC0 + i);
+		if (v == 0xFF)
+			break;
+		if (v != 0xFE)
+		{
+			tr_song.order[n] = v;
+			n++;
+		}
+	}
+	tr_song.order_len = n;
+
+	//Flags bit 2 clear is sample mode: the instrument column indexes samples
+	//directly and any instrument array present is ignored. tr_inst stays NULL,
+	//which the engine already treats as the identity mapping.
+	if (flags & 4)
+	{
+		tr_song.n_instruments = n_ins;
+		for (i = 0; i < n_ins; i++)
+		{
+			off = TrItU32(raw, size, ins_base + i * 4);
+			TrItLoadInst(raw, size, off, i + 1, cmwt);
+		}
+	}
+	else
+		tr_song.n_instruments = n_smp;
+
+	for (i = 0; i < n_smp; i++)
+	{
+		off = TrItU32(raw, size, smp_base + i * 4);
+		TrItLoadSample(raw, size, off, i + 1);
+	}
+
+	for (p = 0; p < n_pat; p++)
+	{
+		off = TrItU32(raw, size, pat_base + p * 4);
+		TrItPatParse(raw, size, off, p, &rows);
+	}
+
+	TrMasterDefault;
+	//Channel pan, 64 bytes at 0x40: value & 0x7F is 0 left, 32 centre,
+	//64 right. Bit 7 marks the channel muted, which is ignored: effects in
+	//muted channels still run.
+	TrChanPanDefault(FALSE);
+	for (i = 0; i < TR_MAX_CHANNELS; i++)
+	{
+		v = TrItU8(raw, size, 0x40 + i) & 0x7F;
+		if (v == 100)
+			tr_chan_pan[i] = 128;		//Surround, folded to centre.
+		else
+			tr_chan_pan[i] = ClampI64(v, 0, 64) * 255 / 64;
+	}
+	TrChansInit;
+
+	return TRUE;
+}

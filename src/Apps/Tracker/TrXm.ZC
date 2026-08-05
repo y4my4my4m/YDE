@@ -1,0 +1,616 @@
+//TrXm.ZC - FastTracker 2 .XM reader. Depends on TrDef, TrSmp.
+//
+//All multi-byte fields are little-endian. Strings are fixed width, space
+//padded, not terminated.
+//
+//Layout:
+//    0    17  "Extended Module: "
+//   17    20  module name
+//   37     1  0x1A
+//   38    20  tracker name
+//   58     2  version, 0x0104 current
+//   60     4  header size, counted from offset 60 and including itself
+//   64     2  song length in orders
+//   66     2  restart position
+//   68     2  channels
+//   70     2  patterns
+//   72     2  instruments
+//   74     2  flags, bit 0: 0 = Amiga, 1 = linear
+//   76     2  default speed, ticks per row
+//   78     2  default bpm
+//   80   256  order table, truncated when the header is short
+//  ...        patterns at 60 + header size, then instruments
+//
+//Pattern block: u32 header length from its own offset, u8 packing, u16 rows,
+//u16 packed size. Data starts at pattern_start + header_length; the next
+//pattern follows the packed bytes.
+//
+//Instrument block: u32 size from its own offset, 22 name, u8 type, u16 sample
+//count, then the extended header at offset 29. Sample headers sit at
+//instrument_start + instrument_size, 40 bytes each, all of them ahead of every
+//sample blob. Instrument size varies by writer (FT2 263, ModPlug 245 or 263,
+//DigiTrakker 29) and the declared sample header size is garbage in the wild,
+//so neither a constant seek nor that field can be trusted.
+//
+//Versions 0x0102 and 0x0103 place instruments before patterns and use an
+//8-byte pattern header; they are rejected.
+
+#define TRXM_MAXSMP		32		//16 samples per instrument officially; 23 occur.
+#define TRXM_ENVPTS		12		//XM envelopes hold 12 points.
+#define TRXM_SMPHDR		40		//Sample header width, always, whatever the
+								//instrument declares.
+
+I64 TrXmByte(U8 *raw, I64 lim, I64 off)
+{//Zero past the readable region. lim is an absolute end offset.
+	if (off < 0 || off >= lim)
+		return 0;
+
+	return raw[off];
+}
+
+I64 TrXmU16(U8 *raw, I64 lim, I64 off)
+{
+	return TrXmByte(raw, lim, off) | (TrXmByte(raw, lim, off + 1) << 8);
+}
+
+I64 TrXmU32(U8 *raw, I64 lim, I64 off)
+{
+	return TrXmU16(raw, lim, off) | (TrXmU16(raw, lim, off + 2) << 16);
+}
+
+U0 TrXmEffect(I64 eff, I64 param, I64 *_eff, I64 *_param)
+{//XM effect byte to the engine's TRX_* space. An unrecognised command becomes
+//a no-op rather than a wrong effect.
+	*_eff	= 0;
+	*_param	= param & 0xFF;
+	if (eff <= 0x0F)
+	{//The MOD nibble, 0x0E extended included with its parameter intact.
+		*_eff = eff;
+		return;
+	}
+	switch (eff)
+	{
+		case 0x10:	*_eff = TRX_GLOBAL_VOL;			break;	//Gxx
+		case 0x11:	*_eff = TRX_GLOBAL_VOLSLIDE;	break;	//Hxy
+		case 0x14:	*_eff = TRX_KEY_OFF;			break;	//Kxx
+		case 0x15:	*_eff = TRX_ENV_POS;			break;	//Lxx
+		case 0x19:	*_eff = TRX_PAN_SLIDE;			break;	//Pxy
+		case 0x1B:	*_eff = TRX_MULTI_RETRIG;		break;	//Rxy
+		case 0x1D:	*_eff = TRX_TREMOR;				break;	//Txy
+		case 0x21:									//X1x up, X2x down
+			if ((param >> 4) == 1)
+			{
+				*_eff	= TRX_XFINE_PORTA_UP;
+				*_param	= param & 0x0F;
+			}
+			else if ((param >> 4) == 2)
+			{
+				*_eff	= TRX_XFINE_PORTA_DN;
+				*_param	= param & 0x0F;
+			}
+			else
+				*_param = 0;
+			break;
+		default:
+			*_param = 0;
+			break;
+	}
+}
+
+U0 TrXmVolCol(I64 v, I64 *_cmd, I64 *_param)
+{//Volume column byte to the engine's split volcmd plus volparam.
+	I64 lo = v & 0x0F;
+
+	*_cmd	= TRV_NONE;
+	*_param	= 0;
+	//Set volume is 0x10..0x50 inclusive, 65 values, so it overruns its nibble
+	//and must be tested ahead of the nibble dispatch.
+	if (0x10 <= v <= 0x50)
+	{
+		*_cmd	= TRV_SET;
+		*_param	= v - 0x10;
+		return;
+	}
+	*_param = lo;
+	switch (v >> 4)
+	{
+		case 0x6:	*_cmd = TRV_SLIDE_DOWN;	break;
+		case 0x7:	*_cmd = TRV_SLIDE_UP;	break;
+		case 0x8:	*_cmd = TRV_FINE_DOWN;	break;
+		case 0x9:	*_cmd = TRV_FINE_UP;	break;
+		case 0xA:	*_cmd = TRV_VIB_SPEED;	break;
+		case 0xB:	*_cmd = TRV_VIB_DEPTH;	break;
+		case 0xC:
+			//XM panning is nibble * 17 over 0..255. TRV_SET_PAN carries 0..64
+			//and the mixer scales it by 4.
+			*_cmd	= TRV_SET_PAN;
+			*_param	= lo * 17 / 4;
+			break;
+		case 0xD:	*_cmd = TRV_PAN_LEFT;	break;
+		case 0xE:	*_cmd = TRV_PAN_RIGHT;	break;
+		case 0xF:
+			//Fx is tone portamento at nibble * 16, the scale effect 3 uses.
+			*_cmd	= TRV_TONE_PORTA;
+			*_param	= lo * 16;
+			break;
+		default:
+			*_param = 0;
+			break;
+	}
+}
+
+U0 TrXmEnvRead(U8 *raw, I64 lim, I64 base, I64 n_points, I64 type,
+			   I64 sus, I64 lp_start, I64 lp_end, CTrEnvelope *e)
+{//12 points of u16 tick then u16 value. Sustain and loop fields are node
+//indices, not tick positions.
+	I64 i, last;
+
+	MemSet(e, 0, sizeof(CTrEnvelope));
+	n_points	= ClampI64(n_points, 0, TRXM_ENVPTS);
+	e->n_points	= n_points;
+	for (i = 0; i < n_points; i++)
+	{
+		e->tick[i]	= TrXmU16(raw, lim, base + i * 4);
+		e->value[i]	= ClampI64(TrXmU16(raw, lim, base + i * 4 + 2), 0, 64);
+	}
+	if (n_points < 1)
+		return;
+	last = n_points - 1;
+	//XM has one sustain point; the engine's sustain span collapses onto it.
+	e->sus_start	= ClampI64(sus, 0, last);
+	e->sus_end		= e->sus_start;
+	e->loop_start	= ClampI64(lp_start, 0, last);
+	e->loop_end		= ClampI64(lp_end, 0, last);
+	if (e->loop_end < e->loop_start)
+		e->loop_end = e->loop_start;
+	if (type & 1)
+		e->flags |= TR_ENV_ON;
+	if (type & 2)
+		e->flags |= TR_ENV_SUSTAIN;
+	if (type & 4)
+		e->flags |= TR_ENV_LOOP;
+}
+
+I64 TrXmProbe(U8 *raw, I64 size)
+{//Channel count, or 0 if this is not an XM this loader reads.
+	I64  i, ch, ver;
+	U8	*sig = "Extended Module: ";
+
+	//Everything up to the order table must be present to place the patterns.
+	if (size < 80)
+		return 0;
+	//Signature case varies; xm.txt documents lowercase "module".
+	for (i = 0; i < 17; i++)
+		if (ToUpper(raw[i]) != ToUpper(sig[i]))
+			return 0;
+	ver = TrRdU16LE(raw + 58);
+	if (ver < 0x0104)
+		return 0;
+	ch = TrRdU16LE(raw + 68);
+	//Odd counts and a count of 1 occur. Do not round up.
+	if (ch < 1 || ch > TR_MAX_CHANNELS)
+		return 0;
+
+	return ch;
+}
+
+Bool TrXmLoad(U8 *raw, I64 size)
+{//Replaces the whole song. Returns FALSE without touching state on reject.
+	I64	 ch, hdr_size, ord_avail, songlen, restart, n_pat, n_ins, flags;
+	I64	 speed, bpm, pos, i, j, k, p, row, b, v;
+	I64	 ph_len, packing, rows, packed, data, q, qend;
+	I64	 note, ins, vol, efx, par, eff_o, par_o, vcmd, vparam;
+	I64	 ins_start, ins_size, n_smp, lim, sh_base, sh_off, dpos;
+	I64	 slot, next_slot, idx;
+	I64	 len_b, ls_b, ll_b, le_b, wide, bpf, ltype, loop_s, loop_e;
+	I64	 frames, avail, old, s16, ft, styp, pan, rel;
+	I64	 smp_slot[TRXM_MAXSMP];
+	I16	*d;
+	CTrCell	*cell;
+	CTrInst	*ip;
+
+	ch = TrXmProbe(raw, size);
+	if (ch < 1)
+		return FALSE;
+
+	//Header size counts from offset 60 and includes its own 4 bytes, so the
+	//first pattern is at 60 + header size. A short header truncates the order
+	//table; never use the nominal 276.
+	hdr_size	= TrRdU32LE(raw + 60);
+	ord_avail	= ClampI64(hdr_size - 20, 0, TR_ORDER_MAX);
+	if (80 + ord_avail > size)
+		ord_avail = size - 80;
+	songlen	= TrRdU16LE(raw + 64);
+	restart	= TrRdU16LE(raw + 66);
+	n_pat	= TrRdU16LE(raw + 70);
+	n_ins	= TrRdU16LE(raw + 72);
+	flags	= TrRdU16LE(raw + 74);
+	speed	= TrRdU16LE(raw + 76);
+	bpm		= TrRdU16LE(raw + 78);
+	songlen	= ClampI64(songlen, 0, ord_avail);
+	if (songlen < 1)
+		songlen = 1;
+	//Slot 0 is reserved, so instruments occupy 1..TR_MAX_INSTRUMENTS-1.
+	n_ins	= ClampI64(n_ins, 0, TR_MAX_INSTRUMENTS - 1);
+	speed	= ClampI64(speed, 1, 255);
+	bpm		= ClampI64(bpm, 32, 1000);
+
+	TrSongFreeAll;
+	MemSet(&tr_song, 0, sizeof(CTrSong));
+	tr_song.channels		= ch;
+	tr_song.n_patterns		= ClampI64(n_pat, 0, TR_MAX_PATTERNS);
+	tr_song.n_instruments	= n_ins;
+	tr_song.global_vol		= 128;
+	tr_song.mix_vol			= 128;
+	tr_song.linear			= (flags & 1) != 0;
+	//XM's Amiga table is normalised so C-4 is 8363 Hz, 0.9% sharp of a real
+	//PAL Amiga.
+	tr_song.clock		= TR_CLOCK_8363;
+	tr_song.order_len	= songlen;
+	tr_song.speed		= speed;
+	tr_song.bpm			= bpm;
+	if (restart < songlen)
+		tr_song.restart = restart;
+	//Module name is 20 bytes, space padded. Control bytes become spaces.
+	for (i = 0; i < 20; i++)
+	{
+		b = raw[17 + i];
+		if (b < 32)
+			b = ' ';
+		tr_song.title[i] = b;
+	}
+	tr_song.title[20] = 0;
+	i = 20;
+	while (i > 0 && tr_song.title[i - 1] == ' ')
+	{
+		i--;
+		tr_song.title[i] = 0;
+	}
+	//Order entries past the pattern count play as an empty 64-row pattern.
+	//A song length forced up from 0 can outrun the readable table; the rest
+	//stays 0.
+	for (i = 0; i < songlen && i < ord_avail; i++)
+		tr_song.order[i] = raw[80 + i];
+
+	//Patterns. Position advances by the declared sizes even where the data is
+	//unusable, so the instruments behind them stay findable.
+	pos = 60 + hdr_size;
+	if (pos < 0 || pos > size)
+		pos = size;
+	for (p = 0; p < n_pat; p++)
+	{
+		rows	= 64;
+		data	= size;
+		packed	= 0;
+		qend	= size;
+		if (pos + 9 <= size)
+		{
+			ph_len	= TrXmU32(raw, size, pos);
+			packing	= TrXmByte(raw, size, pos + 4);
+			rows	= TrXmU16(raw, size, pos + 5);
+			packed	= TrXmU16(raw, size, pos + 7);
+			if (ph_len < 9)
+				ph_len = 9;
+			data = pos + ph_len;
+			if (data > size)
+			{
+				data	= size;
+				packed	= 0;
+			}
+			if (data + packed > size)
+				packed = size - data;
+			pos		= data + packed;
+			qend	= data + packed;
+			//FT2 only ever writes packing type 0. Anything else is undecodable.
+			if (packing)
+				qend = data;
+		}
+		else
+		{//Truncated pattern block: what remains plays as empty rows.
+			pos		= size;
+			data	= size;
+			qend	= size;
+		}
+		if (rows < 1)
+			rows = 64;			//Row count 0 means 64.
+		rows = ClampI64(rows, 1, TR_MAX_ROWS);
+		//Patterns past the engine maximum still advance the position; only the
+		//first TR_MAX_PATTERNS are decoded.
+		if (p < TR_MAX_PATTERNS)
+		{
+			TrPatternAlloc(p, rows);	//Out of memory leaves the pattern NULL
+										//and TrCell rejects every write.
+			q = data;
+			for (row = 0; row < rows; row++)
+				for (k = 0; k < ch; k++)
+				{
+					note	= 0;
+					ins		= 0;
+					vol		= 0;
+					efx		= 0;
+					par		= 0;
+					if (q < qend)
+					{
+						b = raw[q];
+						q++;
+						if (b & 0x80)
+						{//Mask byte: only the flagged fields follow, one each.
+							if ((b & 0x01) && q < qend)
+							{
+								note = raw[q];
+								q++;
+							}
+							if ((b & 0x02) && q < qend)
+							{
+								ins = raw[q];
+								q++;
+							}
+							if ((b & 0x04) && q < qend)
+							{
+								vol = raw[q];
+								q++;
+							}
+							if ((b & 0x08) && q < qend)
+							{
+								efx = raw[q];
+								q++;
+							}
+							if ((b & 0x10) && q < qend)
+							{
+								par = raw[q];
+								q++;
+							}
+						}
+						else
+						{//Unpacked cell: the byte is the note, four fields follow.
+							note = b;
+							if (q < qend)
+							{
+								ins = raw[q];
+								q++;
+							}
+							if (q < qend)
+							{
+								vol = raw[q];
+								q++;
+							}
+							if (q < qend)
+							{
+								efx = raw[q];
+								q++;
+							}
+							if (q < qend)
+							{
+								par = raw[q];
+								q++;
+							}
+						}
+					}
+					cell = TrCell(p, k, row);
+					if (cell)
+					{
+						//XM notes are already 1..96 with 1 = C-0, the engine's own
+						//numbering. 97 is key off; 98 and up are invalid.
+						if (note >= 1 && note <= 96)
+							cell->note = note;
+						else if (note == 97)
+							cell->note = TR_NOTE_OFF;
+						else
+							cell->note = 0;
+						if (ins >= 1 && ins < TR_MAX_INSTRUMENTS)
+							cell->inst = ins;
+						else
+							cell->inst = 0;
+						TrXmVolCol(vol, &vcmd, &vparam);
+						cell->volcmd	= vcmd;
+						cell->volparam	= vparam;
+						TrXmEffect(efx, par, &eff_o, &par_o);
+						cell->eff	= eff_o;
+						cell->param	= par_o;
+					}
+				}
+		}
+	}
+
+	//Instruments. Sample slots are handed out from one running counter across
+	//the whole file; the per-instrument index in the note map is not a slot.
+	next_slot = 1;
+	for (i = 1; i <= n_ins; i++)
+	{
+		if (pos + 29 > size)
+			break;
+		ins_start	= pos;
+		ins_size	= TrXmU32(raw, size, ins_start);
+		n_smp		= TrXmU16(raw, size, ins_start + 27);
+		if (ins_size < 29)
+			ins_size = 29;			//Progress must be monotonic.
+		if (n_smp > TRXM_MAXSMP)
+			n_smp = TRXM_MAXSMP;
+		//A short instrument size zero-fills the rest of the extended header;
+		//a long one leaves surplus bytes that are skipped.
+		lim = MinI64(size, ins_start + ins_size);
+		if (n_smp < 1)
+			lim = MinI64(lim, ins_start + 29);	//No extended header at all.
+
+		ip = TrInstAlloc(i);
+		if (ip)
+		{
+			for (j = 0; j < 22; j++)
+			{
+				b = TrXmByte(raw, lim, ins_start + 4 + j);
+				if (b < 32)
+					b = ' ';
+				ip->name[j] = b;
+			}
+			ip->name[22]	= 0;
+			ip->n_samples	= n_smp;
+			ip->fadeout		= TrXmU16(raw, lim, ins_start + 239);
+			ip->vib_type	= TrXmByte(raw, lim, ins_start + 235);
+			ip->vib_sweep	= TrXmByte(raw, lim, ins_start + 236);
+			ip->vib_depth	= TrXmByte(raw, lim, ins_start + 237);
+			ip->vib_rate	= TrXmByte(raw, lim, ins_start + 238);
+			TrXmEnvRead(raw, lim, ins_start + 129,
+						TrXmByte(raw, lim, ins_start + 225),
+						TrXmByte(raw, lim, ins_start + 233),
+						TrXmByte(raw, lim, ins_start + 227),
+						TrXmByte(raw, lim, ins_start + 228),
+						TrXmByte(raw, lim, ins_start + 229), &ip->vol_env);
+			TrXmEnvRead(raw, lim, ins_start + 177,
+						TrXmByte(raw, lim, ins_start + 226),
+						TrXmByte(raw, lim, ins_start + 234),
+						TrXmByte(raw, lim, ins_start + 230),
+						TrXmByte(raw, lim, ins_start + 231),
+						TrXmByte(raw, lim, ins_start + 232), &ip->pan_env);
+			//XM has no NNA and no instrument default pan.
+			ip->nna			= TR_NNA_CUT;
+			ip->default_pan	= -1;
+		}
+
+		//Sample headers first, then every blob in the same order.
+		sh_base	= ins_start + ins_size;
+		dpos	= sh_base + TRXM_SMPHDR * n_smp;
+		for (j = 0; j < n_smp; j++)
+		{
+			slot = 0;
+			if (next_slot < TR_MAX_SAMPLES)
+			{
+				slot = next_slot;
+				next_slot++;
+			}
+			smp_slot[j] = slot;
+
+			sh_off	= sh_base + j * TRXM_SMPHDR;
+			len_b	= TrXmU32(raw, size, sh_off);
+			ls_b	= TrXmU32(raw, size, sh_off + 4);
+			ll_b	= TrXmU32(raw, size, sh_off + 8);
+			vol		= ClampI64(TrXmByte(raw, size, sh_off + 12), 0, 64);
+			ft		= TrXmByte(raw, size, sh_off + 13);
+			styp	= TrXmByte(raw, size, sh_off + 14);
+			pan		= TrXmByte(raw, size, sh_off + 15);
+			rel		= TrXmByte(raw, size, sh_off + 16);
+			if (ft > 127)
+				ft -= 256;			//Signed, and already at the engine's
+									//-128..127 resolution.
+			if (rel > 127)
+				rel -= 256;
+			wide	= styp & 0x10;	//Bit 4: 16-bit samples.
+			ltype	= styp & 3;
+			bpf		= 1;
+			if (wide)
+				bpf = 2;
+			//Lengths are byte counts even for 16-bit. The loop end is the sum
+			//before halving.
+			le_b	= ls_b + ll_b;
+			frames	= len_b / bpf;
+			loop_s	= ls_b / bpf;
+			loop_e	= le_b / bpf;
+			//Truncation shortens the sample; it never reads past the buffer.
+			avail = 0;
+			if (dpos < size)
+				avail = (size - dpos) / bpf;
+			if (frames > avail)
+				frames = avail;
+
+			if (slot > 0)
+			{
+				if (frames > 0 && TrSampleAlloc(slot, frames))
+				{
+					//Delta encoded, accumulator per sample, wrapping at the
+					//sample width.
+					d	= tr_smp[slot].data;
+					old	= 0;
+					for (k = 0; k < frames; k++)
+					{
+						if (wide)
+						{
+							v	= TrXmU16(raw, size, dpos + k * 2);
+							old	= (old + v) & 0xFFFF;
+							s16	= old;
+							if (s16 > 32767)
+								s16 -= 65536;
+							d[k] = s16;
+						}
+						else
+						{
+							v	= TrXmByte(raw, size, dpos + k);
+							old	= (old + v) & 0xFF;
+							s16	= old;
+							if (s16 > 127)
+								s16 -= 256;
+							//Multiply, not shift: s16 is signed here.
+							d[k] = s16 * 256;
+						}
+					}
+				}
+				else
+					frames = 0;
+
+				//TrSampleAlloc clears the slot, so the header lands after it.
+				tr_smp[slot].volume		= vol;
+				tr_smp[slot].global_vol	= 64;
+				tr_smp[slot].finetune	= ft;
+				tr_smp[slot].rel_note	= rel;
+				tr_smp[slot].pan		= pan;
+				//XM tunes with rel_note and finetune, which the engine applies.
+				tr_smp[slot].step_mul	= 65536;
+				for (k = 0; k < 22; k++)
+				{
+					b = TrXmByte(raw, size, sh_off + 18 + k);
+					if (b < 32)
+						b = ' ';
+					tr_smp[slot].name[k] = b;
+				}
+				tr_smp[slot].name[22] = 0;
+				if (ltype && frames > 0)
+				{
+					if (loop_e > frames)
+						loop_e = frames;
+					if (loop_s < 0)
+						loop_s = 0;
+					if (loop_s < loop_e)
+					{
+						tr_smp[slot].loop_start	= loop_s;
+						tr_smp[slot].loop_len	= loop_e - loop_s;
+						//ModPlug writes loop type 3 for ping-pong as well.
+						if (ltype == 1)
+							tr_smp[slot].loop_type = TR_LOOP_FWD;
+						else
+							tr_smp[slot].loop_type = TR_LOOP_PINGPONG;
+					}
+				}
+				TrSampleGuard(&tr_smp[slot]);
+			}
+			//The file pointer advances by the declared byte length whatever
+			//was readable.
+			dpos += len_b;
+		}
+
+		if (ip)
+			for (k = 1; k <= TR_NOTES; k++)
+			{
+				//96 note entries, note 1 first. They index this instrument's
+				//samples, so map them onto the slots handed out above.
+				slot = 0;
+				if (k <= 96)
+				{
+					idx = TrXmByte(raw, lim, ins_start + 33 + k - 1);
+					if (idx < n_smp)
+						slot = smp_slot[idx];
+				}
+				ip->smp_of_note[k]		= slot;
+				//XM does not transpose per key; IT does.
+				ip->xpose_of_note[k]	= k;
+			}
+
+		pos = dpos;
+		if (pos < ins_start + ins_size)
+			pos = ins_start + ins_size;
+	}
+
+	TrMasterDefault;
+	//XM starts every channel centred; there is no MOD-style LRRL spread.
+	TrChanPanDefault(FALSE);
+	TrChansInit;
+
+	return TRUE;
+}
