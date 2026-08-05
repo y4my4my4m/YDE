@@ -128,6 +128,11 @@ class CUTBsp
 	I64			 num_light_maps;
 	U8			*light_bits;
 	I64			 light_bits_n;
+	I64			*lights;		//flat light-actor refs; NULL-terminated runs
+	I64			 num_lights;
+	U8			*lm_rgb;		//built RGB lightmaps, concatenated
+	I64			 lm_rgb_n;
+	I64			*lm_off;		//byte offset per FLightMapIndex, -1 = none
 	U32			*fog_rgb;		//SoftDrv FogMap Photon DWORD* stand-in
 	I64			 fog_rgb_n;
 };
@@ -163,6 +168,9 @@ U0 UTBspFree(CUTBsp *b)
 	if (b->verts)   Free(b->verts);
 	if (b->surf_tex) Free(b->surf_tex);
 	if (b->light_maps) Free(b->light_maps);
+	if (b->lights) Free(b->lights);
+	if (b->lm_rgb) Free(b->lm_rgb);
+	if (b->lm_off) Free(b->lm_off);
 	if (b->light_bits) Free(b->light_bits);
 	if (b->fog_rgb) Free(b->fog_rgb);
 	Free(b);
@@ -533,6 +541,44 @@ Bool UTBspLoadModel(CUTPackage *pkg, I64 exp_i, CUTBsp *b)
 			}
 		}
 	}
+	//Bounds, LeafHulls, Leaves, then Lights (UModel::Serialize). Lights is a
+	//flat NULL-terminated run per surface; FLightMapIndex.iLightActors indexes
+	//into it. FBox = Min + Max + IsValid(BYTE). FLeaf = 3 indices + QWORD.
+	b->lights = NULL;
+	b->num_lights = 0;
+	if (!ar.err && ar.pos < endpos)
+	{
+		n = UTArcIndex(&ar);				//Bounds
+		if (n > 0 && n < (1 << 22))
+			ar.pos += n * 25;
+		n = UTArcIndex(&ar);				//LeafHulls
+		if (n > 0 && n < (1 << 22))
+			ar.pos += n * 4;
+		n = UTArcIndex(&ar);				//Leaves
+		i = 0;
+		while (i < n && !ar.err && ar.pos < endpos)
+		{
+			UTArcIndex(&ar);
+			UTArcIndex(&ar);
+			UTArcIndex(&ar);
+			ar.pos += 8;
+			i++;
+		}
+		n = UTArcIndex(&ar);				//Lights
+		if (!ar.err && n > 0 && n < (1 << 22))
+		{
+			b->lights = CAlloc(n * sizeof(I64));
+			i = 0;
+			while (i < n && !ar.err && ar.pos < endpos)
+			{
+				b->lights[i] = UTArcIndex(&ar);
+				i++;
+			}
+			b->num_lights = i;
+		}
+	}
+	UTLog("UTBsp: lights_refs=%d\n", b->num_lights);
+
 	//GLightManager FogMap mip stand-in: DWORD Photon RGB from LightBits
 	//density. SoftDrv FogData.Ptr = Surface.FogMap->Mips[0]->DataPtr.
 	if (b->light_bits_n > 0 && b->light_bits)
@@ -556,6 +602,227 @@ Bool UTBspLoadModel(CUTPackage *pkg, I64 exp_i, CUTBsp *b)
 		b->num_vectors, b->num_points, b->num_nodes, b->num_surfs, b->num_verts,
 		b->num_light_maps, b->light_bits_n, b->fog_rgb_n);
 	return b->num_nodes > 0;
+}
+
+
+U0 UTBspLightMapVertex(CUTBsp *b, CUTBspSurf *s, CUTLightMapIdx *lm,
+	F64 *base, F64 *du, F64 *dv)
+{//UnLight SetupForSurf: MapUncoords = MapCoords.Inverse().Transpose().
+ //MapCoords is (Origin=Points[pBase], X=TextureU, Y=TextureV, Z=Normal), so
+ //the inverse-transpose rows are the dual basis, built here with crosses.
+	F64 *U;
+	F64 *V;
+	F64 *N;
+	F64 *O;
+	F64 c1[3];
+	F64 c2[3];
+	F64 det;
+	I64 k;
+
+	U = b->vectors[s->v_texture_u].v;
+	V = b->vectors[s->v_texture_v].v;
+	N = b->vectors[s->v_normal].v;
+	O = b->points[s->p_base].v;
+
+	UTVecCross(V, N, c1);
+	det = UTVecDot(U, c1);
+	if (det > -0.000001 && det < 0.000001)
+		det = 1.0;
+	UTVecCross(N, U, c2);
+	k = 0;
+	while (k < 3)
+	{
+		c1[k] /= det;
+		c2[k] /= det;
+		k++;
+	}
+	//VertexBase = Origin + XAxis*Pan.X + YAxis*Pan.Y
+	k = 0;
+	while (k < 3)
+	{
+		base[k] = O[k] + c1[k] * lm->pan[0] + c2[k] * lm->pan[1];
+		du[k] = c1[k] * lm->u_scale;
+		dv[k] = c2[k] * lm->v_scale;
+		k++;
+	}
+}
+
+U0 UTBspBuildLightMaps(CUTBsp *b)
+{//LightBits is a shadow bitmask per light, not intensity: one bit per texel,
+ //rows padded to bytes, ShadowMaskSpace bytes per light. Light colour comes
+ //from the actors, attenuated by distance and gated by those bits.
+ //UnLight: RRadiusMult = 4093/Radius^2, in range while SqrtOfs < 4096.
+	I64 si;
+	I64 li;
+	I64 u;
+	I64 v;
+	I64 k;
+	I64 total;
+	I64 uc;
+	I64 vc;
+	I64 mask_u;
+	I64 mask_space;
+	I64 shadow;
+	I64 lref;
+	I64 lslot;
+	I64 bitidx;
+	I64 off;
+	I64 built;
+	I64 lit_texels;
+	CUTBspSurf *s;
+	CUTLightMapIdx *lm;
+	CUTLight *L;
+	Bool ok;
+	F64 base[3];
+	F64 du[3];
+	F64 dv[3];
+	F64 p[3];
+	F64 dx;
+	F64 dy;
+	F64 dz;
+	F64 d2;
+	F64 ofs;
+	F64 atten;
+	F64 acc_r;
+	F64 acc_g;
+	F64 acc_b;
+	F64 lr;
+	F64 lg;
+	F64 lb;
+	F64 rrmult;
+	I64 vi;
+
+	if (!b || !b->light_maps || b->num_light_maps < 1 || !b->light_bits)
+		return;
+	b->lm_off = CAlloc(b->num_light_maps * sizeof(I64));
+	li = 0;
+	while (li < b->num_light_maps)
+	{
+		b->lm_off[li] = -1;
+		li++;
+	}
+	//Offsets first so one allocation holds every map.
+	total = 0;
+	si = 0;
+	while (si < b->num_surfs)
+	{
+		s = &b->surfs[si];
+		li = s->i_light_map;
+		if (li >= 0 && li < b->num_light_maps && b->lm_off[li] < 0)
+		{
+			lm = &b->light_maps[li];
+			b->lm_off[li] = total;
+			total += lm->u_clamp * lm->v_clamp * 3;
+		}
+		si++;
+	}
+	if (total < 1)
+		return;
+	b->lm_rgb = CAlloc(total);
+	b->lm_rgb_n = total;
+
+	built = 0;
+	lit_texels = 0;
+	si = 0;
+	while (si < b->num_surfs)
+	{
+		s = &b->surfs[si];
+		li = s->i_light_map;
+		ok = TRUE;
+		if (li < 0 || li >= b->num_light_maps)
+			ok = FALSE;
+		if (ok)
+		{
+			lm = &b->light_maps[li];
+			off = b->lm_off[li];
+			if (off < 0 || b->lm_rgb[off] || lm->i_light_actors < 0)
+				ok = FALSE;
+			if (s->v_texture_u < 0 || s->v_texture_u >= b->num_vectors ||
+				s->v_texture_v < 0 || s->v_texture_v >= b->num_vectors ||
+				s->v_normal < 0 || s->v_normal >= b->num_vectors ||
+				s->p_base < 0 || s->p_base >= b->num_points)
+				ok = FALSE;
+		}
+		if (ok)
+		{
+		uc = lm->u_clamp;
+		vc = lm->v_clamp;
+		mask_u = (uc + 7) >> 3;
+		mask_space = mask_u * vc;
+		UTBspLightMapVertex(b, s, lm, base, du, dv);
+		shadow = lm->data_offset;
+		k = lm->i_light_actors;
+		while (k >= 0 && k < b->num_lights && b->lights[k] != 0)
+		{
+			lslot = UTLightFindByExport(b->lights[k]);
+			if (lslot >= 0)
+			{
+				L = &ut_lights[lslot];
+				lr = 1.0;
+				lg = 1.0;
+				lb = 1.0;
+				UTLightHueRGB(L->hue, &lr, &lg, &lb);
+				rrmult = 4093.0;
+				if (L->radius > 1.0)
+					rrmult = 4093.0 / (L->radius * L->radius);
+				v = 0;
+				while (v < vc)
+				{
+					u = 0;
+					while (u < uc)
+					{
+						bitidx = shadow + v * mask_u + (u >> 3);
+						if (bitidx >= 0 && bitidx < b->light_bits_n &&
+							(b->light_bits[bitidx] & (1 << (u & 7))))
+						{
+							vi = 0;
+							while (vi < 3)
+							{
+								p[vi] = base[vi] + du[vi] * ToF64(u) +
+									dv[vi] * ToF64(v);
+								vi++;
+							}
+							dx = p[0] - L->origin[0];
+							dy = p[1] - L->origin[1];
+							dz = p[2] - L->origin[2];
+							d2 = dx * dx + dy * dy + dz * dz;
+							ofs = d2 * rrmult;
+							if (ofs < 4096.0)
+							{
+								atten = 1.0 - Sqrt(ofs / 4096.0);
+								if (atten > 0.0)
+								{
+									atten = atten * atten * L->bright * 255.0;
+									vi = off + (v * uc + u) * 3;
+									acc_r = ToF64(b->lm_rgb[vi]) + atten * lr;
+									acc_g = ToF64(b->lm_rgb[vi + 1]) +
+										atten * lg;
+									acc_b = ToF64(b->lm_rgb[vi + 2]) +
+										atten * lb;
+									if (acc_r > 255.0) acc_r = 255.0;
+									if (acc_g > 255.0) acc_g = 255.0;
+									if (acc_b > 255.0) acc_b = 255.0;
+									b->lm_rgb[vi] = ToI64(acc_r) & 255;
+									b->lm_rgb[vi + 1] = ToI64(acc_g) & 255;
+									b->lm_rgb[vi + 2] = ToI64(acc_b) & 255;
+									lit_texels++;
+								}
+							}
+						}
+						u++;
+					}
+					v++;
+				}
+			}
+			shadow += mask_space;
+			k++;
+		}
+		built++;
+		}
+		si++;
+	}
+	UTLog("UTBsp: lightmaps built=%d bytes=%d lit=%d\n",
+		built, b->lm_rgb_n, lit_texels);
 }
 
 F64 UTBspSampleLightMap(CUTBsp *b, CUTBspSurf *s, F64 u, F64 v)
