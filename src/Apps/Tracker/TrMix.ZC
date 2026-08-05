@@ -1,0 +1,826 @@
+//TrMix.ZC - sample mixer and tick sequencer. Depends on TrDef, TrSmp.
+//
+//Timing follows the Amiga model: tempo is ticks per row (speed) and rows per
+//minute (bpm); one tick lasts TR_RATE * 2.5 / bpm output frames. Row data is
+//read on tick 0, continuous effects run on every later tick.
+
+U0 TrMasterDefault()
+{//Four channels at peak volume and centre pan reach full scale together.
+	I64 ch = tr_song.channels;
+
+	if (ch < 1)
+		ch = 4;
+	tr.master = ClampI64(512 / ch, 16, 256);
+}
+
+U0 TrChanInit(I64 ch)
+{
+	CTrChan *c = &tr_ch[ch];
+
+	MemSet(c, 0, sizeof(CTrChan));
+	c->vol			= 64;
+	c->mix_vol		= 64;
+	c->period		= TR_PERIOD_MAX;
+	c->sound_period	= TR_PERIOD_MAX;
+	c->delay_ticks	= -1;
+	c->cut_tick		= -1;
+	c->loop_row		= 0;
+	//MOD panning is hard LRRL. Softened to 3/4 throw: full separation is
+	//unlistenable on headphones and every modern player narrows it.
+	if (ch % 4 == 0 || ch % 4 == 3)
+		c->pan = 64;
+	else
+		c->pan = 192;
+}
+
+U0 TrChansInit()
+{
+	I64 ch;
+
+	for (ch = 0; ch < TR_MAX_CHANNELS; ch++)
+		TrChanInit(ch);
+}
+
+I64 TrWaveDelta(I64 wave, I64 pos, I64 depth, I64 div)
+{//ProTracker vibrato/tremolo generator. div is 128 for vibrato, 64 for
+//tremolo. Waveform 3 (random) falls back to sine.
+	I64 v;
+
+	pos &= 63;
+	switch (wave & 3)
+	{
+		case 1:		//Ramp down.
+			v = (pos & 31) * 8;
+			break;
+		case 2:		//Square.
+			v = 255;
+			break;
+		default:
+			v = tr_sine_tab[pos & 31];
+	}
+	v = v * depth / div;
+	if (pos >= 32)
+		v = -v;
+
+	return v;
+}
+
+U0 TrChanStep(CTrChan *c)
+{//Recompute the resample rate from the period actually sounding.
+	I64 mul = 65536;
+
+	if (c->smp)
+		mul = c->smp->step_mul;
+	c->step_fp = TrStepFP(c->sound_period, mul);
+}
+
+U0 TrChanTrigger(CTrChan *c, I64 offset)
+{//Restart the sample. offset is in frames (effect 9xx).
+	CTrSample *s = c->smp;
+
+	if (!s || !s->data || s->len < 1)
+	{
+		c->active = FALSE;
+		return;
+	}
+	if (offset >= s->len)
+	{
+		if (s->loop_len > 1 && s->loop_type != TR_LOOP_NONE)
+			offset = s->loop_start;
+		else
+		{//ProTracker leaves the channel silent when 9xx overruns the sample.
+			c->active = FALSE;
+			return;
+		}
+	}
+	c->pos_fp	 = offset << TR_POS_SHIFT;
+	c->backwards = FALSE;
+	c->active	 = TRUE;
+}
+
+U0 TrMixFrames(I64 n)
+{//Channel-outer so per-channel state stays in registers across the run.
+	I64	 ch, i, idx, frac, s, s1, vl, vr, pos, step, pk, v;
+	I64	 slen, lstart, llen, lend, l, r, mono;
+	CTrChan	  *c;
+	CTrSample *sm;
+
+	if (n < 1)
+		return;
+	MemSet(tr_mix_l, 0, n * sizeof(I64));
+	MemSet(tr_mix_r, 0, n * sizeof(I64));
+
+	for (ch = 0; ch < tr_song.channels; ch++)
+	{
+		c  = &tr_ch[ch];
+		sm = c->smp;
+		if (c->active && sm && sm->data && !c->mute && c->mix_vol > 0)
+		{
+			pos	   = c->pos_fp;
+			step   = c->step_fp;
+			slen   = sm->len;
+			lstart = sm->loop_start;
+			llen   = sm->loop_len;
+			if (sm->loop_type == TR_LOOP_NONE)
+				llen = 0;
+			lend = lstart + llen;
+			if (lend > slen)
+				lend = slen;
+			vl = c->mix_vol * (255 - c->pan) * tr.master / 256;
+			vr = c->mix_vol * c->pan * tr.master / 256;
+			pk = 0;
+			i  = 0;
+			while (i < n && c->active)
+			{
+				idx = pos >> TR_POS_SHIFT;
+				if (idx < 0 || idx >= slen)
+					c->active = FALSE;
+				else
+				{
+					s = sm->data[idx];
+					if (tr.interp)
+					{
+						s1	 = sm->data[idx + 1];
+						frac = (pos >> 16) & 0xFFFF;
+						s	 = s + ((s1 - s) * frac) / 65536;
+					}
+					tr_mix_l[i] += s * vl;
+					tr_mix_r[i] += s * vr;
+					v = s;
+					if (v < 0)
+						v = -v;
+					if (v > pk)
+						pk = v;
+					if (c->backwards)
+						pos -= step;
+					else
+						pos += step;
+					if (llen > 1)
+					{
+						if (c->backwards)
+						{
+							if ((pos >> TR_POS_SHIFT) < lstart)
+							{
+								pos = (lstart << TR_POS_SHIFT) * 2 - pos;
+								c->backwards = FALSE;
+							}
+						}
+						else if ((pos >> TR_POS_SHIFT) >= lend)
+						{
+							if (sm->loop_type == TR_LOOP_PINGPONG)
+							{
+								pos = ((lend - 1) << TR_POS_SHIFT) * 2 - pos;
+								c->backwards = TRUE;
+							}
+							else
+								pos -= (lend - lstart) << TR_POS_SHIFT;
+						}
+					}
+					else if ((pos >> TR_POS_SHIFT) >= slen)
+						c->active = FALSE;
+					i++;
+				}
+			}
+			c->pos_fp = pos;
+			c->peak	  = pk * c->mix_vol / 64;
+		}
+		else
+			c->peak = c->peak * 3 / 4;
+	}
+
+	for (i = 0; i < n; i++)
+	{
+		l = tr_mix_l[i] >> TR_MIX_SHIFT;
+		r = tr_mix_r[i] >> TR_MIX_SHIFT;
+		l = ClampI64(l, -32767, 32767);
+		r = ClampI64(r, -32767, 32767);
+		FifoI64Ins(audio.output[tr.stream].data,
+				   (l & 0xFFFF) | ((r & 0xFFFF) << 16));
+		mono = (l + r) / 2;
+		tr.scope[tr.scope_pos & (TR_SCOPE_N - 1)] = mono;
+		tr.scope_pos++;
+	}
+	tr_play.frames_out += n;
+}
+
+U0 TrEffVolSlide(CTrChan *c, I64 param)
+{
+	I64 up = param >> 4, dn = param & 0x0F;
+
+	if (up)
+		c->vol += up;
+	else
+		c->vol -= dn;
+	c->vol = ClampI64(c->vol, 0, 64);
+}
+
+U0 TrEffTonePorta(CTrChan *c)
+{
+	I64 speed = c->porta_speed * TR_PERIOD_SCALE;
+
+	if (!c->dest_period)
+		return;
+	if (c->period < c->dest_period)
+	{
+		c->period += speed;
+		if (c->period > c->dest_period)
+			c->period = c->dest_period;
+	}
+	else if (c->period > c->dest_period)
+	{
+		c->period -= speed;
+		if (c->period < c->dest_period)
+			c->period = c->dest_period;
+	}
+	if (c->glissando)
+		c->period = TrNotePeriod(TrPeriodNote(c->period, c->finetune),
+								 c->finetune);
+}
+
+U0 TrRowChannel(I64 ch, CTrCell *cell)
+{//Tick 0 of a row: latch instrument, note and effect.
+	CTrChan	*c = &tr_ch[ch];
+	I64		 note, eff, param, sub, target, off, ft;
+	Bool	 porta;
+
+	note  = cell->note;
+	eff	  = cell->eff;
+	param = cell->param;
+	sub	  = param & 0x0F;
+	porta = eff == TRX_TONE_PORTA || eff == TRX_PORTA_VOLSLIDE;
+
+	c->eff			= eff;
+	c->param		= param;
+	c->delay_ticks	= -1;
+	c->cut_tick		= -1;
+
+	//Instrument column selects the sample and resets volume, even with no
+	//note. Amiga behaviour, relied on by countless modules.
+	if (cell->inst && cell->inst < TR_MAX_SAMPLES)
+	{
+		c->inst = cell->inst;
+		c->smp	= &tr_smp[cell->inst];
+		if (c->smp->data)
+		{
+			c->vol		= c->smp->volume;
+			c->finetune	= c->smp->finetune;
+		}
+		else
+			c->smp = NULL;
+	}
+
+	//E5x retunes before the period is computed from the note.
+	if (eff == TRX_EXTENDED && (param >> 4) == 0x5)
+	{
+		ft = sub;
+		if (ft > 7)
+			ft -= 16;
+		c->finetune = ft;
+	}
+
+	if (note == TR_NOTE_OFF)
+	{
+		c->vol	  = 0;
+		c->active = FALSE;
+		note	  = 0;
+	}
+
+	if (note)
+	{
+		c->note = note;
+		if (c->smp)
+			target = TrNotePeriod(ClampI64(note + c->smp->rel_note,
+										   1, TR_NOTES), c->finetune);
+		else
+			target = TrNotePeriod(note, c->finetune);
+		if (porta)
+			c->dest_period = target;
+		else if (eff == TRX_EXTENDED && (param >> 4) == 0xD && sub)
+		{//EDx: hold the note until the given tick.
+			c->delay_ticks	= sub;
+			c->delay_note	= note;
+			c->delay_inst	= cell->inst;
+		}
+		else
+		{
+			c->period		= target;
+			c->dest_period	= target;
+			off				= 0;
+			if (eff == TRX_OFFSET)
+			{
+				if (param)
+					c->offset_mem = param;
+				off = c->offset_mem * 256;
+			}
+			TrChanTrigger(c, off);
+			if (c->vib_wave < 4)
+				c->vib_pos = 0;
+			if (c->trem_wave < 4)
+				c->trem_pos = 0;
+		}
+	}
+
+	//Volume column overrides the instrument default.
+	if (cell->vol)
+		c->vol = ClampI64(cell->vol - 1, 0, 64);
+
+	switch (eff)
+	{
+		case TRX_TONE_PORTA:
+			if (param)
+				c->porta_speed = param;
+			break;
+		case TRX_PORTA_VOLSLIDE:
+			break;			//Slide param belongs to the volume slide.
+		case TRX_VIBRATO:
+			if (param >> 4)
+				c->vib_speed = param >> 4;
+			if (sub)
+				c->vib_depth = sub;
+			break;
+		case TRX_TREMOLO:
+			if (param >> 4)
+				c->trem_speed = param >> 4;
+			if (sub)
+				c->trem_depth = sub;
+			break;
+		case TRX_SET_PAN:
+			c->pan = ClampI64(param, 0, 255);
+			break;
+		case TRX_SET_VOL:
+			c->vol = ClampI64(param, 0, 64);
+			break;
+		case TRX_POS_JUMP:
+			tr_play.jump_order = param;
+			break;
+		case TRX_PAT_BREAK:
+			//Param is two decimal digits, not hex.
+			tr_play.break_row = (param >> 4) * 10 + sub;
+			break;
+		case TRX_SET_SPEED:
+			if (!param)
+				tr_play.ended = TRUE;
+			else if (param < 0x20)
+				tr_song.speed = param;
+			else
+				tr_song.bpm = param;
+			break;
+		case TRX_EXTENDED:
+			switch (param >> 4)
+			{
+				case 0x1:	//Fine portamento up.
+					if (sub)
+						c->fine_up_mem = sub;
+					c->period -= c->fine_up_mem * TR_PERIOD_SCALE;
+					break;
+				case 0x2:	//Fine portamento down.
+					if (sub)
+						c->fine_dn_mem = sub;
+					c->period += c->fine_dn_mem * TR_PERIOD_SCALE;
+					break;
+				case 0x3:
+					c->glissando = sub != 0;
+					break;
+				case 0x4:
+					c->vib_wave = sub;
+					break;
+				case 0x6:	//Pattern loop.
+					if (!sub)
+						c->loop_row = tr_play.row;
+					else
+					{
+						if (!c->loop_count)
+							c->loop_count = sub;
+						else
+							c->loop_count--;
+						if (c->loop_count)
+							tr_play.loop_jump = c->loop_row;
+					}
+					break;
+				case 0x7:
+					c->trem_wave = sub;
+					break;
+				case 0x8:	//Coarse pan, 0..15 spread over 0..255.
+					c->pan = sub * 17;
+					break;
+				case 0x9:	//Retrigger.
+					if (sub)
+						c->retrig_mem = sub;
+					break;
+				case 0xA:	//Fine volume up.
+					if (sub)
+						c->finevol_mem = sub;
+					c->vol = ClampI64(c->vol + c->finevol_mem, 0, 64);
+					break;
+				case 0xB:	//Fine volume down.
+					if (sub)
+						c->finevol_mem = sub;
+					c->vol = ClampI64(c->vol - c->finevol_mem, 0, 64);
+					break;
+				case 0xC:
+					c->cut_tick = sub;
+					break;
+				case 0xE:	//Pattern delay, in rows.
+					if (sub)
+						tr_play.pat_delay = sub;
+					break;
+			}
+			break;
+	}
+}
+
+U0 TrTickChannel(I64 ch, I64 tick)
+{//Ticks 1..speed-1, plus the deferred triggers scheduled on tick 0.
+	CTrChan *c = &tr_ch[ch];
+	I64		 eff = c->eff, param = c->param, sub = param & 0x0F, n;
+
+	if (c->delay_ticks >= 0 && tick >= c->delay_ticks)
+	{
+		if (c->delay_inst && c->delay_inst < TR_MAX_SAMPLES)
+		{
+			c->smp = &tr_smp[c->delay_inst];
+			if (c->smp->data)
+			{
+				c->vol		= c->smp->volume;
+				c->finetune	= c->smp->finetune;
+			}
+		}
+		c->period		= TrNotePeriod(c->delay_note, c->finetune);
+		c->dest_period	= c->period;
+		c->delay_ticks	= -1;
+		TrChanTrigger(c, 0);
+	}
+	if (c->cut_tick >= 0 && tick >= c->cut_tick)
+	{
+		c->vol		= 0;
+		c->cut_tick	= -1;
+	}
+
+	if (tick)
+		switch (eff)
+		{
+			case TRX_ARPEGGIO:
+				break;		//Handled below; it needs the tick index.
+			case TRX_PORTA_UP:
+				c->period -= param * TR_PERIOD_SCALE;
+				break;
+			case TRX_PORTA_DOWN:
+				c->period += param * TR_PERIOD_SCALE;
+				break;
+			case TRX_TONE_PORTA:
+				TrEffTonePorta(c);
+				break;
+			case TRX_VIBRATO:
+				c->vib_pos += c->vib_speed;
+				break;
+			case TRX_PORTA_VOLSLIDE:
+				TrEffTonePorta(c);
+				TrEffVolSlide(c, param);
+				break;
+			case TRX_VIB_VOLSLIDE:
+				c->vib_pos += c->vib_speed;
+				TrEffVolSlide(c, param);
+				break;
+			case TRX_TREMOLO:
+				c->trem_pos += c->trem_speed;
+				break;
+			case TRX_VOLSLIDE:
+				TrEffVolSlide(c, param);
+				break;
+			case TRX_EXTENDED:
+				if ((param >> 4) == 0x9 && c->retrig_mem)
+				{
+					n = c->retrig_mem;
+					if (tick % n == 0)
+						TrChanTrigger(c, 0);
+				}
+				break;
+		}
+
+	c->period		= ClampI64(c->period, TR_PERIOD_MIN, TR_PERIOD_MAX);
+	c->sound_period	= c->period;
+	c->mix_vol		= c->vol;
+
+	if (eff == TRX_ARPEGGIO && param)
+	{
+		n = tick % 3;
+		if (n == 1)
+			c->sound_period = TrNotePeriod(c->note + (param >> 4),
+										   c->finetune);
+		else if (n == 2)
+			c->sound_period = TrNotePeriod(c->note + sub, c->finetune);
+	}
+	if (eff == TRX_VIBRATO || eff == TRX_VIB_VOLSLIDE)
+		c->sound_period += TrWaveDelta(c->vib_wave, c->vib_pos,
+									   c->vib_depth, 128) * TR_PERIOD_SCALE;
+	if (eff == TRX_TREMOLO)
+		c->mix_vol = ClampI64(c->vol + TrWaveDelta(c->trem_wave, c->trem_pos,
+												   c->trem_depth, 64), 0, 64);
+	c->sound_period = ClampI64(c->sound_period, TR_PERIOD_MIN, TR_PERIOD_MAX);
+	TrChanStep(c);
+}
+
+I64 TrPatternForOrder(I64 pos)
+{
+	I64 p;
+
+	if (tr.pat_mode)
+		return ClampI64(tr.cur_pat, 0, TR_MAX_PATTERNS - 1);
+	if (pos < 0 || pos >= tr_song.order_len)
+		return 0;
+	p = tr_song.order[pos];
+	if (p >= TR_MAX_PATTERNS)
+		p = 0;
+
+	return p;
+}
+
+U0 TrMarkPush()
+{//Stamp the sequencer position with the output frame it starts at, so the
+//display can follow what the mixer has actually drained.
+	CTrMark *m = &tr_marks[tr_mark_pos & (TR_MARKS - 1)];
+
+	m->frame = tr_play.frames_out;
+	m->order = tr_play.order_pos;
+	m->pat	 = tr_play.pattern;
+	m->row	 = tr_play.row;
+	tr_mark_pos++;
+}
+
+U0 TrSeqRow()
+{
+	I64		 ch;
+	CTrCell	*cell;
+	CTrCell	 blank;
+
+	MemSet(&blank, 0, sizeof(CTrCell));
+	TrMarkPush;
+	tr_play.jump_order	= -1;
+	tr_play.break_row	= -1;
+	tr_play.loop_jump	= -1;
+	for (ch = 0; ch < tr_song.channels; ch++)
+	{
+		cell = TrCell(tr_play.pattern, ch, tr_play.row);
+		if (!cell)
+			cell = &blank;
+		TrRowChannel(ch, cell);
+	}
+	for (ch = 0; ch < tr_song.channels; ch++)
+		TrTickChannel(ch, 0);
+}
+
+U0 TrSeqAdvance()
+{
+	I64	 rows, nrow, nord;
+	Bool moved = FALSE;
+
+	rows = tr_pat_rows[tr_play.pattern];
+	if (rows < 1)
+		rows = 64;
+	nrow = tr_play.row + 1;
+	nord = tr_play.order_pos;
+
+	if (tr_play.loop_jump >= 0)
+	{
+		nrow  = tr_play.loop_jump;
+		moved = TRUE;
+	}
+	if (tr_play.jump_order >= 0)
+	{
+		nord  = tr_play.jump_order;
+		nrow  = 0;
+		moved = TRUE;
+	}
+	if (tr_play.break_row >= 0)
+	{
+		nrow = tr_play.break_row;
+		if (tr_play.jump_order < 0)
+			nord = tr_play.order_pos + 1;
+		moved = TRUE;
+	}
+	if (!moved && nrow >= rows)
+	{
+		nrow = 0;
+		nord = tr_play.order_pos + 1;
+	}
+
+	if (!tr.pat_mode && nord >= tr_song.order_len)
+	{
+		nord = tr_song.restart;
+		if (nord < 0 || nord >= tr_song.order_len)
+			nord = 0;
+		tr_play.ended = TRUE;
+	}
+	tr_play.order_pos	= nord;
+	tr_play.pattern		= TrPatternForOrder(nord);
+	rows = tr_pat_rows[tr_play.pattern];
+	if (rows < 1)
+		rows = 1;
+	if (nrow >= rows)
+		nrow = 0;
+	tr_play.row = nrow;
+}
+
+U0 TrSeqTick()
+{//One sequencer tick. Sets frames_left for the mixer to consume.
+	I64 ch, speed = tr_song.speed;
+
+	if (speed < 1)
+		speed = 6;
+	if (tr_play.tick == 0)
+		TrSeqRow;
+	else
+		for (ch = 0; ch < tr_song.channels; ch++)
+			TrTickChannel(ch, tr_play.tick);
+
+	tr_play.tick++;
+	if (tr_play.tick >= speed)
+	{
+		tr_play.tick = 0;
+		if (tr_play.pat_delay > 0)
+			tr_play.pat_delay--;
+		else
+			TrSeqAdvance;
+	}
+	//frames per tick = rate * 2.5 / bpm
+	tr_play.tick_frames = TR_RATE * 5 / (ClampI64(tr_song.bpm, 32, 255) * 2);
+	tr_play.frames_left = tr_play.tick_frames;
+}
+
+U0 TrRender(I64 frames)
+{//Split the request at tick boundaries. Mixing runs whether or not the
+//sequencer does, so previewing notes while stopped costs nothing extra.
+	I64 n;
+
+	while (frames > 0)
+	{
+		n = frames;
+		if (tr.playing)
+		{
+			if (tr_play.frames_left <= 0)
+				TrSeqTick;
+			n = MinI64(frames, tr_play.frames_left);
+		}
+		//Cap before charging the tick, or a slow tempo loses the remainder.
+		if (n > TR_BLOCK)
+			n = TR_BLOCK;
+		if (n < 1)
+			n = 1;
+		if (tr.playing)
+			tr_play.frames_left -= n;
+		TrMixFrames(n);
+		frames -= n;
+	}
+}
+
+U0 TrPlayTask()
+{//Feeds the mixer stream ahead of the DMA. Runs for the whole session.
+	I64 target = TR_RATE / 8;	//125ms of queued audio.
+
+	while (!tr.quit)
+	{
+		if (tr.busy)
+		{//Editor owns the song data; hold off and say so.
+			tr.mix_idle = TRUE;
+			Sleep(2);
+		}
+		else
+		{
+			tr.mix_idle = FALSE;
+			if (FifoI64Count(audio.output[tr.stream].data) < target)
+				TrRender(TR_BLOCK);
+			else
+				Sleep(4);
+		}
+	}
+	tr.mix_idle	 = TRUE;
+	tr.play_task = NULL;
+}
+
+U0 TrPlayReset(I64 order_pos, I64 row)
+{
+	I64 ch;
+
+	for (ch = 0; ch < TR_MAX_CHANNELS; ch++)
+	{
+		tr_ch[ch].active	 = FALSE;
+		tr_ch[ch].loop_count = 0;
+		tr_ch[ch].loop_row	 = 0;
+	}
+	tr_play.tick		= 0;
+	tr_play.row			= row;
+	tr_play.order_pos	= order_pos;
+	tr_play.pattern		= TrPatternForOrder(order_pos);
+	tr_play.pat_delay	= 0;
+	tr_play.break_row	= -1;
+	tr_play.jump_order	= -1;
+	tr_play.loop_jump	= -1;
+	tr_play.frames_left	= 0;
+	tr_play.ended		= FALSE;
+}
+
+U0 TrPlayStart(I64 order_pos, I64 row)
+{
+	TrPlayReset(order_pos, row);
+	FifoI64Flush(audio.output[tr.stream].data);
+	audio.output_frames[tr.stream]	= 0;
+	tr_play.frames_out				= 0;
+	tr_mark_pos						= 0;
+	MemSet(tr_marks, 0, sizeof(tr_marks));
+	tr.playing = TRUE;
+}
+
+U0 TrPlayStop()
+{
+	I64 ch;
+
+	tr.playing = FALSE;
+	for (ch = 0; ch < TR_MAX_CHANNELS; ch++)
+		tr_ch[ch].active = FALSE;
+}
+
+U0 TrMixSuspend()
+{//Park the mixer before freeing or replacing patterns and samples. Returns
+//once the render task is provably outside TrRender. The draw handler checks
+//tr.busy too, so give the compositor a frame to notice.
+	I64 spins = 0;
+
+	tr.busy = TRUE;
+	TrPlayStop;
+	while (!tr.mix_idle && TaskValidate(tr.play_task) && spins < 500)
+	{
+		Sleep(1);
+		spins++;
+	}
+	Sleep(40);
+}
+
+U0 TrMixResume()
+{
+	tr.busy = FALSE;
+}
+
+Bool TrMarkNow(I64 *_order, I64 *_pat, I64 *_row)
+{//Latest mark the DMA has already reached.
+	I64		 i, n, played = audio.output_frames[tr.stream];
+	CTrMark	*m, *best = NULL;
+
+	n = tr_mark_pos;
+	if (n > TR_MARKS)
+		n = TR_MARKS;
+	for (i = 0; i < n; i++)
+	{
+		m = &tr_marks[(tr_mark_pos - 1 - i) & (TR_MARKS - 1)];
+		if (m->frame <= played)
+		{
+			best = m;
+			i = n;
+		}
+	}
+	if (!best)
+		return FALSE;
+	*_order	= best->order;
+	*_pat	= best->pat;
+	*_row	= best->row;
+
+	return TRUE;
+}
+
+U0 TrPreview(I64 note, I64 inst, I64 vol)
+{//Audition on a spare channel. The mixer is always running, so this is just
+//a voice trigger; it does not block the UI.
+	I64		 ch, best = 0, quietest = 0x7FFFFFFF;
+	CTrChan	*c;
+
+	if (inst < 1 || inst >= TR_MAX_SAMPLES || !tr_smp[inst].data)
+		return;
+	//Prefer an idle channel; otherwise steal the quietest.
+	for (ch = tr_song.channels - 1; ch >= 0; ch--)
+	{
+		c = &tr_ch[ch];
+		if (!c->active)
+		{
+			best = ch;
+			ch	 = -1;
+		}
+		else if (c->peak < quietest)
+		{
+			quietest = c->peak;
+			best	 = ch;
+		}
+	}
+	c = &tr_ch[best];
+	c->smp			= &tr_smp[inst];
+	c->inst			= inst;
+	c->finetune		= c->smp->finetune;
+	c->vol			= ClampI64(vol, 0, 64);
+	c->mix_vol		= c->vol;
+	c->eff			= 0;
+	c->param		= 0;
+	c->period		= TrNotePeriod(ClampI64(note + c->smp->rel_note,
+											1, TR_NOTES), c->finetune);
+	c->sound_period	= c->period;
+	c->note			= note;
+	TrChanStep(c);
+	TrChanTrigger(c, 0);
+}
