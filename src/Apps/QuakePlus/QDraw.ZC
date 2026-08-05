@@ -69,6 +69,9 @@ I64		q_fog_culled	= 0;
 //surface cache work this frame. declared here because QDrawClear zeroes them
 //well before the cache itself is defined
 I64		q_surf_builds_frame	= 0;
+I64		q_surf_evicts_frame	= 0;
+I64		q_surf_peak_builds	= 0;
+I64		q_surf_peak_evicts	= 0;
 I64		q_surf_hits_frame	= 0;
 
 //--- draw probe -------------------------------------------------------------
@@ -1215,6 +1218,17 @@ U0 QDrawClear(CQCanvas *c, I64 color_index)
 	c->faces_drawn = 0;
 	c->spans_drawn = 0;
 	q_fog_culled   = 0;
+
+	//peaks survive the per-frame reset, so "surfstat" can tell a steady build
+	//load apart from one frame that stalled. an evict count near the build
+	//count is thrash - the cache is dropping what it rebuilds next frame, and
+	//no amount of extra cores fixes that
+	if (q_surf_builds_frame > q_surf_peak_builds)
+		q_surf_peak_builds = q_surf_builds_frame;
+	if (q_surf_evicts_frame > q_surf_peak_evicts)
+		q_surf_peak_evicts = q_surf_evicts_frame;
+	q_surf_evicts_frame = 0;
+
 	q_surf_builds_frame = 0;
 	q_surf_hits_frame   = 0;
 	q_surf_bmip         = 0;
@@ -1713,6 +1727,11 @@ class CQSurfCache
 	I64	 frame;			//last used, for eviction
 	I64	 light_key;		//lighting state built from
 	I64	 texture;		//animation frame built from
+
+	//a worker core is filling this slot. the buffers are allocated and the
+	//face owns the slot, but the texels are garbage until the job is reaped,
+	//so the slot must not be handed out, evicted or freed
+	Bool building;
 };
 
 CQSurfCache	 q_surf[QSURF_SLOTS];
@@ -1730,6 +1749,57 @@ I64			 q_surf_hits	= 0;
 //dereferenced
 U8			 q_surf_rgbonly	= 0;
 #define QSURF_RGBONLY	(&q_surf_rgbonly)
+
+//--- surface builds on other cores ---
+//
+//the texel fill is pure over immutable data - BSP faces, texture mips and
+//compiled lightmaps - so it runs anywhere. only the decision and the
+//allocation stay on the render thread, because MAlloc serialises on one
+//HeapCtrl spinlock and N cores fighting over it would undo the point.
+//
+//a queued surface reports NOT cached, and the caller's existing uncached path
+//lights it per pixel for the frame or two until the job lands. no holes, no
+//placeholder art
+#define QSJ_FREE	0
+#define QSJ_QUEUED	1
+#define QSJ_DONE	2		//written LAST by the worker, read by the reap
+
+#define QSURF_JOBS	1024
+
+class CQSurfJob
+{
+	//fill inputs
+	CQSurfCache	*sc;
+	CQMap		*map;
+	CQFace		*f;
+	CQTexture	*tex;
+	U8			*texels;
+	U8			*lightmap;
+	U8			*lit_base;
+	I64			 cw, ch;
+	I64			 tw, th;
+	I64			 mip;
+	I64			 lm_w, lm_h;
+	I64			 mins_s_i, mins_t_i;
+	Bool		 want_rgb;
+
+	//what the reap stamps onto the slot once the texels are real
+	I64			 slot;
+	I64			 face_index;
+	I64			 key;
+	I64			 tex_key;
+
+	I64			 state;
+};
+
+CQSurfJob	 q_surf_job[QSURF_JOBS];
+I64			 q_surf_job_next	= 0;	//round-robin cursor into the ring
+I64			 q_surf_job_core	= 0;	//and over the worker cores
+I64			 q_surf_job_live	= 0;	//jobs dispatched and not yet reaped
+Bool		 q_surf_mt			= FALSE;
+I64			 q_surf_mt_cores	= 0;
+I64			 q_surf_mt_builds	= 0;	//reaped from workers, for surfstat
+Bool		 q_surf_dispatch_off = FALSE;	//r_surfmt 0, and during a drain
 
 U0 QSurfCacheInit()
 {//globals aren't zeroed, and every pointer here goes to Free on map load -
@@ -1749,7 +1819,23 @@ U0 QSurfCacheInit()
 		q_surf[i].mip       = -1;
 		q_surf[i].light_key = -1;
 		q_surf[i].texture   = -1;
+		q_surf[i].building  = FALSE;
 	}
+
+	for (i = 0; i < QSURF_JOBS; i++)
+		q_surf_job[i].state = QSJ_FREE;
+
+	q_surf_job_next  = 0;
+	q_surf_job_core  = 0;
+	q_surf_job_live  = 0;
+	q_surf_mt_builds = 0;
+
+	//one worker per core beyond this one. mp_count is 1 on a uniprocessor
+	//boot, and JobQueue THROWS for a target_cpu outside it
+	q_surf_mt_cores = mp_count - 1;
+	if (q_surf_mt_cores < 0)
+		q_surf_mt_cores = 0;
+	q_surf_mt = ToBool(q_surf_mt_cores > 0);
 
 	q_face_surf    = NULL;
 	q_face_surf_n  = 0;
@@ -1761,9 +1847,64 @@ U0 QSurfCacheInit()
 	q_surf_hits   = 0;
 }
 
+U0 QSurfJobDrain()
+{//block until no worker is writing into a cache slot.
+ //
+ //MANDATORY before anything frees the buffers or invalidates the map the fill
+ //reads from. a job holds raw pointers into both, and the executive task on
+ //the other core has no idea the map went away
+	CQSurfJob	*j;
+	I64			 i;
+	I64			 live;
+
+	if (!q_surf_mt)
+		return;
+
+	while (TRUE)
+	{
+		live = 0;
+		for (i = 0; i < QSURF_JOBS; i++)
+			if (q_surf_job[i].state == QSJ_QUEUED)
+				live++;
+
+		if (!live)
+			break;
+
+		Yield;
+	}
+
+	//the texels landed but nothing stamped the slot, so the slot describes no
+	//face. release the claim rather than leave it building forever - a flush
+	//wipes it anyway, and a live toggle would otherwise leak a slot that can
+	//be neither used nor evicted
+	for (i = 0; i < QSURF_JOBS; i++)
+	{
+		j = &q_surf_job[i];
+
+		if (j->state != QSJ_FREE && j->sc)
+		{
+			j->sc->building = FALSE;
+			j->sc->face     = -1;
+			j->sc->frame    = -1;
+
+			if (q_face_surf && j->face_index >= 0 &&
+				j->face_index < q_face_surf_n &&
+				q_face_surf[j->face_index] == j->slot)
+				q_face_surf[j->face_index] = -1;
+		}
+
+		j->state = QSJ_FREE;
+	}
+
+	q_surf_job_live = 0;
+}
+
 U0 QSurfCacheFlush()
 {//map change or palette change
 	I64 i;
+
+	//workers hold pointers into these buffers
+	QSurfJobDrain;
 
 	q_surf_flush++;
 
@@ -1785,6 +1926,7 @@ U0 QSurfCacheFlush()
 		q_surf[i].mip       = -1;
 		q_surf[i].light_key = -1;
 		q_surf[i].texture   = -1;
+		q_surf[i].building  = FALSE;
 	}
 
 	if (q_face_surf)
@@ -1839,6 +1981,11 @@ Bool QSurfCacheRelease()
 		if (!q_surf[i].pixels && !q_surf[i].rgb)
 			goto qsr_next;
 
+		//a worker is writing into it - freeing here hands the other core a
+		//dangling pointer
+		if (q_surf[i].building)
+			goto qsr_next;
+
 		//in use this frame, about to be drawn
 		if (q_surf[i].frame == q_surf_frame)
 			goto qsr_next;
@@ -1860,6 +2007,7 @@ qsr_next:
 		q_face_surf[q_surf[best].face] = -1;
 
 	q_surf_bytes -= q_surf[best].bytes;
+	q_surf_evicts_frame++;
 	if (q_surf[best].pixels)
 		Free(q_surf[best].pixels);
 	if (q_surf[best].rgb)
@@ -1887,6 +2035,10 @@ I64 QSurfCacheEvict()
 
 	for (i = 0; i < QSURF_SLOTS; i++)
 	{
+		//a slot under a worker is neither free nor stealable
+		if (q_surf[i].building)
+			goto qse_next;
+
 		if (q_surf[i].face < 0)
 			return i;
 
@@ -1895,6 +2047,8 @@ I64 QSurfCacheEvict()
 			best_frame = q_surf[i].frame;
 			best       = i;
 		}
+
+qse_next:
 	}
 
 	if (best < 0)
@@ -2305,6 +2459,330 @@ I64 QMipForRatio(F64 ratio, I64 prev)
 
 Bool q_prog_mips = TRUE;
 
+U0 QSurfFill(CQSurfJob *j)
+{//the texel loop, lifted out of QSurfCacheGet so a worker core can run it.
+ //
+ //PURE. reads BSP faces, texture mips and a compiled lightmap, all immutable
+ //for the frame; writes only the three planes of its own slot. touches no
+ //cache bookkeeping - the render thread stamps the slot when it reaps
+	CQSurfCache	*sc		= j->sc;
+	CQTexture	*tex	= j->tex;
+	U8			*texels	= j->texels;
+	U8			*out;
+	I64			 cw		= j->cw;
+	I64			 ch		= j->ch;
+	I64			 tw		= j->tw;
+	I64			 th		= j->th;
+	I64			 mip	= j->mip;
+	I64			 lm_w	= j->lm_w;
+	I64			 lm_h	= j->lm_h;
+	U8			*lightmap = j->lightmap;
+	U8			*lit_base = j->lit_base;
+	Bool		 want_rgb = j->want_rgb;
+	I64			 u, v;
+	I64			 tx, ty;
+	I64			 s0, t0;
+	I64			 texel;
+	I64			 light;
+	I64			 shade;
+	F64			 lightv;
+	U32			 argb;
+	I64			 acc_r, acc_g, acc_b, acc_n;
+	I64			 fi, ftx, fty, ftex;
+	I64			 fr2, fg2, fb2;
+	I64			 cr, cg, cb;
+	I64			 ex, ey;
+	U32			 eargb;
+	U32			 raw_argb;
+	I64			 wr, wg, wb;
+	I64			 refv;
+	I64			 lr, lg, lb;
+	I64			 lm;
+
+	out = sc->pixels;
+
+	for (v = 0; v < ch; v++)
+	{
+		t0 = v << mip;
+		ty = QTexWrap((j->mins_t_i + t0) >> mip, th);
+
+		for (u = 0; u < cw; u++)
+		{
+			s0 = u << mip;
+			tx = QTexWrap((j->mins_s_i + s0) >> mip, tw);
+
+			texel = texels[ty * tw + tx];
+
+			if (lightmap && lm_w > 0 && lm_h > 0)
+			{
+				lightv = QLightBilinear(lightmap, lm_w, lm_h,
+							ToF64(s0) / 16.0, ToF64(t0) / 16.0);
+				light  = ClampI64(ToI64(lightv), 0, 255);
+			}
+			else
+			{
+				lightv = 255.0;
+				light  = 255;
+			}
+
+			shade = ClampI64((255 - light) >> 2, 0, QPAL_SHADES - 1);
+
+			//no index plane on a truecolor surface: the colormap lookup and
+			//the store below are both dead work there
+			if (!want_rgb)
+			{
+				if (texel >= QPAL_FULLBRIGHT)
+					out[v * cw + u] = texel;
+				else
+					out[v * cw + u] =
+						qpal_colormap[shade * QPAL_COLORS + texel];
+
+				goto qsf_next_texel;
+			}
+
+			//a cutout carries no colour, and zero is how the span reads one
+			if (tex->is_fence && texel == QFENCE_CUTOUT)
+			{
+				sc->rgb[v * cw + u]     = 0;
+				sc->rgb_raw[v * cw + u] = 0;
+				goto qsf_next_texel;
+			}
+
+			//an RGB mip is a clean filter of the artist's texture, where the
+			//BSP level is a re-quantized palette average. same lighting path
+			//as an external replacement, just a different source
+			if (q_opt_rgbmips && mip > 0 && tex->rgb_mips[mip] &&
+				!tex->ext_rgb)
+			{
+				eargb = tex->rgb_mips[mip][ty * tw + tx];
+
+				if (!eargb)
+				{
+					sc->rgb[v * cw + u]     = 0;
+					sc->rgb_raw[v * cw + u] = 0;
+					goto qsf_next_texel;
+				}
+
+				raw_argb = eargb & 0x00FFFFFF;
+
+				//fullbrights ignore lighting at every mip. QLitTexelRGB does
+				//this for the palette path, so a fullbright surface was
+				//correct at mip 0 and lightmapped from mip 1 down
+				if (texel >= QPAL_FULLBRIGHT)
+				{
+					cr = (eargb >> 16) & 255;
+					cg = (eargb >> 8) & 255;
+					cb = eargb & 255;
+				}
+				else
+				{
+					QLitTexelRGB(QPAL_GREY_REF, lightv, &wr, &wg, &wb);
+					refv = qpal_rgb[QPAL_GREY_REF * 3];
+					if (refv < 1)
+						refv = 1;
+
+					cr = ((eargb >> 16) & 255) * wr / refv;
+					cg = ((eargb >> 8) & 255) * wg / refv;
+					cb = (eargb & 255) * wb / refv;
+				}
+			}
+			//an external replacement supplies real colour; the 8bpp texel
+			//still decides the cutout and still fills the index plane
+			else if (tex->ext_rgb && tex->ext_w > 0 && tex->ext_h > 0)
+			{
+				ex = tx * tex->ext_w / tw;
+				ey = ty * tex->ext_h / th;
+				if (ex < 0) ex = 0;
+				if (ey < 0) ey = 0;
+				if (ex > tex->ext_w - 1) ex = tex->ext_w - 1;
+				if (ey > tex->ext_h - 1) ey = tex->ext_h - 1;
+
+				eargb = tex->ext_rgb[ey * tex->ext_w + ex];
+
+				//the replacement's own alpha is a cutout too
+				if (!eargb)
+				{
+					sc->rgb[v * cw + u]     = 0;
+					sc->rgb_raw[v * cw + u] = 0;
+					goto qsf_next_texel;
+				}
+
+				raw_argb = eargb & 0x00FFFFFF;
+
+				//fullbrights ignore lighting, replacement art included
+				if (texel >= QPAL_FULLBRIGHT)
+				{
+					cr = (eargb >> 16) & 255;
+					cg = (eargb >> 8) & 255;
+					cb = eargb & 255;
+				}
+				else
+				{
+					//Quake's intensity curve read off the grey ramp, so
+					//external art dims exactly as the palette path would
+					QLitTexelRGB(QPAL_GREY_REF, lightv, &wr, &wg, &wb);
+					refv = qpal_rgb[QPAL_GREY_REF * 3];
+					if (refv < 1)
+						refv = 1;
+
+					cr = ((eargb >> 16) & 255) * wr / refv;
+					cg = ((eargb >> 8) & 255) * wg / refv;
+					cb = (eargb & 255) * wb / refv;
+				}
+			}
+			else
+			{
+				//RAW palette RGB, before gamma and tint: those are applied
+				//to the overlay at blit, so a tint costs no cache rebuild
+				QLitTexelRGB(texel, lightv, &cr, &cg, &cb);
+
+				raw_argb = (qpal_rgb[texel * 3] << 16) |
+						   (qpal_rgb[texel * 3 + 1] << 8) |
+							qpal_rgb[texel * 3 + 2];
+			}
+
+			//the 512x512 art is palette-dithered, and point sampling turns
+			//that dither into colour speckle. lighting is near constant over
+			//a 2x2, so averaging the LIT colours filters the texture without
+			//a divide. the index plane stays point sampled
+			if (q_opt_texfilter && !tex->ext_rgb &&
+				!(q_opt_rgbmips && mip > 0 && tex->rgb_mips[mip]))
+			{
+				acc_r = cr;
+				acc_g = cg;
+				acc_b = cb;
+				acc_n = 1;
+
+				for (fi = 1; fi < 4; fi++)
+				{
+					ftx = QTexWrap(tx + (fi & 1), tw);
+					fty = QTexWrap(ty + (fi >> 1), th);
+					ftex = texels[fty * tw + ftx];
+
+					//a cutout carries no colour and would halo the edge
+					if (tex->is_fence && ftex == QFENCE_CUTOUT)
+						goto qsf_next_tap;
+
+					QLitTexelRGB(ftex, lightv, &fr2, &fg2, &fb2);
+					acc_r += fr2;
+					acc_g += fg2;
+					acc_b += fb2;
+					acc_n++;
+
+qsf_next_tap:
+				}
+
+				cr = acc_r / acc_n;
+				cg = acc_g / acc_n;
+				cb = acc_b / acc_n;
+			}
+
+			//.lit carries the colour the mono plane averaged away. the mono
+			//value already holds styles and dlights, so only the chroma
+			//ratio is taken from the RGB luxels
+			if (lit_base && texel < QPAL_FULLBRIGHT)
+			{
+				QLitBilinearRGB(lit_base, lm_w, lm_h, ToF64(s0) / 16.0,
+					ToF64(t0) / 16.0, &lr, &lg, &lb);
+
+				lm = (lr + lg + lb) / 3;
+				if (lm > 0)
+				{
+					cr = cr * lr / lm;
+					cg = cg * lg / lm;
+					cb = cb * lb / lm;
+				}
+			}
+
+			argb = (ClampI64(cr, 0, 255) << 16) |
+				   (ClampI64(cg, 0, 255) << 8) | ClampI64(cb, 0, 255);
+
+			sc->rgb[v * cw + u]     = argb | QRGB_SET;
+			sc->rgb_raw[v * cw + u] = raw_argb;
+
+qsf_next_texel:
+		}
+	}
+}
+
+I64 QSurfFillJob(U8 *data)
+{//worker entry. the state store is LAST and is the publish: the render thread
+ //reads it to decide the texels are real
+	CQSurfJob *j = data;
+
+	QSurfFill(j);
+	j->state = QSJ_DONE;
+
+	return 0;
+}
+
+U0 QSurfJobReap()
+{//stamp finished jobs onto their slots. render thread only, between frames -
+ //a slot becomes visible to QSurfCacheGet exactly here
+	CQSurfJob	*j;
+	CQSurfCache	*sc;
+	I64			 i;
+
+	if (!q_surf_mt)
+		return;
+
+	for (i = 0; i < QSURF_JOBS; i++)
+	{
+		j = &q_surf_job[i];
+		if (j->state != QSJ_DONE)
+			goto qsjr_next;
+
+		sc = j->sc;
+
+		//the slot may have been flushed under the job by a map change
+		if (sc->building)
+		{
+			sc->w         = j->cw;
+			sc->h         = j->ch;
+			sc->mip       = j->mip;
+			sc->face      = j->face_index;
+			sc->frame     = q_surf_frame;
+			sc->light_key = j->key;
+			sc->texture   = j->tex_key;
+			sc->building  = FALSE;
+
+			if (q_face_surf && j->face_index >= 0 &&
+				j->face_index < q_face_surf_n)
+				q_face_surf[j->face_index] = j->slot;
+
+			q_surf_builds++;
+			q_surf_mt_builds++;
+		}
+
+		j->state = QSJ_FREE;
+		q_surf_job_live--;
+
+qsjr_next:
+	}
+
+	if (q_surf_job_live < 0)
+		q_surf_job_live = 0;
+}
+
+I64 QSurfJobAlloc()
+{//a free ring entry, or -1. the ring is the queue depth, not the core count
+	I64 i;
+	I64 k;
+
+	for (i = 0; i < QSURF_JOBS; i++)
+	{
+		k = q_surf_job_next;
+		q_surf_job_next++;
+		if (q_surf_job_next >= QSURF_JOBS)
+			q_surf_job_next = 0;
+
+		if (q_surf_job[k].state == QSJ_FREE)
+			return k;
+	}
+
+	return -1;
+}
+
 U8 *QSurfCacheGet(CQMap *map, CQFace *f, I64 face_index, CQTexture *tex,
 	I64 mip, U8 *lightmap, I64 lm_w, I64 lm_h, I64 *_cw, I64 *_ch,
 	I64 tex_key = 0, U32 **_rgb = NULL, U32 **_rgb_raw = NULL,
@@ -2359,6 +2837,8 @@ U8 *QSurfCacheGet(CQMap *map, CQFace *f, I64 face_index, CQTexture *tex,
 	I64			 lg;
 	I64			 lb;
 	I64			 lm;
+	CQSurfJob	 job;
+	I64			 ji;
 
 	//slots are indexed by face number within ONE map - an external brush model
 	//numbers its own faces and would collide with the world
@@ -2381,6 +2861,13 @@ U8 *QSurfCacheGet(CQMap *map, CQFace *f, I64 face_index, CQTexture *tex,
 	want_mip = mip;
 	if (_mip)
 		*_mip = mip;
+
+	//a worker owns this face already. the planes hold garbage until the reap,
+	//and re-entering below would queue a second job for the same slot
+	slot = q_face_surf[face_index];
+	if (slot >= 0 && slot < QSURF_SLOTS && q_surf[slot].building &&
+		q_surf[slot].face == face_index)
+		return NULL;
 
 	if (q_prog_mips)
 	{
@@ -2566,212 +3053,70 @@ U8 *QSurfCacheGet(CQMap *map, CQFace *f, I64 face_index, CQTexture *tex,
 		lm_w > 0 && lm_h > 0)
 		lit_base = map->litdata + f->light_offset * 3;
 
-	out      = sc->pixels;
-	mins_s_i = ToI64(f->mins_s);
-	mins_t_i = ToI64(f->mins_t);
+	//--- everything below is the fill; package it so either thread can run ---
+	job.sc         = sc;
+	job.map        = map;
+	job.f          = f;
+	job.tex        = tex;
+	job.texels     = texels;
+	job.lightmap   = lightmap;
+	job.lit_base   = lit_base;
+	job.cw         = cw;
+	job.ch         = ch;
+	job.tw         = tw;
+	job.th         = th;
+	job.mip        = mip;
+	job.lm_w       = lm_w;
+	job.lm_h       = lm_h;
+	job.mins_s_i   = ToI64(f->mins_s);
+	job.mins_t_i   = ToI64(f->mins_t);
+	job.want_rgb   = want_rgb;
+	job.slot       = slot;
+	job.face_index = face_index;
+	job.key        = key;
+	job.tex_key    = tex_key;
 
-	for (v = 0; v < ch; v++)
+	out = sc->pixels;
+
+	//OFFLOAD, when there is a core to take it and the lightmap is stable.
+	//
+	//QLightFaceMap hands back q_light_scratch for an animated or dlit face -
+	//one shared buffer the render thread rewrites for the very next face - so
+	//those fill here. a compiled lightmap points into map->lightdata and is
+	//immutable, which is the overwhelming majority
+	if (q_surf_mt && !q_surf_dispatch_off &&
+		(!lightmap || lightmap != q_light_scratch))
 	{
-		t0 = v << mip;
-		ty = QTexWrap((mins_t_i + t0) >> mip, th);
-
-		for (u = 0; u < cw; u++)
+		ji = QSurfJobAlloc;
+		if (ji >= 0)
 		{
-			s0 = u << mip;
-			tx = QTexWrap((mins_s_i + s0) >> mip, tw);
+			MemCopy(&q_surf_job[ji], &job, sizeof(CQSurfJob));
 
-			texel = texels[ty * tw + tx];
+			//claim the slot BEFORE the job can land, so a second sighting of
+			//this face finds it and does not queue a duplicate
+			sc->face     = face_index;
+			sc->building = TRUE;
+			q_face_surf[face_index] = slot;
 
-			if (lightmap && lm_w > 0 && lm_h > 0)
-			{
-				lightv = QLightBilinear(lightmap, lm_w, lm_h,
-							ToF64(s0) / 16.0, ToF64(t0) / 16.0);
-				light  = ClampI64(ToI64(lightv), 0, 255);
-			}
-			else
-			{
-				lightv = 255.0;
-				light  = 255;
-			}
+			q_surf_job[ji].state = QSJ_QUEUED;
+			q_surf_job_live++;
+			q_surf_builds_frame++;
 
-			shade = ClampI64((255 - light) >> 2, 0, QPAL_SHADES - 1);
+			//round robin over the cores past this one
+			q_surf_job_core++;
+			if (q_surf_job_core > q_surf_mt_cores)
+				q_surf_job_core = 1;
 
-			//no index plane on a truecolor surface: the colormap lookup and
-			//the store below are both dead work there
-			if (!want_rgb)
-			{
-				if (texel >= QPAL_FULLBRIGHT)
-					out[v * cw + u] = texel;
-				else
-					out[v * cw + u] =
-						qpal_colormap[shade * QPAL_COLORS + texel];
+			JobQueue(&QSurfFillJob, &q_surf_job[ji], q_surf_job_core,
+				1 << JOBf_FREE_ON_COMPLETE);
 
-				goto qsc_next_texel;
-			}
-
-			//a cutout carries no colour, and zero is how the span reads one
-			if (tex->is_fence && texel == QFENCE_CUTOUT)
-			{
-				sc->rgb[v * cw + u]     = 0;
-				sc->rgb_raw[v * cw + u] = 0;
-				goto qsc_next_texel;
-			}
-
-			//an RGB mip is a clean filter of the artist's texture, where the
-			//BSP level is a re-quantized palette average. same lighting path
-			//as an external replacement, just a different source
-			if (q_opt_rgbmips && mip > 0 && tex->rgb_mips[mip] &&
-				!tex->ext_rgb)
-			{
-				eargb = tex->rgb_mips[mip][ty * tw + tx];
-
-				if (!eargb)
-				{
-					sc->rgb[v * cw + u]     = 0;
-					sc->rgb_raw[v * cw + u] = 0;
-					goto qsc_next_texel;
-				}
-
-				raw_argb = eargb & 0x00FFFFFF;
-
-				//fullbrights ignore lighting at every mip. QLitTexelRGB does
-				//this for the palette path, so a fullbright surface was
-				//correct at mip 0 and lightmapped from mip 1 down
-				if (texel >= QPAL_FULLBRIGHT)
-				{
-					cr = (eargb >> 16) & 255;
-					cg = (eargb >> 8) & 255;
-					cb = eargb & 255;
-				}
-				else
-				{
-					QLitTexelRGB(QPAL_GREY_REF, lightv, &wr, &wg, &wb);
-					refv = qpal_rgb[QPAL_GREY_REF * 3];
-					if (refv < 1)
-						refv = 1;
-
-					cr = ((eargb >> 16) & 255) * wr / refv;
-					cg = ((eargb >> 8) & 255) * wg / refv;
-					cb = (eargb & 255) * wb / refv;
-				}
-			}
-			//an external replacement supplies real colour; the 8bpp texel
-			//still decides the cutout and still fills the index plane
-			else if (tex->ext_rgb && tex->ext_w > 0 && tex->ext_h > 0)
-			{
-				ex = tx * tex->ext_w / tw;
-				ey = ty * tex->ext_h / th;
-				if (ex < 0) ex = 0;
-				if (ey < 0) ey = 0;
-				if (ex > tex->ext_w - 1) ex = tex->ext_w - 1;
-				if (ey > tex->ext_h - 1) ey = tex->ext_h - 1;
-
-				eargb = tex->ext_rgb[ey * tex->ext_w + ex];
-
-				//the replacement's own alpha is a cutout too
-				if (!eargb)
-				{
-					sc->rgb[v * cw + u]     = 0;
-					sc->rgb_raw[v * cw + u] = 0;
-					goto qsc_next_texel;
-				}
-
-				raw_argb = eargb & 0x00FFFFFF;
-
-				//fullbrights ignore lighting, replacement art included
-				if (texel >= QPAL_FULLBRIGHT)
-				{
-					cr = (eargb >> 16) & 255;
-					cg = (eargb >> 8) & 255;
-					cb = eargb & 255;
-				}
-				else
-				{
-					//Quake's intensity curve read off the grey ramp, so
-					//external art dims exactly as the palette path would
-					QLitTexelRGB(QPAL_GREY_REF, lightv, &wr, &wg, &wb);
-					refv = qpal_rgb[QPAL_GREY_REF * 3];
-					if (refv < 1)
-						refv = 1;
-
-					cr = ((eargb >> 16) & 255) * wr / refv;
-					cg = ((eargb >> 8) & 255) * wg / refv;
-					cb = (eargb & 255) * wb / refv;
-				}
-			}
-			else
-			{
-				//RAW palette RGB, before gamma and tint: those are applied
-				//to the overlay at blit, so a tint costs no cache rebuild
-				QLitTexelRGB(texel, lightv, &cr, &cg, &cb);
-
-				raw_argb = (qpal_rgb[texel * 3] << 16) |
-						   (qpal_rgb[texel * 3 + 1] << 8) |
-							qpal_rgb[texel * 3 + 2];
-			}
-
-			//the 512x512 art is palette-dithered, and point sampling turns
-			//that dither into colour speckle. lighting is near constant over
-			//a 2x2, so averaging the LIT colours filters the texture without
-			//a divide. the index plane stays point sampled
-			if (q_opt_texfilter && !tex->ext_rgb &&
-				!(q_opt_rgbmips && mip > 0 && tex->rgb_mips[mip]))
-			{
-				acc_r = cr;
-				acc_g = cg;
-				acc_b = cb;
-				acc_n = 1;
-
-				for (fi = 1; fi < 4; fi++)
-				{
-					ftx = QTexWrap(tx + (fi & 1), tw);
-					fty = QTexWrap(ty + (fi >> 1), th);
-					ftex = texels[fty * tw + ftx];
-
-					//a cutout carries no colour and would halo the edge
-					if (tex->is_fence && ftex == QFENCE_CUTOUT)
-						goto qsc_next_tap;
-
-					QLitTexelRGB(ftex, lightv, &fr2, &fg2, &fb2);
-					acc_r += fr2;
-					acc_g += fg2;
-					acc_b += fb2;
-					acc_n++;
-
-qsc_next_tap:
-				}
-
-				cr = acc_r / acc_n;
-				cg = acc_g / acc_n;
-				cb = acc_b / acc_n;
-			}
-
-			//.lit carries the colour the mono plane averaged away. the mono
-			//value already holds styles and dlights, so only the chroma
-			//ratio is taken from the RGB luxels
-			if (lit_base && texel < QPAL_FULLBRIGHT)
-			{
-				QLitBilinearRGB(lit_base, lm_w, lm_h, ToF64(s0) / 16.0,
-					ToF64(t0) / 16.0, &lr, &lg, &lb);
-
-				lm = (lr + lg + lb) / 3;
-				if (lm > 0)
-				{
-					cr = cr * lr / lm;
-					cg = cg * lg / lm;
-					cb = cb * lb / lm;
-				}
-			}
-
-			argb = (ClampI64(cr, 0, 255) << 16) |
-				   (ClampI64(cg, 0, 255) << 8) | ClampI64(cb, 0, 255);
-
-			sc->rgb[v * cw + u]     = argb | QRGB_SET;
-			sc->rgb_raw[v * cw + u] = raw_argb;
-
-qsc_next_texel:
+			//not cached THIS frame - the caller lights it per pixel until the
+			//reap stamps the slot
+			return NULL;
 		}
 	}
+
+	QSurfFill(&job);
 
 	if (_rgb)
 		*_rgb = sc->rgb;
@@ -4776,32 +5121,6 @@ U8 QSkyTexel(I64 face, F64 u, F64 v)
 	return p[iv * w + iu];
 }
 
-I64 QSkyTexelA(I64 face, F64 u, F64 v)
-{//alpha at a cube texel. 0 where the face carries no plane, so a sky without
- //an alpha channel simply never drifts
-	U8	*p;
-	I64	 w;
-	I64	 h;
-	I64	 iu;
-	I64	 iv;
-
-	if (!q_sky_ready || face < 0 || face >= QSKY_FACES)
-		return 0;
-	p = q_sky_a[face];
-	if (!p)
-		return 0;
-
-	w = q_sky_w[face];
-	h = q_sky_h[face];
-	iu = ToI64(u);
-	iv = ToI64(v);
-	if (iu < 0) iu = 0;
-	if (iu >= w) iu = w - 1;
-	if (iv < 0) iv = 0;
-	if (iv >= h) iv = h - 1;
-	return p[iv * w + iu];
-}
-
 U32 QSkyTexelRGB(I64 face, F64 u, F64 v)
 {//0 when this face has no RGB source; caller falls back to the index plane
 	U32 *p;
@@ -4826,6 +5145,52 @@ U32 QSkyTexelRGB(I64 face, F64 u, F64 v)
 	if (iv >= h) iv = h - 1;
 	return p[iv * w + iu];
 }
+
+I64 QSkyTexelAlphaRGB(I64 face, F64 u, F64 v, U32 *_rgb)
+{//alpha and colour from ONE index computation, for the wind layers. the RGB
+ //load is skipped where alpha is zero - the composite discards it there, and
+ //that is most of a cloud plane
+	U8	*a;
+	U32	*p;
+	I64	 w;
+	I64	 h;
+	I64	 iu;
+	I64	 iv;
+	I64	 idx;
+	I64	 av;
+
+	*_rgb = 0;
+	if (!q_sky_ready || face < 0 || face >= QSKY_FACES)
+		return 0;
+	a = q_sky_a[face];
+	if (!a)
+		return 0;
+
+	w = q_sky_w[face];
+	h = q_sky_h[face];
+	iu = ToI64(u);
+	iv = ToI64(v);
+	if (iu < 0) iu = 0;
+	if (iu >= w) iu = w - 1;
+	if (iv < 0) iv = 0;
+	if (iv >= h) iv = h - 1;
+
+	idx = iv * w + iu;
+	av  = a[idx];
+	if (av)
+	{
+		p = q_sky_rgb[face];
+		if (p)
+			*_rgb = p[idx];
+	}
+	return av;
+}
+
+//skywind cost counters, reported by "skywind" with no argument. an edge block
+//falls back to a ray per pixel per layer, which is the expensive case
+I64	q_sky_blocks		= 0;
+I64	q_sky_edge_blocks	= 0;
+I64	q_sky_slow_px		= 0;
 
 //per-block layer state, so the taps interpolate like the base already does
 I64	q_wl_f[2];			//face at the block start, per layer
@@ -4931,29 +5296,39 @@ U32 QSkyWindPixel(U32 base)
 	F64	 u;
 	F64	 v;
 
-	if (q_wl_flat[0])
+	//a layer whose cross-fade weight is zero contributes nothing; skip its ray
+	//and its fetch outright
+	a1 = 0;
+	l1 = 0;
+	if (q_skywind_wi1)
 	{
-		f = q_wl_f[0];
-		u = q_wl_u[0];
-		v = q_wl_v[0];
+		if (q_wl_flat[0])
+		{
+			f = q_wl_f[0];
+			u = q_wl_u[0];
+			v = q_wl_v[0];
+		}
+		else
+			QSkyRay(&q_wl_da[0], &f, &u, &v);
+
+		a1 = QSkyTexelAlphaRGB(f, u, v, &l1);
 	}
-	else
-		QSkyRay(&q_wl_da[0], &f, &u, &v);
 
-	a1 = QSkyTexelA(f, u, v);
-	l1 = QSkyTexelRGB(f, u, v);
-
-	if (q_wl_flat[1])
+	a2 = 0;
+	l2 = 0;
+	if (q_skywind_wi2)
 	{
-		f = q_wl_f[1];
-		u = q_wl_u[1];
-		v = q_wl_v[1];
-	}
-	else
-		QSkyRay(&q_wl_da[3], &f, &u, &v);
+		if (q_wl_flat[1])
+		{
+			f = q_wl_f[1];
+			u = q_wl_u[1];
+			v = q_wl_v[1];
+		}
+		else
+			QSkyRay(&q_wl_da[3], &f, &u, &v);
 
-	a2 = QSkyTexelA(f, u, v);
-	l2 = QSkyTexelRGB(f, u, v);
+		a2 = QSkyTexelAlphaRGB(f, u, v, &l2);
+	}
 
 	//no cloud here - most of a cube face, and the whole of one with no alpha
 	if (!a1 && !a2)
@@ -5029,9 +5404,14 @@ U0 QDrawSkyBoxSpan(CQCanvas *c, I64 y, I64 x1, I64 x2, F64 iz1, F64 iz2)
 	I64	 f0;
 	I64	 f1;
 	I64	 fc;
+	Bool wind;
 
 	if (y < c->vy || y >= c->vy + c->vh)
 		return;
+
+	//hoisted: two global loads and a branch per pixel otherwise, and the wind
+	//and still paths get separate inner loops below
+	wind = ToBool(q_skywind_on && q_skywind_en);
 	span = ToF64(x2 - x1);
 	if (span <= 0.0)
 		return;
@@ -5084,39 +5464,57 @@ U0 QDrawSkyBoxSpan(CQCanvas *c, I64 y, I64 x1, I64 x2, F64 iz1, F64 iz2)
 			v = v0;
 			fc = f0;
 
-			//both drift layers set up ONCE for this block
-			if (q_skywind_on && q_skywind_en)
+			if (wind)
+			{
+				//both drift layers set up ONCE for this block
 				QSkyWindBlock(dir, cur, n);
 
-			while (x < xe)
-			{
-				if (ToI64(iz * QDEPTH_SCALE) >= zrow[x])
-				{
-					//the index plane is filled either way: if anything
-					//later drops the overlay at this pixel, the 8bpp
-					//quantized sky is what has to show through
-					row[x] = QSkyTexel(fc, u, v);
+				q_sky_blocks++;
+				if (!q_wl_flat[0] || !q_wl_flat[1])
+					q_sky_edge_blocks++;
 
-					texel = 0;
-					if (crow)
+				while (x < xe)
+				{
+					if (ToI64(iz * QDEPTH_SCALE) >= zrow[x])
 					{
-						texel = QSkyTexelRGB(fc, u, v);
+						//the index plane is filled either way: if anything
+						//later drops the overlay at this pixel, the 8bpp
+						//quantized sky is what has to show through
+						row[x] = QSkyTexel(fc, u, v);
 
 						//the base is already sampled - only the two layers
 						//are composited over it
-						if (q_skywind_on && q_skywind_en)
-							texel = QSkyWindPixel(texel);
+						if (crow)
+							crow[x] = QSkyWindPixel(QSkyTexelRGB(fc, u, v));
 
-						crow[x] = texel;
+						zrow[x] = 0;
 					}
-					zrow[x] = 0;
-				}
-				iz += d_iz;
-				u  += du;
-				v  += dv;
-				if (q_skywind_on && q_skywind_en)
+					iz += d_iz;
+					u  += du;
+					v  += dv;
+
+					//advances whether or not the pixel was written - the
+					//layers track x, not the depth test
 					QSkyWindStep;
-				x++;
+					x++;
+				}
+			}
+			else
+			{
+				while (x < xe)
+				{
+					if (ToI64(iz * QDEPTH_SCALE) >= zrow[x])
+					{
+						row[x] = QSkyTexel(fc, u, v);
+						if (crow)
+							crow[x] = QSkyTexelRGB(fc, u, v);
+						zrow[x] = 0;
+					}
+					iz += d_iz;
+					u  += du;
+					v  += dv;
+					x++;
+				}
 			}
 			for (i = 0; i < 3; i++)
 				dir[i] = cur[i];
@@ -5140,8 +5538,9 @@ U0 QDrawSkyBoxSpan(CQCanvas *c, I64 y, I64 x1, I64 x2, F64 iz1, F64 iz2)
 
 						//this branch already rays every pixel, so the layers
 						//are set up for a single-pixel run
-						if (q_skywind_on && q_skywind_en)
+						if (wind)
 						{
+							q_sky_slow_px++;
 							QSkyWindBlock(dir, dir, 1);
 							texel = QSkyWindPixel(texel);
 						}
