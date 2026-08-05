@@ -6336,19 +6336,44 @@ U32 QFogApply(U32 rgb, I64 izi)
 			ClampI64(sb, 0, 255);
 }
 
-U0 QFogBakeCanvas(CQCanvas *c)
-{//fog and the cshift at CANVAS resolution, into the overlay plane
- //
- //the blit stretches the canvas to the window and was fogging every
- //DESTINATION pixel: 640x360 renders 230k pixels but a 1280x720 window fogs
- //921k of them - four times the work for the same image, and measured at
- //8.2ms against a 4.6ms world pass. baking here costs one pass over the view
- //rect and the blit becomes a copy
- //
- //the cshift rides along because it has the same scope: R_PolyBlend covers
- //the 3D view and nothing else. 2D writers stamp QDEPTH_2D, which lands past
- //the end of the fog LUT and selects the untinted palette here, so the status
- //bar, the console and the menu are exempt from both
+//--- full-frame passes split by scanline band ---
+//
+//the post-process and the blit are one pass each over the whole image with no
+//cross-row dependency, so a band per core is a fork-join with no ownership
+//problem at all: nothing is allocated, nothing outlives the join.
+//
+//FORK-JOIN, not the surface cache's fire-and-forget - these results are the
+//frame being presented, so they are needed before it can be shown
+#define QROW_BANDS		16
+#define QROW_MIN_ROWS	64		//below this the IPI costs more than the work
+
+class CQRowJob
+{
+	CQCanvas	*c;
+	CDC			*dc;
+	I64			 y0, y1;
+	I64			 dst_x, dst_y, dst_w, dst_h;
+};
+
+//SEPARATE SETS PER CALL SITE. the bake runs on the game task inside
+//QPresentFrame and the blit runs on the WM task, so the two overlap in time.
+//one shared set has each overwriting the other's job structs and CJob
+//pointers, and JobResGet then spins on a job that was already freed
+CQRowJob	 q_fog_job[QROW_BANDS];
+CJob		*q_fog_cmd[QROW_BANDS];
+CQRowJob	 q_blit_job[QROW_BANDS];
+CJob		*q_blit_cmd[QROW_BANDS];
+
+//raised for the whole of a blit, workers included. QPresentFree waits on it:
+//a resolution change frees the snapshot buffers the bands are reading, and
+//the old "one blit is dropped" guard only covered the single-threaded case
+//where clearing q_present_ok was enough
+Bool		 q_blit_busy = FALSE;
+Bool		 q_mt_post = TRUE;		//r_mtpost
+
+U0 QFogBakeBand(CQCanvas *c, I64 y0, I64 y1)
+{//rows [y0, y1) of the bake. reads the canvas and the fused table, writes only
+ //the overlay row it is on
 	U8	*src;
 	U32	*crow;
 	I32	*zrow;
@@ -6361,29 +6386,15 @@ U0 QFogBakeCanvas(CQCanvas *c)
 	I64	 x0;
 	I64	 x1;
 
-	if (!c || c->prefogged)
-		return;
-
-	if (!c->rgb || !c->depth)
-		return;
-
 	fogged = ToBool(q_opt_fog && q_fog_on);
 	tinted = ToBool(q_tint_a != 0);
-
-	//gamma and contrast are applied here too, so a non-identity ramp is on its
-	//own reason to bake - the blit's palette path cannot fog what it corrects
-	if (!fogged && !tinted && qpal_post_identity)
-		return;
-
-	if (q_fogpost_dirty)
-		QFogPostBuild;
 
 	x0 = c->vx;
 	x1 = c->vx + c->vw;
 	if (x0 < 0)			x0 = 0;
 	if (x1 > c->width)	x1 = c->width;
 
-	for (y = c->vy; y < c->vy + c->vh && y < c->height; y++)
+	for (y = y0; y < y1; y++)
 	{
 		src  = c->pixels + y * c->width;
 		crow = c->rgb + y * c->width;
@@ -6428,22 +6439,110 @@ U0 QFogBakeCanvas(CQCanvas *c)
 			}
 		}
 	}
+}
+
+I64 QFogBakeJob(U8 *data)
+{
+	CQRowJob *j = data;
+
+	QFogBakeBand(j->c, j->y0, j->y1);
+
+	return 0;
+}
+
+U0 QFogBakeCanvas(CQCanvas *c)
+{//fog and the cshift at CANVAS resolution, into the overlay plane
+ //
+ //the blit stretches the canvas to the window and was fogging every
+ //DESTINATION pixel: 640x360 renders 230k pixels but a 1280x720 window fogs
+ //921k of them - four times the work for the same image, and measured at
+ //8.2ms against a 4.6ms world pass. baking here costs one pass over the view
+ //rect and the blit becomes a copy
+ //
+ //the cshift rides along because it has the same scope: R_PolyBlend covers
+ //the 3D view and nothing else. 2D writers stamp QDEPTH_2D, which lands past
+ //the end of the fog LUT and selects the untinted palette here, so the status
+ //bar, the console and the menu are exempt from both
+	Bool tinted;
+	Bool fogged;
+	I64	 y0;
+	I64	 y1;
+	I64	 rows;
+	I64	 bands;
+	I64	 i;
+
+	if (!c || c->prefogged)
+		return;
+
+	if (!c->rgb || !c->depth)
+		return;
+
+	fogged = ToBool(q_opt_fog && q_fog_on);
+	tinted = ToBool(q_tint_a != 0);
+
+	//gamma and contrast are applied here too, so a non-identity ramp is on its
+	//own reason to bake - the blit's palette path cannot fog what it corrects
+	if (!fogged && !tinted && qpal_post_identity)
+		return;
+
+	//BEFORE the fork: every band reads this table
+	if (q_fogpost_dirty)
+		QFogPostBuild;
+
+	y0 = c->vy;
+	if (y0 < 0)
+		y0 = 0;
+	y1 = c->vy + c->vh;
+	if (y1 > c->height)
+		y1 = c->height;
+
+	rows = y1 - y0;
+	if (rows < 1)
+		return;
+
+	bands = 1;
+	if (q_mt_post && q_surf_mt_cores > 0 && rows >= QROW_MIN_ROWS)
+	{
+		bands = q_surf_mt_cores + 1;
+		if (bands > QROW_BANDS)
+			bands = QROW_BANDS;
+	}
+
+	if (bands > 1)
+	{
+		//bands 1..n-1 to the other cores, band 0 on this one - the render
+		//thread waits either way, so it may as well carry a share
+		for (i = 1; i < bands; i++)
+		{
+			q_fog_job[i].c  = c;
+			q_fog_job[i].y0 = y0 + rows * i / bands;
+			q_fog_job[i].y1 = y0 + rows * (i + 1) / bands;
+
+			//flags 0, NOT free-on-complete: JobResGet needs the CJob to still
+			//be there to spin on
+			q_fog_cmd[i] = JobQueue(&QFogBakeJob, &q_fog_job[i], i, 0);
+		}
+
+		QFogBakeBand(c, y0, y0 + rows / bands);
+
+		for (i = 1; i < bands; i++)
+			JobResGet(q_fog_cmd[i]);
+	}
+	else
+		QFogBakeBand(c, y0, y1);
 
 	c->prefogged = TRUE;
 }
 
-U0 QDrawBlitFit(CQCanvas *c, CDC *dc, I64 dst_x, I64 dst_y, I64 dst_w,
-	I64 dst_h)
-{//stretch the indexed canvas into any destination rect
- //
- //integer-only scaling made higher render resolutions display SMALLER. a
- //fixed-point source step lets any render size fill the same rectangle
+U0 QBlitFitBand(CQCanvas *c, CDC *dc, I64 dst_x, I64 dst_y, I64 dst_w,
+	I64 dst_h, I64 y0, I64 y1)
+{//destination rows [y0, y1) of the stretch. each row reads one source row and
+ //writes one destination row, so bands never overlap
 	U8	*src;
 	U32	*dst;
 	U32	*crow;
 	I32	*zrow;
 	U32	 col;
-	//baked at canvas resolution, see QFogBakeCanvas - nothing to do per pixel
 	Bool fog = ToBool(q_opt_fog && q_fog_on && !c->prefogged);
 	I64	 sx_step;
 	I64	 sy_step;
@@ -6456,15 +6555,12 @@ U0 QDrawBlitFit(CQCanvas *c, CDC *dc, I64 dst_x, I64 dst_y, I64 dst_w,
 	I64	 sx;
 	I64	 pitch = dc->width_internal;
 
-	if (dst_w < 1 || dst_h < 1)
-		return;
-
 	//16.16 fixed point. parenthesised - shifts bind tighter than divide in
 	//this compiler and it reorders these silently
 	sx_step = (c->width << 16) / dst_w;
 	sy_step = (c->height << 16) / dst_h;
 
-	for (y = 0; y < dst_h; y++)
+	for (y = y0; y < y1; y++)
 	{
 		py = dst_y + y;
 		if (py < 0 || py >= dc->height)
@@ -6533,6 +6629,65 @@ U0 QDrawBlitFit(CQCanvas *c, CDC *dc, I64 dst_x, I64 dst_y, I64 dst_w,
 
 qbf_next_row:
 	}
+}
+
+I64 QBlitFitJob(U8 *data)
+{
+	CQRowJob *j = data;
+
+	QBlitFitBand(j->c, j->dc, j->dst_x, j->dst_y, j->dst_w, j->dst_h,
+		j->y0, j->y1);
+
+	return 0;
+}
+
+U0 QDrawBlitFit(CQCanvas *c, CDC *dc, I64 dst_x, I64 dst_y, I64 dst_w,
+	I64 dst_h)
+{//stretch the indexed canvas into any destination rect
+ //
+ //integer-only scaling made higher render resolutions display SMALLER. a
+ //fixed-point source step lets any render size fill the same rectangle
+	I64 bands;
+	I64 i;
+
+	if (dst_w < 1 || dst_h < 1)
+		return;
+
+	bands = 1;
+	if (q_mt_post && q_surf_mt_cores > 0 && dst_h >= QROW_MIN_ROWS)
+	{
+		bands = q_surf_mt_cores + 1;
+		if (bands > QROW_BANDS)
+			bands = QROW_BANDS;
+	}
+
+	q_blit_busy = TRUE;
+
+	if (bands > 1)
+	{
+		for (i = 1; i < bands; i++)
+		{
+			q_blit_job[i].c     = c;
+			q_blit_job[i].dc    = dc;
+			q_blit_job[i].dst_x = dst_x;
+			q_blit_job[i].dst_y = dst_y;
+			q_blit_job[i].dst_w = dst_w;
+			q_blit_job[i].dst_h = dst_h;
+			q_blit_job[i].y0    = dst_h * i / bands;
+			q_blit_job[i].y1    = dst_h * (i + 1) / bands;
+
+			q_blit_cmd[i] = JobQueue(&QBlitFitJob, &q_blit_job[i], i, 0);
+		}
+
+		QBlitFitBand(c, dc, dst_x, dst_y, dst_w, dst_h, 0, dst_h / bands);
+
+		for (i = 1; i < bands; i++)
+			JobResGet(q_blit_cmd[i]);
+	}
+	else
+		QBlitFitBand(c, dc, dst_x, dst_y, dst_w, dst_h, 0, dst_h);
+
+	q_blit_busy = FALSE;
 }
 
 U0 QDrawBlit(CQCanvas *c, CDC *dc, I64 dst_x, I64 dst_y, I64 scale)
