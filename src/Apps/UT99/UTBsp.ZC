@@ -32,11 +32,17 @@
 #define UT_PF_PORTAL			0x04000000	//UnObj.h — portal between iZones
 #define UT_PF_MIRRORED			0x08000000
 #define UT_PORTAL_MAX			3		//UnRender MAX_FRAME_RECURSION soft cap
+#define UT_PORTAL_NESTS_MAX		2		//nested walks per frame
+#define UT_SKY_NESTS_MAX		2
 
 I64 ut_portal_depth	= 0;
 I64 ut_portal_zone	= -1;	//-1 main; else opposite iZone nest filter
-I64 ut_portal_nests	= 0;	//diag: nest Walk count this frame
-CUTSpanBuf ut_portal_scissor;	//CreateChildFrame Span (portal ∩ screen)
+I64 ut_portal_nests	= 0;	//nested Walk count this frame
+I64 ut_sky_frames	= 0;	//sky nests this frame
+//One scissor per recursion depth. A single shared buffer made the nested
+//walk receive span_opaque aliased to the buffer it then re-rasterized and
+//self-ANDed, which never terminated.
+CUTSpanBuf ut_portal_scissor[UT_PORTAL_MAX + 2];
 
 extern I64 UTZoneFindWarpNear(F64 *org);
 extern I64 UTZoneWarpPair(I64 from_i);
@@ -577,7 +583,6 @@ Bool UTBspLoadModel(CUTPackage *pkg, I64 exp_i, CUTBsp *b)
 			b->num_lights = i;
 		}
 	}
-	UTLog("UTBsp: lights_refs=%d\n", b->num_lights);
 
 	//GLightManager FogMap mip stand-in: DWORD Photon RGB from LightBits
 	//density. SoftDrv FogData.Ptr = Surface.FogMap->Mips[0]->DataPtr.
@@ -789,10 +794,16 @@ U0 UTBspBuildLightMaps(CUTBsp *b)
 							ofs = d2 * rrmult;
 							if (ofs < 4096.0)
 							{
-								atten = 1.0 - Sqrt(ofs / 4096.0);
+								//UnLight LightSqrt build: S = sqrt(ofs/4096),
+								//falloff = 2S^3 - 3S^2 + 1. Epic's comment
+								//calls this the luminous/specular curve and
+								//names 1-S as the matte alternative.
+								atten = Sqrt(ofs / 4096.0);
+								atten = 2.0 * atten * atten * atten -
+									3.0 * atten * atten + 1.0;
 								if (atten > 0.0)
 								{
-									atten = atten * atten * L->bright * 255.0;
+									atten = atten * L->bright * 255.0;
 									vi = off + (v * uc + u) * 3;
 									acc_r = ToF64(b->lm_rgb[vi]) + atten * lr;
 									acc_g = ToF64(b->lm_rgb[vi + 1]) +
@@ -870,6 +881,42 @@ F64 UTBspSampleLightMap(CUTBsp *b, CUTBspSurf *s, F64 u, F64 v)
 	}
 	byte = b->light_bits[idx];
 	return ToF64(byte) / 255.0;
+}
+
+U0 UTBspSampleLMRGBActive(F64 u, F64 v, F64 *lr, F64 *lg, F64 *lb)
+{//Built RGB lightmap for the facet in flight. 1.0 = unlit, so a surface with
+ //no map keeps its texture unchanged.
+	CUTBsp *b;
+	CUTBspSurf *s;
+	CUTLightMapIdx *lm;
+	I64 lu;
+	I64 lv;
+	I64 off;
+	I64 i;
+
+	*lr = -1.0;
+	b = ut_lm_bsp;
+	s = ut_lm_surf;
+	if (!b || !s || !b->lm_rgb || !b->lm_off)
+		return;
+	if (s->i_light_map < 0 || s->i_light_map >= b->num_light_maps)
+		return;
+	off = b->lm_off[s->i_light_map];
+	if (off < 0)
+		return;
+	lm = &b->light_maps[s->i_light_map];
+	lu = ToI64((u - lm->pan[0]) / lm->u_scale);
+	lv = ToI64((v - lm->pan[1]) / lm->v_scale);
+	if (lu < 0) lu = 0;
+	if (lv < 0) lv = 0;
+	if (lu >= lm->u_clamp) lu = lm->u_clamp - 1;
+	if (lv >= lm->v_clamp) lv = lm->v_clamp - 1;
+	i = off + (lv * lm->u_clamp + lu) * 3;
+	if (i < 0 || i + 2 >= b->lm_rgb_n)
+		return;
+	*lr = ToF64(b->lm_rgb[i] & 255) / 255.0;
+	*lg = ToF64(b->lm_rgb[i + 1] & 255) / 255.0;
+	*lb = ToF64(b->lm_rgb[i + 2] & 255) / 255.0;
 }
 
 F64 UTBspSampleLightMapActive(F64 u, F64 v)
@@ -1055,25 +1102,8 @@ CUTTex *UTBspSurfTex(CUTBsp *b, I64 i_surf, CUTTex *fallback)
 
 //Nested walks share one global scissor (ut_portal_scissor); the inner call
 //receives span_opaque aliased to it. Off until each nest owns a buffer.
-U8 *UTBspSurfSlotName(CUTBsp *b, I64 i)
-{//diagnostic: name held in the surf slot, before the probe rejects it
-	if (!b || !b->surf_tex || i < 0 || i >= b->num_surfs)
-		return "nil";
-	if (!b->surf_tex[i])
-		return "null";
-	return b->surf_tex[i]->name;
-}
 
-I64 UTBspSurfSlotMips(CUTBsp *b, I64 i)
-{
-	if (!b || !b->surf_tex || i < 0 || i >= b->num_surfs)
-		return -1;
-	if (!b->surf_tex[i])
-		return -2;
-	return b->surf_tex[i]->num_mips;
-}
 
-I64 ut_bsp_texdump_n = 0;
 Bool ut_bsp_portals_on = FALSE;
 Bool ut_bsp_sky_on = FALSE;
 
@@ -1113,6 +1143,7 @@ U0 UTBspDrawFacet(CUTCanvas *c, CUTBsp *b, CUTBspNode *n, F64 *eye,
 	F64 invz;
 	F64 eye_save[3];
 	CUTSpanBuf *nest_span;
+	CUTSpanBuf *scis;
 	Bool got_scissor;
 
 	if (!c || !b || !n || !fallback)
@@ -1150,7 +1181,11 @@ U0 UTBspDrawFacet(CUTCanvas *c, CUTBsp *b, CUTBspNode *n, F64 *eye,
 	//Child Span = portal silhouette ∩ screen open (FSpan scissor).
 	if (pf & UT_PF_PORTAL)
 	{
-		if (ut_bsp_portals_on && ut_portal_depth < UT_PORTAL_MAX)
+		//Every nest re-walks the whole BSP, so a wall of portal facets costs
+		//a full frame each. UnRender caps recursion; cap the per-frame count
+		//too — beyond this the facet draws flat.
+		if (ut_bsp_portals_on && ut_portal_depth < UT_PORTAL_MAX &&
+			ut_portal_nests < UT_PORTAL_NESTS_MAX)
 		{
 			is_front = 1;
 			if (facing < 0.0)
@@ -1176,12 +1211,14 @@ U0 UTBspDrawFacet(CUTCanvas *c, CUTBsp *b, CUTBspNode *n, F64 *eye,
 				}
 				if (k == nv && nv >= 3)
 				{
-					ut_portal_scissor.width = c->width;
-					ut_portal_scissor.height = c->height;
-					UTSpanRasterConvex(&ut_portal_scissor, psx, psy, nv);
-					if (span_opaque)
-						UTSpanAnd(&ut_portal_scissor, span_opaque);
-					nest_span = &ut_portal_scissor;
+					scis = &ut_portal_scissor[ut_portal_depth &
+						UT_PORTAL_MAX];
+					scis->width = c->width;
+					scis->height = c->height;
+					UTSpanRasterConvex(scis, psx, psy, nv);
+					if (span_opaque && span_opaque != scis)
+						UTSpanAnd(scis, span_opaque);
+					nest_span = scis;
 					got_scissor = TRUE;
 				}
 				save_z = ut_portal_zone;
@@ -1209,7 +1246,8 @@ U0 UTBspDrawFacet(CUTCanvas *c, CUTBsp *b, CUTBspNode *n, F64 *eye,
 	}
 	//PF_FakeBackdrop + SkyZoneInfo → SoftDrv sky child frame (UnRender HandleSkyWarp).
 	if (ut_bsp_sky_on && (pf & UT_PF_FAKE_BACKDROP) && ut_sky_ready &&
-		ut_portal_depth < UT_PORTAL_MAX && ut_sky_nests < 1)
+		ut_portal_depth < UT_PORTAL_MAX && ut_sky_nests < 1 &&
+		ut_sky_frames < UT_SKY_NESTS_MAX)
 	{
 		got_scissor = FALSE;
 		nest_span = span_opaque;
@@ -1229,12 +1267,13 @@ U0 UTBspDrawFacet(CUTCanvas *c, CUTBsp *b, CUTBspNode *n, F64 *eye,
 		}
 		if (k == nv && nv >= 3)
 		{
-			ut_portal_scissor.width = c->width;
-			ut_portal_scissor.height = c->height;
-			UTSpanRasterConvex(&ut_portal_scissor, psx, psy, nv);
-			if (span_opaque)
-				UTSpanAnd(&ut_portal_scissor, span_opaque);
-			nest_span = &ut_portal_scissor;
+			scis = &ut_portal_scissor[ut_portal_depth & UT_PORTAL_MAX];
+			scis->width = c->width;
+			scis->height = c->height;
+			UTSpanRasterConvex(scis, psx, psy, nv);
+			if (span_opaque && span_opaque != scis)
+				UTSpanAnd(scis, span_opaque);
+			nest_span = scis;
 			got_scissor = TRUE;
 		}
 		UTVecCopy(eye, eye_save);
@@ -1246,6 +1285,7 @@ U0 UTBspDrawFacet(CUTCanvas *c, CUTBsp *b, CUTBspNode *n, F64 *eye,
 			ut_con_fov);
 		ut_portal_depth++;
 		ut_sky_nests++;
+		ut_sky_frames++;
 		UTBspWalkFTB(c, b, 0, eye, fallback, nest_span, 0);
 		ut_sky_nests--;
 		ut_portal_depth--;
@@ -1335,17 +1375,6 @@ U0 UTBspDrawFacet(CUTCanvas *c, CUTBsp *b, CUTBspNode *n, F64 *eye,
 	//PF_Unlit wins after LM/Fog sample
 	if (pf & UT_PF_UNLIT)
 		ut_draw_shade = 1.0;
-	if (ut_bsp_texdump_n < 8)
-	{
-		ut_bsp_texdump_n++;
-		UTLog("UTTexDump: surf=%d fb=%d slots=%d slot=%X nm=%s mips=%d argb64=%X shade=%f\n",
-			n->i_surf, tex == fallback, b->surf_tex != NULL,
-			b->surf_tex[n->i_surf],
-			UTBspSurfSlotName(b, n->i_surf),
-			UTBspSurfSlotMips(b, n->i_surf),
-			tex->argb[64], ut_draw_shade);
-		UTLogFlush;
-	}
 	//PF_Flat — SoftDrv flatten shade (no N·L variance soft)
 	if (pf & UT_PF_FLAT)
 	{
@@ -1512,12 +1541,8 @@ U0 UTBspDrawModel(CUTCanvas *c, CUTBsp *b, CUTTex *tex, CUTSpanBuf *span)
 	ut_portal_depth = 0;
 	ut_portal_zone = -1;
 	ut_bsp_facets_frame = 0;
-	if (!ut_bsp_model_logged)
-	{
-		UTLog("UTBsp: model walk begin\n");
-		UTLogFlush;
-	}
 	ut_portal_nests = 0;
+	ut_sky_frames = 0;
 	UTVecCopy(c->origin, eye);
 	try
 	{
@@ -1530,12 +1555,6 @@ U0 UTBspDrawModel(CUTCanvas *c, CUTBsp *b, CUTTex *tex, CUTSpanBuf *span)
 			ut_bsp_cur_node, ut_bsp_facets_frame,
 			b->nodes[ut_bsp_cur_node].i_surf,
 			b->nodes[ut_bsp_cur_node].num_vertices);
-		UTLogFlush;
-	}
-	if (!ut_bsp_model_logged)
-	{
-		ut_bsp_model_logged = TRUE;
-		UTLog("UTBsp: model walk end facets=%d\n", ut_bsp_facets_frame);
 		UTLogFlush;
 	}
 }
@@ -1714,14 +1733,9 @@ U0 UTBspDrawRoom(CUTCanvas *c, CUTBsp *b)
 		ut_sky_nests = 0;
 		ut_portal_depth = 0;
 		ut_portal_nests = 0;
+		ut_sky_frames = 0;
 		UTBspDrawModel(c, b, &ut_tex_checker, span);
-		if (!ut_bsp_room_logged)
-		{
-			ut_bsp_room_logged = TRUE;
-			UTLog("UTBsp: DrawRoom returned facets=%d\n",
-				ut_bsp_facets_frame);
-			UTLogFlush;
-		}
+
 		return;
 	}
 	if (b->num_points < 8)
