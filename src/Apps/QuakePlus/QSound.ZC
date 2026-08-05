@@ -9,9 +9,14 @@
 // decoding everything up front costs ~47MB, so decode on first use into a
 // bounded cache
 
-#define QSND_MAX_CACHE		256
+//qbj3 alone ships 645 sounds over 114MB of WAV, which decodes to roughly
+//twice that. no cap covers a mod that size, so the cache EVICTS - a fixed
+//ceiling with no eviction meant every sound after the 256th was silent for
+//the rest of the session, and the ones already loaded kept working, which is
+//what made it look like the mixer
+#define QSND_MAX_CACHE		1024
 //native rate storage, ~4x smaller than resampling on load
-#define QSND_CACHE_BUDGET	16777216	//16MB of decoded audio
+#define QSND_CACHE_BUDGET	50331648	//48MB of decoded audio
 #define QSND_RATE			48000		//mixer output rate
 #define QSND_CLIP_DIST		1000.0		//attenuation reaches silence here
 
@@ -27,11 +32,16 @@ class CQSound
 	U32	*frames;		//stereo L16 | R16 << 16, at the file's own rate
 	I64	 count;
 	I64	 rate;			//rate of the stored data, not the mixer's
+	I64	 last_use;		//q_snd_clock when last handed out, for LRU
+	Bool pinned;		//looping ambients hold their PCM forever
 };
 
 CQSound	 q_snd_cache[QSND_MAX_CACHE];
-I64		 q_snd_count	= 0;
+I64		 q_snd_count	= 0;		//high water mark; slots below may be holes
 I64		 q_snd_bytes	= 0;
+I64		 q_snd_used		= 0;		//occupied slots; q_snd_count counts holes too
+I64		 q_snd_clock	= 0;		//monotonic, stamped on every cache hit
+I64		 q_snd_evicted	= 0;
 Bool	 q_snd_enabled	= TRUE;
 
 //quake's own volume 0..1, the AC97 master is the system's and applies on top
@@ -64,23 +74,29 @@ class CQSndChan
 	F64	master_vol;		//0..1 before distance and pan
 	F64	dist_mult;		//attenuation / QSND_CLIP_DIST
 	Bool fixed;			//fixed point, not an entity to follow
+	CQSound *snd;		//what it is playing, so eviction can silence it first
 };
 
 CQSndChan	q_snd_chan[QSND_DYNAMIC_CHANNELS];
 I64			q_snd_viewent = 0;
 
 U0 QSndChannelsClear()
-{
+{//STOP, then forget. dropping a handle without stopping it leaves the mixer
+ //playing a voice nothing can ever reclaim
 	I64 i;
 
 	for (i = 0; i < QSND_DYNAMIC_CHANNELS; i++)
 	{
+		if (q_snd_chan[i].voice >= 0)
+			AudioSFXStop(q_snd_chan[i].voice);
+
 		q_snd_chan[i].entnum     = 0;
 		q_snd_chan[i].entchannel = 0;
 		q_snd_chan[i].voice      = -1;
 		q_snd_chan[i].master_vol = 0.0;
 		q_snd_chan[i].dist_mult  = 0.0;
 		q_snd_chan[i].fixed      = TRUE;
+		q_snd_chan[i].snd        = NULL;
 		QVecSet(q_snd_chan[i].origin, 0.0, 0.0, 0.0);
 	}
 }
@@ -191,6 +207,7 @@ U0 QSndUpdate()
 		if (!AudioSFXPlaying(ch->voice))
 		{
 			ch->voice = -1;
+			ch->snd   = NULL;
 			goto qsu_next;
 		}
 
@@ -243,10 +260,16 @@ U0 QSndInit()
 
 	for (i = 0; i < QSND_MAX_CACHE; i++)
 	{
-		q_snd_cache[i].name[0] = 0;
-		q_snd_cache[i].frames  = NULL;
-		q_snd_cache[i].count   = 0;
+		q_snd_cache[i].name[0]  = 0;
+		q_snd_cache[i].frames   = NULL;
+		q_snd_cache[i].count    = 0;
+		q_snd_cache[i].last_use = 0;
+		q_snd_cache[i].pinned   = FALSE;
 	}
+
+	q_snd_used    = 0;
+	q_snd_clock   = 0;
+	q_snd_evicted = 0;
 
 	q_snd_count         = 0;
 	q_snd_bytes         = 0;
@@ -275,12 +298,16 @@ U0 QSndFree()
 			Free(q_snd_cache[i].frames);
 			q_snd_cache[i].frames = NULL;
 		}
-		q_snd_cache[i].name[0] = 0;
-		q_snd_cache[i].count   = 0;
+		q_snd_cache[i].name[0]  = 0;
+		q_snd_cache[i].count    = 0;
+		q_snd_cache[i].pinned   = FALSE;
+		q_snd_cache[i].last_use = 0;
 	}
 
 	q_snd_count        = 0;
+	q_snd_used         = 0;
 	q_snd_bytes        = 0;
+	q_snd_clock        = 0;
 }
 
 I64 QSndDecodeWav(U8 *raw, I64 size, U32 **_frames, I64 *_rate)
@@ -387,6 +414,88 @@ I64 QSndDecodeWav(U8 *raw, I64 size, U32 **_frames, I64 *_rate)
 	return out_count;
 }
 
+Bool QSndCacheEvict()
+{//drop the least recently used entry, FALSE when nothing can go
+ //
+ //ORDER MATTERS: a voice plays straight out of the cached PCM, so every voice
+ //referencing this entry is silenced before the buffer is released
+	CQSound	*victim  = NULL;
+	Bool	 stopped = FALSE;
+	I64		 best    = 0;
+	I64		 i;
+
+	//a negative entry costs no memory and is cheap to re-probe, so it goes
+	//first whenever the ENTRY count is what ran out
+	if (q_snd_used >= QSND_MAX_CACHE)
+	{
+		for (i = 0; i < q_snd_count; i++)
+		{
+			if (q_snd_cache[i].name[0] && !q_snd_cache[i].frames &&
+				!q_snd_cache[i].pinned)
+			{
+				q_snd_cache[i].name[0] = 0;
+				q_snd_used--;
+				q_snd_evicted++;
+				return TRUE;
+			}
+		}
+	}
+
+	for (i = 0; i < q_snd_count; i++)
+	{
+		if (!q_snd_cache[i].name[0] || q_snd_cache[i].pinned)
+			goto qse_next;
+
+		if (!victim || q_snd_cache[i].last_use < best)
+		{
+			victim = &q_snd_cache[i];
+			best   = q_snd_cache[i].last_use;
+		}
+
+qse_next:
+	}
+
+	if (!victim)
+		return FALSE;
+
+	//silence anything still reading this PCM
+	for (i = 0; i < QSND_DYNAMIC_CHANNELS; i++)
+	{
+		if (q_snd_chan[i].snd == victim)
+		{
+			if (q_snd_chan[i].voice >= 0)
+			{
+				AudioSFXStop(q_snd_chan[i].voice);
+				stopped = TRUE;
+			}
+			q_snd_chan[i].voice = -1;
+			q_snd_chan[i].snd   = NULL;
+		}
+	}
+
+	//the mixer takes no lock and may already hold a frames pointer it read
+	//before the stop landed. it runs every 1ms, so this outlasts a pass in
+	//flight - the same wait AudioSFXStopAll takes for the same reason
+	if (stopped)
+		Sleep(4);
+
+	if (victim->frames)
+	{
+		q_snd_bytes -= victim->count * sizeof(U32);
+		if (q_snd_bytes < 0)
+			q_snd_bytes = 0;
+		Free(victim->frames);
+		victim->frames = NULL;
+	}
+
+	victim->name[0] = 0;
+	victim->count   = 0;
+	q_snd_used--;
+	q_snd_evicted++;
+
+	return TRUE;
+}
+
 CQSound *QSndLoad(U8 *name)
 {//cache fetch, decoding on first use
 	CQSound	*s;
@@ -397,30 +506,43 @@ CQSound *QSndLoad(U8 *name)
 	I64		 rate;
 	U32		*frames = NULL;
 	I64		 i;
+	I64		 slot;
 
 	for (i = 0; i < q_snd_count; i++)
 	{
+		if (!q_snd_cache[i].name[0])
+			goto qsl_next;			//hole left by an eviction
+
 		if (!StrICompare(q_snd_cache[i].name, name))
 		{
+			q_snd_clock++;
+			q_snd_cache[i].last_use = q_snd_clock;
+
 			//misses are cached too, don't re-read the pak every play
 			if (!q_snd_cache[i].frames)
 				return NULL;
 			return &q_snd_cache[i];
 		}
+
+qsl_next:
 	}
 
-	if (q_snd_count >= QSND_MAX_CACHE || q_snd_bytes >= QSND_CACHE_BUDGET)
+	//make room. entries are never so precious that a sound should go silent
+	while (q_snd_used >= QSND_MAX_CACHE || q_snd_bytes >= QSND_CACHE_BUDGET)
 	{
-		//say so, a full cache looks exactly like a missing file
-		if (q_snd_reports < QSND_MAX_REPORTS)
+		if (!QSndCacheEvict)
 		{
-			q_snd_reports++;
-			StrPrint(q_snd_line,
-				"snd: CACHE FULL (%d entries, %d bytes) - %s not loaded\n",
-				q_snd_count, q_snd_bytes, name);
-			QLog(q_snd_line);
+			//nothing evictable: every entry is pinned or in use
+			if (q_snd_reports < QSND_MAX_REPORTS)
+			{
+				q_snd_reports++;
+				StrPrint(q_snd_line,
+					"snd: CACHE FULL (%d entries, %d bytes) - %s not loaded\n",
+					q_snd_count, q_snd_bytes, name);
+				QLog(q_snd_line);
+			}
+			return NULL;
 		}
-		return NULL;
 	}
 
 	//QuakeC names are relative to sound/
@@ -433,12 +555,33 @@ CQSound *QSndLoad(U8 *name)
 	else
 		count = 0;
 
-	s = &q_snd_cache[q_snd_count];
+	//first hole, else extend
+	slot = -1;
+	for (i = 0; i < q_snd_count; i++)
+	{
+		if (!q_snd_cache[i].name[0])
+		{
+			slot = i;
+			break;
+		}
+	}
+
+	if (slot < 0)
+	{
+		slot = q_snd_count;
+		q_snd_count++;
+	}
+
+	q_snd_used++;
+	q_snd_clock++;
+
+	s = &q_snd_cache[slot];
 	QStrCopy(s->name, name, 64);
-	s->frames = frames;
-	s->count  = count;
-	s->rate   = rate;
-	q_snd_count++;
+	s->frames   = frames;
+	s->count    = count;
+	s->rate     = rate;
+	s->last_use = q_snd_clock;
+	s->pinned   = FALSE;
 
 	if (frames)
 	{
@@ -521,6 +664,10 @@ U0 QSndLeafAmbients(CQMap *map, I64 leaf_num, F64 level, F64 fade, F64 now)
 		snd = QSndLoad(q_ambient_sfx[i]);
 		if (!snd || !snd->frames || snd->count < 1)
 			goto qla_next;
+
+		//a looping voice reads this buffer for the rest of the level, so it
+		//must never be evicted out from under the mixer
+		snd->pinned = TRUE;
 
 		//S_UpdateAmbientSounds channels are permanent - one short sample held
 		//indefinitely, not replayed. restarting clicks and resets phase
@@ -728,6 +875,7 @@ U0 QSndPlayAt(U8 *name, F64 *origin, F64 volume, F64 attenuation,
 	ch->entnum     = entnum;
 	ch->entchannel = entchannel;
 	ch->master_vol = gain;
+	ch->snd        = s;		//eviction silences this channel before freeing
 
 	//attenuation 0 gives dist_mult 0 and never fades, as pickups want
 	ch->dist_mult = attenuation / QSND_CLIP_DIST;
@@ -925,6 +1073,7 @@ U0 QSndStop(I64 entnum, I64 entchannel)
 				AudioSFXStop(q_snd_chan[i].voice);
 
 			q_snd_chan[i].voice      = -1;
+			q_snd_chan[i].snd        = NULL;
 			q_snd_chan[i].entnum     = 0;
 			q_snd_chan[i].entchannel = 0;
 			q_snd_chan[i].master_vol = 0.0;
