@@ -20,7 +20,12 @@
 F64	q_far_clip = QFAR_CLIP_DEFAULT;
 
 //pixels between exact perspective divides, error stays under a texel
+//affine run length. the span is exact at block ends and linear between, so
+//this is the perspective-correction granularity: 16 is the world's, and a
+//run longer than any span is fully affine - D_PolysetDraw's behaviour for
+//alias models, and what ALIASSHADER_NOPERSP reproduces
 #define QSPAN_SUB		16
+#define QSPAN_AFFINE	16384
 
 class CQPolyVert
 {
@@ -151,6 +156,15 @@ Bool	q_rgb_active	= FALSE;
 //1/z is bounded by the near clip: QNEAR_CLIP 4.0 means iz <= 0.25, so 2^32
 //keeps the nearest value near 2^30 and still leaves ~500k steps at z=8192
 #define QDEPTH_SCALE	4294967296.0
+
+//DEPTH BIAS, glPolygonOffset's job. an impact effect is a flat card set a few
+//units off the surface it hit, so parts of it fall behind the wall plane and
+//the depth test picks a different winner per pixel - the speckle on every
+//decal. scaling 1/z lifts the whole card toward the eye by a fixed FRACTION
+//of its distance, so one value works at every range. models only: the world
+//is not coplanar with itself
+F64	q_draw_zbias	= 1.0;
+F64	q_mdl_zbias		= 1.004;	//0.4%, ~2 units at 500
 
 //stamped into the depth plane by 2D writers. nearer than any real geometry,
 //so the fog blend skips it - the HUD and console are not in the world and
@@ -1473,6 +1487,11 @@ U0 QDrawSetView(CQCanvas *c, F64 *origin, F64 *angles, F64 fov_x)
 //scr_fov_adapt, mirrored here because the cvar table compiles later
 Bool q_opt_fov_adapt = TRUE;
 
+//r_softemu_mdl_warp. the span subdivision in force for the current draw -
+//QSPAN_SUB for the world, QSPAN_AFFINE for a warped alias model
+I64  q_span_sub		= QSPAN_SUB;
+Bool q_mdl_warp		= FALSE;
+
 F64 QDrawAdaptFovX(F64 fov_x, I64 width, I64 height)
 {//AdaptFovx. the 90 in Quake's fov cvar is a 4:3 HORIZONTAL fov; shown as-is
  //on a 16:9 screen it crops the sides off the intended image instead of
@@ -1654,7 +1673,10 @@ I64 QTextureAnimation(CQMap *map, I64 miptex, I64 frame, F64 time)
 //ran dry mid-scene and the faces that missed it lost their colour entirely
 //runtime settable: the machine has the RAM, and the right size depends on the
 //map. QSurfCacheRelease trims down on the next build if it is lowered
-I64 q_surf_budget = 335544320;		//320MB default
+//mip 0 holds four times the texels per face as mip 1, and d_mipscale
+//defaults to off - so the cache has to be sized for full-detail surfaces or
+//it thrashes the moment a zoom brings distant geometry up to full size
+I64 q_surf_budget = 1073741824;		//1GB default
 
 //a face touched by a dynamic light rebuilds EVERY frame, and a rebuild now
 //carries an RGB plane. past this many per frame the stale surface is reused
@@ -1922,6 +1944,37 @@ I64 QSurfLightKey(CQFace *f)
 	return key;
 }
 
+F64 QLitShadeScale(F64 lightv)
+{//the multiplier this light level applies, from qpal_shade_scale. factored
+ //out so a filtered texel can average RAW colours once and scale the result,
+ //instead of shading each of the four and averaging afterwards - the scale is
+ //identical across a 2x2, so the two are equivalent and this is a quarter of
+ //the work
+	F64 shadef;
+	F64 frac;
+	I64 row0;
+	I64 row1;
+
+	shadef = (255.0 - lightv) / 4.0;
+
+	if (!q_opt_tclight)
+		shadef = ToF64(ToI64(shadef));
+
+	if (shadef < 0.0)
+		shadef = 0.0;
+	if (shadef > ToF64(QPAL_SHADES - 1))
+		shadef = ToF64(QPAL_SHADES - 1);
+
+	row0 = ToI64(shadef);
+	row1 = row0 + 1;
+	if (row1 > QPAL_SHADES - 1)
+		row1 = QPAL_SHADES - 1;
+	frac = shadef - ToF64(row0);
+
+	return qpal_shade_scale[row0] +
+		(qpal_shade_scale[row1] - qpal_shade_scale[row0]) * frac;
+}
+
 U0 QLitTexelRGB(I64 texel, F64 lightv, I64 *_r, I64 *_g, I64 *_b)
 {//raw palette RGB for one texel at a fractional light level. walks the
  //colormap in fractional rows instead of snapping to one: the rows carry
@@ -2072,6 +2125,89 @@ I64 QSurfCacheMipFor(CQMap *map, I64 face_index)
 	return q_surf[slot].mip;
 }
 
+//D_MipLevelForScale's tunables, from the software renderer:
+//    d_scalemip[i] = basemip[i] * d_mipscale.value
+//    if (lmiplevel < d_minmip) lmiplevel = d_minmip;   // d_minmip = d_mipcap
+//mipscale > 1 drops detail sooner (blurrier, cheaper); mipcap forces a
+//MINIMUM mip level, so 1 never uses full-size texels at all
+//0 is an explicit OFF: every face draws at mip 0. that is not id's meaning -
+//there d_mipscale scales the thresholds and 0 would collapse them - but "no
+//mipmapping" is the setting people actually want, and dividing by it has no
+//other sensible reading
+F64	q_mipscale	= 0.0;
+I64	q_mipcap	= 0;
+
+//r_mipzoomhold. a zoom ramps the fov over ~0.125s, and every frame of it
+//rescales the mip ratio - so faces cross thresholds one after another and the
+//surface cache rebuilds them mid-transition, which is the stutter. holding
+//the mip a face already has until the ramp settles costs one frame of
+//staleness at the end and nothing else
+Bool q_mip_zoom_hold	= TRUE;
+Bool q_mip_frozen		= FALSE;
+
+//r_lerpmodels. R_SetupAliasFrame keeps previouspose/currentpose/lerpstart on
+//the entity; edicts here carry no render state, so it lives beside the light
+//cache and is keyed the same way
+#define QLERP_TIME		0.1		//e->lerptime default
+
+Bool q_lerp_models		= TRUE;
+I64	 q_lerp_prev[QLPC_MAX];
+I64	 q_lerp_cur[QLPC_MAX];
+F64	 q_lerp_start[QLPC_MAX];
+
+U0 QLerpClear()
+{//globals are not zeroed, and a stale pose blends a monster from whatever the
+ //last level left in the slot
+	I64 i;
+
+	for (i = 0; i < QLPC_MAX; i++)
+	{
+		q_lerp_prev[i]  = -1;
+		q_lerp_cur[i]   = -1;
+		q_lerp_start[i] = 0.0;
+	}
+}
+
+F64 QLerpPose(I64 key, I64 frame, F64 now, I64 *_prev)
+{//R_SetupAliasFrame: returns the blend and hands back the pose to blend FROM
+ //
+ //    else if (e->currentpose != posenum)   // pose changed, start new lerp
+ //    { e->lerpstart = cl.time; e->previouspose = e->currentpose; ... }
+ //    lerpdata->blend = CLAMP (0, (cl.time - e->lerpstart) / e->lerptime, 1)
+	F64 blend;
+
+	*_prev = -1;
+
+	if (!q_lerp_models || key <= 0 || key >= QLPC_MAX)
+		return 1.0;
+
+	if (q_lerp_cur[key] != frame)
+	{
+		q_lerp_prev[key]  = q_lerp_cur[key];
+		q_lerp_cur[key]   = frame;
+		q_lerp_start[key] = now;
+	}
+
+	if (q_lerp_prev[key] < 0)
+		return 1.0;
+
+	blend = (now - q_lerp_start[key]) / QLERP_TIME;
+
+	//a backwards or stalled clock must not run the blend the wrong way
+	if (blend < 0.0)
+		blend = 0.0;
+
+	if (blend >= 1.0)
+	{
+		q_lerp_prev[key] = q_lerp_cur[key];
+		return 1.0;
+	}
+
+	*_prev = q_lerp_prev[key];
+
+	return blend;
+}
+
 I64 QMipForRatio(F64 ratio, I64 prev)
 {//D_MipLevelForScale with a dead band held toward the mip already cached.
  //
@@ -2080,28 +2216,57 @@ I64 QMipForRatio(F64 ratio, I64 prev)
  //is cheap in a large room where distances are stable and ruinous in a small
  //one, which is exactly where the frame rate collapsed
 	I64 mip;
+	F64 t0;
+	F64 t1;
+	F64 t2;
 
-	if (ratio < 0.5)
+	//mid-zoom: whatever this face is already built at stays
+	if (q_mip_frozen && prev >= 0)
+		return prev;
+
+	//no mipmapping: full detail everywhere, and no threshold to cross, so a
+	//changing fov cannot start a rebuild storm
+	if (q_mipscale <= 0.0)
+	{
+		if (q_mipcap > 0)
+			return q_mipcap;
+		return 0;
+	}
+
+	//ratio rises with distance where the original's scale falls, so the
+	//thresholds DIVIDE by mipscale to keep its sense: larger is blurrier
+	t0 = 0.5 / q_mipscale;
+	t1 = 1.5 / q_mipscale;
+	t2 = 4.0 / q_mipscale;
+
+	if (ratio < t0)
 		mip = 0;
-	else if (ratio < 1.5)
+	else if (ratio < t1)
 		mip = 1;
-	else if (ratio < 4.0)
+	else if (ratio < t2)
 		mip = 2;
 	else
 		mip = 3;
 
+	if (mip < q_mipcap)
+		mip = q_mipcap;
+
 	if (prev < 0 || prev == mip)
 		return mip;
 
-	//15% past the boundary before dropping detail
-	if (prev == 0 && mip == 1 && ratio < 0.575)		return 0;
-	if (prev == 1 && mip == 2 && ratio < 1.725)		return 1;
-	if (prev == 2 && mip == 3 && ratio < 4.600)		return 2;
+	//15% past the boundary before dropping detail. the dead band may hold a
+	//level BELOW the cap, so it is applied once more on the way out
+	if (prev == 0 && mip == 1 && ratio < t0 * 1.15)		mip = 0;
+	else if (prev == 1 && mip == 2 && ratio < t1 * 1.15)	mip = 1;
+	else if (prev == 2 && mip == 3 && ratio < t2 * 1.15)	mip = 2;
 
 	//and the same margin coming back the other way
-	if (prev == 1 && mip == 0 && ratio > 0.435)		return 1;
-	if (prev == 2 && mip == 1 && ratio > 1.305)		return 2;
-	if (prev == 3 && mip == 2 && ratio > 3.480)		return 3;
+	else if (prev == 1 && mip == 0 && ratio > t0 * 0.87)	mip = 1;
+	else if (prev == 2 && mip == 1 && ratio > t1 * 0.87)	mip = 2;
+	else if (prev == 3 && mip == 2 && ratio > t2 * 0.87)	mip = 3;
+
+	if (mip < q_mipcap)
+		mip = q_mipcap;
 
 	return mip;
 }
@@ -2819,6 +2984,15 @@ U0 QDrawStateInit()
  //own clears; these are the loose ones
 	q_opt_simd      = FALSE;
 	q_opt_fov_adapt = TRUE;
+	q_mipscale      = 0.0;
+	q_span_sub      = QSPAN_SUB;
+	q_mdl_warp      = FALSE;
+	q_mip_zoom_hold = TRUE;
+	q_mip_frozen    = FALSE;
+	q_mipcap        = 0;
+	q_draw_zbias    = 1.0;
+	q_mdl_zbias     = 1.004;
+	q_fogpost_dirty = TRUE;		//array, so no declaration initialiser
 	q_occ_enable   = TRUE;
 	q_hiz_enable   = TRUE;
 	q_occworld     = TRUE;
@@ -2884,6 +3058,14 @@ U0 QDrawSpan(CQCanvas *c, I64 y, I64 x1, I64 x2,
 	I64	 lit_r;
 	I64	 lit_g;
 	I64	 lit_b;
+	F64	 zscale = QDEPTH_SCALE * q_draw_zbias;
+	I64	 sub;
+	I64	 ftx;
+	I64	 fty;
+	I64	 t01;
+	I64	 t10;
+	I64	 t11;
+	F64	 fscale;
 	I64	 texel;
 	I64	 xe;
 	I64	 n;
@@ -3056,10 +3238,13 @@ U0 QDrawSpan(CQCanvas *c, I64 y, I64 x1, I64 x2,
 	x = x1;
 
 	//exact only at block ends, linear between - one divide per block instead
-	//of per pixel, error stays well under a texel over 16
+	//of per pixel, error stays well under a texel over 16. a subdivision
+	//longer than the span makes the whole run affine and costs one divide
+	sub = q_span_sub;
+
 	while (x < x2)
 	{
-		xe = x + QSPAN_SUB;
+		xe = x + sub;
 		if (xe > x2)
 			xe = x2;
 		n = xe - x;
@@ -3085,8 +3270,8 @@ U0 QDrawSpan(CQCanvas *c, I64 y, I64 x1, I64 x2,
 		//end is larger bounds every pixel in it. if that bound still loses to
 		//the depth already present, no pixel here can win and everything
 		//below - two divides, the lightmap fetches, the pixel loop - is waste
-		izi_hi = ToI64(iz * QDEPTH_SCALE);
-		izi_lo = ToI64(iz_e * QDEPTH_SCALE);
+		izi_hi = ToI64(iz * zscale);
+		izi_lo = ToI64(iz_e * zscale);
 		if (izi_lo > izi_hi)
 			izi_hi = izi_lo;
 
@@ -3136,8 +3321,8 @@ U0 QDrawSpan(CQCanvas *c, I64 y, I64 x1, I64 x2,
 		//every real texel, so no lit texel can read as zero
 		if (rgbonly)
 		{
-			izi   = ToI64(iz * QDEPTH_SCALE);
-			d_izi = ToI64(d_iz * QDEPTH_SCALE);
+			izi   = ToI64(iz * zscale);
+			d_izi = ToI64(d_iz * zscale);
 
 			ufx  = ToI64((s - ToF64(mins_s_i)) * 65536.0);
 			vfx  = ToI64((t - ToF64(mins_t_i)) * 65536.0);
@@ -3264,8 +3449,8 @@ U0 QDrawSpan(CQCanvas *c, I64 y, I64 x1, I64 x2,
 		if (surf)
 		{
 			//one conversion per block; the pixel loop steps integers only
-			izi   = ToI64(iz * QDEPTH_SCALE);
-			d_izi = ToI64(d_iz * QDEPTH_SCALE);
+			izi   = ToI64(iz * zscale);
+			d_izi = ToI64(d_iz * zscale);
 
 			ufx  = ToI64((s - ToF64(mins_s_i)) * 65536.0);
 			vfx  = ToI64((t - ToF64(mins_t_i)) * 65536.0);
@@ -3418,7 +3603,56 @@ U0 QDrawSpan(CQCanvas *c, I64 y, I64 x1, I64 x2,
 				//uses, so a model and the wall behind it now shade alike
 				if (crow && q_rgb_active)
 				{
-					QLitTexelRGB(texel, lightv, &lit_r, &lit_g, &lit_b);
+					//TEXTURE FILTER for this path too. it used to live only in
+					//the surface cache, which alias models do not have - a
+					//model beside a filtered wall kept every dither speckle.
+					//the 2x2 shares one light value, so the RAW colours are
+					//averaged and the shade applied once
+					if (q_opt_texfilter && texel < QPAL_FULLBRIGHT)
+					{
+						if (clamp_tex)
+						{
+							ftx = tx + 1;
+							fty = ty + 1;
+							if (ftx > tw - 1)	ftx = tw - 1;
+							if (fty > th - 1)	fty = th - 1;
+						}
+						else
+						{
+							ftx = QTexWrap(tx + 1, tw);
+							fty = QTexWrap(ty + 1, th);
+						}
+
+						t01 = texels[ty * tw + ftx];
+						t10 = texels[fty * tw + tx];
+						t11 = texels[fty * tw + ftx];
+
+						//a fullbright in the block would be dimmed by the
+						//shade below, so those pixels stay point sampled
+						if (t01 >= QPAL_FULLBRIGHT || t10 >= QPAL_FULLBRIGHT ||
+							t11 >= QPAL_FULLBRIGHT)
+						{
+							QLitTexelRGB(texel, lightv, &lit_r, &lit_g,
+								&lit_b);
+						}
+						else
+						{
+							fscale = QLitShadeScale(lightv);
+
+							lit_r = ToI64(ToF64(qpal_rgb[texel * 3] +
+								qpal_rgb[t01 * 3] + qpal_rgb[t10 * 3] +
+								qpal_rgb[t11 * 3]) * 0.25 * fscale);
+							lit_g = ToI64(ToF64(qpal_rgb[texel * 3 + 1] +
+								qpal_rgb[t01 * 3 + 1] + qpal_rgb[t10 * 3 + 1] +
+								qpal_rgb[t11 * 3 + 1]) * 0.25 * fscale);
+							lit_b = ToI64(ToF64(qpal_rgb[texel * 3 + 2] +
+								qpal_rgb[t01 * 3 + 2] + qpal_rgb[t10 * 3 + 2] +
+								qpal_rgb[t11 * 3 + 2]) * 0.25 * fscale);
+						}
+					}
+					else
+						QLitTexelRGB(texel, lightv, &lit_r, &lit_g, &lit_b);
+
 					crow[x] = QRGB_SET |
 						(ClampI64(lit_r, 0, 255) << 16) |
 						(ClampI64(lit_g, 0, 255) << 8) |
@@ -3650,6 +3884,9 @@ U8	 q_sky_solid	= 0;
 // applied at blit from the depth buffer, so world, models, sprites and sky all
 // fog through one path instead of each rasteriser growing its own blend
 
+//SphericalCorrection / 64, see QFogBuildLut
+#define QFOG_DENSITY_SCALE	0.01328125
+
 #define QFOG_LUT		1024
 
 //iz at z=64. nearer than that is unfogged, so the table spends its resolution
@@ -3698,9 +3935,17 @@ U0 QFogBuild()
 
 		z = 1.0 / iz;
 
-		//GLQuake and Ironwail feed GL_FOG_DENSITY density/64, so map values
-		//are in those units. using the raw value fogs solid within ~80 units
-		f = q_fog_density * z / 64.0;
+		//Fog_SetupFrame:
+		//    ExpAdjustment       = 1.20112241  // sqrt(log2(e))
+		//    SphericalCorrection = 0.85        // spherical fog reads denser
+		//    DensityScale        = ExpAdjustment * SphericalCorrection / 64
+		//    fogdata[3]          = density * density
+		//with the shader's exp2(-fogdata[3] * dist^2). ExpAdjustment squared
+		//IS log2(e), so it cancels exp2 back to exp and the curve reduces to
+		//    exp(-((d * 0.85 / 64) * dist)^2)
+		//the 0.85 was missing here, which made the exponent 1/0.85^2 = 1.38x
+		//denser than the reference at the same map density
+		f = q_fog_density * QFOG_DENSITY_SCALE * z;
 		f = 1.0 - Exp(-(f * f));
 
 		q_fog_lut[i] = ClampI64(ToI64(f * 255.0 + 0.5), 0, 255);
@@ -3719,7 +3964,8 @@ I64		q_fog_map_b			= 0;
 
 U0 QFogSet(F64 density, I64 r, I64 g, I64 b)
 {
-	q_fog_density = density;
+	q_fog_density   = density;
+	q_fogpost_dirty = TRUE;		//the colour is baked into the fused table
 
 	//distance where the blend is 99% fog: beyond it geometry cannot show, so
 	//the face walk skips it. -ln(0.01) = 4.605, sqrt = 2.146
@@ -5070,6 +5316,69 @@ U0 QDrawFadeScreen(CQCanvas *c)
 	}
 }
 
+//FOG AND GAMMA FUSED INTO ONE TABLE.
+//
+//fog blends toward a CONSTANT colour and gamma is a per-channel map, so the
+//whole chain collapses to entry[alpha][value] per channel:
+//    fogpost[ch][a][c] = gamma_ramp[ c + ((fogcolour[ch] - c) * (a+1) >> 8) ]
+//three byte reads replace the blend AND the ramp - fewer operations than the
+//blend alone cost before, so correcting the order came out cheaper than the
+//wrong order was. alpha 0 is a pure gamma row, which is what 2D pixels want,
+//so the same table serves them with no branch.
+//
+//192KB, rebuilt only when the fog colour, density, gamma or contrast moves.
+//the cshift is NOT foldable - it sits between fog and gamma and changes every
+//frame - so a live tint takes the general path instead.
+U8	 q_fogpost[3 * 256 * 256];
+
+U0 QFogPostBuild()
+{//one pass over 3 x 256 x 256, on change only
+	I64 ch;
+	I64 a;
+	I64 c;
+	I64 fogc;
+	I64 v;
+	U8	*dst;
+
+	for (ch = 0; ch < 3; ch++)
+	{
+		if (ch == 0)		fogc = q_fog_r;
+		else if (ch == 1)	fogc = q_fog_g;
+		else				fogc = q_fog_b;
+
+		for (a = 0; a < 256; a++)
+		{
+			dst = &q_fogpost[ch * 65536 + a * 256];
+
+			for (c = 0; c < 256; c++)
+			{
+				//same arithmetic QFogApply uses: a+1 makes the range 1..256
+				//so the blend is a shift rather than a divide
+				v = c + (((fogc - c) * (a + 1)) >> 8);
+				dst[c] = q_gamma_ramp[ClampI64(v, 0, 255)];
+			}
+		}
+	}
+
+	q_fogpost_dirty = FALSE;
+}
+
+I64 QFogAlphaAt(I64 izi)
+{//the blend weight this depth carries, 0 for none. izi 0 means sky
+	I64 idx;
+
+	if (izi <= 0)
+		return q_fog_sky_alpha;
+
+	idx = (izi * (QFOG_LUT - 1)) >> QFOG_IZ_SHIFT;
+	if (idx > QFOG_LUT - 1)
+		return 0;			//nearer than the table starts, no fog
+	if (idx < 0)
+		idx = 0;
+
+	return q_fog_lut[idx];
+}
+
 U32 QFogApply(U32 rgb, I64 izi)
 {//blend toward the fog colour by depth. izi is 1/z in QDEPTH_SCALE fixed
  //point, and 0 means sky
@@ -5128,6 +5437,7 @@ U0 QFogBakeCanvas(CQCanvas *c)
 	U32	 col;
 	Bool tinted;
 	Bool fogged;
+	I64	 fa;
 	I64	 x;
 	I64	 y;
 	I64	 x0;
@@ -5142,8 +5452,13 @@ U0 QFogBakeCanvas(CQCanvas *c)
 	fogged = ToBool(q_opt_fog && q_fog_on);
 	tinted = ToBool(q_tint_a != 0);
 
-	if (!fogged && !tinted)
+	//gamma and contrast are applied here too, so a non-identity ramp is on its
+	//own reason to bake - the blit's palette path cannot fog what it corrects
+	if (!fogged && !tinted && qpal_post_identity)
 		return;
+
+	if (q_fogpost_dirty)
+		QFogPostBuild;
 
 	x0 = c->vx;
 	x1 = c->vx + c->vw;
@@ -5158,21 +5473,41 @@ U0 QFogBakeCanvas(CQCanvas *c)
 
 		for (x = x0; x < x1; x++)
 		{
-			//same source choice the blit makes, and the same post - the
-			//result is FINAL colour, so the blit applies neither again
+			//ORDER: fog, then the cshift, then gamma and contrast - fog is in
+			//the world shader, R_PolyBlend follows it, and the gamma pass runs
+			//last over the finished frame. blending fog into an already
+			//gamma-corrected colour tints the fog itself
 			if (q_rgb_active && (crow[x] & QRGB_SET))
-			{
-				if (zrow[x] == QDEPTH_2D)
-					col = QPalGammaRGB(crow[x] & 0x00FFFFFF);
-				else
-					col = QPalPostRGB(crow[x] & 0x00FFFFFF);
-			}
-			else if (zrow[x] == QDEPTH_2D)
-				col = qpal_argb[src[x]];
+				col = crow[x] & 0x00FFFFFF;		//overlay holds RAW lit colour
 			else
-				col = qpal_argb_tint[src[x]];
+				col = qpal_raw_argb[src[x]];
 
-			crow[x] = QRGB_SET | (QFogApply(col, zrow[x]) & 0x00FFFFFF);
+			//2D is neither fogged nor tinted; alpha 0 makes the fused table a
+			//pure gamma row, so it needs no branch of its own
+			fa = 0;
+			if (fogged && zrow[x] != QDEPTH_2D)
+				fa = QFogAlphaAt(zrow[x]);
+
+			if (tinted)
+			{
+				//a live cshift sits between the fog and the ramp and cannot
+				//be folded into the table
+				if (fa)
+					col = QFogApply(col, zrow[x]) & 0x00FFFFFF;
+				if (zrow[x] != QDEPTH_2D)
+					col = QPalTintRGB(col);
+
+				crow[x] = QRGB_SET | (QPalGammaRGB(col) & 0x00FFFFFF);
+			}
+			else
+			{
+				fa = fa << 8;
+
+				crow[x] = QRGB_SET |
+					(q_fogpost[((col >> 16) & 255) + fa] << 16) |
+					(q_fogpost[65536 + ((col >> 8) & 255) + fa] << 8) |
+					 q_fogpost[131072 + (col & 255) + fa];
+			}
 		}
 	}
 
