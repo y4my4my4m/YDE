@@ -12,7 +12,8 @@
 #define QPAL_FULLBRIGHT		224		//indices >= this ignore lighting
 
 U8	 qpal_rgb[QPAL_COLORS * 3];
-U32	 qpal_argb[QPAL_COLORS];
+U32	 qpal_argb[QPAL_COLORS];		//gamma only - 2D goes through this
+U32	 qpal_argb_tint[QPAL_COLORS];	//gamma and the cshift - 3D only
 U8	*qpal_colormap = NULL;
 Bool qpal_loaded = FALSE;
 
@@ -84,6 +85,47 @@ U8 QPalNearestRGB(I64 r, I64 g, I64 b)
 	return qpal_nearest555[((r >> 3) << 10) | ((g >> 3) << 5) | (b >> 3)];
 }
 
+//brightness of each colormap row as a fraction of full light.
+//
+//the truecolor lighting path used to read two colormap rows and interpolate
+//between the two PALETTE COLOURS they name. both endpoints are quantized to
+//the 256-entry palette, so a smooth lightmap still walked a coarse staircase
+//of palette entries - the banding on any large lit gradient. this table
+//carries the colormap's tonal response as a continuous scalar instead, so the
+//shade can be applied to the texel's true colour.
+F64 qpal_shade_scale[QPAL_SHADES];
+
+U0 QPalBuildShadeScale()
+{//average luma of row r over the whole palette, against row 0
+	I64 row;
+	I64 i;
+	I64 c;
+	F64 acc;
+	F64 base = 1.0;
+
+	for (row = 0; row < QPAL_SHADES; row++)
+	{
+		acc = 0.0;
+
+		//fullbrights are exempt from lighting and would flatten the average
+		for (i = 0; i < QPAL_FULLBRIGHT; i++)
+		{
+			c    = qpal_colormap[row * QPAL_COLORS + i];
+			acc += ToF64(qpal_rgb[c * 3]) + ToF64(qpal_rgb[c * 3 + 1]) +
+				   ToF64(qpal_rgb[c * 3 + 2]);
+		}
+
+		if (row == 0)
+		{
+			base = acc;
+			if (base <= 0.0)
+				base = 1.0;
+		}
+
+		qpal_shade_scale[row] = acc / base;
+	}
+}
+
 Bool QPalLoad()
 {//pull both tables out of the mounted paks
 	U8  *p;
@@ -101,11 +143,16 @@ Bool QPalLoad()
 	}
 	MemCopy(qpal_rgb, p, QPAL_COLORS * 3);
 
+	//both palettes. gamma is 1 and the tint is empty at load, so they start
+	//identical - qpal_argb_tint is otherwise only written by QPalRebuild, and
+	//QPalSetTint returns early when nothing changed, so a map with no cshift
+	//never reached it and the 3D blit indexed uninitialised memory
 	for (i = 0; i < QPAL_COLORS; i++)
 	{
 		qpal_argb[i] = (qpal_rgb[i * 3] << 16) |
 					   (qpal_rgb[i * 3 + 1] << 8) |
 						qpal_rgb[i * 3 + 2];
+		qpal_argb_tint[i] = qpal_argb[i];
 	}
 
 	p = QPakData("gfx/colormap.lmp", &size);
@@ -120,6 +167,7 @@ Bool QPalLoad()
 	qpal_loaded   = TRUE;
 
 	QPalBuildNearest;
+	QPalBuildShadeScale;
 
 	return TRUE;
 }
@@ -175,12 +223,18 @@ U0 QPalBuildGammaRamp()
 	q_gamma_dirty = FALSE;
 }
 
-//TRUE when tint and gamma are both no-ops, so truecolor pixels can go to the
-//screen untouched
+//TRUE when GAMMA is a no-op, so truecolor pixels can go to the screen
+//untouched. the cshift is not part of this: it belongs to the 3D view and is
+//applied by QFogBakeCanvas, not by the blit
 Bool qpal_post_identity = TRUE;
 
 U0 QPalRebuild()
 {//rebuild the display palette from tint and gamma
+ //
+ //TWO palettes. the cshift is a polyblend over the 3D view: R_PolyBlend runs
+ //inside R_RenderView, and Sbar_Draw and the console draw after it, untinted.
+ //blending it into the one palette tinted the HUD, the console and the menu
+ //with it, so a mod's v_cshift blacked out the whole screen
 	I64 i;
 	I64 sr;
 	I64 sg;
@@ -195,30 +249,45 @@ U0 QPalRebuild()
 
 	for (i = 0; i < QPAL_COLORS; i++)
 	{
+		sr = q_gamma_ramp[qpal_rgb[i * 3]];
+		sg = q_gamma_ramp[qpal_rgb[i * 3 + 1]];
+		sb = q_gamma_ramp[qpal_rgb[i * 3 + 2]];
+
+		qpal_argb[i] = (sr << 16) | (sg << 8) | sb;
+
+		//blend toward the tint, parenthesised against ZealC precedence.
+		//gamma last, or the tint blend undoes it
 		sr = qpal_rgb[i * 3];
 		sg = qpal_rgb[i * 3 + 1];
 		sb = qpal_rgb[i * 3 + 2];
 
-		//blend toward the tint, parenthesised against ZealC precedence
 		sr = sr + ((r - sr) * a) / 255;
 		sg = sg + ((g - sg) * a) / 255;
 		sb = sb + ((b - sb) * a) / 255;
 
-		//gamma last, or the tint blend undoes it
 		sr = q_gamma_ramp[ClampI64(sr, 0, 255)];
 		sg = q_gamma_ramp[ClampI64(sg, 0, 255)];
 		sb = q_gamma_ramp[ClampI64(sb, 0, 255)];
 
-		qpal_argb[i] = (sr << 16) | (sg << 8) | sb;
+		qpal_argb_tint[i] = (sr << 16) | (sg << 8) | sb;
 	}
 
-	qpal_post_identity = ToBool(a == 0 && q_gamma == 1.0);
+	qpal_post_identity = ToBool(q_gamma == 1.0);
+}
+
+U32 QPalGammaRGB(U32 rgb)
+{//gamma over a literal colour. truecolor pixels bypass the palette, so they
+ //have to be put through the ramp here instead. NO tint - this is the 2D path
+	I64 sr = q_gamma_ramp[(rgb >> 16) & 255];
+	I64 sg = q_gamma_ramp[(rgb >> 8) & 255];
+	I64 sb = q_gamma_ramp[rgb & 255];
+
+	return (sr << 16) | (sg << 8) | sb;
 }
 
 U32 QPalPostRGB(U32 rgb)
 {//tint then gamma over a literal colour, the same order and math QPalRebuild
- //applies to the palette. truecolor pixels bypass the palette, so they have
- //to be put through it here instead
+ //applies to qpal_argb_tint. 3D pixels only
 	I64 sr = (rgb >> 16) & 255;
 	I64 sg = (rgb >> 8) & 255;
 	I64 sb = rgb & 255;
