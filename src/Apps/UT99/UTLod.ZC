@@ -1,10 +1,14 @@
 // UTLod.ZC - UMesh / ULodMesh serial + GetFrame skin anim (SoftDrv).
 //
 // Ver>61 TLazyArray: SeekPos INT, TArray (INDEX count + count*elem), Seek(SeekPos).
+// Verts, Tris, Connects and VertLinks are lazy; the other arrays are not.
 // FMeshVert DWORD X:11 Y:11 Z:10. AnimSeq: Name Group Start Num Notifys Rate.
 // FrameVerts/AnimFrames sit after AndFlags=FFFFFFFF OrFlags=0 marker.
 // LodMesh: CollapsePointThus[fv] FaceLevel[faces] Faces CollapseWedge Wedges
 // Materials SpecialFaces ModelVerts SpecialVerts — Faces may be empty on some.
+// A face names its skin through two hops: FMeshFace.MaterialIndex ->
+// Materials[].TextureIndex -> UMesh Textures[]. Full field order and an
+// every-byte check for it live in utils/zctest/utmeshwalk.py.
 
 #define UT_LOD_MAX_VERTS	8192
 #define UT_LOD_MAX_TRIS		16384
@@ -39,9 +43,12 @@ class CUTLodMesh
 	I64	 seq_i;
 	CUTLodSeq seq[UT_LOD_MAX_SEQ];
 	I64	 n_seq;
-	CUTTex *skin;	//resolved skin
+	CUTTex *skin;	//default skin: first Textures entry that resolves
 	I64	 skin_ref[UT_LOD_MAX_SKIN];	//UMesh Textures object refs
 	I64	 n_skin_ref;
+	CUTTex *skin_tex[UT_LOD_MAX_SKIN];	//skin_ref resolved, same indices
+	I64	 mat_tex[UT_LOD_MAX_SKIN];	//FMeshMaterial TextureIndex into skin_ref
+	I64	 n_mat;
 	Bool loaded;
 	Bool faces_ok;		//TRUE if Faces/Wedges or classic Tris
 	U8	 name[64];
@@ -60,6 +67,10 @@ U0 UTLodFree(CUTLodMesh *m)
 		Free(m->verts);
 	if (m->tri_i)
 		Free(m->tri_i);
+	if (m->tri_uv)
+		Free(m->tri_uv);
+	if (m->tri_mat)
+		Free(m->tri_mat);
 	MemSet(m, 0, sizeof(CUTLodMesh));
 }
 
@@ -128,6 +139,22 @@ Bool UTLodReadLazyElems(CUTArc *ar, U8 **out, I64 *out_n, I64 elem_size)
 	return TRUE;
 }
 
+Bool UTLodSkipLazy(CUTArc *ar, I64 elem_size)
+{//TLazyArray<T> ver>61: INT skip offset, INDEX n, n*elem. Offset is absolute
+ //in the file, so it is never a valid seek target inside an export slice.
+	I64 n;
+
+	if (ar->ver > 61)
+		UTArcI32(ar);
+	n = UTArcIndex(ar);
+	if (ar->err || n < 0 || n > (1 << 24))
+		return FALSE;
+	if (ar->pos + n * elem_size > ar->size)
+		return FALSE;
+	ar->pos += n * elem_size;
+	return TRUE;
+}
+
 Bool UTLodSkipTArrayWords(CUTArc *ar)
 {
 	I64 n;
@@ -159,6 +186,7 @@ Bool UTLodReadFacesAsTris(CUTArc *ar, CUTLodMesh *m, I64 fv)
 	F64 *uv;
 	I64 *mat;
 	I64 nt;
+	I64 nm;
 
 	nf = UTArcIndex(ar);
 	if (ar->err || nf < 1 || nf > UT_LOD_MAX_TRIS)
@@ -225,6 +253,26 @@ Bool UTLodReadFacesAsTris(CUTArc *ar, CUTLodMesh *m, I64 fv)
 	m->tri_uv = uv;
 	m->tri_mat = mat;
 	m->num_tris = nt;
+
+	//Materials follows Wedges. FMeshMaterial is PolyFlags(U32) TextureIndex(I32);
+	//TextureIndex selects the UMesh Textures entry, which is why a face's
+	//MaterialIndex alone cannot name a skin.
+	m->n_mat = 0;
+	nm = UTArcIndex(ar);
+	if (!ar->err && nm >= 0 && nm <= UT_LOD_MAX_SKIN &&
+		ar->pos + nm * 8 <= ar->size)
+	{
+		i = 0;
+		while (i < nm)
+		{
+			UTArcU32(ar);				//PolyFlags
+			m->mat_tex[i] = UTArcI32(ar);
+			i++;
+		}
+		m->n_mat = nm;
+	}
+	else
+		ar->err = FALSE;
 	return TRUE;
 }
 
@@ -484,27 +532,24 @@ Bool UTLodLoadExport(CUTPackage *pkg, I64 exp_i, CUTLodMesh *m)
 		m->n_seq = 0;
 	}
 
-	//UMesh::Serialize order after AnimSeqs:
+	//UMesh::Serialize order after AnimSeqs (Engine/Src/UnMesh.cpp):
 	//  Connects, BoundingBox, BoundingSphere, VertLinks, Textures,
 	//  BoundingBoxes, BoundingSpheres, FrameVerts, AnimFrames
-	//Parsing it exactly reaches Textures, which the marker scan skipped over
-	//and which is the only authoritative source of a mesh's skins. The scan
-	//stays as the fallback: if the exact walk lands somewhere implausible,
-	//the old path still finds the frame header.
+	//Connects and VertLinks are TLazyArray, not TArray: an INT skip offset
+	//precedes the count. Reading that offset as the count desyncs the walk by
+	//4 bytes and Textures is never reached. Textures is the only authoritative
+	//source of a mesh's skins. The frame-header scan stays as the fallback.
+	//Verified forward on all 196 meshes in Botpack.u.
 	tex_save = ar.pos;
 	m->n_skin_ref = 0;
-	n = UTArcIndex(&ar);					//Connects
-	if (!ar.err && n >= 0 && n < 1000000)
+	if (UTLodSkipLazy(&ar, 8))				//Connects
 	{
-		ar.pos += n * 8;
 		ar.pos += 25;						//BoundingBox
 		ar.pos += 12;						//BoundingSphere centre
 		if (pkg->file_version > 61)
 			ar.pos += 4;					//radius
-		n = UTArcIndex(&ar);				//VertLinks
-		if (!ar.err && n >= 0 && n < 4000000)
+		if (UTLodSkipLazy(&ar, 4))			//VertLinks
 		{
-			ar.pos += n * 4;
 			n = UTArcIndex(&ar);			//Textures
 			if (!ar.err && n >= 0 && n <= UT_LOD_MAX_SKIN)
 			{
@@ -519,7 +564,11 @@ Bool UTLodLoadExport(CUTPackage *pkg, I64 exp_i, CUTLodMesh *m)
 			else
 				ar.err = TRUE;
 		}
+		else
+			ar.err = TRUE;
 	}
+	else
+		ar.err = TRUE;
 	if (ar.err || m->n_skin_ref < 1)
 	{
 		ar.err = FALSE;
@@ -617,16 +666,25 @@ Bool UTLodLoadExport(CUTPackage *pkg, I64 exp_i, CUTLodMesh *m)
 	//UMesh Textures entries are object refs: negative = import (the skin
 	//lives in another package), positive = export in this one. Resolving by
 	//name through the texture catalog covers both.
+	//Every entry is resolved: a face picks one via Materials[MaterialIndex].
+	//Entry 0 is commonly None (PulseGun3rd is {None, JPulse3rd_01}), so the
+	//default skin is the first entry that resolves, not slot 0.
 	m->skin = NULL;
-	if (m->n_skin_ref > 0)
+	k = 0;
+	while (k < m->n_skin_ref)
 	{
-		sk_nm = UTLinkObjName(pkg, m->skin_ref[0]);
-		if (sk_nm && sk_nm[0])
+		m->skin_tex[k] = NULL;
+		if (m->skin_ref[k])
 		{
-			m->skin = UTLinkLoadTex(sk_nm);
-			UTLog("UTLod: %s skin '%s' %d refs -> %d\n", m->name, sk_nm,
-				m->n_skin_ref, m->skin != NULL);
+			sk_nm = UTLinkObjName(pkg, m->skin_ref[k]);
+			if (sk_nm && sk_nm[0])
+				m->skin_tex[k] = UTLinkLoadTex(sk_nm);
+			UTLog("UTLod: %s tex[%d] '%s' -> %d\n", m->name, k,
+				sk_nm, m->skin_tex[k] != NULL);
 		}
+		if (!m->skin && m->skin_tex[k])
+			m->skin = m->skin_tex[k];
+		k++;
 	}
 	m->loaded = TRUE;
 	UTLog("UTLod: %s verts=%d frames=%d tris=%d fv=%d seqs=%d faces=%d\n",
@@ -830,6 +888,8 @@ U0 UTLodDraw(CUTCanvas *c, CUTLodMesh *m, I64 color)
 	I64 col;
 	I64 prev_flags;
 	F64 us;
+	I64 mi;
+	I64 ti;
 
 	if (!c || !m || !m->loaded)
 		return;
@@ -889,12 +949,24 @@ U0 UTLodDraw(CUTCanvas *c, CUTLodMesh *m, I64 color)
 			sc = sc * 0.5 + face_s * 0.5;
 			if (ut_tex_ready && ut_tex_checker.num_mips > 0)
 			{
-				//Wedge UVs from the mesh, not a synthetic mapping. The skin
-				//itself still comes from the mesh's Textures array, which is
-				//not read yet, so the checker stands in for it.
+				//Wedge UVs from the mesh, not a synthetic mapping. Skin per
+				//face: FMeshFace.MaterialIndex -> Materials[].TextureIndex ->
+				//Textures[]. PulseGunR needs this; its materials are AmmoLed,
+				//JPulseGun_02 and JPulseGun_03.
 				skin = &ut_tex_checker;
 				if (m->skin && m->skin->num_mips > 0)
 					skin = m->skin;
+				if (m->tri_mat && m->n_mat > 0)
+				{
+					mi = m->tri_mat[i];
+					if (mi >= 0 && mi < m->n_mat)
+					{
+						ti = m->mat_tex[mi];
+						if (ti >= 0 && ti < m->n_skin_ref &&
+							m->skin_tex[ti] && m->skin_tex[ti]->num_mips > 0)
+							skin = m->skin_tex[ti];
+					}
+				}
 				if (m->tri_uv)
 					UTDrawTriTexShade3(c, pa, pb, pc,
 						m->tri_uv[i * 6], m->tri_uv[i * 6 + 1],

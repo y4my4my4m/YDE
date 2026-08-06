@@ -1743,6 +1743,29 @@ class CQSurfCache
 	Bool building;
 };
 
+//--- per-face prepare, for the banded world pass ---
+//
+//QSurfCacheGet is the ONE thing in the world draw that mutates shared state:
+//it picks slots, evicts, writes q_face_surf and stamps the LRU. Every other
+//step is pure - QDrawPolygon and QDrawSkyPolygon write no globals at all.
+//
+//so the render thread resolves it for every visible face up front and parks
+//the answer here; the banded pass then only reads. frame stamps the entry so
+//a face that was not prepared this frame is obvious
+class CQFacePrep
+{
+	U8	*surf;
+	U32	*surf_rgb;
+	U32	*surf_raw;
+	I64	 sw;
+	I64	 sh;
+	I64	 built_mip;
+	I64	 frame;
+};
+
+CQFacePrep	*q_face_prep	= NULL;
+I64			 q_face_prep_n	= 0;
+
 CQSurfCache	 q_surf[QSURF_SLOTS];
 I64			*q_face_surf	= NULL;		//face index -> slot, -1 for none
 I64			 q_face_surf_n	= 0;
@@ -1966,11 +1989,22 @@ U0 QSurfCacheSetMap(CQMap *map)
 	q_surf_map     = map;
 	q_surf_map_gen = q_map_gen;
 
+	if (q_face_prep)
+	{
+		Free(q_face_prep);
+		q_face_prep   = NULL;
+		q_face_prep_n = 0;
+	}
+
 	if (map && map->num_faces > 0)
 	{
 		q_face_surf_n = map->num_faces;
 		q_face_surf   = MAlloc(q_face_surf_n * sizeof(I64));
 		MemSet(q_face_surf, 0xFF, q_face_surf_n * sizeof(I64));
+
+		q_face_prep_n = map->num_faces;
+		q_face_prep   = MAlloc(q_face_prep_n * sizeof(CQFacePrep));
+		MemSet(q_face_prep, 0, q_face_prep_n * sizeof(CQFacePrep));
 	}
 }
 
@@ -3539,6 +3573,12 @@ U0 QDrawSpan(CQCanvas *c, I64 y, I64 x1, I64 x2,
 	F64	 t_e;
 	F64	 ds;
 	F64	 dt;
+	I64	 sfx;		//16.16 texture walk for the uncached fetch
+	I64	 tfx;
+	I64	 dsfx;
+	I64	 dtfx;
+	I64	 lfx;		//and the light, same reason
+	I64	 dlfx;
 	Bool clamp_tex;
 	Bool fence;
 	I64	 pend_raw;
@@ -3774,12 +3814,28 @@ U0 QDrawSpan(CQCanvas *c, I64 y, I64 x1, I64 x2,
 		ds = (s_e - s) / ToF64(n);
 		dt = (t_e - t) / ToF64(n);
 
+		//16.16 for the plain (non-turb) fetch. that branch cost two Floor plus
+		//two cvttsd2si per pixel, and it is the path every MODEL takes - a
+		//model never caches, so the viewmodel alone was measured at 4.6-9.5ms.
+		//an arithmetic shift is Floor for negatives, so wrap and clamp behave
+		//exactly as before.
+		//
+		//s and t keep stepping in float: the turb branch indexes its table
+		//with them, and the block tail resyncs from s_e/t_e to stop stepping
+		//error accumulating across the span
+		sfx  = ToI64(s * 65536.0);
+		tfx  = ToI64(t * 65536.0);
+		dsfx = ToI64(ds * 65536.0);
+		dtfx = ToI64(dt * 65536.0);
+
 		//a cached surface carries its own light, so the bilinear fetches and
 		//the per-pixel light step below are dead work on that path
 		if (surf)
 		{
 			lightv = 0.0;
 			dlight = 0.0;
+			lfx    = 0;
+			dlfx   = 0;
 		}
 		else if (lightmap && lm_w > 0 && lm_h > 0)
 		{
@@ -3788,11 +3844,21 @@ U0 QDrawSpan(CQCanvas *c, I64 y, I64 x1, I64 x2,
 			light_e = QLightBilinear(lightmap, lm_w, lm_h,
 						(s_e - mins_s) / 16.0, (t_e - mins_t) / 16.0);
 			dlight  = (light_e - lightv) / ToF64(n);
+
+			//16.16, same reason as the texture walk above
+			lfx  = ToI64(lightv * 65536.0);
+			dlfx = ToI64(dlight * 65536.0);
 		}
 		else
 		{
+			//no lightmap: an ALIAS MODEL, lit by one value for the whole span.
+			//lfx must be set here too - this is the branch the viewmodel and
+			//every monster take, and a stale one would miscolour them
 			lightv = ToF64(flat_light);
 			dlight = 0.0;
+
+			lfx  = ToI64(lightv * 65536.0);
+			dlfx = 0;
 		}
 
 		//truecolor cached surface: one plane, one load, one store per pixel.
@@ -4024,8 +4090,10 @@ U0 QDrawSpan(CQCanvas *c, I64 y, I64 x1, I64 x2,
 			}
 			else
 			{
-				tx = ToI64(Floor(s)) >> mip;
-				ty = ToI64(Floor(t)) >> mip;
+				//>> (16 + mip): the fixed point shift and the mip shift fold
+				//into one
+				tx = sfx >> (16 + mip);
+				ty = tfx >> (16 + mip);
 			}
 
 			if (surf)
@@ -4034,9 +4102,12 @@ U0 QDrawSpan(CQCanvas *c, I64 y, I64 x1, I64 x2,
 			}
 			else if (clamp_tex)
 			{
-				//model skin, arbitrary size, never tiles
-				tx = ClampI64(tx, 0, tw - 1);
-				ty = ClampI64(ty, 0, th - 1);
+				//model skin, arbitrary size, never tiles. inlined - ClampI64
+				//is a CALL, and this is the per-pixel path every model takes
+				if (tx < 0)			tx = 0;
+				if (tx > tw - 1)	tx = tw - 1;
+				if (ty < 0)			ty = 0;
+				if (ty > th - 1)	ty = th - 1;
 			}
 			else
 			{
@@ -4060,7 +4131,7 @@ U0 QDrawSpan(CQCanvas *c, I64 y, I64 x1, I64 x2,
 			else
 			{
 				//inlined, see the cached path: ClampI64 is a CALL
-				light = ToI64(lightv);
+				light = lfx >> 16;
 				if (light < 0)		light = 0;
 				if (light > 255)	light = 255;
 
@@ -4154,7 +4225,10 @@ U0 QDrawSpan(CQCanvas *c, I64 y, I64 x1, I64 x2,
 qds_next_pixel:
 			s      += ds;
 			t      += dt;
+			sfx    += dsfx;
+			tfx    += dtfx;
 			lightv += dlight;
+			lfx    += dlfx;
 			iz     += d_iz;
 			izi    += d_izi;
 			x++;
@@ -4225,7 +4299,8 @@ U0 QDrawPolygon(CQCanvas *c, CQScreenVert *v, I64 count,
 	CQTexture *tex, U8 *lightmap, I64 lm_w, I64 lm_h,
 	F64 mins_s, F64 mins_t, I64 flat_light, I64 mip,
 	U8 *surf = NULL, I64 sw = 0, I64 sh = 0, U32 *surf_rgb = NULL,
-	U8 *dlmap = NULL, U32 *surf_raw = NULL)
+	U8 *dlmap = NULL, U32 *surf_raw = NULL,
+	I64 band_y0 = -1, I64 band_y1 = -1)
 {//scanline fill of a convex poly - intersect every edge per row, extremes
  //become the span. O(edges), but rarely more than eight after clipping, and
  //no active edge table to get the winding order wrong in
@@ -4272,6 +4347,18 @@ U0 QDrawPolygon(CQCanvas *c, CQScreenVert *v, I64 count,
 		y0 = c->vy;
 	if (y1 >= c->vy + c->vh)
 		y1 = c->vy + c->vh - 1;
+
+	//SCANLINE BAND. a banded pass gives each core a disjoint row range and
+	//every core submits every face, so the fill divides while the walk is
+	//simply repeated. -1 is the whole view, which is what every existing
+	//caller passes and what a single core run uses
+	if (band_y0 >= 0)
+	{
+		if (y0 < band_y0)
+			y0 = band_y0;
+		if (y1 > band_y1)
+			y1 = band_y1;
+	}
 
 	for (y = y0; y <= y1; y++)
 	{
@@ -5878,7 +5965,8 @@ U0 QDrawSkySpan(CQCanvas *c, I64 y, I64 x1, I64 x2, F64 iz1, F64 iz2,
 	c->spans_drawn++;
 }
 
-U0 QDrawSkyPolygon(CQCanvas *c, CQScreenVert *v, I64 count, CQTexture *tex)
+U0 QDrawSkyPolygon(CQCanvas *c, CQScreenVert *v, I64 count, CQTexture *tex,
+	I64 band_y0 = -1, I64 band_y1 = -1)
 {//same edge walk as the textured path, but only depth interpolates - the
  //texture comes from the view ray, not surface coords
 	F64	 y_min = 1.0e30;
@@ -5918,6 +6006,15 @@ U0 QDrawSkyPolygon(CQCanvas *c, CQScreenVert *v, I64 count, CQTexture *tex)
 		y0 = c->vy;
 	if (y1 >= c->vy + c->vh)
 		y1 = c->vy + c->vh - 1;
+
+	//see QDrawPolygon: -1 is the whole view
+	if (band_y0 >= 0)
+	{
+		if (y0 < band_y0)
+			y0 = band_y0;
+		if (y1 > band_y1)
+			y1 = band_y1;
+	}
 
 	for (y = y0; y <= y1; y++)
 	{
@@ -5965,8 +6062,14 @@ U0 QDrawSkyPolygon(CQCanvas *c, CQScreenVert *v, I64 count, CQTexture *tex)
 	}
 }
 
+//QDrawFace prep_mode
+#define QFP_INLINE	0	//resolve the cache and rasterize, the original path
+#define QFP_RESOLVE	1	//resolve the cache and STOP - no rasterizing
+#define QFP_USE		2	//rasterize from the stored record, never touch the cache
+
 U0 QDrawFace(CQCanvas *c, CQMap *map, I64 face_index, F64 *offset = NULL,
-	I64 ent_frame = 0)
+	I64 ent_frame = 0, I64 band_y0 = -1, I64 band_y1 = -1,
+	I64 prep_mode = QFP_INLINE)
 {//transform, clip, project and fill one BSP face
  //
  //offset translates the face in world space, which is what lets a BRUSH MODEL
@@ -5976,6 +6079,7 @@ U0 QDrawFace(CQCanvas *c, CQMap *map, I64 face_index, F64 *offset = NULL,
  //texture coords come from the UNSHIFTED position: the texture is fixed to
  //the brush, so a moving door doesn't drag its texture with it
 	CQFace		*f  = &map->faces[face_index];
+	CQFacePrep	*fp;
 	CQTexInfo	*ti;
 	CQTexture	*tex;
 	CQPolyVert	 poly[QMAX_POLY_VERTS];
@@ -6107,7 +6211,7 @@ U0 QDrawFace(CQCanvas *c, CQMap *map, I64 face_index, F64 *offset = NULL,
 	}
 
 	if (tex->is_sky)
-		QDrawSkyPolygon(c, scr, count, tex);
+		QDrawSkyPolygon(c, scr, count, tex, band_y0, band_y1);
 	else
 	{
 		//mip from EYE DISTANCE, not camera-space Z. cam[2] is dot(rel,
@@ -6163,15 +6267,50 @@ U0 QDrawFace(CQCanvas *c, CQMap *map, I64 face_index, F64 *offset = NULL,
 				lm_pending = FALSE;
 			}
 
-			//the cache may build COARSER than asked - see r_progmips. the
-			//span must step at the level that was built, not the one wanted
-			surf = QSurfCacheGet(map, f, face_index, tex, mip,
-					lightmap, lm_w, lm_h, &sw, &sh, anim_tex, &surf_rgb,
-					&surf_raw, &built_mip);
+			if (prep_mode == QFP_USE && q_face_prep &&
+				face_index < q_face_prep_n &&
+				q_face_prep[face_index].frame == q_surf_frame)
+			{
+				//BANDED PASS: read what the render thread resolved. calling
+				//the cache here would have N cores evicting under each other
+				fp        = &q_face_prep[face_index];
+				surf      = fp->surf;
+				surf_rgb  = fp->surf_rgb;
+				surf_raw  = fp->surf_raw;
+				sw        = fp->sw;
+				sh        = fp->sh;
+				built_mip = fp->built_mip;
+			}
+			else
+			{
+				//the cache may build COARSER than asked - see r_progmips. the
+				//span must step at the level that was built, not the one
+				//wanted
+				surf = QSurfCacheGet(map, f, face_index, tex, mip,
+						lightmap, lm_w, lm_h, &sw, &sh, anim_tex, &surf_rgb,
+						&surf_raw, &built_mip);
+
+				if (prep_mode == QFP_RESOLVE && q_face_prep &&
+					face_index < q_face_prep_n)
+				{
+					fp            = &q_face_prep[face_index];
+					fp->surf      = surf;
+					fp->surf_rgb  = surf_rgb;
+					fp->surf_raw  = surf_raw;
+					fp->sw        = sw;
+					fp->sh        = sh;
+					fp->built_mip = built_mip;
+					fp->frame     = q_surf_frame;
+				}
+			}
 
 			if (surf)
 				mip = built_mip;
 		}
+
+		//resolve pass: the cache entry is what it came for
+		if (prep_mode == QFP_RESOLVE)
+			return;
 
 		//the uncached path reads it per pixel, so it must exist by here
 		if (!surf && lm_pending)
@@ -6189,18 +6328,19 @@ U0 QDrawFace(CQCanvas *c, CQMap *map, I64 face_index, F64 *offset = NULL,
 		//NULL lightmap means fullbright, and by here that is only turb
 		QDrawPolygon(c, scr, count, tex, lightmap, lm_w, lm_h,
 			f->mins_s, f->mins_t, 255, mip, surf, sw, sh, surf_rgb, dlmap,
-			surf_raw);
+			surf_raw, band_y0, band_y1);
 	}
 
 	c->faces_drawn++;
 }
 
-U0 QDrawWorld(CQCanvas *c, CQMap *map, CQVisState *vs)
+U0 QDrawWorld(CQCanvas *c, CQMap *map, CQVisState *vs,
+	I64 band_y0 = -1, I64 band_y1 = -1)
 {//faces arrive front to back, so the depth test kills most overdraw
 	I64 i;
 
 	for (i = 0; i < vs->face_count; i++)
-		QDrawFace(c, map, vs->face_list[i]);
+		QDrawFace(c, map, vs->face_list[i], NULL, 0, band_y0, band_y1);
 }
 
 U0 QDrawBrushModel(CQCanvas *c, CQMap *map, I64 model_index,
