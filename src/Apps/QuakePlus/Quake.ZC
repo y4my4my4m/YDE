@@ -122,9 +122,12 @@ U0 QPresentFree()
 	while (q_blit_busy)
 		Yield;
 
-	if (q_present_pix)	Free(q_present_pix);
-	if (q_present_rgb)	Free(q_present_rgb);
-	if (q_present_dep)	Free(q_present_dep);
+	QGuardFree(q_present_pix, q_present_w * q_present_h,
+		"present.pix");
+	QGuardFree(q_present_rgb, q_present_w * q_present_h * sizeof(U32),
+		"present.rgb");
+	QGuardFree(q_present_dep, q_present_w * q_present_h * sizeof(I32),
+		"present.dep");
 	q_present_pix = NULL;
 	q_present_rgb = NULL;
 	q_present_dep = NULL;
@@ -151,9 +154,9 @@ U0 QPresentFrame()
 		//the WM must not read the buffers mid-free. one blit is dropped
 		q_present_ok = FALSE;
 		QPresentFree;
-		q_present_pix = MAlloc(n);
-		q_present_rgb = MAlloc(n * sizeof(U32));
-		q_present_dep = MAlloc(n * sizeof(I32));
+		q_present_pix = QGuardAlloc(n);
+		q_present_rgb = QGuardAlloc(n * sizeof(U32));
+		q_present_dep = QGuardAlloc(n * sizeof(I32));
 		q_present_w   = q_canvas->width;
 		q_present_h   = q_canvas->height;
 	}
@@ -163,7 +166,15 @@ U0 QPresentFrame()
 		MemCopy(q_present_rgb, q_canvas->rgb, n * sizeof(U32));
 	else
 		MemSet(q_present_rgb, 0, n * sizeof(U32));
-	MemCopy(q_present_dep, q_canvas->depth, n * sizeof(I32));
+
+	//depth is read by the blit ONLY to apply fog, and only when the bake did
+	//not already do it - QDrawBlitFit's
+	//    fog = q_opt_fog && q_fog_on && !c->prefogged
+	//so a baked frame copies a megabyte per frame that nothing reads. the
+	//shell's depth pointer stays valid either way, just stale, and the same
+	//flag that makes it stale is the one that stops it being read
+	if (!q_canvas->prefogged)
+		MemCopy(q_present_dep, q_canvas->depth, n * sizeof(I32));
 
 	//the shell copy carries prefogged with it, so the wm task's blit reads a
 	//flag consistent with the pixels it is blitting
@@ -3488,9 +3499,11 @@ U0 QGameLoop()
 		//surface cache load, straight to the log - the peaks are worth nothing
 		//if reading them means opening the console mid-flight. silent until a
 		//second passes with real build activity, so an idle view logs nothing
+		//guards are six compares a second and stay on: they only write to the
+		//log when something is actually broken
 		if (now - surf_stat_time >= 1.0)
 		{
-			if (q_surf_peak_builds > 0 || q_surf_peak_evicts > 0)
+			if (q_diag && (q_surf_peak_builds > 0 || q_surf_peak_evicts > 0))
 			{
 				StrPrint(q_surf_stat_line,
 					"surf: peak built %d (cap %d)  peak evicted %d  %d KB  mt %d/%d  fps %d\n",
@@ -3502,10 +3515,48 @@ U0 QGameLoop()
 				q_surf_peak_builds = 0;
 				q_surf_peak_evicts = 0;
 			}
+			//guards on the buffers that live across frames. checked here so a
+			//break is logged near the second it happened, not only at exit
+			QGuardCheck(q_present_pix, q_present_w * q_present_h,
+				"present.pix");
+			QGuardCheck(q_present_rgb, q_present_w * q_present_h * sizeof(U32),
+				"present.rgb");
+			QGuardCheck(q_present_dep, q_present_w * q_present_h * sizeof(I32),
+				"present.dep");
+			if (q_canvas)
+			{
+				QGuardCheck(q_canvas->pixels,
+					q_canvas->width * q_canvas->height, "canvas.pixels");
+				QGuardCheck(q_canvas->depth,
+					q_canvas->width * q_canvas->height * sizeof(I32),
+					"canvas.depth");
+				QGuardCheck(q_canvas->rgb,
+					q_canvas->width * q_canvas->height * sizeof(U32),
+					"canvas.rgb");
+			}
+
+			//the tick lines are the expensive part - see q_diag
+			if (!q_diag)
+				goto qd_tick_done;
+
+			//sky phase and water state, once a second. neither can be read
+			//from the console while playing, which is exactly when they
+			//misbehave: phase still advancing while the sky looks frozen
+			//means the drift is running and the stall is visual, and a
+			//"pre" that stays high after "real" drops to 0 is QuakeC holding
+			//the player underwater
+			StrPrint(q_surf_stat_line,
+				"tick: sky phase %d/1000 blend %d/1000  water real %d pre %d eff %d\n",
+				ToI64(q_skywind_t1 * 1000.0),
+				ToI64(q_skywind_bl * 1000.0),
+				q_water_real, q_pre_water_level, q_water_level);
+			QLog(q_surf_stat_line);
+
 			//the console mirror does not flush per line, so this is what puts
 			//it on disk. a crash loses at most a second
 			QLogFlush;
 
+qd_tick_done:
 			surf_stat_time = now;
 		}
 
@@ -3564,6 +3615,58 @@ ql_next_frame:
 	}
 }
 
+//Quake renders over the whole window, so the terminal text has to go. it must
+//NOT be the shell's own document though: DocClear frees every entry, and the
+//shell's lexer keeps cur_entry pointing into them, so the next title rebuild
+//walks freed memory and faults in the lexer long after Quake returned. that is
+//the crash-on-quit, and it only bites after a level because the surface cache
+//churns hundreds of megabytes through those addresses - with no map the freed
+//entries still happen to read like entries
+CDoc *q_doc			 = NULL;
+CDoc *q_doc_old_put	 = NULL;
+CDoc *q_doc_old_disp = NULL;
+
+U0 QDocInit()
+{//declaration initialisers on globals are ignored
+	q_doc		  = NULL;
+	q_doc_old_put = NULL;
+	q_doc_old_disp = NULL;
+}
+
+U0 QDocTake()
+{//render into a scratch document of our own, leaving the shell's untouched
+	q_doc_old_put  = DocPut;
+	q_doc_old_disp = DocDisplay;
+
+	q_doc = DocNew;
+	if (!q_doc)
+		return;
+
+	Fs->put_doc = Fs->display_doc = q_doc;
+}
+
+U0 QDocGiveBack()
+{//shell document restored BEFORE anything else prints, so the closing
+ //messages land where the user can read them
+	if (!q_doc)
+		return;
+
+	if (q_doc_old_put)
+		Fs->put_doc = q_doc_old_put;
+	if (q_doc_old_disp)
+		Fs->display_doc = q_doc_old_disp;
+
+	q_doc_old_put  = NULL;
+	q_doc_old_disp = NULL;
+}
+
+U0 QDocFree()
+{//after the wm has had a frame to stop displaying it
+	if (q_doc)
+		DocDel(q_doc);
+	q_doc = NULL;
+}
+
 U0 QDocCursorPark()
 {//park the terminal's document cursor at the END.
  //
@@ -3574,19 +3677,16 @@ U0 QDocCursorPark()
  //
  //same idiom the doc utilities use.
 	CDoc *doc;
-	Bool  unlock;
 
 	doc = Fs->put_doc;
 	if (!doc)
 		return;
 
-	unlock = DocLock(doc);
-
-	doc->cur_entry = &doc->head;
-	doc->cur_col   = 0;
-
-	if (unlock)
-		DocUnlock(doc);
+	//DocBottom, not a hand-rolled cur_entry assignment: it takes the lock AND
+	//calls DocRecalc. without the recalc the line state still describes the
+	//document as it was before everything Quake printed, and the shell reads
+	//its command line from that stale geometry
+	DocBottom(doc);
 }
 
 U0 Quake(U8 *mapname = QDEFAULT_MAP)
@@ -3614,6 +3714,8 @@ U0 Quake(U8 *mapname = QDEFAULT_MAP)
 	//QLogReset's "already allocated" test would believe it
 	QLogInit;
 	QLogReset;
+	QDocInit;
+	QGuardInit;
 
 	//before a single allocation of ours: corruption here did not come from
 	//here.
@@ -3698,7 +3800,8 @@ U0 Quake(U8 *mapname = QDEFAULT_MAP)
 
 	//Applied AFTER the cvars exist: QCfgLoad ran before this and only parked
 	//the value, because defining it there would have been shadowed here.
-	QCvarSet("crosshair", ToF64(q_opt_crosshair));
+	//the player's saved choice, not a per-weapon glyph a mod left behind
+	QCvarSet("crosshair", ToF64(q_opt_crosshair_user));
 
 	if (q_cfg_viewsize >= 0)
 		QCvarSet("viewsize", ToF64(q_cfg_viewsize));
@@ -3819,12 +3922,25 @@ U0 Quake(U8 *mapname = QDEFAULT_MAP)
 
 	try
 	{
-		Fs->win_inhibit = WIG_TASK_DEFAULT - WIF_SELF_FOCUS -
-						  WIF_SELF_GRAB_SCROLL - WIF_FOCUS_TASK_MENU;
+		//a raw Spawn()ed task owns no put/display doc, and everything below
+		//writes through them - DocClear, the console, QDocTake. running in the
+		//terminal task these already existed
+		if (!DocPut)
+			DocTermNew;
+
+		//WIG_USER_TASK_DEFAULT is what a real terminal runs with. the old base
+		//was WIG_TASK_DEFAULT, which is 0xFFFF less two bits and inhibits
+		//focus, clicks and the task list - invisible and unreachable once the
+		//app is spawned instead of called. inhibits are ADDED here rather than
+		//subtracted from a near-full mask, which underflows if a bit is absent
+		Fs->win_inhibit = WIG_USER_TASK_DEFAULT | WIF_SELF_GRAB_SCROLL |
+						  WIF_FOCUS_TASK_MENU;
+
 		AutoComplete;
 		WinBorder;
 		WinMax;
 		DocCursor;
+		QDocTake;
 		DocClear;
 
 		QCenterView(Fs);
@@ -3835,6 +3951,17 @@ U0 Quake(U8 *mapname = QDEFAULT_MAP)
 		MouseRawReset;
 
 		Fs->draw_it = &QDrawIt;
+
+		//LAST, and only now: the DE builds its taskbar from tasks carrying
+		//DISPLAYf_SHOW (DE.ZC DEBarRebuild), and a raw Spawn()ed task does not
+		//have it - the window exists, draws nothing and cannot be reached by
+		//the taskbar or alt-tab. set after draw_it so the first paint the DE
+		//asks for has something to call
+		LBts(&Fs->display_flags, DISPLAYf_SHOW);
+
+		//focus only once the window is listed; before that there is nothing
+		//for the wm to raise
+		WinFocus;
 
 		//raw_data.z is a delta the frame loop's MouseRawReset clears, not a
 		//position - discard what accumulated before the loop, or entering the
@@ -3869,6 +3996,11 @@ U0 Quake(U8 *mapname = QDEFAULT_MAP)
 
 	if (!raw_was_on)
 		MouseRaw(FALSE);
+
+	//the shell's document comes back BEFORE the closing summary prints, so
+	//that summary lands in the terminal rather than in the scratch doc that
+	//is about to be deleted
+	QDocGiveBack;
 
 	SettingsPop;
 	MenuPop;
@@ -3943,6 +4075,12 @@ U0 Quake(U8 *mapname = QDEFAULT_MAP)
 	StrPrint(line, "exit: %d frames rendered\n", q_frame_count);
 	QLog(line);
 
+	//a non-zero count names the overrun; zero with blocks still live means
+	//nothing guarded was overrun and the write is somewhere else
+	StrPrint(line, "guard: %d broken, %d blocks still live\n",
+		q_guard_bad, q_guard_n);
+	QLog(line);
+
 	if (q_log_dropped)
 	{
 		StrPrint(line, "log: %d lines dropped at the %d KB cap\n",
@@ -4008,8 +4146,6 @@ U0 Quake(U8 *mapname = QDEFAULT_MAP)
 	QInputDrainAll;
 	QDocCursorPark;
 
-	//THIS IS WHY EXITING FAULTED IN ExeCmdLine.
-	//
 	//the shell's lexer holds cur_entry into the terminal document and rebuilds
 	//the task title from it every iteration:
 	//
@@ -4017,15 +4153,20 @@ U0 Quake(U8 *mapname = QDEFAULT_MAP)
 	//    while (doc_e != doc && ptr2 < ptr3)
 	//        switch (doc_e->type_u8) ...
 	//
-	//DocClear in the setup above freed every entry, so that walk reads freed
-	//memory and faults nowhere near this code.
+	//QDocTake is what makes that safe: the DocClear at startup now falls on a
+	//scratch document, so no entry the shell points at is ever freed.
 	//
-	//it only runs while title_src is TTS_CUR_LEX, and ExeCmdLine restores the
-	//previous value when its own loop finishes.
+	//this line remains because it also suppresses the walk during teardown,
+	//but it is not sufficient on its own - ExeCmdLine restores the previous
+	//value when its loop finishes, and the walk resumes.
 	Fs->title_src = TTS_LOCKED_CONST;
 
 	//settle before handing the task back: the wm, the mixer and the block cache
 	//run on their own tasks and may still hold work referring to this one.
 	Sleep(200);
+
+	//only now: the wm has had frames to stop displaying it, and nothing of
+	//the shell's ever pointed into it
+	QDocFree;
 
 }
