@@ -610,6 +610,294 @@ U0 UTSoftDrawActor(CUTCanvas *c, F64 *origin, I64 yaw, I64 color)
 	UTDrawTri3(c, p0, p1, p2, color);
 }
 
+
+//---- Drawable map actors (UnRender DrawActor / UMesh::GetTexture) ----
+//Map instances rarely override Mesh; it comes from the class defaults, so each
+//class is resolved once and its mesh shared by every instance of it.
+
+#define UT_AMESH_MAX		40		//distinct meshes held at once
+#define UT_ADRAW_MAX		192		//drawable instances in a level
+#define UT_DT_NONE			0
+#define UT_DT_SPRITE		1
+#define UT_DT_MESH			2
+#define UT_DT_BRUSH			3
+
+class CUTActorMesh
+{
+	U8			name[64];
+	CUTLodMesh	mesh;
+	Bool		ok;
+};
+
+class CUTDrawActor
+{
+	F64		origin[3];
+	I64		yaw;
+	F64		draw_scale;
+	I64		mesh_i;			//index into ut_amesh
+	CUTTex *skin;			//AActor.Skin
+	CUTTex *multi[8];		//AActor.MultiSkins
+	F64		frame;
+	Bool	unlit;
+};
+
+CUTActorMesh	ut_amesh[UT_AMESH_MAX];
+I64				ut_amesh_n	= 0;
+CUTDrawActor	ut_dactor[UT_ADRAW_MAX];
+I64				ut_dactor_n	= 0;
+Bool			ut_amesh_zeroed = FALSE;
+
+U0 UTActorMeshClear()
+{
+	I64 i;
+
+	if (!ut_amesh_zeroed)
+	{
+		MemSet(ut_amesh, 0, sizeof(CUTActorMesh) * UT_AMESH_MAX);
+		ut_amesh_zeroed = TRUE;
+	}
+	else
+	{
+		i = 0;
+		while (i < ut_amesh_n)
+		{
+			UTLodFree(&ut_amesh[i].mesh);
+			i++;
+		}
+	}
+	ut_amesh_n = 0;
+	ut_dactor_n = 0;
+}
+
+I64 UTActorMeshSlot(U8 *pkg_path, U8 *mesh_name)
+{//find or load a mesh by name; -1 when it will not load.
+	I64 i;
+	CUTActorMesh *am;
+
+	if (!mesh_name || !mesh_name[0])
+		return -1;
+	i = 0;
+	while (i < ut_amesh_n)
+	{
+		if (!StrCompare(ut_amesh[i].name, mesh_name))
+		{
+			if (ut_amesh[i].ok)
+				return i;
+			return -1;
+		}
+		i++;
+	}
+	if (ut_amesh_n >= UT_AMESH_MAX)
+		return -1;
+	am = &ut_amesh[ut_amesh_n];
+	MemSet(am, 0, sizeof(CUTActorMesh));
+	StrPrint(am->name, "%s", mesh_name);
+	am->ok = UTLodLoadNamed(pkg_path, mesh_name, &am->mesh);
+	ut_amesh_n++;
+	if (!am->ok)
+		return -1;
+	return ut_amesh_n - 1;
+}
+
+U8 *UTActorMeshPkgPath(CUTPackage *pkg, I64 ref, U8 *buf)
+{//Object ref -> package file holding it. Imports name their root package.
+	U8 *rp;
+
+	if (ref < 0)
+	{
+		rp = UTLinkObjPkg(pkg, ref);
+		if (rp && rp[0])
+		{
+			StrPrint(buf, "::/Apps/UT99/System/%s.u", rp);
+			return buf;
+		}
+	}
+	StrPrint(buf, "::/Apps/UT99/System/Botpack.u");
+	return buf;
+}
+
+CUTTex *UTActorTexFromRef(CUTPackage *pkg, I64 ref)
+{
+	U8 *nm;
+
+	if (!ref)
+		return NULL;
+	nm = UTLinkObjName(pkg, ref);
+	if (!nm || !nm[0])
+		return NULL;
+	return UTLinkLoadTex(nm);
+}
+
+U0 UTActorScanDrawables(CUTPackage *pkg)
+{//Every export carrying a Location and resolving to a mesh becomes drawable.
+	I64 i;
+	I64 j;
+	I64 mi;
+	CUTExport *e;
+	U8 *cls;
+	U8 *mesh_nm;
+	CUTPropBag bag;
+	CUTPropBag cbag;
+	I64 mesh_ref;
+	I64 skin_ref;
+	I64 dt;
+	CUTDrawActor *d;
+	U8 path[128];
+	CUTPackage *rpkg;
+	Bool live;
+	I64 n_cand;
+	I64 n_loc;
+	I64 n_ref;
+
+	UTActorMeshClear;
+	if (!pkg)
+		return;
+	n_cand = 0;
+	n_loc = 0;
+	n_ref = 0;
+	i = 0;
+	while (i < pkg->export_count && ut_dactor_n < UT_ADRAW_MAX)
+	{
+		e = &pkg->exports[i];
+		cls = UTPkgClassName(pkg, e->class_index);
+		//Brushes are BSP; lights and path markers never draw.
+		live = ToBool(e->serial_size != 0 &&
+			StrCompare(cls, "Brush") && StrCompare(cls, "Light") &&
+			StrCompare(cls, "PathNode") && StrCompare(cls, "InventorySpot") &&
+			StrCompare(cls, "PlayerStart") && StrCompare(cls, "ZoneInfo") &&
+			StrCompare(cls, "LevelInfo") && StrCompare(cls, "Camera"));
+		if (live)
+		{
+			n_cand++;
+			live = UTPropLoadBag(pkg, e->serial_offset, e->serial_size,
+				e->object_flags, &bag);
+		}
+		if (live)
+		{
+			live = ToBool(bag.has_location && !bag.b_hidden);
+			if (live)
+				n_loc++;
+		}
+		if (live)
+		{
+			mesh_ref = bag.mesh_ref;
+			skin_ref = bag.skin_ref;
+			dt = bag.draw_type;
+			rpkg = pkg;
+			//Instances rarely override Mesh; it comes from the class
+			//defaults, whose object refs index the class package's tables,
+			//not the map's. Resolve names against whichever package the ref
+			//actually came from.
+			j = 0;
+			while (j < 4 && !mesh_ref)
+			{
+				if (j == 0)
+					StrPrint(path, "::/Apps/UT99/System/Botpack.u");
+				else if (j == 1)
+					StrPrint(path, "::/Apps/UT99/System/UnrealShare.u");
+				else if (j == 2)
+					StrPrint(path, "::/Apps/UT99/System/UnrealI.u");
+				else
+					StrPrint(path, "::/Apps/UT99/System/Engine.u");
+				if (UTPropLoadClassDefaults(path, cls, &cbag))
+				{
+					if (cbag.mesh_ref)
+					{
+						mesh_ref = cbag.mesh_ref;
+						if (!skin_ref)
+							skin_ref = cbag.skin_ref;
+						if (dt < 0)
+							dt = cbag.draw_type;
+						rpkg = UTPkgLoad(path);
+						if (!rpkg)
+							rpkg = pkg;
+					}
+				}
+				j++;
+			}
+			if (mesh_ref)
+				n_ref++;
+			live = ToBool(mesh_ref != 0 && dt != UT_DT_NONE &&
+				dt != UT_DT_BRUSH);
+		}
+		if (live)
+		{
+			mesh_nm = UTLinkObjName(rpkg, mesh_ref);
+			UTActorMeshPkgPath(rpkg, mesh_ref, path);
+			mi = UTActorMeshSlot(path, mesh_nm);
+			if (mi >= 0)
+			{
+				d = &ut_dactor[ut_dactor_n];
+				MemSet(d, 0, sizeof(CUTDrawActor));
+				UTVecCopy(bag.location, d->origin);
+				d->yaw = bag.rotation[1];
+				d->draw_scale = bag.draw_scale;
+				if (d->draw_scale <= 0.0)
+					d->draw_scale = 1.0;
+				d->mesh_i = mi;
+				d->skin = UTActorTexFromRef(rpkg, skin_ref);
+				j = 0;
+				while (j < 8)
+				{
+					d->multi[j] = UTActorTexFromRef(pkg,
+						bag.multi_skin_ref[j]);
+					j++;
+				}
+				d->frame = 0.0;
+				ut_dactor_n++;
+			}
+		}
+		i++;
+	}
+	UTLog("UTActor: cand=%d loc=%d meshref=%d drawables=%d meshes=%d\n",
+		n_cand, n_loc, n_ref, ut_dactor_n, ut_amesh_n);
+}
+
+U0 UTActorDrawMeshes(CUTCanvas *c)
+{//Shared mesh, per-instance transform and skin. Mesh state is transient.
+	I64 i;
+	I64 j;
+	CUTDrawActor *d;
+	CUTLodMesh *m;
+	F64 sv[3];
+
+	if (!c)
+		return;
+	i = 0;
+	while (i < ut_dactor_n)
+	{
+		d = &ut_dactor[i];
+		if (d->mesh_i >= 0 && d->mesh_i < ut_amesh_n && ut_amesh[d->mesh_i].ok)
+		{
+			m = &ut_amesh[d->mesh_i].mesh;
+			UTVecCopy(m->scale, sv);
+			m->scale[0] = sv[0] * d->draw_scale;
+			m->scale[1] = sv[1] * d->draw_scale;
+			m->scale[2] = sv[2] * d->draw_scale;
+			UTVecCopy(d->origin, m->draw_origin);
+			m->draw_yaw = d->yaw;
+			m->frame = d->frame;
+			m->owner_skin = d->skin;
+			j = 0;
+			while (j < 8)
+			{
+				m->multi_skin[j] = d->multi[j];
+				j++;
+			}
+			UTLodDraw(c, m, 100);
+			UTVecCopy(sv, m->scale);
+			m->owner_skin = NULL;
+			j = 0;
+			while (j < 8)
+			{
+				m->multi_skin[j] = NULL;
+				j++;
+			}
+		}
+		i++;
+	}
+}
+
 U0 UTActorDraw(CUTCanvas *c)
 {//Map specials via SoftDrv DrawActor mesh path.
 	I64 i;

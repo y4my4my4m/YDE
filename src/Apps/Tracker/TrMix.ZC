@@ -37,6 +37,9 @@ U0 TrChanInit(I64 ch)
 	c->macro_wave	= -1;
 	c->duty			= -1;
 	c->fine_pitch	= 0;
+	c->dac_level	= -1;
+	c->dac_hp		= 0;
+	c->swp_rate		= 0;
 	c->fds_depth	= 0;
 	c->fds_rate		= 0;
 	c->fds_pos		= 0;
@@ -60,6 +63,9 @@ U0 TrChanPanDefault(Bool amiga)
 		//Only IT carries per-channel volume; every loader passes through here,
 		//so full volume is the default the others keep.
 		tr_chan_vol[ch] = 64;
+		//Same for names: cleared here, filled by any loader that has them.
+		if (ch < TR_MAX_CHANNELS)
+			tr_chan_name[ch][0] = 0;
 	}
 }
 
@@ -135,7 +141,7 @@ U0 TrChanTrigger(CTrChan *c, I64 offset)
 U0 TrMixFrames(I64 n)
 {//Channel-outer so per-channel state stays in registers across the run.
 	I64	 ch, i, idx, frac, s, s1, vl, vr, pos, step, pk, v;
-	I64	 slen, lstart, llen, lend, l, r, mono;
+	I64	 slen, lstart, llen, lend, l, r, mp, mv, gch;
 	CTrChan	  *c;
 	CTrSample *sm;
 
@@ -162,8 +168,17 @@ U0 TrMixFrames(I64 n)
 			lend = lstart + llen;
 			if (lend > slen)
 				lend = slen;
-			vl = c->mix_vol * (255 - c->mix_pan) * tr.master / 256;
-			vr = c->mix_vol * c->mix_pan * tr.master / 256;
+			//Mixer strip rides on top of everything the module set. A
+			//background voice carries its channel in owner; it belongs to
+			//that strip, not to the voice slot it happens to occupy.
+			gch = c->owner;
+			if (gch < 0)
+				gch = ch;
+			gch = ClampI64(gch, 0, TR_MAX_VOICES - 1);
+			mp = ClampI64(c->mix_pan + tr_chan_pan_ofs[gch], 0, 255);
+			mv = c->mix_vol * ClampI64(tr_chan_gain[gch], 0, 64) / 64;
+			vl = mv * (255 - mp) * tr.master / 256;
+			vr = mv * mp * tr.master / 256;
 			pk = 0;
 			i  = 0;
 			while (i < n && c->active)
@@ -222,6 +237,43 @@ U0 TrMixFrames(I64 n)
 		}
 		else
 			c->peak = c->peak * 3 / 4;
+
+		//DMC direct load. The output is the counter itself, so the channel
+		//sounds without a sample: what is audible is the STEP from one written
+		//level to the next, at whatever rate the pattern writes them.
+		//
+		//The level is high-passed rather than emitted as raw DC. The NES puts
+		//the DAC through its output capacitor, so a held level decays to
+		//silence there too, and a mixer with no such filter would carry a
+		//constant offset into every other channel's headroom.
+		if (c->dac_level >= 0 && !c->mute)
+		{
+			gch = c->owner;
+			if (gch < 0)
+				gch = ch;
+			gch = ClampI64(gch, 0, TR_MAX_VOICES - 1);
+			//64 is the counter's midpoint; the span either side is 63. The
+			//gain terms are the sample path's, so a DAC step and a sample of
+			//the same amplitude land at the same level.
+			v	= (c->dac_level - 64) * 32767 / 64;
+			mp	= ClampI64(128 + tr_chan_pan_ofs[gch], 0, 255);
+			mv	= 64 * ClampI64(tr_chan_gain[gch], 0, 64) / 64;
+			vl	= mv * (255 - mp) * tr.master / 256;
+			vr	= mv * mp * tr.master / 256;
+			pk	= 0;
+			for (i = 0; i < n; i++)
+			{
+				//One pole near 30 Hz at TR_RATE: y += (x - y) / 1024.
+				c->dac_hp += (v - c->dac_hp) / 1024;
+				s = v - c->dac_hp;
+				tr_mix_l[i] += s * vl;
+				tr_mix_r[i] += s * vr;
+				if (AbsI64(s) > pk)
+					pk = AbsI64(s);
+			}
+			if (pk > c->peak)
+				c->peak = pk;
+		}
 	}
 
 	for (i = 0; i < n; i++)
@@ -232,8 +284,8 @@ U0 TrMixFrames(I64 n)
 		r = ClampI64(r, -32767, 32767);
 		FifoI64Ins(audio.output[tr.stream].data,
 				   (l & 0xFFFF) | ((r & 0xFFFF) << 16));
-		mono = (l + r) / 2;
-		tr.scope[tr.scope_pos & (TR_SCOPE_N - 1)] = mono;
+		tr.scope[tr.scope_pos & (TR_SCOPE_N - 1)]	= l;
+		tr.scope_r[tr.scope_pos & (TR_SCOPE_N - 1)]	= r;
 		tr.scope_pos++;
 	}
 	tr_play.frames_out += n;
@@ -359,7 +411,7 @@ U0 TrMacroApply(CTrChan *c)
 //so switching waveform mid-note keeps the phase.
 	CTrInst	*ins = c->ins;
 	CTrMacro *m;
-	I64		 v, slot;
+	I64		 v, n, slot;
 
 	if (!ins)
 		return;
@@ -368,6 +420,8 @@ U0 TrMacroApply(CTrChan *c)
 	if (m->len > 0)
 	{
 		v = TrMacroValue(m, c->macro_pos[TR_MACRO_VOL]);
+		if (m->mode == TR_VOL_GATE && v > 0)
+			v = 64;
 		c->mix_vol = c->mix_vol * ClampI64(v, 0, 64) / 64;
 	}
 
@@ -387,9 +441,31 @@ U0 TrMacroApply(CTrChan *c)
 	if (m->len > 0)
 	{
 		//Accumulates: the macro gives a per-tick delta, not a position.
-		c->macro_pitch += TrMacroValue(m, c->macro_pos[TR_MACRO_PITCH]);
-		c->sound_period -= c->macro_pitch;
+		//
+		//mode carries a scale here. A macro value is one unit of whatever
+		//period the source chip counts in, and the engine's period is 16x
+		//finer than the NES's, so an FTM pitch macro has to be multiplied
+		//to reach the depth it was written for. mode is otherwise only used
+		//by the arpeggio macro, and the value cannot live in val, which is
+		//an I8 that CTrInst dumps straight to disk.
+		n = m->mode;
+		if (n < 1)
+			n = 1;
+		c->macro_pitch += TrMacroValue(m, c->macro_pos[TR_MACRO_PITCH]) * n;
 	}
+
+	//Hi-pitch adds into the same total, at its own rate and from its own
+	//position in its own sequence.
+	m = &ins->macro[TR_MACRO_HIPITCH];
+	if (m->len > 0)
+	{
+		n = m->mode;
+		if (n < 1)
+			n = 1;
+		c->macro_pitch += TrMacroValue(m, c->macro_pos[TR_MACRO_HIPITCH]) * n;
+	}
+	if (ins->macro[TR_MACRO_PITCH].len > 0 || m->len > 0)
+		c->sound_period -= c->macro_pitch;
 
 	//The duty sequence wins while it runs; Vxx sets what plays without one.
 	m = &ins->macro[TR_MACRO_DUTY];
@@ -813,6 +889,24 @@ U0 TrRowChannel(I64 ch, CTrCell *cell)
 			//Pxx detunes the channel, 0x80 centre. Held until changed.
 			c->fine_pitch = 0x80 - param;
 			break;
+		case TRX_DPCM_DAC:
+			//0x4011 is 7 bits. The write holds until the next one; there is no
+			//note involved and none is needed.
+			c->dac_level = param & 0x7F;
+			break;
+		case TRX_SWEEP_UP:
+		case TRX_SWEEP_DN:
+			//Shift 0 disables the unit, as clearing 0x4001 does, so a bare
+			//H00 or I00 stops a sweep already running.
+			c->swp_shift	= param & 7;
+			c->swp_rate		= (param >> 4) & 7;
+			c->swp_sign		= 1;
+			if (eff == TRX_SWEEP_UP)
+				c->swp_sign = -1;	//Up in pitch shortens the period.
+			c->swp_count	= 0;
+			if (!c->swp_shift)
+				c->swp_rate = 0;
+			break;
 		case TRX_FDS_DEPTH:
 			c->fds_depth = ClampI64(param, 0, 63);
 			break;
@@ -1001,6 +1095,9 @@ U0 TrTickChannel(I64 ch, I64 tick)
 			case TRX_TREMOR:
 				c->tremor_pos++;
 				break;
+			case TRX_SWEEP_UP:
+			case TRX_SWEEP_DN:
+				break;		//Runs every tick, below, not only under Hxy.
 			case TRX_MULTI_RETRIG:
 				if (c->retrig_mem && tick % c->retrig_mem == 0)
 				{
@@ -1135,6 +1232,32 @@ U0 TrTickChannel(I64 ch, I64 tick)
 	//stored offset is applied directly and reaches a sixteenth of the depth
 	//FamiTracker gives it.
 	c->sound_period -= c->fine_pitch;
+	//2A03 sweep. The unit keeps running after the row that set it, so it sits
+	//here rather than under its own effect: period moves by period >> shift
+	//every rate+1 steps, negate meaning up in pitch.
+	//
+	//Hardware clocks it from the half-frame at about 120 Hz; this runs on the
+	//engine tick, which at the default tempo is half that. The sweep is used
+	//for short drops and blips, where the shape matters more than the exact
+	//rate.
+	if (c->swp_rate > 0 && c->swp_shift > 0)
+	{
+		c->swp_count++;
+		if (c->swp_count > c->swp_rate)
+		{
+			c->swp_count = 0;
+			c->period += c->swp_sign * (c->period >> c->swp_shift);
+			c->period = ClampI64(c->period, TR_PERIOD_MIN, TR_PERIOD_MAX);
+			//The unit silences the channel when a sweep runs the period past
+			//either end, which is what makes a drop end in silence.
+			if (c->period <= TR_PERIOD_MIN || c->period >= TR_PERIOD_MAX)
+			{
+				c->swp_rate	= 0;
+				c->active	= FALSE;
+			}
+			c->sound_period = c->period;
+		}
+	}
 	mv = mv * ClampI64(tr_song.global_vol, 0, 128) / 128;
 	//Song mix volume. IT byte 0x31, S3M master volume doubled, 128 elsewhere.
 	mv = mv * ClampI64(tr_song.mix_vol, 0, 128) / 128;

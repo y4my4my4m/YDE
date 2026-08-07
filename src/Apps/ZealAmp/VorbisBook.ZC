@@ -1,0 +1,410 @@
+// Vorbis I codebooks. Spec sections 3 and 8.6.
+//
+// Codeword bits are MSB first, unlike every scalar field around them.
+// A length of 0 means the entry is absent and takes no codeword.
+
+#define VB_MAX_BOOKS		256
+#define VB_MAX_LEN			32		//longest legal codeword
+
+class CVBook
+{
+	I64	 dims;			//values per entry
+	I64	 entries;
+	U8	*lengths;		//codeword length per entry, 0 = unused
+	I64	*codes;			//assigned codeword per entry
+	I64	 used;			//entries with a length
+
+	//canonical decode tables, indexed by codeword length
+	I64	 count[VB_MAX_LEN + 2];
+	I64	 first[VB_MAX_LEN + 2];		//lowest codeword of this length
+	I64	 offset[VB_MAX_LEN + 2];	//where this length starts in sorted[]
+	I64	*sorted;					//entry number, ordered by (length, code)
+
+	//vector lookup. 0 = none, the book only yields entry numbers
+	I64	 lookup;
+	F64	 min;
+	F64	 delta;
+	I64	 value_bits;
+	I64	 sequence_p;
+	I64	 lookup_values;
+	F64	*mult;			//decoded vectors, entries * dims when lookup != 0
+};
+
+CVBook	*vb_book[VB_MAX_BOOKS];
+I64		 vb_book_count = 0;
+
+U0 VBInit()
+{//declaration initialisers on globals are ignored
+	I64 i;
+
+	for (i = 0; i < VB_MAX_BOOKS; i++)
+		vb_book[i] = NULL;
+
+	vb_book_count = 0;
+}
+
+U0 VBBookFree(CVBook *b)
+{
+	if (!b)
+		return;
+
+	if (b->lengths)	Free(b->lengths);
+	if (b->codes)	Free(b->codes);
+	if (b->sorted)	Free(b->sorted);
+	if (b->mult)	Free(b->mult);
+
+	Free(b);
+}
+
+U0 VBFreeAll()
+{
+	I64 i;
+
+	for (i = 0; i < VB_MAX_BOOKS; i++)
+	{
+		VBBookFree(vb_book[i]);
+		vb_book[i] = NULL;
+	}
+
+	vb_book_count = 0;
+}
+
+I64 VBILog(I64 v)
+{//9.2.1, highest set bit position
+	I64 n = 0;
+
+	while (v > 0)
+	{
+		n++;
+		v = v >> 1;
+	}
+
+	return n;
+}
+
+F64 VBFloat32Unpack(I64 x)
+{//9.2.2. not IEEE binary32: sign, 10 bit exponent bias 788, 21 bit mantissa
+	F64 mant = ToF64(x & 0x1FFFFF);
+	I64 sign = x & 0x80000000;
+	I64 exp  = (x & 0x7FE00000) >> 21;
+
+	if (sign)
+		mant = -mant;
+
+	//no ldexp in ZealC
+	exp -= 788;
+
+	while (exp > 0)
+	{
+		mant = mant * 2.0;
+		exp--;
+	}
+	while (exp < 0)
+	{
+		mant = mant / 2.0;
+		exp++;
+	}
+
+	return mant;
+}
+
+I64 VBLookup1Values(I64 entries, I64 dims)
+{//largest n with n^dims <= entries
+	I64 n = 0;
+
+	while (TRUE)
+	{
+		I64 acc = 1;
+		I64 i;
+
+		for (i = 0; i < dims; i++)
+		{
+			acc *= (n + 1);
+			if (acc > entries)
+				return n;
+		}
+
+		n++;
+
+		if (n > 0xFFFF)
+			return n;			//nothing legal is this large
+	}
+}
+
+Bool VBAssignCodes(CVBook *b)
+{//3.2.1. lowest free codeword of each length, in entry order
+	I64 len;
+	I64 i;
+	I64 code;
+	I64 n;
+
+	for (len = 0; len <= VB_MAX_LEN + 1; len++)
+	{
+		b->count[len]  = 0;
+		b->first[len]  = 0;
+		b->offset[len] = 0;
+	}
+
+	b->used = 0;
+
+	for (i = 0; i < b->entries; i++)
+	{
+		len = b->lengths[i];
+		if (len < 1)
+			goto vba_next;			//absent
+
+		if (len > VB_MAX_LEN)
+			return FALSE;
+
+		b->count[len]++;
+		b->used++;
+
+vba_next:
+	}
+
+	//a book with no used entries is illegal
+	if (!b->used)
+		return FALSE;
+
+	//first codeword per length, and its start in sorted[]
+	code = 0;
+	n    = 0;
+	for (len = 1; len <= VB_MAX_LEN; len++)
+	{
+		b->first[len]  = code;
+		b->offset[len] = n;
+
+		n    += b->count[len];
+		code  = (code + b->count[len]) << 1;
+
+		//over-subscribed: wraps past the length's code space
+		if (code > (1 << (len + 1)))
+			return FALSE;
+	}
+
+	b->sorted = MAlloc(b->used * sizeof(I64));
+	if (!b->sorted)
+		return FALSE;
+
+	//fill sorted[] and record each entry's codeword
+	for (len = 1; len <= VB_MAX_LEN; len++)
+	{
+		code = b->first[len];
+		n    = b->offset[len];
+
+		for (i = 0; i < b->entries; i++)
+		{
+			if (b->lengths[i] != len)
+				goto vbc_next;
+
+			b->codes[i]   = code;
+			b->sorted[n]  = i;
+			code++;
+			n++;
+
+vbc_next:
+		}
+	}
+
+	return TRUE;
+}
+
+I64 VBDecodeScalar(CVBook *b)
+{//entry number, or -1 if the codeword is not in the book. MSB first
+	I64 code = 0;
+	I64 len;
+	I64 idx;
+
+	for (len = 1; len <= VB_MAX_LEN; len++)
+	{
+		code = (code << 1) | OggGetBits(1);
+
+		if (b->count[len])
+		{
+			idx = code - b->first[len];
+
+			if (idx >= 0 && idx < b->count[len])
+				return b->sorted[b->offset[len] + idx];
+		}
+	}
+
+	return -1;
+}
+
+Bool VBReadBook(CVBook *b)
+{//8.6.1
+	I64	 i;
+	I64	 j;
+	I64	 len;
+	I64	 num;
+	I64	 sparse;
+	I64	 total;
+	I64	 idx;
+	F64	 last;			//running sum when sequence_p
+	F64	 v;
+	I64	 div;
+	F64	*packed;
+
+	//sync 0x564342
+	if (OggGetBits(8) != 0x42 || OggGetBits(8) != 0x43 ||
+		OggGetBits(8) != 0x56)
+		return FALSE;
+
+	b->dims    = OggGetBits(16);
+	b->entries = OggGetBits(24);
+
+	if (b->dims < 1 || b->entries < 1 || b->entries > 0xFFFFFF)
+		return FALSE;
+
+	b->lengths = MAlloc(b->entries);
+	b->codes   = MAlloc(b->entries * sizeof(I64));
+	if (!b->lengths || !b->codes)
+		return FALSE;
+
+	if (!OggGetBits(1))
+	{
+		//UNORDERED: a length per entry, optionally sparse
+		sparse = OggGetBits(1);
+
+		for (i = 0; i < b->entries; i++)
+		{
+			if (sparse && !OggGetBits(1))
+			{
+				b->lengths[i] = 0;		//absent
+				goto vbr_next_len;
+			}
+
+			b->lengths[i] = OggGetBits(5) + 1;
+
+vbr_next_len:
+		}
+	}
+	else
+	{
+		//ordered: runs of equal length, count width shrinks with the
+		//remaining entry space
+		i   = 0;
+		len = OggGetBits(5) + 1;
+
+		while (i < b->entries)
+		{
+			num = OggGetBits(VBILog(b->entries - i));
+
+			if (num < 0 || i + num > b->entries)
+				return FALSE;
+
+			for (j = 0; j < num; j++)
+				b->lengths[i + j] = len;
+
+			i   += num;
+			len++;
+
+			if (len > VB_MAX_LEN + 1)
+				return FALSE;
+		}
+	}
+
+	if (!VBAssignCodes(b))
+		return FALSE;
+
+	b->lookup = OggGetBits(4);
+
+	if (!b->lookup)
+		return TRUE;			//scalar book, no vectors
+
+	if (b->lookup > 2)
+		return FALSE;
+
+	b->min        = VBFloat32Unpack(OggGetBits(32));
+	b->delta      = VBFloat32Unpack(OggGetBits(32));
+	b->value_bits = OggGetBits(4) + 1;
+	b->sequence_p = OggGetBits(1);
+
+	if (b->lookup == 1)
+		b->lookup_values = VBLookup1Values(b->entries, b->dims);
+	else
+		b->lookup_values = b->entries * b->dims;
+
+	if (b->lookup_values < 1)
+		return FALSE;
+
+	b->mult = MAlloc(b->entries * b->dims * sizeof(F64));
+	if (!b->mult)
+		return FALSE;
+
+	//separate buffer: expanding in place overwrites entries later ones index
+	total  = b->lookup_values;
+	packed = MAlloc(total * sizeof(F64));
+	if (!packed)
+		return FALSE;
+
+	for (i = 0; i < total; i++)
+		packed[i] = ToF64(OggGetBits(b->value_bits));
+
+	if (b->lookup == 1)
+	{
+		//lookup 1: dimension j indexes the table by base-N digits
+		for (i = b->entries - 1; i >= 0; i--)
+		{
+			div  = 1;
+			last = 0.0;
+
+			for (j = 0; j < b->dims; j++)
+			{
+				idx = (i / div) % b->lookup_values;
+				v   = packed[idx] * b->delta + b->min + last;
+
+				b->mult[i * b->dims + j] = v;
+
+				if (b->sequence_p)
+					last = v;
+
+				div *= b->lookup_values;
+			}
+		}
+	}
+	else
+	{
+		//lookup 2: vectors stored flat, one run per entry
+		for (i = b->entries - 1; i >= 0; i--)
+		{
+			last = 0.0;
+
+			for (j = 0; j < b->dims; j++)
+			{
+				v = packed[i * b->dims + j] * b->delta + b->min + last;
+
+				b->mult[i * b->dims + j] = v;
+
+				if (b->sequence_p)
+					last = v;
+			}
+		}
+	}
+
+	Free(packed);
+
+	return TRUE;
+}
+
+Bool VBReadAll(I64 count)
+{//every codebook, in order
+	I64 i;
+
+	if (count < 1 || count > VB_MAX_BOOKS)
+		return FALSE;
+
+	for (i = 0; i < count; i++)
+	{
+		vb_book[i] = CAlloc(sizeof(CVBook));
+		if (!vb_book[i])
+			return FALSE;
+
+		if (!VBReadBook(vb_book[i]))
+			return FALSE;
+	}
+
+	vb_book_count = count;
+
+	return TRUE;
+}

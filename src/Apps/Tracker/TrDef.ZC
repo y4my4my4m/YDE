@@ -71,7 +71,12 @@
 #define TR_MASTER_DEFAULT	160
 
 #define TR_BLOCK			1024	//Frames rendered per mixer call.
-#define TR_SCOPE_N			1024
+//Scope capture ring. The display shows half of it and searches the other half
+//for a trigger point, so the buffer has to be at least twice what is drawn.
+//At 48 kHz half is 43 ms, which holds a couple of cycles of anything down to
+//about 50 Hz.
+#define TR_SCOPE_N			4096
+#define TR_SCOPE_SPAN		2048	//Frames drawn.
 #define TR_MARKS			256		//Playhead history ring.
 
 //Instrument macros: a per-tick step sequence with a loop and a release
@@ -84,12 +89,24 @@
 #define TR_MACRO_ARP		1	//semitone offset
 #define TR_MACRO_PITCH		2	//period delta per tick, accumulates
 #define TR_MACRO_DUTY		3	//index into the instrument's wave bank
-#define TR_MACRO_COUNT		4
+//FamiTracker's second pitch sequence. One unit is 16 NES period units where
+//TR_MACRO_PITCH's is 1, and it has its own loop and release points, so it
+//cannot fold into the pitch macro. Both accumulate into the same running
+//total. Kept last in the array: the YTK3 loader relies on that to read
+//instrument records written before this slot existed.
+#define TR_MACRO_HIPITCH	4	//period delta per tick, 16x coarser
+#define TR_MACRO_COUNT		5
 
 //Arpeggio macro interpretation.
 #define TR_ARP_ABSOLUTE		0	//offset from the played note
 #define TR_ARP_FIXED		1	//absolute note, ignores the played one
 #define TR_ARP_RELATIVE		2	//accumulates
+
+//Volume macro interpretation. The triangle channel has no volume control on
+//hardware, so FamiTracker's volume sequence there only decides whether the
+//channel counts at all: any nonzero value plays at full level.
+#define TR_VOL_LEVEL		0
+#define TR_VOL_GATE			1
 
 //Which bank TR_MACRO_DUTY indexes.
 #define TR_BANK_NONE		0	//PCM: the duty macro does nothing
@@ -205,7 +222,12 @@
 #define TRX_FDS_RATE_HI		0x23	//FTM Ixx
 #define TRX_FDS_RATE_LO		0x24	//FTM Jxx
 #define TRX_GROOVE			0x25	//FTM Oxx
-#define TRX_COUNT			0x26
+#define TRX_DPCM_DAC		0x26	//FTM Zxx
+//Direction is a separate code rather than a flag in the parameter: a cell
+//stores its parameter in a U8 and has no bit to spare.
+#define TRX_SWEEP_UP		0x27	//FTM Hxy on a pulse channel
+#define TRX_SWEEP_DN		0x28	//FTM Ixy
+#define TRX_COUNT			0x29
 
 class CTrSample
 {
@@ -369,6 +391,15 @@ class CTrChan
 	I64	 fds_depth;
 	I64	 fds_rate;
 	I64	 fds_pos;
+	//DMC direct load, 0x4011. The DPCM channel's output IS this counter, so
+	//writing it row by row drives the channel as a bare 7-bit DAC with no
+	//sample involved, which is what most Zxx in the wild does. -1 when the
+	//channel has never been written and the effect is idle.
+	I64	 dac_level;
+	I64	 dac_hp;			//One-pole high-pass state, in mix units.
+	//2A03 sweep unit, 0x4001/0x4005. rate counts frames between steps, shift is
+	//how far the period moves each time, sign is the direction.
+	I64	 swp_rate, swp_shift, swp_sign, swp_count;
 
 	I64	 eff, param;
 	I64	 porta_speed;
@@ -433,6 +464,13 @@ class CTrPlayer
 #define TR_PANE_ORDER	3
 #define TR_PANE_MACRO	4
 #define TR_PANE_WAVE	5
+#define TR_PANE_COUNT	6
+
+//Scope display modes.
+#define TR_SCOPE_SPLIT	0	//Left lane above right lane.
+#define TR_SCOPE_MONO	1	//The sum, across the whole box.
+#define TR_SCOPE_OVER	2	//Both over each other, one box.
+#define TR_SCOPE_MODES	3
 
 class CTrGlobals
 {
@@ -443,11 +481,23 @@ class CTrGlobals
 	//Persisted in YTRACKER.CFG, independent of the DE's own volume.
 	I64	 user_master;
 	Bool interp;			//Linear interpolation between source frames.
+	//Scope display, TR_SCOPE_*. Clicking the scope cycles it. Persisted in
+	//YTRACKER.CFG.
+	I64	 scope_mode;
 	Bool playing, quit, follow, edit, pat_mode;
 	//Handshake that keeps the mixer task out of song data while the editor
 	//frees or replaces it. See TrMixSuspend.
 	Bool busy, mix_idle;
+	//Which pane owns the KEYBOARD. Each pane is its own task and window, so
+	//more than one can be on screen; this is set by whichever last took a
+	//key, and the pattern grid clears it when it takes one. The pane key
+	//branches in TrKeyScan read it.
 	I64	 pane;				//TR_PANE_*
+	//One task per open pane. ZealOS has no child windows: a window IS a
+	//task, so a pane window is a spawned task drawing shared globals.
+	CTask *pane_task[TR_PANE_COUNT];
+	I64	 pane_spawn;		//Kind handed to the task being spawned.
+	I64	 pane_close;		//Bit per kind: asked to close itself.
 	//Which representation of the song is on screen. Both read the same
 	//patterns, so an edit in one shows in the other with no conversion.
 	I64	 view_mode;			//TR_VIEW_*
@@ -483,7 +533,10 @@ class CTrGlobals
 	U8	 dir_smp[256];
 	U8	 status[128];
 
-	I16	 scope[TR_SCOPE_N];
+	//Scope capture, kept per side. The mixer used to store the mono sum,
+	//which throws away the one thing a stereo scope shows.
+	I16	 scope[TR_SCOPE_N];		//Left.
+	I16	 scope_r[TR_SCOPE_N];
 	I64	 scope_pos;
 } tr;
 
@@ -503,6 +556,23 @@ I64			tr_chan_pan[TR_MAX_VOICES];
 //Per-channel default volume, 0..64. IT carries it in the header; the other
 //formats have no equivalent and leave it at 64.
 I64			tr_chan_vol[TR_MAX_VOICES];
+//Mixer strip, applied at mix time and owned by the user rather than the
+//module. tr_chan_vol and tr_chan_pan are what a channel STARTS a note with,
+//and Cxx and 8xx overwrite them mid-note, so a fader writing there would be
+//undone by the next effect column that touches the channel. These sit after
+//all of that: gain scales the channel's output, pan_ofs shifts its position.
+I64			tr_chan_gain[TR_MAX_VOICES];	//0..64, 64 = unity.
+I64			tr_chan_pan_ofs[TR_MAX_VOICES];	//-128..127, 0 = no shift.
+
+//Per-channel name, empty when there is none.
+//
+//No format here stores one: MOD, XM, S3M and IT all name samples and
+//instruments but never channels. FTM does not either, but its channels have
+//fixed roles from the chip, so the loader fills these with the voice a
+//channel IS - Pulse 1, Triangle, VRC6 Saw - which is the useful thing to
+//show. Left empty, the display falls back to the bare channel number.
+#define TR_CHNAME		12
+U8			tr_chan_name[TR_MAX_CHANNELS][TR_CHNAME];
 
 //Sample slots holding the generated single-cycle banks. Filled by
 //TrSynthBuild; 0 means the entry was never built.
@@ -678,6 +748,47 @@ Bool TrPatternAlloc(I64 pat, I64 rows)
 	return TRUE;
 }
 
+I64 TrPatternClone(I64 src)
+{//Copy a pattern into the lowest unused slot and return it, or the source if
+//there is none free. A slot counts as used when it is allocated or when the
+//order list points at it, so cloning never lands on a pattern the song plays
+//but has not yet allocated.
+	I64	 i, pos, ch, rows, dst = 0;
+	Bool used;
+
+	if (src < 0 || src >= TR_MAX_PATTERNS)
+		return src;
+	for (i = 1; i < TR_MAX_PATTERNS && !dst; i++)
+	{
+		used = tr_pat[i] != NULL;
+		for (pos = 0; pos < tr_song.order_len && !used; pos++)
+		{
+			if (tr_song.order[pos] == i)
+				used = TRUE;
+			for (ch = 0; ch < tr_song.channels && !used; ch++)
+				if (tr_order_ch[pos][ch] == i)
+					used = TRUE;
+		}
+		if (!used)
+			dst = i;
+	}
+	if (!dst)
+		return src;
+	rows = tr_pat_rows[src];
+	if (rows < 1)
+		rows = 64;
+	if (!TrPatternAlloc(dst, rows))
+		return src;
+	if (tr_pat[src])
+		MemCopy(tr_pat[dst], tr_pat[src],
+				MinI64(rows, tr_pat_rows[src]) * tr_song.channels *
+				sizeof(CTrCell));
+	if (dst >= tr_song.n_patterns)
+		tr_song.n_patterns = dst + 1;
+
+	return dst;
+}
+
 U0 TrSampleFree(I64 i)
 {
 	if (0 <= i < TR_MAX_SAMPLES)
@@ -797,8 +908,10 @@ U0 TrDataInit()
 	//both.
 	for (i = 0; i < TR_MAX_VOICES; i++)
 	{
-		tr_chan_pan[i] = 128;
-		tr_chan_vol[i] = 64;
+		tr_chan_pan[i]		= 128;
+		tr_chan_vol[i]		= 64;
+		tr_chan_gain[i]		= 64;
+		tr_chan_pan_ofs[i]	= 0;
 	}
 	MemSet(tr_ch, 0, sizeof(tr_ch));
 	MemSet(&tr_play, 0, sizeof(CTrPlayer));
