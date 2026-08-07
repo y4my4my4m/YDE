@@ -14,11 +14,11 @@ class CVBook
 	I64	*codes;			//assigned codeword per entry
 	I64	 used;			//entries with a length
 
-	//canonical decode tables, indexed by codeword length
+	//decode tables, indexed by codeword length
 	I64	 count[VB_MAX_LEN + 2];
-	I64	 first[VB_MAX_LEN + 2];		//lowest codeword of this length
 	I64	 offset[VB_MAX_LEN + 2];	//where this length starts in sorted[]
 	I64	*sorted;					//entry number, ordered by (length, code)
+	I64	*scode;						//that entry's codeword, ascending per length
 
 	//vector lookup. 0 = none, the book only yields entry numbers
 	I64	 lookup;
@@ -29,6 +29,9 @@ class CVBook
 	I64	 lookup_values;
 	F64	*mult;			//decoded vectors, entries * dims when lookup != 0
 };
+
+//_make_words scratch. file scope: ZealC local arrays are unreliable
+I64		 vb_marker[VB_MAX_LEN + 2];
 
 CVBook	*vb_book[VB_MAX_BOOKS];
 I64		 vb_book_count = 0;
@@ -51,6 +54,7 @@ U0 VBBookFree(CVBook *b)
 	if (b->lengths)	Free(b->lengths);
 	if (b->codes)	Free(b->codes);
 	if (b->sorted)	Free(b->sorted);
+	if (b->scode)	Free(b->scode);
 	if (b->mult)	Free(b->mult);
 
 	Free(b);
@@ -132,17 +136,23 @@ I64 VBLookup1Values(I64 entries, I64 dims)
 }
 
 Bool VBAssignCodes(CVBook *b)
-{//3.2.1. lowest free codeword of each length, in entry order
+{//3.2.1. entries take the lowest free tree node of their length, walked in
+ //entry order. mirrors libvorbis _make_words.
+ //
+ //this is not canonical Huffman: codewords of one length are contiguous only
+ //when the length array is non-decreasing in entry index, which real books are
+ //not. assigning canonically decodes every book to a different symbol stream.
 	I64 len;
 	I64 i;
-	I64 code;
+	I64 j;
+	I64 entry;
 	I64 n;
 
 	for (len = 0; len <= VB_MAX_LEN + 1; len++)
 	{
 		b->count[len]  = 0;
-		b->first[len]  = 0;
 		b->offset[len] = 0;
+		vb_marker[len]    = 0;
 	}
 
 	b->used = 0;
@@ -166,40 +176,74 @@ vba_next:
 	if (!b->used)
 		return FALSE;
 
-	//first codeword per length, and its start in sorted[]
-	code = 0;
-	n    = 0;
+	for (i = 0; i < b->entries; i++)
+	{
+		len = b->lengths[i];
+		if (len < 1)
+			goto vbw_next;
+
+		entry = vb_marker[len];
+
+		//node already past the length's code space: over-populated tree
+		if (len < VB_MAX_LEN && entry >> len)
+			return FALSE;
+
+		b->codes[i] = entry;
+
+		//claim the node, jumping branches when this one is spent
+		for (j = len; j > 0; j--)
+		{
+			if (vb_marker[j] & 1)
+			{
+				if (j == 1)
+					vb_marker[1]++;
+				else
+					vb_marker[j] = vb_marker[j - 1] << 1;
+
+				break;
+			}
+
+			vb_marker[j]++;
+		}
+
+		//longer markers dangling from the taken node move to the new one
+		for (j = len + 1; j <= VB_MAX_LEN + 1; j++)
+		{
+			if ((vb_marker[j] >> 1) != entry)
+				break;
+
+			entry     = vb_marker[j];
+			vb_marker[j] = vb_marker[j - 1] << 1;
+		}
+
+vbw_next:
+	}
+
+	n = 0;
 	for (len = 1; len <= VB_MAX_LEN; len++)
 	{
-		b->first[len]  = code;
 		b->offset[len] = n;
-
-		n    += b->count[len];
-		code  = (code + b->count[len]) << 1;
-
-		//over-subscribed: wraps past the length's code space
-		if (code > (1 << (len + 1)))
-			return FALSE;
+		n += b->count[len];
 	}
 
 	b->sorted = MAlloc(b->used * sizeof(I64));
-	if (!b->sorted)
+	b->scode  = MAlloc(b->used * sizeof(I64));
+	if (!b->sorted || !b->scode)
 		return FALSE;
 
-	//fill sorted[] and record each entry's codeword
+	//the walk hands out ascending codewords within a length, so entry order
+	//is already code order and no sort is needed
 	for (len = 1; len <= VB_MAX_LEN; len++)
 	{
-		code = b->first[len];
-		n    = b->offset[len];
+		n = b->offset[len];
 
 		for (i = 0; i < b->entries; i++)
 		{
 			if (b->lengths[i] != len)
 				goto vbc_next;
 
-			b->codes[i]   = code;
-			b->sorted[n]  = i;
-			code++;
+			b->sorted[n] = i;
+			b->scode[n]  = b->codes[i];
 			n++;
 
 vbc_next:
@@ -210,22 +254,41 @@ vbc_next:
 }
 
 I64 VBDecodeScalar(CVBook *b)
-{//entry number, or -1 if the codeword is not in the book. MSB first
+{//entry number, or -1 if the codeword is not in the book. MSB first.
+ //codewords of one length are not contiguous, so the length's slice of
+ //scode[] is searched rather than indexed
 	I64 code = 0;
 	I64 len;
-	I64 idx;
+	I64 lo;
+	I64 hi;
+	I64 mid;
+	I64 c;
 
 	for (len = 1; len <= VB_MAX_LEN; len++)
 	{
 		code = (code << 1) | OggGetBits(1);
 
-		if (b->count[len])
-		{
-			idx = code - b->first[len];
+		if (!b->count[len])
+			goto vbd_next;
 
-			if (idx >= 0 && idx < b->count[len])
-				return b->sorted[b->offset[len] + idx];
+		lo = b->offset[len];
+		hi = lo + b->count[len] - 1;
+
+		while (lo <= hi)
+		{
+			mid = (lo + hi) >> 1;
+			c   = b->scode[mid];
+
+			if (c == code)
+				return b->sorted[mid];
+
+			if (c < code)
+				lo = mid + 1;
+			else
+				hi = mid - 1;
 		}
+
+vbd_next:
 	}
 
 	return -1;
@@ -408,3 +471,7 @@ Bool VBReadAll(I64 count)
 
 	return TRUE;
 }
+
+//globals are not zeroed and the app calls FreeAll before Init. run once at
+//compile time so the first FreeAll sees NULL, not stale boot memory
+VBInit;

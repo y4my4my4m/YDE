@@ -1,12 +1,16 @@
 // Inverse MDCT, window construction and overlap-add. Spec sections 1.3.2 and
 // 4.3.1.
 //
-// Direct O(n*n/2) transform. At blocksize 2048 that is ~2M multiply-adds per
-// block per channel; the FFT decomposition replaces it behind this same
-// interface when speed matters.
+// VMImdct runs an n/4-point complex FFT. VMImdctDirect is the O(n*n/2)
+// definition, kept as the reference the self-test measures against.
 //
-// The inner sum steps its angle by a rotation recurrence rather than calling
-// Cos per term - two multiplies instead of a transcendental.
+// All angle tables are exact per entry. A rotation recurrence decays: it holds
+// only while cos^2 + sin^2 == 1, and 1024 iterations of a norm under one drive
+// the output to nothing.
+//
+// Angles use the kernel's pi. A literal carries at most 16 significant digits:
+// the mantissa parses into an I64, so a longer one overflows and every angle
+// comes out scaled by the overflow.
 
 #define VM_MAX_N		2048		//blocksize1
 #define VM_MAX_CH		2
@@ -19,6 +23,50 @@ F64	vm_lap[VM_MAX_CH * VM_MAX_N];	//right half of the previous block
 I64	vm_lap_n = 0;					//its blocksize, 0 = no previous block
 
 F64	vm_tmp[VM_MAX_N];
+
+//IMDCT cosine table. the angle is pi/half * (i + 1/2 + n/4)(k + 1/2), which on
+//quarter-integer granularity is pi*m/(4*half) with m = (2i + 1 + half)(2k + 1).
+//cos has period 2pi, so m wraps at 8*half.
+//
+//built for the longest block; a shorter one strides by half_max/half. sized
+//8 * VM_MAX_N / 2.
+#define VM_CT_SIZE		(4 * VM_MAX_N)
+
+F64	vm_ct[VM_CT_SIZE];
+I64	vm_ct_half = 0;					//half this table was built for, 0 = unbuilt
+
+//FFT tables. transform length is m = n/4: 64 for blocksize0, 512 for
+//blocksize1. post-rotation runs over n/2 entries.
+#define VM_FFT_MAX		(VM_MAX_N / 4)
+
+F64	vm_fr[VM_FFT_MAX];				//FFT work buffers, real and imaginary
+F64	vm_fi[VM_FFT_MAX];
+I64	vm_rev[VM_FFT_MAX];				//bit reversal permutation
+F64	vm_twr[VM_FFT_MAX / 2];			//e^(+2 pi i t / m), t = 0..m/2-1
+F64	vm_twi[VM_FFT_MAX / 2];
+F64	vm_pre_r[VM_FFT_MAX];			//(-1)^j e^(i pi j / half)
+F64	vm_pre_i[VM_FFT_MAX];
+F64	vm_post_r[VM_MAX_N / 2];		//norm * e^(i pi (2j + 1/2 + half/2)/(2 half))
+F64	vm_post_i[VM_MAX_N / 2];
+I64	vm_fft_n = 0;					//blocksize these were built for, 0 = unbuilt
+
+U0 VMCosReady(I64 half_max)
+{//exact per entry. a rotation recurrence instead of this decays: it holds only
+ //while cos^2 + sin^2 == 1, and 1024 iterations of a norm even slightly under
+ //one drive the output to nothing
+	F64 scale;
+	I64 j;
+
+	if (vm_ct_half == half_max)
+		return;
+
+	scale = pi / ToF64(4 * half_max);
+
+	for (j = 0; j < VM_CT_SIZE; j++)
+		vm_ct[j] = Cos(scale * ToF64(j));
+
+	vm_ct_half = half_max;
+}
 
 U0 VMWindowBuild(F64 *w, I64 n)
 {//rising slope over n samples. spec 1.3.2 states the window over a full block
@@ -33,8 +81,8 @@ U0 VMWindowBuild(F64 *w, I64 n)
 
 	for (i = 0; i < n; i++)
 	{
-		s    = Sin(3.14159265358979323846 / ToF64(2 * n) * (ToF64(i) + 0.5));
-		w[i] = Sin(1.57079632679489661923 * s * s);
+		s    = Sin(pi / ToF64(2 * n) * (ToF64(i) + 0.5));
+		w[i] = Sin(pi / 2.0 * s * s);
 	}
 }
 
@@ -47,6 +95,8 @@ U0 VMInit()
 
 	vm_lap_n     = 0;
 	vm_win_ready = FALSE;
+	vm_ct_half   = 0;
+	vm_fft_n     = 0;
 }
 
 U0 VMWindowsReady(I64 bs0, I64 bs1)
@@ -60,54 +110,220 @@ U0 VMWindowsReady(I64 bs0, I64 bs1)
 	vm_win_ready = TRUE;
 }
 
-U0 VMImdct(F64 *spec, F64 *out, I64 n)
-{//out[0..n-1] from spec[0..n/2-1].
+U0 VMImdctDirect(F64 *spec, F64 *out, I64 n)
+{//reference transform. out[0..n-1] from spec[0..n/2-1].
  //
  //  out[i] = sum X[k] cos(pi/(n/2) * (i + 1/2 + n/4) * (k + 1/2))
  //
- //the k sum advances its angle by a constant step for a fixed i, so cos and
- //sin come from a rotation instead of a call per term
+ //the angle advances by a constant step for a fixed i, so the table index
+ //advances by a constant stride
 	I64 half = n / 2;
 	I64 i;
 	I64 k;
-	F64 base;
-	F64 step;
-	F64 c;
-	F64 s;
-	F64 cs;
-	F64 sn;
-	F64 nc;
+	I64 mask;
+	I64 stride;
+	I64 step;
+	I64 idx;
 	F64 acc;
-	F64 norm = 4.0 / ToF64(n);		//makes this the exact inverse of the
-									//unnormalised forward transform; verified
-									//by TDAC round trip
+	//4/n inverts an unnormalised forward transform; libvorbis folds scaling
+	//into the encoder, so the decoder needs more. 308 matches ffmpeg's
+	//max_volume of -2.8 dB (linear 0.724) on track121.ogg, where 4/n peaks at
+	//0.0094.
+	//
+	//peak-matched on one track, not derived. the 1/n term is unverified for
+	//short blocks: a wrong block-size dependence gives level jumps at
+	//transients rather than wrong overall loudness
+	F64 norm = 308.0 / ToF64(n);
+
+	VMCosReady(VM_MAX_N / 2);
+
+	//table indices are pi*j/(4*half_max); a block with a smaller half strides
+	stride = (VM_MAX_N / 2) / half;
+	mask   = VM_CT_SIZE - 1;		//8*half_max is a power of two
 
 	for (i = 0; i < n; i++)
 	{
-		//angle of the k = 0 term, and the increment per k
-		step = 3.14159265358979323846 / ToF64(half) *
-			   (ToF64(i) + 0.5 + ToF64(n) / 4.0);
-		base = step * 0.5;
-
-		c  = Cos(base);
-		s  = Sin(base);
-		cs = Cos(step);
-		sn = Sin(step);
+		//m = (2i + 1 + half)(2k + 1) advances by 2(2i + 1 + half) per k
+		step = (2 * i + 1 + half) * 2 * stride;
+		idx  = ((2 * i + 1 + half) * stride) & mask;
 
 		acc = 0.0;
 
 		for (k = 0; k < half; k++)
 		{
-			acc += spec[k] * c;
-
-			//rotate by step
-			nc = c * cs - s * sn;
-			s  = c * sn + s * cs;
-			c  = nc;
+			acc += spec[k] * vm_ct[idx];
+			idx  = (idx + step) & mask;
 		}
 
 		out[i] = acc * norm;
 	}
+}
+
+U0 VMFftReady(I64 n)
+{//pre-rotation, FFT twiddle, bit reversal and post-rotation for blocksize n.
+ //norm is folded into the post-rotation; both depend on n alone
+	I64 half = n / 2;
+	I64 m    = n / 4;
+	I64 bits;
+	I64 j;
+	I64 b;
+	I64 r;
+	F64 a;
+	F64 c;
+	F64 s;
+	F64 scale;
+	F64 norm = 308.0 / ToF64(n);
+
+	if (vm_fft_n == n)
+		return;
+
+	bits = 0;
+	while ((1 << bits) < m)
+		bits++;
+
+	for (j = 0; j < m; j++)
+	{
+		r = 0;
+		for (b = 0; b < bits; b++)
+			if (j & (1 << b))
+				r |= 1 << (bits - 1 - b);
+		vm_rev[j] = r;
+	}
+
+	scale = 2.0 * pi / ToF64(m);
+	for (j = 0; j < m / 2; j++)
+	{
+		a         = scale * ToF64(j);
+		vm_twr[j] = Cos(a);
+		vm_twi[j] = Sin(a);
+	}
+
+	scale = pi / ToF64(half);
+	for (j = 0; j < m; j++)
+	{
+		a = scale * ToF64(j);
+		c = Cos(a);
+		s = Sin(a);
+		if (j & 1)
+		{
+			c = -c;
+			s = -s;
+		}
+		vm_pre_r[j] = c;
+		vm_pre_i[j] = s;
+	}
+
+	//psi_j = pi (2j + 1/2 + half/2)/(2 half); the half/2 term is pi/4 for any half
+	scale = pi / ToF64(4 * half);
+	for (j = 0; j < half; j++)
+	{
+		a            = scale * ToF64(4 * j + 1) + pi / 4.0;
+		vm_post_r[j] = norm * Cos(a);
+		vm_post_i[j] = norm * Sin(a);
+	}
+
+	vm_fft_n = n;
+}
+
+U0 VMImdct(F64 *spec, F64 *out, I64 n)
+{//out[0..n-1] from spec[0..n/2-1], same result as VMImdctDirect.
+ //
+ //  out[i] = norm * sum X[k] cos(pi/half * (i + 1/2 + half/2) * (k + 1/2))
+ //
+ //with half = n/2 and m = half/2. pairing k = 2j against k = half-1-2j turns
+ //the sum into
+ //
+ //  out[2t] = Re{ e^(i psi_t) * sum_j conj(u_j) p_j e^(+2 pi i t j / m) }
+ //  u_j     = X[2j] + i X[half-1-2j]
+ //  p_j     = (-1)^j e^(i pi j / half)
+ //  psi_t   = pi (2t + 1/2 + half/2) / (2 half)
+ //
+ //which needs half divisible by 4, true for every blocksize from 16 up. the
+ //inner sum is periodic in t with period m, so one m-point FFT covers all n/2
+ //even outputs. odd outputs follow from out[half-1-i] = -out[i] and
+ //out[3 half-1-i] = out[i], both exact in the defining formula
+	I64 half = n / 2;
+	I64 m    = n / 4;
+	I64 size;
+	I64 hs;
+	I64 step;
+	I64 base;
+	I64 t;
+	I64 j;
+	I64 k;
+	I64 ia;
+	I64 ib;
+	F64 ur;
+	F64 ui;
+	F64 wr;
+	F64 wi;
+	F64 xr;
+	F64 xi;
+
+	VMFftReady(n);
+
+	//pre-rotate straight into bit-reversed order
+	for (j = 0; j < m; j++)
+	{
+		ur = spec[2 * j];
+		ui = -spec[half - 1 - 2 * j];
+		wr = vm_pre_r[j];
+		wi = vm_pre_i[j];
+		k  = vm_rev[j];
+
+		vm_fr[k] = ur * wr - ui * wi;
+		vm_fi[k] = ur * wi + ui * wr;
+	}
+
+	//radix-2 decimation in time, e^(+2 pi i t j / m)
+	size = 2;
+	while (size <= m)
+	{
+		hs   = size >> 1;
+		step = m / size;
+
+		for (base = 0; base < m; base += size)
+		{
+			t = 0;
+
+			for (k = 0; k < hs; k++)
+			{
+				wr = vm_twr[t];
+				wi = vm_twi[t];
+				ia = base + k;
+				ib = ia + hs;
+
+				xr = vm_fr[ib] * wr - vm_fi[ib] * wi;
+				xi = vm_fr[ib] * wi + vm_fi[ib] * wr;
+
+				vm_fr[ib] = vm_fr[ia] - xr;
+				vm_fi[ib] = vm_fi[ia] - xi;
+				vm_fr[ia] = vm_fr[ia] + xr;
+				vm_fi[ia] = vm_fi[ia] + xi;
+
+				t += step;
+			}
+		}
+
+		size <<= 1;
+	}
+
+	//post-rotate; t wraps at m
+	k = 0;
+	for (t = 0; t < half; t++)
+	{
+		out[2 * t] = vm_fr[k] * vm_post_r[t] - vm_fi[k] * vm_post_i[t];
+
+		k++;
+		if (k == m)
+			k = 0;
+	}
+
+	for (t = 1; t < half; t += 2)
+		out[t] = -out[half - 1 - t];
+
+	for (t = half + 1; t < n; t += 2)
+		out[t] = out[3 * half - 1 - t];
 }
 
 U0 VMWindowApply(F64 *v, I64 n, I64 bs0, I64 bs1, Bool blockflag,
@@ -221,3 +437,7 @@ I64 VMOverlap(F64 *v, I64 n, I64 ch, F64 *pcm)
 
 	return hop;
 }
+
+//globals are not zeroed and the app calls FreeAll before Init. run once at
+//compile time so the first FreeAll sees NULL, not stale boot memory
+VMInit;
