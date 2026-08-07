@@ -704,15 +704,19 @@ qla_next:
 // the music is redbook CD audio, nothing in PAK0 or PAK1 to extract. ripped
 // tracks are read from a music dir beside the PAKs, as source ports do:
 //
-//     ::/Apps/QuakePlus/id1/music/track02.wav ... track11.wav
+//     ::/Apps/QuakePlus/id1/music/track02.ogg ... track11.ogg
 //
+// .ogg, then .mp3, then .wav; the active gamedir before id1 within each.
 // numbering starts at 2, track 1 on the disc is the data track. worldspawn's
 // sounds field picks it, sent to the client as svc_cdtrack
 //
-// WAV only. the ZealC MP3 decoder in Apps/ZealAmp isn't in the system image,
-// so depending on it would break the build - same constraint as the net stack.
-// whole-file decode, so supply 22050Hz mono: 44.1kHz stereo is 30MB+ a track
+// ogg and mp3 decode INLINE on the game task, a slice per tick, through the
+// codecs in the system image. no spawned task: in the HL1 port a decode task
+// on core 2 triple-faulted the machine at spawn, and music has no realtime
+// need. the destination is one allocation sized to the whole track, so the
+// pointer handed to the mixer never moves and looping stays a retrigger
 
+//ceiling on one decoded track. 44.1kHz stereo costs 10.6MB a minute
 #define QMUSIC_MAX_BYTES	(48 * 1024 * 1024)
 
 U32		*q_music_frames	= NULL;
@@ -724,6 +728,78 @@ I64		 q_music_voice	= -1;		//track's voice, -1 when silent
 F64		 q_music_ends	= 0.0;
 F64		 q_music_volume	= 0.7;
 U8		 q_music_status[64];
+
+#define QMUSIC_PEND_IDLE		0
+#define QMUSIC_PEND_DECODING	1
+#define QMUSIC_PEND_READY		2
+
+#define QMUSIC_SRC_MP3			1
+#define QMUSIC_SRC_OGG			2
+
+//wall clock spent decoding per tick. a fixed frame count suits one codec
+//only: MP3 runs ~12x realtime, Vorbis near 1x
+#define QMUSIC_SLICE_SECS		0.006
+
+//floor on the buffered lead before the voice starts
+#define QMUSIC_LIVE_SECS		2.0
+
+//shortest run that measures a decode rate
+#define QMUSIC_RATE_SECS		0.5
+
+U8		*q_music_pend_raw;		//compressed source, read by the decoder
+I64		 q_music_pend_track;
+U8		 q_music_pend_name[32];
+U32		*q_music_pend_frames;
+I64		 q_music_pend_count;	//write cursor, in U32 frames
+I64		 q_music_pend_cap;
+I64		 q_music_pend_rate;
+I64		 q_music_pend_state;
+I64		 q_music_pend_src;		//QMUSIC_SRC_*
+F64		 q_music_pend_total;	//track length in seconds
+F64		 q_music_pend_t0;		//tS at decode start, for the decode rate
+Bool	 q_music_pend_live;		//voice runs on the buffer still being written
+
+//cdmp3 / cdogg 0 disable a branch, isolating that decoder from a crash. fed
+//from the game loop: QSound compiles before the cvar table
+Bool	 q_music_mp3_on;
+Bool	 q_music_ogg_on;
+
+F64		*q_music_ogg_l;			//VADecode scratch, VM_MAX_N samples each
+F64		*q_music_ogg_r;
+
+U0 QMusicStreamDrop()
+{//release the compressed source and decoder scratch. the decoded buffer is
+ //not owned here - it is either pend_frames or already the voice's
+	if (q_music_pend_raw)
+		Free(q_music_pend_raw);
+	q_music_pend_raw = NULL;
+
+	//Ogg borrows its source; a dangling ogg_src outlives this stream
+	ogg_src  = NULL;
+	ogg_size = 0;
+
+	if (q_music_ogg_l)
+		Free(q_music_ogg_l);
+	if (q_music_ogg_r)
+		Free(q_music_ogg_r);
+	q_music_ogg_l = NULL;
+	q_music_ogg_r = NULL;
+}
+
+U0 QMusicPendFree()
+{//abandon an in-flight stream decode. a live buffer belongs to q_music_frames
+	QMusicStreamDrop;
+
+	if (q_music_pend_frames)
+		Free(q_music_pend_frames);
+
+	q_music_pend_frames = NULL;
+	q_music_pend_count  = 0;
+	q_music_pend_cap    = 0;
+	q_music_pend_total  = 0.0;
+	q_music_pend_live   = FALSE;
+	q_music_pend_state  = QMUSIC_PEND_IDLE;
+}
 
 U0 QMusicFree()
 {//ORDER MATTERS. the mixer task reads voice->frames every millisecond, so stop
@@ -748,8 +824,255 @@ U0 QMusicFree()
 	q_music_track   = 0;
 }
 
+U0 QMusicDecodeSlice()
+{//decode until the slice budget is spent, appending at the write cursor.
+ //READY at the end of the stream or of the buffer
+	U32	*dst;
+	F64	 deadline;
+	I64	 n;
+	I64	 got;
+	I64	 i;
+	I64	 k;
+	I64	 s;
+	I64	 l;
+	I64	 r;
+	I64	 gr;
+	Bool ok;
+	Bool done = FALSE;
+
+	if (q_music_pend_live)
+		dst = q_music_frames;
+	else
+		dst = q_music_pend_frames;
+
+	if (!dst)
+	{//the track changed under the decode; drop the stream
+		QMusicStreamDrop;
+		q_music_pend_live  = FALSE;
+		q_music_pend_state = QMUSIC_PEND_IDLE;
+		return;
+	}
+
+	deadline = tS + QMUSIC_SLICE_SECS;
+
+	while (!done && tS < deadline)
+	{
+		if (q_music_pend_src == QMUSIC_SRC_MP3)
+		{
+			n = 0;
+			if (q_music_pend_count + 1152 <= q_music_pend_cap)
+				n = MP3StreamFrame();
+
+			if (n < 1)
+				done = TRUE;
+			else
+			{
+				//mp3_out holds left in the high half of each U32; the mixer
+				//voice reads left from the low. mono carries the sample in
+				//the low half
+				k = q_music_pend_count;
+				for (gr = 0; gr < 2; gr++)
+					for (i = 0; i < 576; i++)
+					{
+						s = mp3_out[gr][i];
+						if (mp3_stream_channels == 2)
+							dst[k] = (s >> 16 & 0xFFFF) | ((s & 0xFFFF) << 16);
+						else
+						{
+							l = s & 0xFFFF;
+							dst[k] = l | (l << 16);
+						}
+						k++;
+					}
+				q_music_pend_count = k;
+			}
+		}
+		else
+		{
+			ok  = FALSE;
+			got = 0;
+
+			//VM_MAX_N bounds one packet's hop
+			if (q_music_pend_count + VM_MAX_N <= q_music_pend_cap)
+			{
+				if (OggNextPacket)
+					ok = VADecode(q_music_ogg_l, q_music_ogg_r, &got);
+			}
+
+			if (!ok)
+				done = TRUE;
+			else
+			{
+				//the first audio packet primes the lap buffer and yields
+				//nothing, which leaves got at 0
+				k = q_music_pend_count;
+				for (i = 0; i < got; i++)
+				{
+					l = ClampI64(ToI64(q_music_ogg_l[i] * 32767.0),
+							-32768, 32767);
+
+					if (ogg_channels == 1)
+						r = l;
+					else
+						r = ClampI64(ToI64(q_music_ogg_r[i] * 32767.0),
+								-32768, 32767);
+
+					dst[k] = (l & 0xFFFF) | (r << 16);
+					k++;
+				}
+				q_music_pend_count = k;
+			}
+		}
+	}
+
+	if (done)
+	{//the compressed source is finished with
+		QMusicStreamDrop;
+		q_music_pend_state = QMUSIC_PEND_READY;
+	}
+}
+
+Bool QMusicOggOpen(U8 *raw, I64 size, I64 track)
+{//headers and sizing; the audio packets are the slice decoder's. FALSE, as
+ //nothing plays until QMusicUpdate hands the buffer to a voice
+	I64		total;
+	I64		secs;
+	I64		est;
+	Bool	ok;
+
+	OggFree;
+	OggInit;
+	VBFreeAll;
+	VBInit;
+	VSFreeAll;
+	VSInit;
+	VFInit;
+	VMInit;
+
+	ogg_src  = raw;
+	ogg_size = size;
+
+	//OggHeaders walks all three header packets; OggOpen consumes the first
+	ok = OggHeaders();
+
+	if (ok && (ogg_rate < 1 || ogg_channels < 1 || ogg_channels > 2 ||
+		ogg_blocksize1 > VM_MAX_N))
+		ok = FALSE;
+
+	if (!ok)
+	{
+		Free(raw);
+		ogg_src  = NULL;
+		ogg_size = 0;
+		StrPrint(q_music_status, "track%02d.ogg unsupported", track);
+		return FALSE;
+	}
+
+	//the last page's granule position is the sample count. a stream without
+	//one is sized from the nominal bitrate, then from a 5 minute ceiling
+	total = OggTotalSamples(raw, size);
+	if (total < 1 && ogg_bitrate_nom > 0)
+		total = size * 8 / ogg_bitrate_nom * ogg_rate;
+	if (total < 1)
+		total = 300 * ogg_rate;
+
+	secs = total / ogg_rate;
+	est  = (secs + 2) * ogg_rate;
+	if (est > QMUSIC_MAX_BYTES / sizeof(U32))
+		est = QMUSIC_MAX_BYTES / sizeof(U32);
+
+	q_music_ogg_l = MAlloc(VM_MAX_N * sizeof(F64));
+	q_music_ogg_r = MAlloc(VM_MAX_N * sizeof(F64));
+
+	q_music_pend_raw    = raw;
+	q_music_pend_track  = track;
+	q_music_pend_rate   = ogg_rate;
+	q_music_pend_cap    = est;
+	q_music_pend_count  = 0;
+	q_music_pend_src    = QMUSIC_SRC_OGG;
+	q_music_pend_total  = ToF64(secs);
+	q_music_pend_t0     = tS;
+	q_music_pend_live   = FALSE;
+	q_music_pend_frames = MAlloc(est * sizeof(U32));
+
+	//zeroed: the voice can reach past the write cursor, and the tail plays as
+	//silence rather than heap garbage
+	MemSet(q_music_pend_frames, 0, est * sizeof(U32));
+
+	StrPrint(q_music_pend_name, "track%02d.ogg", track);
+	StrPrint(q_music_status, "decoding track%02d.ogg", track);
+
+	q_music_pend_state = QMUSIC_PEND_DECODING;
+
+	return FALSE;
+}
+
+Bool QMusicMp3Open(U8 *raw, I64 size, I64 track)
+{//as QMusicOggOpen, through the MP3Stream API ZealAmp plays with
+	I64 secs;
+	I64 est;
+
+	//one frame proves the stream and yields format + bitrate
+	MP3StreamInit(raw, size);
+	if (MP3StreamFrame() < 1)
+	{
+		Free(raw);
+		StrPrint(q_music_status, "track%02d.mp3 undecodable", track);
+		return FALSE;
+	}
+
+	//ZAMp3Open's sizing: duration from the mean bitrate, +8s for VBR
+	secs = size * 8 / MaxI64(1, mp3_bitrates[mp3_h_bitrate_index]);
+	est  = (secs + 8) * mp3_stream_rate;
+	if (est > QMUSIC_MAX_BYTES / sizeof(U32))
+		est = QMUSIC_MAX_BYTES / sizeof(U32);
+
+	q_music_pend_raw    = raw;
+	q_music_pend_track  = track;
+	q_music_pend_rate   = mp3_stream_rate;
+	q_music_pend_cap    = est;
+	q_music_pend_count  = 0;
+	q_music_pend_src    = QMUSIC_SRC_MP3;
+	q_music_pend_total  = ToF64(secs);
+	q_music_pend_t0     = tS;
+	q_music_pend_live   = FALSE;
+	q_music_pend_frames = MAlloc(est * sizeof(U32));
+
+	MemSet(q_music_pend_frames, 0, est * sizeof(U32));
+
+	StrPrint(q_music_pend_name, "track%02d.mp3", track);
+	StrPrint(q_music_status, "decoding track%02d.mp3", track);
+
+	//the probe frame is discarded; restart the stream clean
+	MP3StreamInit(raw, size);
+
+	q_music_pend_state = QMUSIC_PEND_DECODING;
+
+	return FALSE;
+}
+
+U8 *QMusicRead(I64 track, U8 *dir, U8 *ext, I64 *_size, U8 *_path)
+{//<dir>/music/track<NN>.<ext>, NULL when there is no such file. the directory
+ //is probed first: FileFind on a path whose parent is missing prints in red
+	U8 probe[96];
+
+	if (!dir || !dir[0])
+		return NULL;
+
+	StrPrint(probe, "::/Apps/QuakePlus/%s/music", dir);
+	if (!FileFind(probe))
+		return NULL;
+
+	StrPrint(_path, "::/Apps/QuakePlus/%s/music/track%02d.%s", dir, track, ext);
+	if (!FileFind(_path))
+		return NULL;
+
+	return FileRead(_path, _size);
+}
+
 Bool QMusicLoad(I64 track)
-{//read and decode one track, FALSE if there is no file for it
+{//open one track. TRUE only for WAV, which is resident on return; a stream
+ //returns FALSE and starts playing from QMusicUpdate
 	U8	 path[96];
 	U8	*raw;
 	I64	 size  = 0;
@@ -758,16 +1081,40 @@ Bool QMusicLoad(I64 track)
 	I64	 count;
 
 	QMusicFree;
+	QMusicPendFree;
 
-	StrPrint(path, "::/Apps/QuakePlus/id1/music/track%02d.wav", track);
+	if (q_music_ogg_on)
+	{
+		raw = QMusicRead(track, q_game_dir, "ogg", &size, path);
+		if (!raw)
+			raw = QMusicRead(track, "id1", "ogg", &size, path);
 
-	raw = FileRead(path, &size);
+		if (raw)
+			return QMusicOggOpen(raw, size, track);
+	}
+
+	if (q_music_mp3_on)
+	{
+		raw = QMusicRead(track, q_game_dir, "mp3", &size, path);
+		if (!raw)
+			raw = QMusicRead(track, "id1", "mp3", &size, path);
+
+		if (raw)
+			return QMusicMp3Open(raw, size, track);
+	}
+
+	raw = QMusicRead(track, q_game_dir, "wav", &size, path);
+	if (!raw)
+		raw = QMusicRead(track, "id1", "wav", &size, path);
+
 	if (!raw)
 	{
-		StrPrint(q_music_status, "no track%02d.wav", track);
+		StrPrint(q_music_status, "no track%02d ogg/mp3/wav", track);
 		return FALSE;
 	}
 
+	//WAV is whole-file: uncompressed, so the decode is a copy and the cost is
+	//the allocation
 	count = QSndDecodeWav(raw, size, &frames, &rate);
 	Free(raw);
 
@@ -794,6 +1141,25 @@ U0 QMusicReset()
 	q_music_voice   = -1;
 	q_music_playing = FALSE;
 	q_music_ends    = 0.0;
+
+	q_music_pend_raw     = NULL;
+	q_music_pend_frames  = NULL;
+	q_music_pend_name[0] = 0;
+	q_music_pend_track   = 0;
+	q_music_pend_count   = 0;
+	q_music_pend_cap     = 0;
+	q_music_pend_rate    = QSND_RATE;
+	q_music_pend_src     = 0;
+	q_music_pend_total   = 0.0;
+	q_music_pend_t0      = 0.0;
+	q_music_pend_live    = FALSE;
+	q_music_pend_state   = QMUSIC_PEND_IDLE;
+
+	q_music_ogg_l = NULL;
+	q_music_ogg_r = NULL;
+
+	q_music_mp3_on = TRUE;
+	q_music_ogg_on = TRUE;
 }
 
 U0 QMusicStart(F64 now)
@@ -815,16 +1181,52 @@ U0 QMusicStart(F64 now)
 	q_music_playing = TRUE;
 }
 
+Bool QMusicLeadOK()
+{//TRUE once the buffered lead covers the rest of the decode.
+ //
+ //buffered B seconds of a track of T, decode rate r in audio-seconds per wall
+ //second: the playhead reaches the write cursor unless B >= T * (1 - r). MP3
+ //clears this at the floor; Vorbis near 1x buffers most of the track first
+	F64 buffered;
+	F64 elapsed;
+	F64 rate;
+	F64 need;
+
+	if (q_music_pend_rate < 1)
+		return FALSE;
+
+	buffered = ToF64(q_music_pend_count) / ToF64(q_music_pend_rate);
+	if (buffered < QMUSIC_LIVE_SECS)
+		return FALSE;
+
+	elapsed = tS - q_music_pend_t0;
+	if (elapsed < QMUSIC_RATE_SECS)
+		return FALSE;
+
+	rate = buffered / elapsed;
+	if (rate >= 1.0)
+		return TRUE;
+
+	need = q_music_pend_total * (1.0 - rate) + QMUSIC_LIVE_SECS;
+
+	return ToBool(buffered >= need);
+}
+
 Bool QMusicPlay(I64 track, F64 now)
 {
 	if (track < 2)
 	{
 		QMusicFree;
+		QMusicPendFree;
 		return FALSE;
 	}
 
 	//CDAudio_Play has the same check, a level reload must not restart music
 	if (q_music_playing && q_music_track == track)
+		return TRUE;
+
+	//nor restart a decode that has not reached its voice yet
+	if (q_music_pend_state != QMUSIC_PEND_IDLE && q_music_pend_track == track)
 		return TRUE;
 
 	if (!QMusicLoad(track))
@@ -836,14 +1238,72 @@ Bool QMusicPlay(I64 track, F64 now)
 }
 
 U0 QMusicUpdate(F64 now)
-{//retrigger once the mixer says it finished - predicting from length runs
- //early and stacks copies, or late and leaves a gap
+{//advance a stream decode, then retrigger once the mixer says the voice
+ //finished - predicting from length runs early and stacks copies, or late and
+ //leaves a gap
+	if (q_music_pend_state == QMUSIC_PEND_DECODING)
+	{
+		QMusicDecodeSlice;
+
+		if (!q_music_pend_live &&
+			q_music_pend_state == QMUSIC_PEND_DECODING && QMusicLeadOK)
+		{//hand the buffer being written to a voice, counted at the full
+		 //estimate; the count is trimmed at stream end
+			QMusicFree;
+
+			q_music_frames = q_music_pend_frames;
+			q_music_count  = q_music_pend_cap;
+			q_music_rate   = q_music_pend_rate;
+			q_music_track  = q_music_pend_track;
+
+			q_music_pend_frames = NULL;
+			q_music_pend_live   = TRUE;
+
+			StrPrint(q_music_status, "%s (decoding)", q_music_pend_name);
+
+			QMusicStart(now);
+			return;
+		}
+	}
+
+	if (q_music_pend_state == QMUSIC_PEND_READY)
+	{
+		if (q_music_pend_live)
+		{//the stream ended under a live voice: trim to the real length
+			q_music_count = q_music_pend_count;
+			AudioSFXSetCount(q_music_voice, q_music_pend_count);
+
+			q_music_pend_live  = FALSE;
+			q_music_pend_state = QMUSIC_PEND_IDLE;
+		}
+		else
+		{//decode finished before the lead was large enough to go live
+			QMusicFree;
+
+			q_music_frames = q_music_pend_frames;
+			q_music_count  = q_music_pend_count;
+			q_music_rate   = q_music_pend_rate;
+			q_music_track  = q_music_pend_track;
+
+			q_music_pend_frames = NULL;
+			q_music_pend_state  = QMUSIC_PEND_IDLE;
+
+			QMusicStart(now);
+		}
+
+		StrPrint(q_music_status, "%s %dHz %ds", q_music_pend_name,
+			q_music_rate, q_music_count / MaxI64(1, q_music_rate));
+
+		return;
+	}
+
 	if (!q_music_playing || !q_music_frames)
 		return;
 
 	if (q_music_voice >= 0 && AudioSFXPlaying(q_music_voice))
 		return;
 
+	//CDAudio_Play(track, TRUE): svc_cdtrack loops until the level changes
 	QMusicStart(now);
 }
 

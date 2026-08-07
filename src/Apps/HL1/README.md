@@ -44,7 +44,7 @@ comments. Deviations are deliberate and marked.
   forward); world uses PVS.
 - **Dlights** - keyed rocket/muzzle/explosion/flashlight entries feed the
   surface-cache key.
-- **Sound** - 48 mixer voices (`AUDIO_MAX_SFX_VOICES`, `src/System/AC97.ZC`),
+- **Sound** - 48 mixer voices (`AUDIO_MAX_SFX_VOICES`, `src/System/Audio/Driver/AC97.ZC`),
   twelve ambient loops, sixteen dynamic channels, reverb by room type,
   `sentences.txt` word scheduler, distance-cadenced footsteps.
 - **CD audio** - `trigger_cdaudio` tracks map to the shipped
