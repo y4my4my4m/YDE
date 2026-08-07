@@ -3,12 +3,21 @@
 //A full-screen image composited on TOP of every finished frame by the Window
 //Manager, via the gr.fp_final_screen_update hook (the same hook FileMgr uses
 //to paint over everything). Because it is drawn last, nothing underneath -
-//the two terminals, AutoComplete, the wallpaper, or boot/compile output - can
+//the terminal, AutoComplete, the wallpaper, or boot/compile output - can
 //overtake it. Boot proceeds completely normally underneath; there is no
 //waiting, no window z-order fighting, and no hiding of other windows.
 //
-//A background task clears the overlay on the first key/click or after a
-//timeout, restoring whatever final-screen hook was there before.
+//Two layers: a static full-screen background (gradient + glow + text) rendered
+//once, and a logo layer redrawn every frame with a truecolor extruded "YDE"
+//mesh. The mesh sweeps a cell grid into boxes - one box per horizontal run,
+//merged vertically - then lights, depth-sorts and wire-outlines them.
+//
+//Every colour derives from one hue, read from the saved YDE config so the
+//splash matches the desktop accent the user picked.
+//
+//A background task drives the animation and clears the overlay on the first
+//key/click or once boot finishes, restoring whatever final-screen hook was
+//there before.
 //
 //Invoked from StartOS.ZC right after the WinMgr task spawns.
 
@@ -21,67 +30,524 @@ DefineListLoad("YDE_MOTTOS",
 	"Ring-0 all the way down.\0"
 	"Do you like the command line?\0");
 
-CDC	 *yde_splash_dc		= NULL;		//Pre-rendered full-screen splash image.
+#define YS_CFG			"::/Home/Config/YDE.CFG"
+#define YS_HUE_DEFAULT	271		//YKD violet, same as DE/Theme.ZC.
+
+#define YS_LW			640		//logo layer size, in pixels
+#define YS_LH			320
+#define YS_MAXB			96		//extruded boxes; "YDE" needs about 40
+
+#define YS_DEPTH		1.6		//half-depth of the extrusion, in glyph cells
+#define YS_DIST			60.0	//camera distance, in glyph cells
+#define YS_FOCAL		1020.0	//focal length; FOCAL/DIST = pixels per cell
+
+//Logotype grid. The 8x8 system font is too thin to extrude - its Y leaves the
+//arms one cell clear of the crossbar, which reads as a hole once the strokes
+//have depth. These are two cells thick and connected.
+#define YS_GW			9		//cells per glyph
+#define YS_GH			12
+#define YS_PITCH		10		//glyph origin spacing, so one cell of air
+
+U8 *ys_glyph[3] = {
+	"##.....##"
+	"##.....##"
+	".##...##."
+	".##...##."
+	"..##.##.."
+	"..#####.."
+	"...###..."
+	"...###..."
+	"...###..."
+	"...###..."
+	"...###..."
+	"...###...",
+
+	"#######.."
+	"########."
+	"##....##."
+	"##.....##"
+	"##.....##"
+	"##.....##"
+	"##.....##"
+	"##.....##"
+	"##.....##"
+	"##....##."
+	"########."
+	"#######..",
+
+	"#########"
+	"#########"
+	"##......."
+	"##......."
+	"##......."
+	"#######.."
+	"#######.."
+	"##......."
+	"##......."
+	"##......."
+	"#########"
+	"#########"};
+
+CDC	 *yde_splash_dc		= NULL;		//Static full-screen background.
+CDC	 *yde_logo_dc		= NULL;		//Front logo layer, read by the overlay.
+CDC	 *yde_logo_back		= NULL;		//Back logo layer, written by the animator.
+I64	  yde_logo_x		= 0;
+I64	  yde_logo_y		= 0;
+I64	  yde_hue			= YS_HUE_DEFAULT;
 Bool  yde_splash_up		= FALSE;
-U0	(*yde_splash_old_hook)(CDC *dc) = NULL;
+U0	 (*yde_splash_old_hook)(CDC *dc) = NULL;
 
-U0 YDESplashLogo(CDC *dc, I64 lx, I64 ly, I64 sc, U32 col)
-{//Pixel-upscale "YDE" in the system font, top-left at (lx, ly), scale sc.
-	U8	*name = "YDE";
-	I64	 i, px, py;
-	U64	 bits;
+//Box corner k: x = k & 1, y = k >> 1 & 1, z = k >> 2 & 1. Each face lists its
+//four corners in perimeter order; the scanline fill is winding-agnostic.
+I64 ys_face[24] = {0, 2, 6, 4,  1, 3, 7, 5,  0, 1, 5, 4,
+				   2, 3, 7, 6,  0, 1, 3, 2,  4, 5, 7, 6};
+F64 ys_fnx[6] = {-1.0,  1.0,  0.0, 0.0,  0.0, 0.0};
+F64 ys_fny[6] = { 0.0,  0.0, -1.0, 1.0,  0.0, 0.0};
+F64 ys_fnz[6] = { 0.0,  0.0,  0.0, 0.0, -1.0, 1.0};
 
-	dc->color = col;
-	for (i = 0; name[i]; i++)
+I64 ys_nb = 0;								//boxes built
+F64 ys_bx0[YS_MAXB], ys_bx1[YS_MAXB];		//model-space extents
+F64 ys_by0[YS_MAXB], ys_by1[YS_MAXB];
+F64 ys_bz [YS_MAXB];						//rotated centroid z, per frame
+I64 ys_order[YS_MAXB];						//painter's order, far to near
+
+F64 ys_ca = 1.0, ys_sa = 0.0;				//yaw cos/sin
+F64 ys_cb = 1.0, ys_sb = 0.0;				//pitch cos/sin
+F64 ys_rx = 0.0, ys_ry = 0.0, ys_rz = 0.0;	//YSRot output
+
+F64 ys_cx[8], ys_cy[8], ys_cz[8];			//one box's rotated corners
+I64 ys_px[8], ys_py[8];						//and their projected pixels
+
+I64 ys_base_r = 0, ys_base_g = 0, ys_base_b = 0;	//logo body colour
+I64 ys_wire = 0;									//outline colour
+
+/* ---------------- colour ---------------- */
+
+I64 YSHsv(I64 hue, I64 s, I64 v)
+{//HSV to a packed 0xRRGGBB. hue 0..359, s/v 0..255. Integer math only.
+//Same construction as DEHue2RGB in DE/Theme.ZC, which does not exist yet here.
+	I64 r, g, b, i, f, p, q, t;
+
+	hue = ClampI64(hue, 0, 359);
+	i = hue / 60;
+	f = hue % 60;
+	p = v * (255 - s) / 255;
+	q = v * (255 * 60 - s * f) / (255 * 60);
+	t = v * (255 * 60 - s * (60 - f)) / (255 * 60);
+	switch (i)
 	{
-		bits = text.font[name[i]];
-		for (py = 0; py < FONT_HEIGHT; py++)
-			for (px = 0; px < FONT_WIDTH; px++)
-				if (bits >> (py * 8 + px) & 1)
-					GrRect(dc, lx + (i * FONT_WIDTH + px) * sc, ly + py * sc, sc, sc);
+		case 0:	 r = v; g = t; b = p; break;
+		case 1:	 r = q; g = v; b = p; break;
+		case 2:	 r = p; g = v; b = t; break;
+		case 3:	 r = p; g = q; b = v; break;
+		case 4:	 r = t; g = p; b = v; break;
+		default: r = v; g = p; b = q; break;
+	}
+
+	return (r & 0xFF) << 16 | (g & 0xFF) << 8 | b & 0xFF;
+}
+
+I64 YSMix(I64 a, I64 b, I64 t)
+{//Blend two packed colours; t/256 of b.
+	I64 ar = a >> 16 & 0xFF, ag = a >> 8 & 0xFF, ab = a & 0xFF,
+		br = b >> 16 & 0xFF, bg = b >> 8 & 0xFF, bb = b & 0xFF;
+
+	return (ar + (br - ar) * t / 256) << 16 |
+		   (ag + (bg - ag) * t / 256) << 8 |
+		   (ab + (bb - ab) * t / 256);
+}
+
+I64 YSHueRead()
+{//Accent hue from the saved desktop config, so the splash matches the desktop.
+//The DE is not compiled yet at splash time - this parses the same key=value
+//file DEConfigSave writes, matched at line start only.
+	I64	 size, hue = YS_HUE_DEFAULT;
+	U8	*body, *p;
+
+	if (!FileFind(YS_CFG))
+		return hue;
+	body = FileRead(YS_CFG, &size);
+	if (!body)
+		return hue;
+	p = StrFind("hue ", body);
+	while (p)
+	{
+		if (p == body || p[-1] == '\n')
+		{
+			hue = Str2I64(p + 4);
+			p = NULL;
+		}
+		else
+			p = StrFind("hue ", p + 1);
+	}
+	Free(body);
+
+	return ClampI64(hue, 0, 359);
+}
+
+/* ---------------- logo layer primitives ---------------- */
+
+U0 YSLine(CDC *dc, I64 x0, I64 y0, I64 x1, I64 y1, I64 col)
+{//Clipped DDA into the logo layer. dc->body is 0x00RRGGBB.
+	I64	 dx = x1 - x0, dy = y1 - y0, n, i, w = dc->width, h = dc->height;
+	F64	 sx, sy, fx, fy;
+
+	if (dx < 0)
+		n = -dx;
+	else
+		n = dx;
+	if (dy < 0)
+		i = -dy;
+	else
+		i = dy;
+	if (i > n)
+		n = i;
+	if (n < 1)
+		n = 1;
+	sx = ToF64(dx) / ToF64(n);
+	sy = ToF64(dy) / ToF64(n);
+	fx = ToF64(x0);
+	fy = ToF64(y0);
+	for (i = 0; i <= n; i++)
+	{
+		x0 = ToI64(fx);
+		y0 = ToI64(fy);
+		if (0 <= x0 < w && 0 <= y0 < h)
+			dc->body[y0 * dc->width_internal + x0] = col;
+		fx += sx;
+		fy += sy;
 	}
 }
 
+U0 YSQuadFill(CDC *dc, I64 f, I64 col)
+{//Scanline-fill the projected quad of face f. Convex, so two crossings per
+//row; min/max makes it winding-agnostic.
+	I64	 qx[4], qy[4], i, a, b, y, ymin, ymax, x0, x1, xa,
+		 w = dc->width, h = dc->height;
+	U32	*row;
+	F64	 t;
+
+	for (i = 0; i < 4; i++)
+	{
+		qx[i] = ys_px[ys_face[f * 4 + i]];
+		qy[i] = ys_py[ys_face[f * 4 + i]];
+	}
+	ymin = qy[0];
+	ymax = qy[0];
+	for (i = 1; i < 4; i++)
+	{
+		if (qy[i] < ymin)
+			ymin = qy[i];
+		if (qy[i] > ymax)
+			ymax = qy[i];
+	}
+	if (ymin < 0)
+		ymin = 0;
+	if (ymax > h)
+		ymax = h;
+
+	for (y = ymin; y < ymax; y++)
+	{
+		x0 = 1 << 30;
+		x1 = -(1 << 30);
+		for (i = 0; i < 4; i++)
+		{
+			a = i;
+			b = (i + 1) & 3;	//& binds tighter than + here; parens load-bearing
+			if (qy[a] <= y < qy[b] || qy[b] <= y < qy[a])
+			{
+				t = ToF64(y - qy[a]) / ToF64(qy[b] - qy[a]);
+				xa = qx[a] + ToI64(t * ToF64(qx[b] - qx[a]));
+				if (xa < x0)
+					x0 = xa;
+				if (xa > x1)
+					x1 = xa;
+			}
+		}
+		if (x0 <= x1)
+		{
+			if (x0 < 0)
+				x0 = 0;
+			if (x1 > w - 1)
+				x1 = w - 1;
+			row = dc->body + y * dc->width_internal;
+			for (i = x0; i <= x1; i++)
+				row[i] = col;
+		}
+	}
+}
+
+/* ---------------- mesh ---------------- */
+
+U0 YSBuild()
+{//Sweep the "YDE" grid into boxes, one per horizontal run of set cells. Model
+//space is centred on the origin with Y up: 29 cells wide, YS_GH tall.
+//A run directly under an identical run extends that box instead of adding a
+//new one, so vertical strokes come out as single slabs, not stacks of cubes.
+	I64	 i, py, px, run, k;
+	F64	 x0, x1, y0, y1, cx, cy;
+	U8	*g;
+	Bool merged;
+
+	cx = ToF64(3 * YS_PITCH - 1) / 2.0;
+	cy = ToF64(YS_GH) / 2.0;
+	ys_nb = 0;
+	for (i = 0; i < 3; i++)
+	{
+		g = ys_glyph[i];
+		for (py = 0; py < YS_GH; py++)
+		{
+			px = 0;
+			while (px < YS_GW)
+			{
+				if (g[py * YS_GW + px] == '#')
+				{
+					run = px;
+					while (px < YS_GW && g[py * YS_GW + px] == '#')
+						px++;
+					x0 = ToF64(i * YS_PITCH + run) - cx;
+					x1 = ToF64(i * YS_PITCH + px)  - cx;
+					y1 = cy - ToF64(py);
+					y0 = cy - ToF64(py + 1);
+					merged = FALSE;
+					//Extents are whole numbers held exactly in F64, so == is safe.
+					for (k = 0; k < ys_nb; k++)
+						if (!merged && ys_bx0[k] == x0 && ys_bx1[k] == x1 &&
+							ys_by0[k] == y1)
+						{
+							ys_by0[k] = y0;
+							merged = TRUE;
+						}
+					if (!merged && ys_nb < YS_MAXB)
+					{
+						ys_bx0[ys_nb] = x0;
+						ys_bx1[ys_nb] = x1;
+						ys_by0[ys_nb] = y0;
+						ys_by1[ys_nb] = y1;
+						ys_nb++;
+					}
+				}
+				else
+					px++;
+			}
+		}
+	}
+}
+
+U0 YSRot(F64 x, F64 y, F64 z)
+{//Yaw about Y, then pitch about X. Result in ys_rx/ys_ry/ys_rz.
+	F64 x1 = x * ys_ca + z * ys_sa,
+		z1 = z * ys_ca - x * ys_sa;
+
+	ys_rx = x1;
+	ys_ry = y * ys_cb - z1 * ys_sb;
+	ys_rz = y * ys_sb + z1 * ys_cb;
+}
+
+U0 YSOrder()
+{//Insertion sort of the box indices, farthest first. Boxes are disjoint convex
+//volumes, so a centroid sort is exact enough for painter's order.
+	I64 i, j, k;
+	F64 z;
+
+	for (i = 0; i < ys_nb; i++)
+		ys_order[i] = i;
+	for (i = 1; i < ys_nb; i++)
+	{
+		k = ys_order[i];
+		z = ys_bz[k];
+		j = i - 1;
+		while (j >= 0 && ys_bz[ys_order[j]] < z)
+		{
+			ys_order[j + 1] = ys_order[j];
+			j--;
+		}
+		ys_order[j + 1] = k;
+	}
+}
+
+U0 YSBoxDraw(CDC *dc, I64 b)
+{//Project one box and paint its camera-facing faces, lit then wire-outlined.
+	I64	 k, f, i0, i1, shade, col, cx = dc->width / 2, cy = dc->height / 2;
+	F64	 x, y, z, nx, ny, nz, cxm, cym, czm, d, lum;
+
+	for (k = 0; k < 8; k++)
+	{
+		if (k & 1)
+			x = ys_bx1[b];
+		else
+			x = ys_bx0[b];
+		if (k >> 1 & 1)
+			y = ys_by1[b];
+		else
+			y = ys_by0[b];
+		if (k >> 2 & 1)
+			z = YS_DEPTH;
+		else
+			z = -YS_DEPTH;
+		YSRot(x, y, z);
+		ys_cx[k] = ys_rx;
+		ys_cy[k] = ys_ry;
+		ys_cz[k] = ys_rz + YS_DIST;
+		ys_px[k] = cx + ToI64(YS_FOCAL * ys_rx / ys_cz[k]);
+		ys_py[k] = cy - ToI64(YS_FOCAL * ys_ry / ys_cz[k]);
+	}
+
+	for (f = 0; f < 6; f++)
+	{
+		YSRot(ys_fnx[f], ys_fny[f], ys_fnz[f]);
+		nx = ys_rx;
+		ny = ys_ry;
+		nz = ys_rz;
+		//Face centroid: mean of its four corners, already rotated.
+		cxm = 0.0;
+		cym = 0.0;
+		czm = 0.0;
+		for (k = 0; k < 4; k++)
+		{
+			i0 = ys_face[f * 4 + k];
+			cxm += ys_cx[i0];
+			cym += ys_cy[i0];
+			czm += ys_cz[i0];
+		}
+		cxm /= 4.0;
+		cym /= 4.0;
+		czm /= 4.0;
+		//Camera sits at the origin looking down +Z: a face is visible when its
+		//outward normal points back toward the eye.
+		d = nx * cxm + ny * cym + nz * czm;
+		if (d < 0.0)
+		{
+			//Key light from the upper left front, plus a flat ambient floor.
+			lum = 0.72 * ny - 0.45 * nx - 0.53 * nz;
+			if (lum < 0.0)
+				lum = 0.0;
+			shade = 60 + ToI64(195.0 * lum);
+			col = (ys_base_r * shade / 255) << 16 |
+				  (ys_base_g * shade / 255) << 8 |
+				   ys_base_b * shade / 255;
+			YSQuadFill(dc, f, col);
+			for (k = 0; k < 4; k++)
+			{
+				i0 = ys_face[f * 4 + k];
+				i1 = ys_face[f * 4 + ((k + 1) & 3)];
+				YSLine(dc, ys_px[i0], ys_py[i0], ys_px[i1], ys_py[i1], ys_wire);
+			}
+		}
+	}
+}
+
+U0 YSLogoFrame(F64 t)
+{//Redraw the logo layer into the back buffer, then publish it. The overlay
+//reads the front pointer only, so a half-drawn frame is never composited.
+	CDC	*dc = yde_logo_back;
+	I64	 y, i, b, w = YS_LW;
+	F64	 yaw, pitch;
+
+	if (!dc || !yde_splash_dc)
+		return;
+	//Start from the matching slice of the static background so the layer
+	//composites seamlessly over it.
+	if (yde_logo_x + w > yde_splash_dc->width)
+		w = yde_splash_dc->width - yde_logo_x;
+	for (y = 0; y < dc->height; y++)
+	{
+		if (yde_logo_y + y < yde_splash_dc->height)
+			MemCopy(dc->body + y * dc->width_internal,
+					yde_splash_dc->body + (yde_logo_y + y) *
+						yde_splash_dc->width_internal + yde_logo_x,
+					w * sizeof(U32));
+	}
+
+	yaw   = 0.46 * Sin(t * 0.75);
+	pitch = 0.16 * Sin(t * 0.47) + 0.10;
+	ys_ca = Cos(yaw);
+	ys_sa = Sin(yaw);
+	ys_cb = Cos(pitch);
+	ys_sb = Sin(pitch);
+
+	for (b = 0; b < ys_nb; b++)
+	{//Centroid depth for the painter's order.
+		YSRot((ys_bx0[b] + ys_bx1[b]) / 2.0, (ys_by0[b] + ys_by1[b]) / 2.0, 0.0);
+		ys_bz[b] = ys_rz;
+	}
+	YSOrder;
+	for (i = 0; i < ys_nb; i++)
+		YSBoxDraw(dc, ys_order[i]);
+
+	yde_logo_back = yde_logo_dc;
+	yde_logo_dc   = dc;			//published last
+}
+
+/* ---------------- static background ---------------- */
+
 U0 YDESplashRender()
-{//Draw the gradient sky, logotype and text into a full-screen DC, once.
-	I64	 y, r, g, b, sc = 10, lw, lx, ly;
+{//Gradient sky, accent glow and text into a full-screen DC, once.
+	I64	 x, y, top, bot, c, ty;
+	U32	*dst;
 	U8	*motto = MStrPrint("%Z", RandU8 % DefineCount("YDE_MOTTOS"), "YDE_MOTTOS");
 
+	yde_hue		= YSHueRead();
+	c			= YSHsv(yde_hue, 175, 245);
+	ys_base_r	= c >> 16 & 0xFF;
+	ys_base_g	= c >> 8 & 0xFF;
+	ys_base_b	= c & 0xFF;
+	ys_wire		= YSMix(c, 0xFFFFFF, 90);
+
+	top = YSHsv(yde_hue + 12, 215, 26);
+	bot = YSHsv(yde_hue - 26, 185, 92);
+
 	yde_splash_dc = DCNew(GR_WIDTH, GR_HEIGHT, sys_task);
+	yde_logo_x = (GR_WIDTH  - YS_LW) / 2;
+	yde_logo_y = (GR_HEIGHT - YS_LH) / 2 - 34;
+	if (yde_logo_x < 0)
+		yde_logo_x = 0;
+	if (yde_logo_y < 0)
+		yde_logo_y = 0;
+
+	//Flat vertical gradient, top to bottom.
 	for (y = 0; y < GR_HEIGHT; y++)
-	{//Vertical gradient, navy -> violet.
-		r = 14 + 40 * y / GR_HEIGHT;
-		g = 10 + 12 * y / GR_HEIGHT;
-		b = 40 + 90 * y / GR_HEIGHT;
-		yde_splash_dc->color = ColorRGB(r, g, b);
-		GrRect(yde_splash_dc, 0, y, GR_WIDTH, 1);
+	{
+		c   = YSMix(top, bot, y * 256 / GR_HEIGHT);
+		dst = yde_splash_dc->body + y * yde_splash_dc->width_internal;
+		for (x = 0; x < GR_WIDTH; x++)
+			dst[x] = c;
 	}
 	yde_splash_dc->flags |= DCF_NO_TRANSPARENTS;
 
-	lw = 3 * FONT_WIDTH * sc;
-	lx = (GR_WIDTH - lw) / 2;
-	ly = (GR_HEIGHT - FONT_HEIGHT * sc) / 2 - 24;
-	YDESplashLogo(yde_splash_dc, lx + 2, ly + 2, sc, ColorRGB(0x22, 0x10, 0x3A)); //shadow
-	YDESplashLogo(yde_splash_dc, lx, ly, sc, ColorRGB(0xC8, 0x8F, 0xFF));         //logo
-
+	//Text sits below the logo layer so the animator never has to repaint it.
+	ty = yde_logo_y + YS_LH + 6;
+	if (ty > GR_HEIGHT - 60)
+		ty = GR_HEIGHT - 60;
 	yde_splash_dc->color = ColorRGB(0xE8, 0xEC, 0xF4);
 	GrPrint(yde_splash_dc, (GR_WIDTH - StrLen(sys_os_version_str) * FONT_WIDTH) / 2,
-			ly + FONT_HEIGHT * sc + 20, "%s", sys_os_version_str);
-	yde_splash_dc->color = ColorRGB(0x8A, 0x94, 0xA8);
+			ty, "%s", sys_os_version_str);
+	c = YSHsv(yde_hue, 80, 200);
+	yde_splash_dc->color = ColorRGB(c >> 16 & 0xFF, c >> 8 & 0xFF, c & 0xFF);
 	GrPrint(yde_splash_dc, (GR_WIDTH - StrLen(motto) * FONT_WIDTH) / 2,
-			ly + FONT_HEIGHT * sc + 36, "%s", motto);
-	yde_splash_dc->color = ColorRGB(0x60, 0x68, 0x7C);
+			ty + 18, "%s", motto);
+	c = YSHsv(yde_hue, 100, 120);
+	yde_splash_dc->color = ColorRGB(c >> 16 & 0xFF, c >> 8 & 0xFF, c & 0xFF);
 	GrPrint(yde_splash_dc, (GR_WIDTH - 21 * FONT_WIDTH) / 2, GR_HEIGHT - 40,
 			"Any key skips the wait");
 
 	Free(motto);
+
+	//Logo layers last: YSLogoFrame samples the finished background.
+	yde_logo_dc   = DCNew(YS_LW, YS_LH, sys_task);
+	yde_logo_back = DCNew(YS_LW, YS_LH, sys_task);
+	yde_logo_dc->flags   |= DCF_NO_TRANSPARENTS;
+	yde_logo_back->flags |= DCF_NO_TRANSPARENTS;
+	YSBuild;
+	YSLogoFrame(0.0);
 }
 
 U0 YDESplashOverlay(CDC *dc)
-{//gr.fp_final_screen_update: blit the splash over the finished frame with a
-//raw row copy (no z-buffer clipping, so it covers literally everything), then
-//chain to whatever hook we replaced.
-	I64 y, w = GR_WIDTH;
+{//gr.fp_final_screen_update: blit the background and the logo layer over the
+//finished frame with raw row copies (no z-buffer clipping, so it covers
+//literally everything), then chain to whatever hook we replaced.
+	I64	  y, w = GR_WIDTH, lw;
+	CDC	 *logo = yde_logo_dc;
 
 	if (yde_splash_up && yde_splash_dc)
 	{
@@ -91,6 +557,16 @@ U0 YDESplashOverlay(CDC *dc)
 			MemCopy(dc->body + y * dc->width_internal,
 					yde_splash_dc->body + y * yde_splash_dc->width_internal,
 					w * sizeof(U32));
+		if (logo)
+		{
+			lw = logo->width;
+			if (yde_logo_x + lw > w)
+				lw = w - yde_logo_x;
+			for (y = 0; y < logo->height && yde_logo_y + y < dc->height; y++)
+				MemCopy(dc->body + (yde_logo_y + y) * dc->width_internal + yde_logo_x,
+						logo->body + y * logo->width_internal,
+						lw * sizeof(U32));
+		}
 	}
 	if (yde_splash_old_hook)
 		(*yde_splash_old_hook)(dc);
@@ -99,29 +575,40 @@ U0 YDESplashOverlay(CDC *dc)
 extern Bool yde_boot_done; //StartOS.ZC sets this once boot has finished.
 
 U0 YDESplashDismissTask()
-{//Keep the overlay up until boot has actually finished (yde_boot_done) so no
-//tail-end compile output leaks past it - or until the user hits a key/click,
-//with a hard safety cap. Then remove the overlay and restore the old hook.
+{//Animate the logo and keep the overlay up until boot has actually finished
+//(yde_boot_done) so no tail-end compile output leaks past it - or until the
+//user hits a key/click, with a hard safety cap. Then remove the overlay and
+//restore the old hook.
 	F64	t0	 = tS;
 	I64	snap = kbd.last_down_scan_code;
+	CDC *a, *b;
 
 	while (yde_splash_up && tS - t0 < 30.0)
 	{
+		YSLogoFrame(tS - t0);
 		if (tS - t0 >= 2.5 && yde_boot_done)
 		{//Shown at least briefly AND boot finished: let the freshly-spawned
-		//terminals paint a frame, then clear.
+		//terminal paint a frame, then clear.
 			Sleep(600);
 			break;
 		}
 		if (tS - t0 >= 1.0 && (kbd.last_down_scan_code != snap || mouse.lb || mouse.rb))
 			break; //user skip, after a moment so a boot keypress does not count
-		Sleep(40);
+		Sleep(33);
 	}
 
 	yde_splash_up = FALSE;
 	gr.fp_final_screen_update = yde_splash_old_hook;
 	yde_splash_old_hook = NULL;
-	Sleep(80); //let the in-flight frame finish reading the DC
+	Sleep(80); //let the in-flight frame finish reading the DCs
+	a = yde_logo_dc;
+	b = yde_logo_back;
+	yde_logo_dc	  = NULL;
+	yde_logo_back = NULL;
+	if (a)
+		DCDel(a);
+	if (b)
+		DCDel(b);
 	if (yde_splash_dc)
 	{
 		DCDel(yde_splash_dc);
@@ -130,7 +617,7 @@ U0 YDESplashDismissTask()
 }
 
 U0 YDESplashStart()
-{//Render once, install the overlay hook, spawn the dismisser, and return so
+{//Render once, install the overlay hook, spawn the animator, and return so
 //boot carries on underneath.
 	if (yde_splash_up)
 		return;

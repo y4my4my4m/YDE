@@ -734,6 +734,37 @@ I64		 q_music_fail	= 0;
 //clipping, not underrunning
 I64		 q_music_clip	= 0;
 Bool	 q_music_clip_said = FALSE;		//reported once per track
+
+//--- decode on a worker core -------------------------------------------------
+//
+// QMusicUpdate runs once per RENDERED frame, so a 4fps area gave the decoder
+// four slices a second and the voice read the zeroed tail as pops. HL1 does
+// not hit this because MP3 runs ~12x realtime and it front-loads the whole
+// track; Vorbis does not.
+//
+// the fill is pure over the codec globals and nothing else touches them while
+// a job runs. the ONE hazard is allocation: MAlloc/Free across a core boundary
+// corrupts the heap, so the packet buffer is grown to its ceiling at open and
+// OggPacketRoom never reallocates afterwards
+#define QMJOB_FREE	0
+#define QMJOB_RUN	1
+#define QMJOB_DONE	2		//written LAST by the worker
+
+I64		 q_music_job	= QMJOB_FREE;
+
+//OFF by default. the worker cores are already claimed by the surface fill, and
+//a decode job long enough to matter starves one of them. the fixed AUDIO quota
+//below removes the starvation this was meant to fix, without the contention
+Bool	 q_music_mt		= FALSE;
+
+U0 QMusicJobDrain()
+{//no buffer may be freed or reassigned while a worker writes into it
+	while (q_music_job == QMJOB_RUN)
+		Yield;
+
+	q_music_job = QMJOB_FREE;
+}
+
 I64		 q_music_voice	= -1;		//track's voice, -1 when silent
 F64		 q_music_ends	= 0.0;
 F64		 q_music_volume	= 0.7;
@@ -809,6 +840,7 @@ U0 QMusicStreamDrop()
 
 U0 QMusicPendFree()
 {//abandon an in-flight stream decode. a live buffer belongs to q_music_frames
+	QMusicJobDrain;
 	QMusicStreamDrop;
 
 	if (q_music_pend_frames)
@@ -825,7 +857,11 @@ U0 QMusicPendFree()
 U0 QMusicFree()
 {//ORDER MATTERS. the mixer task reads voice->frames every millisecond, so stop
  //the voice BEFORE freeing what it points at. freeing first corrupts the heap
- //silently instead of faulting, and only bites much later
+ //silently instead of faulting, and only bites much later.
+ //
+ //a decode job writes into that same buffer, so it is drained first
+	QMusicJobDrain;
+
 	if (q_music_voice >= 0)
 	{
 		AudioSFXStop(q_music_voice);
@@ -850,7 +886,7 @@ U0 QMusicDecodeSlice()
  //READY at the end of the stream or of the buffer
 	U32	*dst;
 	F64	 deadline;
-	F64	 budget;
+	I64	 quota;
 	F64	 lead;
 	I64	 n;
 	I64	 got;
@@ -893,22 +929,29 @@ U0 QMusicDecodeSlice()
 	//
 	//spend more per call as the lead shrinks: the cost is paid on a frame that
 	//is slow anyway, and running dry is worse than a longer slice
-	budget = QMUSIC_SLICE_SECS;
+	//A FIXED QUOTA OF AUDIO, not of wall clock. this runs once per RENDERED
+	//frame, so a time budget yields whatever a 4fps frame can afford and the
+	//lead drains exactly where the frame is already slow. HLMusicDecodeSlice
+	//takes 8 MP3 frames per call for the same reason - the amount produced has
+	//to be independent of how often it is called.
+	//
+	//the wall clock still caps it, at a much larger value, so one call cannot
+	//stall a frame outright if the codec is slower than expected
+	quota = q_music_pend_count + q_music_pend_rate / 4;	//0.25s of audio
 
 	if (q_music_pend_live && q_music_pend_rate > 0)
 	{
 		lead = ToF64(q_music_pend_count) / ToF64(q_music_pend_rate) -
 			   (tS - q_music_live_t0);
 
+		//losing ground: take a second of audio per call until it recovers
 		if (lead < QMUSIC_LEAD_LOW)
-			budget = QMUSIC_SLICE_MAX;
-		else if (lead < QMUSIC_LEAD_MAX / 2.0)
-			budget = QMUSIC_SLICE_SECS * 4.0;
+			quota = q_music_pend_count + q_music_pend_rate;
 	}
 
-	deadline = tS + budget;
+	deadline = tS + QMUSIC_SLICE_MAX;
 
-	while (!done && tS < deadline)
+	while (!done && q_music_pend_count < quota && tS < deadline)
 	{
 		if (q_music_pend_src == QMUSIC_SRC_MP3)
 		{
@@ -996,6 +1039,30 @@ U0 QMusicDecodeSlice()
 	}
 }
 
+I64 QMusicDecodeJob(U8 *data)
+{//worker entry. decodes until the stream ends or the lead is full, so one job
+ //covers many frames and the frame rate stops gating the decoder
+	I64 guard = 0;
+
+	while (q_music_pend_state == QMUSIC_PEND_DECODING && guard < 4096)
+	{
+		guard++;
+		QMusicDecodeSlice;
+
+		//the throttle inside the slice returns without progress once the lead
+		//is full; stop rather than spin the core on it
+		if (q_music_pend_live && q_music_pend_rate > 0 &&
+			ToF64(q_music_pend_count) / ToF64(q_music_pend_rate) -
+			(tS - q_music_live_t0) > QMUSIC_LEAD_MAX)
+			break;
+	}
+
+	q_music_job = QMJOB_DONE;		//LAST: the render task reads it to reclaim
+
+	return 0;
+}
+
+
 Bool QMusicOggOpen(U8 *raw, I64 size, I64 track)
 {//headers and sizing; the audio packets are the slice decoder's. FALSE, as
  //nothing plays until QMusicUpdate hands the buffer to a voice
@@ -1015,6 +1082,18 @@ Bool QMusicOggOpen(U8 *raw, I64 size, I64 track)
 
 	ogg_src  = raw;
 	ogg_size = size;
+
+	//grown to its ceiling HERE, on the task that owns this heap. the decode may
+	//run on a worker, and MAlloc/Free across that boundary corrupts the heap -
+	//so OggPacketRoom must never reallocate once decoding starts
+	if (!OggPacketRoom(OGG_MAX_PACKET))
+	{
+		Free(raw);
+		ogg_src  = NULL;
+		ogg_size = 0;
+		StrPrint(q_music_status, "track%02d.ogg no packet buffer", track);
+		return FALSE;
+	}
 
 	//OggHeaders walks all three header packets; OggOpen consumes the first
 	ok = OggHeaders();
@@ -1220,6 +1299,8 @@ U0 QMusicReset()
 	q_music_fail         = 0;
 	q_music_clip         = 0;
 	q_music_clip_said    = FALSE;
+	q_music_job          = QMJOB_FREE;
+	q_music_mt           = FALSE;
 	q_music_pend_live    = FALSE;
 	q_music_pend_state   = QMUSIC_PEND_IDLE;
 
@@ -1334,11 +1415,29 @@ U0 QMusicUpdate(F64 now)
  //leaves a gap
 	if (q_music_pend_state == QMUSIC_PEND_DECODING)
 	{
-		QMusicDecodeSlice;
+		if (q_music_job == QMJOB_DONE)
+			q_music_job = QMJOB_FREE;
+
+		//one job spans many frames. mp_count is 1 on a uniprocessor, where
+		//this falls back to a slice per frame
+		if (q_music_mt && mp_count > 1)
+		{
+			if (q_music_job == QMJOB_FREE)
+			{
+				q_music_job = QMJOB_RUN;
+				JobQueue(&QMusicDecodeJob, NULL, mp_count - 1,
+					1 << JOBf_FREE_ON_COMPLETE);
+			}
+		}
+		else
+			QMusicDecodeSlice;
 
 		if (!q_music_pend_live &&
 			q_music_pend_state == QMUSIC_PEND_DECODING && QMusicLeadOK)
-		{//hand the buffer being written to a voice, counted at the full
+		{
+			//the swap below reassigns the very buffer a worker writes into
+			QMusicJobDrain;
+//hand the buffer being written to a voice, counted at the full
 		 //estimate; the count is trimmed at stream end
 			QMusicFree;
 

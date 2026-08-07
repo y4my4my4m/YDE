@@ -884,8 +884,13 @@ qad_next:
 }
 
 U8 *QLightFaceMap(CQMap *map, CQFace *f, I64 lm_w, I64 lm_h, F64 time,
-	I64 band = 0)
+	I64 band = 0, Bool with_dyn = TRUE)
 {//R_BuildLightMap - compiled lighting scaled by each style, plus dlights
+ //
+ //with_dyn FALSE for a SURFACE CACHE BUILD. dlights are not in QSurfLightKey,
+ //so nothing invalidates a surface once built - baking a muzzle flash into one
+ //leaves that wall lit for the rest of the map. the span adds dlights over the
+ //cached copy through QRGBAddLight instead
  //
  //returns the map's own data untouched when nothing is animated, so the
  //common case costs one compare instead of a per-texel recombine
@@ -906,7 +911,7 @@ U8 *QLightFaceMap(CQMap *map, CQFace *f, I64 lm_w, I64 lm_h, F64 time,
 	if (f->light_offset < 0)
 	{
 		//a flash still lands on an unlit face, the zeros are just the base
-		if (q_dlight_any && f->dlight_frame == q_dlight_frame &&
+		if (with_dyn && q_dlight_any && f->dlight_frame == q_dlight_frame &&
 			f->dlight_bits != 0 && size > 0 && size <= QLIGHT_SCRATCH)
 		{
 			for (i = 0; i < size; i++)
@@ -953,9 +958,13 @@ U8 *QLightFaceMap(CQMap *map, CQFace *f, I64 lm_w, I64 lm_h, F64 time,
 	if (size <= 0 || size > QLIGHT_SCRATCH)
 		return base;
 
-	//marked by R_MarkLights this frame, not just "some light exists"
-	dyn = ToBool(q_dlight_any && f->dlight_frame == q_dlight_frame &&
-			f->dlight_bits != 0);
+	//marked by R_MarkLights this frame, not just "some light exists".
+	//
+	//with_dyn gates it: a SURFACE CACHE BUILD must not fold a dlight in. the
+	//key has no dlight term, so nothing invalidates the surface afterwards and
+	//the flash stays on that wall for the rest of the map
+	dyn = ToBool(with_dyn && q_dlight_any &&
+			f->dlight_frame == q_dlight_frame && f->dlight_bits != 0);
 
 	//one steady style and no dlight makes the recombine a no-op
 	//ambient hits every luxel, so it rules out the fast path
@@ -1931,6 +1940,13 @@ class CQSurfJob
 };
 
 CQSurfJob	 q_surf_job[QSURF_JOBS];
+
+//one lightmap copy per job slot. QLightFaceMap hands back a q_light_scratch
+//BAND for an animated or dlit face - a working buffer its owner rewrites for
+//the next face - so those could not be offloaded at all. those are exactly the
+//faces that rebuild every frame, so the whole rebuild load ran on one core.
+//copying lm_w*lm_h bytes is nothing against a fill of millions of texels
+U8			*q_surf_job_lm = NULL;
 I64			 q_surf_job_next	= 0;	//round-robin cursor into the ring
 I64			 q_surf_job_core	= 0;	//and over the worker cores
 I64			 q_surf_job_live	= 0;	//jobs dispatched and not yet reaped
@@ -1970,6 +1986,9 @@ U0 QSurfCacheInit()
 
 	for (i = 0; i < QSURF_JOBS; i++)
 		q_surf_job[i].state = QSJ_FREE;
+
+	if (!q_surf_job_lm)
+		q_surf_job_lm = MAlloc(QSURF_JOBS * QLIGHT_SCRATCH);
 
 	q_surf_job_next  = 0;
 	q_surf_job_core  = 0;
@@ -2455,53 +2474,6 @@ U0 QLitBilinearRGB(U8 *lit, I64 lm_w, I64 lm_h, F64 s, F64 t,
 	}
 }
 
-Bool QSurfCacheWouldHit(CQMap *map, CQFace *f, I64 face_index, I64 mip,
-	I64 tex_key, Bool want_rgb, Bool dlit = FALSE)
-{//the cache key is built from lighting STATE, not from the lightmap itself,
- //so a hit can be predicted before spending QLightFaceMap on the face. that
- //call is per visible face per frame and dominates when a dlight is live
-	CQSurfCache	*sc;
-	I64			 slot;
-	I64			 key;
-
-	if (map != q_surf_map || !q_face_surf || !q_face_pend)
-		return FALSE;
-	if (face_index < 0 || face_index >= q_face_surf_n)
-		return FALSE;
-
-	//a rebuild for this face is in flight in another slot, so QSurfCacheGet
-	//hands back the previous surface and fills nothing. no lightmap is needed
-	if (q_face_pend[face_index] >= 0)
-		return TRUE;
-
-	slot = q_face_surf[face_index];
-	if (slot < 0 || slot >= QSURF_SLOTS)
-		return FALSE;
-
-	sc  = &q_surf[slot];
-	key = QSurfLightKey(f);
-
-	//a worker owns the slot: face is already claimed but mip, texture and
-	//light_key still describe the previous tenant and the planes are
-	//uninitialised. QSurfCacheGet returns NULL here, so this must too or the
-	//caller skips the lightmap for a surface that is about to be built
-	if (sc->building)
-		return FALSE;
-
-	//mirrors the hit test in QSurfCacheGet EXACTLY, including the stale reuse
-	//once the frame has spent its rebuild budget and the unlit-plane term.
-	//
-	//any disagreement here builds a surface with no lightmap: this says cached
-	//so the caller skips QLightFaceMap, then QSurfCacheGet rebuilds anyway and
-	//QSurfFill takes light 255, which the overbright colormap row turns near
-	//white. q_surf_nolight counts it
-	return ToBool(sc->face == face_index && sc->mip == mip &&
-		sc->texture == tex_key && (sc->pixels || sc->rgb) &&
-		ToBool(sc->rgb != NULL) == want_rgb &&
-		(!(want_rgb && dlit) || sc->rgb_raw) &&
-		(sc->light_key == key ||
-		 q_surf_builds_frame >= q_surf_build_max));
-}
 
 I64 QSurfCacheMipFor(CQMap *map, I64 face_index)
 {//the mip this face is already cached at, -1 when it is not cached
@@ -2743,6 +2715,8 @@ U0 QSurfFill(CQSurfJob *j)
 	I64			 lm;
 	Bool		 use_rgbmip;
 	U32			*raw_plane;
+	I64			 tex_row, out_row;
+	F64			 ls, lt, ls_step;
 
 	out = sc->pixels;
 
@@ -2753,22 +2727,30 @@ U0 QSurfFill(CQSurfJob *j)
 	use_rgbmip = ToBool(q_opt_rgbmips && mip > 0 && tex->rgb_mips[mip] &&
 					!tex->ext_rgb);
 
+	//per ROW invariants. this compiler has no optimiser, so every one of these
+	//was a multiply, a divide or an int-to-float PER TEXEL
+	ls_step = ToF64(1 << mip) / 16.0;
+
 	for (v = 0; v < ch; v++)
 	{
 		t0 = v << mip;
 		ty = QTexWrap((j->mins_t_i + t0) >> mip, th);
+
+		tex_row = ty * tw;
+		out_row = v * cw;
+		lt      = ToF64(t0) / 16.0;
+		ls      = 0.0;
 
 		for (u = 0; u < cw; u++)
 		{
 			s0 = u << mip;
 			tx = QTexWrap((j->mins_s_i + s0) >> mip, tw);
 
-			texel = texels[ty * tw + tx];
+			texel = texels[tex_row + tx];
 
 			if (lightmap && lm_w > 0 && lm_h > 0)
 			{
-				lightv = QLightBilinear(lightmap, lm_w, lm_h,
-							ToF64(s0) / 16.0, ToF64(t0) / 16.0);
+				lightv = QLightBilinear(lightmap, lm_w, lm_h, ls, lt);
 				light  = ClampI64(ToI64(lightv), 0, 255);
 			}
 			else
@@ -2784,9 +2766,9 @@ U0 QSurfFill(CQSurfJob *j)
 			if (!want_rgb)
 			{
 				if (texel >= QPAL_FULLBRIGHT)
-					out[v * cw + u] = texel;
+					out[out_row + u] = texel;
 				else
-					out[v * cw + u] =
+					out[out_row + u] =
 						qpal_colormap[shade * QPAL_COLORS + texel];
 
 				goto qsf_next_texel;
@@ -2802,9 +2784,9 @@ U0 QSurfFill(CQSurfJob *j)
 			//where an RGB mip exists it owns the decision
 			if (tex->is_fence && !use_rgbmip && texel == QFENCE_CUTOUT)
 			{
-				sc->rgb[v * cw + u] = 0;
+				sc->rgb[out_row + u] = 0;
 				if (raw_plane)
-					raw_plane[v * cw + u] = 0;
+					raw_plane[out_row + u] = 0;
 				goto qsf_next_texel;
 			}
 
@@ -2813,13 +2795,13 @@ U0 QSurfFill(CQSurfJob *j)
 			//as an external replacement, just a different source
 			if (use_rgbmip)
 			{
-				eargb = tex->rgb_mips[mip][ty * tw + tx];
+				eargb = tex->rgb_mips[mip][tex_row + tx];
 
 				if (!eargb)
 				{
-					sc->rgb[v * cw + u] = 0;
+					sc->rgb[out_row + u] = 0;
 					if (raw_plane)
-						raw_plane[v * cw + u] = 0;
+						raw_plane[out_row + u] = 0;
 					goto qsf_next_texel;
 				}
 
@@ -2918,9 +2900,9 @@ U0 QSurfFill(CQSurfJob *j)
 				//the replacement's own alpha is a cutout too
 				if (!eargb)
 				{
-					sc->rgb[v * cw + u] = 0;
+					sc->rgb[out_row + u] = 0;
 					if (raw_plane)
-						raw_plane[v * cw + u] = 0;
+						raw_plane[out_row + u] = 0;
 					goto qsf_next_texel;
 				}
 
@@ -2998,8 +2980,7 @@ qsf_next_tap:
 			//ratio is taken from the RGB luxels
 			if (lit_base && texel < QPAL_FULLBRIGHT)
 			{
-				QLitBilinearRGB(lit_base, lm_w, lm_h, ToF64(s0) / 16.0,
-					ToF64(t0) / 16.0, &lr, &lg, &lb);
+				QLitBilinearRGB(lit_base, lm_w, lm_h, ls, lt, &lr, &lg, &lb);
 
 				lm = (lr + lg + lb) / 3;
 				if (lm > 0)
@@ -3013,11 +2994,14 @@ qsf_next_tap:
 			argb = (ClampI64(cr, 0, 255) << 16) |
 				   (ClampI64(cg, 0, 255) << 8) | ClampI64(cb, 0, 255);
 
-			sc->rgb[v * cw + u] = argb | QRGB_SET;
+			sc->rgb[out_row + u] = argb | QRGB_SET;
 			if (raw_plane)
-				raw_plane[v * cw + u] = raw_argb;
+				raw_plane[out_row + u] = raw_argb;
 
 qsf_next_texel:
+			//AFTER the label: every goto above lands here, and a row that
+			//stopped stepping would light the whole run from column 0
+			ls += ls_step;
 		}
 	}
 }
@@ -3113,6 +3097,115 @@ I64 QSurfJobAlloc()
 	return -1;
 }
 
+I64 QSurfMipAdjust(CQFace *f, CQTexture *tex, I64 face_index, I64 mip)
+{//the level QSurfCacheGet will actually BUILD, from the one the caller wants.
+ //
+ //SHARED WITH QSurfCacheWouldHit ON PURPOSE. that test compares a slot's mip
+ //against this, never against the wanted level. the two disagreeing means the
+ //caller skips QLightFaceMap for a face that then rebuilds, QSurfFill takes
+ //light 255, and the overbright colormap row renders the wall near white and
+ //caches it that way. q_surf_nolight counts it
+	I64	 slot = -1;
+	Bool have = FALSE;
+
+	if (q_face_surf && face_index >= 0 && face_index < q_face_surf_n)
+	{
+		slot = q_face_surf[face_index];
+		if (slot >= 0 && slot < QSURF_SLOTS &&
+			q_surf[slot].face == face_index &&
+			(q_surf[slot].pixels || q_surf[slot].rgb))
+			have = TRUE;
+	}
+
+	if (!have)
+	{
+		//first sight of this face: the cheap level, now. r_progmips only
+		//chooses THIS - what the first build costs before anything is on
+		//screen. the clamp below is not part of that choice
+		if (q_prog_mips)
+		{
+			mip += QSURF_PROG_STEP;
+			if (mip > 3)
+				mip = 3;
+		}
+	}
+	else if (q_surf_builds_frame >= q_surf_build_max || q_mip_frozen)
+	{
+		//no budget, or a zoom is ramping - draw whatever is built and refine on
+		//a later frame. a zoom moves every visible face's target level in the
+		//same frame, so without this the whole set rebuilds at once
+		mip = q_surf[slot].mip;
+	}
+
+	//SURFACE TEXEL CEILING. rebuild cost is the texel count, and a lightstyle
+	//animating at 10Hz rebuilds every face it touches that often - a mip 0
+	//surface on a big lava-lit room runs to millions of texels.
+	//
+	//applies whatever d_mipscale says: mipmaps off asks for full detail, not
+	//for an unbounded per-face allocation
+	while (mip < 3 && q_surf_texmax > 0 &&
+		   ((f->extent_s >> mip) + 1) * ((f->extent_t >> mip) + 1) >
+		   q_surf_texmax)
+		mip++;
+
+	while (mip > 0 && !tex->texels[mip])
+		mip--;
+
+	return mip;
+}
+
+Bool QSurfCacheWouldHit(CQMap *map, CQFace *f, I64 face_index, I64 mip,
+	I64 tex_key, Bool want_rgb, Bool dlit = FALSE)
+{//the cache key is built from lighting STATE, not from the lightmap itself,
+ //so a hit can be predicted before spending QLightFaceMap on the face. that
+ //call is per visible face per frame and dominates when a dlight is live
+	CQSurfCache	*sc;
+	I64			 slot;
+	I64			 key;
+
+	if (map != q_surf_map || !q_face_surf || !q_face_pend)
+		return FALSE;
+	if (face_index < 0 || face_index >= q_face_surf_n)
+		return FALSE;
+
+	//a rebuild for this face is in flight in another slot, so QSurfCacheGet
+	//hands back the previous surface and fills nothing. no lightmap is needed
+	if (q_face_pend[face_index] >= 0)
+		return TRUE;
+
+	slot = q_face_surf[face_index];
+	if (slot < 0 || slot >= QSURF_SLOTS)
+		return FALSE;
+
+	sc  = &q_surf[slot];
+	key = QSurfLightKey(f);
+
+	//the level QSurfCacheGet will build, not the one asked for
+	if (tex_key >= 0 && tex_key < map->num_textures)
+		mip = QSurfMipAdjust(f, &map->textures[tex_key], face_index, mip);
+
+	//a worker owns the slot: face is already claimed but mip, texture and
+	//light_key still describe the previous tenant and the planes are
+	//uninitialised. QSurfCacheGet returns NULL here, so this must too or the
+	//caller skips the lightmap for a surface that is about to be built
+	if (sc->building)
+		return FALSE;
+
+	//mirrors the hit test in QSurfCacheGet EXACTLY, including the stale reuse
+	//once the frame has spent its rebuild budget and the unlit-plane term.
+	//
+	//any disagreement here builds a surface with no lightmap: this says cached
+	//so the caller skips QLightFaceMap, then QSurfCacheGet rebuilds anyway and
+	//QSurfFill takes light 255, which the overbright colormap row turns near
+	//white. q_surf_nolight counts it
+	return ToBool(sc->face == face_index && sc->mip == mip &&
+		sc->texture == tex_key && (sc->pixels || sc->rgb) &&
+		ToBool(sc->rgb != NULL) == want_rgb &&
+		(!(want_rgb && dlit) || sc->rgb_raw) &&
+		(sc->light_key == key ||
+		 q_surf_builds_frame >= q_surf_build_max));
+}
+
 U8 *QSurfCacheGet(CQMap *map, CQFace *f, I64 face_index, CQTexture *tex,
 	I64 mip, U8 *lightmap, I64 lm_w, I64 lm_h, I64 *_cw, I64 *_ch,
 	I64 tex_key = 0, U32 **_rgb = NULL, U32 **_rgb_raw = NULL,
@@ -3136,6 +3229,7 @@ U8 *QSurfCacheGet(CQMap *map, CQFace *f, I64 face_index, CQTexture *tex,
 	I64			 total;
 	Bool		 want_rgb;
 	Bool		 want_raw;
+	Bool		 lm_scratch;
 	U8			*lit_base;
 	CQSurfJob	 job;
 	I64			 ji;
@@ -3220,52 +3314,8 @@ U8 *QSurfCacheGet(CQMap *map, CQFace *f, I64 face_index, CQTexture *tex,
 		return osc->pixels;
 	}
 
-	slot = q_face_surf[face_index];
-	have = FALSE;
-	if (slot >= 0 && slot < QSURF_SLOTS &&
-		q_surf[slot].face == face_index &&
-		(q_surf[slot].pixels || q_surf[slot].rgb))
-		have = TRUE;
-
-	if (!have)
-	{
-		//first sight of this face: the cheap level, now. r_progmips only
-		//chooses THIS - what the first build costs before anything is on
-		//screen. the clamp below is not part of that choice
-		if (q_prog_mips)
-		{
-			mip += QSURF_PROG_STEP;
-			if (mip > 3)
-				mip = 3;
-		}
-	}
-	else if (q_surf_builds_frame >= q_surf_build_max || q_mip_frozen)
-	{
-		//no budget, or a zoom is ramping - draw whatever is built and refine on
-		//a later frame. a zoom moves every visible face's target level in the
-		//same frame, so without this the whole set rebuilds at once and the
-		//frame stalls. the freeze is the point of r_mipzoomhold.
-		//
-		//OUTSIDE the r_progmips test: progressive picks the first build's
-		//level, it does not license an unbounded rebuild storm. gating the
-		//clamp on it left r_progmips 0 with no per-frame cap at all
-		mip = q_surf[slot].mip;
-	}
-
-	//SURFACE TEXEL CEILING. rebuild cost is the texel count, and a lightstyle
-	//animating at 10Hz rebuilds every face it touches that often - a mip 0
-	//surface on a big lava-lit room runs to millions of texels and the frame
-	//goes with it. coarsening one level quarters it.
-	//
-	//applies whatever d_mipscale says: mipmaps off asks for full detail, not
-	//for an unbounded per-face allocation
-	while (mip < 3 && q_surf_texmax > 0 &&
-		   ((f->extent_s >> mip) + 1) * ((f->extent_t >> mip) + 1) >
-		   q_surf_texmax)
-		mip++;
-
-	while (mip > 0 && !tex->texels[mip])
-		mip--;
+	//SHARED with QSurfCacheWouldHit - see QSurfMipAdjust
+	mip = QSurfMipAdjust(f, tex, face_index, mip);
 
 	if (_mip)
 		*_mip = mip;
@@ -3347,10 +3397,16 @@ U8 *QSurfCacheGet(CQMap *map, CQFace *f, I64 face_index, CQTexture *tex,
 	//
 	//a RANGE test, not a pointer compare: the scratch is one buffer per band,
 	//so equality against the base only ever caught band 0
-	async_ok = ToBool(q_surf_mt && !q_surf_dispatch_off &&
-		(!lightmap ||
-		 lightmap < q_light_scratch ||
-		 lightmap >= q_light_scratch + QBAND_MAX * QLIGHT_SCRATCH));
+	//a compiled lightmap points into map->lightdata and is immutable, so the
+	//worker can read it directly. a SCRATCH one is rewritten for the very next
+	//face, so it is copied into the job below - which is what lets an animated
+	//or dlit face offload at all
+	lm_scratch = ToBool(lightmap &&
+		lightmap >= q_light_scratch &&
+		lightmap < q_light_scratch + QBAND_MAX * QLIGHT_SCRATCH);
+
+	async_ok = ToBool(q_surf_mt && !q_surf_dispatch_off && q_surf_job_lm &&
+		(!lm_scratch || lm_w * lm_h <= QLIGHT_SCRATCH));
 
 	//DOUBLE BUFFER a rebuild that a worker will run. this face already has
 	//drawable texels, and filling them in place leaves it showing garbage for
@@ -3489,6 +3545,15 @@ U8 *QSurfCacheGet(CQMap *map, CQFace *f, I64 face_index, CQTexture *tex,
 		if (ji >= 0)
 		{
 			job.old_slot = old_slot;
+
+			//the worker outlives this frame's scratch band
+			if (lm_scratch)
+			{
+				MemCopy(q_surf_job_lm + ji * QLIGHT_SCRATCH, lightmap,
+					lm_w * lm_h);
+				job.lightmap = q_surf_job_lm + ji * QLIGHT_SCRATCH;
+			}
+
 			MemCopy(&q_surf_job[ji], &job, sizeof(CQSurfJob));
 
 			//claim the slot BEFORE the job can land, so a second sighting of
@@ -6634,6 +6699,7 @@ U0 QDrawFace(CQCanvas *c, CQMap *map, I64 face_index, F64 *offset = NULL,
 	U32			*surf_raw = NULL;
 	Bool		 lm_pending = FALSE;
 	Bool		 dlit;
+	Bool		 lm_has_dyn = TRUE;	//lightmap in hand carries dlights
 	U8			*dlmap;
 	I64			 built_mip = 0;
 	I64			 sw = 0;
@@ -6850,8 +6916,13 @@ U0 QDrawFace(CQCanvas *c, CQMap *map, I64 face_index, F64 *offset = NULL,
 				!QSurfCacheWouldHit(map, f, face_index, mip, anim_tex,
 					ToBool(q_opt_truecolor), dlit))
 			{
-				lightmap   = QLightFaceMap(map, f, lm_w, lm_h, q_light_time, band);
+				//built to be CACHED: no dlights, or the flash bakes in and the
+				//wall stays lit - nothing invalidates a cached surface for a
+				//dlight. the span adds them over it
+				lightmap   = QLightFaceMap(map, f, lm_w, lm_h, q_light_time,
+								band, FALSE);
 				lm_pending = FALSE;
+				lm_has_dyn = FALSE;
 			}
 
 			if (fp)
@@ -6898,10 +6969,14 @@ U0 QDrawFace(CQCanvas *c, CQMap *map, I64 face_index, F64 *offset = NULL,
 			return;
 
 		//the uncached path reads it per pixel, so it must exist by here
-		if (!surf && lm_pending)
+		//the uncached span lights per pixel from this map, so it DOES want the
+		//dlights folded in. also re-taken when the cache build left a dlight
+		//free copy behind and the face then failed to cache
+		if (!surf && (lm_pending || (dlit && !lm_has_dyn)))
 		{
 			lightmap   = QLightFaceMap(map, f, lm_w, lm_h, q_light_time, band);
 			lm_pending = FALSE;
+			lm_has_dyn = TRUE;
 		}
 
 		//only the cached truecolor span adds it; the uncached path already has

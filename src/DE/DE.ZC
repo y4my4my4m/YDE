@@ -46,6 +46,10 @@ class CDEGlobals
 	F64		 cal_last;					//Debounce for clock -> calendar spawns.
 	CTask	*ctx_task, *ctx_target;		//Right-click menu task + the task it acts on.
 	CTask	*net_task;					//One-shot task that brings the net stack up.
+	CCtrl	*desk;						//Desktop ctrl: LMB-hold stats, right-click menu.
+	Bool	 stats_hold;				//LMB held on the desktop: stock stats instead of the image.
+	CTask	*desk_menu_task;			//Desktop right-click menu task.
+	F64		 desk_menu_last;			//Debounce for that menu.
 	CTask	*min_tasks[DE_BAR_TASKS_MAX];//Windows minimized from the taskbar.
 	I64		 min_count;
 	U8		 wallpaper_path[256];		//Current wallpaper, remembered for config.
@@ -158,17 +162,107 @@ CDC *DEDCScaleNew(CDC *src, I64 w, I64 h, CTask *mem_task=NULL)
 	return res;
 }
 
+public CDC *DEImageRead(U8 *filename, CTask *mem_task=NULL)
+{//Decode any image format the tree ships. Extension first, then every decoder
+//in turn - the loaders sniff their own magic, so a wrong name still works.
+	CDC	*img = NULL;
+	U8	*ext = filename + StrLen(filename);
+
+	while (ext > filename && ext[-1] != '.' && ext[-1] != '/')
+		ext--;
+	if (!StrICompare(ext, "PNG"))
+		img = PNGRead(filename);
+	else if (!StrICompare(ext, "JPG") || !StrICompare(ext, "JPEG"))
+		img = JPGRead(filename, mem_task);
+	else if (!StrICompare(ext, "GIF"))
+		img = GIFRead(filename, mem_task);
+	else if (!StrICompare(ext, "WEBP"))
+		img = WEBPRead(filename);
+	else if (!StrICompare(ext, "TGA"))
+		img = TGARead(filename, mem_task);
+	if (!img)
+		img = PNGRead(filename);
+	if (!img)
+		img = JPGRead(filename, mem_task);
+	if (!img)
+		img = GIFRead(filename, mem_task);
+	if (!img)
+		img = WEBPRead(filename);
+	if (!img)
+		img = TGARead(filename, mem_task);
+
+	return img;
+}
+
+public U0 DESysLogShow(Bool on)
+{//The DE wallpaper blots over every cell the z-buffer says is desktop, so a
+//window that was never raised sits under it. Raising SysLog puts it in the
+//z-order where the blot skips it.
+	if (on)
+	{
+		LBts(&sys_task->display_flags, DISPLAYf_SHOW);
+		WinToTop(sys_task);
+		WinFocus(sys_task);
+	}
+	else
+		LBtr(&sys_task->display_flags, DISPLAYf_SHOW);
+	WinZBufUpdate;
+}
+
 U0 DEWallpaperDraw(CTask *task, CDC *dc)
-{//Hung on sys_winmgr_task->draw_it. dc is a z-buffered screen alias, so the
-//blot self-clips to the uncovered desktop background.
-	if (de.wallpaper)
-		GrBlot(dc, 0, 0, de.wallpaper);
+{//Hung on sys_winmgr_task->draw_it.
+//Skipped while the LMB is held on the desktop: the image is drawn AFTER the
+//text layer, so dropping it is what uncovers the stock stats underneath.
+//
+//GrBlot() would also self-clip here, but it walks every pixel of the image and
+//re-reads the z-buffer every 8 - a full screen of that each frame whether or
+//not any desktop is visible. This tests the z-buffer once per 8x8 cell and
+//copies only the visible runs, so a maximized app costs a cell scan instead of
+//a megapixel scan.
+	CDC	*img = de.wallpaper;
+	U16	*zb  = gr.win_z_buf;
+	I64	 zn  = task->win_z_num;
+	I64	 cx, cy, run, y, x0, w, cols = TEXT_COLS, rows = TEXT_ROWS;
+
+	if (!img || de.stats_hold)
+		return;
+	if (!zb)
+	{
+		GrBlot(dc, 0, 0, img);
+		return;
+	}
+	if (rows * FONT_HEIGHT > img->height)
+		rows = img->height / FONT_HEIGHT;
+	if (cols * FONT_WIDTH > img->width)
+		cols = img->width / FONT_WIDTH;
+	for (cy = 0; cy < rows; cy++)
+	{
+		cx = 0;
+		while (cx < cols)
+		{//A cell is desktop when no higher window owns it.
+			if (zn >= zb[cy * TEXT_COLS + cx])
+			{
+				run = cx;
+				while (cx < cols && zn >= zb[cy * TEXT_COLS + cx])
+					cx++;
+				x0 = run * FONT_WIDTH;
+				w  = (cx - run) * FONT_WIDTH;
+				for (y = 0; y < FONT_HEIGHT; y++)
+					MemCopy(dc->body + (cy * FONT_HEIGHT + y) * dc->width_internal + x0,
+							img->body + (cy * FONT_HEIGHT + y) * img->width_internal + x0,
+							w * sizeof(U32));
+			}
+			else
+				cx++;
+		}
+	}
 }
 
 U0 DEWallpaperLoad(U8 *filename)
-{//PNG wallpaper, scaled to screen if needed. Procedural gradient fallback.
-	CDC *png = PNGRead(filename), *old = de.wallpaper;
-	I64  x, y, r, g, b;
+{//Image wallpaper, scaled to screen if needed. Procedural gradient fallback,
+//derived from the accent hue so it tracks the theme.
+	CDC *png = DEImageRead(filename), *old = de.wallpaper;
+	I64  x, y, top, bot, r, g, b;
 	U32 *dst;
 
 	if (filename && filename != de.wallpaper_path)
@@ -185,13 +279,17 @@ U0 DEWallpaperLoad(U8 *filename)
 		DCDel(png);
 	}
 	else
-	{//No PNG found: vertical navy->violet gradient.
+	{//Nothing decoded: vertical gradient in the accent hue, dark to lit.
+		//DEColorLerp is defined further down and the compiler is single pass,
+		//so the blend is spelled out here.
+		top = DEHue2RGB(de_theme.hue + 12, 215, 26) & 0xFFFFFF;
+		bot = DEHue2RGB(de_theme.hue - 26, 185, 92) & 0xFFFFFF;
 		de.wallpaper = DCNew(GR_WIDTH, GR_HEIGHT, sys_task);
 		for (y = 0; y < GR_HEIGHT; y++)
 		{
-			r = 12 + 30 * y / GR_HEIGHT;
-			g = 10 + 14 * y / GR_HEIGHT;
-			b = 34 + 72 * y / GR_HEIGHT;
+			r = (top >> 16 & 0xFF) + ((bot >> 16 & 0xFF) - (top >> 16 & 0xFF)) * y / GR_HEIGHT;
+			g = (top >> 8 & 0xFF)  + ((bot >> 8 & 0xFF)  - (top >> 8 & 0xFF))  * y / GR_HEIGHT;
+			b = (top & 0xFF)       + ((bot & 0xFF)       - (top & 0xFF))       * y / GR_HEIGHT;
 			dst = de.wallpaper->body + y * de.wallpaper->width_internal;
 			for (x = 0; x < GR_WIDTH; x++)
 				dst[x] = r << 16 | g << 8 | b;
@@ -232,10 +330,7 @@ Bool DEConfigLoad()
 	if (!de.glass)
 		WinOpaque;
 
-	if (DEConfigValI64(body, "syslog", 0))
-		LBts(&sys_task->display_flags, DISPLAYf_SHOW);
-	else
-		LBtr(&sys_task->display_flags, DISPLAYf_SHOW);
+	DESysLogShow(DEConfigValI64(body, "syslog", 0) != 0);
 
 	vol = DEConfigValI64(body, "volume", ac97.volume);
 	de.muted = DEConfigValI64(body, "muted", 0) != 0;
@@ -887,6 +982,82 @@ U0 DEBarRightClick(CCtrl *c, I64 x, I64 y, Bool down)
 		}
 }
 
+/* ---------------- desktop ctrl ---------------- */
+
+U0 DEDeskClick(CCtrl *c, I64 x, I64 y, Bool down)
+{//CTRLF_CAPTURE_LEFT_MS: called every frame while the button is down on bare
+//desktop, then once with down = FALSE. Holding re-arms the stock stats
+//wallpaper (DEStart retired it) and DEWallpaperDraw drops the image, so the
+//text underneath shows through for as long as the button is held.
+	no_warn c;
+	no_warn x;
+	no_warn y;
+	if (down)
+	{
+		if (!de.stats_hold)
+		{
+			de.stats_hold	 = TRUE;
+			gr.fp_wall_paper = de.old_wall_paper;
+		}
+	}
+	else if (de.stats_hold)
+	{
+		de.stats_hold	 = FALSE;
+		gr.fp_wall_paper = NULL;
+	}
+}
+
+U0 DEDeskMenuTask()
+{//Desktop right-click menu, in its own task so the WinMgr never blocks.
+//Entries that live in later-included files are launched by runtime string:
+//DE.ZC compiles before Settings.ZC, so &DESettings would not resolve.
+	U8	*file;
+	I64	 i = PopUpPickList("Settings\0New Terminal\0File Manager\0"
+						   "Task Manager\0Wallpaper...\0");
+
+	switch (i)
+	{
+		case 0:
+			//PopUp with no parent = run and exit, so Settings closes its whole
+			//task when it is dismissed instead of leaving a terminal behind.
+			PopUp("DESettings;");
+			break;
+		case 1:
+			User;
+			break;
+		case 2:
+			User("FileMgr;\n");
+			break;
+		case 3:
+			User("TaskRep;\n");
+			break;
+		case 4:
+			file = PopUpPickFile("::/DE");
+			if (file)
+			{
+				DEWallpaperLoad(file);
+				Free(file);
+				de.cfg_dirty = TRUE;
+			}
+			break;
+	}
+	de.desk_menu_task = NULL;
+}
+
+U0 DEDeskRightClick(CCtrl *c, I64 x, I64 y, Bool down)
+{
+	no_warn c;
+	no_warn x;
+	no_warn y;
+	if (!down)
+		return;
+	if (!TaskValidate(de.desk_menu_task) && tS - de.desk_menu_last > 0.3)
+	{
+		de.desk_menu_last = tS;
+		de.desk_menu_task = Spawn(&DEDeskMenuTask, NULL, "DE Desktop Menu");
+	}
+}
+
 U0 DEBarWheel(CCtrl *c, I64 delta)
 {//Scroll over the volume tray to step the volume up/down.
 	I64 mx = mouse.pos.x;
@@ -1042,6 +1213,10 @@ public U0 DEStart(U8 *wallpaper_filename="::/DE/Wallpaper.PNG")
 	de.ctx_task			 = NULL;
 	de.ctx_target		 = NULL;
 	de.net_task			 = NULL;
+	de.desk				 = NULL;
+	de.stats_hold		 = FALSE;
+	de.desk_menu_task	 = NULL;
+	de.desk_menu_last	 = 0;
 	de.min_count		 = 0;
 	de.menu_close		 = FALSE;
 	de.menu_last		 = 0;
@@ -1080,6 +1255,23 @@ public U0 DEStart(U8 *wallpaper_filename="::/DE/Wallpaper.PNG")
 	QueueInsert(c, sys_winmgr_task->last_ctrl);
 	TaskDerivedValsUpdate(sys_winmgr_task);
 	de.bar = c;
+
+	//Desktop ctrl: everything above the bar. The WinMgr only runs a task's
+	//ctrls when that task is the topmost window under the cursor, so this fires
+	//on bare desktop only - clicks on windows are untouched. Paints nothing.
+	c = SysCAlloc(sizeof(CCtrl));
+	c->win_task		= sys_winmgr_task;
+	c->flags		= CTRLF_SHOW | CTRLF_CAPTURE_LEFT_MS;
+	c->type			= CTRLT_GENERIC;
+	c->left_click	= &DEDeskClick;
+	c->right_click	= &DEDeskRightClick;
+	c->left			= 0;
+	c->right		= GR_WIDTH - 1;
+	c->top			= 0;
+	c->bottom		= GR_HEIGHT - DE_BAR_HEIGHT - 1;
+	QueueInsert(c, sys_winmgr_task->last_ctrl);
+	TaskDerivedValsUpdate(sys_winmgr_task);
+	de.desk = c;
 
 	if (!gr.tc_chrome) //Truecolor chrome on by default; Settings can revert.
 		GuiChromeTrueColor(de_theme.accent, ColorRGB(0x0A, 0x10, 0x1A), de_theme.accent_dim);
@@ -1126,6 +1318,10 @@ public U0 DEStop()
 	if (TaskValidate(de.ctx_task))
 		Kill(de.ctx_task);
 	de.ctx_task = NULL;
+	if (TaskValidate(de.desk_menu_task))
+		Kill(de.desk_menu_task);
+	de.desk_menu_task = NULL;
+	de.stats_hold = FALSE;
 	de.net_task = NULL;
 	de.min_count = 0;
 
@@ -1141,6 +1337,14 @@ public U0 DEStop()
 		POPFD
 		TaskDerivedValsUpdate(sys_winmgr_task);
 	}
+	if (de.desk)
+	{
+		PUSHFD
+		CLI
+		QueueRemove(de.desk);
+		POPFD
+		TaskDerivedValsUpdate(sys_winmgr_task);
+	}
 	if (de.term_bttn)
 	{
 		de.term_bttn->flags |= CTRLF_SHOW;
@@ -1152,6 +1356,11 @@ public U0 DEStop()
 	{
 		Free(de.bar);
 		de.bar = NULL;
+	}
+	if (de.desk)
+	{
+		Free(de.desk);
+		de.desk = NULL;
 	}
 	gr.translucent_bg = NULL;
 	WinOpaque;
