@@ -44,7 +44,7 @@ class CZAmpMedia
 	//MP3 streaming (decode-ahead): compressed file kept, decoded on the fly.
 	U8		*mp3_src;
 	I64		 mp3_size, src_rate;
-	Bool	 is_mp3, decoding;
+	Bool	 is_mp3, is_ogg, decoding;
 };
 
 class CZAmpMarquee
@@ -432,6 +432,7 @@ U0 ZAMediaFree()
 	zamp.media.pcm_frames = 0;
 	zamp.media.pcm_cap = 0;
 	zamp.media.is_mp3 = FALSE;
+	zamp.media.is_ogg = FALSE;
 }
 
 U0 ZAMediaSet(U32 *pcm, I64 frames, I64 channels, I64 src_khz, U8 *title)
@@ -641,12 +642,85 @@ Bool ZAWavBuf(U8 *raw, I64 size, U8 *filename)
 	return TRUE;
 }
 
+U0 ZAOggDecodeTask()
+{//Decode-ahead: one audio packet at a time, linear-resample to 48kHz, append
+//to pcm_data. Mirrors ZADecodeTask.
+	F64	 phase = 0.0, step;
+	F64	*pcm_l, *pcm_r;
+	I64	 got, i, si, cl, cr, nl, nr;
+	F64	 last_l = 0.0, last_r = 0.0, frac, l, r;
+
+	//longest hop is blocksize1 / 2
+	pcm_l = MAlloc(VM_MAX_N * sizeof(F64));
+	pcm_r = MAlloc(VM_MAX_N * sizeof(F64));
+
+	step = ToF64(ogg_rate) / ZA_RATE;
+
+	while (zamp.media.decoding)
+	{
+		if (!OggNextPacket)
+			break;						//EOF
+
+		if (!VADecode(pcm_l, pcm_r, &got))
+			break;
+
+		if (ogg_channels == 1)
+			for (i = 0; i < got; i++)
+				pcm_r[i] = pcm_l[i];
+
+		//first audio packet primes the lap buffer and yields nothing
+		if (!got)
+			goto zaog_next;
+
+		while (phase < ToF64(got))
+		{
+			si   = phase;
+			frac = phase - ToF64(si);
+
+			if (!si)
+			{
+				cl = ToI64(last_l * 32767.0);
+				cr = ToI64(last_r * 32767.0);
+			}
+			else
+			{
+				cl = ToI64(pcm_l[si - 1] * 32767.0);
+				cr = ToI64(pcm_r[si - 1] * 32767.0);
+			}
+
+			nl = ToI64(pcm_l[si] * 32767.0);
+			nr = ToI64(pcm_r[si] * 32767.0);
+
+			if (zamp.media.pcm_frames >= zamp.media.pcm_cap)
+				break;
+
+			zamp.media.pcm_data[zamp.media.pcm_frames].i16[0] =
+				ClampI64(cl + ToI64((nl - cl) * frac), -32768, 32767);
+			zamp.media.pcm_data[zamp.media.pcm_frames].i16[1] =
+				ClampI64(cr + ToI64((nr - cr) * frac), -32768, 32767);
+			zamp.media.pcm_frames++;
+			phase += step;
+		}
+
+		phase -= ToF64(got);
+		last_l = pcm_l[got - 1];
+		last_r = pcm_r[got - 1];
+
+zaog_next:
+		if (!(zamp.media.pcm_frames & 0x3FFF))
+			Sleep(1);					//yield to the feed task and UI
+	}
+
+	Free(pcm_l);
+	Free(pcm_r);
+	zamp.media.decoding = FALSE;
+	zamp.decode_task    = NULL;
+}
+
 Bool ZAOggOpen(U8 *raw, I64 size, U8 *filename)
-{//headers only. the audio path needs MDCT, which is not written - this proves
- //the container, codebooks and setup header against a real file
-	I64 total;
-	I64 secs;
-	U8	line[300];
+{
+	I64	total, secs, est_frames;
+	U8	title[300];
 
 	OggFree;
 	OggInit;
@@ -655,6 +729,7 @@ Bool ZAOggOpen(U8 *raw, I64 size, U8 *filename)
 	VSFreeAll;
 	VSInit;
 	VFInit;
+	VMInit;
 
 	if (size < 64)
 		return FALSE;
@@ -669,16 +744,43 @@ Bool ZAOggOpen(U8 *raw, I64 size, U8 *filename)
 		return FALSE;
 	}
 
+	if (ogg_channels < 1 || ogg_channels > 2 || ogg_blocksize1 > VM_MAX_N)
+	{
+		PopUpOk("Unsupported Vorbis stream layout.");
+		return FALSE;
+	}
+
+	//last page's granule position is the sample count
 	total = OggTotalSamples(raw, size);
 	secs  = total / MaxI64(1, ogg_rate);
+	est_frames = (secs + 8) * ZA_RATE;
 
-	StrPrint(line, "ogg: %dHz %dch books %d floors %d res %d map %d mode %d  %d:%02d",
-		ogg_rate, ogg_channels, vb_book_count, vs_floor_count,
-		vs_residue_count, vs_mapping_count, vs_mode_count,
-		secs / 60, secs % 60);
-	PopUpOk(line);
+	ZAMediaFree;
+	zamp.media.mp3_src	 = raw;			//compressed source, freed by ZAMediaFree
+	zamp.media.mp3_size	 = size;
+	zamp.media.is_ogg	 = TRUE;
+	zamp.media.src_rate	 = ogg_rate;
+	zamp.media.channels	 = ogg_channels;
+	zamp.media.sample_rate_khz = ogg_rate / 1000;
+	zamp.media.bitrate_kbps = ogg_bitrate_nom / 1000;
+	zamp.media.pcm_cap	 = est_frames;
+	zamp.media.pcm_data	 = MAlloc(est_frames * sizeof(U32));
+	zamp.media.pcm_frames = 0;
+	zamp.media.runtime_mins = secs / 60;
+	zamp.media.runtime_secs = secs % 60;
 
-	return FALSE;			//no PCM yet
+	StrCopy(zamp.media.title, ZABasename(filename));
+	StrPrint(title, "1. %s (%02d:%02d) *** ", zamp.media.title,
+		zamp.media.runtime_mins, zamp.media.runtime_secs);
+	ZAMarqueeSet(title);
+	ZASeekTo(0);
+	zamp.media.stopped = FALSE;
+	zamp.media.paused  = FALSE;
+
+	zamp.media.decoding = TRUE;
+	zamp.decode_task = Spawn(&ZAOggDecodeTask, NULL, "ZealAmp Ogg Decode", 2);
+
+	return TRUE;
 }
 
 Bool ZAMp3Open(U8 *raw, I64 size, U8 *filename)
@@ -747,8 +849,9 @@ Bool ZAOpenFile(U8 *filename)
 	}
 	else if (!MemCompare(raw, "OggS", 4))
 	{
-		ok = ZAOggOpen(raw, size, filename);
-		Free(raw);
+		ok = ZAOggOpen(raw, size, filename); //On success, owns raw for streaming.
+		if (!ok)
+			Free(raw);
 	}
 	else
 	{
