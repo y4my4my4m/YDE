@@ -14,6 +14,8 @@ the same structure as the Quake and HL1 ports.
 
        ExeFile("::/Apps/Diablo1/Run");
 
+   The game spawns its own task, so the invoking shell stays usable.
+
    `D1Test;` afterwards runs the data-layer self check (extraction byte
    sums, frame counts, town assembly). `D1TestAudio;` checks the playback
    path - voice allocation, pool oversubscription, music track switching,
@@ -80,7 +82,10 @@ and autosaves.
   Recharge, Identify, Disarm, Infravision and Resurrect have no book
   rows, matching their sBookLvl of -1 - they are staff-only.
 - Objects: barrels, chests, and functional doors (exact objects.cpp
-  piece-swap tables for cathedral and catacombs).
+  piece-swap tables for cathedral and catacombs), plus the dSpecial arch
+  and open-door layer from L1S/L2S/TownS.CEL placed per DRLG_InitL1Vals
+  and ObjL2Special, shaded through the tile's own dLight. Opening or
+  closing a door refreshes vision, as RedoPlayerVision does.
 - A* pathfinding (path.cpp) with BFS fallback past its 24-step cap.
 - Audio through the native AC97 mixer: WAV decode + 48kHz resample,
   8-voice SFX pool, looped music per level band, monster voices,
@@ -139,10 +144,11 @@ and autosaves.
 - Save/load: 3 slots, own compact format, checksummed; persists the
   character, inventory, position and all 17 level seeds so dungeons
   regenerate identically, plus per-item prefix/suffix/unique/identified
-  state, durability, staff charges and per-item affix rolls, the
-  unique-drop bitmap, quest state and spell levels. Autosaves on level
-  change and on exit. Format version 4; versions 1-3 still load with
-  documented defaults.
+  state, durability, staff charges, per-item affix rolls and the item on
+  the cursor, the unique-drop bitmap, quest state and spell levels. Town
+  floor loot persists across level changes. Autosaves on level
+  change and on exit. Format
+  version 6; versions 1-5 still load with documented defaults.
 - devilutionX-style QOL: town jog, 2x zoom ('z' and the mouse wheel),
   a resizable canvas with five modes to 1280x960 ('w' or the options
   menu), hover HP bar, click feedback sounds.
