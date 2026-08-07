@@ -1843,6 +1843,10 @@ class CQSurfCache
 
 	I64	 guard_n;		//texels per plane, what the trailing magic sits after
 
+	//r_exthires. this surface is built 1<<ext_shift finer than the BSP texture
+	//so a replacement's detail survives the cache. 0 is the 1:1 default
+	I64	 ext_shift;
+
 	//a worker core is filling this slot. the buffers are allocated and the
 	//face owns the slot, but the texels are garbage until the job is reaped,
 	//so the slot must not be handed out, evicted or freed
@@ -1866,6 +1870,7 @@ class CQFacePrep
 	I64	 sw;
 	I64	 sh;
 	I64	 built_mip;
+	I64	 ext_shift;
 	I64	 frame;
 };
 
@@ -1924,6 +1929,7 @@ class CQSurfJob
 	I64			 mip;
 	I64			 lm_w, lm_h;
 	I64			 mins_s_i, mins_t_i;
+	I64			 ext_shift;
 	Bool		 want_rgb;
 
 	//what the reap stamps onto the slot once the texels are real
@@ -2510,6 +2516,14 @@ I64	q_mipcap	= 0;
 //one mip coarser until it fits. 0 disables. 64K texels is 256KB of RGB plane
 I64	q_surf_texmax = 65536;
 
+//r_exthires. the surface cache holds one texel per BSP texel, so a 960x1280
+//replacement over a 96x128 miptex is sampled at 96x128 - 1% of it. build the
+//surface finer where a replacement exists. costs only on faces that have one
+Bool q_ext_hires = FALSE;
+
+//ceiling on the extra detail. 4 is 16x per axis, 256x the texels
+#define QEXT_SHIFT_MAX	4
+
 //r_mipaniso. mip from distance AND foreshortening, not distance alone
 Bool q_mip_aniso = TRUE;
 
@@ -2716,6 +2730,7 @@ U0 QSurfFill(CQSurfJob *j)
 	Bool		 use_rgbmip;
 	U32			*raw_plane;
 	I64			 tex_row, out_row;
+	I64			 esh, fine_s, fine_t;
 	F64			 ls, lt, ls_step;
 
 	out = sc->pixels;
@@ -2729,22 +2744,28 @@ U0 QSurfFill(CQSurfJob *j)
 
 	//per ROW invariants. this compiler has no optimiser, so every one of these
 	//was a multiply, a divide or an int-to-float PER TEXEL
-	ls_step = ToF64(1 << mip) / 16.0;
+	esh     = j->ext_shift;
+	ls_step = ToF64(1 << mip) / 16.0 / ToF64(1 << esh);
 
+	//the cache runs 1<<esh finer than the BSP texture. fine coordinates index
+	//the replacement; the BSP texel for cutout, fullbright and the index plane
+	//is that shifted back down
 	for (v = 0; v < ch; v++)
 	{
 		t0 = v << mip;
-		ty = QTexWrap((j->mins_t_i + t0) >> mip, th);
+		fine_t = (j->mins_t_i << esh) + t0;
+		ty = QTexWrap((fine_t >> esh) >> mip, th);
 
 		tex_row = ty * tw;
 		out_row = v * cw;
-		lt      = ToF64(t0) / 16.0;
+		lt      = ToF64(t0) / 16.0 / ToF64(1 << esh);
 		ls      = 0.0;
 
 		for (u = 0; u < cw; u++)
 		{
 			s0 = u << mip;
-			tx = QTexWrap((j->mins_s_i + s0) >> mip, tw);
+			fine_s = (j->mins_s_i << esh) + s0;
+			tx = QTexWrap((fine_s >> esh) >> mip, tw);
 
 			texel = texels[tex_row + tx];
 
@@ -2839,8 +2860,13 @@ U0 QSurfFill(CQSurfJob *j)
 				//
 				//16.16, and PARENTHESISED: shifts bind tighter than divide in
 				//this compiler and it reorders these silently
-				exf = ((tx * tex->ext_w) << 16) / tw;
-				eyf = ((ty * tex->ext_h) << 16) / th;
+				//fine coordinate, not the BSP texel - that is the whole point
+				//of the finer surface. wrapped in fine units so a tiling wall
+				//still meets itself
+				exf = ((QTexWrap(fine_s >> mip, tw << esh) * tex->ext_w) << 16) /
+						(tw << esh);
+				eyf = ((QTexWrap(fine_t >> mip, th << esh) * tex->ext_h) << 16) /
+						(th << esh);
 
 				ex = exf >> 16;
 				ey = eyf >> 16;
@@ -3041,6 +3067,7 @@ U0 QSurfJobReap()
 			sc->w         = j->cw;
 			sc->h         = j->ch;
 			sc->mip       = j->mip;
+			sc->ext_shift = j->ext_shift;
 			sc->face      = j->face_index;
 			sc->frame     = q_surf_frame;
 			sc->light_key = j->key;
@@ -3095,6 +3122,52 @@ I64 QSurfJobAlloc()
 	}
 
 	return -1;
+}
+
+I64 QSurfExtShift(CQTexture *tex, I64 mip)
+{//how much finer than the BSP texture a surface is built, as a shift.
+ //
+ //SHARED WITH QSurfCacheWouldHit, for the same reason QSurfMipAdjust is: the
+ //two hit tests must agree on the surface geometry or the caller skips the
+ //lightmap for a face that then rebuilds, and it builds fullbright.
+ //
+ //the largest power of two that fits the ratio - the sampler handles the
+ //remainder, so a 10x replacement takes 8x.
+ //
+ //INCOMPLETE, which is why r_exthires defaults off. the shift comes from the
+ //TEXTURE ratio alone and ignores how large the face is on screen, so a wall
+ //covering 200 pixels is built at 64x the texels it can show. an animated
+ //replacement multiplies that by its frame count.
+ //
+ //the level should come from screen-space texel density - the same term
+ //QMipForRatio uses, inverted: go finer only while the face is magnified, and
+ //stop where the extra texels stop being visible. that bounds the memory by
+ //what is on screen rather than by what is on disk.
+ //
+ //sampling tex->ext_rgb per pixel in the span instead is NOT a free
+ //alternative: it trades a cached blit for a fetch plus per-pixel lighting,
+ //which is the uncached path and measures far slower. it only wins on faces
+ //that rebuild every frame
+	I64 tw;
+	I64 th;
+	I64 sh = 0;
+
+	if (!q_ext_hires || !tex || !tex->ext_rgb ||
+		tex->ext_w <= 0 || tex->ext_h <= 0)
+		return 0;
+
+	tw = tex->width  >> mip;
+	th = tex->height >> mip;
+
+	if (tw <= 0 || th <= 0)
+		return 0;
+
+	while (sh < QEXT_SHIFT_MAX &&
+		   (tw << (sh + 1)) <= tex->ext_w &&
+		   (th << (sh + 1)) <= tex->ext_h)
+		sh++;
+
+	return sh;
 }
 
 I64 QSurfMipAdjust(CQFace *f, CQTexture *tex, I64 face_index, I64 mip)
@@ -3201,6 +3274,7 @@ Bool QSurfCacheWouldHit(CQMap *map, CQFace *f, I64 face_index, I64 mip,
 	return ToBool(sc->face == face_index && sc->mip == mip &&
 		sc->texture == tex_key && (sc->pixels || sc->rgb) &&
 		ToBool(sc->rgb != NULL) == want_rgb &&
+		sc->ext_shift == QSurfExtShift(&map->textures[tex_key], mip) &&
 		(!(want_rgb && dlit) || sc->rgb_raw) &&
 		(sc->light_key == key ||
 		 q_surf_builds_frame >= q_surf_build_max));
@@ -3209,7 +3283,7 @@ Bool QSurfCacheWouldHit(CQMap *map, CQFace *f, I64 face_index, I64 mip,
 U8 *QSurfCacheGet(CQMap *map, CQFace *f, I64 face_index, CQTexture *tex,
 	I64 mip, U8 *lightmap, I64 lm_w, I64 lm_h, I64 *_cw, I64 *_ch,
 	I64 tex_key = 0, U32 **_rgb = NULL, U32 **_rgb_raw = NULL,
-	I64 *_mip = NULL, Bool dlit = FALSE)
+	I64 *_mip = NULL, Bool dlit = FALSE, I64 *_esh = NULL)
 {//R_DrawSurface - texture with lighting applied at the mip being drawn.
  //NULL means not cached, light it per pixel
 	CQSurfCache	*sc;
@@ -3230,6 +3304,7 @@ U8 *QSurfCacheGet(CQMap *map, CQFace *f, I64 face_index, CQTexture *tex,
 	Bool		 want_rgb;
 	Bool		 want_raw;
 	Bool		 lm_scratch;
+	I64			 ext_shift;
 	U8			*lit_base;
 	CQSurfJob	 job;
 	I64			 ji;
@@ -3240,6 +3315,8 @@ U8 *QSurfCacheGet(CQMap *map, CQFace *f, I64 face_index, CQTexture *tex,
 		*_rgb = NULL;
 	if (_rgb_raw)
 		*_rgb_raw = NULL;
+	if (_esh)
+		*_esh = 0;
 
 	if (map != q_surf_map)
 		return NULL;
@@ -3305,6 +3382,9 @@ U8 *QSurfCacheGet(CQMap *map, CQFace *f, I64 face_index, CQTexture *tex,
 		if (_rgb_raw)
 			*_rgb_raw = osc->rgb_raw;
 
+		if (_esh)
+			*_esh = osc->ext_shift;
+
 		q_surf_hits++;
 		q_surf_hits_frame++;
 		q_surf_stale_frame++;
@@ -3327,8 +3407,14 @@ U8 *QSurfCacheGet(CQMap *map, CQFace *f, I64 face_index, CQTexture *tex,
 	if (!texels || tw <= 0 || th <= 0)
 		return NULL;
 
-	cw = (f->extent_s >> mip) + 1;
-	ch = (f->extent_t >> mip) + 1;
+	//r_exthires: build finer than the BSP texture where a replacement supplies
+	//the detail. the largest power of two that fits the ratio - the sampler
+	//below handles any leftover, so a 10x replacement takes 8x and loses only
+	//the remainder
+	ext_shift = QSurfExtShift(tex, mip);
+
+	cw = ((f->extent_s << ext_shift) >> mip) + 1;
+	ch = ((f->extent_t << ext_shift) >> mip) + 1;
 
 	if (cw <= 0 || ch <= 0)
 		return NULL;
@@ -3362,6 +3448,7 @@ U8 *QSurfCacheGet(CQMap *map, CQFace *f, I64 face_index, CQTexture *tex,
 		if (sc->face == face_index && sc->mip == mip &&
 			sc->texture == tex_key && (sc->pixels || sc->rgb) &&
 			ToBool(sc->rgb != NULL) == want_rgb &&
+			sc->ext_shift == ext_shift &&
 			(!want_raw || sc->rgb_raw) &&
 			(sc->light_key == key ||
 			 q_surf_builds_frame >= q_surf_build_max))
@@ -3373,6 +3460,9 @@ U8 *QSurfCacheGet(CQMap *map, CQFace *f, I64 face_index, CQTexture *tex,
 				*_rgb = sc->rgb;
 			if (_rgb_raw)
 				*_rgb_raw = sc->rgb_raw;
+			if (_esh)
+				*_esh = sc->ext_shift;
+
 			q_surf_hits++;
 			q_surf_hits_frame++;
 			if (want_rgb)
@@ -3530,6 +3620,7 @@ U8 *QSurfCacheGet(CQMap *map, CQFace *f, I64 face_index, CQTexture *tex,
 	job.lm_h       = lm_h;
 	job.mins_s_i   = ToI64(f->mins_s);
 	job.mins_t_i   = ToI64(f->mins_t);
+	job.ext_shift  = ext_shift;
 	job.want_rgb   = want_rgb;
 	job.slot       = slot;
 	job.face_index = face_index;
@@ -3596,6 +3687,9 @@ U8 *QSurfCacheGet(CQMap *map, CQFace *f, I64 face_index, CQTexture *tex,
 				if (_rgb_raw)
 					*_rgb_raw = osc->rgb_raw;
 
+				if (_esh)
+					*_esh = osc->ext_shift;
+
 				q_surf_hits++;
 				q_surf_hits_frame++;
 				q_surf_stale_frame++;
@@ -3628,6 +3722,7 @@ U8 *QSurfCacheGet(CQMap *map, CQFace *f, I64 face_index, CQTexture *tex,
 	sc->w         = cw;
 	sc->h         = ch;
 	sc->mip       = mip;
+	sc->ext_shift = ext_shift;
 	sc->face      = face_index;
 	sc->frame     = q_surf_frame;
 	sc->light_key = key;
@@ -3639,6 +3734,8 @@ U8 *QSurfCacheGet(CQMap *map, CQFace *f, I64 face_index, CQTexture *tex,
 
 	*_cw = cw;
 	*_ch = ch;
+	if (_esh)
+		*_esh = ext_shift;
 
 	if (want_rgb)
 		return QSURF_RGBONLY;
@@ -3922,6 +4019,7 @@ U0 QDrawStateInit()
 	q_mipcap        = 0;
 	q_mip_aniso     = TRUE;
 	q_surf_texmax   = 65536;
+	q_ext_hires     = FALSE;
 	q_draw_zbias    = 1.0;
 	q_mdl_zbias     = 1.004;
 	q_fogpost_dirty = TRUE;		//array, so no declaration initialiser
@@ -3959,7 +4057,8 @@ U0 QDrawSpan(CQCanvas *c, I64 y, I64 x1, I64 x2,
 	CQTexture *tex, U8 *lightmap, I64 lm_w, I64 lm_h,
 	F64 mins_s, F64 mins_t, I64 flat_light, I64 mip,
 	U8 *surf = NULL, I64 sw = 0, I64 sh = 0, U32 *surf_rgb = NULL,
-	U8 *dlmap = NULL, U32 *surf_raw = NULL, I64 zlift_in = 0)
+	U8 *dlmap = NULL, U32 *surf_raw = NULL, I64 zlift_in = 0,
+	I64 ext_shift = 0)
 {//fill one horizontal run. HOT LOOP - everything else runs a few thousand
  //times a frame, this runs a few hundred thousand
 	U8	*row;
@@ -4374,10 +4473,13 @@ U0 QDrawSpan(CQCanvas *c, I64 y, I64 x1, I64 x2,
 				{
 					//inline: ClampI64 is _extern _CLAMP_I64, a real CALL, and
 					//this loop ran two of them per pixel
-					tx = (ufx >> 16) >> mip;
+					//ext_shift keeps that many more fractional bits, which is
+					//exactly a multiply by 1<<ext_shift with the precision the
+					//finer surface needs. 0 for every ordinary surface
+					tx = (ufx >> (16 - ext_shift)) >> mip;
 					if (tx < 0)		tx = 0;
 					if (tx > tw1)	tx = tw1;
-					ty = (vfx >> 16) >> mip;
+					ty = (vfx >> (16 - ext_shift)) >> mip;
 					if (ty < 0)		ty = 0;
 					if (ty > th1)	ty = th1;
 
@@ -4791,7 +4893,7 @@ U0 QDrawPolygon(CQCanvas *c, CQScreenVert *v, I64 count,
 	F64 mins_s, F64 mins_t, I64 flat_light, I64 mip,
 	U8 *surf = NULL, I64 sw = 0, I64 sh = 0, U32 *surf_rgb = NULL,
 	U8 *dlmap = NULL, U32 *surf_raw = NULL,
-	I64 band_y0 = -1, I64 band_y1 = -1)
+	I64 band_y0 = -1, I64 band_y1 = -1, I64 ext_shift = 0)
 {//scanline fill of a convex poly - intersect every edge per row, extremes
  //become the span. O(edges), but rarely more than eight after clipping, and
  //no active edge table to get the winding order wrong in
@@ -5002,7 +5104,8 @@ U0 QDrawPolygon(CQCanvas *c, CQScreenVert *v, I64 count,
 			QDrawSpan(c, y, ToI64(xls), ToI64(xrs),
 				izl, sozl, tozl, izr, sozr, tozr,
 				tex, lightmap, lm_w, lm_h, mins_s, mins_t, flat_light, mip,
-				surf, sw, sh, surf_rgb, dlmap, surf_raw, zlift_poly);
+				surf, sw, sh, surf_rgb, dlmap, surf_raw, zlift_poly,
+				ext_shift);
 		}
 	}
 }
@@ -6702,6 +6805,7 @@ U0 QDrawFace(CQCanvas *c, CQMap *map, I64 face_index, F64 *offset = NULL,
 	Bool		 lm_has_dyn = TRUE;	//lightmap in hand carries dlights
 	U8			*dlmap;
 	I64			 built_mip = 0;
+	I64			 ext_shift = 0;
 	I64			 sw = 0;
 	I64			 sh = 0;
 	F64			 rel[3];
@@ -6935,6 +7039,7 @@ U0 QDrawFace(CQCanvas *c, CQMap *map, I64 face_index, F64 *offset = NULL,
 				sw        = fp->sw;
 				sh        = fp->sh;
 				built_mip = fp->built_mip;
+				ext_shift = fp->ext_shift;
 			}
 			else
 			{
@@ -6943,7 +7048,7 @@ U0 QDrawFace(CQCanvas *c, CQMap *map, I64 face_index, F64 *offset = NULL,
 				//wanted
 				surf = QSurfCacheGet(map, f, face_index, tex, mip,
 						lightmap, lm_w, lm_h, &sw, &sh, anim_tex, &surf_rgb,
-						&surf_raw, &built_mip, dlit);
+						&surf_raw, &built_mip, dlit, &ext_shift);
 
 				if (prep_mode == QFP_RESOLVE && q_face_prep &&
 					face_index < q_face_prep_n)
@@ -6955,6 +7060,7 @@ U0 QDrawFace(CQCanvas *c, CQMap *map, I64 face_index, F64 *offset = NULL,
 					fp->sw        = sw;
 					fp->sh        = sh;
 					fp->built_mip = built_mip;
+					fp->ext_shift = ext_shift;
 					fp->frame     = q_surf_frame;
 				}
 			}
@@ -6988,7 +7094,7 @@ U0 QDrawFace(CQCanvas *c, CQMap *map, I64 face_index, F64 *offset = NULL,
 		//NULL lightmap means fullbright, and by here that is only turb
 		QDrawPolygon(c, scr, count, tex, lightmap, lm_w, lm_h,
 			f->mins_s, f->mins_t, 255, mip, surf, sw, sh, surf_rgb, dlmap,
-			surf_raw, band_y0, band_y1);
+			surf_raw, band_y0, band_y1, ext_shift);
 	}
 
 	c->faces_drawn++;
