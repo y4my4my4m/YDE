@@ -134,6 +134,43 @@ I64		q_probe_cmap	= -1;		//what the colormap turned it into
 I64		q_probe_tw		= -1;
 I64		q_probe_th		= -1;
 
+//COLUMN PROBE. one pixel names one surface; a stripe needs the run of rows
+//through it. same ownership test as the single probe, repeated over
+//QPROBE_COL consecutive rows at the probe column, so each row reports the
+//span that actually won it: texture, stored colour, cache row and the cache
+//plane it came from
+#define QPROBE_COL		24
+Bool	q_probe_col_req		= FALSE;
+I64		q_probe_col_y0		= 0;
+I64		q_probe_pty			= -1;	//surface-cache row this span sampled
+U8		q_probe_col_tex[QPROBE_COL * 16];
+I64		q_probe_col_own[QPROBE_COL];
+U32		q_probe_col_argb[QPROBE_COL];
+U32		q_probe_col_raw[QPROBE_COL];
+I64		q_probe_col_ty[QPROBE_COL];
+I64		q_probe_col_mip[QPROBE_COL];
+I64		q_probe_col_ptr[QPROBE_COL];
+I64		q_probe_col_off[QPROBE_COL];
+U8		q_probe_col_line[160];
+I64		q_probe_col_i		= 0;
+
+U0 QProbeColClear()
+{//globals are not zeroed at load, so every field is written here
+	I64 i;
+
+	for (i = 0; i < QPROBE_COL; i++)
+	{
+		q_probe_col_tex[i * 16] = 0;
+		q_probe_col_own[i]      = 0;
+		q_probe_col_argb[i]     = 0;
+		q_probe_col_raw[i]      = 0;
+		q_probe_col_ty[i]       = -1;
+		q_probe_col_mip[i]      = -1;
+		q_probe_col_ptr[i]      = 0;
+		q_probe_col_off[i]      = -1;
+	}
+}
+
 //continuous crosshair readout. the console is unusable mid-game, so this is
 //how the probe is meant to be driven
 Bool	q_opt_debugtex	= FALSE;
@@ -302,6 +339,35 @@ I64			q_px_simd		= 0;	//pixels the SSE2 kernel took
 //.alpha for the surface being drawn, 0..255. set around a brush entity and
 //restored after, as q_draw_vis is. 255 is opaque and costs nothing extra
 I64			q_draw_alpha	= 255;
+
+I64 QEntAlphaDraw(F64 a)
+{//.alpha as a 0..255 blend weight. 0 means the entity is invisible and must
+ //not be drawn at all.
+ //
+ //ENTALPHA_ENCODE, protocol.h:136:
+ //    ((a)==0) ? ENTALPHA_DEFAULT : Q_rint(CLAMP(1.0f,(a)*254.0f+1,255.0f))
+ //ENTALPHA_DECODE, protocol.h:137:
+ //    ((a)==ENTALPHA_DEFAULT) ? 1.0f : ((float)(a)-1)/254
+ //R_SortEntities then drops anything encoding to ENTALPHA_ZERO:
+ //    if (!ent->model || ent->alpha == ENTALPHA_ZERO) continue;
+ //
+ //the clamp is what gives a NEGATIVE key its meaning: mods write .alpha -1
+ //to hide a brush entity, and it encodes to ENTALPHA_ZERO. testing only
+ //0 < a < 1 drew those fully opaque
+	I64 e;
+
+	if (a == 0.0)
+		return 255;
+
+	//Q_rint on the encode; the clamp catches negatives
+	e = ClampI64(ToI64((a * 254.0) + 1.5), 1, 255);
+
+	if (e == 1)		//ENTALPHA_ZERO
+		return 0;
+
+	//decoded 0..1 rescaled to the blend weight the span loops take
+	return ClampI64(((e - 1) * 255) / 254, 1, 255);
+}
 
 //runtime occlusion, both switchable from the console: r_occents for the
 //per-entity depth query, r_occworld for the tiled node rejection
@@ -2456,6 +2522,13 @@ I64 QSurfCacheMipFor(CQMap *map, I64 face_index)
 F64	q_mipscale	= 0.0;
 I64	q_mipcap	= 0;
 
+//r_mipaniso. mip from distance AND foreshortening, not distance alone
+Bool q_mip_aniso = TRUE;
+
+//cosine floor for the foreshortening term: 0.25 caps the boost at 4x, two mip
+//levels, so a face at the grazing limit stays bounded
+#define QMIP_MIN_COS	0.25
+
 //r_mipzoomhold. a zoom ramps the fov over ~0.125s, and every frame of it
 //rescales the mip ratio - so faces cross thresholds one after another and the
 //surface cache rebuilds them mid-transition, which is the stutter. holding
@@ -3723,6 +3796,7 @@ U0 QDrawStateInit()
 	q_mip_zoom_hold = TRUE;
 	q_mip_frozen    = FALSE;
 	q_mipcap        = 0;
+	q_mip_aniso     = TRUE;
 	q_draw_zbias    = 1.0;
 	q_mdl_zbias     = 1.004;
 	q_fogpost_dirty = TRUE;		//array, so no declaration initialiser
@@ -3952,7 +4026,7 @@ U0 QDrawSpan(CQCanvas *c, I64 y, I64 x1, I64 x2,
 		crow = c->rgb + y * c->width;
 
 	q_probe_own = -1.0;
-	q_probe_ent = -1;
+	q_probe_pty = -1;
 	pend_raw    = -1;
 	pend_cmap   = -1;
 
@@ -4133,8 +4207,12 @@ U0 QDrawSpan(CQCanvas *c, I64 y, I64 x1, I64 x2,
 
 			//SSE2 kernel for the plain case: no dlight, no alpha, no probe
 			//on this row. remainder and every special case stay scalar below
+			//SIMD writes no probe state, so every row the probe reads must stay
+			//on the scalar loop
 			if (q_opt_simd && !dlmap && q_draw_alpha == 255 &&
-				!(q_probe_req && y == q_probe_y) && xe - x >= 8)
+				!(q_probe_req && y == q_probe_y) &&
+				!(q_probe_col_req && y >= q_probe_col_y0 &&
+				  y < q_probe_col_y0 + QPROBE_COL) && xe - x >= 8)
 			{
 				k4 = (xe - x) & ~3;
 
@@ -4208,7 +4286,7 @@ U0 QDrawSpan(CQCanvas *c, I64 y, I64 x1, I64 x2,
 						if (x == q_probe_x)
 						{
 							q_probe_own    = izi;
-							q_probe_ent    = q_draw_ent;
+							q_probe_pty    = ty;
 							q_probe_argb   = argb & 0x00FFFFFF;
 							q_probe_cached = TRUE;
 							if (surf_raw)
@@ -4284,7 +4362,7 @@ U0 QDrawSpan(CQCanvas *c, I64 y, I64 x1, I64 x2,
 						if (x == q_probe_x)
 						{
 							q_probe_own = izi;
-							q_probe_ent = q_draw_ent;
+							q_probe_pty = ty;
 						}
 					}
 				}
@@ -4465,7 +4543,7 @@ U0 QDrawSpan(CQCanvas *c, I64 y, I64 x1, I64 x2,
 			if (x == q_probe_x)
 			{
 				q_probe_own = izi;
-				q_probe_ent = q_draw_ent;
+				q_probe_pty = ty;
 				pend_raw    = texel;
 				pend_cmap   = row[x];
 			}
@@ -4506,6 +4584,9 @@ qds_block_end:
 		{
 			q_probe_iz    = izi;
 			q_probe_hit   = TRUE;
+			//latched with the rest of the description. set per pixel it was
+			//overwritten by every later span, so it always read -1
+			q_probe_ent   = q_draw_ent;
 			q_probe_sky   = FALSE;
 			q_probe_texel = row[q_probe_x];
 			q_probe_mip   = mip;
@@ -4538,6 +4619,42 @@ qds_block_end:
 			q_probe_rgb   = ToBool(crow != NULL &&
 								(crow[q_probe_x] & QRGB_SET) != 0);
 			QStrCopy(q_probe_tex, tex->name, 16);
+		}
+	}
+
+	//COLUMN PROBE, same ownership rule, one entry per row
+	if (q_probe_col_req && y >= q_probe_col_y0 &&
+		y < q_probe_col_y0 + QPROBE_COL &&
+		q_probe_x >= x1 && q_probe_x < x2)
+	{
+		izi = c->depth[y * c->width + q_probe_x];
+
+		if (izi > 0 && izi == q_probe_own)
+		{
+			k = y - q_probe_col_y0;
+
+			QStrCopy(&q_probe_col_tex[k * 16], tex->name, 16);
+			q_probe_col_own[k]  = izi;
+			q_probe_col_ty[k]   = q_probe_pty;
+			q_probe_col_mip[k]  = mip;
+			q_probe_col_off[k]  = q_face_pend_off;
+			q_probe_col_ptr[k]  = surf_rgb;
+
+			if (rgbonly)
+			{
+				q_probe_col_argb[k] = q_probe_argb;
+				q_probe_col_raw[k]  = q_probe_rawrgb;
+			}
+			else if (crow)
+			{
+				q_probe_col_argb[k] = crow[q_probe_x] & 0x00FFFFFF;
+				q_probe_col_raw[k]  = 0;
+			}
+			else
+			{
+				q_probe_col_argb[k] = 0;
+				q_probe_col_raw[k]  = 0;
+			}
 		}
 	}
 
@@ -4574,6 +4691,8 @@ U0 QDrawPolygon(CQCanvas *c, CQScreenVert *v, I64 count,
 	F64	 dx1, dy1, di1;
 	F64	 dx2, dy2, di2;
 	F64	 det, d, gx, gy;
+	F64	 xls, xrs, pw, fl, fr;
+	F64	 izc, sozc, tozc;
 	I64	 best;
 	I64	 zlift_poly;
 	I64	 i;
@@ -4724,7 +4843,38 @@ U0 QDrawPolygon(CQCanvas *c, CQScreenVert *v, I64 count,
 
 		if (found && xr > xl)
 		{
-			QDrawSpan(c, y, ToI64(Ceil(xl)), ToI64(Ceil(xr)),
+			//SUB-PIXEL CORRECTION. the interpolants are evaluated at the
+			//fractional edge xl, and the span starts at Ceil(xl). handing the
+			//edge value over as the value at the first pixel carries up to one
+			//whole d_iz of depth error, and two surfaces whose edges land at
+			//different fractional offsets get different errors. that is enough
+			//to flip the depth test row by row where they are near coplanar -
+			//a sign on a wall separated by 0.06% fights and bands.
+			//
+			//exact for a linear interpolant: re-evaluate at the integer pixel
+			xls = Ceil(xl);
+			xrs = Ceil(xr);
+			pw  = xr - xl;
+
+			if (pw > 0.0)
+			{
+				fl = (xls - xl) / pw;
+				fr = (xrs - xl) / pw;
+
+				izc  = izl  + (izr  - izl)  * fl;
+				sozc = sozl + (sozr - sozl) * fl;
+				tozc = tozl + (tozr - tozl) * fl;
+
+				izr  = izl  + (izr  - izl)  * fr;
+				sozr = sozl + (sozr - sozl) * fr;
+				tozr = tozl + (tozr - tozl) * fr;
+
+				izl  = izc;
+				sozl = sozc;
+				tozl = tozc;
+			}
+
+			QDrawSpan(c, y, ToI64(xls), ToI64(xrs),
 				izl, sozl, tozl, izr, sozr, tozr,
 				tex, lightmap, lm_w, lm_h, mins_s, mins_t, flat_light, mip,
 				surf, sw, sh, surf_rgb, dlmap, surf_raw, zlift_poly);
@@ -6440,6 +6590,9 @@ U0 QDrawFace(CQCanvas *c, CQMap *map, I64 face_index, F64 *offset = NULL,
 	I64			 mip;
 	F64			 near_z;
 	F64			 ratio;
+	F64			 view_d;
+	F64			 cosv;
+	CQPlane		*fpl;
 	F64		   shifted[3];
 	F64		   cull_d[3];
 
@@ -6568,7 +6721,9 @@ U0 QDrawFace(CQCanvas *c, CQMap *map, I64 face_index, F64 *offset = NULL,
 			cull_d[2] += offset[2];
 		}
 
-		near_z = QVecLength(cull_d) - f->radius;
+		view_d = QVecLength(cull_d);
+
+		near_z = view_d - f->radius;
 		if (near_z < QNEAR_CLIP)
 			near_z = QNEAR_CLIP;
 
@@ -6579,6 +6734,31 @@ U0 QDrawFace(CQCanvas *c, CQMap *map, I64 face_index, F64 *offset = NULL,
 			return;
 
 		ratio = near_z / c->x_scale;
+
+		//FORESHORTENING. distance alone gave a face seen at a grazing angle the
+		//same level as one seen square on, and its texels compress along the
+		//foreshortened axis until the span steps several texel ROWS per pixel.
+		//point sampling that is what banded a sign into stripes.
+		//
+		//D_MipLevelForScale takes the scale off the projected texture axes; for
+		//a planar face the cosine between the view vector and the plane normal
+		//is the same term. floored so a face at the grazing limit cannot demand
+		//an unbounded level
+		if (q_mip_aniso && view_d > 0.0)
+		{
+			fpl  = &map->planes[f->plane_num];
+			cosv = (cull_d[0] * fpl->normal[0] +
+					cull_d[1] * fpl->normal[1] +
+					cull_d[2] * fpl->normal[2]) / view_d;
+
+			if (cosv < 0.0)
+				cosv = -cosv;
+			if (cosv < QMIP_MIN_COS)
+				cosv = QMIP_MIN_COS;
+
+			ratio = ratio / cosv;
+		}
+
 		mip   = QMipForRatio(ratio, QSurfCacheMipFor(map, face_index));
 
 		//D_CacheSurface. turb warps every frame and sky is drawn by direction,
