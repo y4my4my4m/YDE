@@ -20,7 +20,10 @@ the same structure as the Quake and HL1 ports.
    sums, frame counts, town assembly). `D1TestAudio;` checks the playback
    path - voice allocation, pool oversubscription, music track switching,
    and buffer stability while a voice is reading. It is audible and takes
-   about 20 seconds.
+   about 20 seconds. `D1TestNet;` checks the net layer on one machine
+   (transport, packet codec, turn ring, character pack, RNG window);
+   `D1TestLockstep;` is the two-peer determinism proof - it runs the same
+   world as both machines and compares field by field every turn.
 
 Controls: left-click walks / attacks / picks up / opens / talks;
 right-click casts the selected spell; `i` inventory, `c` character,
@@ -217,6 +220,11 @@ pinned, frames eyeballed as PNG) and in-VM by D1Test.
   town spells (Identify, town-cast utility) are outside the roster.
 - Missiles draw over walls.
 - Nova's book level is the Hellfire row's 14. Retail's is -1, staff only.
+- Durability wear, inventory placement, store stock and towner gossip roll
+  on a per-machine RNG stream, never the shared one: they read state no
+  other peer holds.
+- Missiles and spells do not run in a session; ranged monsters close to
+  melee (D1MonIsRanged).
 - Town stores reseed from a town-visit counter, not GetTickCount: a wall
   clock cannot agree across lockstep peers. The RNG stream is restored
   afterwards, where retail leaves it pinned.
@@ -241,16 +249,20 @@ pinned, frames eyeballed as PNG) and in-VM by D1Test.
 - L3ANVIL places on level 10; Anvil of Fury ground item drops there.
   Griswold turn-in (reward weapon) is not wired yet.
 - Music plays one pass and stops.
-- Multiplayer: lockstep transport and peer sim are in tree
-  (`D1Net.ZC`, `D1Peer*` in `D1Play.ZC`); Host/Join menu and character-
-  pack hooks are not wired yet. Prove determinism with
-  `D1TestLockstep;`. LAN entry is `ExeFile("::/Apps/Diablo1/RunNet");`.
+- Multiplayer: peer-to-peer lockstep over UDP. Main-menu Host/Join with
+  typed addresses, character select reused from single player, the
+  D1Save version 6 image shipped as the join pack in eight fragments,
+  and seed exchange so both peers regenerate identical dungeons.
+  Determinism is proved by `D1TestLockstep;`, which runs the same world
+  as both machines and compares field by field every turn. LAN entry is
+  `ExeFile("::/Apps/Diablo1/RunNet");` - not `Run`; the UDP binding is
+  compile-time.
 
 ## Roadmap
 
 remaining gaps: set levels, books and scrolls, rings and amulets, shrines
-and traps, talking quest monsters, unique-monster packs, multiplayer
-Host/Join UI and character-pack wire-up.
+and traps, talking quest monsters, unique-monster packs, missiles and
+spells in a session.
 
 ## License
 
