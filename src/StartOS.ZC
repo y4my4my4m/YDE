@@ -11,54 +11,642 @@ Option(0,0); //(0,0)=EchoOff	 (0,1)=EchoOn
 #include "/Kernel/KernelC.HH"
 #include "/Compiler/CompilerB.HH"
 
-U0 YDEEarlySplash()
-{//Direct-framebuffer splash painted BEFORE the System compile: no Gr, no
-//tasks - just the kernel font and the truecolor LFB. Boot text is echo-off,
-//so this mostly survives until the Window Manager takes over the screen.
-//sys_framebuffer_pidth is not set this early; derive it from pitch/bpp.
-	I64	 w = text.cols * FONT_WIDTH, h = text.rows * FONT_HEIGHT;
-	I64	 x, y, r, g, b, i, gx0, gy0, px, py, sc = 12;
-	I64	 pidth = sys_framebuffer_pitch / (sys_framebuffer_bpp / 8);
-	U64	 bits;
-	U32 *row;
-	U8	*name = "YDE";
+/* ---------------- boot wireframe ---------------- */
 
-	if (!text.fb_alias || sys_framebuffer_bpp != 32)
-		return;
-	for (y = 0; y < h; y++)
-	{//Vertical gradient, navy -> violet.
-		r = 10 + 34 * y / h;
-		g = 8  + 10 * y / h;
-		b = 34 + 82 * y / h;
-		row = text.fb_alias + y * pidth;
-		for (x = 0; x < w; x++)
-			row[x] = r << 16 | g << 8 | b;
-	}
-	gx0 = (w - 3 * FONT_WIDTH * sc) / 2;
-	gy0 = (h - FONT_HEIGHT * sc) / 2 - 16;
-	for (i = 0; name[i]; i++)
+//Demo-style boot logo: a Z built as an extruded wireframe solid that unwinds
+//stroke by stroke into the YDE logotype, holds, then rolls back, looping for as
+//long as the splash is up. The spin runs only while a morph is in flight, so
+//both forms are held face on and legible. Chromatic
+//aberration is done the way ::/DE/Demo.ZC does it - the whole model is drawn
+//once per channel at three slightly different focal lengths, so the split
+//grows with distance from the centre on its own. An accumulation buffer decays
+//3/4 per step instead of clearing, which is what leaves the phosphor trails.
+//
+//Everything lives here, before the System compile, because the pre-Gr animator
+//and the WinMgr overlay must produce identical pixels. StartOS.ZC compiles
+//first, so both call these functions rather than carrying copies that drift:
+//one animation, from the first frame after the kernel to the desktop, handed
+//between two paint paths without a seam.
+//
+//Render target is always a raw U32 buffer, which is the LFB in one case and a
+//CDC body in the other.
+
+#define YW_SEGS			16
+#define YW_LW			640		//logo layer, model px
+#define YW_LH			320
+#define YW_FOCAL		760.0	//perspective focal length, model px
+#define YW_DIST			700.0	//camera distance, model px
+#define YW_CA			0.014	//focal spread per channel, fraction
+#define YW_WIDE			5.0		//stroke half-width, in the letter plane
+#define YW_DEEP			34.0	//stroke half-depth: this is what makes it a solid
+#define YW_MORPH_DUR	1.2		//per-stroke morph length
+#define YW_MORPH_STAG	0.05	//per-stroke delay, so the form unwinds in order
+#define YW_SPAN			(YW_MORPH_DUR + YW_SEGS * YW_MORPH_STAG)
+#define YW_HOLD_MIN		2.2		//shortest hold between flips, seconds
+#define YW_HOLD_RAND	4200	//extra hold, mS, uniform
+#define YW_SPIN			0.55	//idle spin about Y, rad/s
+#define YW_SPIN_BOOST	0.40	//extra while a flip is in flight
+#define YW_STEP_HZ		30.0	//accumulation buffer update rate
+//Half-extents of the region the wireframe can ever touch, measured over every
+//rotation and morph state: |x| <= 325, |y| <= 199 at YW_FOCAL/YW_DIST. Drawing
+//is clipped to this box, so fade and compose only ever walk it - the rest of
+//the screen is static gradient and never needs a per-pixel pass.
+#define YW_BOX_W		352
+#define YW_BOX_H		224
+#define YW_HUE_DEFAULT	271		//YKD violet, same as DE/Theme.ZC
+#define YW_CFG			"::/Home/Config/YDE.CFG"
+
+public F64	 yde_wire_t0	= 0.0;				//tS of frame zero
+public I64	 yde_wire_hue	= YW_HUE_DEFAULT;
+public Bool	 yde_wire_stop	= FALSE;			//YDEWireInstall raises this to retire the pre-Gr task
+public Bool	 yde_wire_ready	= FALSE;			//DE/Splash.ZC raises this when the desktop is up
+public U8	*yde_wire_motto = NULL;
+
+//x0,y0,z0,x1,y1,z1 per stroke.
+F64 yw_form_z[YW_SEGS * 6];
+F64 yw_form_yde[YW_SEGS * 6];
+
+U32	*yw_bg	 = NULL;	//static gradient + caption
+U32	*yw_fx	 = NULL;	//accumulation buffer, decays per step
+U32	*yw_out	 = NULL;	//bg + fx, composed once per step; blit is a straight copy
+I64	 yw_bx0	 = 0;		//draw box, screen pixels
+I64	 yw_by0	 = 0;
+I64	 yw_bx1	 = 0;
+I64	 yw_by1	 = 0;
+Bool yw_hint = FALSE;	//"press any key" drawn into yw_out
+I64	 yw_w	 = 0;
+I64	 yw_h	 = 0;
+F64	 yw_last = -1.0;	//t of the last accumulation step
+F64	 yw_ay	 = 0.0;		//spin about Y, integrated
+F64	 yw_flip = -100.0;	//t the current flip started
+F64	 yw_next = 0.0;		//t of the next flip
+//Boot state is "arrived at the Z": from = 1 makes YWStrokeU return 1 - prog,
+//and prog has long since saturated, so every stroke sits at 0 = Z.
+I64	 yw_from = 1;		//form being left, 0 = Z, 1 = logotype
+I64	 yw_to	 = 0;		//form being entered
+
+public I64 YWHsv(I64 hue, I64 s, I64 v)
+{//HSV to a packed 0xRRGGBB. hue 0..359, s/v 0..255. Integer math only.
+	I64 r, g, b, i, f, p, q, t;
+
+	hue = ClampI64(hue, 0, 359);
+	i = hue / 60;
+	f = hue % 60;
+	p = v * (255 - s) / 255;
+	q = v * (255 * 60 - s * f) / (255 * 60);
+	t = v * (255 * 60 - s * (60 - f)) / (255 * 60);
+	switch (i)
 	{
-		bits = text.font[name[i]];
+		case 0:	 r = v; g = t; b = p; break;
+		case 1:	 r = q; g = v; b = p; break;
+		case 2:	 r = p; g = v; b = t; break;
+		case 3:	 r = p; g = q; b = v; break;
+		case 4:	 r = t; g = p; b = v; break;
+		default: r = v; g = p; b = q; break;
+	}
+
+	return (r & 0xFF) << 16 | (g & 0xFF) << 8 | b & 0xFF;
+}
+
+U0 YWSeg(F64 *f, I64 i, F64 x0, F64 y0, F64 z0, F64 x1, F64 y1, F64 z1)
+{
+	f[i * 6]	 = x0;
+	f[i * 6 + 1] = y0;
+	f[i * 6 + 2] = z0;
+	f[i * 6 + 3] = x1;
+	f[i * 6 + 4] = y1;
+	f[i * 6 + 5] = z1;
+}
+
+U0 YWFormsBuild()
+{//Both forms, 16 strokes each. Stroke i of the Z becomes stroke i of the
+//logotype, so the order here is the order of the morph. Both are flat in z -
+//the depth comes from the extrusion in YWBeam, so the whole logo is one solid
+//rather than three letters on three planes.
+	F64	 x0 = -104, x1 = 104, yt = -122, yb = 122, a, b;
+	I64	 i, n = 0;
+
+	//--- ZealOS Z: top bar (4), diagonal (8), bottom bar (4). The diagonal takes
+	//half the budget because it carries the eye across the whole glyph.
+	for (i = 0; i < 4; i++)
+	{
+		a = i / 4.0;
+		b = (i + 1) / 4.0;
+		YWSeg(yw_form_z, n++, x0 + (x1 - x0) * a, yt, 0, x0 + (x1 - x0) * b, yt, 0);
+	}
+	for (i = 0; i < 8; i++)
+	{
+		a = i / 8.0;
+		b = (i + 1) / 8.0;
+		YWSeg(yw_form_z, n++, x1 + (x0 - x1) * a, yt + (yb - yt) * a, 0,
+							  x1 + (x0 - x1) * b, yt + (yb - yt) * b, 0);
+	}
+	for (i = 0; i < 4; i++)
+	{
+		a = i / 4.0;
+		b = (i + 1) / 4.0;
+		YWSeg(yw_form_z, n++, x0 + (x1 - x0) * a, yb, 0, x0 + (x1 - x0) * b, yb, 0);
+	}
+
+	//--- YDE.
+	n = 0;
+	//Y. Down both diagonals, then the stem.
+	YWSeg(yw_form_yde, n++, -247, -100, 0, -216,  -50, 0);
+	YWSeg(yw_form_yde, n++, -216,  -50, 0, -184,    0, 0);
+	YWSeg(yw_form_yde, n++, -121, -100, 0, -152,  -50, 0);
+	YWSeg(yw_form_yde, n++, -152,  -50, 0, -184,    0, 0);
+	YWSeg(yw_form_yde, n++, -184,    0, 0, -184,  100, 0);
+	//D. Stem, top bar, bowl in three, bottom bar.
+	YWSeg(yw_form_yde, n++,  -60, -100, 0,  -60,  100, 0);
+	YWSeg(yw_form_yde, n++,  -60, -100, 0,   21, -100, 0);
+	YWSeg(yw_form_yde, n++,   21, -100, 0,   63,  -42, 0);
+	YWSeg(yw_form_yde, n++,   63,  -42, 0,   63,   42, 0);
+	YWSeg(yw_form_yde, n++,   63,   42, 0,   21,  100, 0);
+	YWSeg(yw_form_yde, n++,   21,  100, 0,  -60,  100, 0);
+	//E. Stem in two, three bars; the middle one is short.
+	YWSeg(yw_form_yde, n++,  129, -100, 0,  129,    0, 0);
+	YWSeg(yw_form_yde, n++,  129,    0, 0,  129,  100, 0);
+	YWSeg(yw_form_yde, n++,  129, -100, 0,  244, -100, 0);
+	YWSeg(yw_form_yde, n++,  129,    0, 0,  219,    0, 0);
+	YWSeg(yw_form_yde, n++,  129,  100, 0,  244,  100, 0);
+}
+
+F64 YWEase(F64 u)
+{//Smoothstep. Both ends are flat, so a stroke leaves and arrives without a
+//corner in its velocity.
+	if (u <= 0.0)
+		return 0.0;
+	if (u >= 1.0)
+		return 1.0;
+
+	return u * u * (3.0 - 2.0 * u);
+}
+
+U0 YWAdd(I64 x, I64 y, I64 r, I64 g, I64 b)
+{//Saturating additive blend of one pixel of the accumulation buffer.
+	U32	*p;
+	I64	 c, nr, ng, nb;
+
+	if (x < yw_bx0 || y < yw_by0 || x > yw_bx1 || y > yw_by1)
+		return;		//box, not buffer: fade and compose only walk the box
+	p  = yw_fx + y * yw_w + x;
+	c  = *p;
+	nr = (c >> 16 & 0xFF) + r;
+	ng = (c >> 8 & 0xFF) + g;
+	nb = (c & 0xFF) + b;
+	if (nr > 255)
+		nr = 255;
+	if (ng > 255)
+		ng = 255;
+	if (nb > 255)
+		nb = 255;
+	*p = (nr << 16) + (ng << 8) + nb;	//parenthesised: << binds looser than +
+}
+
+U0 YWLine(I64 x1, I64 y1, I64 x2, I64 y2, I64 r, I64 g, I64 b)
+{//Additive Bresenham. Bails on absurd spans, so a vertex that swings behind the
+//camera cannot turn into a million-pixel scanline.
+	I64 dx = AbsI64(x2 - x1), dy = AbsI64(y2 - y1), sx = -1, sy = -1, err, e2;
+
+	if (dx > 4 * yw_w || dy > 4 * yw_h)
+		return;
+	if (x1 < x2)
+		sx = 1;
+	if (y1 < y2)
+		sy = 1;
+	err = dx - dy;
+	while (TRUE)
+	{
+		YWAdd(x1, y1, r, g, b);
+		if (x1 == x2 && y1 == y2)
+			break;
+		e2 = 2 * err;
+		if (e2 > -dy)
+		{
+			err -= dy;
+			x1  += sx;
+		}
+		if (e2 < dx)
+		{
+			err += dx;
+			y1  += sy;
+		}
+	}
+}
+
+U0 YWFade()
+{//Phosphor decay: fx *= 3/4 via two masked shifts, no divide, no clear. This
+//is the whole trail effect. Box only - nothing outside it is ever written.
+	I64	 x, y;
+	U32	 c, *row;
+
+	for (y = yw_by0; y <= yw_by1; y++)
+	{
+		row = yw_fx + y * yw_w;
+		for (x = yw_bx0; x <= yw_bx1; x++)
+		{
+			c = row[x];
+			if (c)
+				row[x] = (c >> 1 & 0x7F7F7F) + (c >> 2 & 0x3F3F3F);
+		}
+	}
+}
+
+U0 YWCompose()
+{//out = bg + fx, saturating, over the box. Outside it out already holds bg and
+//never changes, so the per-frame blit is a straight copy.
+	I64	 x, y, c, f, r, g, b;
+	U32	*sr, *ar, *dr;
+
+	for (y = yw_by0; y <= yw_by1; y++)
+	{
+		sr = yw_bg + y * yw_w;
+		ar = yw_fx + y * yw_w;
+		dr = yw_out + y * yw_w;
+		for (x = yw_bx0; x <= yw_bx1; x++)
+		{
+			f = ar[x];
+			if (!f)
+				dr[x] = sr[x];
+			else
+			{
+				c = sr[x];
+				r = (c >> 16 & 0xFF) + (f >> 16 & 0xFF);
+				g = (c >> 8 & 0xFF) + (f >> 8 & 0xFF);
+				b = (c & 0xFF) + (f & 0xFF);
+				if (r > 255) r = 255;
+				if (g > 255) g = 255;
+				if (b > 255) b = 255;
+				dr[x] = (r << 16) + (g << 8) + b;
+			}
+		}
+	}
+}
+
+/* ---------------- 3D ---------------- */
+
+//Rotated model verts of the current frame's beams, then projected per channel.
+//File scope, not stack: 16 strokes x 8 corners x three passes is a lot to keep
+//re-deriving, and ZealC tasks do not have room to spare.
+#define YW_VERTS	(YW_SEGS * 8)
+F64 yw_vx[YW_VERTS], yw_vy[YW_VERTS], yw_vz[YW_VERTS];
+I64 yw_px[YW_VERTS], yw_py[YW_VERTS];
+I64 yw_nv = 0;
+
+U0 YWVert(F64 x, F64 y, F64 z, F64 sa, F64 ca, F64 sb, F64 cb, F64 sc, F64 cc)
+{//Rotate about X, then Y, then Z, and stash. Same order as YDRotate() in
+//::/DE/Demo.ZC.
+	F64 x1, y1, z1;
+
+	y1 = y * ca - z * sa;
+	z1 = y * sa + z * ca;
+	x1 = x * cb + z1 * sb;
+	z1 = z1 * cb - x * sb;
+	yw_vx[yw_nv] = x1 * cc - y1 * sc;
+	yw_vy[yw_nv] = x1 * sc + y1 * cc;
+	yw_vz[yw_nv] = z1;
+	yw_nv++;
+}
+
+F64 YWStrokeU(I64 i, F64 t)
+{//0 = Z, 1 = logotype, for one stroke. The strokes are staggered in the
+//direction of travel, so a flip unwinds from the end it is heading for rather
+//than replaying the outbound wipe backwards.
+	I64	 idx = i;
+	F64	 prog;
+
+	if (!yw_to)
+		idx = YW_SEGS - 1 - i;
+	prog = YWEase((t - yw_flip - idx * YW_MORPH_STAG) / YW_MORPH_DUR);
+	if (yw_from)
+		return 1.0 - prog;
+
+	return prog;
+}
+
+F64 YWMorphAct(F64 t)
+{//How much of a flip is in flight, 0..1.
+	F64 tau = t - yw_flip;
+
+	if (tau < 0.0 || tau > YW_SPAN)
+		return 0.0;
+
+	return Sin(3.14159265 * tau / YW_SPAN);
+}
+
+U0 YWFlipMaybe(F64 t)
+{//Flip between the two forms at random intervals rather than on a fixed cycle,
+//so the splash never looks like a loop even when boot takes a while.
+	if (t < yw_next)
+		return;
+	yw_from = yw_to;
+	yw_to	= !yw_to;
+	yw_flip = t;
+	yw_next = t + YW_SPAN + YW_HOLD_MIN + ToF64(RandU16 % YW_HOLD_RAND) / 1000.0;
+}
+
+U0 YWBuildVerts(F64 t, F64 ax, F64 ay, F64 az)
+{//Interpolate the two forms, extrude each stroke into a box, rotate every
+//corner. The box is thin across the stroke and deep in z, which is what reads
+//as extruded lettering rather than a ribbon.
+	F64	 sa = Sin(ax), ca = Cos(ax), sb = Sin(ay), cb = Cos(ay);
+	F64	 sc = Sin(az), cc = Cos(az);
+	F64	 s[6], u, dx, dy, len, px, py;
+	I64	 i, k;
+
+	yw_nv = 0;
+	for (i = 0; i < YW_SEGS; i++)
+	{
+		u = YWStrokeU(i, t);
+		for (k = 0; k < 6; k++)
+			s[k] = yw_form_z[i * 6 + k] +
+				   (yw_form_yde[i * 6 + k] - yw_form_z[i * 6 + k]) * u;
+		dx  = s[3] - s[0];
+		dy  = s[4] - s[1];
+		len = Sqrt(dx * dx + dy * dy);
+		if (len < 0.001)
+			len = 1.0;
+		px = -dy / len * YW_WIDE;
+		py =  dx / len * YW_WIDE;
+		//Corner order 0..3 walks the cross-section, so consecutive indices are
+		//adjacent edges and the rung ring below is just a loop.
+		YWVert(s[0] + px, s[1] + py, s[2] + YW_DEEP, sa, ca, sb, cb, sc, cc);
+		YWVert(s[0] - px, s[1] - py, s[2] + YW_DEEP, sa, ca, sb, cb, sc, cc);
+		YWVert(s[0] - px, s[1] - py, s[2] - YW_DEEP, sa, ca, sb, cb, sc, cc);
+		YWVert(s[0] + px, s[1] + py, s[2] - YW_DEEP, sa, ca, sb, cb, sc, cc);
+		YWVert(s[3] + px, s[4] + py, s[5] + YW_DEEP, sa, ca, sb, cb, sc, cc);
+		YWVert(s[3] - px, s[4] - py, s[5] + YW_DEEP, sa, ca, sb, cb, sc, cc);
+		YWVert(s[3] - px, s[4] - py, s[5] - YW_DEEP, sa, ca, sb, cb, sc, cc);
+		YWVert(s[3] + px, s[4] + py, s[5] - YW_DEEP, sa, ca, sb, cb, sc, cc);
+	}
+}
+
+U0 YWDrawChan(I64 cx, I64 cy, F64 focal, I64 r, I64 g, I64 b)
+{//Project every corner at one focal length and stroke the box edges into one
+//colour channel. Called three times per frame at slightly different focals -
+//that difference IS the chromatic aberration, and it grows toward the edge of
+//the frame for free.
+	I64	 i, k, base;
+	F64	 z;
+
+	for (i = 0; i < yw_nv; i++)
+	{
+		z = yw_vz[i] + YW_DIST;
+		if (z < 1.0)
+			z = 1.0;
+		yw_px[i] = cx + ToI64(yw_vx[i] * focal / z);
+		yw_py[i] = cy + ToI64(yw_vy[i] * focal / z);
+	}
+	for (i = 0; i < YW_SEGS; i++)
+	{
+		base = i * 8;
+		for (k = 0; k < 4; k++)
+		{//Four rails a->b, then the rung ring at each end.
+			YWLine(yw_px[base + k], yw_py[base + k],
+				   yw_px[base + 4 + k], yw_py[base + 4 + k], r, g, b);
+			YWLine(yw_px[base + k], yw_py[base + k],
+				   yw_px[base + ((k + 1) & 3)], yw_py[base + ((k + 1) & 3)],
+				   r * 5 / 8, g * 5 / 8, b * 5 / 8);
+			YWLine(yw_px[base + 4 + k], yw_py[base + 4 + k],
+				   yw_px[base + 4 + ((k + 1) & 3)], yw_py[base + 4 + ((k + 1) & 3)],
+				   r * 5 / 8, g * 5 / 8, b * 5 / 8);
+		}
+	}
+}
+
+/* ---------------- caption ---------------- */
+
+U0 YWTextTo(U32 *dst, I64 pitch, I64 x, I64 y, U8 *st, I64 col)
+{//Kernel font, one bit per pixel, no scaling, written solid. GrPrint does not
+//exist this early and both paint paths need the same glyphs.
+	I64 i, px, py, sx;
+	U64 bits;
+
+	for (i = 0; st[i]; i++)
+	{
+		bits = text.font[st[i]];
+		sx	 = x + i * FONT_WIDTH;
 		for (py = 0; py < FONT_HEIGHT; py++)
 			for (px = 0; px < FONT_WIDTH; px++)
 				if (bits >> (py * 8 + px) & 1)
-					for (y = 0; y < sc; y++)
-					{
-						row = text.fb_alias + (gy0 + py * sc + y) * pidth;
-						for (x = 0; x < sc; x++)
-							row[gx0 + (i * FONT_WIDTH + px) * sc + x] = 0xC88FFF;
-					}
+					if (0 <= sx + px < yw_w && 0 <= y + py < yw_h)
+						dst[(y + py) * pitch + sx + px] = col;
 	}
-	MemCopy(text.raw_screen, text.fb_alias, text.buffer_size);
 }
 
-YDEEarlySplash;
+U0 YWCaption(U32 *dst, I64 pitch)
+{//Version, quote and the exit hint, under the logo. Static: it goes into the
+//gradient, not the accumulation buffer, so the decay never touches it.
+	I64 ty = yw_h / 2 - 34 + YW_LH / 2 + 26, c;
 
-//Keep the System compile quiet so its paren/dup-type warnings do not flood
-//over the boot splash. (Stock ZealOS turns these ON here for dev visibility;
-//errors still print. Flip to ON if you are debugging the System build.)
+	if (ty > yw_h - 60)
+		ty = yw_h - 60;
+	if (sys_os_version_str)
+		YWTextTo(dst, pitch, (yw_w - StrLen(sys_os_version_str) * FONT_WIDTH) / 2,
+				 ty, sys_os_version_str, 0xE8ECF4);
+	c = YWHsv(yde_wire_hue, 80, 200);
+	if (yde_wire_motto)
+		YWTextTo(dst, pitch, (yw_w - StrLen(yde_wire_motto) * FONT_WIDTH) / 2,
+				 ty + 18, yde_wire_motto, c);
+}
+
+U0 YWHintDraw()
+{//Only once the desktop is actually ready behind the splash: offering the key
+//before that would dismiss it onto a half-built screen. Written straight into
+//yw_out, outside the draw box, so nothing overwrites it afterwards.
+	I64 c = YWHsv(yde_wire_hue, 100, 120);
+
+	YWTextTo(yw_out, yw_w, (yw_w - 25 * FONT_WIDTH) / 2, yw_h - 40,
+			 "Press any key to continue", c);
+}
+
+/* ---------------- frame ---------------- */
+
+public U0 YDEWireStep(F64 t)
+{//Advance the accumulation buffer. Rate limited: the WinMgr calls the overlay
+//every frame, but the trails are tuned for YW_STEP_HZ and a faster decay just
+//erases them.
+	F64	 dt, act, ax, ay, az;
+	I64	 col, cr, cg, cb;
+
+	if (!yw_fx)
+		return;
+	if (yw_last < 0.0)
+		yw_last = t - 1.0 / YW_STEP_HZ;
+	dt = t - yw_last;
+	if (dt < 1.0 / YW_STEP_HZ)
+		return;
+	if (dt > 0.25)
+		dt = 0.25;	//a long compile stall must not teleport the spin
+	yw_last = t;
+
+	YWFade;
+	YWFlipMaybe(t);
+
+	//One continuous turn about Y, never corrected toward an angle, with a slow
+	//independent tumble on the other two axes. Nothing here snaps.
+	act = YWMorphAct(t);
+	yw_ay += dt * (YW_SPIN + YW_SPIN_BOOST * act);
+	ax = 0.34 * Sin(t * 0.31);
+	az = 0.14 * Sin(t * 0.23);
+	ay = yw_ay;
+
+	col = YWHsv(yde_wire_hue, 130, 255);
+	cr	= col >> 16 & 0xFF;
+	cg	= col >> 8 & 0xFF;
+	cb	= col & 0xFF;
+	YWBuildVerts(t, ax, ay, az);
+	YWDrawChan(yw_w / 2, yw_h / 2 - 34, YW_FOCAL * (1.0 + YW_CA), cr, 0, 0);
+	YWDrawChan(yw_w / 2, yw_h / 2 - 34, YW_FOCAL, 0, cg, 0);
+	YWDrawChan(yw_w / 2, yw_h / 2 - 34, YW_FOCAL * (1.0 - YW_CA), 0, 0, cb);
+	YWCompose;
+	if (yde_wire_ready && !yw_hint)
+	{
+		YWHintDraw;
+		yw_hint = TRUE;
+	}
+}
+
+public U0 YDEWireBlit(U32 *dst, I64 pitch, I64 w, I64 h)
+{//Straight copy of the composed frame. The WinMgr rebuilds dst every frame, so
+//this runs at frame rate while the composition above runs at YW_STEP_HZ.
+	I64	 y, ww = yw_w, hh = yw_h;
+
+	if (!yw_out)
+		return;
+	if (ww > w)
+		ww = w;
+	if (hh > h)
+		hh = h;
+	for (y = 0; y < hh; y++)
+		MemCopy(dst + y * pitch, yw_out + y * yw_w, ww * sizeof(U32));
+}
+
+U0 YWBgBuild()
+{//Flat vertical gradient, top to bottom. Built once; the logo and the banner
+//live in the accumulation buffer over it.
+	I64	 x, y, c;
+	I64	 top = YWHsv(yde_wire_hue + 12, 215, 22);
+	I64	 bot = YWHsv(yde_wire_hue - 26, 190, 78);
+	I64	 tr = top >> 16 & 0xFF, tg = top >> 8 & 0xFF, tb = top & 0xFF;
+	I64	 br = bot >> 16 & 0xFF, bg = bot >> 8 & 0xFF, bb = bot & 0xFF;
+	U32	*row;
+
+	for (y = 0; y < yw_h; y++)
+	{
+		row = yw_bg + y * yw_w;
+		c	= (tr + (br - tr) * y / yw_h) << 16 |
+			  (tg + (bg - tg) * y / yw_h) << 8 |
+			  (tb + (bb - tb) * y / yw_h);
+		for (x = 0; x < yw_w; x++)
+			row[x] = c;
+	}
+}
+
+I64 YWHueRead()
+{//Accent hue from the saved desktop config, matched at line start. The DE is
+//not compiled yet, so this parses the file DEConfigSave writes.
+	I64	 size, hue = YW_HUE_DEFAULT;
+	U8	*body, *p;
+
+	if (!FileFind(YW_CFG))
+		return hue;
+	body = FileRead(YW_CFG, &size);
+	if (!body)
+		return hue;
+	p = StrFind("hue ", body);
+	while (p)
+	{
+		if (p == body || p[-1] == '\n')
+		{
+			hue = Str2I64(p + 4);
+			p = NULL;
+		}
+		else
+			p = StrFind("hue ", p + 1);
+	}
+	Free(body);
+
+	return ClampI64(hue, 0, 359);
+}
+
+U8 *YWMottoPick()
+{
+	switch (RandU16 % 7)
+	{
+		case 1:	 return "640x480 was a suggestion.";
+		case 2:	 return "16 colors were not enough.";
+		case 3:	 return "No ELFs were harmed.";
+		case 4:	 return "Divine intellect, divine intuition.";
+		case 5:	 return "Ring-0 all the way down.";
+		case 6:	 return "Do you like the command line?";
+		default: return "Charter? What charter.";
+	}
+}
+
+public U0 YDEWireInit()
+{//One-shot: buffers, geometry, colours, banner text.
+	if (yw_bg)
+		return;
+	yw_w = text.cols * FONT_WIDTH;
+	yw_h = text.rows * FONT_HEIGHT;
+	yde_wire_hue   = YWHueRead;
+	yde_wire_motto = YWMottoPick;
+	yw_bg  = SysMAlloc(yw_w * yw_h * sizeof(U32));
+	yw_fx  = SysCAlloc(yw_w * yw_h * sizeof(U32));
+	yw_out = SysMAlloc(yw_w * yw_h * sizeof(U32));
+	yw_bx0 = MaxI64(0, yw_w / 2 - YW_BOX_W);
+	yw_bx1 = MinI64(yw_w - 1, yw_w / 2 + YW_BOX_W);
+	yw_by0 = MaxI64(0, yw_h / 2 - 34 - YW_BOX_H);
+	yw_by1 = MinI64(yw_h - 1, yw_h / 2 - 34 + YW_BOX_H);
+	YWBgBuild;
+	YWCaption(yw_bg, yw_w);
+	MemCopy(yw_out, yw_bg, yw_w * yw_h * sizeof(U32));
+	YWFormsBuild;
+	yw_next = YW_HOLD_MIN + ToF64(RandU16 % YW_HOLD_RAND) / 1000.0;
+}
+
+U0 YDEEarlySplashTask(U8 *)
+{//Animates straight into the linear framebuffer while the System compiles.
+//This is the same YDEWireStep the WinMgr overlay calls, on the same clock and
+//the same buffers, so when YDEWireInstall retires this task the motion carries
+//straight through the change of paint path.
+//sys_framebuffer_pidth is not set this early; derive it from pitch/bpp.
+	I64	 pidth = sys_framebuffer_pitch / (sys_framebuffer_bpp / 8);
+	I64	 y;
+	U32	*buf;
+
+	if (!text.fb_alias || sys_framebuffer_bpp != 32)
+		return;
+	YDEWireInit;
+	buf = SysMAlloc(yw_w * yw_h * sizeof(U32));
+	while (!yde_wire_stop)
+	{
+		YDEWireStep(tS - yde_wire_t0);
+		YDEWireBlit(buf, yw_w, yw_w, yw_h);
+		for (y = 0; y < yw_h; y++)
+			MemCopy(text.fb_alias + y * pidth, buf + y * yw_w, yw_w * sizeof(U32));
+		MemCopy(text.raw_screen, text.fb_alias, text.buffer_size);
+		Sleep(25);
+	}
+	Free(buf);
+}
+
+yde_wire_t0 = tS;
+YDEWireInit;
+Spawn(&YDEEarlySplashTask, NULL, "YDE Boot Splash");
+
+//Keep the boot compiles off the screen so their warnings do not flood over the
+//splash. Silent() drops this task's StdOut, which is what the compiler prints
+//through; the Options alone are not enough, because System/Math/MakeMath.ZC
+//switches them back on mid-compile and several warnings are gated by no option
+//at all. A fault still drops to the debugger. Comment out the Silent lines
+//below when debugging the System build.
+Silent(ON);
 Option(OPTf_WARN_PAREN, OFF);
 Option(OPTf_WARN_DUP_TYPES, OFF);
+Option(OPTf_WARN_UNUSED_VAR, OFF);
+Option(OPTf_WARN_HEADER_MISMATCH, OFF);
 HashTablePurge(sys_task->hash_table);
 
 #include "/System/MakeSystem"
@@ -67,17 +655,75 @@ HashTablePurge(sys_task->hash_table);
 DocTermNew;
 WinVert(2, text.rows / 8);
 
+//Overlay half of the splash. Below the System compile because it touches gr and
+//CDC, neither of which exists above it - the geometry and rasteriser upstream
+//are kernel-only on purpose, so the pre-Gr animator can share them.
+public Bool	 yde_wire_up		= FALSE;	//Overlay visible.
+Bool		 yw_old_ms_show		= TRUE;
+U0			(*yw_old_hook)(CDC *dc)	= NULL;
+
+public U0 YDEWireOverlay(CDC *dc)
+{//gr.fp_final_screen_update: paint over the finished frame with raw row copies,
+//so it covers everything the WinMgr just drew, then chain to whatever hook was
+//already installed.
+	if (yde_wire_up)
+	{
+		YDEWireStep(tS - yde_wire_t0);
+		YDEWireBlit(dc->body, dc->width_internal, dc->width, dc->height);
+	}
+	if (yw_old_hook)
+		(*yw_old_hook)(dc);
+}
+
+public U0 YDEWireInstall()
+{//Installed BEFORE the WinMgr spawns, so its very first composited frame is
+//already the splash. Anything the desktop paints during the DE and Home
+//compiles happens underneath.
+	YDEWireInit;
+	yw_old_hook				  = gr.fp_final_screen_update;
+	yw_old_ms_show			  = mouse.show;
+	mouse.show				  = FALSE;	//DrawMouse gates on this
+	yde_wire_up				  = TRUE;
+	gr.fp_final_screen_update = &YDEWireOverlay;
+	yde_wire_stop			  = TRUE;	//retire the direct-framebuffer animator
+}
+
+public U0 YDEWireRelease()
+{//Take the splash down. ::/DE/Splash.ZC calls this when the user dismisses it.
+	yde_wire_up = FALSE;
+	mouse.show = yw_old_ms_show;
+	gr.fp_final_screen_update = yw_old_hook;
+	yw_old_hook = NULL;
+	Sleep(80);	//let the in-flight frame finish reading the buffers
+	if (yw_bg)
+	{
+		Free(yw_bg);
+		yw_bg = NULL;
+	}
+	if (yw_fx)
+	{
+		Free(yw_fx);
+		yw_fx = NULL;
+	}
+	if (yw_out)
+	{
+		Free(yw_out);
+		yw_out = NULL;
+	}
+}
+
+YDEWireInstall; //Before the WinMgr, so its first frame is already the splash.
 sys_winmgr_task = Spawn(&WinMgrTask, NULL, "Window Manager");
 Fs->win_inhibit = WIG_TASK_DEFAULT - WIF_SELF_BORDER - WIF_SELF_GRAB_SCROLL - WIF_SELF_CTRLS;
 LBts(&Fs->display_flags, DISPLAYf_CHILDREN_NOT_ON_TOP);
 LBts(&Fs->display_flags, DISPLAYf_SHOW);
 
-//YDE splash: installed as a full-screen overlay (gr.fp_final_screen_update)
-//that the WinMgr draws on top of every frame, so Registry/wallpaper/DE/Home
-//compile time and the spawning terminals all run underneath, invisible. The
-//splash's dismiss task watches yde_boot_done (set at the very end of this
-//file), so it stays up until boot has actually finished - no fixed wait, no
-//window fighting - then clears to a ready desktop (or on a key/click).
+//The splash overlay is already up (YDEWireInstall above), so Registry,
+//wallpaper, DE and Home compile time and the spawning terminals all run
+//underneath it, invisible. ::/DE/Splash.ZC only adds the dismiss task, which
+//watches yde_boot_done (set at the very end of this file): the splash stays up
+//until boot has actually finished - no fixed wait, no window fighting - then
+//clears to a ready desktop on a key or a click.
 public Bool yde_boot_done = FALSE;
 //Set by ::/DE/BootTerm.ZC, called by ~/HomeSys.ZC. Declared here because it is
 //the only file both of them compile after. NULL = stock tiling.
@@ -85,10 +731,15 @@ public U0 (*boot_term_fp)(CTask *task) = NULL;
 if (sys_boot_src.u16[0] != BOOT_SRC_RAM)
 {
 	if (FileFind("::/DE/Splash.ZC"))
-		ExeFile("::/DE/Splash"); //defines + runs YDESplashStart, then returns
+		ExeFile("::/DE/Splash"); //spawns the dismiss task, then returns
 	else
+	{//No DE: nothing would ever take the overlay down.
+		YDEWireRelease;
 		PopUp("ExeFile2(\"::/System/ZSplash.ZC\");");
+	}
 }
+else
+	YDEWireRelease; //RAM boot has no splash lifecycle to hand it to.
 
 RegInit;
 LBts(&sys_run_level, RLf_REGISTRY);
@@ -110,5 +761,6 @@ if (FileFind("::/DE/MakeDE.ZC"))
 #include "~/MakeHome"
 
 yde_boot_done = TRUE; //Desktop + terminals are up: the splash may now clear.
+Silent(OFF); //Boot is over: the System task prints normally again.
 
 //After this file, the System task enters $LK,"server mode",A="HI:Job"$.
