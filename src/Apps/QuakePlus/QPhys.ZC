@@ -1,0 +1,434 @@
+// QPhys.ZC - player movement and collision against the clipnode hulls
+//
+// hulls 1 and 2 are the render geometry pre-grown by a player and a monster
+// box, so collision is a POINT trace, not a box sweep - no bounds carried here
+//
+// NOTE: recursion here is DIRECT self-recursion. routing it through a
+// forward-declared helper miscompiles on this compiler
+
+#define QCONTENTS_NODE		0		//not a leaf value; only children are
+
+#define QPHYS_GRAVITY		800.0
+#define QPHYS_MAXSPEED		320.0
+#define QPHYS_ACCEL			10.0
+#define QPHYS_AIRACCEL		0.7
+#define QPHYS_FRICTION		4.0
+#define QPHYS_STOPSPEED		100.0
+#define QPHYS_JUMP			270.0
+#define QPHYS_STEPSIZE		18.0
+//SV_FlyMove numbumps - an extra bump slides along one more plane than the
+//original allows and lands the player somewhere else in a tight corner
+#define QPHYS_MAXCLIP		4
+#define QPHYS_EPSILON		0.03125	//1/32, matches the compiler's precision
+#define QPHYS_OVERCLIP		1.0
+
+//player box for sampling liquid depth, must match hull 1's expansion
+#define QPHYS_MINS_Z		-24.0
+#define QPHYS_MAXS_Z		32.0
+#define QPHYS_VIEW_Z		22.0
+
+#define QPHYS_WATERFRICTION	4.0
+#define QPHYS_WATERSPEED	0.7		//swimming is slower than running
+#define QPHYS_WATERSINK		60.0	//drift down when not actively swimming
+
+class CQTrace
+{
+	Bool all_solid;		//the whole sweep was inside solid
+	Bool start_solid;	//the sweep began inside solid
+	F64	 fraction;		//how far along the move it reached, 0..1
+	F64	 end_pos[3];
+	F64	 plane_normal[3];
+	F64	 plane_dist;
+	Bool hit;			//a plane was struck
+	I64	 ent;			//edict struck, -1 for the world
+
+	//what the sweep crossed - visible() rejects a sight line through BOTH
+	Bool in_open;
+	Bool in_water;
+};
+
+I64 QHullPointContents(CQMap *map, I64 num, F64 *p)
+{//walk the clipnode tree until a negative (contents) child appears
+	CQClipNode	*node;
+	CQPlane		*plane;
+	F64			 d;
+
+	while (num >= 0)
+	{
+		if (num >= map->num_clipnodes)
+			return QCONTENTS_SOLID;
+
+		node  = &map->clipnodes[num];
+		plane = &map->planes[node->plane_num];
+
+		//axial planes are the common case, skip the dot product
+		if (plane->type < 3)
+			d = p[plane->type] - plane->dist;
+		else
+			d = QVecDot(p, plane->normal) - plane->dist;
+
+		if (d < 0.0)
+			num = node->children[1];
+		else
+			num = node->children[0];
+	}
+
+	return num;
+}
+
+Bool QIsZeroF(F64 v)
+{//exactly-zero test written WITHOUT == on an F64
+ //HACK: F64 equality is sign-of-zero sensitive on this compiler and misses
+ //-0.0, which SV_FlyMove's step test depends on matching. relationals are not
+	return ToBool(v <= 0.0 && v >= 0.0);
+}
+
+//hull->firstclipnode - the backup loop must test against the WHOLE hull, not
+//the subtree being recursed. set by the two entry points below
+I64 q_hull_head = 0;
+
+Bool QRecursiveHullCheck(CQMap *map, I64 num, F64 p1f, F64 p2f,
+	F64 *p1, F64 *p2, CQTrace *trace)
+{//sweep a point p1 to p2, FALSE once the move is blocked
+ //direct self-recursion only, see the file header
+	CQClipNode	*node;
+	CQPlane		*plane;
+	F64			 t1;
+	F64			 t2;
+	F64			 frac;
+	F64			 midf;
+	F64			 mid[3];
+	F64			 zero[3];
+	I64			 side;
+	I64			 i;
+
+	//--- leaf ---
+	if (num < 0)
+	{
+		if (num != QCONTENTS_SOLID)
+		{
+			trace->all_solid = FALSE;
+
+			//SV_RecursiveHullCheck records what it crossed as it goes
+			if (num == QCONTENTS_EMPTY)
+				trace->in_open = TRUE;
+			else
+				trace->in_water = TRUE;
+
+			return TRUE;
+		}
+
+		trace->start_solid = TRUE;
+		return TRUE;
+	}
+
+	if (num >= map->num_clipnodes)
+		return FALSE;
+
+	node  = &map->clipnodes[num];
+	plane = &map->planes[node->plane_num];
+
+	if (plane->type < 3)
+	{
+		t1 = p1[plane->type] - plane->dist;
+		t2 = p2[plane->type] - plane->dist;
+	}
+	else
+	{
+		t1 = QVecDot(p1, plane->normal) - plane->dist;
+		t2 = QVecDot(p2, plane->normal) - plane->dist;
+	}
+
+	//wholly on one side, no split
+	if (t1 >= 0.0 && t2 >= 0.0)
+		return QRecursiveHullCheck(map, node->children[0], p1f, p2f, p1, p2,
+			trace);
+	if (t1 < 0.0 && t2 < 0.0)
+		return QRecursiveHullCheck(map, node->children[1], p1f, p2f, p1, p2,
+			trace);
+
+	//--- split: stop short of the plane so the point never lands on it ---
+	if (t1 < 0.0)
+		frac = (t1 + QPHYS_EPSILON) / (t1 - t2);
+	else
+		frac = (t1 - QPHYS_EPSILON) / (t1 - t2);
+
+	if (frac < 0.0)
+		frac = 0.0;
+	if (frac > 1.0)
+		frac = 1.0;
+
+	midf = p1f + (p2f - p1f) * frac;
+	for (i = 0; i < 3; i++)
+		mid[i] = p1[i] + frac * (p2[i] - p1[i]);
+
+	if (t1 < 0.0)
+		side = 1;
+	else
+		side = 0;
+
+	//near side first, if it blocks the far side is unreachable
+	if (!QRecursiveHullCheck(map, node->children[side], p1f, midf, p1, mid,
+			trace))
+		return FALSE;
+
+	//far side open, the move continues into it
+	if (QHullPointContents(map, node->children[side ^ 1], mid) !=
+			QCONTENTS_SOLID)
+		return QRecursiveHullCheck(map, node->children[side ^ 1], midf, p2f,
+			mid, p2, trace);
+
+	//started in solid and never got out, no usable impact
+	if (trace->all_solid)
+		return FALSE;
+
+	//impact - the stored normal always faces back along the move
+	if (side)
+	{
+		//SUBTRACTED FROM ZERO, not multiplied by -1, as VectorSubtract from
+		//vec3_origin does. 0.0 - 0.0 is +0.0, 0.0 * -1.0 is -0.0, and
+		//SV_FlyMove's step test on normal[2] fails against -0.0 - a stair
+		//approached from the back side of its plane then blocks the player
+		QVecSet(zero, 0.0, 0.0, 0.0);
+		QVecSub(zero, plane->normal, trace->plane_normal);
+
+		trace->plane_dist = -plane->dist;
+	}
+	else
+	{
+		QVecCopy(plane->normal, trace->plane_normal);
+		trace->plane_dist = plane->dist;
+	}
+
+	//back out until the impact point is really out of solid - "shouldn't
+	//really happen, but does occasionally". the DIST_EPSILON nudge is off ONE
+	//plane and says nothing about the others bounding the leaf, so an inside
+	//corner still lands in solid and the next move starts all-solid
+	while (QHullPointContents(map, q_hull_head, mid) == QCONTENTS_SOLID)
+	{
+		frac -= 0.1;
+
+		if (frac < 0.0)
+		{
+			//gave up - the original logs "backup past 0" and keeps the
+			//point anyway, there is nothing better to return
+			trace->fraction = midf;
+			QVecCopy(mid, trace->end_pos);
+			trace->hit = TRUE;
+			return FALSE;
+		}
+
+		midf = p1f + (p2f - p1f) * frac;
+		for (i = 0; i < 3; i++)
+			mid[i] = p1[i] + frac * (p2[i] - p1[i]);
+	}
+
+	trace->fraction = midf;
+	QVecCopy(mid, trace->end_pos);
+	trace->hit = TRUE;
+
+	return FALSE;
+}
+
+U0 QTraceMove(CQMap *map, F64 *start, F64 *end, CQTrace *trace)
+{//sweep the player's origin through hull 1
+	I64 head;
+
+	trace->all_solid   = TRUE;
+	trace->start_solid = FALSE;
+	trace->fraction    = 1.0;
+	trace->hit         = FALSE;
+	trace->plane_dist  = 0.0;
+	trace->ent         = -1;
+	QVecSet(trace->plane_normal, 0.0, 0.0, 0.0);
+	QVecCopy(end, trace->end_pos);
+
+	//guarded AFTER init so a rejected map still returns a formed trace
+	if (!QMapValid(map, "QTraceMove"))
+		return;
+
+	head = map->models[0].head_node[1];
+
+	q_hull_head = head;
+	QRecursiveHullCheck(map, head, 0.0, 1.0, start, end, trace);
+}
+
+F64  q_old_origin[3];		//last origin known to be in open space
+I64  q_stuck_reports = 0;	//capped so a stuck frame can't flood the console
+
+Bool QTestPlayerPosition(CQMap *map, F64 *origin)
+{//TRUE when the player box at this origin is embedded in solid
+	CQTrace trace;
+
+	QTraceMove(map, origin, origin, &trace);
+	return trace.all_solid;
+}
+
+U0 QCheckStuck(CQMap *map, F64 *origin)
+{//push the player back out of solid, else being stuck is PERMANENT - the
+ //slide move sees all_solid, zeroes velocity and leaves the origin alone.
+ //recovery order matches the original: last open origin, then outward one
+ //unit at a time and up 18, enough to clear a step, not to cross a wall
+	F64 org[3];
+	I64 i;
+	I64 j;
+	I64 z;
+
+	if (!QTestPlayerPosition(map, origin))
+	{
+		QVecCopy(origin, q_old_origin);
+		return;
+	}
+
+	QVecCopy(origin, org);
+
+	QVecCopy(q_old_origin, origin);
+	if (!QTestPlayerPosition(map, origin))
+		return;
+
+	for (z = 0; z < 18; z++)
+	{
+		for (i = -1; i <= 1; i++)
+		{
+			for (j = -1; j <= 1; j++)
+			{
+				origin[0] = org[0] + ToF64(i);
+				origin[1] = org[1] + ToF64(j);
+				origin[2] = org[2] + ToF64(z);
+
+				if (!QTestPlayerPosition(map, origin))
+					return;
+			}
+		}
+	}
+
+	//nothing open nearby - restore the original spot and say so
+	QVecCopy(org, origin);
+
+	if (q_stuck_reports < 8)
+	{
+		q_stuck_reports++;
+		"QPhys: player stuck at %.0f %.0f %.0f\n", org[0], org[1], org[2];
+	}
+}
+
+U0 QClipVelocity(F64 *v, F64 *normal, F64 overbounce, F64 *out)
+{//kill the component of v heading into the plane, so the move slides
+	F64 backoff = QVecDot(v, normal) * overbounce;
+	I64 i;
+
+	for (i = 0; i < 3; i++)
+	{
+		out[i] = v[i] - normal[i] * backoff;
+
+		//nudge off zero or the player creeps back into the surface
+		if (out[i] > -QPHYS_EPSILON && out[i] < QPHYS_EPSILON)
+			out[i] = 0.0;
+	}
+}
+
+//Quake allows 5 clip planes before giving up on a way out
+
+//return bits from QFlyMove, same meaning as SV_FlyMove's
+
+
+
+
+
+
+
+
+
+I64 QPointContents(CQMap *map, F64 *p)
+{//volume this point is in: empty, solid, water, slime or lava
+ //walks the RENDER node tree - hull 0 is that tree, NOT a clipnode hull, and
+ //feeding head_node[0] to the clipnode walker indexes a different array
+	CQNode	*node;
+	CQPlane	*plane;
+	I64		 num;
+	F64		 d;
+
+	//an unusable map reads as solid - stops movement instead of leaking
+	if (!QMapValid(map, "QPointContents"))
+		return QCONTENTS_SOLID;
+
+	num = map->models[0].head_node[0];
+
+	while (num >= 0)
+	{
+		if (num >= map->num_nodes)
+			return QCONTENTS_SOLID;
+
+		node  = &map->nodes[num];
+		plane = &map->planes[node->plane_num];
+
+		if (plane->type < 3)
+			d = p[plane->type] - plane->dist;
+		else
+			d = QVecDot(p, plane->normal) - plane->dist;
+
+		if (d < 0.0)
+			num = node->children[1];
+		else
+			num = node->children[0];
+	}
+
+	//a negative child is ~(leaf index), the leaf carries the contents
+	num = -1 - num;
+	if (num < 0 || num >= map->num_leafs)
+		return QCONTENTS_SOLID;
+
+	return map->leafs[num].contents;
+}
+
+I64 QWaterLevelGet(CQMap *map, F64 *origin, I64 *_watertype)
+{//liquid depth, 0 dry to 3 fully under
+ //sampled at feet, waist and eyes - what QuakeC keys swimming and drowning on
+	F64 point[3];
+	I64 contents;
+	I64 level = 0;
+
+	if (_watertype)
+		*_watertype = QCONTENTS_EMPTY;
+
+	//feet, just above the bottom of the box
+	QVecCopy(origin, point);
+	point[2] = origin[2] + QPHYS_MINS_Z + 1.0;
+
+	contents = QPointContents(map, point);
+	if (contents > QCONTENTS_SOLID || contents == QCONTENTS_EMPTY)
+	{
+		//empty or solid at the feet, not in liquid
+		if (contents != QCONTENTS_WATER && contents != QCONTENTS_SLIME &&
+			contents != QCONTENTS_LAVA)
+			return 0;
+	}
+
+	if (contents != QCONTENTS_WATER && contents != QCONTENTS_SLIME &&
+		contents != QCONTENTS_LAVA)
+		return 0;
+
+	level = 1;
+	if (_watertype)
+		*_watertype = contents;
+
+	//waist
+	point[2] = origin[2] + (QPHYS_MINS_Z + QPHYS_MAXS_Z) * 0.5;
+	contents = QPointContents(map, point);
+	if (contents == QCONTENTS_WATER || contents == QCONTENTS_SLIME ||
+		contents == QCONTENTS_LAVA)
+	{
+		level = 2;
+
+		//eyes - fully submerged, gates swimming and drowning
+		point[2] = origin[2] + QPHYS_VIEW_Z;
+		contents = QPointContents(map, point);
+		if (contents == QCONTENTS_WATER || contents == QCONTENTS_SLIME ||
+			contents == QCONTENTS_LAVA)
+			level = 3;
+	}
+
+	return level;
+}
+
+

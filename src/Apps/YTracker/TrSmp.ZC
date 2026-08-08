@@ -1,0 +1,554 @@
+//TrSmp.ZC - sample bank: byte readers, PCM allocation, synthetic waveforms,
+//WAV import. Depends on TrDef.
+
+#define TR_WAVE_LEN		256		//Frames in a generated single-cycle wave.
+#define TR_NOISE_LEN	32767	//NES long-mode LFSR period.
+#define TR_WAVE_AMP		20000	//Headroom below 32767 for 4-voice sums.
+
+U32 TrRdU16LE(U8 *p)
+{
+	return p[0] | (p[1] << 8);
+}
+
+U32 TrRdU32LE(U8 *p)
+{//Top byte widened first. Shifting a byte into bit 31 directly is fine in
+//ZealC, where the operand is already I64, but the transpiled sanitiser build
+//sees C's int promotion and reports overflow on every read.
+	I64 hi = p[3];
+
+	return p[0] | (p[1] << 8) | (p[2] << 16) | (hi << 24);
+}
+
+U32 TrRdU16BE(U8 *p)
+{//MOD stores lengths and loop points as big-endian word counts.
+	return (p[0] << 8) | p[1];
+}
+
+Bool TrSampleAlloc(I64 i, I64 len)
+{//len+1 frames: the last is an interpolation guard, filled by TrSampleGuard.
+	if (i < 1 || i >= TR_MAX_SAMPLES || len < 1)
+		return FALSE;
+	TrSampleFree(i);
+	tr_smp[i].data = CAlloc((len + 1) * sizeof(I16));
+	if (!tr_smp[i].data)
+		return FALSE;
+	tr_smp[i].len = len;
+
+	return TRUE;
+}
+
+I64 TrSynthStepMul(I64 wave_len)
+{//A single-cycle wave of wave_len frames sounds at rate/wave_len, but the
+//period table maps a note to a playback RATE. step_mul reconciles the two so
+//note 49 (C-4) sounds at 261.6256 Hz.
+	F64 base_step, want_step;
+
+	base_step = ToF64(TR_STEP_NUM) / (ToF64(TR_REF_PERIOD) * TR_RATE);
+	want_step = 261.6255653 * wave_len / TR_RATE;
+
+	return ToI64(65536.0 * want_step / base_step + 0.5);
+}
+
+I64 TrC5StepMul(I64 c5speed)
+{//S3M and IT tune a sample by its C-5 playback rate instead of a finetune
+//offset. Note 61 is C-5 and sounds at TR_C5_BASE_HZ with step_mul at unity,
+//in both the Amiga and linear models, so the multiplier is just the ratio.
+	if (c5speed < 1)
+		c5speed = 8363;
+
+	return ToI64(65536.0 * c5speed / TR_C5_BASE_HZ + 0.5);
+}
+
+U0 TrSynthFill(I64 slot, I64 shape)
+{//One cycle of shape into slot, looping over its whole length.
+	I64	 i, n = TR_WAVE_LEN, lfsr, bit;
+	F64	 ph, amp = TR_WAVE_AMP;
+	I16	*d;
+
+	if (shape == TRI_NOISE)
+		n = TR_NOISE_LEN;
+	if (!TrSampleAlloc(slot, n))
+		return;
+	d = tr_smp[slot].data;
+	lfsr = 1;
+	for (i = 0; i < n; i++)
+	{
+		ph = ToF64(i) / n;
+		switch (shape)
+		{
+			case TRI_SINE:
+				d[i] = ToI64(amp * Sin(2 * pi * ph));
+				break;
+			case TRI_PULSE1:
+				if (ph < 0.5)
+					d[i] = TR_WAVE_AMP;
+				else
+					d[i] = -TR_WAVE_AMP;
+				break;
+			case TRI_PULSE2:
+				if (ph < 0.25)
+					d[i] = TR_WAVE_AMP;
+				else
+					d[i] = -TR_WAVE_AMP;
+				break;
+			case TRI_TRIANGLE:
+				if (ph < 0.5)
+					d[i] = ToI64(amp * (4.0 * ph - 1.0));
+				else
+					d[i] = ToI64(amp * (3.0 - 4.0 * ph));
+				break;
+			case TRI_SAW:
+				d[i] = ToI64(amp * (1.0 - 2.0 * ph));
+				break;
+			case TRI_NOISE:
+				//15-bit Galois LFSR, taps 0 and 1; one output frame per step.
+				bit = (lfsr ^ (lfsr >> 1)) & 1;
+				lfsr = (lfsr >> 1) | (bit << 14);
+				if (lfsr & 1)
+					d[i] = TR_WAVE_AMP;
+				else
+					d[i] = -TR_WAVE_AMP;
+				break;
+		}
+	}
+	tr_smp[slot].loop_start	= 0;
+	tr_smp[slot].loop_len	= n;
+	tr_smp[slot].loop_type	= TR_LOOP_FWD;
+	tr_smp[slot].volume		= 64;
+	tr_smp[slot].pan		= 128;
+	tr_smp[slot].finetune	= 0;
+	tr_smp[slot].rel_note	= 0;
+	tr_smp[slot].synth		= shape;
+	tr_smp[slot].step_mul	= TrSynthStepMul(n);
+	StrCopy(tr_smp[slot].name, tr_synth_names[shape]);
+	TrSampleGuard(&tr_smp[slot]);
+}
+
+U0 TrPulseFill(I64 slot, I64 high)
+{//One pulse width as a single-cycle wave, high frames of TR_WAVE_LEN spent
+//at the top of the swing.
+	I64	 i, n = TR_WAVE_LEN, pp, hi, lo;
+	I16	*d;
+
+	high = ClampI64(high, 1, n - 1);
+	if (!TrSampleAlloc(slot, n))
+		return;
+	d = tr_smp[slot].data;
+	//The 2A03 pulse output is unipolar and the console blocks DC. Built as a
+	//plain +/- square the 12.5% wave sits at -0.75 full scale and the 75% wave
+	//at +0.5, so a duty macro steps the output by up to 1.25 full scale on
+	//every change, heard as a click. Each wave is zero-mean instead, with the
+	//same peak-to-peak for all four, which is what the DC block leaves: duty
+	//sets timbre, not level. 8/7 puts the widest excursion, the high side of
+	//the 12.5% wave, exactly at TR_WAVE_AMP.
+	pp = TR_WAVE_AMP * 8 / 7;
+	hi = pp * (n - high) / n;
+	lo = -(pp * high / n);
+	for (i = 0; i < n; i++)
+	{
+		if (i < high)
+			d[i] = hi;
+		else
+			d[i] = lo;
+	}
+	tr_smp[slot].loop_start	= 0;
+	tr_smp[slot].loop_len	= n;
+	tr_smp[slot].loop_type	= TR_LOOP_FWD;
+	tr_smp[slot].volume		= 64;
+	tr_smp[slot].global_vol	= 64;
+	tr_smp[slot].pan		= 128;
+	tr_smp[slot].synth		= TRI_PULSE1;
+	tr_smp[slot].step_mul	= TrSynthStepMul(n);
+	StrPrint(tr_smp[slot].name, "Pulse%d", high * 100 / n);
+	TrSampleGuard(&tr_smp[slot]);
+}
+
+U0 TrDutyFill(I64 slot, I64 duty)
+{//One 2A03 pulse width. Duty 0..3 is 12.5, 25, 50, 75 per cent, the order the
+//2A03 numbers them.
+	I64 high = TR_WAVE_LEN / 8;
+
+	if (duty == 1)
+		high = TR_WAVE_LEN / 4;
+	else if (duty == 2)
+		high = TR_WAVE_LEN / 2;
+	else if (duty == 3)
+		high = TR_WAVE_LEN * 3 / 4;
+	TrPulseFill(slot, high);
+}
+
+U0 TrV6DutyFill(I64 slot, I64 duty)
+{//One VRC6 pulse width. The chip has eight, (duty + 1) / 16 of the cycle
+//high, so 6.25 through 50 per cent. Duty 7 is the same shape as the 2A03's
+//50 per cent setting.
+	TrPulseFill(slot, TR_WAVE_LEN * (ClampI64(duty, 0, 7) + 1) / 16);
+}
+
+U0 TrV6SawFill(I64 slot)
+{//VRC6 sawtooth. The accumulator adds the rate seven times per period and the
+//DAC takes the top five bits, so the ramp is seven steps, not a line. That
+//staircase is what the channel sounds like; a smooth ramp does not.
+	I64	 i, n = TR_WAVE_LEN, step, v;
+	I16	*d;
+
+	if (!TrSampleAlloc(slot, n))
+		return;
+	d = tr_smp[slot].data;
+	for (i = 0; i < n; i++)
+	{
+		step = i * 7 / n;			//0..6
+		//Centred on zero: the steps run -3..3 scaled to the wave amplitude.
+		v = (step * 2 - 6) * TR_WAVE_AMP / 6;
+		d[i] = v;
+	}
+	tr_smp[slot].loop_start	= 0;
+	tr_smp[slot].loop_len	= n;
+	tr_smp[slot].loop_type	= TR_LOOP_FWD;
+	tr_smp[slot].volume		= 64;
+	tr_smp[slot].global_vol	= 64;
+	tr_smp[slot].pan		= 128;
+	tr_smp[slot].synth		= TRI_SAW;
+	tr_smp[slot].step_mul	= TrSynthStepMul(n);
+	StrCopy(tr_smp[slot].name, "VRC6Saw");
+	TrSampleGuard(&tr_smp[slot]);
+}
+
+//OPLL frequency multiplier per MULT nibble, doubled so the 0.5 entry stays an
+//integer. Indices 11, 13 and 15 repeat their neighbours; that is the chip.
+I64 tr_fm_mult[16] = {1, 2, 4, 6, 8, 10, 12, 14,
+					  16, 18, 20, 20, 24, 24, 30, 30};
+
+U0 TrFmFillMod(I64 slot, U8 *patch, I64 mod_scale)
+{//Bake one 2-operator OPLL voice into a single-cycle wave. mod_scale is the
+//modulator level, 0..64, against the patch's own total level: 0 is a bare
+//carrier and 64 the patch as written. Sweeping it across a bank of waves is
+//how the modulator envelope is reproduced, since one wave cannot carry it.
+//
+//Patch bytes, modulator first then carrier:
+//    0,1  AM(7) VIB(6) EG(5) KSR(4) MULT(3:0)
+//    2    modulator KSL(7:6), total level(5:0), 0.75 dB per step
+//    3    carrier KSL(7:6), DC(4), DM(3), feedback(2:0)
+//    4,5  attack(7:4) decay(3:0)
+//    6,7  sustain level(7:4) release(3:0)
+//Waveform bit 0 is a sine, 1 a sine with the negative half clipped to zero.
+//
+//The wave spans TWO fundamental periods so a MULT of 0.5 stays periodic, and
+//step_mul is set for one period so the note still sounds where it is written.
+//
+//Envelopes are not baked: attack, decay, sustain and release are dropped and
+//the note plays at the sustain timbre throughout. Tremolo and vibrato are
+//dropped. Feedback is approximated by iterating the modulator twice rather
+//than by running the operator at sample rate.
+	I64	 i, n = TR_WAVE_LEN * 2, mm, mc, tl, fb, dm, dc, pk, v;
+	I64	 ms = ClampI64(mod_scale, 0, 64);
+	F64	 amp, depth, fbamt, ph, mo, co, prev;
+	F64	*acc;
+	I16	*d;
+
+	if (!TrSampleAlloc(slot, n))
+		return;
+	acc = CAlloc(n * sizeof(F64));
+	if (!acc)
+		return;
+	d	= tr_smp[slot].data;
+	mm	= tr_fm_mult[patch[0] & 15];
+	mc	= tr_fm_mult[patch[1] & 15];
+	tl	= patch[2] & 0x3F;
+	fb	= patch[3] & 7;
+	dm	= (patch[3] >> 3) & 1;
+	dc	= (patch[3] >> 4) & 1;
+	//Total level attenuates 0.75 dB per step; 0.9172759 is 10^(-0.75/20).
+	amp = 1.0;
+	for (i = 0; i < tl; i++)
+		amp *= 0.9172759;
+	//The carrier phase moves by 2 * modulator output, in radians, so a
+	//modulator at full level swings it by 2 radians. Roughly a third of a
+	//cycle, not several: over-driving this is what turns every patch into a
+	//buzz.
+	depth = 2.0 * amp * ToF64(ms) / 64.0;
+	//Feedback index doubles per step: FB 1 is pi/16 and FB 7 is 4*pi, which is
+	//pi * 2^(FB - 5).
+	fbamt = 0;
+	if (fb)
+	{
+		fbamt = pi;
+		for (i = 5; i > fb; i--)
+			fbamt /= 2.0;
+		for (i = 5; i < fb; i++)
+			fbamt *= 2.0;
+	}
+	pk = 1;
+	for (i = 0; i < n; i++)
+	{
+		ph = 2.0 * pi * ToF64(i) / n;
+		//Two passes stand in for the operator feeding its own input.
+		prev = 0;
+		mo	 = Sin(mm * ph);
+		if (dm && mo < 0)
+			mo = 0;
+		if (fbamt > 0)
+		{
+			prev = mo;
+			mo	 = Sin(mm * ph + fbamt * prev);
+			if (dm && mo < 0)
+				mo = 0;
+		}
+		co = Sin(mc * ph + depth * mo);
+		if (dc && co < 0)
+			co = 0;
+		acc[i] = co;
+		v = ToI64(co * 32767.0);
+		if (v < 0)
+			v = -v;
+		if (v > pk)
+			pk = v;
+	}
+	//Normalise: a clipped waveform is quieter than a sine, and the carrier
+	//waveform bit halves the level outright.
+	for (i = 0; i < n; i++)
+		d[i] = ToI64(acc[i] * TR_WAVE_AMP * 32767.0 / pk);
+	Free(acc);
+	tr_smp[slot].loop_start	= 0;
+	tr_smp[slot].loop_len	= n;
+	tr_smp[slot].loop_type	= TR_LOOP_FWD;
+	tr_smp[slot].volume		= 64;
+	tr_smp[slot].global_vol	= 64;
+	tr_smp[slot].pan		= 128;
+	tr_smp[slot].synth		= TRI_SINE;
+	//One fundamental period is half the sample.
+	tr_smp[slot].step_mul	= TrSynthStepMul(TR_WAVE_LEN);
+	TrSampleGuard(&tr_smp[slot]);
+}
+
+U0 TrFmFill(I64 slot, U8 *patch)
+{//The patch at its written modulation depth.
+	TrFmFillMod(slot, patch, 64);
+}
+
+U0 TrStepsFill(I64 slot, U8 *steps, I64 n, I64 maxv)
+{//A wavetable of n unsigned steps, each 0..maxv, as a single-cycle wave. Each
+//step is held for TR_WAVE_LEN/n frames so the pitch model is unchanged, and
+//the table is centred, since a wavetable chip's output is unipolar and its
+//DC is blocked downstream.
+	I64	 i, j, hold, v;
+	I16	*d;
+
+	if (n < 1 || maxv < 1)
+		return;
+	if (n > TR_WAVE_LEN)
+		n = TR_WAVE_LEN;
+	hold = TR_WAVE_LEN / n;
+	if (hold < 1)
+		hold = 1;
+	if (!TrSampleAlloc(slot, hold * n))
+		return;
+	d = tr_smp[slot].data;
+	for (i = 0; i < n; i++)
+	{
+		v = (steps[i] * 2 - maxv) * TR_WAVE_AMP / maxv;
+		for (j = 0; j < hold; j++)
+			d[i * hold + j] = v;
+	}
+	tr_smp[slot].loop_start	= 0;
+	tr_smp[slot].loop_len	= hold * n;
+	tr_smp[slot].loop_type	= TR_LOOP_FWD;
+	tr_smp[slot].volume		= 64;
+	tr_smp[slot].global_vol	= 64;
+	tr_smp[slot].pan		= 128;
+	tr_smp[slot].synth		= TRI_SINE;
+	tr_smp[slot].step_mul	= TrSynthStepMul(hold * n);
+	TrSampleGuard(&tr_smp[slot]);
+}
+
+U0 TrWaveRender(I64 w)
+{//Render a user wavetable into its sample slot. Each of the 32 steps is held
+//for TR_WAVE_LEN/TR_WAVE_STEPS frames, so the pitch model is unchanged.
+	I64	 i, j, hold, slot, v;
+	I16	*d;
+
+	if (w < 0 || w >= TR_WAVE_SLOTS)
+		return;
+	slot = tr_wave_slot[w];
+	if (slot < 1 || slot >= TR_MAX_SAMPLES)
+		return;
+	if (!TrSampleAlloc(slot, TR_WAVE_LEN))
+		return;
+	d	 = tr_smp[slot].data;
+	hold = TR_WAVE_LEN / TR_WAVE_STEPS;
+	for (i = 0; i < TR_WAVE_STEPS; i++)
+	{
+		//Steps are 0..15 unsigned; centre them so silence is a flat table.
+		v = (tr_wave[w].step[i] * 2 - TR_WAVE_MAX) * TR_WAVE_AMP / TR_WAVE_MAX;
+		for (j = 0; j < hold; j++)
+			d[i * hold + j] = v;
+	}
+	tr_smp[slot].loop_start	= 0;
+	tr_smp[slot].loop_len	= TR_WAVE_LEN;
+	tr_smp[slot].loop_type	= TR_LOOP_FWD;
+	tr_smp[slot].volume		= 64;
+	tr_smp[slot].global_vol	= 64;
+	tr_smp[slot].pan		= 128;
+	tr_smp[slot].synth		= TRI_SINE;
+	tr_smp[slot].step_mul	= TrSynthStepMul(TR_WAVE_LEN);
+	StrPrint(tr_smp[slot].name, "Wave%02d", w);
+	TrSampleGuard(&tr_smp[slot]);
+}
+
+U0 TrWaveBankBuild()
+{//Duty bank then wavetable bank, in sample slots above the named voices.
+	I64 i, j, slot = TRI_COUNT;
+
+	for (i = 0; i < TR_DUTY_COUNT; i++)
+	{
+		tr_duty_slot[i] = slot;
+		TrDutyFill(slot, i);
+		slot++;
+	}
+	for (i = 0; i < TR_WAVE_SLOTS; i++)
+	{
+		tr_wave_slot[i] = slot;
+		if (!tr_wave[i].used)
+		{//Default table: a ramp, so a fresh slot is audible rather than silent.
+			for (j = 0; j < TR_WAVE_STEPS; j++)
+				tr_wave[i].step[j] = j * TR_WAVE_MAX / (TR_WAVE_STEPS - 1);
+			tr_wave[i].used = TRUE;
+		}
+		TrWaveRender(i);
+		slot++;
+	}
+}
+
+U0 TrSynthBuild()
+{//Slots 1..6 are the built-in voices. Their numbering matches YTracker 1's
+//F1..F5 so YTK2 songs import unchanged.
+	I64 i;
+
+	for (i = TRI_SINE; i < TRI_COUNT; i++)
+		TrSynthFill(i, i);
+	TrWaveBankBuild;
+}
+
+I64 TrSampleImportWav(I64 slot, U8 *raw, I64 size)
+{//16- or 8-bit PCM RIFF/WAVE to mono I16. Returns frames, 0 on reject.
+	U8	*p, *tail, *pcm = NULL;
+	I64	 chunk, channels = 1, rate = 8363, bits = 8, dsize = 0;
+	I64	 i, n, l, r, c;
+	I16	*d;
+
+	if (size < 44 || MemCompare(raw, "RIFF", 4) || MemCompare(raw + 8, "WAVE", 4))
+		return 0;
+	p	 = raw + 12;
+	tail = raw + size;
+	while (p + 8 <= tail)
+	{
+		chunk = TrRdU32LE(p + 4);
+		if (chunk < 0 || p + 8 + chunk > tail)
+			chunk = tail - (p + 8);
+		if (!MemCompare(p, "fmt ", 4) && chunk >= 16)
+		{
+			channels = TrRdU16LE(p + 10);
+			rate	 = TrRdU32LE(p + 12);
+			bits	 = TrRdU16LE(p + 22);
+		}
+		else if (!MemCompare(p, "data", 4))
+		{
+			pcm	  = p + 8;
+			dsize = chunk;
+		}
+		p += 8 + chunk + (chunk & 1);
+	}
+	if (!pcm || dsize < 1 || rate < 1)
+		return 0;
+	if (channels < 1 || channels > 2)
+		return 0;
+	if (bits != 8 && bits != 16)
+		return 0;
+
+	if (bits == 8)
+		n = dsize / channels;
+	else
+		n = dsize / (channels * 2);
+	if (n < 1 || !TrSampleAlloc(slot, n))
+		return 0;
+
+	d = tr_smp[slot].data;
+	for (i = 0; i < n; i++)
+	{
+		if (bits == 8)
+		{//WAV 8-bit is unsigned. Multiply, not shift: the result is signed.
+			l = (pcm[i * channels] - 128) * 256;
+			r = l;
+			if (channels == 2)
+				r = (pcm[i * channels + 1] - 128) * 256;
+		}
+		else
+		{
+			c = i * channels * 2;
+			l = TrRdU16LE(pcm + c);
+			if (l > 32767)
+				l -= 65536;
+			r = l;
+			if (channels == 2)
+			{
+				r = TrRdU16LE(pcm + c + 2);
+				if (r > 32767)
+					r -= 65536;
+			}
+		}
+		d[i] = (l + r) / 2;
+	}
+
+	tr_smp[slot].loop_start	= 0;
+	tr_smp[slot].loop_len	= 0;
+	tr_smp[slot].loop_type	= TR_LOOP_NONE;
+	tr_smp[slot].volume		= 64;
+	tr_smp[slot].pan		= 128;
+	tr_smp[slot].finetune	= 0;
+	tr_smp[slot].rel_note	= 0;
+	tr_smp[slot].synth		= TRI_NONE;
+	//Play at the file's own rate when the cursor sits on C-4.
+	tr_smp[slot].step_mul = ToI64(65536.0 * rate * TR_REF_PERIOD /
+								  TR_STEP_NUM + 0.5);
+	TrSampleGuard(&tr_smp[slot]);
+
+	return n;
+}
+
+U0 TrSampleNameSet(I64 slot, U8 *path)
+{//Basename without directory or extension, clipped to the name field.
+	U8	*s = path, *p;
+	I64	 i;
+
+	p = path;
+	while (*p)
+	{
+		if (*p == '/')
+			s = p + 1;
+		p++;
+	}
+	for (i = 0; i < 22 && s[i] && s[i] != '.'; i++)
+		tr_smp[slot].name[i] = s[i];
+	tr_smp[slot].name[i] = 0;
+}
+
+I64 TrSampleNextFree()
+{
+	I64 i;
+
+	for (i = 1; i < TR_MAX_SAMPLES; i++)
+		if (!tr_smp[i].data)
+			return i;
+
+	return 0;
+}
+
+I64 TrSampleCount()
+{
+	I64 i, n = 0;
+
+	for (i = 1; i < TR_MAX_SAMPLES; i++)
+		if (tr_smp[i].data)
+			n = i;
+
+	return n;
+}

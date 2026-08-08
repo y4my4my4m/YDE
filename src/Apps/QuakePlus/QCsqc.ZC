@@ -1,0 +1,1061 @@
+// QCsqc.ZC - the "simple CSQC" HUD, as Ironwail/QuakeSpasm-Spiked run it
+//
+// csprogs.dat exports CSQC_DrawHud(vector virtsize, float showscores). the
+// engine calls it instead of the classic status bar when it loads. drawing
+// goes through builtins 315-328, stats through 330/331 reading the SERVER
+// edicts - simple CSQC has no world of its own.
+//
+// the client image runs on the same VM as a capture/restore of its flat
+// state, see CQPrVM. the q_fld_/q_ofs_ caches stay SERVER-resolved
+// throughout; the client offsets live in q_cs_* below.
+
+//canvas coordinates arrive in VIRTUAL units: gl_draw.c:1219,
+//s = CLAMP(1, scr_sbarscale, guiwidth/320), virtsize = screen / s
+I64			q_cs_scale	= 1;
+
+CQPrVM		q_ssqc_vm;
+CQPrVM		q_cs_vm;
+
+//globals are NOT zeroed: q_cs_vm.raw starts as garbage, and QCsqcFree tested
+//it directly - the first map load handed wild pointers to QPrFree. this flag
+//IS initialized, so it is the only safe thing to branch on
+Bool		q_cs_vm_live	= FALSE;
+Bool		q_cs_ok			= FALSE;
+//cl_csqc 0 forces the classic bar AND skips loading csprogs.dat entirely -
+//the second VM is the newest subsystem here, so it has to be switchable off
+//without a rebuild
+Bool		q_cs_enable		= TRUE;
+I64			q_cs_fn_drawhud	= -1;
+I64			q_cs_fn_init	= -1;
+I64			q_cs_ofs_time	= -1;
+
+CQCanvas   *q_cs_canvas		= NULL;
+
+//SSQC stat sources, resolved once per server progs load
+I64			q_cs_fld_shells	 = -1;
+I64			q_cs_fld_nails	 = -1;
+I64			q_cs_fld_rockets = -1;
+I64			q_cs_fld_cells	 = -1;
+
+//clip rect in canvas pixels, drawsetcliparea
+I64			q_cs_clip_x0 = 0;
+I64			q_cs_clip_y0 = 0;
+I64			q_cs_clip_x1 = 0;
+I64			q_cs_clip_y1 = 0;
+
+//--- pic cache --------------------------------------------------------------
+//
+// precache_pic takes wad lump names ("sb_nails") and pak paths
+// ("gfx/foo.lmp"). lmp layout: I32 width, I32 height, bytes. pixels are
+// borrowed from the archive or the wad, freed by neither
+
+//where the HUD time actually goes: draw calls, pixels touched, and cache
+//misses. a miss is a full archive search, so a HUD naming pics dynamically
+//would search the paks on every draw
+I64 q_cs_calls	= 0;
+I64 q_cs_px		= 0;
+I64 q_cs_miss	= 0;
+
+#define QCS_MAX_PICS	128
+
+U8		q_cs_pic_name[QCS_MAX_PICS * 64];
+CQPic	q_cs_pic[QCS_MAX_PICS];
+I64		q_cs_pic_ofs[QCS_MAX_PICS];		//QC string offset, the lookup key
+I64		q_cs_pic_count = 0;
+
+I64 q_cs_missing_said = 0;
+
+U0 QCsPicMissing(U8 *name)
+{//named once: the HUD asks for it every frame and the log would fill
+	U8 line[128];
+
+	//was 12, which the offset-aliasing bug used up on garbage names before any
+	//real miss got reported. resets per map, see QCsFree
+	if (q_cs_missing_said >= 64)
+		return;
+
+	q_cs_missing_said++;
+	StrPrint(line, "csqc: pic not found '%s'\n", name);
+	QLog(line);
+}
+
+CQPic *QCsPicFind(I64 sofs)
+{//keyed on the QC STRING OFFSET, not the text - the HUD draws dozens of pics
+ //a frame and a StrICompare scan per draw is a kernel call per entry. two
+ //offsets naming the same file take two slots, which is only wasteful
+	I64	 i;
+	U8	*name;
+	U8	*raw;
+	I64	 size;
+	U8	 safe[72];		//name, LENGTH BOUNDED - see below
+	U8	 bare[72];
+	U8	 alt[80];
+	CQPic *pic;
+	Bool temp;
+
+	if (sofs <= 0)
+		return NULL;
+
+	//IS THIS OFFSET REUSABLE? QPrTempString hands out a 64 slot ring, so a
+	//string from strcat/ftos/sprintf occupies an offset that will carry a
+	//DIFFERENT name a few dozen strings later. keying the cache on such an
+	//offset returns whatever pic was registered against that slot last time
+	//round - qbj3 builds its weapon icon names with strcat, so the HUD drew a
+	//different picture every frame as the ring rotated
+	temp = ToBool(q_pr_temp_str > 0 && sofs >= q_pr_temp_str &&
+			sofs < q_pr_temp_str + QPR_TEMP_SLOTS * QPR_TEMP_STR_LEN);
+
+	//fast path: compiled string offsets only. those live in the progs blob and
+	//never change text
+	if (!temp)
+	{
+		for (i = 0; i < q_cs_pic_count; i++)
+		{
+			if (q_cs_pic_ofs[i] == sofs)
+			{
+				//negative entry: known absent, do not search again
+				if (!q_cs_pic[i].pixels)
+					return NULL;
+
+				return &q_cs_pic[i];
+			}
+		}
+	}
+
+	name = QPrStr(sofs);
+	if (!name || !name[0])
+		return NULL;			//an empty name is not a lookup
+
+	//slow path: BY NAME. a mod that builds the string each frame hands over a
+	//new offset every time - keyed on offset alone that consumed a slot per
+	//frame until the table filled and pics stopped drawing entirely
+	for (i = 0; i < q_cs_pic_count; i++)
+	{
+		if (!StrICompare(&q_cs_pic_name[i * 64], name))
+		{
+			//alias only an immutable offset. aliasing a ring slot is what
+			//poisoned the fast path above
+			if (!temp)
+				q_cs_pic_ofs[i] = sofs;
+			if (!q_cs_pic[i].pixels)
+				return NULL;
+
+			return &q_cs_pic[i];
+		}
+	}
+
+	q_cs_miss++;
+
+	if (q_cs_pic_count >= QCS_MAX_PICS)
+		return NULL;
+
+	//the slot is claimed BEFORE the lookup can fail. a miss walks the whole
+	//search path - on a loose-file gamedir that is FileFind plus FileRead,
+	//milliseconds - and an uncached failure repeated it every single frame.
+	//pixels NULL is the negative entry
+	pic         = &q_cs_pic[q_cs_pic_count];
+	pic->pixels = NULL;
+	pic->width  = 0;
+	pic->height = 0;
+
+	QStrCopy(&q_cs_pic_name[q_cs_pic_count * 64], name, 63);
+	q_cs_pic_ofs[q_cs_pic_count] = 0;
+	if (!temp)
+		q_cs_pic_ofs[q_cs_pic_count] = sofs;
+	q_cs_pic_count++;
+
+	//the QC string is UNBOUNDED - it comes out of the progs blob and a mod can
+	//build it with strcat. every buffer below is filled from this truncated
+	//copy, never from name directly: StrPrint("%s.lmp", name) smashed the
+	//stack and returned into garbage
+	QStrCopy(safe, name, 64);
+
+	//Draw_CachePic accepts both spellings: "gfx/sb_quad" names the WAD LUMP
+	//sb_quad, and "gfx/foo.lmp" names a file. try every form before giving up
+	QStrCopy(bare, safe, 64);
+	if (!StrNICompare(safe, "gfx/", 4))
+		QStrCopy(bare, safe + 4, 64);
+
+	i = StrLen(bare);
+	if (i > 4 && !StrICompare(bare + i - 4, ".lmp"))
+		bare[i - 4] = 0;
+
+	if (QWadPic(safe, pic))
+		return pic;
+	if (QWadPic(bare, pic))
+		return pic;
+
+	size = 0;
+	raw  = QPakData(safe, &size);
+	if (!raw)
+	{
+		StrPrint(alt, "%s.lmp", safe);
+		raw = QPakData(alt, &size);
+	}
+
+	if (!raw || size < 8)
+	{
+		QCsPicMissing(safe);
+		pic->pixels = NULL;
+		return NULL;
+	}
+
+	pic->width  = QRdI32(raw);
+	pic->height = QRdI32(raw + 4);
+	pic->pixels = raw + 8;
+
+	if (pic->width < 1 || pic->height < 1 ||
+		pic->width * pic->height + 8 > size)
+	{
+		QCsPicMissing(safe);
+		pic->pixels = NULL;
+		return NULL;
+	}
+
+	return pic;
+}
+
+U0 QCsPicsClear()
+{//pixels are borrowed; a gamedir switch invalidates the archives behind them
+	q_cs_pic_count    = 0;
+	q_cs_missing_said = 0;
+}
+
+//--- draw primitives --------------------------------------------------------
+
+U0 QCsClipReset()
+{
+	if (!q_cs_canvas)
+		return;
+
+	q_cs_clip_x0 = 0;
+	q_cs_clip_y0 = 0;
+	q_cs_clip_x1 = q_cs_canvas->width;
+	q_cs_clip_y1 = q_cs_canvas->height;
+}
+
+//per-draw colour, as Draw_SubPic takes it. every CSQC draw call carries an
+//rgb vector and an alpha and Ironwail modulates by both - ignoring them drew
+//the whole HUD at full opacity in raw palette colour
+I64		q_cs_cr		= 255;
+I64		q_cs_cg		= 255;
+I64		q_cs_cb		= 255;
+I64		q_cs_ca		= 255;	//0..255
+
+U0 QCsSetColor(F64 *rgb, F64 alpha)
+{//a mod may pass '0 0 0' meaning "unset"; Draw_SubPic treats that as white
+	if (rgb[0] <= 0.0 && rgb[1] <= 0.0 && rgb[2] <= 0.0)
+	{
+		q_cs_cr = 255;
+		q_cs_cg = 255;
+		q_cs_cb = 255;
+	}
+	else
+	{
+		q_cs_cr = ClampI64(ToI64(rgb[0] * 255.0), 0, 255);
+		q_cs_cg = ClampI64(ToI64(rgb[1] * 255.0), 0, 255);
+		q_cs_cb = ClampI64(ToI64(rgb[2] * 255.0), 0, 255);
+	}
+
+	//alpha 0 from a mod that never set it means opaque, as the GL path does
+	if (alpha <= 0.0)
+		q_cs_ca = 255;
+	else
+		q_cs_ca = ClampI64(ToI64(alpha * 255.0), 0, 255);
+}
+
+U0 QCsPixel(CQCanvas *c, U8 *drow, U32 *crow, I32 *zrow, I64 px, U32 src)
+{//modulate by the draw colour, blend by alpha, land in the truecolor overlay
+ //
+ //the overlay carries literal RGB, so the tint is exact rather than requantised
+ //through the palette. the index plane keeps a nearest match for the 8bpp path
+	I64 r;
+	I64 g;
+	I64 b;
+	I64 dr;
+	I64 dg;
+	I64 db;
+	U32 dst;
+
+	r = (((src >> 16) & 255) * q_cs_cr) / 255;
+	g = (((src >> 8) & 255)  * q_cs_cg) / 255;
+	b = ((src & 255)         * q_cs_cb) / 255;
+
+	if (q_cs_ca < 255)
+	{
+		dst = 0;
+		if (crow)
+			dst = crow[px];
+
+		if (dst & QRGB_SET)
+		{
+			dr = (dst >> 16) & 255;
+			dg = (dst >> 8) & 255;
+			db = dst & 255;
+		}
+		else
+		{
+			dst = qpal_argb[drow[px]];
+			dr  = (dst >> 16) & 255;
+			dg  = (dst >> 8) & 255;
+			db  = dst & 255;
+		}
+
+		r = (r * q_cs_ca + dr * (255 - q_cs_ca)) / 255;
+		g = (g * q_cs_ca + dg * (255 - q_cs_ca)) / 255;
+		b = (b * q_cs_ca + db * (255 - q_cs_ca)) / 255;
+	}
+
+	if (crow)
+		crow[px] = QRGB_SET | (r << 16) | (g << 8) | b;
+	else
+		drow[px] = QPalNearestRGB(r, g, b);
+
+	if (zrow)
+		zrow[px] = QDEPTH_2D;
+}
+
+U0 QCsBlit(CQPic *pic, I64 dx, I64 dy, I64 dw, I64 dh,
+	I64 sx, I64 sy, I64 sw, I64 sh)
+{//nearest stretch of a pic sub-rect into the canvas, index 255 transparent
+ //
+ //the source walk is 16.16 fixed point and the clip is hoisted. it used to
+ //be a multiply AND a divide per pixel, with the clip tested per pixel and
+ //QRGBDrop called per pixel - the HUD cost 10-15 fps on its own
+	CQCanvas *c = q_cs_canvas;
+	U8	*prow;
+	U8	*drow;
+	U32	*crow;
+	I32	*zrow;
+	I64	 x;
+	I64	 y;
+	I64	 tx;
+	I64	 ty;
+	I64	 x0;
+	I64	 x1;
+	I64	 txf;
+	I64	 dtx;
+	U8	 texel;
+
+	if (!c || !pic || !pic->pixels || dw < 1 || dh < 1 || sw < 1 || sh < 1)
+		return;
+
+	x0 = 0;
+	x1 = dw;
+	if (dx + x0 < q_cs_clip_x0)	x0 = q_cs_clip_x0 - dx;
+	if (dx + x1 > q_cs_clip_x1)	x1 = q_cs_clip_x1 - dx;
+	if (x0 < 0)		x0 = 0;
+	if (x1 > dw)	x1 = dw;
+	if (x0 >= x1)
+		return;
+
+	dtx = (sw << 16) / dw;
+
+	q_cs_calls++;
+	q_cs_px += (x1 - x0) * dh;
+
+	for (y = 0; y < dh; y++)
+	{
+		if (dy + y < q_cs_clip_y0 || dy + y >= q_cs_clip_y1)
+			goto qcb_next_row;
+
+		ty = sy + y * sh / dh;
+		if (ty < 0 || ty >= pic->height)
+			goto qcb_next_row;
+
+		prow = pic->pixels + ty * pic->width;
+		drow = c->pixels + (dy + y) * c->width;
+
+		crow = NULL;
+		if (c->rgb && q_rgb_active)
+			crow = c->rgb + (dy + y) * c->width;
+		zrow = NULL;
+		if (c->depth)
+			zrow = c->depth + (dy + y) * c->width;
+
+		txf = (sx << 16) + dtx * x0;
+
+		for (x = x0; x < x1; x++)
+		{
+			tx   = txf >> 16;
+			txf += dtx;
+
+			if (tx < 0 || tx >= pic->width)
+				goto qcb_next_px;
+
+			texel = prow[tx];
+			if (texel == 255)
+				goto qcb_next_px;
+
+			//index plane keeps the raw texel so an 8bpp reader sees something
+			drow[dx + x] = texel;
+			QCsPixel(c, drow, crow, zrow, dx + x, qpal_argb[texel]);
+
+qcb_next_px:
+		}
+
+qcb_next_row:
+	}
+}
+
+U0 QCsFill(I64 dx, I64 dy, I64 dw, I64 dh, I64 r, I64 g, I64 b, F64 alpha)
+{//drawfill: nearest palette colour; alpha under half reads as a dim overlay,
+ //approximated with the colormap's darker rows
+	CQCanvas *c = q_cs_canvas;
+	U8	*drow;
+	U32	*crow;
+	I32	*zrow;
+	I64	 x;
+	I64	 y;
+	I64	 x0;
+	I64	 x1;
+	U8	 idx;
+	U32	 fill;
+
+	if (!c || dw < 1 || dh < 1 || alpha <= 0.0)
+		return;
+
+	x0 = dx;
+	x1 = dx + dw;
+	if (x0 < q_cs_clip_x0)	x0 = q_cs_clip_x0;
+	if (x1 > q_cs_clip_x1)	x1 = q_cs_clip_x1;
+	if (x0 >= x1)
+		return;
+
+	//the shared pixel path applies the draw colour, so this call's rgb IS the
+	//source and the modulate must be neutral
+	fill = (ClampI64(r, 0, 255) << 16) | (ClampI64(g, 0, 255) << 8) |
+		ClampI64(b, 0, 255);
+	idx  = QPalNearestRGB(ClampI64(r, 0, 255), ClampI64(g, 0, 255),
+		ClampI64(b, 0, 255));
+
+	q_cs_cr = 255;
+	q_cs_cg = 255;
+	q_cs_cb = 255;
+	q_cs_ca = 255;
+	if (alpha > 0.0 && alpha < 1.0)
+		q_cs_ca = ClampI64(ToI64(alpha * 255.0), 0, 255);
+
+	q_cs_calls++;
+	q_cs_px += (x1 - x0) * dh;
+
+	for (y = dy; y < dy + dh; y++)
+	{
+		if (y < q_cs_clip_y0 || y >= q_cs_clip_y1)
+			goto qcf_next_row;
+
+		drow = c->pixels + y * c->width;
+
+		crow = NULL;
+		if (c->rgb && q_rgb_active)
+			crow = c->rgb + y * c->width;
+		zrow = NULL;
+		if (c->depth)
+			zrow = c->depth + y * c->width;
+
+		for (x = x0; x < x1; x++)
+		{
+			drow[x] = idx;
+			QCsPixel(c, drow, crow, zrow, x, fill);
+		}
+
+qcf_next_row:
+	}
+}
+
+U0 QCsChar(I64 dx, I64 dy, I64 dw, I64 dh, I64 ch)
+{//one conchars glyph, stretched. the atlas is a 16x16 grid of square cells
+	CQPic glyph;
+	I64	  cell;
+
+	if (!q_conchars || ch <= 0 || ch > 255)
+		return;
+
+	cell = q_conchars_dim / 16;
+
+	glyph.width  = q_conchars_dim;
+	glyph.height = q_conchars_dim;
+	glyph.pixels = q_conchars;
+
+	QCsBlit(&glyph, dx, dy, dw, dh,
+		(ch & 15) * cell, (ch >> 4) * cell, cell, cell);
+}
+
+//--- stats ------------------------------------------------------------------
+
+F64 QCsSsqcFieldF(I64 ent, I64 fld)
+{//read the SERVER edict block while the client image is active
+	U8 *p;
+
+	if (!q_ssqc_vm.edicts || ent < 0 || ent >= q_ssqc_vm.max_edicts ||
+		fld < 0 || fld >= q_ssqc_vm.entity_fields)
+		return 0.0;
+
+	p = q_ssqc_vm.edicts + ent * q_ssqc_vm.edict_stride + fld * 4;
+
+	return QRdF32(p);
+}
+
+F64 QCsSsqcGlobalF(I64 ofs)
+{
+	if (!q_ssqc_vm.globals || ofs < 0 || ofs >= q_ssqc_vm.num_globals)
+		return 0.0;
+
+	return QF32Bits(q_ssqc_vm.globals[ofs]);
+}
+
+F64 QCsStat(I64 num)
+{//STAT_ numbers, plus whatever clientstat/globalstat registered
+	I64 ply = q_player_edict;
+
+	switch (num)
+	{
+		case 0:		return QCsSsqcFieldF(ply, q_fld_health);
+		case 3:		return QCsSsqcFieldF(ply, q_fld_currentammo);
+		case 4:		return QCsSsqcFieldF(ply, q_fld_armorvalue);
+		case 5:		return QCsSsqcFieldF(ply, q_fld_weaponframe);
+		case 6:		return QCsSsqcFieldF(ply, q_cs_fld_shells);
+		case 7:		return QCsSsqcFieldF(ply, q_cs_fld_nails);
+		case 8:		return QCsSsqcFieldF(ply, q_cs_fld_rockets);
+		case 9:		return QCsSsqcFieldF(ply, q_cs_fld_cells);
+		case 10:	return QCsSsqcFieldF(ply, q_fld_weapon);
+		case 11:	return QCsSsqcGlobalF(q_ofs_total_secrets);
+		case 12:	return QCsSsqcGlobalF(q_ofs_total_monsters);
+		case 13:	return QCsSsqcGlobalF(q_ofs_found_secrets);
+		case 14:	return QCsSsqcGlobalF(q_ofs_killed_monsters);
+		case 15:	return QCsSsqcFieldF(ply, q_fld_items);
+	}
+
+	if (num >= 0 && num < QBI_MAX_STATS)
+	{
+		if (q_stat_fld[num] >= 0)
+			return QCsSsqcFieldF(ply, q_stat_fld[num]);
+		if (q_stat_glob[num] >= 0)
+			return QCsSsqcGlobalF(q_stat_glob[num]);
+	}
+
+	return 0.0;
+}
+
+//--- the client builtin dispatch --------------------------------------------
+
+I64 q_cs_unknown_said = 0;
+
+//statements CSQC_DrawHud alone spent this frame. the mod's HUD versus our own
+//drawing code is otherwise guesswork
+I64 q_cs_stmts	= 0;
+I64 q_cs_stmts0	= 0;
+
+
+//csqcdump: log every draw the HUD makes for ONE frame. comparing screenshots
+//guesses at the difference; this states what the mod actually asked for
+Bool q_cs_trace		= FALSE;
+I64  q_cs_trace_n	= 0;
+U8   q_cs_trace_line[192];
+
+U0 QCsTrace(I64 num, F64 *pos, F64 *size, U8 *name)
+{//one line per draw call: builtin, screen rect in canvas pixels, pic
+	if (!q_cs_trace || q_cs_trace_n >= 64)
+		return;
+
+	q_cs_trace_n++;
+
+	StrPrint(q_cs_trace_line,
+		"csqc %d: at %d,%d size %d,%d rgb %d,%d,%d a%d '%s'\n",
+		num,
+		ToI64(pos[0]) * q_cs_scale, ToI64(pos[1]) * q_cs_scale,
+		ToI64(size[0]) * q_cs_scale, ToI64(size[1]) * q_cs_scale,
+		q_cs_cr, q_cs_cg, q_cs_cb, q_cs_ca, name);
+	QLog(q_cs_trace_line);
+}
+
+U0 QCsDispatch(I64 num)
+{
+	F64	 pos[3];
+	F64	 size[3];
+	F64	 spos[3];
+	F64	 ssize[3];
+	F64	 v[3];
+	U8	*sa;
+	U8	*sb;
+	U8	 buf[256];
+	CQPic *pic;
+	I64	 i;
+	I64	 n;
+	I64	 sc = q_cs_scale;
+	I64	 sbits;		//getstatf bit extraction
+	I64	 sfirst;
+	I64	 scount;
+
+	switch (num)
+	{
+		case 317:	//precache_pic(string) -> string
+			QCsPicFind(QPrGetI(QBiArg(0)));
+			QPrSetI(QPR_OFS_RETURN, QPrGetI(QBiArg(0)));
+			break;
+
+		case 316:	//iscachedpic
+			if (QCsPicFind(QPrGetI(QBiArg(0))))
+				QBiRetF(1.0);
+			else
+				QBiRetF(0.0);
+			break;
+
+		case 318:	//draw_getimagesize -> vector
+			pic = QCsPicFind(QPrGetI(QBiArg(0)));
+			QVecSet(v, 0.0, 0.0, 0.0);
+			if (pic)
+			{
+				v[0] = ToF64(pic->width);
+				v[1] = ToF64(pic->height);
+			}
+			QBiRetV(v);
+			break;
+
+		case 320:	//drawcharacter(pos, char, size, rgb, alpha)
+			QBiArgV(0, pos);
+			QBiArgV(2, size);
+			QBiArgV(3, v);
+			QCsSetColor(v, QBiArgF(4));
+			QCsTrace(320, pos, size, "char");
+			QCsChar(ToI64(pos[0]) * sc, ToI64(pos[1]) * sc,
+				ToI64(size[0]) * sc, ToI64(size[1]) * sc,
+				ToI64(QBiArgF(1)));
+			QBiRetF(0.0);
+			break;
+
+		case 321:	//drawrawstring(pos, string, size, rgb, alpha)
+		case 326:	//drawcolorcodedstring - codes ignored
+			QBiArgV(0, pos);
+			sa = QBiArgS(1);
+			QBiArgV(2, size);
+			QBiArgV(3, v);
+			QCsSetColor(v, QBiArgF(4));
+			QCsTrace(321, pos, size, sa);
+			i = 0;
+			while (sa[i])
+			{
+				QCsChar((ToI64(pos[0]) + i * ToI64(size[0])) * sc,
+					ToI64(pos[1]) * sc,
+					ToI64(size[0]) * sc, ToI64(size[1]) * sc, sa[i]);
+				i++;
+			}
+			QBiRetF(0.0);
+			break;
+
+		case 322:	//drawpic(pos, pic, size, rgb, alpha)
+			QBiArgV(0, pos);
+			pic = QCsPicFind(QPrGetI(QBiArg(1)));
+			QBiArgV(2, size);
+			QBiArgV(3, v);
+			QCsSetColor(v, QBiArgF(4));
+			QCsTrace(322, pos, size, QBiArgS(1));
+			if (pic)
+				QCsBlit(pic, ToI64(pos[0]) * sc, ToI64(pos[1]) * sc,
+					ToI64(size[0]) * sc, ToI64(size[1]) * sc,
+					0, 0, pic->width, pic->height);
+			QBiRetF(0.0);
+			break;
+
+		case 328:	//drawsubpic(pos, size, pic, srcpos, srcsize, rgb, alpha)
+			QBiArgV(0, pos);
+			QBiArgV(1, size);
+			pic = QCsPicFind(QPrGetI(QBiArg(2)));
+			QBiArgV(3, spos);
+			QBiArgV(4, ssize);
+			QBiArgV(5, v);
+			QCsSetColor(v, QBiArgF(6));
+			QCsTrace(328, pos, size, QBiArgS(2));
+			if (pic)
+				QCsBlit(pic, ToI64(pos[0]) * sc, ToI64(pos[1]) * sc,
+					ToI64(size[0]) * sc, ToI64(size[1]) * sc,
+					ToI64(spos[0] * ToF64(pic->width)),
+					ToI64(spos[1] * ToF64(pic->height)),
+					ToI64(ssize[0] * ToF64(pic->width)),
+					ToI64(ssize[1] * ToF64(pic->height)));
+			QBiRetF(0.0);
+			break;
+
+		case 323:	//drawfill(pos, size, rgb, alpha)
+			QBiArgV(0, pos);
+			QBiArgV(1, size);
+			QBiArgV(2, v);
+			QCsTrace(323, pos, size, "fill");
+			QCsFill(ToI64(pos[0]) * sc, ToI64(pos[1]) * sc,
+				ToI64(size[0]) * sc, ToI64(size[1]) * sc,
+				ToI64(v[0] * 255.0), ToI64(v[1] * 255.0),
+				ToI64(v[2] * 255.0), QBiArgF(3));
+			QBiRetF(0.0);
+			break;
+
+		case 324:	//drawsetcliparea(x, y, w, h)
+			q_cs_clip_x0 = ToI64(QBiArgF(0)) * sc;
+			q_cs_clip_y0 = ToI64(QBiArgF(1)) * sc;
+			q_cs_clip_x1 = q_cs_clip_x0 + ToI64(QBiArgF(2)) * sc;
+			q_cs_clip_y1 = q_cs_clip_y0 + ToI64(QBiArgF(3)) * sc;
+			break;
+
+		case 325:	//drawresetcliparea
+			QCsClipReset;
+			break;
+
+		case 327:	//stringwidth(string, usecolors, size)
+			sa = QBiArgS(0);
+			QBiArgV(2, size);
+			QBiRetF(ToF64(StrLen(sa)) * size[0]);
+			break;
+
+		case 315:	//drawline - unused by HUDs worth having
+			break;
+
+		//getstatf(stnum, firstbit, bitcount). the two extra arguments are
+		//OPTIONAL and were being ignored, so getstatbits - which qbj3 defines
+		//as this same builtin - handed back the whole stat for every call.
+		//its HUD reads
+		//    stat_items  = getstatbits(STAT_ITEMS, 0, 23)
+		//    stat_items2 = getstatbits(STAT_ITEMS, 23, 9)
+		//and got the same value twice, so the second loop compared bits that
+		//belong to the first
+		case 330:	//getstati
+		case 331:	//getstatf
+			sbits = ToI64(QCsStat(ToI64(QBiArgF(0))));
+
+			if (q_pr_argc >= 3)
+			{
+				sfirst = ToI64(QBiArgF(1));
+				scount = ToI64(QBiArgF(2));
+
+				if (scount > 0 && sfirst >= 0 && sfirst < 32)
+				{
+					sbits = sbits >> sfirst;
+					if (scount < 32)
+						sbits = sbits & ((1 << scount) - 1);
+				}
+			}
+
+			QBiRetF(ToF64(sbits));
+			break;
+
+		case 348:	//getplayerkeyvalue
+			QPrSetI(QPR_OFS_RETURN, 0);
+			break;
+
+		//--- shared basics the HUD leans on ---
+		case 81:	//stof
+			QBiRetF(QAtoF(QBiArgS(0)));
+			break;
+
+		//mod(a, n). a plain math builtin, and qbj3's modern HUD uses it in
+		//Hud_DrawWeaponModern - without it every weapon icon that path draws
+		//raised "unknown builtin 245"
+		case 245:	//mod
+			pos[0] = QBiArgF(0);
+			pos[1] = QBiArgF(1);
+			if (pos[1] == 0.0)
+				QBiRetF(0.0);
+			else
+				QBiRetF(pos[0] - Floor(pos[0] / pos[1]) * pos[1]);
+			break;
+
+		case 94:	//min
+			pos[0] = QBiArgF(0);
+			for (i = 1; i < q_pr_argc; i++)
+				if (QBiArgF(i) < pos[0])
+					pos[0] = QBiArgF(i);
+			QBiRetF(pos[0]);
+			break;
+
+		case 95:	//max
+			pos[0] = QBiArgF(0);
+			for (i = 1; i < q_pr_argc; i++)
+				if (QBiArgF(i) > pos[0])
+					pos[0] = QBiArgF(i);
+			QBiRetF(pos[0]);
+			break;
+
+		case 114:	//strlen
+			QBiRetF(ToF64(StrLen(QBiArgS(0))));
+			break;
+
+		case 115:	//strcat
+			buf[0] = 0;
+			n = 0;
+			for (i = 0; i < q_pr_argc && i < 8; i++)
+			{
+				sa = QBiArgS(i);
+				while (*sa && n < 254)
+				{
+					buf[n] = *sa;
+					n++;
+					sa++;
+				}
+			}
+			buf[n] = 0;
+			//temp ring, not a permanent allocation: a HUD concatenates every
+			//frame and QPrNewString never frees
+			QPrSetI(QPR_OFS_RETURN, QPrTempString(buf));
+			break;
+
+		case 116:	//substring(s, start, len)
+			sa = QBiArgS(0);
+			i  = ClampI64(ToI64(QBiArgF(1)), 0, StrLen(sa));
+			n  = ClampI64(ToI64(QBiArgF(2)), 0, 254);
+			sb = sa + i;
+			i  = 0;
+			while (sb[i] && i < n)
+			{
+				buf[i] = sb[i];
+				i++;
+			}
+			buf[i] = 0;
+			QPrSetI(QPR_OFS_RETURN, QPrTempString(buf));
+			break;
+
+		case 222:	//str2chr(s, ofs)
+			sa = QBiArgS(0);
+			i  = ToI64(QBiArgF(1));
+			if (i >= 0 && i < StrLen(sa))
+				QBiRetF(ToF64(sa[i]));
+			else
+				QBiRetF(0.0);
+			break;
+
+		default:
+			//the server dispatch covers the classic table: ftos, floor,
+			//dprint and friends are VM-agnostic. its unknowns return zero
+			QBiDispatch(num);
+	}
+}
+
+//--- load and per-frame -----------------------------------------------------
+
+U0 QCsqcInit()
+{//ZealC ignores declaration initialisers on globals. the VM structs are the
+ //dangerous ones: a garbage q_cs_vm_live sends garbage pointers to QPrFree
+	I64 i;
+
+	q_cs_ok           = FALSE;
+	q_cs_hud_live     = FALSE;
+	q_cs_vm_live      = FALSE;
+	q_cs_enable       = TRUE;
+	q_cs_scale        = 1;
+	q_cs_canvas       = NULL;
+	q_cs_fn_drawhud   = -1;
+	q_cs_fn_init      = -1;
+	q_cs_ofs_time     = -1;
+	q_cs_fld_shells   = -1;
+	q_cs_fld_nails    = -1;
+	q_cs_fld_rockets  = -1;
+	q_cs_fld_cells    = -1;
+	q_cs_clip_x0      = 0;
+	q_cs_clip_y0      = 0;
+	q_cs_clip_x1      = 0;
+	q_cs_clip_y1      = 0;
+	q_cs_pic_count    = 0;
+	q_cs_missing_said = 0;
+	q_cs_unknown_said = 0;
+	q_cs_stmts        = 0;
+	q_cs_stmts0       = 0;
+	q_cs_trace        = FALSE;
+	q_cs_trace_n      = 0;
+	q_cs_trace_line[0] = 0;
+	q_cs_calls        = 0;
+	q_cs_px           = 0;
+	q_cs_miss         = 0;
+
+	MemSet(&q_ssqc_vm, 0, sizeof(CQPrVM));
+	MemSet(&q_cs_vm,   0, sizeof(CQPrVM));
+
+	for (i = 0; i < QCS_MAX_PICS; i++)
+	{
+		q_cs_pic[i].pixels = NULL;
+		q_cs_pic_ofs[i]    = 0;
+	}
+}
+
+U0 QCsqcFree()
+{
+	q_cs_ok       = FALSE;
+	q_cs_hud_live = FALSE;
+	QCsPicsClear;
+
+	if (!q_cs_vm_live)
+		return;
+
+	//free through the active slots, QPrFree owns the walk
+	QPrVMStore(&q_ssqc_vm);
+	QPrVMLoad(&q_cs_vm);
+	QPrFree;
+	QPrVMClearActive;
+	QPrVMStore(&q_cs_vm);
+	QPrVMLoad(&q_ssqc_vm);
+
+	q_cs_vm_live = FALSE;
+}
+
+U0 QCsqcLoad()
+{//after the server progs is up. absent csprogs.dat is the common case
+	U8 line[96];
+
+	QCsqcFree;
+
+	if (!q_cs_enable)
+		return;
+
+	//stat ammo fields resolve against the SERVER progs, active right now
+	q_cs_fld_shells  = QPrFindField("ammo_shells");
+	q_cs_fld_nails   = QPrFindField("ammo_nails");
+	q_cs_fld_rockets = QPrFindField("ammo_rockets");
+	q_cs_fld_cells   = QPrFindField("ammo_cells");
+
+	//QPakData walks paks AND loose gamedir files - QPakFind was pak-only and
+	//a loose-file mod's csprogs.dat never passed the gate
+	if (!QPakData("csprogs.dat"))
+		return;
+
+	QPrVMStore(&q_ssqc_vm);
+	QPrVMClearActive;
+
+	if (!QPrLoad("csprogs.dat", 64))
+	{
+		//a partial load left allocations in the active slots; restoring the
+		//server image over them would strand the memory
+		QPrFree;
+		QPrVMClearActive;
+		QPrVMLoad(&q_ssqc_vm);
+		QLog("csqc: csprogs.dat failed to load\n");
+		return;
+	}
+
+	q_cs_fn_drawhud = QPrFindFunction("CSQC_DrawHud");
+	q_cs_fn_init    = QPrFindFunction("CSQC_Init");
+	q_cs_ofs_time   = QPrFindGlobal("time");
+
+	if (q_cs_fn_drawhud < 0)
+	{
+		QPrFree;
+		QPrVMClearActive;
+		QPrVMLoad(&q_ssqc_vm);
+		QLog("csqc: no CSQC_DrawHud, ignoring csprogs.dat\n");
+		return;
+	}
+
+	QGameLoadMark("csqc image up");
+
+	if (q_cs_fn_init > 0)
+	{
+		q_pr_builtin_call = &QCsDispatch;
+		QPrExecute(q_cs_fn_init);
+		q_pr_error        = FALSE;
+		q_pr_builtin_call = &QBiDispatch;
+	}
+
+	QPrVMStore(&q_cs_vm);
+	QPrVMLoad(&q_ssqc_vm);
+
+	QGameLoadMark("csqc init ran");
+
+	q_cs_vm_live = TRUE;
+	q_cs_ok       = TRUE;
+	q_cs_hud_live = q_cs_enable;
+
+	StrPrint(line, "csqc: HUD loaded, %d functions\n", q_cs_vm.num_functions);
+	QLog(line);
+}
+
+I64	q_cs_frames		= 0;
+I64	q_cs_flap_said	= 0;
+Bool q_cs_last_drew	= FALSE;
+
+U0 QCsFlap(Bool drew)
+{//the classic bar alternating with the HUD means this return is flapping.
+ //name the gate the moment it changes instead of guessing which
+	U8 line[128];
+
+	if (drew == q_cs_last_drew)
+		return;
+
+	q_cs_last_drew = drew;
+	if (q_cs_flap_said >= 8)
+		return;
+
+	q_cs_flap_said++;
+	StrPrint(line, "csqc: hud %d (ok=%d en=%d err=%d frame=%d)\n",
+		drew, q_cs_ok, q_cs_enable, q_pr_error, q_cs_frames);
+	QLog(line);
+	if (q_pr_print)
+		q_pr_print(line);
+}
+
+Bool QCsqcDrawHud(CQCanvas *c, Bool showscores)
+{//TRUE when the client HUD drew this frame - the classic bar then stays away
+	F64 virt[3];
+
+	q_cs_frames++;
+
+	//SCR_CalcRefdef reserves no status-bar rows when the mod owns the HUD
+	q_cs_hud_live = ToBool(q_cs_ok && q_cs_enable);
+
+	if (!q_cs_ok || !q_cs_enable || !c)
+	{
+		QCsFlap(FALSE);
+		return FALSE;
+	}
+
+	//CANVAS_CSQC: s = CLAMP(1, scr_sbarscale, width/320). QHudScale carries
+	//the auto rule (hudscale 0), which the raw option value does not - at
+	//scale 1 on an auto-scaled canvas the HUD drew tiny and off to the side
+	q_cs_scale = QHudScale(c);
+	if (q_cs_scale > c->width / 320)
+		q_cs_scale = c->width / 320;
+	if (q_cs_scale < 1)
+		q_cs_scale = 1;
+
+	q_cs_canvas = c;
+	QCsClipReset;
+
+	QPrVMStore(&q_ssqc_vm);
+	QPrVMLoad(&q_cs_vm);
+
+	if (q_cs_ofs_time >= 0)
+		QPrSetF(q_cs_ofs_time, q_game_time);
+
+	virt[0] = ToF64(c->width / q_cs_scale);
+	virt[1] = ToF64(c->height / q_cs_scale);
+	virt[2] = 0.0;
+
+	QPrSetV(QPR_OFS_PARM0, virt);
+	QPrSetF(QPR_OFS_PARM0 + QPR_PARM_STRIDE, ToF64(showscores));
+
+	q_cs_calls = 0;
+	q_cs_px    = 0;
+	q_cs_miss  = 0;
+
+	if (q_cs_trace)
+	{
+		StrPrint(q_cs_trace_line, "csqc trace: virt %dx%d scale %d\n",
+			c->width / q_cs_scale, c->height / q_cs_scale, q_cs_scale);
+		QLog(q_cs_trace_line);
+		q_cs_trace_n = 0;
+	}
+
+	q_cs_stmts0       = q_pr_stmts;
+	q_pr_builtin_call = &QCsDispatch;
+	QPrExecute(q_cs_fn_drawhud);
+	q_pr_error        = FALSE;
+	q_pr_builtin_call = &QBiDispatch;
+	q_cs_stmts        = q_pr_stmts - q_cs_stmts0;
+
+	QPrVMStore(&q_cs_vm);
+	QPrVMLoad(&q_ssqc_vm);
+
+	if (q_cs_trace)
+	{
+		q_cs_trace = FALSE;
+		QLogFlush;
+	}
+
+	QCsFlap(TRUE);
+
+	return TRUE;
+}

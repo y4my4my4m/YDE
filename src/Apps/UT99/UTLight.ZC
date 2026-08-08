@@ -1,0 +1,322 @@
+// UTLight.ZC - Light actor attenuation + SoftDrv LightMap/FogMap shade.
+//
+// WorldLightRadius = 25 * (LightRadius+1) — AActor.h.
+// SoftDrv DrawSurf SampleLight: LightBits[DataOffset+v*UClamp+u] → 0..1.
+// FogMap FTextureInfo built by Engine GLightManager — absent in packages.
+// Host FogMap sample: LightBits density + zone dim + UTLightFogAt.
+// Actor lights blend with LM sample in UTBspDrawFacet / UTDrawSpanTexRun.
+
+#define UT_LIGHT_MAX		96
+#define UT_LIGHT_AMBIENT	0.45
+
+class CUTLight
+{
+	I64	 exp_i;			//owning export; FLightMapIndex.iLightActors resolves here
+	F64	 origin[3];
+	F64	 radius;
+	F64	 bright;		//0..1 from LightBrightness
+	I64	 hue;			//0..255 LightHue; -1 = white corona
+	I64	 sat;			//LightSaturation; 255 = white, 0 = full hue
+	U8	 tag[48];
+	Bool triggerable;	//TriggerLight — Event toggles active
+	Bool flicker;		//TorchFlame SoftDrv pulse
+	Bool active;
+};
+
+CUTLight	ut_lights[UT_LIGHT_MAX];
+I64			ut_light_n		= 0;
+Bool		ut_light_ready	= FALSE;
+
+U0 UTLightHueRGB(I64 hue, I64 sat, F64 *r, F64 *g, F64 *b)
+{//GlobalLighting takes the colour from HSV(LightHue, LightSaturation, 255).
+ //UE1 saturation is inverted from the usual sense: 255 is white, 0 is the
+ //full hue, which is why untinted lights carry the default 255.
+	F64 h;
+	F64 f;
+	F64 amount;
+	F64 cr;
+	F64 cg;
+	F64 cb;
+	I64 sector;
+
+	cr = 1.0;
+	cg = 1.0;
+	cb = 1.0;
+	if (hue >= 0)
+	{
+		h = ToF64(hue & 255) * 6.0 / 256.0;
+		sector = ToI64(h);
+		f = h - ToF64(sector);
+		if (sector == 0)
+		{
+			cr = 1.0; cg = f; cb = 0.0;
+		}
+		else if (sector == 1)
+		{
+			cr = 1.0 - f; cg = 1.0; cb = 0.0;
+		}
+		else if (sector == 2)
+		{
+			cr = 0.0; cg = 1.0; cb = f;
+		}
+		else if (sector == 3)
+		{
+			cr = 0.0; cg = 1.0 - f; cb = 1.0;
+		}
+		else if (sector == 4)
+		{
+			cr = f; cg = 0.0; cb = 1.0;
+		}
+		else
+		{
+			cr = 1.0; cg = 0.0; cb = 1.0 - f;
+		}
+	}
+	//sat 255 -> white, sat 0 -> pure hue.
+	amount = 1.0;
+	if (sat >= 0)
+		amount = 1.0 - ToF64(sat & 255) / 255.0;
+	*r = cr * amount + (1.0 - amount);
+	*g = cg * amount + (1.0 - amount);
+	*b = cb * amount + (1.0 - amount);
+}
+
+I64 UTLightFindByExport(I64 exp_ref)
+{//Model->Lights holds 1-based export refs; 0 terminates a surface's run.
+	I64 i;
+
+	if (exp_ref <= 0)
+		return -1;
+	i = 0;
+	while (i < ut_light_n)
+	{
+		if (ut_lights[i].exp_i == exp_ref - 1)
+			return i;
+		i++;
+	}
+	return -1;
+}
+
+U0 UTLightClear()
+{
+	ut_light_n = 0;
+	ut_light_ready = FALSE;
+}
+
+Bool UTLightClassMatch(U8 *cls)
+{
+	if (!cls)
+		return FALSE;
+	if (!StrCompare(cls, "Light"))
+		return TRUE;
+	if (!StrCompare(cls, "Spotlight") || !StrCompare(cls, "SpotLight"))
+		return TRUE;
+	if (!StrCompare(cls, "TorchFlame") || !StrCompare(cls, "FlameThrowerFlame"))
+		return TRUE;
+	if (!StrCompare(cls, "TriggerLight"))
+		return TRUE;
+	return FALSE;
+}
+
+U0 UTLightScanPackage(CUTPackage *pkg)
+{
+	I64 i;
+	I64 li;
+	CUTExport *e;
+	U8 *cls;
+	F64 v[3];
+	CUTPropBag bag;
+	CUTLight *L;
+	F64 sum_b;
+	F64 sum_r;
+	F64 min_r;
+	F64 max_r;
+
+	UTLightClear;
+	if (!pkg)
+		return;
+	i = 0;
+	while (i < pkg->export_count && ut_light_n < UT_LIGHT_MAX)
+	{
+		e = &pkg->exports[i];
+		cls = UTPkgClassName(pkg, e->class_index);
+		if (UTLightClassMatch(cls))
+		{
+			if (UTPropFindStructVec(pkg, e->serial_offset, e->serial_size,
+				"Location", v))
+			{
+				li = ut_light_n;
+				L = &ut_lights[li];
+				MemSet(L, 0, sizeof(CUTLight));
+				L->exp_i = i;
+				UTVecCopy(v, L->origin);
+				//Light.uc defaults: LightBrightness=64, LightRadius=64,
+				//LightSaturation=255. WorldLightRadius = 25*(LightRadius+1).
+				//The map only stores properties that differ from these, so a
+				//wrong default silently halves or dims most lights.
+				L->radius = 25.0 * 65.0;
+				L->bright = 64.0 / 255.0;
+				L->sat = 255;
+				L->hue = -1;
+				L->tag[0] = 0;
+				L->triggerable = FALSE;
+				L->flicker = FALSE;
+				L->active = TRUE;
+				if (!StrCompare(cls, "TriggerLight"))
+				{
+					L->triggerable = TRUE;
+					L->active = FALSE;	//default initially off
+				}
+				if (!StrCompare(cls, "TorchFlame") ||
+					!StrCompare(cls, "FlameThrowerFlame"))
+					L->flicker = TRUE;
+				if (UTPropLoadBag(pkg, e->serial_offset, e->serial_size,
+					e->object_flags, &bag))
+				{
+					if (bag.light_radius >= 0)
+						L->radius = 25.0 * (ToF64(bag.light_radius) + 1.0);
+					if (bag.light_brightness >= 0)
+						L->bright = ToF64(bag.light_brightness) / 255.0;
+					L->sat = 255;
+					if (bag.light_sat >= 0)
+						L->sat = bag.light_sat;
+					if (bag.light_hue >= 0)
+						L->hue = bag.light_hue & 255;
+					if (bag.tag_name[0])
+						StrPrint(L->tag, "%s", bag.tag_name);
+					//A light really can be authored dim or small; clamping
+					//it back up invented light the map does not have.
+				}
+				ut_light_n++;
+			}
+		}
+		i++;
+	}
+	ut_light_ready = (ut_light_n > 0);
+	UTLog("UTLight: %d lights\n", ut_light_n);
+	if (ut_light_n > 0)
+	{
+		sum_b = 0.0;
+		sum_r = 0.0;
+		min_r = 1.0e9;
+		max_r = 0.0;
+		li = 0;
+		while (li < ut_light_n)
+		{
+			sum_b += ut_lights[li].bright;
+			sum_r += ut_lights[li].radius;
+			if (ut_lights[li].radius < min_r)
+				min_r = ut_lights[li].radius;
+			if (ut_lights[li].radius > max_r)
+				max_r = ut_lights[li].radius;
+			li++;
+		}
+		UTLog("UTLight: bright avg=%.3f radius avg=%.0f min=%.0f max=%.0f\n",
+			sum_b / ToF64(ut_light_n), sum_r / ToF64(ut_light_n),
+			min_r, max_r);
+	}
+}
+
+U0 UTLightToggleByTag(U8 *tag)
+{//Trigger.Event → TriggerLight.Tag
+	I64 i;
+	CUTLight *L;
+
+	if (!tag || !tag[0])
+		return;
+	i = 0;
+	while (i < ut_light_n)
+	{
+		L = &ut_lights[i];
+		if (L->triggerable && L->tag[0] && !StrCompare(L->tag, tag))
+			L->active = !L->active;
+		i++;
+	}
+}
+
+F64 UTLightShadeAt(F64 *p)
+{//0..1 SoftDrv facet shade. Ambient + inverse-square-ish falloff.
+	I64 i;
+	CUTLight *L;
+	F64 dx;
+	F64 dy;
+	F64 dz;
+	F64 d;
+	F64 t;
+	F64 shade;
+	F64 contrib;
+
+	if (!p)
+		return 1.0;
+	if (!ut_light_ready || ut_light_n < 1)
+		return 1.0;
+	shade = UT_LIGHT_AMBIENT;
+	i = 0;
+	while (i < ut_light_n)
+	{
+		L = &ut_lights[i];
+		if (L->active && L->radius > 1.0)
+		{
+			dx = p[0] - L->origin[0];
+			dy = p[1] - L->origin[1];
+			dz = p[2] - L->origin[2];
+			d = Sqrt(dx * dx + dy * dy + dz * dz);
+			if (d < L->radius)
+			{
+				t = 1.0 - d / L->radius;
+				contrib = L->bright * t * t;
+				if (L->flicker)
+					contrib = contrib *
+						(0.65 + 0.35 * Sin(tS * 14.0 + ToF64(i) * 1.7));
+				shade += contrib;
+			}
+		}
+		i++;
+	}
+	if (shade > 1.0)
+		shade = 1.0;
+	if (shade < 0.12)
+		shade = 0.12;
+	return shade;
+}
+
+F64 UTLightFogAt(F64 *p)
+{//GLightManager FogMap stand-in: haze near bright lights.
+ //SoftDrv FogMap RGB photons absent; return 0.55..1.0 multiply.
+	I64 i;
+	CUTLight *L;
+	F64 dx;
+	F64 dy;
+	F64 dz;
+	F64 d;
+	F64 haze;
+	F64 t;
+
+	haze = 1.0;
+	if (!p || !ut_light_ready || ut_light_n < 1)
+		return haze;
+	i = 0;
+	while (i < ut_light_n)
+	{
+		L = &ut_lights[i];
+		if (L->active && L->radius > 1.0)
+		{
+			dx = p[0] - L->origin[0];
+			dy = p[1] - L->origin[1];
+			dz = p[2] - L->origin[2];
+			d = Sqrt(dx * dx + dy * dy + dz * dz);
+			if (d < L->radius * 1.25)
+			{
+				t = 1.0 - d / (L->radius * 1.25);
+				//Near light → clearer; far → more haze
+				haze -= L->bright * t * 0.12;
+			}
+		}
+		i++;
+	}
+	if (haze < 0.55)
+		haze = 0.55;
+	if (haze > 1.0)
+		haze = 1.0;
+	return haze;
+}

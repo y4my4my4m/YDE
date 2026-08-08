@@ -7,6 +7,8 @@ release: everything here is written against the published file format specs
 It plays: software rasterizer, QuakeC VM, save/load, demos, sound, and UDP
 multiplayer against other ZealOS boxes or a stock NetQuake client.
 
+FitzQuake / QuakeSpasm / Ironwail-class mods live in `::/Apps/QuakePlus`.
+
 
 ## Game data
 

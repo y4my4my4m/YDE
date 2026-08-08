@@ -1,0 +1,2312 @@
+//TrFtm.ZC - FamiTracker .FTM reader. Depends on TrDef, TrSmp, TrMix.
+//
+//Little-endian throughout.
+//
+//File header:
+//    0x00   18  "FamiTracker Module", ASCII, no NUL and no padding
+//    0x12    4  u32 file version, BCD-ish: 0x0440 is 4.40
+//    0x16   ..  first block
+//Dn-FamiTracker writes "Dn-FamiTracker Module", 21 bytes, version at 0x15 and
+//the first block at 0x19. Accepted versions are 0x0200..0x0450.
+//
+//Block header, 24 bytes:
+//    0x00   16  ID, ASCII, zero-padded to 16
+//    0x10    4  u32 block version
+//    0x14    4  u32 payload size, excluding this header
+//    0x18   ..  payload
+//The file ends with "END": three bytes, no version, no size. Blocks are
+//independently addressed, so a misparse inside one costs only that block.
+//Block version gates the layout; the file version gates almost nothing.
+//
+//Blocks read here: PARAMS, INFO, HEADER, INSTRUMENTS, SEQUENCES, FRAMES,
+//PATTERNS and "DPCM SAMPLES" (note the space). Everything else is skipped by
+//its declared size. PARAMS, HEADER, FRAMES and PATTERNS are required; the
+//0.5.0 beta TRACK block that replaces the last three is rejected.
+//
+//Only the first track of a multi-track module is loaded. Later tracks are
+//parsed to keep the byte stream aligned inside FRAMES and PATTERNS, then
+//discarded.
+//
+//Channel to engine mapping. FTM is a chip format and this engine plays
+//samples, so each channel kind becomes a synthesised waveform. The chip mask
+//decides which kinds a module has; TrFtmChanMap holds the order.
+//    pulse     2A03 and MMC5 -> TR_BANK_DUTY, four widths, Vxx or the duty
+//                              macro selects
+//    triangle                -> TRI_TRIANGLE
+//    noise                   -> one LFSR sequence at sixteen rates, the note's
+//                              low nibble inverted picking the rate, and Vxx
+//                              choosing the long or short sequence
+//    DPCM                    -> the decoded sample from the key table
+//    VRC6 pulse              -> TR_BANK_V6DUTY, eight widths
+//    VRC6 saw                -> the seven-step staircase the accumulator makes
+//    FDS, N163               -> the instrument's own wavetable, one sample per
+//                              instrument
+//    VRC7                    -> the 2-operator OPLL patch baked at eight
+//                              modulation depths, the duty macro walking them
+//                              to reproduce the modulator's envelope
+//
+//Sequences: volume, arpeggio, pitch, hi-pitch and duty all map. On the
+//triangle the volume sequence is a GATE, not a level: the channel has no
+//volume DAC, so any nonzero value plays full.
+//
+//Not reproduced: OPLL key scaling, tremolo and vibrato; a VRC7 modulator
+//envelope longer than TR_MACRO_LEN ticks, which holds at the depth tick 63
+//reached.
+//
+//An FTM instrument carries sequences plus a DPCM key table and may be played
+//on any channel, so one engine instrument cannot serve all of them. One
+//engine instrument is built per (FTM instrument, channel kind) pair actually
+//used in the patterns, and the pattern's instrument column is remapped to it.
+//64 instruments times 4 kinds is 256, one more than the 255 usable engine
+//slots; a pair that finds no free slot loses its instrument column.
+//
+//Frames. FamiTracker gives every channel its own pattern index per frame;
+//the engine has one pattern per order position shared by all channels. Each
+//frame is therefore flattened into its own engine pattern and the order list
+//is the identity 0..frames-1.
+//
+//Timing. FTM's tempo sets the ROW rate and the tick rate stays pinned to the
+//refresh, the opposite of the Amiga model. Rows per minute is tempo * 24 /
+//speed. The engine's tick is TR_RATE * 2.5 / bpm frames and a row is speed
+//ticks, so its rows per minute is 60 * bpm / (2.5 * speed) = 24 * bpm / speed.
+//The two agree exactly at bpm = tempo, speed = speed, which is the mapping
+//used. The tick rate then scales as tempo / 150 rather than staying at 60 Hz,
+//so at non-default tempos macros and vibrato run proportionally fast or slow.
+//Tempo 0 means speed ticks per row at the refresh rate: bpm 150 NTSC,
+//125 PAL.
+
+#define TRFTM_SIG			"FamiTracker Module"
+#define TRFTM_SIG_LEN		18
+#define TRFTM_SIG_DN		"Dn-FamiTracker Module"
+#define TRFTM_SIG_DN_LEN	21
+#define TRFTM_VER_MIN		0x0200
+#define TRFTM_VER_MAX		0x0450
+#define TRFTM_BLK_MAX		50000000	//Largest payload FamiTracker accepts.
+
+#define TRFTM_B_PARAMS		0
+#define TRFTM_B_INFO		1
+#define TRFTM_B_HEADER		2
+#define TRFTM_B_INSTS		3
+#define TRFTM_B_SEQS		4
+#define TRFTM_B_FRAMES		5
+#define TRFTM_B_PATS		6
+#define TRFTM_B_DPCM		7
+#define TRFTM_B_SEQ_VRC6	8
+#define TRFTM_B_SEQ_N163	9
+#define TRFTM_B_SEQ_S5B		10
+#define TRFTM_B_GROOVES		11
+#define TRFTM_B_COUNT		12
+
+#define TRFTM_CHANS			5	//2A03: pulse 1, pulse 2, triangle, noise, DPCM.
+#define TRFTM_MAXCHANS		29	//Longest channel list FamiTracker declares.
+#define TRFTM_MAXTRACKS		256	//Track count is a u8 plus one.
+
+//Channel kinds. A kind is a way of making sound, not a chip: the MMC5's
+//pulses are the 2A03's, so they share one.
+#define TRFTM_KIND_PULSE	0	//2A03 and MMC5 pulse, four widths
+#define TRFTM_KIND_TRI		1
+#define TRFTM_KIND_NOISE	2
+#define TRFTM_KIND_DPCM		3
+#define TRFTM_KIND_V6PULSE	4	//VRC6 pulse, eight widths
+#define TRFTM_KIND_V6SAW	5	//VRC6 sawtooth
+#define TRFTM_KIND_FDS		6	//FDS wavetable
+#define TRFTM_KIND_N163		7	//N163 wavetable
+#define TRFTM_KIND_VRC7		8	//VRC7 FM
+#define TRFTM_KIND_S5B		9	//S5B square
+#define TRFTM_KINDS			10
+
+//Chip mask bits, as PARAMS stores them.
+#define TRFTM_CHIP_VRC6		0x01
+#define TRFTM_CHIP_VRC7		0x02
+#define TRFTM_CHIP_FDS		0x04
+#define TRFTM_CHIP_MMC5		0x08
+#define TRFTM_CHIP_N163		0x10
+#define TRFTM_CHIP_S5B		0x20
+
+#define TRFTM_INSTS_MAX		64
+#define TRFTM_SEQS_MAX		128
+#define TRFTM_SEQ_TYPES		5	//Volume, arpeggio, pitch, hi-pitch, duty.
+#define TRFTM_SEQ_ALL		640	//TRFTM_SEQS_MAX * TRFTM_SEQ_TYPES.
+#define TRFTM_KEYS			96	//8 octaves of 12 notes in the DPCM key table.
+#define TRFTM_DPCM_MAX		64
+#define TRFTM_DPCM_BYTES	0x7FFF	//Declared sample size ceiling.
+#define TRFTM_PAIRS_MAX		64	//Decoded (sample, pitch, loop, delta) slots.
+#define TRFTM_PCM_BUDGET	4000000	//Decoded frames across all DPCM slots.
+
+//Instrument types, as stored in the INSTRUMENTS record.
+#define TRFTM_INST_2A03		1
+#define TRFTM_INST_VRC6		2
+#define TRFTM_INST_VRC7		3
+#define TRFTM_INST_FDS		4
+#define TRFTM_INST_N163		5
+#define TRFTM_INST_S5B		6
+
+#define TRFTM_WAVE_MAX		64	//Longest wave kept per entry; FDS is exactly 64.
+#define TRFTM_INST_WAVES	8	//N163 waves kept per instrument.
+#define TRFTM_FDS_WAVE		64
+#define TRFTM_INL_SEQS		3	//FDS inline sequences: volume, arpeggio, pitch.
+
+//Sequence types, as stored.
+#define TRFTM_SEQ_VOL		0
+#define TRFTM_SEQ_ARP		1
+#define TRFTM_SEQ_PITCH		2
+#define TRFTM_SEQ_HIPITCH	3
+#define TRFTM_SEQ_DUTY		4
+
+//DPCM period tables, pitch index 0..15. Output rate is the CPU clock over the
+//period. The rate table is the ONLY DPCM difference between NTSC and PAL: the
+//delta counter, looping and sample addressing are identical. NESdev records
+//that PAL indices 4 and 12 miss their intended A-440 tuning; that is the
+//hardware, not a transcription error.
+#define TRFTM_CPU_NTSC		1789773
+#define TRFTM_CPU_PAL		1662607
+
+I64 tr_ftm_dpcm_period[16] = {
+	428, 380, 340, 320, 286, 254, 226, 214,
+	190, 160, 142, 128, 106,  84,  72,  54};
+
+I64 tr_ftm_dpcm_period_pal[16] = {
+	398, 354, 316, 298, 276, 236, 210, 198,
+	176, 148, 132, 118,  98,  78,  66,  50};
+
+//PARAMS machine field. Only the 2A03 has a PAL variant; every expansion chip
+//runs off the CPU clock and keeps its NTSC numbers.
+Bool		tr_ftm_pal;
+
+//VRC7 built-in patches 1..15, eight bytes each, from the silicon ROM dump on
+//the NESdev wiki. Patch 0 is the instrument's own eight registers.
+U8 tr_ftm_vrc7_patch[15][8] = {
+	{0x03, 0x21, 0x05, 0x06, 0xE8, 0x81, 0x42, 0x27},	//Buzzy Bell
+	{0x13, 0x41, 0x14, 0x0D, 0xD8, 0xF6, 0x23, 0x12},	//Guitar
+	{0x11, 0x11, 0x08, 0x08, 0xFA, 0xB2, 0x20, 0x12},	//Wurly
+	{0x31, 0x61, 0x0C, 0x07, 0xA8, 0x64, 0x61, 0x27},	//Flute
+	{0x32, 0x21, 0x1E, 0x06, 0xE1, 0x76, 0x01, 0x28},	//Clarinet
+	{0x02, 0x01, 0x06, 0x00, 0xA3, 0xE2, 0xF4, 0xF4},	//Synth
+	{0x21, 0x61, 0x1D, 0x07, 0x82, 0x81, 0x11, 0x07},	//Trumpet
+	{0x23, 0x21, 0x22, 0x17, 0xA2, 0x72, 0x01, 0x17},	//Organ
+	{0x35, 0x11, 0x25, 0x00, 0x40, 0x73, 0x72, 0x01},	//Bells
+	{0xB5, 0x01, 0x0F, 0x0F, 0xA8, 0xA5, 0x51, 0x02},	//Vibes
+	{0x17, 0xC1, 0x24, 0x07, 0xF8, 0xF8, 0x22, 0x12},	//Vibraphone
+	{0x71, 0x23, 0x11, 0x06, 0x65, 0x74, 0x18, 0x16},	//Tutti
+	{0x01, 0x02, 0xD3, 0x05, 0xC9, 0x95, 0x03, 0x02},	//Fretless
+	{0x61, 0x63, 0x0C, 0x00, 0x94, 0xC0, 0x33, 0xF6},	//Synth Bass
+	{0x21, 0x72, 0x0D, 0x00, 0xC1, 0xD5, 0x56, 0x06}};	//Sweep
+
+U8 *tr_ftm_block_ids[TRFTM_B_COUNT] = {
+	"PARAMS", "INFO", "HEADER", "INSTRUMENTS",
+	"SEQUENCES", "FRAMES", "PATTERNS", "DPCM SAMPLES",
+	"SEQUENCES_VRC6", "SEQUENCES_N163", "SEQUENCES_S5B", "GROOVES"};
+
+class CTrFtmCur
+{//Bounded cursor over one block payload. Every read past end sets over and
+//yields zero, so a truncated block degrades instead of over-reading.
+	U8	*base;
+	I64	 pos;
+	I64	 end;
+	Bool over;
+};
+
+class CTrFtmSeq
+{//One FamiTracker sequence, already clamped to the engine macro length.
+	I64	 len;			//Items kept, 0..TR_MACRO_LEN.
+	I64	 loop, release;	//-1 for none.
+	I64	 setting;		//Arpeggio scheme for the arpeggio type.
+	Bool used;
+	I8	 val[TR_MACRO_LEN];
+};
+
+class CTrFtmInst
+{
+	Bool used;
+	I64	 type;					//TRFTM_INST_*, which chip's instrument this is.
+	U8	 name[TR_SMP_NAME];
+	U8	 seq_on[TRFTM_SEQ_TYPES];
+	U8	 seq_idx[TRFTM_SEQ_TYPES];
+	U8	 key_smp[TRFTM_KEYS];	//1-based DPCM slot, 0 = none.
+	U8	 key_pitch[TRFTM_KEYS];	//Bits 0-3 pitch index, bit 7 loop.
+	U8	 key_delta[TRFTM_KEYS];	//0xFF = do not preload the DAC.
+	//Wavetable chips carry their waveform in the instrument. FDS holds 64
+	//steps of 6 bits; N163 holds wave_len 4-bit samples, one per byte, and
+	//only its first wave is kept.
+	U8	 wave[TRFTM_WAVE_MAX * TRFTM_INST_WAVES];
+	I64	 wave_len;
+	I64	 wave_n;			//Waves kept, 1 for FDS.
+	I64	 vrc7_patch;			//0 = the custom patch in vrc7_reg.
+	U8	 vrc7_reg[8];
+	//FDS overrides the shared header and stores its sequences inline in the
+	//instrument rather than in a SEQUENCES block.
+	CTrFtmSeq inl[TRFTM_INL_SEQS];
+	I64	 eng[TRFTM_KINDS];		//Engine instrument slot per channel kind.
+};
+
+CTrFtmSeq	tr_ftm_seq[TRFTM_SEQ_TYPES][TRFTM_SEQS_MAX];
+//VRC6, N163 and S5B keep their sequences in their own blocks, indexed the
+//same way. One set is kept: a module with two expansion chips resolves both
+//against whichever block came first.
+CTrFtmSeq	tr_ftm_xseq[TRFTM_SEQ_TYPES][TRFTM_SEQS_MAX];
+Bool		tr_ftm_xseq_used;
+CTrFtmInst	tr_ftm_ins[TRFTM_INSTS_MAX];
+//First-pass (index, type) list: SEQUENCES stores release and setting in a
+//trailing pass at block versions 5 and 6.
+I64			tr_ftm_pass_idx[TRFTM_SEQ_ALL];
+I64			tr_ftm_pass_type[TRFTM_SEQ_ALL];
+I64			tr_ftm_pass_n;
+
+I64			tr_ftm_dpcm_off[TRFTM_DPCM_MAX];
+I64			tr_ftm_dpcm_len[TRFTM_DPCM_MAX];
+//Decoded DPCM slots, keyed by everything that changes the PCM or its rate.
+I64			tr_ftm_pair_smp[TRFTM_PAIRS_MAX];
+I64			tr_ftm_pair_pitch[TRFTM_PAIRS_MAX];
+I64			tr_ftm_pair_loop[TRFTM_PAIRS_MAX];
+I64			tr_ftm_pair_delta[TRFTM_PAIRS_MAX];
+I64			tr_ftm_pair_slot[TRFTM_PAIRS_MAX];
+I64			tr_ftm_pairs;
+I64			tr_ftm_pcm_used;
+
+//Pattern data is stored per (channel position, pattern index) because a frame
+//names a different pattern for every channel.
+CTrCell	   *tr_ftm_col[TRFTM_MAXCHANS][TR_MAX_PATTERNS];
+U8			tr_ftm_order[TR_ORDER_MAX][TRFTM_MAXCHANS];
+//Kind of each channel POSITION, filled by TrFtmChanMap from the chip mask.
+I64			tr_ftm_kind[TRFTM_MAXCHANS];
+I64			tr_ftm_gain_max;	//Loudest chip gain this module uses.
+
+//Noise rate anchor: the CPU clock over the longest noise period, 1789773 /
+//4068, scaled so engine note 1 sounds there. TrC5StepMul anchors at note 61,
+//five octaves up, hence the 32x.
+#define TRFTM_NOISE_HZ		14079
+
+//Engine note offset for each value written to $$400E, which is the note's low
+//nibble inverted. The 2A03 noise period table is within 13 cents of semitone
+//spacing across its whole range, so one waveform at 16 transposed rates is
+//the same sound as 16 separate rates.
+I64 tr_ftm_noise_xpose[16] = {120, 108, 96, 84, 72, 65, 60, 56,
+							  52,  48,  41, 36, 29, 24, 12, 0};
+
+//Parse context shared by the block readers.
+I64			tr_ftm_file_ver;
+I64			tr_ftm_split;		//Fxx speed/tempo split point.
+I64			tr_ftm_chans;		//Declared channel count, 2A03 plus expansion.
+I64			tr_ftm_tracks;
+I64			tr_ftm_fx[TRFTM_MAXCHANS];	//Effect columns minus one, track 0.
+U8		   *tr_ftm_raw;
+I64			tr_ftm_size;
+
+U0 TrFtmCurSet(CTrFtmCur *c, U8 *raw, I64 off, I64 len)
+{
+	c->base = raw;
+	c->pos	= off;
+	c->end	= off + len;
+	c->over	= FALSE;
+}
+
+I64 TrFtmRdU8(CTrFtmCur *c)
+{
+	I64 v;
+
+	if (c->pos < 0 || c->pos >= c->end)
+	{
+		c->over = TRUE;
+		return 0;
+	}
+	v = c->base[c->pos];
+	c->pos++;
+
+	return v;
+}
+
+I64 TrFtmRdI8(CTrFtmCur *c)
+{
+	I64 v = TrFtmRdU8(c);
+
+	if (v > 127)
+		v -= 256;
+
+	return v;
+}
+
+I64 TrFtmRdU32(CTrFtmCur *c)
+{//Bytes widened to I64 first; the top one would otherwise land on bit 31.
+	I64 a = TrFtmRdU8(c);
+	I64 b = TrFtmRdU8(c);
+	I64 d = TrFtmRdU8(c);
+	I64 e = TrFtmRdU8(c);
+
+	return a | (b << 8) | (d << 16) | (e << 24);
+}
+
+I64 TrFtmRdI32(CTrFtmCur *c)
+{
+	I64 v = TrFtmRdU32(c);
+
+	if (v > 0x7FFFFFFF)
+		v -= 0x100000000;
+
+	return v;
+}
+
+U0 TrFtmSkip(CTrFtmCur *c, I64 n)
+{
+	if (n < 0 || c->pos + n > c->end)
+	{
+		c->pos	= c->end;
+		c->over	= TRUE;
+		return;
+	}
+	c->pos += n;
+}
+
+U0 TrFtmSkipStr(CTrFtmCur *c)
+{//NUL-terminated string. Stops at the payload end.
+	while (c->pos < c->end)
+	{
+		if (!c->base[c->pos])
+		{
+			c->pos++;
+			return;
+		}
+		c->pos++;
+	}
+	c->over = TRUE;
+}
+
+I64 TrFtmHeader(U8 *raw, I64 size, I64 *_ver)
+{//Offset of the first block, or 0 if the signature or version is wrong.
+	I64 off = 0, ver;
+
+	*_ver = 0;
+	if (size < TRFTM_SIG_LEN + 4 + 3)
+		return 0;
+	if (!MemCompare(raw, TRFTM_SIG, TRFTM_SIG_LEN))
+		off = TRFTM_SIG_LEN;
+	else if (size >= TRFTM_SIG_DN_LEN + 4 + 3 &&
+			 !MemCompare(raw, TRFTM_SIG_DN, TRFTM_SIG_DN_LEN))
+		off = TRFTM_SIG_DN_LEN;
+	else
+		return 0;
+	ver = TrRdU32LE(raw + off);
+	//Below 0x0200 is a different pre-block format.
+	if (ver < TRFTM_VER_MIN || ver > TRFTM_VER_MAX)
+		return 0;
+	*_ver = ver;
+
+	return off + 4;
+}
+
+I64 TrFtmChanMap(I64 chip, I64 n163)
+{//Fill tr_ftm_kind in the order FamiTracker lays channels out and return the
+//count. Order is ascending chan_id, NOT the order of the mask bits:
+//    0..4    2A03 pulse 1, pulse 2, triangle, noise, DPCM   always present
+//    5..7    VRC6 pulse 1, pulse 2, sawtooth
+//    8..9    MMC5 pulse 1, pulse 2       id 10 is skipped, so MMC5 adds two
+//    11..18  N163, only the first n163 of them
+//    19      FDS
+//    20..25  VRC7
+//    26..28  S5B
+//The channel type bytes in HEADER are ignored, as FamiTracker ignores them;
+//this mapping is the only thing that decides what a position plays.
+	I64 n = 0, i;
+
+	tr_ftm_kind[n++] = TRFTM_KIND_PULSE;
+	tr_ftm_kind[n++] = TRFTM_KIND_PULSE;
+	tr_ftm_kind[n++] = TRFTM_KIND_TRI;
+	tr_ftm_kind[n++] = TRFTM_KIND_NOISE;
+	tr_ftm_kind[n++] = TRFTM_KIND_DPCM;
+	if (chip & TRFTM_CHIP_VRC6)
+	{
+		tr_ftm_kind[n++] = TRFTM_KIND_V6PULSE;
+		tr_ftm_kind[n++] = TRFTM_KIND_V6PULSE;
+		tr_ftm_kind[n++] = TRFTM_KIND_V6SAW;
+	}
+	if (chip & TRFTM_CHIP_MMC5)
+	{
+		tr_ftm_kind[n++] = TRFTM_KIND_PULSE;
+		tr_ftm_kind[n++] = TRFTM_KIND_PULSE;
+	}
+	if (chip & TRFTM_CHIP_N163)
+	{
+		n163 = ClampI64(n163, 1, 8);
+		for (i = 0; i < n163; i++)
+			tr_ftm_kind[n++] = TRFTM_KIND_N163;
+	}
+	if (chip & TRFTM_CHIP_FDS)
+		tr_ftm_kind[n++] = TRFTM_KIND_FDS;
+	if (chip & TRFTM_CHIP_VRC7)
+		for (i = 0; i < 6; i++)
+			tr_ftm_kind[n++] = TRFTM_KIND_VRC7;
+	if (chip & TRFTM_CHIP_S5B)
+		for (i = 0; i < 3; i++)
+			tr_ftm_kind[n++] = TRFTM_KIND_S5B;
+
+	return n;
+}
+
+I64 TrFtmProbe(U8 *raw, I64 size)
+{//Non-zero if this is an FTM. The value is the 2A03 channel count, which is
+//the minimum any module has; the real count depends on the chip mask in
+//PARAMS and is set by the loader.
+	I64 ver;
+
+	if (!TrFtmHeader(raw, size, &ver))
+		return 0;
+
+	return TRFTM_CHANS;
+}
+
+Bool TrFtmScan(U8 *raw, I64 size, I64 first, I64 *off, I64 *ver, I64 *len)
+{//Index the blocks we care about. First occurrence of each ID wins. Returns
+//FALSE only if nothing at all parsed.
+	I64	 p = first, i, bver, bsize, n = 0;
+	U8	 id[17];
+
+	for (i = 0; i < TRFTM_B_COUNT; i++)
+	{
+		off[i] = -1;
+		ver[i] = 0;
+		len[i] = 0;
+	}
+	while (p >= 0 && p + 3 <= size)
+	{
+		if (!MemCompare(raw + p, "END", 3))
+			break;
+		if (p + 24 > size)
+			break;
+		MemCopy(id, raw + p, 16);
+		id[16]	= 0;
+		bver	= TrRdU32LE(raw + p + 16);
+		bsize	= TrRdU32LE(raw + p + 20);
+		if (bsize < 0 || bsize > TRFTM_BLK_MAX)
+			break;
+		//A truncated final block is kept at whatever length remains.
+		if (p + 24 + bsize > size)
+			bsize = size - p - 24;
+		for (i = 0; i < TRFTM_B_COUNT; i++)
+			if (off[i] < 0 && !StrCompare(id, tr_ftm_block_ids[i]))
+			{
+				off[i] = p + 24;
+				ver[i] = bver;
+				len[i] = bsize;
+			}
+		n++;
+		p += 24 + bsize;
+	}
+
+	return n > 0;
+}
+
+U0 TrFtmSeqLoad(U8 *raw, I64 off, I64 len, I64 bver, CTrFtmSeq *dst,
+				Bool inl_rel)
+{//A SEQUENCES block. The 2A03 and VRC6 blocks put release and setting in a
+//trailing pass; N163 and S5B store them inline at every version, which is
+//what inl_rel selects. Block versions below 3 use an older layout that is not
+//decoded; those files load without macros.
+	CTrFtmCur	cur;
+	CTrFtmSeq  *s;
+	I64			count, i, j, idx, type, items, loop, rel, set, v, keep;
+
+	if (bver < 3)
+		return;
+	TrFtmCurSet(&cur, raw, off, len);
+	count = TrFtmRdI32(&cur);
+	if (count < 0)
+		count = 0;
+	if (count > TRFTM_SEQ_ALL)
+		count = TRFTM_SEQ_ALL;
+	tr_ftm_pass_n = 0;
+	for (i = 0; i < count; i++)
+	{
+		if (cur.over)
+			break;
+		idx		= TrFtmRdI32(&cur);
+		type	= TrFtmRdI32(&cur);
+		items	= TrFtmRdU8(&cur);
+		loop	= TrFtmRdI32(&cur);
+		rel		= -1;
+		set		= 0;
+		if (inl_rel)
+		{
+			rel = TrFtmRdI32(&cur);
+			set = TrFtmRdI32(&cur);
+		}
+		tr_ftm_pass_idx[tr_ftm_pass_n]	= idx;
+		tr_ftm_pass_type[tr_ftm_pass_n]	= type;
+		tr_ftm_pass_n++;
+		keep = items;
+		if (keep > TR_MACRO_LEN)
+			keep = TR_MACRO_LEN;
+		if (0 <= type < TRFTM_SEQ_TYPES && 0 <= idx < TRFTM_SEQS_MAX)
+		{
+			s			= &dst[type * TRFTM_SEQS_MAX + idx];
+			s->used		= TRUE;
+			s->len		= keep;
+			s->loop		= loop;
+			s->release	= rel;
+			s->setting	= set;
+			for (j = 0; j < items; j++)
+			{
+				v = TrFtmRdI8(&cur);
+				if (j < keep)
+					s->val[j] = v;
+			}
+		}
+		else
+			for (j = 0; j < items; j++)
+				TrFtmRdI8(&cur);
+	}
+	if (inl_rel)
+		return;
+	if (bver == 5)
+	{//One (release, setting) pair for every slot, index-major, type-minor.
+		for (idx = 0; idx < TRFTM_SEQS_MAX; idx++)
+			for (type = 0; type < TRFTM_SEQ_TYPES; type++)
+			{
+				rel = TrFtmRdI32(&cur);
+				set = TrFtmRdI32(&cur);
+				if (cur.over)
+					return;
+				s = &dst[type * TRFTM_SEQS_MAX + idx];
+				if (s->used)
+				{
+					s->release	= rel;
+					s->setting	= set;
+				}
+			}
+	}
+	else if (bver >= 6)
+	{//One pair per sequence, in first-pass order.
+		for (i = 0; i < tr_ftm_pass_n; i++)
+		{
+			rel = TrFtmRdI32(&cur);
+			set = TrFtmRdI32(&cur);
+			if (cur.over)
+				return;
+			idx		= tr_ftm_pass_idx[i];
+			type	= tr_ftm_pass_type[i];
+			if (0 <= type < TRFTM_SEQ_TYPES && 0 <= idx < TRFTM_SEQS_MAX)
+			{
+				dst[type * TRFTM_SEQS_MAX + idx].release	= rel;
+				dst[type * TRFTM_SEQS_MAX + idx].setting	= set;
+			}
+		}
+	}
+}
+
+U0 TrFtmInlSeq(CTrFtmCur *cur, CTrFtmInst *ip, I64 slot)
+{//One FDS inline sequence: u8 count, then loop, release and setting as i32,
+//then the items. Shaped differently from the SEQUENCES block, which stores
+//the count as i32 and puts release and setting in a trailing pass.
+	CTrFtmSeq	*s = NULL;
+	I64			 n, i, v, loop, rel, set;
+
+	if (ip && 0 <= slot < TRFTM_INL_SEQS)
+		s = &ip->inl[slot];
+	n	 = TrFtmRdU8(cur);
+	loop = TrFtmRdI32(cur);
+	rel	 = TrFtmRdI32(cur);
+	set	 = TrFtmRdI32(cur);
+	if (s)
+	{
+		s->used		= n > 0;
+		s->len		= ClampI64(n, 0, TR_MACRO_LEN);
+		s->loop		= loop;
+		s->release	= rel;
+		s->setting	= set;
+	}
+	for (i = 0; i < n; i++)
+	{
+		v = TrFtmRdI8(cur);
+		if (s && i < TR_MACRO_LEN)
+			s->val[i] = v;
+	}
+}
+
+U0 TrFtmInstLoad(U8 *raw, I64 off, I64 len, I64 bver)
+{//INSTRUMENTS. Records are not length-prefixed, so a type this reader sizes
+//wrongly desyncs the rest of the block; the block is self-contained and the
+//cost is the instruments after it.
+	CTrFtmCur	 cur;
+	CTrFtmInst	*ip;
+	I64			 count, i, j, k, idx, type, octaves, nlen, ok;
+	I64			 wsize, wcount, on, si, sm, sp, sd, v;
+
+	TrFtmCurSet(&cur, raw, off, len);
+	count = TrFtmRdU32(&cur);
+	if (count > TRFTM_INSTS_MAX)
+		count = TRFTM_INSTS_MAX;
+	for (i = 0; i < count; i++)
+	{
+		if (cur.over)
+			break;
+		idx		= TrFtmRdU32(&cur);
+		type	= TrFtmRdI8(&cur);
+		ip		= NULL;
+		if (0 <= idx < TRFTM_INSTS_MAX && 1 <= type <= 6)
+		{
+			ip			= &tr_ftm_ins[idx];
+			ip->used	= TRUE;
+			ip->type	= type;
+		}
+		ok = TRUE;
+		if (type == 1 || type == 2 || type == 5 || type == 6)
+		{//Shared sequence header, 14 bytes. The stored type count is range
+		//checked then discarded; five pairs always follow, and the index byte
+		//is present even when the sequence is disabled.
+			TrFtmRdU32(&cur);
+			for (j = 0; j < TRFTM_SEQ_TYPES; j++)
+			{
+				on = TrFtmRdI8(&cur);
+				si = TrFtmRdU8(&cur);
+				if (ip)
+				{
+					ip->seq_on[j]	= on & 1;
+					ip->seq_idx[j]	= si;
+				}
+			}
+		}
+		if (type == 1)
+		{//2A03 DPCM key table, octave-major.
+			octaves = 8;
+			if (bver == 1)
+				octaves = 6;
+			for (j = 0; j < octaves; j++)
+				for (k = 0; k < 12; k++)
+				{
+					sm = TrFtmRdI8(&cur) & 0xFF;
+					sp = TrFtmRdI8(&cur) & 0xFF;
+					sd = 0xFF;
+					if (bver > 5)
+						sd = TrFtmRdI8(&cur) & 0xFF;
+					if (ip && j * 12 + k < TRFTM_KEYS)
+					{
+						ip->key_smp[j * 12 + k]		= sm;
+						ip->key_pitch[j * 12 + k]	= sp;
+						ip->key_delta[j * 12 + k]	= sd;
+					}
+				}
+		}
+		else if (type == 3)
+		{//VRC7: patch number then the eight custom-patch registers, which
+		//only matter when the patch is 0.
+			v = TrFtmRdU32(&cur);
+			if (ip)
+				ip->vrc7_patch = ClampI64(v, 0, 15);
+			for (j = 0; j < 8; j++)
+			{
+				v = TrFtmRdU8(&cur);
+				if (ip)
+					ip->vrc7_reg[j] = v;
+			}
+		}
+		else if (type == 4)
+		{//FDS overrides Load without calling the base, so it has no shared
+		//header: 64-byte wave, 32-byte modulation table, three u32 fields,
+		//then three inline sequences shaped (u8 count, i32 loop, i32 release,
+		//i32 setting, items). Three is the count that consumes the block
+		//exactly on every module tested.
+			for (j = 0; j < TRFTM_FDS_WAVE; j++)
+			{
+				v = TrFtmRdU8(&cur);
+				if (ip)
+					ip->wave[j] = v & 0x3F;		//6-bit steps.
+			}
+			if (ip)
+			{
+				ip->wave_len	= TRFTM_FDS_WAVE;
+				ip->wave_n		= 1;
+			}
+			TrFtmSkip(&cur, 32 + 12);	//Modulation table and its three fields.
+			for (j = 0; j < TRFTM_INL_SEQS; j++)
+				TrFtmInlSeq(&cur, ip, j);
+		}
+		else if (type == 5)
+		{//N163: wave size, wave position, wave count, then one byte per
+		//4-bit sample. Only the first wave is kept.
+			wsize	= TrFtmRdU32(&cur);
+			TrFtmRdU32(&cur);			//Wave position.
+			wcount	= TrFtmRdU32(&cur);
+			if (wsize < 0 || wsize > TRFTM_WAVE_MAX || wcount < 0 ||
+				wcount > 64)
+				ok = FALSE;
+			else
+			{
+				for (j = 0; j < wsize * wcount; j++)
+				{
+					v = TrFtmRdU8(&cur);
+					//Waves are stored back to back; the duty sequence picks
+					//among them at play time.
+					if (ip && wsize <= TRFTM_WAVE_MAX &&
+						j < TRFTM_WAVE_MAX * TRFTM_INST_WAVES)
+						ip->wave[j] = v & 0x0F;
+				}
+				if (ip && wsize <= TRFTM_WAVE_MAX)
+				{
+					ip->wave_len	= wsize;
+					ip->wave_n		= ClampI64(wcount, 1, TRFTM_INST_WAVES);
+				}
+			}
+		}
+		else if (type != 2 && type != 6)
+			ok = FALSE;		//Unknown type: the record length is unknowable.
+		if (!ok)
+			break;
+		nlen = TrFtmRdU32(&cur);
+		if (nlen < 0 || nlen > 4096)
+			break;
+		for (j = 0; j < nlen; j++)
+		{
+			k = TrFtmRdU8(&cur);
+			if (ip && j < TR_SMP_NAME - 1)
+			{
+				if (k < 32)
+					k = 32;
+				ip->name[j] = k;
+			}
+		}
+		if (ip)
+		{
+			j = nlen;
+			if (j > TR_SMP_NAME - 1)
+				j = TR_SMP_NAME - 1;
+			ip->name[j] = 0;
+		}
+	}
+}
+
+U0 TrFtmDpcmLoad(U8 *raw, I64 off, I64 len)
+{//DPCM SAMPLES. Only the payload extent of each sample is recorded; decoding
+//happens once a key table entry asks for it. Sample index is 0-based here,
+//unlike the 1-based index in the instrument key table.
+	CTrFtmCur	cur;
+	I64			count, i, idx, nlen, slen;
+
+	TrFtmCurSet(&cur, raw, off, len);
+	count = TrFtmRdU8(&cur);
+	if (count > TRFTM_DPCM_MAX)
+		count = TRFTM_DPCM_MAX;
+	for (i = 0; i < count; i++)
+	{
+		if (cur.over)
+			break;
+		idx		= TrFtmRdU8(&cur);
+		nlen	= TrFtmRdI32(&cur);
+		if (nlen < 0 || nlen > 4096)
+			break;
+		TrFtmSkip(&cur, nlen);
+		slen = TrFtmRdI32(&cur);
+		if (slen < 0 || slen > TRFTM_DPCM_BYTES)
+			break;
+		if (cur.pos + slen > cur.end)
+			slen = cur.end - cur.pos;
+		if (slen < 0)
+			break;
+		if (0 <= idx < TRFTM_DPCM_MAX)
+		{
+			tr_ftm_dpcm_off[idx] = cur.pos;
+			tr_ftm_dpcm_len[idx] = slen;
+		}
+		TrFtmSkip(&cur, slen);
+	}
+}
+
+I64 TrFtmDpcmSlot(I64 di, I64 pitch, I64 loop, I64 delta)
+{//Engine sample slot for one DPCM sample at one playback rate, decoded on
+//first use. Rate, loop and the preloaded DAC level all live in the sample
+//record rather than the note, so each distinct combination needs its own
+//slot; the same PCM is decoded again for each.
+	I64	 i, slot, frames, src, slen, j, b, k, dc, rate;
+	I16	*d;
+
+	if (di < 0 || di >= TRFTM_DPCM_MAX)
+		return 0;
+	pitch &= 15;
+	if (loop)
+		loop = 1;
+	for (i = 0; i < tr_ftm_pairs; i++)
+		if (tr_ftm_pair_smp[i] == di && tr_ftm_pair_pitch[i] == pitch &&
+			tr_ftm_pair_loop[i] == loop && tr_ftm_pair_delta[i] == delta)
+			return tr_ftm_pair_slot[i];
+
+	src		= tr_ftm_dpcm_off[di];
+	slen	= tr_ftm_dpcm_len[di];
+	if (slen < 1 || src < 0 || src + slen > tr_ftm_size)
+		return 0;
+	frames = slen * 8;
+	//Budget and table are both hard caps. Past either, an already decoded
+	//slot for the same sample is reused at whatever rate it holds.
+	if (tr_ftm_pairs >= TRFTM_PAIRS_MAX ||
+		tr_ftm_pcm_used + frames > TRFTM_PCM_BUDGET)
+	{
+		for (i = 0; i < tr_ftm_pairs; i++)
+			if (tr_ftm_pair_smp[i] == di)
+				return tr_ftm_pair_slot[i];
+		return 0;
+	}
+	slot = TrSampleNextFree();
+	if (slot < 1 || slot >= TR_MAX_SAMPLES)
+		return 0;
+	if (!TrSampleAlloc(slot, frames))
+		return 0;
+	tr_ftm_pcm_used += frames;
+
+	//1-bit delta modulation into a 7-bit DAC, LSB first within each byte. The
+	//clamp skips the step rather than saturating, which preserves the
+	//counter's parity. 0xFF means do not preload.
+	dc = delta;
+	if (dc < 0 || dc > 127)
+		dc = 0;
+	d = tr_smp[slot].data;
+	for (j = 0; j < slen; j++)
+	{
+		b = tr_ftm_raw[src + j];
+		for (k = 0; k < 8; k++)
+		{
+			if (b & (1 << k))
+			{
+				if (dc < 126)
+					dc += 2;
+			}
+			else if (dc > 1)
+				dc -= 2;
+			//7-bit unsigned centred on 64 and scaled by 256: peak 16384,
+			//the same headroom the synthetic waves use.
+			d[j * 8 + k] = (dc - 64) * 256;
+		}
+	}
+	tr_smp[slot].volume		= 64;
+	tr_smp[slot].global_vol	= 64;
+	tr_smp[slot].pan		= 128;
+	tr_smp[slot].synth		= TRI_NONE;
+	if (loop)
+	{
+		tr_smp[slot].loop_start	= 0;
+		tr_smp[slot].loop_len	= frames;
+		tr_smp[slot].loop_type	= TR_LOOP_FWD;
+	}
+	//The DPCM rate is fixed by the key table, not by the note, so the
+	//instrument transposes every note to 61 (C-5) and step_mul carries the
+	//whole rate. TrC5StepMul(hz) is the multiplier that makes note 61 sound
+	//at hz.
+	if (tr_ftm_pal)
+		rate = TRFTM_CPU_PAL / tr_ftm_dpcm_period_pal[pitch];
+	else
+		rate = TRFTM_CPU_NTSC / tr_ftm_dpcm_period[pitch];
+	tr_smp[slot].step_mul = TrC5StepMul(rate);
+	StrPrint(tr_smp[slot].name, "DPCM%02d-%d", di, pitch);
+	TrSampleGuard(&tr_smp[slot]);
+
+	tr_ftm_pair_smp[tr_ftm_pairs]	= di;
+	tr_ftm_pair_pitch[tr_ftm_pairs]	= pitch;
+	tr_ftm_pair_loop[tr_ftm_pairs]	= loop;
+	tr_ftm_pair_delta[tr_ftm_pairs]	= delta;
+	tr_ftm_pair_slot[tr_ftm_pairs]	= slot;
+	tr_ftm_pairs++;
+
+	return slot;
+}
+
+U0 TrFtmMacroCopy(CTrMacro *m, CTrFtmSeq *s, I64 scale, Bool neg)
+{//One FamiTracker sequence into one engine macro. Sequences longer than
+//TR_MACRO_LEN keep their first 64 steps; loop and release points that fall
+//past the cut become none, so the macro holds its last value instead of
+//jumping outside itself.
+	I64 i, v;
+
+	if (!s->used || s->len < 1)
+		return;
+	m->len		= s->len;
+	m->loop		= -1;
+	m->release	= -1;
+	if (0 <= s->loop < m->len)
+		m->loop = s->loop;
+	if (0 <= s->release < m->len)
+		m->release = s->release;
+	for (i = 0; i < m->len; i++)
+	{
+		v = s->val[i] * scale;
+		if (neg)
+			v = -v;
+		m->val[i] = ClampI64(v, -127, 127);
+	}
+}
+
+I64 TrFtmNoiseSlot(I64 mode)
+{//The noise channel is one LFSR clocked at CPU/period, so all sixteen pitches
+//are the same sequence at different rates and only the rate anchor differs
+//from the shared TRI_NOISE voice. Mode 0 feeds bit 1 back and runs 32767
+//steps; mode 1, selected by Vxx, feeds bit 6 back and repeats after 93,
+//which is short enough to be heard as a pitch rather than as noise.
+	I64	 slot, n, i, lfsr, bit, tap;
+	I16	*d;
+
+	mode &= 1;
+	if (tr_noise_slot[mode])
+		return tr_noise_slot[mode];
+	n = 32767;
+	if (mode)
+		n = 93;
+	slot = TrSampleNextFree();
+	if (slot < 1)
+		return 0;
+	if (!TrSampleAlloc(slot, n))
+		return 0;
+	d	 = tr_smp[slot].data;
+	lfsr = 1;
+	tap	 = 1;
+	if (mode)
+		tap = 6;
+	for (i = 0; i < n; i++)
+	{
+		bit	 = (lfsr ^ (lfsr >> tap)) & 1;
+		lfsr = (lfsr >> 1) | (bit << 14);
+		if (lfsr & 1)
+			d[i] = TR_WAVE_AMP;
+		else
+			d[i] = -TR_WAVE_AMP;
+	}
+	tr_smp[slot].loop_start	= 0;
+	tr_smp[slot].loop_len	= n;
+	tr_smp[slot].loop_type	= TR_LOOP_FWD;
+	tr_smp[slot].volume		= 64;
+	tr_smp[slot].global_vol	= 64;
+	tr_smp[slot].pan		= -1;
+	tr_smp[slot].c5speed	= TRFTM_NOISE_HZ;
+	tr_smp[slot].step_mul	= TrC5StepMul(TRFTM_NOISE_HZ);
+	StrPrint(tr_smp[slot].name, "Noise%d", mode);
+	TrSampleGuard(&tr_smp[slot]);
+	tr_noise_slot[mode] = slot;
+
+	return slot;
+}
+
+I64 TrFtmKindXpose(I64 kind)
+{//Semitones to shift a written note by.
+//
+//Twelve of it is display realignment. FamiTracker builds its note tables from
+//BASE_FREQ 32.7032 at index 0 (SoundGen.cpp:1122, 1139), so index 45 is
+//440 Hz, and it DISPLAYS that index as A-3 (PatternEditor.cpp:1346, which
+//draws the stored octave field verbatim). The engine calls 440 Hz A-4, note
+//58, since note 49 is C-4. Same pitch, octave numbers one apart.
+//
+//On top of that each chip's own divisor moves the sounding pitch against the
+//table it was looked up in:
+//
+//    triangle  -12. It shares the PULSE table (SoundGen.cpp:1302) but steps a
+//              32-entry wave per period+1 (APU/Triangle.cpp:24-27) where the
+//              pulse steps a 16-entry duty (APU/Square.cpp:27-32).
+//    VRC7      -12. block = index / 12 and fnum comes from a 12-entry table
+//              (ChannelsVRC7.cpp:234-248); fnum 172 at block 0 with ML 1 is
+//              16.31 Hz against the tables' 32.70.
+//    FDS       0. TRANSPOSE_FDS is defined (FamiTrackerDoc.h:32), and that
+//              path tunes the FDS table to the others.
+//    VRC6      0, both pulse and saw; the saw has its own table built for its
+//              14 accumulate steps (SoundGen.cpp:1152).
+//    N163      0 for a 16-step wave only. The correction for other lengths is
+//              per instrument and applied where the instrument is built.
+//    S5B       0 here, which is a DELIBERATE DEVIATION. In 0.4.6 the S5B note
+//              table is never installed - the SetNoteTable calls sit inside
+//              an #if 0 (SoundGen.cpp:1318-1322) - so the period register
+//              receives the raw note index and S5B pitch in the reference is
+//              not musical at all. Playing it in tune is the useful answer.
+//
+//Applied here rather than at the note decode because the cell value is also
+//an INDEX elsewhere: the noise nibble picks an LFSR period from it and the
+//DPCM key table is addressed by it. Shifting the stored note would move both.
+//Neither kind reaches this function; they set their own transpose.
+	switch (kind)
+	{
+		case TRFTM_KIND_TRI:
+		case TRFTM_KIND_VRC7:
+			return 0;
+	}
+
+	return 12;
+}
+
+I64 TrFtmKindGain(I64 kind)
+{//Relative chip loudness, as a percentage of a 2A03 pulse. Flat.
+//
+//The NSFe mixe defaults that nsfplay and Dn ship are FDS 224, N163 589,
+//VRC7 468, S5B 75, DPCM 98. Applying them normalised against the loudest kind
+//in the module attenuates the 2A03 channels hard: a VRC7 module puts them
+//13.4 dB down, which buries the parts a listener expects to hear. Those
+//figures describe raw chip output at equal register settings, and the
+//composer has already balanced against that, so applying them again
+//double-counts.
+//
+//Left flat until it can be judged by ear. The numbers are in
+//docs/tracker/FTM_CHIPS.md section 8 if this is revisited.
+	switch (kind)
+	{
+		case TRFTM_KIND_DPCM:
+		case TRFTM_KIND_FDS:
+		case TRFTM_KIND_N163:
+		case TRFTM_KIND_VRC7:
+		case TRFTM_KIND_S5B:
+			return 100;
+	}
+
+	return 100;
+}
+
+
+I64 TrFtmEnvTicks(I64 rate)
+{//OPLL envelope rate, 4 bits, into engine ticks. Rate 15 is immediate and each
+//step down roughly doubles the time. The chip's rates also scale with pitch
+//through KSR, which is not reproduced: one envelope serves every note.
+	I64 i, t = 1;
+
+	rate = ClampI64(rate, 0, 15);
+	if (rate >= 15)
+		return 0;
+	for (i = rate; i < 14; i++)
+	{
+		t *= 2;
+		if (t > 512)
+			return 512;
+	}
+
+	return t;
+}
+
+U0 TrFtmVrc7Env(CTrInst *p, U8 *patch)
+{//The carrier ADSR as the engine's volume envelope. VRC7 has no sequence
+//header and so no volume macro; the chip envelope is the only one there is.
+//Without it every VRC7 note holds at full level until something cuts it,
+//which is audibly wrong on any percussive patch.
+//
+//Only the CARRIER envelope maps. The modulator's moves the modulation index
+//over time, which shifts the spectrum rather than the level, and a baked wave
+//cannot carry that. Bytes 5 and 7 hold the carrier's rates.
+//
+//EG-type is bit 5 of the carrier byte: set holds at the sustain level while
+//the key is down, clear decays to silence, which is what a piano patch wants.
+	CTrEnvelope	*e = &p->vol_env;
+	I64			 ar, dr, sl, eg, i, ta, td, lvl;
+
+	ar = (patch[5] >> 4) & 0x0F;
+	dr = patch[5] & 0x0F;
+	sl = (patch[7] >> 4) & 0x0F;
+	eg = (patch[1] >> 5) & 1;
+	ta = TrFtmEnvTicks(ar);
+	td = TrFtmEnvTicks(dr);
+	//Sustain level steps 3 dB, so amplitude falls by about 0.707 a step.
+	//15 is silence, and a percussive patch decays to nothing regardless.
+	lvl = 64;
+	for (i = 0; i < sl; i++)
+		lvl = lvl * 7 / 10;
+	if (sl >= 15 || !eg)
+		lvl = 0;
+
+	MemSet(e, 0, sizeof(CTrEnvelope));
+	e->tick[0]	= 0;
+	e->value[0]	= 0;
+	e->n_points	= 1;
+	if (ta > 0)
+	{
+		e->tick[1]	= ta;
+		e->value[1]	= 64;
+		e->n_points	= 2;
+	}
+	else
+		e->value[0] = 64;
+	e->tick[e->n_points]	= e->tick[e->n_points - 1] + td + 1;
+	e->value[e->n_points]	= lvl;
+	e->n_points++;
+	//Sustain sits on the last point: a sustained patch holds there while the
+	//key is down; a percussive one has already reached zero.
+	e->sus_start	= e->n_points - 1;
+	e->sus_end		= e->n_points - 1;
+	e->flags		= TR_ENV_ON;
+	if (eg)
+		e->flags |= TR_ENV_SUSTAIN;
+}
+
+#define TRFTM_VRC7_WAVES	8	//Modulation-depth steps baked per patch.
+
+U0 TrFtmVrc7Mod(CTrInst *p, U8 *patch)
+{//The MODULATOR envelope, as a duty macro over a bank of waves baked at
+//rising then falling modulation depth. The modulator's envelope moves the
+//modulation index, which shifts the spectrum rather than the level, so it
+//cannot ride on vol_env the way the carrier's does: a single baked wave holds
+//one timbre for the whole note. Eight steps is enough that a brass patch
+//opens and a bell patch closes audibly, without eight being eight full
+//waveform bakes per instrument that nothing hears.
+//
+//Byte 4 holds the modulator's attack and decay rates, byte 6 its sustain
+//level, byte 0 bit 5 its EG-type.
+//
+//The macro is one value per tick and TR_MACRO_LEN caps it at 64. A modulator
+//envelope longer than that holds at whatever depth tick 63 reached.
+	CTrMacro	*m = &p->macro[TR_MACRO_DUTY];
+	I64			 ar, dr, sl, eg, ta, td, i, k, sus, top = TRFTM_VRC7_WAVES - 1;
+
+	if (p->bank != TR_BANK_INST || p->bank_n < 2)
+		return;
+	ar = (patch[4] >> 4) & 0x0F;
+	dr = patch[4] & 0x0F;
+	sl = (patch[6] >> 4) & 0x0F;
+	eg = (patch[0] >> 5) & 1;
+	ta = TrFtmEnvTicks(ar);
+	td = TrFtmEnvTicks(dr);
+	//Sustain level steps 3 dB. Percussive patches, and a sustain of 15, fall
+	//to a bare carrier.
+	sus = top;
+	for (i = 0; i < sl; i++)
+		sus = sus * 7 / 10;
+	if (sl >= 15 || !eg)
+		sus = 0;
+
+	MemSet(m, 0, sizeof(CTrMacro));
+	m->loop		= -1;
+	m->release	= -1;
+	m->mode		= 0;
+	for (i = 0; i < TR_MACRO_LEN; i++)
+	{
+		if (i < ta)
+			k = top * i / ta;
+		else if (i < ta + td && td > 0)
+			k = top - (top - sus) * (i - ta) / td;
+		else
+			k = sus;
+		m->val[i] = ClampI64(k, 0, top);
+	}
+	m->len = TR_MACRO_LEN;
+}
+
+I64 TrFtmS5bSlot(I64 mode)
+{//S5B voice. Mode 0 is the tone, a 50 per cent square with no duty control at
+//all. Mode 1 is the noise, a 17-bit LFSR tapped at bits 16 and 13, which is a
+//different polynomial and a much longer period than the 2A03's.
+	I64	 slot, n, i, lfsr, bit;
+	I16	*d;
+
+	mode &= 1;
+	if (tr_s5b_slot[mode])
+		return tr_s5b_slot[mode];
+	slot = TrSampleNextFree();
+	if (slot < 1)
+		return 0;
+	if (!mode)
+	{
+		TrPulseFill(slot, TR_WAVE_LEN / 2);
+		if (tr_smp[slot].data)
+			tr_s5b_slot[0] = slot;
+
+		return tr_s5b_slot[0];
+	}
+	n = 131071;						//2^17 - 1, one full LFSR period.
+	if (!TrSampleAlloc(slot, n))
+		return 0;
+	d	 = tr_smp[slot].data;
+	lfsr = 1;
+	for (i = 0; i < n; i++)
+	{
+		bit	 = (lfsr ^ (lfsr >> 3)) & 1;	//Taps 16 and 13.
+		lfsr = (lfsr >> 1) | (bit << 16);
+		if (lfsr & 1)
+			d[i] = TR_WAVE_AMP;
+		else
+			d[i] = -TR_WAVE_AMP;
+	}
+	tr_smp[slot].loop_start	= 0;
+	tr_smp[slot].loop_len	= n;
+	tr_smp[slot].loop_type	= TR_LOOP_FWD;
+	tr_smp[slot].volume		= 64;
+	tr_smp[slot].global_vol	= 64;
+	tr_smp[slot].pan		= -1;
+	tr_smp[slot].c5speed	= TRFTM_NOISE_HZ;
+	tr_smp[slot].step_mul	= TrC5StepMul(TRFTM_NOISE_HZ);
+	StrCopy(tr_smp[slot].name, "S5BNoise");
+	TrSampleGuard(&tr_smp[slot]);
+	tr_s5b_slot[1] = slot;
+
+	return slot;
+}
+
+I64 TrFtmV6Slot(I64 entry)
+{//One VRC6 pulse width, built on first use. The chip has eight widths rather
+//than the 2A03's four, so they need their own bank.
+	I64 slot;
+
+	entry = ClampI64(entry, 0, TR_V6DUTY_COUNT - 1);
+	if (tr_v6duty_slot[entry])
+		return tr_v6duty_slot[entry];
+	slot = TrSampleNextFree();
+	if (slot < 1)
+		return 0;
+	TrV6DutyFill(slot, entry);
+	if (!tr_smp[slot].data)
+		return 0;
+	tr_v6duty_slot[entry] = slot;
+
+	return slot;
+}
+
+I64 TrFtmV6SawSlot()
+{
+	I64 slot;
+
+	if (tr_v6saw_slot)
+		return tr_v6saw_slot;
+	slot = TrSampleNextFree();
+	if (slot < 1)
+		return 0;
+	TrV6SawFill(slot);
+	if (!tr_smp[slot].data)
+		return 0;
+	tr_v6saw_slot = slot;
+
+	return slot;
+}
+
+I64 TrFtmEngInst(I64 fi, I64 kind)
+{//Engine instrument slot for one (FTM instrument, channel kind) pair, built
+//on first use. 0 if the instrument was never declared or no slot is free.
+	CTrFtmInst	*fp;
+	CTrInst		*p;
+	CTrFtmSeq	*s, *set;
+	I64			 slot, n, key, sm, sp, sd, wave, idx;
+	U8			 vrc7[8];
+
+	if (fi < 0 || fi >= TRFTM_INSTS_MAX || kind < 0 || kind >= TRFTM_KINDS)
+		return 0;
+	fp = &tr_ftm_ins[fi];
+	if (!fp->used)
+		return 0;
+	if (fp->eng[kind])
+		return fp->eng[kind];
+
+	for (slot = 1; slot < TR_MAX_INSTRUMENTS; slot++)
+		if (!tr_inst[slot])
+			break;
+	if (slot >= TR_MAX_INSTRUMENTS)
+		return 0;
+	p = TrInstAlloc(slot);
+	if (!p)
+		return 0;
+	fp->eng[kind] = slot;
+	StrCopy(p->name, fp->name);
+
+	wave = TRI_TRIANGLE;
+	if (kind == TRFTM_KIND_NOISE)
+		wave = TRI_NOISE;
+	if (kind == TRFTM_KIND_PULSE)
+	{//2A03 and MMC5 pulses are the same four widths.
+		p->bank			= TR_BANK_DUTY;
+		p->wave_slot	= 0;
+		wave			= tr_duty_slot[0];
+	}
+	if (kind == TRFTM_KIND_V6PULSE)
+	{
+		p->bank			= TR_BANK_V6DUTY;
+		p->wave_slot	= 0;
+		wave			= TrFtmV6Slot(0);
+	}
+	if (kind == TRFTM_KIND_V6SAW)
+		wave = TrFtmV6SawSlot();
+	if (kind == TRFTM_KIND_VRC7)
+	{//Patch 0 is the instrument's own eight registers; 1..15 index the ROM.
+	//Hardware shares one custom patch across all six voices, so a module using
+	//two different custom patches at once cannot sound right on the chip
+	//either; here each instrument keeps its own.
+		if (0 < fp->vrc7_patch <= 15)
+			MemCopy(vrc7, tr_ftm_vrc7_patch[fp->vrc7_patch - 1], 8);
+		else
+			MemCopy(vrc7, fp->vrc7_reg, 8);
+	//Waves run from a bare carrier to the patch's written depth. The duty
+	//macro walks them; the bank is the instrument's own, as N163's is.
+		wave		= 0;
+		p->bank_n	= 0;
+		for (n = 0; n < TRFTM_VRC7_WAVES; n++)
+		{
+			sm = TrSampleNextFree();
+			if (sm < 1)
+				break;
+			TrFmFillMod(sm, vrc7, n * 64 / (TRFTM_VRC7_WAVES - 1));
+			if (!tr_smp[sm].data)
+				break;
+			p->bank_slot[p->bank_n] = sm;
+			p->bank_n++;
+		}
+		//The note starts at the depth the macro's first tick asks for; with
+		//a nonzero attack that is the bare carrier.
+		if (p->bank_n > 0)
+			wave = p->bank_slot[p->bank_n - 1];
+		if (p->bank_n > 1)
+		{
+			p->bank		 = TR_BANK_INST;
+			p->wave_slot = 0;
+		}
+		else if (p->bank_n == 1)
+		{//Out of sample slots. One wave is left, and it must be the patch as
+		//written rather than the bare carrier the first bake gave it.
+			TrFmFillMod(p->bank_slot[0], vrc7, 64);
+			p->bank_n = 0;
+		}
+		TrFtmVrc7Env(p, vrc7);
+		TrFtmVrc7Mod(p, vrc7);
+	}
+	if (kind == TRFTM_KIND_S5B)
+	{//Vxx picks tone or noise through the bank; both are built up front so a
+	//mode change mid-note has something to switch to.
+		p->bank			= TR_BANK_S5B;
+		p->wave_slot	= 0;
+		TrFtmS5bSlot(1);
+		wave			= TrFtmS5bSlot(0);
+	}
+	if (kind == TRFTM_KIND_FDS || kind == TRFTM_KIND_N163)
+	{//The waveform lives in the instrument, so each one needs its own sample.
+	//FDS steps are 6-bit over a fixed 64; N163 steps are 4-bit over the
+	//length the instrument declares. N163 may carry several waves, and the
+	//duty sequence indexes them, so they go in a bank the instrument owns
+	//rather than a table shared by the chip.
+		key		= 15;
+		if (fp->type == TRFTM_INST_FDS)
+			key = 63;
+		wave	= 0;
+		p->bank_n = 0;
+		for (n = 0; n < fp->wave_n && n < TR_INST_WAVES; n++)
+		{
+			sm = TrSampleNextFree();
+			if (sm < 1)
+				break;
+			TrStepsFill(sm, &fp->wave[n * fp->wave_len], fp->wave_len, key);
+			if (!tr_smp[sm].data)
+				break;
+			p->bank_slot[p->bank_n] = sm;
+			p->bank_n++;
+			if (!wave)
+				wave = sm;
+		}
+		if (p->bank_n > 1)
+		{
+			p->bank		 = TR_BANK_INST;
+			p->wave_slot = 0;
+		}
+	}
+	if (kind == TRFTM_KIND_DPCM)
+	{
+		//Key table entries cover notes 1..96. Every note transposes to 61 so
+		//the sample's own step_mul sets the rate; notes without a sample in
+		//the table stay silent.
+		for (n = 0; n <= TR_NOTES + 1; n++)
+		{
+			p->smp_of_note[n]	= 0;
+			p->xpose_of_note[n]	= 61;
+		}
+		for (n = 1; n <= TRFTM_KEYS; n++)
+		{
+			key = n - 1;
+			sm	= fp->key_smp[key];
+			if (sm)
+			{
+				sp	= fp->key_pitch[key];
+				sd	= fp->key_delta[key];
+				idx	= TrFtmDpcmSlot(sm - 1, sp & 0x0F, sp & 0x80, sd);
+				p->smp_of_note[n] = idx;
+			}
+		}
+		return slot;
+	}
+	if (kind == TRFTM_KIND_NOISE)
+	{//Noise is not pitched. The written note picks one of sixteen periods
+	//through its low nibble, inverted, so every note transposes onto the rate
+	//anchor and the octave is discarded. Arpeggio and pitch macros move the
+	//played note rather than the period index, which is not what the 2A03
+	//does, but noise arpeggio is rare.
+		//Vxx picks the LFSR mode through the bank; the note only sets rate.
+		p->bank		= TR_BANK_NOISE;
+		p->wave_slot = 0;
+		TrFtmNoiseSlot(1);
+		idx = TrFtmNoiseSlot(0);
+		for (n = 0; n <= TR_NOTES + 1; n++)
+		{
+			p->smp_of_note[n]	= idx;
+			key					= (n - 1) & 15;
+			p->xpose_of_note[n]	= ClampI64(1 + tr_ftm_noise_xpose[key ^ 15],
+										   1, TR_NOTES);
+		}
+	}
+	else
+	{//The chip's own divisor shifts the sounding pitch away from the written
+	//note; xpose_of_note carries that, since it already remaps notes.
+		key = TrFtmKindXpose(kind);
+		//N163's note table assumes a 16-step wave (SoundGen.cpp:1163). The
+		//emulator wraps the phase at length << 16 (APU/N163.CPP:245), so a
+		//longer wave sounds at 16/L of the written pitch, an octave per
+		//doubling. Our samples are all normalised to one cycle, so the
+		//difference has to come back as a transpose.
+		if (kind == TRFTM_KIND_N163)
+		{
+			n = fp->wave_len;
+			while (n > 16)
+			{
+				key -= 12;
+				n /= 2;
+			}
+		}
+		for (n = 0; n <= TR_NOTES + 1; n++)
+		{
+			p->smp_of_note[n]	= wave;
+			p->xpose_of_note[n]	= ClampI64(n + key, 1, TR_NOTES);
+		}
+	}
+	p->global_vol = ClampI64(128 * TrFtmKindGain(kind) / tr_ftm_gain_max,
+							 8, 128);
+
+	//Volume rules for the kind. Set whether or not a volume sequence exists:
+	//stickiness and the S5B curve are properties of the channel, and the mode
+	//is read even when the macro is empty.
+	p->macro[TR_MACRO_VOL].mode = TR_VOL_STICKY | TR_VOL_FLOOR;
+	if (kind == TRFTM_KIND_TRI)
+		p->macro[TR_MACRO_VOL].mode |= TR_VOL_GATE;
+	if (kind == TRFTM_KIND_S5B)
+		p->macro[TR_MACRO_VOL].mode |= TR_VOL_S5B;
+
+	//Sequences resolve against the block their chip wrote. FDS keeps them in
+	//the instrument instead, so it uses neither set.
+	set = &tr_ftm_seq[0][0];
+	if (fp->type == TRFTM_INST_VRC6 || fp->type == TRFTM_INST_N163 ||
+		fp->type == TRFTM_INST_S5B)
+		set = &tr_ftm_xseq[0][0];
+	if (fp->type == TRFTM_INST_FDS)
+	{//Volume, arpeggio and pitch, in that order, stored inline.
+		TrFtmMacroCopy(&p->macro[TR_MACRO_VOL],   &fp->inl[0], 2, FALSE);
+		TrFtmMacroCopy(&p->macro[TR_MACRO_ARP],   &fp->inl[1], 1, FALSE);
+		TrFtmMacroCopy(&p->macro[TR_MACRO_PITCH], &fp->inl[2], 1, TRUE);
+		return slot;
+	}
+
+	//Volume, arpeggio, pitch, hi-pitch and duty.
+	if (fp->seq_on[TRFTM_SEQ_VOL] && fp->seq_idx[TRFTM_SEQ_VOL] <
+		TRFTM_SEQS_MAX)
+	{//FTM volume is 0..15 against the engine's 0..64. Multiplied by 4, so 15
+	//maps to 60 and full level sits 0.6 dB low; the scale stays linear and 0
+	//stays silent.
+	//
+	//The triangle has no volume DAC. Its sequence gates the channel instead:
+	//0 silences, anything else plays at full level. Applied as a level a
+	//sequence written as a gate makes the triangle duck under every step
+	//below 15, which on a bass line reads as the part dropping out.
+		s = &set[TRFTM_SEQ_VOL * TRFTM_SEQS_MAX + fp->seq_idx[TRFTM_SEQ_VOL]];
+		TrFtmMacroCopy(&p->macro[TR_MACRO_VOL], s, 4, FALSE);
+		//4 leaves full scale at 60 of 64, half a dB down, and the loss
+		//compounds against the volume column. 16/15 finishes the job so 15
+		//reaches 64 exactly.
+		for (n = 0; n < p->macro[TR_MACRO_VOL].len; n++)
+			p->macro[TR_MACRO_VOL].val[n] =
+				ClampI64(p->macro[TR_MACRO_VOL].val[n] * 16 / 15, 0, 64);
+	}
+	if (fp->seq_on[TRFTM_SEQ_ARP] && fp->seq_idx[TRFTM_SEQ_ARP] <
+		TRFTM_SEQS_MAX)
+	{
+		s = &set[TRFTM_SEQ_ARP * TRFTM_SEQS_MAX + fp->seq_idx[TRFTM_SEQ_ARP]];
+		TrFtmMacroCopy(&p->macro[TR_MACRO_ARP], s, 1, FALSE);
+		//Setting 3 is the 0CC scheme mode, played as absolute.
+		if (s->setting == 1)
+			p->macro[TR_MACRO_ARP].mode = TR_ARP_FIXED;
+		else if (s->setting == 2)
+			p->macro[TR_MACRO_ARP].mode = TR_ARP_RELATIVE;
+		else
+			p->macro[TR_MACRO_ARP].mode = TR_ARP_ABSOLUTE;
+	}
+	if (fp->seq_on[TRFTM_SEQ_PITCH] && fp->seq_idx[TRFTM_SEQ_PITCH] <
+		TRFTM_SEQS_MAX)
+	{//FTM adds its value to the period; the engine subtracts the running
+	//total, so the sign flips. One engine period unit is a sixteenth of a NES
+	//one, and val is an I8 that cannot hold the scaled figure, so the factor
+	//rides in mode and the mixer applies it. Without it a pitch macro plays
+	//at a sixteenth of its written depth, which is close to inaudible: a
+	//snare's sweep flattens into a click.
+		s = &set[TRFTM_SEQ_PITCH * TRFTM_SEQS_MAX + fp->seq_idx[TRFTM_SEQ_PITCH]];
+		TrFtmMacroCopy(&p->macro[TR_MACRO_PITCH], s, 1, TRUE);
+		p->macro[TR_MACRO_PITCH].mode = TR_PERIOD_SCALE;
+	}
+	if (fp->seq_on[TRFTM_SEQ_HIPITCH] && fp->seq_idx[TRFTM_SEQ_HIPITCH] <
+		TRFTM_SEQS_MAX)
+	{//Hi-pitch shifts the period by 16 NES units per value against pitch's 1,
+	//so its scale is 16 times pitch's. Same sign flip.
+		s = &set[TRFTM_SEQ_HIPITCH * TRFTM_SEQS_MAX +
+				 fp->seq_idx[TRFTM_SEQ_HIPITCH]];
+		TrFtmMacroCopy(&p->macro[TR_MACRO_HIPITCH], s, 1, TRUE);
+		p->macro[TR_MACRO_HIPITCH].mode = TR_PERIOD_SCALE * 16;
+	}
+	if (p->bank != TR_BANK_NONE && fp->seq_on[TRFTM_SEQ_DUTY] &&
+		fp->seq_idx[TRFTM_SEQ_DUTY] < TRFTM_SEQS_MAX)
+	{//Duty values index the channel's bank: four 2A03 widths, eight VRC6
+	//widths, or the two noise LFSR modes.
+		s = &set[TRFTM_SEQ_DUTY * TRFTM_SEQS_MAX + fp->seq_idx[TRFTM_SEQ_DUTY]];
+		TrFtmMacroCopy(&p->macro[TR_MACRO_DUTY], s, 1, FALSE);
+	}
+
+	return slot;
+}
+
+Bool TrFtmGrooveLoad(U8 *raw, I64 off, I64 len, I64 tracks)
+{//GROOVES. Block version is 1 and nothing inside is version gated.
+//
+//    u8            count of PRESENT grooves, 0..32
+//    per groove:
+//        u8        slot index, 0..31
+//        u8        entry count, 1..128
+//        u8[n]     ticks per row, each 1..255
+//    u8            track count
+//    u8[tracks]    use-groove flag, one per track
+//
+//The table is sparse and self-indexing: only non-empty slots are written and
+//each carries its own index.
+//
+//Returns the use-groove flag for track 0. That flag lives HERE, in the tail,
+//not in PARAMS, HEADER or FRAMES, which is why the FRAMES speed field cannot
+//be interpreted until this block has been read.
+	CTrFtmCur	cur;
+	I64			n, i, j, idx, size, v, want;
+	Bool		flag = FALSE;
+
+	TrFtmCurSet(&cur, raw, off, len);
+	n = TrFtmRdU8(&cur);
+	if (n > TR_GROOVES)
+		n = TR_GROOVES;
+	for (i = 0; i < n; i++)
+	{
+		if (cur.over)
+			break;
+		idx	 = TrFtmRdU8(&cur);
+		size = TrFtmRdU8(&cur);
+		if (size < 1 || size > TR_GROOVE_LEN)
+			return FALSE;		//A bad size desyncs the rest of the block.
+		for (j = 0; j < size; j++)
+		{
+			v = TrFtmRdU8(&cur);
+			if (idx < TR_GROOVES && j < TR_GROOVE_LEN)
+				tr_groove[idx][j] = v;
+		}
+		if (idx < TR_GROOVES)
+			tr_groove_len[idx] = size;
+	}
+	//The tail is not optional: it is present even when every flag is zero.
+	want = TrFtmRdU8(&cur);
+	if (want > tracks)
+		want = tracks;
+	for (i = 0; i < want; i++)
+	{
+		v = TrFtmRdU8(&cur);
+		if (!i && v)
+			flag = TRUE;
+	}
+	if (cur.over)
+		return FALSE;
+
+	return flag;
+}
+
+I64 TrFtmStoredEffect(I64 fx)
+{//PATTERNS stores ordinals 33..41 permuted; 0..32 and 42..44 are stored as
+//written. Both 0CC and Dn apply this on WRITE unconditionally, so it is not
+//confined to the versions that apply it on read.
+//
+//    stored  33 34 35 36 37 38 39 40 41
+//    means   36 37 38 39 40 41 33 34 35
+	if (fx < 33 || fx > 41)
+		return fx;
+	if (fx <= 38)
+		return fx + 3;
+
+	return fx - 6;
+}
+
+I64 TrFtmEffect(I64 kind, I64 fx, I64 *_param, I64 fver)
+{//FamiTracker effect ordinal into the engine's TRX_* space. -1 when nothing
+//equivalent exists, so the caller can look at the next effect column.
+//
+//Dropped for want of an engine equivalent: 5 Exx length counter, 24 Xxx DPCM
+//retrigger, 29 Wxx DPCM pitch, and the fork-specific effects above 42.
+	I64 p = *_param & 0xFF, row;
+
+	switch (fx)
+	{
+		case 1:		//Fxx. F00 means F01, not stop.
+			if (!p)
+				p = 1;
+			//File version 0x0200 stored speeds one low.
+			if (fver == 0x0200 && p < 20)
+				p++;
+			//Below the split point the value is a speed, at or above it a
+			//tempo. FamiTracker compares against the live tempo; the static
+			//split from PARAMS is used instead.
+			if (p < tr_ftm_split)
+			{
+				*_param = ClampI64(p, 1, 31);
+				return TRX_SET_SPEED;
+			}
+			*_param = ClampI64(p, 32, 255);
+			return TRX_SET_TEMPO;
+		case 2:		//Bxx. Frames map one to one onto order positions.
+			*_param = p;
+			return TRX_POS_JUMP;
+		case 3:		//Dxx. The engine decodes the break row as two decimal
+			//digits, so a plain row number is re-encoded.
+			row = ClampI64(p, 0, 99);
+			*_param = (row / 10) * 16 + row % 10;
+			return TRX_PAT_BREAK;
+		case 4:		//Cxx. Speed 0 is the engine's end-of-song.
+			*_param = 0;
+			return TRX_SET_SPEED;
+		case 6:		//3xx.
+			*_param = p;
+			return TRX_TONE_PORTA;
+		case 10:	//0xy.
+			*_param = p;
+			return TRX_ARPEGGIO;
+		case 11:	//4xy.
+			*_param = p;
+			return TRX_VIBRATO;
+		case 12:	//7xy.
+			*_param = p;
+			return TRX_TREMOLO;
+		case 14:	//Gxx, note delay. EDx carries at most 15 ticks.
+			*_param = 0xD0 | ClampI64(p, 0, 15);
+			return TRX_EXTENDED;
+		case 16:	//1xx.
+			*_param = p;
+			return TRX_PORTA_UP;
+		case 17:	//2xx.
+			*_param = p;
+			return TRX_PORTA_DOWN;
+		case 19:	//Yxx, DPCM sample offset in 64-byte units. One byte is 8
+			//PCM frames and TRX_OFFSET counts 256, so the parameter doubles.
+			//Meaningless on the other channels, where FamiTracker ignores it.
+			if (kind != TRFTM_KIND_DPCM)
+				break;
+			*_param = ClampI64(p * 2, 0, 255);
+			return TRX_OFFSET;
+		case 22:	//Axy, x up and y down, the MOD order.
+			*_param = p;
+			return TRX_VOLSLIDE;
+		case 33:	//Wxx, S5B noise period. Written to the chip inverted, so
+			//the parameter counts upward in pitch; the engine plays noise as
+			//a sample, and the period is not reproduced.
+			if (kind != TRFTM_KIND_S5B)
+				break;
+			break;
+		case 37:	//Oxx, groove select. Applies to the whole song.
+			*_param = p & (TR_GROOVES - 1);
+			return TRX_GROOVE;
+		case 39:	//Zxx, N163 wave-RAM position. Overrides the instrument's
+			//own position until 0x7F restores it. Wave position changes which
+			//samples the channel reads, which this engine fixes per
+			//instrument, so it is dropped.
+			if (kind != TRFTM_KIND_N163)
+				break;
+			break;
+		case 26:	//Hxx, FDS modulation depth. The same letter is a hardware
+			//sweep on the 2A03, so the channel's chip decides.
+			if (kind != TRFTM_KIND_FDS)
+				break;
+			*_param = p & 0x3F;
+			return TRX_FDS_DEPTH;
+		case 27:	//Ixx, modulation rate high nibble.
+			if (kind != TRFTM_KIND_FDS)
+				break;
+			*_param = p & 0x0F;
+			return TRX_FDS_RATE_HI;
+		case 28:	//Jxx, modulation rate low byte.
+			if (kind != TRFTM_KIND_FDS)
+				break;
+			*_param = p;
+			return TRX_FDS_RATE_LO;
+		case 13:	//Pxx, fine pitch. 0x80 is centre.
+			*_param = p;
+			return TRX_FINE_PITCH;
+		case 20:	//Qxy, slide up y semitones at speed x.
+			*_param = p;
+			return TRX_NOTE_SLIDE_UP;
+		case 21:	//Rxy, slide down.
+			*_param = p;
+			return TRX_NOTE_SLIDE_DN;
+		case 18:	//Vxx. On a pulse channel the width, on noise the LFSR
+			//mode. Both are bank entries, so one effect covers them; on the
+			//triangle and DPCM FamiTracker ignores it and so does this.
+			if (kind == TRFTM_KIND_PULSE)
+			{
+				*_param = p & 3;
+				return TRX_SET_DUTY;
+			}
+			if (kind == TRFTM_KIND_NOISE)
+			{
+				*_param = p & 1;
+				return TRX_SET_DUTY;
+			}
+			if (kind == TRFTM_KIND_S5B)
+			{//A 3-bit mask over tone 1, noise 2, envelope 4. The chip ANDs
+			//tone with noise when both are on, which is neither a periodic
+			//wave nor noise; the noise is the closer of the two. The envelope
+			//bit is dropped.
+				if (p & 2)
+					*_param = 1;
+				else
+					*_param = 0;
+				return TRX_SET_DUTY;
+			}
+			break;
+		case 8:		//Hxy, 2A03 sweep up in pitch. Bit 8 carries the direction,
+		case 9:		//Ixy, sweep down. rate in the high nibble, shift in the low.
+			//Hardware sets the negate bit for up, which subtracts from the
+			//period. The engine's period runs the same way round.
+			//
+			//Only the two 2A03 pulses carry a sweep unit; the same ordinals
+			//written elsewhere do nothing on the chip either.
+			if (kind != TRFTM_KIND_PULSE)
+				return -1;
+			*_param = p & 0x77;
+			if (fx == 8)
+				return TRX_SWEEP_UP;
+			return TRX_SWEEP_DN;
+		case 15:	//Zxx, DMC direct load. Written without a note far more
+			//often than with one: the DPCM channel's output IS the counter,
+			//so a column of Zxx drives it as a bare 7-bit DAC.
+			//
+			//The chip write is global, not per channel, so on hardware this
+			//moves the DPCM output from wherever it is written. Here it acts
+			//on the channel carrying it, and only the DPCM one has an output
+			//to move; written on any other it is dropped rather than made to
+			//click there.
+			if (kind != TRFTM_KIND_DPCM)
+				return -1;
+			*_param = p & 0x7F;
+			return TRX_DPCM_DAC;
+		case 23:	//Sxx, note cut. ECx carries at most 15 ticks.
+			*_param = 0xC0 | ClampI64(p, 0, 15);
+			return TRX_EXTENDED;
+	}
+	*_param = 0;
+
+	return -1;
+}
+
+U0 TrFtmPatLoad(U8 *raw, I64 off, I64 len, I64 bver)
+{//PATTERNS. No record count: read until the payload runs out. Rows land in
+//per (channel, pattern) columns; frames select among them later.
+	CTrFtmCur	 cur;
+	CTrCell		*col, *cell;
+	I64			 track, chan, pat, nrows, r, row, ncols, e, need;
+	I64			 note, oct, ins, vol, fx, fp, eff, param, kind, n, got;
+
+	TrFtmCurSet(&cur, raw, off, len);
+	need = 16;
+	if (bver <= 1)
+		need = 12;
+	while (!cur.over && cur.pos + need <= cur.end)
+	{
+		track = 0;
+		if (bver > 1)
+			track = TrFtmRdI32(&cur);
+		chan	= TrFtmRdI32(&cur);
+		pat		= TrFtmRdI32(&cur);
+		nrows	= TrFtmRdI32(&cur);
+		if (nrows < 0)
+			break;
+		//Channel is a position in the channel list, not a chan_id, so the kind
+		//comes from the map the chip mask built.
+		col = NULL;
+		if (track == 0 && 0 <= chan < tr_ftm_chans &&
+			0 <= pat < TR_MAX_PATTERNS)
+		{
+			if (!tr_ftm_col[chan][pat])
+				tr_ftm_col[chan][pat] = CAlloc(TR_MAX_ROWS * sizeof(CTrCell));
+			col = tr_ftm_col[chan][pat];
+		}
+		kind = TRFTM_KIND_PULSE;
+		if (0 <= chan < TRFTM_MAXCHANS)
+			kind = tr_ftm_kind[chan];
+
+		//Effect columns: one at file version 0x0200, always four at block
+		//version 6 and above regardless of HEADER, otherwise HEADER's stored
+		//count plus one.
+		ncols = 1;
+		if (bver >= 6)
+			ncols = 4;
+		else if (tr_ftm_file_ver != 0x0200)
+		{
+			ncols = 1;
+			if (0 <= chan < TRFTM_MAXCHANS)
+				ncols = ClampI64(tr_ftm_fx[chan] + 1, 1, 4);
+		}
+
+		for (r = 0; r < nrows; r++)
+		{
+			if (cur.over)
+				break;
+			//Row index is four bytes except at file version 0x0200 and block
+			//version 6 and above.
+			if (tr_ftm_file_ver == 0x0200 || bver >= 6)
+				row = TrFtmRdU8(&cur);
+			else
+				row = TrFtmRdI32(&cur);
+			note	= TrFtmRdU8(&cur);
+			oct		= TrFtmRdU8(&cur);
+			ins		= TrFtmRdU8(&cur);
+			vol		= TrFtmRdU8(&cur);
+			eff		= 0;
+			param	= 0;
+			got		= FALSE;
+			for (e = 0; e < ncols; e++)
+			{
+				fx = TrFtmStoredEffect(TrFtmRdU8(&cur));
+				fp = 0;
+				//The effect pair width changes at block version 6: below it
+				//an empty effect still consumes its parameter byte.
+				if (bver < 6 || fx)
+					fp = TrFtmRdU8(&cur);
+				//Song-level effects win the single slot. A cell may carry
+				//several and the engine holds one; losing Fxx, Bxx, Dxx or
+				//Cxx changes the tempo or the song's route through the order
+				//list, where losing a vibrato changes one note. 4217 of them
+				//are outranked by a channel effect in this corpus.
+				if (got && fx && (fx == 1 || fx == 2 || fx == 3 || fx == 4))
+					got = FALSE;
+				if (!got && fx)
+				{
+					param	= fp;
+					n		= TrFtmEffect(kind, fx, &param, tr_ftm_file_ver);
+					if (n >= 0)
+					{//The engine holds one effect per cell; later columns
+					//that also map are dropped.
+						eff	= n;
+						got	= TRUE;
+					}
+				}
+			}
+			if (col && 0 <= row < TR_MAX_ROWS && !cur.over)
+			{
+				cell = &col[row];
+				//Note 13 is RELEASE and 14 is HALT. 15 is the 0CC echo
+				//buffer and plays as empty.
+				if (1 <= note <= 12)
+				{
+					oct = ClampI64(oct, 0, 7);
+					cell->note = ClampI64(oct * 12 + note, 1, TR_NOTES);
+				}
+				else if (note == 13)
+					cell->note = TR_NOTE_OFF;
+				else if (note == 14)
+					cell->note = TR_NOTE_CUT;
+				else
+					cell->note = 0;
+
+				cell->inst = 0;
+				if (ins < TRFTM_INSTS_MAX)
+					cell->inst = TrFtmEngInst(ins, kind);
+
+				cell->volcmd	= TRV_NONE;
+				cell->volparam	= 0;
+				if (tr_ftm_file_ver == 0x0200)
+				{//Stored one high, 0 meaning empty.
+					if (vol)
+						vol--;
+					else
+						vol = 0x10;
+				}
+				if (vol < 16 && kind != TRFTM_KIND_DPCM)
+				{//4-bit, 0..15 against the engine's 0..64. Linear on every
+				//chip: S5B's logarithmic DAC converts once at the end of the
+				//chain, after the sequence has been folded in, so converting
+				//the column on the way in would apply the curve twice and to
+				//the wrong quantity.
+				//
+				//The triangle has no volume DAC. Its column gates the channel
+				//exactly as its sequence does: any nonzero value plays full.
+				//
+				//DPCM ignores the column outright, so it gets no command at
+				//all rather than a level nothing reads.
+					cell->volcmd	= TRV_SET;
+					cell->volparam	= vol * 4;
+					if (kind == TRFTM_KIND_TRI && vol)
+						cell->volparam = 64;
+				}
+				cell->eff	= eff;
+				cell->param	= param;
+			}
+		}
+	}
+}
+
+U0 TrFtmColsFree()
+{
+	I64 c, p;
+
+	for (c = 0; c < TRFTM_MAXCHANS; c++)
+		for (p = 0; p < TR_MAX_PATTERNS; p++)
+			if (tr_ftm_col[c][p])
+			{
+				Free(tr_ftm_col[c][p]);
+				tr_ftm_col[c][p] = NULL;
+			}
+}
+
+Bool TrFtmLoad(U8 *raw, I64 size)
+{//Replaces the whole song. Returns FALSE without touching state on reject.
+	CTrFtmCur	 cur;
+	CTrCell		*src, *dst;
+	I64			 boff[TRFTM_B_COUNT], bver[TRFTM_B_COUNT], blen[TRFTM_B_COUNT];
+	I64			 first, fver, pver, chip, machine, i, j, c, f, v, n163;
+	I64			 frames, speed, tempo, rows, bpm, n_inst, pat;
+
+	first = TrFtmHeader(raw, size, &fver);
+	if (!first)
+		return FALSE;
+	if (!TrFtmScan(raw, size, first, boff, bver, blen))
+		return FALSE;
+	//The 0.5.0 beta replaces HEADER, FRAMES and PATTERNS with a TRACK block
+	//whose layout is unverified. Reject rather than guess.
+	if (boff[TRFTM_B_PARAMS] < 0 || boff[TRFTM_B_HEADER] < 0 ||
+		boff[TRFTM_B_FRAMES] < 0 || boff[TRFTM_B_PATS] < 0)
+		return FALSE;
+
+	tr_ftm_raw		= raw;
+	tr_ftm_size		= size;
+	tr_ftm_file_ver	= fver;
+	tr_ftm_split	= 21;
+
+	//PARAMS. Every field is version gated; reading them out of order shifts
+	//everything after.
+	pver	= bver[TRFTM_B_PARAMS];
+	chip	= 0;
+	TrFtmCurSet(&cur, raw, boff[TRFTM_B_PARAMS], blen[TRFTM_B_PARAMS]);
+	speed = 6;
+	if (pver == 1)
+		speed = TrFtmRdU32(&cur);
+	if (pver >= 2)
+		chip = TrFtmRdI8(&cur) & 0xFF;
+	tr_ftm_chans	= TrFtmRdU32(&cur);
+	machine			= TrFtmRdU32(&cur);
+	tr_ftm_pal		= machine == 1;
+	if (pver < 7)
+		TrFtmRdU32(&cur);			//Engine speed in Hz, 0 = machine default.
+	else
+	{
+		TrFtmRdU32(&cur);			//Playback rate type.
+		TrFtmRdU32(&cur);			//Rate in microseconds.
+	}
+	if (pver >= 3)
+		TrFtmRdU32(&cur);			//Vibrato style.
+	if (pver >= 9)
+		TrFtmRdU32(&cur);			//Sweep pitch reset.
+	if (4 <= pver <= 6)
+	{
+		TrFtmRdU32(&cur);			//Row highlight 1.
+		TrFtmRdU32(&cur);			//Row highlight 2.
+	}
+	//Files exist with a chip mask of 0xFF and five channels; the count wins.
+	if (tr_ftm_chans == TRFTM_CHANS)
+		chip = 0;
+	n163 = 1;
+	if (pver >= 5 && (chip & TRFTM_CHIP_N163))
+		n163 = TrFtmRdU32(&cur);
+	if (pver >= 6)
+		tr_ftm_split = ClampI64(TrFtmRdU32(&cur), 1, 255);
+	if (tr_ftm_chans < TRFTM_CHANS || tr_ftm_chans > TRFTM_MAXCHANS)
+		return FALSE;
+	if (cur.over)
+		return FALSE;
+	//The chip mask decides what each position plays. The declared count still
+	//drives FRAMES and PATTERNS, so a file whose mask and count disagree stays
+	//in sync; positions the mask does not reach fall back to a pulse.
+	for (i = 0; i < TRFTM_MAXCHANS; i++)
+		tr_ftm_kind[i] = TRFTM_KIND_PULSE;
+	TrFtmChanMap(chip, n163);
+	//Name each channel by the voice it is. FTM stores no channel names, but
+	//the chip mask fixes what every position plays, and "CH03 Triangle" is
+	//worth more on screen than "CH03".
+	for (i = 0; i < tr_ftm_chans && i < TR_MAX_CHANNELS; i++)
+		switch (tr_ftm_kind[i])
+		{
+			case TRFTM_KIND_PULSE:		StrCopy(tr_chan_name[i], "Pulse");	break;
+			case TRFTM_KIND_TRI:		StrCopy(tr_chan_name[i], "Triangle");break;
+			case TRFTM_KIND_NOISE:		StrCopy(tr_chan_name[i], "Noise");	break;
+			case TRFTM_KIND_DPCM:		StrCopy(tr_chan_name[i], "DPCM");	break;
+			case TRFTM_KIND_V6PULSE:	StrCopy(tr_chan_name[i], "VRC6 Pls");break;
+			case TRFTM_KIND_V6SAW:		StrCopy(tr_chan_name[i], "VRC6 Saw");break;
+			case TRFTM_KIND_FDS:		StrCopy(tr_chan_name[i], "FDS");	break;
+			case TRFTM_KIND_N163:		StrCopy(tr_chan_name[i], "N163");	break;
+			case TRFTM_KIND_VRC7:		StrCopy(tr_chan_name[i], "VRC7");	break;
+			case TRFTM_KIND_S5B:		StrCopy(tr_chan_name[i], "S5B");	break;
+		}
+
+	//Chip gains are ratios against a 2A03 pulse and some exceed it, so they
+	//are normalised against the loudest kind the module actually has. The
+	//balance between chips is what matters; the song level is set separately.
+	tr_ftm_gain_max = 100;
+	for (i = 0; i < tr_ftm_chans && i < TRFTM_MAXCHANS; i++)
+	{
+		v = TrFtmKindGain(tr_ftm_kind[i]);
+		if (v > tr_ftm_gain_max)
+			tr_ftm_gain_max = v;
+	}
+
+	//HEADER. Only the track 0 effect column counts are used; the rest is
+	//consumed to reach them. Channel type bytes are ignored, as FamiTracker
+	//ignores them: the layout comes from the chip mask.
+	for (i = 0; i < TRFTM_MAXCHANS; i++)
+		tr_ftm_fx[i] = 0;
+	pver = bver[TRFTM_B_HEADER];
+	TrFtmCurSet(&cur, raw, boff[TRFTM_B_HEADER], blen[TRFTM_B_HEADER]);
+	if (pver <= 1)
+	{
+		tr_ftm_tracks = 1;
+		for (i = 0; i < tr_ftm_chans; i++)
+		{
+			TrFtmRdI8(&cur);
+			v = TrFtmRdI8(&cur);
+			if (i < TRFTM_MAXCHANS)
+				tr_ftm_fx[i] = ClampI64(v, 0, 3);
+		}
+	}
+	else
+	{
+		tr_ftm_tracks = TrFtmRdU8(&cur) + 1;
+		if (tr_ftm_tracks < 1 || tr_ftm_tracks > TRFTM_MAXTRACKS)
+			return FALSE;
+		if (pver >= 3)
+			for (i = 0; i < tr_ftm_tracks; i++)
+				TrFtmSkipStr(&cur);
+		//Channel-major, track-minor.
+		for (i = 0; i < tr_ftm_chans; i++)
+		{
+			TrFtmRdI8(&cur);
+			for (j = 0; j < tr_ftm_tracks; j++)
+			{
+				v = TrFtmRdI8(&cur);
+				if (j == 0 && i < TRFTM_MAXCHANS)
+					tr_ftm_fx[i] = ClampI64(v, 0, 3);
+			}
+		}
+		if (pver >= 4)
+			TrFtmSkip(&cur, 2 * tr_ftm_tracks);
+	}
+
+	//FRAMES, track 0. The block is not self-describing: the channel count
+	//comes from PARAMS and the track count from HEADER.
+	pver = bver[TRFTM_B_FRAMES];
+	TrFtmCurSet(&cur, raw, boff[TRFTM_B_FRAMES], blen[TRFTM_B_FRAMES]);
+	tempo = 150;
+	rows  = 64;
+	if (pver <= 1)
+	{
+		frames = TrFtmRdI32(&cur);
+		TrFtmRdI32(&cur);			//Channel count, ignored.
+		//No speed, tempo or row count here. PARAMS block version 1 carried
+		//the track speed, and a value above 19 was really a tempo.
+		if (speed > 19)
+		{
+			tempo = speed;
+			speed = 6;
+		}
+	}
+	else
+	{
+		frames	= TrFtmRdI32(&cur);
+		speed	= TrFtmRdI32(&cur);
+		if (pver >= 3)
+			tempo = TrFtmRdI32(&cur);
+		rows	= TrFtmRdI32(&cur);
+	}
+	if (frames < 1)
+		return FALSE;
+	frames	= ClampI64(frames, 1, TR_ORDER_MAX);
+	rows	= ClampI64(rows, 1, TR_MAX_ROWS);
+	speed	= ClampI64(speed, 1, 31);
+	tempo	= ClampI64(tempo, 0, 255);
+	MemSet(tr_ftm_order, 0, sizeof(tr_ftm_order));
+	for (f = 0; f < frames; f++)
+		for (c = 0; c < tr_ftm_chans; c++)
+		{
+			v = TrFtmRdU8(&cur);
+			if (c < TRFTM_MAXCHANS)
+				tr_ftm_order[f][c] = v;
+		}
+	//A truncated frame table leaves the tail pointing at pattern 0, which
+	//plays as empty rows.
+
+	//Every reject is behind us; the song in memory can go now.
+	TrSongFreeAll;
+	MemSet(&tr_song, 0, sizeof(CTrSong));
+	MemSet(tr_ftm_seq, 0, sizeof(tr_ftm_seq));
+	MemSet(tr_ftm_xseq, 0, sizeof(tr_ftm_xseq));
+	tr_ftm_xseq_used = FALSE;
+	MemSet(tr_ftm_ins, 0, sizeof(tr_ftm_ins));
+	MemSet(tr_ftm_col, 0, sizeof(tr_ftm_col));
+	MemSet(tr_ftm_dpcm_off, 0, sizeof(tr_ftm_dpcm_off));
+	MemSet(tr_ftm_dpcm_len, 0, sizeof(tr_ftm_dpcm_len));
+	tr_ftm_pairs		= 0;
+	tr_ftm_pcm_used		= 0;
+	tr_ftm_pass_n		= 0;
+	//Sample slots were just released, so the cached copies are stale.
+	MemSet(tr_noise_slot, 0, sizeof(tr_noise_slot));
+
+	tr_song.channels	= tr_ftm_chans;
+	tr_song.n_patterns	= frames;
+	tr_song.order_len	= frames;
+	tr_song.restart		= 0;
+	tr_song.global_vol	= 128;
+	//An expansion module carries up to 29 channels against the 2A03's five,
+	//and the master gain is independent of channel count. Voices are
+	//uncorrelated, so the sum grows as the square root of the count; backing
+	//the song level off by that keeps an eleven-channel module level with a
+	//five-channel one instead of clipping it.
+	//128 * sqrt(5 / channels), by integer Newton on the square.
+	j = 16384 * TRFTM_CHANS / tr_ftm_chans;
+	v = 128;
+	for (i = 0; i < 8; i++)
+		v = (v + j / v) / 2;
+	tr_song.mix_vol		= ClampI64(v, 32, 128);
+	tr_song.linear		= FALSE;
+	tr_song.fine_slides	= FALSE;
+	tr_song.clock		= TR_STEP_NUM;
+
+	//Rows per minute is 24 * bpm / speed in the engine and tempo * 24 / speed
+	//in FamiTracker, so bpm = tempo holds the musical tempo exactly. Tempo 0
+	//locks a row to speed ticks of the refresh: 3600 / speed rows per minute
+	//on NTSC, which is bpm 150, and 3000 / speed on PAL, which is bpm 125.
+	bpm = tempo;
+	if (tempo < 1)
+	{
+		bpm = 150;
+		if (machine == 1)
+			bpm = 125;
+	}
+	//Tempo below 32 is outside FamiTracker's own range but representable by
+	//doubling both terms, which leaves the ratio and so the row rate alone.
+	while (bpm < 32 && speed <= 15)
+	{
+		bpm		*= 2;
+		speed	*= 2;
+	}
+	//FamiTracker's tick rate is the video frame rate and never moves; the
+	//tempo sets how many ticks a row lasts. Our tick rate follows bpm, so bpm
+	//is pinned to whatever makes one tick one frame and the tempo is handed to
+	//the accumulator instead. Pinning it is what keeps every macro, envelope,
+	//vibrato and arpeggio running at the rate they were written for: at tempo
+	//90 they were running at 60 per cent of it.
+	tr_ftm_hz		= 60;
+	if (tr_ftm_pal)
+		tr_ftm_hz = 50;
+	tr_ftm_tempo	= ClampI64(bpm, 1, 255);
+	tr_ftm_speed	= ClampI64(speed, 1, 31);
+	tr_ftm_accum	= 0;
+	tr_song.bpm		= tr_ftm_hz * 5 / 2;	//60 Hz -> 150, 50 Hz -> 125.
+	tr_song.speed	= ClampI64(speed, 1, 31);
+	//GROOVES is written after FRAMES, so the speed field cannot be read as
+	//either a tick count or a groove index until the flag in this block's tail
+	//is known. Reading a groove index as a tick count plays the song at
+	//roughly double tempo, which is why the block cannot simply be skipped.
+	tr_groove_idx = -1;
+	tr_groove_pos = 0;
+	if (boff[TRFTM_B_GROOVES] >= 0 &&
+		TrFtmGrooveLoad(raw, boff[TRFTM_B_GROOVES], blen[TRFTM_B_GROOVES],
+						tr_ftm_tracks))
+	{
+		v = speed & (TR_GROOVES - 1);
+		if (tr_groove_len[v] > 0)
+		{
+			tr_groove_idx	= v;
+			tr_groove_pos	= 0;
+			tr_song.speed	= ClampI64(tr_groove[v][0], 1, 31);
+		}
+		else
+			tr_song.speed = 6;	//Flag set on an empty slot: DEFAULT_SPEED.
+	}
+	for (i = 0; i < frames; i++)
+		tr_song.order[i] = i;
+
+	TrSynthBuild;
+
+	//INFO, block version 1: three fixed 32-byte fields, NUL padded and not
+	//guaranteed NUL terminated.
+	if (boff[TRFTM_B_INFO] >= 0 && blen[TRFTM_B_INFO] >= 32)
+	{
+		for (i = 0; i < TR_TITLE_LEN - 1; i++)
+		{
+			v = raw[boff[TRFTM_B_INFO] + i];
+			if (!v)
+				break;
+			if (v < 32)
+				v = 32;
+			tr_song.title[i] = v;
+		}
+		tr_song.title[i] = 0;
+	}
+
+	if (boff[TRFTM_B_INSTS] >= 0)
+		TrFtmInstLoad(raw, boff[TRFTM_B_INSTS], blen[TRFTM_B_INSTS],
+					  bver[TRFTM_B_INSTS]);
+	if (boff[TRFTM_B_SEQS] >= 0)
+		TrFtmSeqLoad(raw, boff[TRFTM_B_SEQS], blen[TRFTM_B_SEQS],
+					 bver[TRFTM_B_SEQS], &tr_ftm_seq[0][0], FALSE);
+	//Expansion sequences share one set. VRC6 follows the 2A03's trailing
+	//pass; N163 and S5B carry release and setting inline.
+	tr_ftm_pass_n = 0;
+	if (boff[TRFTM_B_SEQ_VRC6] >= 0)
+	{
+		TrFtmSeqLoad(raw, boff[TRFTM_B_SEQ_VRC6], blen[TRFTM_B_SEQ_VRC6],
+					 bver[TRFTM_B_SEQ_VRC6], &tr_ftm_xseq[0][0], FALSE);
+		tr_ftm_xseq_used = TRUE;
+	}
+	else if (boff[TRFTM_B_SEQ_N163] >= 0)
+	{
+		TrFtmSeqLoad(raw, boff[TRFTM_B_SEQ_N163], blen[TRFTM_B_SEQ_N163],
+					 bver[TRFTM_B_SEQ_N163], &tr_ftm_xseq[0][0], TRUE);
+		tr_ftm_xseq_used = TRUE;
+	}
+	else if (boff[TRFTM_B_SEQ_S5B] >= 0)
+	{
+		TrFtmSeqLoad(raw, boff[TRFTM_B_SEQ_S5B], blen[TRFTM_B_SEQ_S5B],
+					 bver[TRFTM_B_SEQ_S5B], &tr_ftm_xseq[0][0], TRUE);
+		tr_ftm_xseq_used = TRUE;
+	}
+	if (boff[TRFTM_B_DPCM] >= 0)
+		TrFtmDpcmLoad(raw, boff[TRFTM_B_DPCM], blen[TRFTM_B_DPCM]);
+
+	//Patterns must follow the instrument, sequence and DPCM blocks: the
+	//instrument column is remapped as it is read.
+	TrFtmPatLoad(raw, boff[TRFTM_B_PATS], blen[TRFTM_B_PATS],
+				 bver[TRFTM_B_PATS]);
+
+	//One engine pattern per frame. Each channel takes its own column.
+	for (f = 0; f < frames; f++)
+	{
+		if (!TrPatternAlloc(f, rows))
+		{//Out of memory. Keep the frames that landed.
+			frames = f;
+			break;
+		}
+		for (c = 0; c < tr_ftm_chans; c++)
+		{
+			pat = tr_ftm_order[f][c];
+			src = tr_ftm_col[c][pat];
+			if (src)
+				for (i = 0; i < rows; i++)
+				{
+					dst = TrCell(f, c, i);
+					if (dst)
+						MemCopy(dst, &src[i], sizeof(CTrCell));
+				}
+		}
+	}
+	tr_song.n_patterns	= frames;
+	tr_song.order_len	= frames;
+	TrFtmColsFree;
+
+	n_inst = 0;
+	for (i = 1; i < TR_MAX_INSTRUMENTS; i++)
+		if (tr_inst[i])
+			n_inst = i;
+	tr_song.n_instruments = n_inst;
+
+	TrMasterDefault;
+	//NES channels are centred, not panned in the Amiga LRRL pattern.
+	TrChanPanDefault(FALSE);
+	TrChansInit;
+
+	return TRUE;
+}

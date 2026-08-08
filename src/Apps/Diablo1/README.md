@@ -14,11 +14,16 @@ the same structure as the Quake and HL1 ports.
 
        ExeFile("::/Apps/Diablo1/Run");
 
+   The game spawns its own task, so the invoking shell stays usable.
+
    `D1Test;` afterwards runs the data-layer self check (extraction byte
    sums, frame counts, town assembly). `D1TestAudio;` checks the playback
    path - voice allocation, pool oversubscription, music track switching,
    and buffer stability while a voice is reading. It is audible and takes
-   about 20 seconds.
+   about 20 seconds. `D1TestNet;` checks the net layer on one machine
+   (transport, packet codec, turn ring, character pack, RNG window);
+   `D1TestLockstep;` is the two-peer determinism proof - it runs the same
+   world as both machines and compares field by field every turn.
 
 Controls: left-click walks / attacks / picks up / opens / talks;
 right-click casts the selected spell; `i` inventory, `c` character,
@@ -49,8 +54,11 @@ and autosaves.
   Banner2, Blood1, Bonestr2, Blind2, Warlord and the four level-16 diab
   quads). Theme rooms are absent, so layouts diverge from retail seeds
   but are deterministic in ours.
-- Lighting: MakeLightTable ramp shading, radial falloff around the
-  player, applied to tiles and actors.
+- Lighting: the retail DoLighting/DoVision split - lightradius and
+  lightblock radial falloff into dLight, crawl-table line of sight into
+  dFlags (VISIBLE/LIT/EXPLORED) blocked by nBlockTable pieces, and the
+  dTransVal wall-transparency pass. Monsters are drawn and picked only
+  on lit tiles, as CheckCursMove does.
 - Monsters: 80 types over the full depth, machine-generated from their
   monstdat rows with TRN recolors, carrying mAi, class and magic
   resistance. Per-type AI mirroring the MAI_ routines: fallen rally and
@@ -60,8 +68,11 @@ and autosaves.
 - Missiles: 11 types (arrows, firebolt, fireball, holy bolt, elemental,
   inferno, charged bolt, acid, blood star, lightning) with wall and
   target collision.
-- Combat: to-hit rolls both ways, hit flash, XP with level-ups (real
-  ExpLvlsTbl thresholds), player death and town respawn.
+- Combat: to-hit rolls both ways, the player roll clamped 5..95 with the
+  Warrior bonus and item to-hit; missiles roll to hit per MonsterMHit,
+  bows carrying the (dist*dist)>>1 range falloff and rolling damage at
+  impact. Hit flash, XP with level-ups (real ExpLvlsTbl thresholds),
+  player death and town respawn.
 - Objects and loot: barrels shatter, chests open, monsters drop gold and
   potions; click to pick up, keys 1-8 drink from the belt.
 - Items: 74 base items generated from itemdat rows (weapons, armor,
@@ -70,9 +81,14 @@ and autosaves.
   equip slots; weapon damage and armor AC feed combat.
 - Staves carry a GetStaffSpell roll and charges; casting from one bills
   the staff, the panel icon tints orange (RSPLTYPE_CHARGES), and Adria
-  stocks them. A spent staff stays spent: recharging is absent.
+  stocks them. A spent staff stays spent: recharging is absent. Repair,
+  Recharge, Identify, Disarm, Infravision and Resurrect have no book
+  rows, matching their sBookLvl of -1 - they are staff-only.
 - Objects: barrels, chests, and functional doors (exact objects.cpp
-  piece-swap tables for cathedral and catacombs).
+  piece-swap tables for cathedral and catacombs), plus the dSpecial arch
+  and open-door layer from L1S/L2S/TownS.CEL placed per DRLG_InitL1Vals
+  and ObjL2Special, shaded through the tile's own dLight. Opening or
+  closing a door refreshes vision, as RedoPlayerVision does.
 - A* pathfinding (path.cpp) with BFS fallback past its 24-step cap.
 - Audio through the native AC97 mixer: WAV decode + 48kHz resample,
   8-voice SFX pool, looped music per level band, monster voices,
@@ -131,10 +147,11 @@ and autosaves.
 - Save/load: 3 slots, own compact format, checksummed; persists the
   character, inventory, position and all 17 level seeds so dungeons
   regenerate identically, plus per-item prefix/suffix/unique/identified
-  state, durability, staff charges and per-item affix rolls, the
-  unique-drop bitmap, quest state and spell levels. Autosaves on level
-  change and on exit. Format version 4; versions 1-3 still load with
-  documented defaults.
+  state, durability, staff charges, per-item affix rolls and the item on
+  the cursor, the unique-drop bitmap, quest state and spell levels. Town
+  floor loot persists across level changes. Autosaves on level
+  change and on exit. Format
+  version 6; versions 1-5 still load with documented defaults.
 - devilutionX-style QOL: town jog, 2x zoom ('z' and the mouse wheel),
   a resizable canvas with five modes to 1280x960 ('w' or the options
   menu), hover HP bar, click feedback sounds.
@@ -154,7 +171,7 @@ pinned, frames eyeballed as PNG) and in-VM by D1Test.
 | D1Rnd.ZC | Borland LCG | engine.cpp SetRndSeed/random_ |
 | D1Draw.ZC | 8bpp canvas, window blit | dx.cpp/scrollrt blit |
 | D1Lvl.ZC | dPiece/micros/SOL, town, grids | gendung.cpp, town.cpp |
-| D1Light.ZC | shade tables, light grid | lighting.cpp |
+| D1Light.ZC (+D1LightT) | DoLighting/DoVision, shade tables | lighting.cpp |
 | D1Cel.ZC | CEL/CL2/PCX, small font | engine.cpp, control.cpp tables |
 | D1Menu.ZC | title/menu/cut screens | DiabloUI (simplified) |
 | D1Drlg1.ZC | cathedral generation | drlg_l1.cpp |
@@ -201,16 +218,30 @@ pinned, frames eyeballed as PNG) and in-VM by D1Test.
   retail exits the program.
 - Only Healing casts in town, per spelldat sTownSpell; retail's other
   town spells (Identify, town-cast utility) are outside the roster.
-- Lighting falloff is plain radial, not the original crawl tables. No
-  wall-transparency (dTransVal) pass; missiles draw over walls.
+- Missiles draw over walls.
 - Nova's book level is the Hellfire row's 14. Retail's is -1, staff only.
+- Durability wear, inventory placement, store stock and towner gossip roll
+  on a per-machine RNG stream, never the shared one: they read state no
+  other peer holds.
+- Missiles and spells do not run in a session; ranged monsters close to
+  melee (D1MonIsRanged).
+- Town stores reseed from a town-visit counter, not GetTickCount: a wall
+  clock cannot agree across lockstep peers. The RNG stream is restored
+  afterwards, where retail leaves it pinned.
+- Flash, Fire Wall, Lightning, Charged Bolt and Chain Lightning match
+  retail damage and duration but approximate its frame-by-frame growth;
+  Charged Bolt aims its bolts off-line instead of walking bpath[].
 - The Skeleton King stands in the SKngDO room; the port has no set
   levels, so his own level is not built.
 - AI_CLEAVER, AI_SKELKING and AI_WARLORD are unimplemented; all three
   bosses reduce to the skeleton melee AI.
 - The hovered name floats over ground items (colored Alt-style). Retail puts
   actor names in the panel info box; monsters still fill that box too. When
-  Enemy Health Bar is on, the top bar shows frame + HP fill + monster name.
+  Enemy Health Bar is on, the top bar shows the frame, the HP fill clipped
+  to its inner rect, and the vertically centred monster name - whitegold
+  for uniques. Blue pack-minion names are absent: the port has no
+  unique-monster packs. Transient toasts are gold with a black outline
+  rather than retail's plain fill.
 - towners.cpp AnimOrder frame-sequence tables are absent. Six of the
   eight towners play a hand-authored sequence upstream; here they cycle
   their frames linearly at the correct per-towner rate.
@@ -218,15 +249,20 @@ pinned, frames eyeballed as PNG) and in-VM by D1Test.
 - L3ANVIL places on level 10; Anvil of Fury ground item drops there.
   Griswold turn-in (reward weapon) is not wired yet.
 - Music plays one pass and stops.
-- Multiplayer: lockstep transport and peer sim are in tree
-  (`D1Net.ZC`, `D1Peer*` in `D1Play.ZC`); Host/Join menu and character-
-  pack hooks are not wired yet. Prove determinism with
-  `D1TestLockstep;`. LAN entry is `ExeFile("::/Apps/Diablo1/RunNet");`.
+- Multiplayer: peer-to-peer lockstep over UDP. Main-menu Host/Join with
+  typed addresses, character select reused from single player, the
+  D1Save version 6 image shipped as the join pack in eight fragments,
+  and seed exchange so both peers regenerate identical dungeons.
+  Determinism is proved by `D1TestLockstep;`, which runs the same world
+  as both machines and compares field by field every turn. LAN entry is
+  `ExeFile("::/Apps/Diablo1/RunNet");` - not `Run`; the UDP binding is
+  compile-time.
 
 ## Roadmap
 
-remaining gaps: crawl-table lighting and the dTransVal pass, set levels,
-multiplayer Host/Join UI and character-pack wire-up.
+remaining gaps: set levels, books and scrolls, rings and amulets, shrines
+and traps, talking quest monsters, unique-monster packs, missiles and
+spells in a session.
 
 ## License
 

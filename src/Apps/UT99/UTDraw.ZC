@@ -1,0 +1,1375 @@
+// UTDraw.ZC - SoftDrv CPU raster (ZealC clean-room of SoftDrv.cpp path).
+//
+// SoftDrv.dll absent from Ut99PubSrc. Body algorithms from Unreal v200 SoftDrv:
+// DrawGouraudPolygon → triangle fan + span Index walk; DrawComplexSurface fills
+// Facet.Span; Lock clears screen. P8 canvas + Quake/HL1 draw_it blit. No GL/D3D.
+
+#define UT_SCR_W		320
+#define UT_SCR_H		240
+#define UT_NEAR_CLIP	4.0
+#define UT_SPAN_SUB		16		//pixels between exact perspective divides
+#define UT_MAX_POLY_VERTS	8
+
+Bool ut_draw_truecolor = TRUE;
+//UnRender occludes with FSpanBuffer alone and DrawSurf.cpp has no depth
+//buffer — but that only works because OccludeBsp emits ordered draw lists
+//with per-zone spans and bounding-box rejection. Our walker has none of
+//that, so spans alone leave masked and coplanar surfaces unordered. The Z
+//test stays until R3 lands; dropping it early was adopting half an
+//architecture. Console 'worldz' toggles it.
+//Depth test. World facets draw front-to-back with span punching, so the test
+//is redundant there; meshes carry no spans and depend on it entirely. Left
+//FALSE the test never ran and mesh triangles painted in file order.
+Bool ut_draw_world_z = TRUE;
+//DrawComplexSurface composites Texture * LightMap. The mesh is stored at
+//UT_LM_UNIT = unit light, so the composite divides by it; a fully lit texel
+//reproduces the texture, overlapping lights overbright past it. There is no
+//ambient term and no gain: an unlit surface is black, as in the engine.
+
+//Per-facet lightmap bind. Sampling used to call across to UTBsp and divide
+//twice per texel; at 300k texels a frame that cost more than the whole rest
+//of the span loop. The facet fills these once, the loop only multiplies.
+U8 *ut_lm_ptr	= NULL;		//NULL when the facet has no lightmap
+I64 ut_lm_uc	= 1;
+I64 ut_lm_vc	= 1;
+F64 ut_lm_pan0	= 0.0;
+F64 ut_lm_pan1	= 0.0;
+F64 ut_lm_ru	= 1.0;		//1/UScale
+F64 ut_lm_rv	= 1.0;
+//SoftDrv InitColorTables, ported rather than approximated. Epic resolves a
+//pixel with one table lookup, not a float multiply and a blend:
+//  Shade[SHADE_R + Tex + Light*256] with LIGHTSHADES 128
+//  Val = Tex * Light * (0.5 + Brightness) * 8 / (128*128) * FlashScale
+//FlashScale is 128 at normal brightness, so the multiplier collapses to
+//Tex * Light * (0.5 + Brightness) / 16 with Tex a 6-bit texture channel and
+//Light the raw 7-bit lightmap channel. GRender->Brightness default is 0.39.
+#define UT_RENDER_BRIGHTNESS	0.39
+#define UT_LIGHTSHADES			128		//Light index range
+#define UT_TEXSHADES			64		//6-bit texture channel
+#define UT_UNLITLEVEL			63		//SoftDrv UNLITLEVEL 0x3F
+
+U8	 ut_shade_lut[UT_LIGHTSHADES * UT_TEXSHADES];
+I64	 ut_unlit_light	= 56;	//Clamp(UNLITLEVEL * (0.5 + Brightness), 0, 127)
+Bool ut_shade_ready	= FALSE;
+
+U0 UTDrawBuildShadeTable()
+{//= USoftwareRenderDevice::InitColorTables, ColorBytes 4 path.
+	F64 scale;
+	I64 light;
+	I64 tex;
+	I64 v;
+
+	scale = (0.5 + UT_RENDER_BRIGHTNESS) / 16.0;
+	light = 0;
+	while (light < UT_LIGHTSHADES)
+	{
+		tex = 0;
+		while (tex < UT_TEXSHADES)
+		{
+			v = ToI64(ToF64(tex) * ToF64(light) * scale);
+			if (v > 255)
+				v = 255;
+			ut_shade_lut[light * UT_TEXSHADES + tex] = v & 255;
+			tex++;
+		}
+		light++;
+	}
+	v = ToI64(ToF64(UT_UNLITLEVEL) * (0.5 + UT_RENDER_BRIGHTNESS));
+	if (v > 127)
+		v = 127;
+	if (v < 0)
+		v = 0;
+	ut_unlit_light = v;
+	ut_shade_ready = TRUE;
+}
+
+Bool ut_draw_unlit	= FALSE;
+
+#define UT_RES_COUNT		6
+#define UT_DRAW_PF_TRANSLUCENT	0x00000004
+#define UT_DRAW_PF_MODULATED	0x00000040
+#define UT_DRAW_PF_MASKED	0x00000002
+//SoftDrv canvas picks. Index 5 = match window (see UTApplyVideo).
+I64 ut_res_w[UT_RES_COUNT] = {320, 400, 512, 640, 800, 0};
+I64 ut_res_h[UT_RES_COUNT] = {240, 300, 384, 480, 600, 0};
+I64 ut_opt_res = 3;	//640x480 default; F5/= cycles table
+F64 ut_opt_brightness = 1.0;	//1.0 = FlashScale 128
+Bool ut_opt_music = TRUE;
+F64 ut_opt_mouse = 1.0;		//Controls prefs → UTInMouseLook scale
+F64 ut_opt_hud = 1.0;		//HUD prefs → ChallengeHUD scale
+F64 ut_opt_sfx = 1.0;		//Audio prefs → UTSndPlay scale
+Bool ut_opt_crosshair = TRUE;	//HUD prefs → SoftDrv cross underlay
+I64 ut_opt_cross_style = 0;	//0 + 1 x 2 dot 3 circle
+Bool ut_opt_autoaim = TRUE;	//TournamentWeapon AutoAim soft
+Bool ut_opt_viewbob = TRUE;	//walk bob SoftDrv eye
+F64 ut_view_bob = 0.0;		//bob phase
+F64 ut_view_shake = 0.0;	//damage camera kick
+Bool ut_listen_active = FALSE;	//Browser Local Listen stub (no IpDrv)
+I64  ut_listen_port = 7777;	//display-only; no socket bind
+U8   ut_listen_map[64] = "DM-Morpheus";
+Bool ut_res_dirty = FALSE;
+
+class CUTPolyVert
+{//camera-space vert + texels. SoftDrv / QDraw poly clip unit.
+	F64	cam[3];
+	F64	u;
+	F64	v;
+	F64	sx;
+	F64	sy;
+	F64	inv_z;
+	F64	u_over_z;
+	F64	v_over_z;
+	F64	shade;		//SoftDrv DrawGouraud vertex light 0..1
+};
+
+class CUTCanvas
+{
+	U8	*pixels;
+	//Truecolor plane. Bit 31 set means this pixel holds a literal 0x00RRGGBB
+	//and the index plane is ignored at blit. Lets writers convert one at a
+	//time instead of a flag-day switch of every span routine.
+	U32	*argb;
+	F64	*depth;
+	I64	 width;
+	I64	 height;
+	F64	 origin[3];
+	F64	 forward[3];
+	F64	 right[3];
+	F64	 up[3];
+	F64	 x_scale;
+	F64	 y_scale;
+	F64	 center_x;
+	F64	 center_y;
+	I64	 tris_drawn;
+	I64	 verts_drawn;
+	I64	 spans_drawn;
+	I64	 tiles_drawn;
+};
+
+F64 ut_draw_shade = 1.0;	//SoftDrv Light attenuation 0..1
+Bool ut_draw_lm_on = FALSE;	//facet LightMap active (set in UTBspDrawFacet)
+Bool ut_draw_gouraud = FALSE;	//TRUE → interpolate CUTPolyVert.shade in spans
+F64 ut_draw_fog_r = 0.0;	//SoftDrv FogMap Photon R 0..1
+F64 ut_draw_fog_g = 0.0;
+F64 ut_draw_fog_b = 0.0;
+F64 ut_draw_fog_a = 0.0;	//fog blend 0..1
+Bool ut_draw_fog_on = FALSE;
+I64 ut_draw_poly_flags = 0;	//SoftDrv DrawTile/mesh PolyFlags
+
+extern F64 UTBspSampleLightMapActive(F64 u, F64 v);
+extern U0 UTBspSampleLMRGBActive(F64 u, F64 v, F64 *lr, F64 *lg, F64 *lb);
+extern U0 UTBspSampleFogPhotonActive(F64 u, F64 v,
+	F64 *fr, F64 *fg, F64 *fb, F64 *fa);
+
+//Defined here (before UTUWin). Late define + early extern → garbage ptr GPF.
+CUTCanvas	*ut_canvas	= NULL;
+
+CUTCanvas *UTDrawNew(I64 w, I64 h)
+{
+	CUTCanvas *c;
+
+	if (w < 1 || h < 1)
+		return NULL;
+	if (!ut_shade_ready)
+		UTDrawBuildShadeTable;
+	c = CAlloc(sizeof(CUTCanvas));
+	c->width  = w;
+	c->height = h;
+	c->pixels = CAlloc(w * h);
+	c->argb   = CAlloc(w * h * sizeof(U32));
+	c->depth  = CAlloc(w * h * sizeof(F64));
+	c->center_x = ToF64(w) * 0.5;
+	c->center_y = ToF64(h) * 0.5;
+	c->x_scale  = ToF64(w) * 0.5;
+	c->y_scale  = ToF64(h) * 0.5;
+	UTVecSet(c->origin, 0.0, 0.0, 0.0);
+	UTVecSet(c->forward, 1.0, 0.0, 0.0);
+	UTVecSet(c->right, 0.0, 1.0, 0.0);
+	UTVecSet(c->up, 0.0, 0.0, 1.0);
+	return c;
+}
+
+U0 UTDrawFree(CUTCanvas *c)
+{
+	if (!c)
+		return;
+	if (c->pixels)
+		Free(c->pixels);
+	if (c->argb)
+		Free(c->argb);
+	if (c->depth)
+		Free(c->depth);
+	c->pixels = NULL;
+	c->argb   = NULL;
+	c->depth  = NULL;
+	Free(c);
+}
+
+U0 UTDrawClear(CUTCanvas *c, I64 color_index)
+{
+	if (!c || !c->pixels)
+		return;
+	MemSet(c->pixels, color_index, c->width * c->height);
+	//argb cleared to 0: bit 31 low, so every pixel starts owned by the index
+	//plane and only writers that set it take the truecolor path.
+	MemSet(c->argb, 0, c->width * c->height * sizeof(U32));
+	MemSet(c->depth, 0, c->width * c->height * sizeof(F64));
+	c->tris_drawn  = 0;
+	c->verts_drawn = 0;
+	c->spans_drawn = 0;
+	c->tiles_drawn = 0;
+}
+
+U0 UTDrawSetView(CUTCanvas *c, F64 *origin, I64 pitch, I64 yaw, I64 roll,
+	F64 fov_deg)
+{//eye at origin; GetAxes supplies forward/right/up. FOV horizontal degrees.
+ //x_scale = y_scale so pixels stay square (QDrawSetView).
+	F64 half;
+
+	UTVecCopy(origin, c->origin);
+	UTGetAxes(pitch, yaw, roll, c->forward, c->right, c->up);
+	half = Tan(fov_deg * 0.5 * UT_DEG2RAD);
+	c->x_scale  = ToF64(c->width) * 0.5 / half;
+	c->y_scale  = c->x_scale;
+	c->center_x = ToF64(c->width) * 0.5;
+	c->center_y = ToF64(c->height) * 0.5;
+}
+
+Bool UTDrawProject(CUTCanvas *c, F64 *world, F64 *sx, F64 *sy, F64 *inv_z)
+{
+	F64 cam[3];
+	F64 z;
+
+	UTTransformPointBy(world, c->origin, c->right, c->up, c->forward, cam);
+	//TransformPointBy with (right,up,forward) as X/Y/Z axes:
+	//cam[0]=right, cam[1]=up, cam[2]=forward depth
+	z = cam[2];
+	if (z < UT_NEAR_CLIP)
+		return FALSE;
+	*inv_z = 1.0 / z;
+	*sx = c->center_x + cam[0] * c->x_scale * (*inv_z);
+	*sy = c->center_y - cam[1] * c->y_scale * (*inv_z);
+	return TRUE;
+}
+
+U0 UTDrawPlot(CUTCanvas *c, I64 x, I64 y, F64 inv_z, I64 color)
+{
+	I64 i;
+
+	if (x < 0 || y < 0 || x >= c->width || y >= c->height)
+		return;
+	i = y * c->width + x;
+	if (inv_z > c->depth[i])
+	{
+		c->depth[i]  = inv_z;
+		c->pixels[i] = color;
+	}
+}
+
+U0 UTDrawFillTri(CUTCanvas *c, F64 *ax, F64 *ay, F64 *ainv,
+	F64 *bx, F64 *by, F64 *binv,
+	F64 *cx, F64 *cy, F64 *cinv, I64 color)
+{//barycentric fill. pointers so callers pass projected scalars by address.
+	F64	minx;
+	F64	maxx;
+	F64	miny;
+	F64	maxy;
+	I64	x0;
+	I64	x1;
+	I64	y0;
+	I64	y1;
+	I64	x;
+	I64	y;
+	F64	px;
+	F64	py;
+	F64	v0x;
+	F64	v0y;
+	F64	v1x;
+	F64	v1y;
+	F64	v2x;
+	F64	v2y;
+	F64	dot00;
+	F64	dot01;
+	F64	dot02;
+	F64	dot11;
+	F64	dot12;
+	F64	inv;
+	F64	u;
+	F64	v;
+	F64	w;
+	F64	iz;
+
+	minx = *ax;
+	if (*bx < minx) minx = *bx;
+	if (*cx < minx) minx = *cx;
+	maxx = *ax;
+	if (*bx > maxx) maxx = *bx;
+	if (*cx > maxx) maxx = *cx;
+	miny = *ay;
+	if (*by < miny) miny = *by;
+	if (*cy < miny) miny = *cy;
+	maxy = *ay;
+	if (*by > maxy) maxy = *by;
+	if (*cy > maxy) maxy = *cy;
+
+	x0 = ToI64(minx);
+	x1 = ToI64(maxx);
+	y0 = ToI64(miny);
+	y1 = ToI64(maxy);
+	if (x0 < 0) x0 = 0;
+	if (y0 < 0) y0 = 0;
+	if (x1 >= c->width)  x1 = c->width - 1;
+	if (y1 >= c->height) y1 = c->height - 1;
+	if (x0 > x1 || y0 > y1)
+		return;
+
+	v0x = *cx - *ax;
+	v0y = *cy - *ay;
+	v1x = *bx - *ax;
+	v1y = *by - *ay;
+	dot00 = v0x * v0x + v0y * v0y;
+	dot01 = v0x * v1x + v0y * v1y;
+	dot11 = v1x * v1x + v1y * v1y;
+	inv = dot00 * dot11 - dot01 * dot01;
+	if (inv > -1.0e-12 && inv < 1.0e-12)
+		return;
+	inv = 1.0 / inv;
+
+	y = y0;
+	while (y <= y1)
+	{
+		x = x0;
+		while (x <= x1)
+		{
+			px = ToF64(x) + 0.5;
+			py = ToF64(y) + 0.5;
+			v2x = px - *ax;
+			v2y = py - *ay;
+			dot02 = v0x * v2x + v0y * v2y;
+			dot12 = v1x * v2x + v1y * v2y;
+			u = (dot11 * dot02 - dot01 * dot12) * inv;
+			v = (dot00 * dot12 - dot01 * dot02) * inv;
+			w = 1.0 - u - v;
+			if (u >= 0.0 && v >= 0.0 && w >= 0.0)
+			{
+				iz = w * (*ainv) + v * (*binv) + u * (*cinv);
+				UTDrawPlot(c, x, y, iz, color);
+			}
+			x++;
+		}
+		y++;
+	}
+	c->tris_drawn++;
+}
+
+U0 UTDrawTri3(CUTCanvas *c, F64 *a, F64 *b, F64 *cc, I64 color)
+{
+	F64 ax;
+	F64 ay;
+	F64 aiz;
+	F64 bx;
+	F64 by;
+	F64 biz;
+	F64 cx;
+	F64 cy;
+	F64 ciz;
+
+	if (!UTDrawProject(c, a, &ax, &ay, &aiz))
+		return;
+	if (!UTDrawProject(c, b, &bx, &by, &biz))
+		return;
+	if (!UTDrawProject(c, cc, &cx, &cy, &ciz))
+		return;
+	c->verts_drawn += 3;
+	UTDrawFillTri(c, &ax, &ay, &aiz, &bx, &by, &biz, &cx, &cy, &ciz, color);
+}
+
+U0 UTDrawBlitFit(CUTCanvas *c, CDC *dc, I64 dst_x, I64 dst_y, I64 dst_w,
+	I64 dst_h)
+{//SoftDrv Unlock display path: P8 → ARGB32 (ZealOS CDC). FlashSprite32 pal.
+ //No 15/16 fb — ZealOS has no RGB555/565 surface; 16-bit SoftDrv math stays
+ //in UTPalFlash16Add / ut_flash16_pal for fidelity helpers only.
+	U8	*src;
+	U32	*srgb;
+	U32	*dst;
+	U32	 v;
+	I64	 sx_step;
+	I64	 sy_step;
+	I64	 sxf;
+	I64	 sy;
+	I64	 x;
+	I64	 y;
+	I64	 py;
+	I64	 sx;
+	I64	 pitch;
+	U32	*pal32;
+
+	if (!c || !c->pixels || !ut_pal_ready)
+		return;
+	if (dst_w < 1 || dst_h < 1)
+		return;
+
+	pal32 = ut_flash32_pal;
+	if (!ut_flash_ready)
+		pal32 = ut_pal_argb;
+
+	pitch   = dc->width_internal;
+	sx_step = (c->width << 16) / dst_w;
+	sy_step = (c->height << 16) / dst_h;
+
+	y = 0;
+	while (y < dst_h)
+	{
+		py = dst_y + y;
+		if (py >= 0 && py < dc->height)
+		{
+			sy = (y * sy_step) >> 16;
+			if (sy >= c->height)
+				sy = c->height - 1;
+			src = c->pixels + sy * c->width;
+			srgb = c->argb + sy * c->width;
+			dst = dc->body + py * pitch;
+			sxf = 0;
+			x = 0;
+			while (x < dst_w)
+			{
+				sx = sxf >> 16;
+				if (sx >= c->width)
+					sx = c->width - 1;
+				if (dst_x + x >= 0 && dst_x + x < dc->width)
+				{
+					//Bit 31 marks a pixel the truecolor plane owns; those
+					//carry literal RGB and skip the palette entirely.
+					v = srgb[sx];
+					if (v & 0x80000000)
+						dst[dst_x + x] = v & 0x00FFFFFF;
+					else
+						dst[dst_x + x] = pal32[src[sx] & 255];
+				}
+				sxf += sx_step;
+				x++;
+			}
+		}
+		y++;
+	}
+}
+
+U0 UTDrawLine2(CUTCanvas *c, I64 x0, I64 y0, I64 x1, I64 y1, I64 color)
+{
+	I64 dx;
+	I64 dy;
+	I64 sx;
+	I64 sy;
+	I64 err;
+	I64 e2;
+
+	dx = x1 - x0;
+	if (dx < 0) dx = -dx;
+	dy = y1 - y0;
+	if (dy < 0) dy = -dy;
+	if (x0 < x1) sx = 1; else sx = -1;
+	if (y0 < y1) sy = 1; else sy = -1;
+	err = dx - dy;
+	while (TRUE)
+	{
+		UTDrawPlot(c, x0, y0, 1.0, color);
+		if (x0 == x1 && y0 == y1)
+			break;
+		e2 = 2 * err;
+		if (e2 > -dy)
+		{
+			err -= dy;
+			x0  += sx;
+		}
+		if (e2 < dx)
+		{
+			err += dx;
+			y0  += sy;
+		}
+	}
+}
+
+Bool UTDrawLine3(CUTCanvas *c, F64 *a, F64 *b, I64 color)
+{//SoftDrv world-space beam — project ends → DrawLine2.
+	F64 ax;
+	F64 ay;
+	F64 aiz;
+	F64 bx;
+	F64 by;
+	F64 biz;
+
+	if (!c || !a || !b)
+		return FALSE;
+	if (!UTDrawProject(c, a, &ax, &ay, &aiz))
+		return FALSE;
+	if (!UTDrawProject(c, b, &bx, &by, &biz))
+		return FALSE;
+	if (aiz <= 0.0 || biz <= 0.0)
+		return FALSE;
+	UTDrawLine2(c, ToI64(ax), ToI64(ay), ToI64(bx), ToI64(by), color);
+	return TRUE;
+}
+
+F64		ut_beam_a[3];
+F64		ut_beam_b[3];
+F64		ut_beam_until	= 0.0;
+I64		ut_beam_col		= 211;
+Bool ut_opt_beams	= TRUE;
+Bool ut_opt_pathdraw	= FALSE;
+Bool ut_opt_hud_on	= TRUE;
+Bool ut_opt_radar	= TRUE;
+Bool ut_opt_hitmark	= TRUE;
+
+U0 UTDrawBeamSet(F64 *a, F64 *b, I64 col, F64 life)
+{
+	if (!a || !b)
+		return;
+	UTVecCopy(a, ut_beam_a);
+	UTVecCopy(b, ut_beam_b);
+	ut_beam_col = col;
+	ut_beam_until = tS + life;
+}
+
+U0 UTDrawBeamPass(CUTCanvas *c)
+{
+	if (!c || !ut_opt_beams || tS >= ut_beam_until)
+		return;
+	UTDrawLine3(c, ut_beam_a, ut_beam_b, ut_beam_col);
+}
+
+I64 UTDrawLmLerp(I64 i0, I64 i1, I64 i2, I64 i3, I64 ch, F64 fx, F64 fy)
+{//Bilinear lightmap fetch. DrawSurf blends along the span in eighths; sampling
+ //both axes gives the same smooth result without a per-span Photon buffer.
+	F64 a;
+	F64 b;
+	F64 v;
+
+	a = ToF64(ut_lm_ptr[i0 + ch] & 127) * (1.0 - fx) +
+		ToF64(ut_lm_ptr[i1 + ch] & 127) * fx;
+	b = ToF64(ut_lm_ptr[i2 + ch] & 127) * (1.0 - fx) +
+		ToF64(ut_lm_ptr[i3 + ch] & 127) * fx;
+	v = a * (1.0 - fy) + b * fy;
+	if (v < 0.0) v = 0.0;
+	if (v > 127.0) v = 127.0;
+	return ToI64(v);
+}
+
+U0 UTDrawSpanTexRun(CUTCanvas *c, I64 y, I64 x1, I64 x2,
+	F64 iz1, F64 uoz1, F64 voz1, F64 d_iz, F64 d_uoz, F64 d_voz,
+	CUTTex *tex, F64 sh1, F64 d_sh)
+{//inner SoftDrv textured pixels for one open FSpan. Perspective subdiv.
+	U8	*row;
+	U32	*argbrow;
+	F64	*zrow;
+	U32	 src;
+	I64	 lu;
+	I64	 lv;
+	I64	 lmi;
+	F64	 mr;
+	F64	 mg;
+	F64	 mb;
+	I64	 sr;
+	I64	 sg;
+	I64	 sb;
+	F64	 iz;
+	F64	 uoz;
+	F64	 voz;
+	F64	 z;
+	I64	 x;
+	I64	 u;
+	I64	 v;
+	I64	 i;
+	I64	 texel;
+	I64	 n;
+	I64	 step;
+	F64	 iz_e;
+	F64	 uoz_e;
+	F64	 voz_e;
+	F64	 u0;
+	F64	 v0;
+	F64	 u1;
+	F64	 v1;
+	F64	 du;
+	F64	 dv;
+	F64	 lm;
+	F64	 shade;
+	F64	 sh;
+	I64	 fr;
+	I64	 fg;
+	I64	 fb;
+	Bool	 masked;
+	Bool	 mod;
+	Bool	 fast_tc;
+	I64		 mip;
+	F64		 flu;
+	F64		 flv;
+	F64		 fx;
+	F64		 fy;
+	I64		 lu1;
+	I64		 lv1;
+	I64		 lmi2;
+	I64		 lmi3;
+	I64		 lmi4;
+	I64		 li_r;
+	I64		 li_g;
+	I64		 li_b;
+
+	if (x1 >= x2)
+		return;
+	masked = (ut_draw_poly_flags & UT_DRAW_PF_MASKED) != 0;
+	fast_tc = ToBool(ut_draw_truecolor && tex && tex->has_argb);
+	mod = (ut_draw_poly_flags & UT_DRAW_PF_MODULATED) != 0;
+	row  = c->pixels + y * c->width;
+	argbrow = c->argb + y * c->width;
+	zrow = c->depth + y * c->width;
+	iz   = iz1;
+	uoz  = uoz1;
+	voz  = voz1;
+	sh   = sh1;
+	x    = x1;
+	while (x < x2)
+	{
+		n = x2 - x;
+		if (n > UT_SPAN_SUB)
+			n = UT_SPAN_SUB;
+		iz_e  = iz + d_iz * ToF64(n);
+		uoz_e = uoz + d_uoz * ToF64(n);
+		voz_e = voz + d_voz * ToF64(n);
+		if (iz <= 0.0 || iz_e <= 0.0)
+		{
+			iz = iz_e; uoz = uoz_e; voz = voz_e;
+			sh += d_sh * ToF64(n);
+			x += n;
+			goto ut_run_next;
+		}
+		z  = 1.0 / iz;
+		u0 = uoz * z;
+		v0 = voz * z;
+		z  = 1.0 / iz_e;
+		u1 = uoz_e * z;
+		v1 = voz_e * z;
+		du = (u1 - u0) / ToF64(n);
+		dv = (v1 - v0) / ToF64(n);
+		//Level of detail for this run, as DrawSurf picks per span.
+		mip = UTTexMipForStep(tex, du, dv);
+		step = 0;
+		while (step < n)
+		{
+			i = x + step;
+			if (mod)
+			{
+				//Detail/Macro SoftDrv: modulate already-drawn facet (Z match).
+				if (zrow[i] > 0.0 &&
+					Abs(iz - zrow[i]) <= zrow[i] * 0.08 + 1.0e-6)
+				{
+					u = ToI64(u0);
+					v = ToI64(v0);
+					texel = UTTexSampleMip(tex, u, v, mip);
+					if (texel & 255)
+						row[i] = UTPalBlendMod(texel & 255, row[i]);
+				}
+			}
+			else if (!ut_draw_world_z || iz > zrow[i])
+			{
+				u = ToI64(u0);
+				v = ToI64(v0);
+				texel = UTTexSampleMip(tex, u, v, mip);
+				if (!(masked && (texel & 255) == 0))
+				{
+					zrow[i] = iz;
+					//Truecolor facets take the texture's own ARGB scaled by
+					//the prebound lightmap. The shade/lm/fog block below is
+					//the indexed path only: it calls across to UTBsp twice
+					//per pixel, and this branch discarded the result anyway.
+					if (fast_tc)
+					{
+						src = tex->argb[texel & 255];
+						//Light index is the raw 7-bit lightmap channel; the
+						//shade table carries the whole transfer function.
+						if (ut_draw_unlit)
+						{
+							li_r = ut_unlit_light;
+							li_g = li_r;
+							li_b = li_r;
+						}
+						else if (ut_lm_ptr)
+						{
+							//DrawSurf spreads one lightmap texel over 8 pixels and fills
+							//them by blending toward the next texel. Point sampling
+							//turns every texel into a flat block, which is what made
+							//lit surfaces look faceted.
+							flu = (u0 - ut_lm_pan0) * ut_lm_ru;
+							flv = (v0 - ut_lm_pan1) * ut_lm_rv;
+							if (flu < 0.0) flu = 0.0;
+							if (flv < 0.0) flv = 0.0;
+							lu = ToI64(flu);
+							lv = ToI64(flv);
+							if (lu >= ut_lm_uc - 1) lu = ut_lm_uc - 1;
+							if (lv >= ut_lm_vc - 1) lv = ut_lm_vc - 1;
+							lu1 = lu + 1;
+							lv1 = lv + 1;
+							if (lu1 > ut_lm_uc - 1) lu1 = ut_lm_uc - 1;
+							if (lv1 > ut_lm_vc - 1) lv1 = ut_lm_vc - 1;
+							fx = flu - ToF64(lu);
+							fy = flv - ToF64(lv);
+							if (fx < 0.0) fx = 0.0;
+							if (fy < 0.0) fy = 0.0;
+							lmi  = (lv * ut_lm_uc + lu) * 3;
+							lmi2 = (lv * ut_lm_uc + lu1) * 3;
+							lmi3 = (lv1 * ut_lm_uc + lu) * 3;
+							lmi4 = (lv1 * ut_lm_uc + lu1) * 3;
+							li_r = UTDrawLmLerp(lmi, lmi2, lmi3, lmi4, 0, fx, fy);
+							li_g = UTDrawLmLerp(lmi, lmi2, lmi3, lmi4, 1, fx, fy);
+							li_b = UTDrawLmLerp(lmi, lmi2, lmi3, lmi4, 2, fx, fy);
+						}
+						else
+						{
+							//Mesh vertex light, pending FLightManager::Light.
+							if (ut_draw_gouraud)
+								mr = sh;
+							else
+								mr = ut_draw_shade;
+							if (mr < 0.0) mr = 0.0;
+							if (mr > 1.0) mr = 1.0;
+							li_r = ToI64(mr * 127.0);
+							li_g = li_r;
+							li_b = li_r;
+						}
+						sr = ut_shade_lut[li_r * UT_TEXSHADES +
+							(((src >> 16) & 255) >> 2)] & 255;
+						sg = ut_shade_lut[li_g * UT_TEXSHADES +
+							(((src >> 8) & 255) >> 2)] & 255;
+						sb = ut_shade_lut[li_b * UT_TEXSHADES +
+							((src & 255) >> 2)] & 255;
+						argbrow[i] = 0x80000000 | (sr << 16) |
+							(sg << 8) | sb;
+						u0 += du;
+						v0 += dv;
+						iz += d_iz;
+						sh += d_sh;
+						step++;
+						goto ut_px_next;
+					}
+					//Indexed path works in global pens; the sampler returns the
+					//texture's own index.
+					texel = UTTexPen(tex, texel);
+					if (ut_draw_gouraud)
+						shade = sh;
+					else
+						shade = ut_draw_shade;
+					if (shade < 0.12) shade = 0.12;
+					if (shade > 1.0) shade = 1.0;
+					if (ut_draw_lm_on)
+					{
+						lm = UTBspSampleLightMapActive(u0, v0);
+						if (lm >= 0.0)
+						{
+							shade = lm * 0.7 + shade * 0.3;
+							if (shade > 1.0) shade = 1.0;
+							if (shade < 0.12) shade = 0.12;
+						}
+					}
+					if (ut_draw_fog_on)
+					{
+						UTBspSampleFogPhotonActive(u0, v0,
+							&ut_draw_fog_r, &ut_draw_fog_g,
+							&ut_draw_fog_b, &ut_draw_fog_a);
+						if (ut_draw_fog_a > 0.02)
+						{
+							fr = ToI64(ToF64(ut_pal_r[texel & 255]) *
+								(1.0 - ut_draw_fog_a) +
+								ut_draw_fog_r * 255.0 * ut_draw_fog_a);
+							fg = ToI64(ToF64(ut_pal_g[texel & 255]) *
+								(1.0 - ut_draw_fog_a) +
+								ut_draw_fog_g * 255.0 * ut_draw_fog_a);
+							fb = ToI64(ToF64(ut_pal_b[texel & 255]) *
+								(1.0 - ut_draw_fog_a) +
+								ut_draw_fog_b * 255.0 * ut_draw_fog_a);
+							if (ut_draw_fog_a > 0.35)
+							{
+								fr += ToI64(ut_draw_fog_r * 48.0 *
+									ut_draw_fog_a);
+								fg += ToI64(ut_draw_fog_g * 48.0 *
+									ut_draw_fog_a);
+								fb += ToI64(ut_draw_fog_b * 48.0 *
+									ut_draw_fog_a);
+							}
+							if (fr > 255) fr = 255;
+							if (fg > 255) fg = 255;
+							if (fb > 255) fb = 255;
+							texel = UTPalBestMatch(fr, fg, fb, 1) & 255;
+							shade = shade * (1.0 - ut_draw_fog_a * 0.35);
+						}
+					}
+					if (shade < 0.99)
+						row[i] = UTPalShadeIndex(texel, shade);
+					else
+						row[i] = texel;
+				}
+			}
+			u0 += du;
+			v0 += dv;
+			iz += d_iz;
+			sh += d_sh;
+			step++;
+ut_px_next:
+		}
+		uoz = uoz_e;
+		voz = voz_e;
+		x += n;
+ut_run_next:
+	}
+}
+
+U0 UTDrawSpanTex(CUTCanvas *c, I64 y, I64 x1, I64 x2,
+	F64 iz1, F64 uoz1, F64 voz1, F64 iz2, F64 uoz2, F64 voz2,
+	F64 sh1, F64 sh2,
+	CUTTex *tex, CUTSpanBuf *span)
+{//one horizontal SoftDrv textured run. SoftDrv InnerGouraud / RenderSurfSpans:
+ //for (FSpan* Span=*Index++; Span; Span=Span->Next) fill ∩ then punch raster.
+ //Gradient from full edge [x1,x2); prestep into each open segment.
+	F64	 span_w;
+	F64	 d_iz;
+	F64	 d_uoz;
+	F64	 d_voz;
+	F64	 d_sh;
+	F64	 iz_s;
+	F64	 uoz_s;
+	F64	 voz_s;
+	F64	 sh_s;
+	I64	 hit_a[UT_SPAN_MAX_HIT];
+	I64	 hit_b[UT_SPAN_MAX_HIT];
+	I64	 nh;
+	I64	 hi;
+	I64	 cx1;
+	I64	 cx2;
+	I64	 ox1;
+	I64	 ox2;
+
+	if (!c || !tex || y < 0 || y >= c->height)
+		return;
+	if (x1 >= x2)
+		return;
+	ox1 = x1;
+	ox2 = x2;
+	if (ox1 < 0) ox1 = 0;
+	if (ox2 > c->width) ox2 = c->width;
+	if (ox1 >= ox2)
+		return;
+
+	span_w = ToF64(x2 - x1);
+	if (span_w <= 0.0)
+		return;
+	d_iz  = (iz2 - iz1) / span_w;
+	d_uoz = (uoz2 - uoz1) / span_w;
+	d_voz = (voz2 - voz1) / span_w;
+	d_sh  = (sh2 - sh1) / span_w;
+
+	if (!span)
+	{
+		//DrawGouraudPolygon: null SpanBuffer → full-screen open default.
+		if (ox1 != x1)
+		{
+			iz1  += d_iz * ToF64(ox1 - x1);
+			uoz1 += d_uoz * ToF64(ox1 - x1);
+			voz1 += d_voz * ToF64(ox1 - x1);
+			sh1  += d_sh * ToF64(ox1 - x1);
+		}
+		UTDrawSpanTexRun(c, y, ox1, ox2, iz1, uoz1, voz1, d_iz, d_uoz, d_voz,
+			tex, sh1, d_sh);
+		c->spans_drawn++;
+		return;
+	}
+
+	nh = UTSpanIntersect(span, y, ox1, ox2, hit_a, hit_b, UT_SPAN_MAX_HIT);
+	if (nh < 1)
+		return;
+	hi = 0;
+	while (hi < nh)
+	{
+		cx1 = hit_a[hi];
+		cx2 = hit_b[hi];
+		iz_s  = iz1  + d_iz  * ToF64(cx1 - x1);
+		uoz_s = uoz1 + d_uoz * ToF64(cx1 - x1);
+		voz_s = voz1 + d_voz * ToF64(cx1 - x1);
+		sh_s  = sh1  + d_sh  * ToF64(cx1 - x1);
+		UTDrawSpanTexRun(c, y, cx1, cx2, iz_s, uoz_s, voz_s,
+			d_iz, d_uoz, d_voz, tex, sh_s, d_sh);
+		hi++;
+	}
+	//Punch full raster ∩ screen like CopyFromRasterUpdate (once per row).
+	//Modulated Detail/Macro pass does not punch (SoftDrv second DrawSurf).
+	if (!(ut_draw_poly_flags & UT_DRAW_PF_MODULATED))
+		UTSpanPunch(span, y, ox1, ox2);
+	c->spans_drawn++;
+}
+
+I64 UTDrawClipNear(CUTPolyVert *in, I64 count, CUTPolyVert *out)
+{//Sutherland-Hodgman against cam.z = UT_NEAR_CLIP. Mirrors QDrawClipNear.
+	I64 i;
+	I64 j;
+	I64 n;
+	F64 d1;
+	F64 d2;
+	F64 frac;
+
+	n = 0;
+	i = 0;
+	while (i < count)
+	{
+		j = i + 1;
+		if (j >= count)
+			j = 0;
+		d1 = in[i].cam[2] - UT_NEAR_CLIP;
+		d2 = in[j].cam[2] - UT_NEAR_CLIP;
+
+		if (d1 >= 0.0)
+		{
+			if (n < UT_MAX_POLY_VERTS)
+			{
+				MemCopy(&out[n], &in[i], sizeof(CUTPolyVert));
+				n++;
+			}
+		}
+
+		if ((d1 >= 0.0) != (d2 >= 0.0))
+		{
+			if (n < UT_MAX_POLY_VERTS && (d1 - d2) != 0.0)
+			{
+				frac = d1 / (d1 - d2);
+				out[n].cam[0] = in[i].cam[0] + frac * (in[j].cam[0] - in[i].cam[0]);
+				out[n].cam[1] = in[i].cam[1] + frac * (in[j].cam[1] - in[i].cam[1]);
+				out[n].cam[2] = in[i].cam[2] + frac * (in[j].cam[2] - in[i].cam[2]);
+				out[n].u = in[i].u + frac * (in[j].u - in[i].u);
+				out[n].v = in[i].v + frac * (in[j].v - in[i].v);
+				out[n].shade = in[i].shade +
+					frac * (in[j].shade - in[i].shade);
+				n++;
+			}
+		}
+		i++;
+	}
+	return n;
+}
+
+U0 UTDrawProjectPoly(CUTCanvas *c, CUTPolyVert *v, I64 count)
+{//screen x/y and perspective attributes. Interpolate u/z, not u.
+	I64 i;
+	F64 iz;
+
+	i = 0;
+	while (i < count)
+	{
+		iz = 1.0 / v[i].cam[2];
+		v[i].inv_z    = iz;
+		v[i].u_over_z = v[i].u * iz;
+		v[i].v_over_z = v[i].v * iz;
+		v[i].sx = c->center_x + v[i].cam[0] * c->x_scale * iz;
+		v[i].sy = c->center_y - v[i].cam[1] * c->y_scale * iz;
+		i++;
+	}
+}
+
+U0 UTDrawPolyTex(CUTCanvas *c, CUTPolyVert *v, I64 count,
+	CUTTex *tex, CUTSpanBuf *span)
+{//convex scan fill → UTDrawSpanTex. Mirrors QDrawPolygon.
+	F64	y_min;
+	F64	y_max;
+	F64	xl;
+	F64	xr;
+	F64	izl;
+	F64	izr;
+	F64	uozl;
+	F64	uozr;
+	F64	vozl;
+	F64	vozr;
+	F64	shl;
+	F64	shr;
+	F64	ya;
+	F64	yb;
+	F64	frac;
+	F64	xi;
+	F64	izi;
+	F64	uozi;
+	F64	vozi;
+	F64	shi;
+	F64	yc;
+	F64	span_w;
+	I64	i;
+	I64	j;
+	I64	y;
+	I64	y0;
+	I64	y1;
+	I64	ix0;
+	I64	ix1;
+	Bool found;
+
+	if (count < 3 || !tex)
+		return;
+
+	y_min = v[0].sy;
+	y_max = v[0].sy;
+	i = 1;
+	while (i < count)
+	{
+		if (v[i].sy < y_min) y_min = v[i].sy;
+		if (v[i].sy > y_max) y_max = v[i].sy;
+		i++;
+	}
+
+	y0 = ToI64(Ceil(y_min));
+	y1 = ToI64(Floor(y_max));
+	if (y0 < 0) y0 = 0;
+	if (y1 >= c->height) y1 = c->height - 1;
+	if (y0 > y1)
+		return;
+
+	y = y0;
+	while (y <= y1)
+	{
+		yc    = ToF64(y);
+		found = FALSE;
+		xl = 0.0; xr = 0.0;
+		izl = 0.0; izr = 0.0;
+		uozl = 0.0; uozr = 0.0;
+		vozl = 0.0; vozr = 0.0;
+		shl = ut_draw_shade; shr = ut_draw_shade;
+
+		i = 0;
+		while (i < count)
+		{
+			j = i + 1;
+			if (j >= count)
+				j = 0;
+			ya = v[i].sy;
+			yb = v[j].sy;
+
+			if ((ya <= yc && yb > yc) || (yb <= yc && ya > yc))
+			{
+				frac = (yc - ya) / (yb - ya);
+				xi   = v[i].sx + frac * (v[j].sx - v[i].sx);
+				izi  = v[i].inv_z + frac * (v[j].inv_z - v[i].inv_z);
+				uozi = v[i].u_over_z + frac * (v[j].u_over_z - v[i].u_over_z);
+				vozi = v[i].v_over_z + frac * (v[j].v_over_z - v[i].v_over_z);
+				shi  = v[i].shade + frac * (v[j].shade - v[i].shade);
+
+				if (!found)
+				{
+					xl = xi; xr = xi;
+					izl = izi; izr = izi;
+					uozl = uozi; uozr = uozi;
+					vozl = vozi; vozr = vozi;
+					shl = shi; shr = shi;
+					found = TRUE;
+				}
+				else
+				{
+					if (xi < xl)
+					{
+						xl = xi; izl = izi; uozl = uozi; vozl = vozi;
+						shl = shi;
+					}
+					if (xi > xr)
+					{
+						xr = xi; izr = izi; uozr = uozi; vozr = vozi;
+						shr = shi;
+					}
+				}
+			}
+			i++;
+		}
+
+		if (found && xr > xl)
+		{
+			//snap attrs from float edge x to integer pixel edges so Ceil
+			//does not feed stale left/right interpolants into the span
+			span_w = xr - xl;
+			ix0 = ToI64(Ceil(xl));
+			ix1 = ToI64(Ceil(xr));
+			if (ix1 > ix0 && span_w > 1.0e-12)
+			{
+				frac = (ToF64(ix0) - xl) / span_w;
+				izi  = izl + frac * (izr - izl);
+				uozi = uozl + frac * (uozr - uozl);
+				vozi = vozl + frac * (vozr - vozl);
+				shi  = shl + frac * (shr - shl);
+				frac = (ToF64(ix1) - xl) / span_w;
+				izr  = izl + frac * (izr - izl);
+				uozr = uozl + frac * (uozr - uozl);
+				vozr = vozl + frac * (vozr - vozl);
+				shr  = shl + frac * (shr - shl);
+				izl  = izi;
+				uozl = uozi;
+				vozl = vozi;
+				shl  = shi;
+				UTDrawSpanTex(c, y, ix0, ix1,
+					izl, uozl, vozl, izr, uozr, vozr, shl, shr, tex, span);
+			}
+		}
+		y++;
+	}
+	c->tris_drawn++;
+}
+
+U0 UTDrawTriTex3(CUTCanvas *c, F64 *a, F64 *b, F64 *cc,
+	F64 au, F64 av, F64 bu, F64 bv, F64 cu, F64 cv,
+	CUTTex *tex, CUTSpanBuf *span)
+{//transform → near clip → project u/z → span fill. SoftDrv DrawGouraudPolygon.
+	CUTPolyVert in[3];
+	CUTPolyVert out[UT_MAX_POLY_VERTS];
+	I64 n;
+
+	if (!c || !tex)
+		return;
+
+	UTTransformPointBy(a, c->origin, c->right, c->up, c->forward, in[0].cam);
+	in[0].u = au; in[0].v = av; in[0].shade = ut_draw_shade;
+	UTTransformPointBy(b, c->origin, c->right, c->up, c->forward, in[1].cam);
+	in[1].u = bu; in[1].v = bv; in[1].shade = ut_draw_shade;
+	UTTransformPointBy(cc, c->origin, c->right, c->up, c->forward, in[2].cam);
+	in[2].u = cu; in[2].v = cv; in[2].shade = ut_draw_shade;
+
+	n = UTDrawClipNear(in, 3, out);
+	if (n < 3)
+		return;
+
+	UTDrawProjectPoly(c, out, n);
+	c->verts_drawn += n;
+	UTDrawPolyTex(c, out, n, tex, span);
+}
+
+U0 UTDrawTriTexShade3(CUTCanvas *c, F64 *a, F64 *b, F64 *cc,
+	F64 au, F64 av, F64 bu, F64 bv, F64 cu, F64 cv,
+	F64 sa, F64 sb, F64 sc,
+	CUTTex *tex, CUTSpanBuf *span)
+{//= DrawGouraudPolygon with per-vertex SoftDrv light
+	CUTPolyVert in[3];
+	CUTPolyVert out[UT_MAX_POLY_VERTS];
+	I64 n;
+	Bool prev;
+
+	if (!c || !tex)
+		return;
+	UTTransformPointBy(a, c->origin, c->right, c->up, c->forward, in[0].cam);
+	in[0].u = au; in[0].v = av; in[0].shade = sa;
+	UTTransformPointBy(b, c->origin, c->right, c->up, c->forward, in[1].cam);
+	in[1].u = bu; in[1].v = bv; in[1].shade = sb;
+	UTTransformPointBy(cc, c->origin, c->right, c->up, c->forward, in[2].cam);
+	in[2].u = cu; in[2].v = cv; in[2].shade = sc;
+	n = UTDrawClipNear(in, 3, out);
+	if (n < 3)
+		return;
+	prev = ut_draw_gouraud;
+	ut_draw_gouraud = TRUE;
+	UTDrawProjectPoly(c, out, n);
+	c->verts_drawn += n;
+	UTDrawPolyTex(c, out, n, tex, span);
+	ut_draw_gouraud = prev;
+}
+
+//FlashSprite UCoord — kept below DrawTile path
+#define UT_FLASH_UCOORD_MAX	1024
+I64 ut_flash_ucoord[UT_FLASH_UCOORD_MAX];	//DrawTile.cpp UCoordTable
+
+U0 UTFlashBuildUCoord(I64 w, F64 u0, F64 du)
+{//SoftDrv DrawTile UCoordTable — per-column U for FlashSprite scan.
+	I64 j;
+	I64 n;
+
+	n = w;
+	if (n > UT_FLASH_UCOORD_MAX)
+		n = UT_FLASH_UCOORD_MAX;
+	j = 0;
+	while (j < n)
+	{
+		ut_flash_ucoord[j] = ToI64(u0 + ToF64(j) * du);
+		j++;
+	}
+}
+
+U0 UTDrawPutTexel(CUTCanvas *c, I64 i, CUTTex *tex, I64 texel, Bool trans,
+	Bool mod, F64 iz)
+{//One texel to the canvas. When the texture kept its own UPalette the colour
+ //goes to the truecolor plane verbatim; the global 256-pen remap is lossy
+ //because every UT texture has a different palette.
+	U32 src;
+	U32 dst;
+	I64 r;
+	I64 g;
+	I64 b;
+
+	if (ut_draw_truecolor && tex && tex->has_argb)
+	{
+		src = tex->argb[texel & 255];
+		if (trans || mod)
+		{
+			dst = c->argb[i] & 0x00FFFFFF;
+			if (!(c->argb[i] & 0x80000000))
+				dst = ut_pal_argb[c->pixels[i] & 255] & 0x00FFFFFF;
+			if (trans)
+			{
+				r = ((src >> 16) & 255) + ((dst >> 16) & 255);
+				g = ((src >> 8) & 255) + ((dst >> 8) & 255);
+				b = (src & 255) + (dst & 255);
+				if (r > 255) r = 255;
+				if (g > 255) g = 255;
+				if (b > 255) b = 255;
+			}
+			else
+			{
+				r = (((src >> 16) & 255) * ((dst >> 16) & 255)) / 255;
+				g = (((src >> 8) & 255) * ((dst >> 8) & 255)) / 255;
+				b = ((src & 255) * (dst & 255)) / 255;
+			}
+			c->argb[i] = 0x80000000 | (r << 16) | (g << 8) | b;
+		}
+		else
+		{
+			c->depth[i] = iz;
+			c->argb[i] = 0x80000000 | (src & 0x00FFFFFF);
+		}
+		return;
+	}
+	//No source palette: stay on the indexed path. The P8 plane stores global
+	//pens; the sampler hands back the texture's own index.
+	texel = UTTexPen(tex, texel);
+	if (trans)
+		c->pixels[i] = UTPalBlendAdd(texel & 255, c->pixels[i]);
+	else if (mod)
+		c->pixels[i] = UTPalBlendMod(texel & 255, c->pixels[i]);
+	else
+	{
+		c->depth[i] = iz;
+		c->pixels[i] = texel;
+	}
+}
+
+U0 UTDrawTile(CUTCanvas *c, CUTTex *tex, I64 x, I64 y, I64 w, I64 h,
+	F64 u0, F64 v0, F64 uw, F64 vh, F64 z, CUTSpanBuf *span)
+{//USoftwareRenderDevice::DrawTile — SoftDrv blit; PF_Translucent additive.
+ //FlashSprite8 path via UTPalBlendAdd/Mod tables (P8 stand-in for 16/32).
+	I64	px;
+	I64	py;
+	I64	x1;
+	I64	y1;
+	I64	cx1;
+	I64	cx2;
+	I64	hit_a[UT_SPAN_MAX_HIT];
+	I64	hit_b[UT_SPAN_MAX_HIT];
+	I64	nh;
+	I64	hi;
+	I64	u_i;
+	F64	du;
+	F64	dv;
+	F64	u;
+	F64	v;
+	F64	iz;
+	I64	texel;
+	I64	i;
+	Bool	trans;
+	Bool	mod;
+
+	if (!c || !tex || w < 1 || h < 1)
+		return;
+	iz = 1.0 / z;
+	if (iz <= 0.0)
+		return;
+	x1 = x + w;
+	y1 = y + h;
+	if (x1 > c->width)  x1 = c->width;
+	if (y1 > c->height) y1 = c->height;
+	if (x < 0) x = 0;
+	if (y < 0) y = 0;
+	if (x >= x1 || y >= y1)
+		return;
+	trans = (ut_draw_poly_flags & UT_DRAW_PF_TRANSLUCENT) != 0;
+	mod = (ut_draw_poly_flags & UT_DRAW_PF_MODULATED) != 0;
+
+	du = uw / ToF64(w);
+	dv = vh / ToF64(h);
+	UTFlashBuildUCoord(x1 - x, u0, du);
+	py = y;
+	while (py < y1)
+	{
+		v = v0 + ToF64(py - y) * dv;
+		if (span)
+		{
+			nh = UTSpanIntersect(span, py, x, x1, hit_a, hit_b, UT_SPAN_MAX_HIT);
+			if (nh < 1)
+			{
+				py++;
+				goto ut_tile_row;
+			}
+			hi = 0;
+			while (hi < nh)
+			{
+				cx1 = hit_a[hi];
+				cx2 = hit_b[hi];
+				px = cx1;
+				while (px < cx2)
+				{
+					u_i = px - x;
+					if (u_i >= 0 && u_i < UT_FLASH_UCOORD_MAX)
+						u = ToF64(ut_flash_ucoord[u_i]);
+					else
+						u = u0 + ToF64(px - x) * du;
+					i = py * c->width + px;
+					if (trans || mod || iz >= c->depth[i])
+					{
+						texel = UTTexSample(tex, ToI64(u), ToI64(v));
+						if (texel)
+						{
+							//Inline fast path: a call per texel dropped the
+							//frame rate to seconds per frame.
+							if (ut_draw_truecolor && !trans && !mod && tex->has_argb)
+							{
+								c->depth[i] = iz;
+								c->argb[i] = 0x80000000 |
+									tex->argb[texel & 255];
+							}
+							else
+								UTDrawPutTexel(c, i, tex, texel, trans, mod,
+									iz);
+						}
+					}
+					px++;
+				}
+				hi++;
+			}
+			if (!trans && !mod)
+				UTSpanPunch(span, py, x, x1);
+		}
+		else
+		{
+			px = x;
+			while (px < x1)
+			{
+				u_i = px - x;
+				if (u_i >= 0 && u_i < UT_FLASH_UCOORD_MAX)
+					u = ToF64(ut_flash_ucoord[u_i]);
+				else
+					u = u0 + ToF64(px - x) * du;
+				i = py * c->width + px;
+				if (trans || mod || iz >= c->depth[i])
+				{
+					texel = UTTexSample(tex, ToI64(u), ToI64(v));
+					if (texel)
+					{
+						if (ut_draw_truecolor && !trans && !mod && tex->has_argb)
+						{
+							c->depth[i] = iz;
+							c->argb[i] = 0x80000000 |
+								tex->argb[texel & 255];
+						}
+						else
+							UTDrawPutTexel(c, i, tex, texel, trans, mod, iz);
+					}
+				}
+				px++;
+			}
+		}
+ut_tile_row:
+		py++;
+	}
+	c->tiles_drawn++;
+}

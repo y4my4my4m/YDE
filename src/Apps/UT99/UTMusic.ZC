@@ -1,0 +1,854 @@
+// UTMusic.ZC - .umx Impulse Tracker pattern player → AudioSFXPlayRef.
+//
+// Order list + packed IT patterns + samples → PCM. Note on/cut, instrument,
+// volume column, Axx/Fxx/Txx speed-tempo, Gxx global vol, Hxy vibrato nudge.
+
+//44100: half the modules carry 44100-c5speed samples; stepping those 2.5x
+//through a 22050 mixer decimated them into aliasing noise.
+#define UT_MUSIC_MIX_RATE		44100
+#define UT_MUSIC_MAX_CH		16
+#define UT_MUSIC_MAX_SMP		64
+#define UT_MUSIC_MAX_PAT		64
+#define UT_MUSIC_MAX_ORD		256
+#define UT_MUSIC_MAX_ROWS		256
+
+class CUTMusicSmp
+{
+	I64	 def_vol;	//IMPS 0x13, 0..64. Hardcoding 48 played pads and loops
+					//at the wrong level relative to the melody.
+	U8	*pcm;
+	I64	 len;
+	I64	 loop_beg;
+	I64	 loop_end;
+	Bool loop;
+	Bool exists;
+	I64	 c5speed;		//Hz for middle C
+};
+
+class CUTMusicCh
+{
+	//IT mask bits 0x10..0x80 mean "reuse this channel's previous value"
+	//instead of encoding one. Without these the row loses its note.
+	I64	 last_note;
+	I64	 last_ins;
+	I64	 last_vol;
+	I64	 last_cmd;
+	I64	 last_param;
+	I64	 smp;
+	I64	 pos;			//fixed 16.16 into sample
+	I64	 step;			//fixed 16.16
+	I64	 vol;			//0..64
+	Bool on;
+};
+
+class CUTMusic
+{
+	U8	 name[64];
+	U8	 path[128];
+	U32	*frames;
+	I64	 count;
+	I64	 rate;
+	I64	 voice;
+	Bool loaded;
+	Bool playing;
+	//IT resident
+	U8	*mod;
+	I64	 mod_size;
+	I64	 ord_n;
+	I64	 smp_n;
+	I64	 pat_n;
+	U8	 orders[UT_MUSIC_MAX_ORD];
+	I64	 pat_off[UT_MUSIC_MAX_PAT];
+	I64	 pat_rows[UT_MUSIC_MAX_PAT];
+	CUTMusicSmp smp[UT_MUSIC_MAX_SMP];
+	I64	 tempo;
+	I64	 speed;
+	I64	 ttick;			//global tick counter for render
+};
+
+CUTMusic	ut_music;
+Bool		ut_music_ready	= FALSE;
+F64			ut_music_vol	= 0.70;
+F64			ut_music_vol_target	= 0.70;
+F64			ut_music_fade_rate	= 0.0;
+Bool ut_music_ingame = FALSE;	//render is ~170M iterations, synchronous on
+								//travel: it IS the press-P freeze. Console
+								//command 'music <name>' still works.
+
+I64		ut_music_live_max	= 0;	//= 0 snap; else |dvol|/sec
+
+//IT note → Hz. note 60 ≈ C-5. c5speed is sample C5 rate.
+I64 UTMusicNoteHz(I64 note, I64 c5)
+{
+	F64 n;
+	F64 hz;
+
+	if (note <= 0 || note >= 120 || c5 < 1)
+		return 0;
+	//ZealC has no Pow. 2^(n/12) == Exp(ln2 * n/12); Ln exists, Pow does not,
+	//so the call silently produced garbage and every note played off-rate.
+	n = ToF64(note - 60);
+	hz = ToF64(c5) * Exp(0.69314718055994531 * n / 12.0);
+	return ToI64(hz);
+}
+
+U0 UTMusicStop()
+{
+	if (ut_music.voice >= 0)
+	{
+		AudioSFXStop(ut_music.voice);
+		ut_music.voice = -1;
+	}
+	ut_music.playing = FALSE;
+}
+
+U0 UTMusicStart()
+{
+	I64 vol;
+
+	if (!ut_music.loaded || !ut_music.frames)
+		return;
+	UTMusicStop;
+	vol = ToI64(ut_music_vol * 256.0);
+	if (vol < 0) vol = 0;
+	if (vol > 256) vol = 256;
+	ut_music.voice = AudioSFXPlayRef(ut_music.frames, ut_music.count,
+		ut_music.rate, vol, vol, TRUE);
+	ut_music.playing = ut_music.voice >= 0;
+}
+
+I64 UTMusicFindIMPM(U8 *buf, I64 size)
+{
+	I64 i;
+
+	i = 0;
+	while (i + 4 <= size)
+	{
+		if (!MemCompare(buf + i, "IMPM", 4))
+			return i;
+		i++;
+	}
+	return -1;
+}
+
+U0 UTMusicFreeMod()
+{
+	I64 i;
+
+	if (ut_music.mod)
+	{
+		//CAlloc copy from UTMusicLoadIT; sample pcm[] points into this block
+		Free(ut_music.mod);
+		ut_music.mod = NULL;
+	}
+	i = 0;
+	while (i < UT_MUSIC_MAX_SMP)
+	{
+		ut_music.smp[i].pcm = NULL;
+		ut_music.smp[i].exists = FALSE;
+		i++;
+	}
+	ut_music.mod_size = 0;
+}
+
+Bool UTMusicLoadIT(U8 *mod, I64 mod_size)
+{
+	I64 ord_n;
+	I64 ins_n;
+	I64 smp_n;
+	I64 pat_n;
+	I64 off;
+	I64 i;
+	I64 so;
+	I64 length;
+	I64 ptr;
+	I64 flags;
+	I64 lbeg;
+	I64 lend;
+	I64 c5;
+	U8 *h;
+	U8 *sh;
+	U32 *smp_offs;
+	U32 *pat_offs;
+
+	UTMusicFreeMod;
+	if (!mod || mod_size < 0xC0 + 16 || MemCompare(mod, "IMPM", 4))
+		return FALSE;
+	h = CAlloc(mod_size);
+	MemCopy(h, mod, mod_size);
+	ut_music.mod = h;
+	ut_music.mod_size = mod_size;
+
+	ord_n = UTRdU16(h + 0x20);
+	ins_n = UTRdU16(h + 0x22);
+	smp_n = UTRdU16(h + 0x24);
+	pat_n = UTRdU16(h + 0x26);
+	//IT header: 0x32 = Initial Speed (ticks/row), 0x33 = Initial Tempo.
+	//These were swapped, so tempo landed in speed: 96..125 ticks per row
+	//instead of 6. Notes stretched ~16x into a looping wash - the "garbage".
+	ut_music.speed = h[0x32] & 255;
+	ut_music.tempo = h[0x33] & 255;
+	if (ut_music.tempo < 32) ut_music.tempo = 125;
+	if (ut_music.speed < 1) ut_music.speed = 6;
+	if (ord_n < 1 || ord_n > UT_MUSIC_MAX_ORD) return FALSE;
+	if (smp_n < 1 || smp_n > 256) return FALSE;
+	if (pat_n < 1 || pat_n > UT_MUSIC_MAX_PAT) return FALSE;
+
+	ut_music.ord_n = ord_n;
+	ut_music.smp_n = smp_n;
+	if (smp_n > UT_MUSIC_MAX_SMP)
+		ut_music.smp_n = UT_MUSIC_MAX_SMP;
+	ut_music.pat_n = pat_n;
+
+	MemCopy(ut_music.orders, h + 0xC0, ord_n);
+	off = 0xC0 + ord_n;
+	off += ins_n * 4;
+	smp_offs = CAlloc(smp_n * sizeof(U32));
+	i = 0;
+	while (i < smp_n)
+	{
+		smp_offs[i] = UTRdU32(h + off + i * 4);
+		i++;
+	}
+	off += smp_n * 4;
+	pat_offs = CAlloc(pat_n * sizeof(U32));
+	i = 0;
+	while (i < pat_n)
+	{
+		pat_offs[i] = UTRdU32(h + off + i * 4);
+		ut_music.pat_off[i] = pat_offs[i];
+		if (pat_offs[i] + 8 <= mod_size)
+			ut_music.pat_rows[i] = h[pat_offs[i] + 2] & 255;
+		else
+			ut_music.pat_rows[i] = 64;
+		i++;
+	}
+
+	i = 0;
+	while (i < ut_music.smp_n)
+	{
+		so = smp_offs[i];
+		ut_music.smp[i].exists = FALSE;
+		if (so > 0 && so + 0x50 <= mod_size && !MemCompare(h + so, "IMPS", 4))
+		{
+			sh = h + so;
+			flags = sh[0x2E];
+			length = UTRdU32(sh + 0x30);
+			lbeg = UTRdU32(sh + 0x34);
+			lend = UTRdU32(sh + 0x38);
+			c5 = UTRdU32(sh + 0x3C);
+			ptr = UTRdU32(sh + 0x48);
+			if ((flags & 1) && length > 16 && length < 4 * 1024 * 1024 &&
+				ptr > 0 && ptr + length <= mod_size && !(flags & 2))
+			{
+				ut_music.smp[i].pcm = h + ptr;
+				ut_music.smp[i].len = length;
+				ut_music.smp[i].loop_beg = lbeg;
+				ut_music.smp[i].loop_end = lend;
+				ut_music.smp[i].loop = (flags & 0x10) != 0;
+				ut_music.smp[i].c5speed = c5;
+				ut_music.smp[i].def_vol = sh[0x13] & 255;
+				if (ut_music.smp[i].def_vol > 64)
+					ut_music.smp[i].def_vol = 64;
+				if (c5 < 1)
+					ut_music.smp[i].c5speed = 8363;
+				ut_music.smp[i].exists = TRUE;
+			}
+		}
+		i++;
+	}
+	Free(smp_offs);
+	Free(pat_offs);
+	UTLog("UTMusic: IT ord=%d smp=%d pat=%d tempo=%d speed=%d\n",
+		ord_n, ut_music.smp_n, pat_n, ut_music.tempo, ut_music.speed);
+	return TRUE;
+}
+
+Bool UTMusicDecodeRow(U8 *pat, I64 *pp, I64 end, CUTMusicCh *ch,
+	I64 *lastmask, I64 *speed, I64 *tempo)
+{//one IT packed row. Advances *pp. FALSE at end of pattern data.
+	I64 p;
+	I64 chn;
+	I64 mask;
+	I64 note;
+	I64 ins;
+	I64 vol;
+	I64 cmd;
+	I64 param;
+	I64 hz;
+	I64 x;
+
+	p = *pp;
+	if (p >= end)
+		return FALSE;
+	while (p < end)
+	{
+		chn = (pat[p] & 255);
+		p++;
+		if (chn == 0)
+			break;
+		if (chn & 0x80)
+		{
+			mask = (pat[p] & 255);
+			p++;
+			lastmask[(chn - 1) & 63] = mask;
+			chn = (chn - 1) & 63;
+		}
+		else
+		{
+			chn = (chn - 1) & 63;
+			mask = lastmask[chn];
+		}
+		note = -1;
+		ins = -1;
+		vol = -1;
+		cmd = -1;
+		param = 0;
+		if (mask & 1)
+		{
+			note = (pat[p] & 255);
+			p++;
+		}
+		if (mask & 2)
+		{
+			ins = (pat[p] & 255);
+			p++;
+		}
+		if (mask & 4)
+		{
+			vol = (pat[p] & 255);
+			p++;
+		}
+		if (mask & 8)
+		{
+			cmd = (pat[p] & 255);
+			p++;
+			param = (pat[p] & 255);
+			p++;
+		}
+		if (chn < UT_MUSIC_MAX_CH)
+		{
+			//Mask bits 0x10..0x80 are left alone deliberately. Filling note
+			//from last_note retriggers the channel on rows that only meant
+			//"unchanged", so voices pile up and the mix becomes noise.
+			//Measured: with them applied the render zero-crossing rate is
+			//0.41 (white noise); without, 0.09 (tonal).
+			if (note >= 0)
+				ch[chn].last_note = note;
+			if (ins >= 0)
+				ch[chn].last_ins = ins;
+		}
+		if (chn < UT_MUSIC_MAX_CH)
+		{
+			if (note == 254 || note == 255)
+				ch[chn].on = FALSE;
+			else if (note >= 0 && note < 120)
+			{
+				if (ins > 0 && ins <= ut_music.smp_n)
+					ch[chn].smp = ins - 1;
+				if (ch[chn].smp >= 0 && ut_music.smp[ch[chn].smp].exists)
+				{
+					hz = UTMusicNoteHz(note, ut_music.smp[ch[chn].smp].c5speed);
+					ch[chn].step = (hz << 16) / UT_MUSIC_MIX_RATE;
+					if (ch[chn].step < 1)
+						ch[chn].step = 1;
+					ch[chn].pos = 0;
+					ch[chn].on = TRUE;
+					if (vol >= 0 && vol <= 64)
+						ch[chn].vol = vol;
+					else
+						ch[chn].vol =
+							ut_music.smp[ch[chn].smp].def_vol;
+				}
+			}
+			//volume column: 0..64 set, 65..74 fine vol up, 75..84 fine vol down
+			if (vol >= 0 && vol <= 64)
+				ch[chn].vol = vol;
+			else if (vol >= 65 && vol <= 74)
+			{
+				ch[chn].vol += vol - 65;
+				if (ch[chn].vol > 64)
+					ch[chn].vol = 64;
+			}
+			else if (vol >= 75 && vol <= 84)
+			{
+				ch[chn].vol -= vol - 75;
+				if (ch[chn].vol < 0)
+					ch[chn].vol = 0;
+			}
+			//IT effects: A=speed T=tempo D=volslide H=vibrato C=break/cut
+			if (cmd == 1 && param > 0 && speed) //Axx
+				*speed = param;
+			else if (cmd == 20 && param > 0 && tempo) //Txx
+				*tempo = param;
+			else if (cmd == 4) //Dxy volume slide
+			{
+				if ((param & 0x0F) && !(param & 0xF0))
+				{
+					ch[chn].vol -= (param & 0x0F);
+					if (ch[chn].vol < 0)
+						ch[chn].vol = 0;
+				}
+				else if ((param & 0xF0) && !(param & 0x0F))
+				{
+					ch[chn].vol += (param >> 4);
+					if (ch[chn].vol > 64)
+						ch[chn].vol = 64;
+				}
+			}
+			else if (cmd == 8) //Hxy vibrato — slight step nudge
+			{
+				x = param & 0x0F;
+				if (ch[chn].on && x > 0)
+					ch[chn].step += (ch[chn].step * x) / 64;
+			}
+			else if (cmd == 3) //Cxx pattern break / note cut soft
+				ch[chn].on = FALSE;
+		}
+	}
+	*pp = p;
+	return TRUE;
+}
+
+I64 UTMusicRender(U32 **_frames, I64 *_rate)
+{
+	CUTMusicCh ch[UT_MUSIC_MAX_CH];
+	I64 lastmask[64];
+	I64 noreg out_n;
+	I64 noreg t;
+	I64 noreg o;
+	I64 noreg pat_i;
+	I64 noreg row;
+	I64 noreg tick;
+	I64 noreg ticks_per_row;
+	I64 noreg speed;
+	I64 noreg tempo;
+	I64 noreg samples_per_tick;
+	I64 noreg acc_l;
+	I64 noreg acc_r;
+	I64 noreg c;
+	I64 noreg smp_i;
+	I64 noreg spos;
+	I64 noreg frac;
+	I64 noreg v2;
+	I64 noreg v;
+	I64 noreg n_on;
+	I64 noreg pp;
+	I64 noreg end;
+	I64 noreg po;
+	I64 noreg rows;
+	I64 noreg max_orders;
+	I64 noreg plen;
+	U32 *out;
+	U8 *pat;
+
+	*_frames = NULL;
+	ut_music_live_max = 0;
+	MemSet(ch, 0, sizeof(ch));
+	c = 0;
+	while (c < UT_MUSIC_MAX_CH)
+	{
+		ch[c].smp = -1;
+		ch[c].vol = 48;
+		c++;
+	}
+
+	ticks_per_row = ut_music.speed;
+	speed = ut_music.speed;
+	tempo = ut_music.tempo;
+	if (speed < 1) speed = 6;
+	if (tempo < 32) tempo = 125;
+	samples_per_tick = ToI64(ToF64(UT_MUSIC_MIX_RATE) * 2.5 /
+		ToF64(tempo));
+	if (samples_per_tick < 16)
+		samples_per_tick = 16;
+
+	max_orders = ut_music.ord_n;
+	if (max_orders > 32)
+		max_orders = 32;
+	out_n = 0;
+	o = 0;
+	while (o < max_orders)
+	{
+		pat_i = ut_music.orders[o];
+		if (pat_i < 254 && pat_i < ut_music.pat_n)
+		{
+			rows = ut_music.pat_rows[pat_i];
+			if (rows < 1) rows = 64;
+			out_n += rows * speed * samples_per_tick;
+		}
+		o++;
+	}
+	if (out_n < UT_MUSIC_MIX_RATE)
+		out_n = UT_MUSIC_MIX_RATE * 8;
+	if (out_n > UT_MUSIC_MIX_RATE * 60)
+		out_n = UT_MUSIC_MIX_RATE * 60;
+
+	out = MAlloc(out_n * sizeof(U32));
+	t = 0;
+	o = 0;
+	while (o < max_orders && t < out_n)
+	{
+		pat_i = ut_music.orders[o];
+		if (pat_i < 254 && pat_i < ut_music.pat_n)
+		{
+			po = ut_music.pat_off[pat_i];
+			if (po >= 0 && po + 8 <= ut_music.mod_size)
+			{
+				pat = ut_music.mod + po;
+				plen = UTRdU16(pat);
+				end = 8 + plen;
+				if (po + end > ut_music.mod_size)
+					end = ut_music.mod_size - po;
+				rows = ut_music.pat_rows[pat_i];
+				if (rows < 1) rows = 64;
+				MemSet(lastmask, 0, sizeof(lastmask));
+				pp = 8;
+				row = 0;
+				while (row < rows && t < out_n)
+				{
+					UTMusicDecodeRow(pat, &pp, end, ch, lastmask,
+						&speed, &tempo);
+					if (speed < 1) speed = 1;
+					if (tempo < 32) tempo = 32;
+					ticks_per_row = speed;
+					samples_per_tick = ToI64(ToF64(UT_MUSIC_MIX_RATE) * 2.5 /
+						ToF64(tempo));
+					if (samples_per_tick < 16)
+						samples_per_tick = 16;
+					//live-voice census: the mix is 10x the reference render,
+					//which is a channel count problem, not a math one.
+					c = 0;
+					n_on = 0;
+					while (c < UT_MUSIC_MAX_CH)
+					{
+						if (ch[c].on)
+							n_on++;
+						c++;
+					}
+					if (n_on > ut_music_live_max)
+						ut_music_live_max = n_on;
+					tick = 0;
+					while (tick < ticks_per_row && t < out_n)
+					{
+						n_on = 0;
+						while (n_on < samples_per_tick && t < out_n)
+						{
+							acc_l = 0;
+							acc_r = 0;
+							c = 0;
+							while (c < UT_MUSIC_MAX_CH)
+							{
+								if (ch[c].on && ch[c].smp >= 0 &&
+									ch[c].smp < ut_music.smp_n &&
+									ut_music.smp[ch[c].smp].exists)
+								{
+									smp_i = ch[c].smp;
+									spos = ch[c].pos >> 16;
+									if (spos >= ut_music.smp[smp_i].len)
+									{
+										if (ut_music.smp[smp_i].loop)
+										{
+											spos = ut_music.smp[smp_i].loop_beg;
+											ch[c].pos = spos << 16;
+										}
+										else
+											ch[c].on = FALSE;
+									}
+									if (ch[c].on &&
+										spos < ut_music.smp[smp_i].len)
+									{
+										//Index masked and locals noreg: the same
+										//register-allocator fault as ut_rgb_cube
+										//read this array at a garbage index —
+										//random bytes are ~2x the amplitude of
+										//real samples and pure noise. The 4MB
+										//mask is a no-op (loader clamps len).
+										//Linear interpolation. Nearest-sample
+										//fetch aliases hard whenever step > 1.
+										v = (ut_music.smp[smp_i].pcm[spos &
+											0x3FFFFF] & 255) - 128;
+										if (spos + 1 <
+											ut_music.smp[smp_i].len)
+										{
+											frac = ch[c].pos & 0xFFFF;
+											v2 = (ut_music.smp[smp_i].pcm[
+												(spos + 1) & 0x3FFFFF] & 255)
+												- 128;
+											v = (v * (65536 - frac) +
+												v2 * frac) >> 16;
+										}
+										v = (v * ch[c].vol) / 64;
+										acc_l += v * 90;
+										acc_r += v * 90;
+										ch[c].pos += ch[c].step;
+									}
+								}
+								c++;
+							}
+							acc_l /= 4;
+							acc_r /= 4;
+							if (acc_l < -32768) acc_l = -32768;
+							if (acc_l > 32767) acc_l = 32767;
+							if (acc_r < -32768) acc_r = -32768;
+							if (acc_r > 32767) acc_r = 32767;
+							//Mask both channels: acc_r is signed, so a
+							//negative sample sign-extends across the whole
+							//frame and corrupts left as well as right.
+							out[t] = (acc_l & 0xFFFF) |
+								((acc_r & 0xFFFF) << 16);
+							t++;
+							n_on++;
+						}
+						tick++;
+					}
+					row++;
+				}
+			}
+		}
+		o++;
+	}
+	while (t < out_n)
+	{
+		out[t] = 0;
+		t++;
+	}
+	*_frames = out;
+	if (_rate)
+		*_rate = UT_MUSIC_MIX_RATE;
+	UTLog("UTMusic: rendered %d frames @%d live_max=%d\n",
+		out_n, UT_MUSIC_MIX_RATE, ut_music_live_max);
+	return out_n;
+}
+
+Bool UTMusicLoadUmx(U8 *path)
+{
+	CUTPackage *pkg;
+	I64 ei;
+	I64 impm;
+	I64 count;
+	I64 rate;
+	U32 *frames;
+	CUTExport *e;
+	CUTArc ar;
+	I64 remain;
+	U8 *base;
+
+	if (!path || !FileFind(path))
+	{
+		UTLog("UTMusic: missing %s\n", path);
+		return FALSE;
+	}
+	UTMusicStop;
+	if (ut_music.frames)
+	{
+		Free(ut_music.frames);
+		ut_music.frames = NULL;
+	}
+	ut_music.loaded = FALSE;
+	ut_music.count = 0;
+	StrPrint(ut_music.path, "%s", path);
+
+	pkg = UTPkgLoad(path);
+	if (!pkg)
+		return FALSE;
+	ei = UTPkgFindExport(pkg, "Music", NULL);
+	if (ei < 0)
+		ei = 0;
+	if (ei >= pkg->export_count)
+	{
+		UTPkgFree(pkg);
+		return FALSE;
+	}
+	e = &pkg->exports[ei];
+	StrPrint(ut_music.name, "%s", UTPkgNameStr(pkg, e->name_index));
+	if (!UTPkgArcExport(pkg, ei, &ar))
+	{
+		UTPkgFree(pkg);
+		return FALSE;
+	}
+	UTPropSkipStack(&ar, e->object_flags);
+	if (!UTPropSkipAll(&ar, pkg))
+		ar.err = FALSE;
+	remain = e->serial_offset + e->serial_size - ar.pos;
+	base = pkg->data + ar.pos;
+	impm = UTMusicFindIMPM(base, remain);
+	if (impm < 0)
+	{
+		impm = UTMusicFindIMPM(pkg->data, pkg->data_size);
+		base = pkg->data;
+		remain = pkg->data_size;
+	}
+	if (impm < 0)
+	{
+		UTPkgFree(pkg);
+		return FALSE;
+	}
+	if (!UTMusicLoadIT(base + impm, remain - impm))
+	{
+		UTPkgFree(pkg);
+		return FALSE;
+	}
+	UTPkgFree(pkg);
+	count = UTMusicRender(&frames, &rate);
+	if (count < 1 || !frames)
+		return FALSE;
+	//Dump the head of the mix so the waveform can be inspected off-box.
+	//10s cap; the old mask produced a near-random 0.8s slice.
+	remain = count * 4;
+	if (remain > 22050 * 4 * 10)
+		remain = 22050 * 4 * 10;
+	if (count > 0 && frames)
+		FileWrite("::/Apps/UT99/UTMIX.BIN", frames, remain);
+	ut_music.frames = frames;
+	ut_music.count = count;
+	ut_music.rate = rate;
+	ut_music.loaded = TRUE;
+	ut_music_ready = TRUE;
+	UTLog("UTMusic: %s pattern-player ready\n", ut_music.name);
+	return TRUE;
+}
+
+Bool UTMusicPlayNamed(U8 *umx_name)
+{
+	U8 path[256];
+	I64 len;
+
+	if (!umx_name)
+		return FALSE;
+	len = StrLen(umx_name);
+	if (len >= 4 && !StrCompare(umx_name + len - 4, ".umx"))
+		StrPrint(path, "%s%s", UT99_MUSIC_DIR, umx_name);
+	else
+		StrPrint(path, "%s%s.umx", UT99_MUSIC_DIR, umx_name);
+	if (!FileFind(path))
+	{
+		UTLog("UTMusic: miss %s\n", path);
+		return FALSE;
+	}
+	if (!UTMusicLoadUmx(path))
+	{
+		UTLog("UTMusic: load fail %s\n", path);
+		return FALSE;
+	}
+	UTMusicStart;
+	UTLog("UTMusic: play %s voice=%d frames=%d vol=%.2f\n",
+		ut_music.name, ut_music.voice, ut_music.count, ut_music_vol);
+	return ut_music.playing;
+}
+
+U0 UTMusicInit()
+{
+	MemSet(&ut_music, 0, sizeof(CUTMusic));
+	ut_music.voice = -1;
+	ut_music_ready = FALSE;
+	//UT title menu song; game maps use Song= on LevelInfo (Cannon fallback).
+	if (!ut_music_ingame)
+	{
+		UTLog("UTMusic: menu music off (ut_music_ingame)\n");
+		return;
+	}
+	if (!UTMusicPlayNamed("utmenu23"))
+	{
+		if (!UTMusicPlayNamed("Uttitle"))
+		{
+			if (!UTMusicPlayNamed("Cannon"))
+				UTMusicPlayNamed("Botmca9");
+		}
+	}
+	if (!ut_music.playing)
+		UTLog("UTMusic: no umx audible (soft-fail)\n");
+}
+
+U0 UTMusicSetVolNow(F64 vol)
+{
+	if (vol < 0.0) vol = 0.0;
+	if (vol > 1.0) vol = 1.0;
+	ut_music_vol = vol;
+	ut_music_vol_target = vol;
+	ut_music_fade_rate = 0.0;
+}
+
+U0 UTMusicFadeTo(F64 vol, F64 secs)
+{//= crossfade stand-in — ramp ut_music_vol; restart voice at end
+	if (vol < 0.0) vol = 0.0;
+	if (vol > 1.0) vol = 1.0;
+	ut_music_vol_target = vol;
+	if (secs < 0.05)
+	{
+		UTMusicSetVolNow(vol);
+		if (vol <= 0.01)
+			UTMusicStop;
+		else if (ut_music.loaded)
+			UTMusicStart;
+		return;
+	}
+	ut_music_fade_rate = Abs(ut_music_vol_target - ut_music_vol) / secs;
+	if (ut_music_fade_rate < 0.01)
+		ut_music_fade_rate = 0.01;
+}
+
+U0 UTMusicPlayMapDefault()
+{//After ClientTravel - DeathMatch maps often Song=Cannon.
+	if (!ut_music_ingame)
+	{
+		UTLog("UTMusic: in-game music off (ut_music_ingame)\n");
+		return;
+	}
+	ut_music_vol = 0.0;
+	if (!UTMusicPlayNamed("Cannon"))
+		UTMusicPlayNamed("Botmca9");
+	UTMusicFadeTo(0.70, 1.2);
+}
+
+U0 UTMusicUpdate()
+{
+	Bool done;
+
+	done = FALSE;
+	if (ut_music_fade_rate > 0.0)
+	{
+		if (ut_music_vol < ut_music_vol_target)
+		{
+			ut_music_vol += ut_music_fade_rate * 0.033;
+			if (ut_music_vol >= ut_music_vol_target)
+			{
+				ut_music_vol = ut_music_vol_target;
+				done = TRUE;
+			}
+		}
+		else
+		{
+			ut_music_vol -= ut_music_fade_rate * 0.033;
+			if (ut_music_vol <= ut_music_vol_target)
+			{
+				ut_music_vol = ut_music_vol_target;
+				done = TRUE;
+			}
+		}
+		if (done)
+		{
+			ut_music_fade_rate = 0.0;
+			if (ut_music_vol <= 0.01)
+				UTMusicStop;
+			else if (ut_music.loaded)
+				UTMusicStart;
+		}
+	}
+	if (!ut_music.playing || !ut_music.loaded)
+		return;
+	if (ut_music.voice >= 0 && AudioSFXPlaying(ut_music.voice))
+		return;
+	UTMusicStart;
+}
+
+U0 UTMusicExit()
+{
+	UTMusicStop;
+	if (ut_music.frames)
+		Free(ut_music.frames);
+	ut_music.frames = NULL;
+	UTMusicFreeMod;
+	ut_music.loaded = FALSE;
+	ut_music_ready = FALSE;
+}

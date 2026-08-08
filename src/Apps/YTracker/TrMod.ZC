@@ -1,0 +1,252 @@
+//TrMod.ZC - ProTracker .MOD reader. Depends on TrDef, TrSmp.
+//
+//Layout, 31-sample variant:
+//    0    20  title
+//   20   930  31 sample headers, 30 bytes each
+//         +0  22  name
+//        +22   2  length in big-endian words
+//        +24   1  finetune, signed 4-bit in the low nibble
+//        +25   1  default volume, 0..64
+//        +26   2  loop start in big-endian words
+//        +28   2  loop length in big-endian words
+//  950     1  song length in orders
+//  951     1  restart position
+//  952   128  order list
+// 1080     4  format magic
+// 1084   ...  patterns, 64 rows of channels * 4 bytes, then sample PCM
+//
+//The 15-sample Soundtracker variant has no magic and shifts everything up by
+//16 headers; patterns start at 600.
+
+#define TRMOD_HDR31		1084
+#define TRMOD_HDR15		600
+
+I64 TrModMagicChannels(U8 *mg)
+{//Channel count for a format magic, 0 if unrecognised.
+	if (!MemCompare(mg, "M.K.", 4) || !MemCompare(mg, "M!K!", 4) ||
+		!MemCompare(mg, "M&K!", 4) || !MemCompare(mg, "FLT4", 4) ||
+		!MemCompare(mg, "N.T.", 4) || !MemCompare(mg, "NSMS", 4) ||
+		!MemCompare(mg, "LARD", 4) || !MemCompare(mg, "PATT", 4))
+		return 4;
+	if (!MemCompare(mg, "FLT8", 4) || !MemCompare(mg, "CD81", 4) ||
+		!MemCompare(mg, "OKTA", 4) || !MemCompare(mg, "OCTA", 4))
+		return 8;
+	//"nnCH" for 10..32 channels, "nCHN" for 1..9, "TDZn" for 1..3.
+	if (mg[2] == 'C' && mg[3] == 'H' &&
+		'0' <= mg[0] <= '9' && '0' <= mg[1] <= '9')
+		return (mg[0] - '0') * 10 + (mg[1] - '0');
+	if (mg[1] == 'C' && mg[2] == 'H' && mg[3] == 'N' && '0' <= mg[0] <= '9')
+		return mg[0] - '0';
+	if (!MemCompare(mg, "TDZ", 3) && '1' <= mg[3] <= '3')
+		return mg[3] - '0';
+
+	return 0;
+}
+
+I64 TrModProbe(U8 *raw, I64 size, I64 *_samples, I64 *_hdr)
+{//Channel count, or 0 if this is not a MOD. Also reports sample count and
+//where pattern data starts.
+	I64 ch, i, hdr, n_pat = 0, total, len;
+
+	*_samples	= 31;
+	*_hdr		= TRMOD_HDR31;
+	if (size < TRMOD_HDR15 + 1024)
+		return 0;
+
+	if (size >= TRMOD_HDR31)
+	{
+		ch = TrModMagicChannels(raw + 1080);
+		if (ch >= 1 && ch <= TR_MAX_CHANNELS)
+			return ch;
+	}
+
+	//No magic: try the 15-sample layout. Accept only if the declared sizes
+	//add up to something no larger than the file.
+	hdr = TRMOD_HDR15;
+	for (i = 0; i < 128; i++)
+		if (raw[472 + i] > n_pat)
+			n_pat = raw[472 + i];
+	n_pat++;
+	if (n_pat > 64)
+		return 0;
+	total = hdr + n_pat * 64 * 4 * 4;
+	for (i = 0; i < 15; i++)
+	{
+		len = TrRdU16BE(raw + 20 + i * 30 + 22) * 2;
+		if ((raw[20 + i * 30 + 25] & 0xFF) > 64)
+			return 0;
+		total += len;
+	}
+	if (total > size + 4096 || total < size / 2)
+		return 0;
+	*_samples	= 15;
+	*_hdr		= hdr;
+
+	return 4;
+}
+
+Bool TrModLoad(U8 *raw, I64 size)
+{//Replaces the whole song. Returns FALSE without touching state on reject.
+	I64	 ch, n_smp, hdr, i, j, k, p, row, n_pat = 0, songlen, restart;
+	I64	 len, ls, ll, ft, vol, v, ord_base, smp_base, want;
+	U8	*sh, *cp;
+	I16	*d;
+	CTrCell	*cell;
+
+	ch = TrModProbe(raw, size, &n_smp, &hdr);
+	if (ch < 1)
+		return FALSE;
+
+	if (n_smp == 31)
+		ord_base = 952;
+	else
+		ord_base = 472;
+	songlen = raw[ord_base - 2];
+	restart = raw[ord_base - 1];
+	if (songlen < 1 || songlen > 128)
+		songlen = 128;
+	for (i = 0; i < 128; i++)
+		if (raw[ord_base + i] > n_pat)
+			n_pat = raw[ord_base + i];
+	n_pat++;
+	if (n_pat > TR_MAX_PATTERNS)
+		n_pat = TR_MAX_PATTERNS;
+
+	//Truncated pattern blocks are common in the wild. Keep what fits rather
+	//than rejecting; orders pointing past it play as empty rows.
+	want = hdr + n_pat * 64 * ch * 4;
+	if (want > size)
+	{
+		n_pat = (size - hdr) / (64 * ch * 4);
+		if (n_pat < 1)
+			return FALSE;
+	}
+
+	TrSongFreeAll;
+	MemSet(&tr_song, 0, sizeof(CTrSong));
+	tr_song.channels	= ch;
+	tr_song.n_patterns	= n_pat;
+	tr_song.n_instruments = n_smp;
+	tr_song.global_vol	= 128;
+	tr_song.mix_vol		= 128;
+	tr_song.linear		= FALSE;
+	tr_song.clock		= TR_STEP_NUM;	//Real PAL Amiga, C-4 = 8287 Hz.
+	tr_song.order_len	= songlen;
+	tr_song.speed		= 6;
+	tr_song.bpm			= 125;
+	if (restart < songlen)
+		tr_song.restart = restart;
+	for (i = 0; i < 20 && raw[i]; i++)
+		tr_song.title[i] = raw[i];
+	tr_song.title[20] = 0;
+	for (i = 0; i < songlen; i++)
+		tr_song.order[i] = raw[ord_base + i];
+
+	//Sample headers. Slot numbering is 1-based and matches the file.
+	for (i = 0; i < n_smp; i++)
+	{
+		sh	= raw + 20 + i * 30;
+		len	= TrRdU16BE(sh + 22) * 2;
+		ft	= sh[24] & 0x0F;
+		if (ft > 7)
+			ft -= 16;
+		ft *= 16;			//MOD 1/8 semitone units to the engine's 1/128.
+		vol	= ClampI64(sh[25], 0, 64);
+		ls	= TrRdU16BE(sh + 26) * 2;
+		ll	= TrRdU16BE(sh + 28) * 2;
+		p	= i + 1;
+		tr_smp[p].volume	= vol;
+		tr_smp[p].finetune	= ft;
+		tr_smp[p].pan		= 128;
+		tr_smp[p].step_mul	= 65536;
+		for (j = 0; j < 22 && sh[j]; j++)
+			tr_smp[p].name[j] = sh[j];
+		tr_smp[p].name[22] = 0;
+		if (len > 2)
+		{
+			if (TrSampleAlloc(p, len))
+			{
+				if (ll > 2 && ls < len)
+				{
+					if (ls + ll > len)
+						ll = len - ls;
+					tr_smp[p].loop_start	= ls;
+					tr_smp[p].loop_len		= ll;
+					tr_smp[p].loop_type		= TR_LOOP_FWD;
+				}
+				//Restore the header fields TrSampleAlloc cleared.
+				tr_smp[p].volume	= vol;
+				tr_smp[p].finetune	= ft;
+				tr_smp[p].pan		= 128;
+				tr_smp[p].step_mul	= 65536;
+				for (j = 0; j < 22 && sh[j]; j++)
+					tr_smp[p].name[j] = sh[j];
+				tr_smp[p].name[22] = 0;
+			}
+		}
+	}
+
+	//Patterns. PCM follows the full declared block, so remember where it
+	//ends even if allocation gives out partway.
+	smp_base = hdr + n_pat * 64 * ch * 4;
+	for (p = 0; p < n_pat; p++)
+	{
+		if (!TrPatternAlloc(p, 64))
+		{//Out of memory. Keep the patterns that landed.
+			tr_song.n_patterns	= p;
+			n_pat				= p;
+		}
+		else
+			for (row = 0; row < 64; row++)
+				for (k = 0; k < ch; k++)
+				{
+					cp	 = raw + hdr + ((p * 64 + row) * ch + k) * 4;
+					cell = TrCell(p, k, row);
+					if (cell)
+					{
+						cell->inst	= (cp[0] & 0xF0) | (cp[2] >> 4);
+						cell->eff	= cp[2] & 0x0F;
+						cell->param	= cp[3];
+						v = ((cp[0] & 0x0F) << 8) | cp[1];
+						if (v)
+							cell->note = TrPeriodNote(v * TR_PERIOD_SCALE, 0);
+						else
+							cell->note = 0;
+						cell->volcmd  = TRV_NONE;
+						cell->volparam = 0;
+					}
+				}
+	}
+
+	//Sample PCM: signed 8-bit, in slot order, immediately after the patterns.
+	for (i = 0; i < n_smp; i++)
+	{
+		p	= i + 1;
+		len	= tr_smp[p].len;
+		if (len > 0 && tr_smp[p].data)
+		{
+			d = tr_smp[p].data;
+			for (j = 0; j < len; j++)
+			{
+				v = 0;
+				if (smp_base + j < size)
+				{
+					v = raw[smp_base + j];
+					if (v > 127)
+						v -= 256;
+				}
+				//Multiply, not shift: v is signed here.
+				d[j] = v * 256;
+			}
+			TrSampleGuard(&tr_smp[p]);
+			smp_base += len;
+		}
+	}
+
+	tr_song.n_patterns = n_pat;
+	TrMasterDefault;
+	TrChanPanDefault(TRUE);
+	TrChansInit;
+
+	return TRUE;
+}

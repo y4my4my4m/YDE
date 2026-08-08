@@ -1,0 +1,1769 @@
+// QBSP.ZC - BSP29 / BSP2 / 2PSB loader
+//
+// 4 byte version, then 15 (offset, length) lump pointers. every record is
+// decoded field by field into F64 structs instead of overlaid: on-disk vectors
+// are binary32 and ZealC only does F64 math, so an overlay reads garbage
+//
+// BSP2 (magic little-endian 'BSP2') and 2PSB widen node/leaf/face/clip/edge/
+// marksurf records - same in-memory CQ* layout either way
+//
+// widening near doubles the geometry, e1m1 is ~2MB of structs off a 1.3MB file
+
+#define QLUMP_ENTITIES		0
+#define QLUMP_PLANES		1
+#define QLUMP_MIPTEX		2
+#define QLUMP_VERTICES		3
+#define QLUMP_VISIBILITY	4
+#define QLUMP_NODES			5
+#define QLUMP_TEXINFO		6
+#define QLUMP_FACES			7
+#define QLUMP_LIGHTING		8
+#define QLUMP_CLIPNODES		9
+#define QLUMP_LEAFS			10
+#define QLUMP_MARKSURFACES	11
+#define QLUMP_EDGES			12
+#define QLUMP_SURFEDGES		13
+#define QLUMP_MODELS		14
+#define QLUMP_COUNT			15
+
+#define QBSP_VERSION		29
+//disk magic as LE i32: bytes "BSP2" / "2PSB"
+#define QBSP2_BSP2			0x32505342
+#define QBSP2_2PSB			0x42535032
+
+//bsp2 level used while loading: 0 = BSP29, 1 = 2PSB (short bbox), 2 = BSP2 (float bbox)
+#define QBSP_FMT_29			0
+#define QBSP_FMT_2PSB		1
+#define QBSP_FMT_BSP2		2
+
+//leaf contents, everything but EMPTY is solid or a fluid volume
+#define QCONTENTS_EMPTY		-1
+#define QCONTENTS_SOLID		-2
+#define QCONTENTS_WATER		-3
+#define QCONTENTS_SLIME		-4
+#define QCONTENTS_LAVA		-5
+#define QCONTENTS_SKY		-6
+
+class CQPlane
+{
+	F64	normal[3];
+	F64	dist;
+	I64	type;		//0-2 axial on x/y/z, 3+ general case
+};
+
+class CQVertex
+{
+	F64	pt[3];
+};
+
+class CQEdge
+{
+	I64	v[2];
+};
+
+class CQNode
+{
+	I64	plane_num;
+	I64	children[2];	//>= 0 node index, < 0 is ~(leaf index)
+	F64	mins[3];
+	F64	maxs[3];
+	I64	first_face;
+	I64	num_faces;
+};
+
+class CQLeaf
+{
+	I64	contents;
+	I64	vis_offset;		//byte offset into the compressed pvs, -1 if none
+	F64	mins[3];
+	F64	maxs[3];
+	I64	first_marksurface;
+	I64	num_marksurfaces;
+	U8	ambient[4];
+};
+
+class CQClipNode
+{//collision tree, pre-expanded by the compiler for each bbox size, so a trace
+ //is a POINT trace through the matching hull, not a box sweep
+	I64	plane_num;
+	I64	children[2];	//>= 0 clipnode index, < 0 is a contents value
+};
+
+class CQTexInfo
+{
+	F64	vecs[8];		//two rows of (x y z offset)
+	I64	miptex;
+	I64	flags;
+};
+
+class CQFace
+{
+	I64	plane_num;
+	I64	side;			//0 front of plane, 1 back
+	I64	first_edge;		//index into the surfedge list
+	I64	num_edges;
+	I64	tex_info;
+	U8	styles[4];
+	I64	light_offset;	//byte offset into the lighting lump, -1 if unlit
+
+	//R_MarkLights: which dlights reached this face, and on what frame
+	I64	dlight_frame;
+	I64	dlight_bits;
+
+	//bounding sphere in world space, for distance culling
+	F64	center[3];
+	F64	radius;
+
+	//derived by QBSPCalcSurfaceExtents
+	F64	mins_s;
+	F64	mins_t;
+	I64	extent_s;
+	I64	extent_t;
+};
+
+class CQModel
+{
+	F64	mins[3];
+	F64	maxs[3];
+	F64	origin[3];
+	I64	head_node[4];
+	//root of the synthesised hull 0 from QBSPMakeHull0. head_node[0] stays a
+	//render node index - the vis walk and point contents both use it as one
+	I64	hull0_head;
+	I64	vis_leafs;
+	I64	first_face;
+	I64	num_faces;
+};
+
+class CQTexture
+{
+	U8	 name[16];
+	I64	 width;
+	I64	 height;
+	U8	*texels[4];		//four mip levels, borrowed from the map buffer
+
+	//world textures are power of two and wrap with an AND. model skins are
+	//arbitrary (296x194 and such) and must clamp - masking scrambles them
+	Bool clamp;
+
+	//256x128 holding two stacked 128x128 layers, drawn by eye direction
+	Bool is_sky;
+	Bool is_turb;	//leading '*': water, slime, lava, teleport
+
+	//leading '{': index 255 is a cutout, not a color. grates, foliage, rails
+	Bool is_fence;
+
+	//tool textures: compiler markup, never rendered. the faces survive into
+	//the BSP carrying no lightmap samples, so drawing them puts a solid black
+	//wall where the mapper meant an invisible volume
+	Bool is_tool;
+
+	//external replacement, 0xRRGGBB with bit 31 set on opaque texels. NULL
+	//when the gamedir ships none, which is the usual case
+	U32	*ext_rgb;
+	I64	 ext_w;
+	I64	 ext_h;
+
+	//TRUE when texels[1..3] were rebuilt into their own buffers by
+	//QBSPFenceMips and no longer point into the map lump
+	Bool mips_owned;
+
+	//RGB mip chain, levels 1-3 only. the compiler builds its mips by
+	//averaging PALETTE INDICES and re-quantizing, which bakes dither noise
+	//into every level below 0. these are filtered in RGB from mip 0 instead.
+	//level 0 is absent: the original art needs no reconstruction
+	U32	*rgb_mips[4];
+
+	//Mod_LoadTextures anim chains. "+0button" is frame 0, "+abutton".."+jbutton"
+	//are the alternate chain an entity picks with .frame
+	I64	 anim_total;	//frames * ANIM_CYCLE, 0 when not animated
+	I64	 anim_min;
+	I64	 anim_max;
+	I64	 anim_next;		//texture index of the next frame
+	I64	 alt_anims;		//texture index of the alternate chain, -1 if none
+};
+
+class CQMap
+{
+	U8			*raw;			//owned copy of the whole file
+	I64			 raw_size;
+
+	CQPlane		*planes;
+	I64			 num_planes;
+	CQVertex	*vertices;
+	I64			 num_vertices;
+	CQEdge		*edges;
+	I64			 num_edges;
+	I64			*surfedges;		//signed, negative walks the edge backwards
+	I64			 num_surfedges;
+	CQNode		*nodes;
+	I64			 num_nodes;
+	CQClipNode	*clipnodes;
+	I64			 num_clipnodes;
+	CQLeaf		*leafs;
+	I64			 num_leafs;
+	CQTexInfo	*texinfo;
+	I64			 num_texinfo;
+	CQFace		*faces;
+	I64			 num_faces;
+	I64			*marksurfaces;
+	I64			 num_marksurfaces;
+	CQModel		*models;
+	I64			 num_models;
+	CQTexture	*textures;
+	I64			 num_textures;
+
+	U8			*visdata;		//rle compressed pvs
+	I64			 visdata_size;
+	U8			*lightdata;
+	I64			 lightdata_size;
+	Bool		 lightdata_owned;	//TRUE when .lit luminance replaced the BSP borrow
+
+	//RGB triples from .lit, same luxel indexing as lightdata. the mono plane
+	//still drives styles and dlights; this only carries the colour
+	U8			*litdata;
+	I64			 litdata_size;
+	U8			*entities;		//nul terminated key/value text
+	I64			 entities_size;
+};
+
+//path of the map currently up. lives here, not the shell, because the console
+//and the savegame both need it and both compile first
+U8 q_map_name[96];
+
+//must be declared before QNetSv, remote QPlayerMove needs it
+CQMap *q_map = NULL;
+
+I64 q_map_bad_reports = 0;
+
+Bool QMapValid(CQMap *map, U8 *who)
+{//reject an impossible map pointer and name the caller
+ //
+ //a corrupted CQMap* is non-canonical, so the cpu raises a GP fault, not a
+ //page fault, and it lands in the debugger with no log and no caller
+	I64 addr = map;
+
+	//canonical user addresses only, corruption shows as high bits set,
+	//e.g. F000FF53F000FF53
+	if (map && addr >= 0x1000 && addr < 0x0000800000000000)
+		return TRUE;
+
+	//NULL is a legitimate state - the title screen has no world. only a
+	//non-canonical pointer is corruption worth naming
+	if (map && q_map_bad_reports < 8)
+	{
+		q_map_bad_reports++;
+		"QBSP: bad map pointer 0x%X from %s\n", addr, who;
+	}
+
+	return FALSE;
+}
+
+//bumped on every load and free. a freed CQMap and the one allocated straight
+//after it routinely land on the same address, so a pointer alone cannot tell
+//two maps apart - anything caching per-map state compares the generation too
+I64 q_map_gen = 0;
+
+U0 QBSPFree(CQMap *map)
+{
+	I64 i;
+	I64 j;
+
+	if (!map)
+		return;
+
+	q_map_gen++;
+
+	if (map->planes)		Free(map->planes);
+	if (map->vertices)		Free(map->vertices);
+	if (map->edges)			Free(map->edges);
+	if (map->surfedges)		Free(map->surfedges);
+	if (map->nodes)			Free(map->nodes);
+	if (map->clipnodes)		Free(map->clipnodes);
+	if (map->leafs)			Free(map->leafs);
+	if (map->texinfo)		Free(map->texinfo);
+	if (map->faces)			Free(map->faces);
+	if (map->marksurfaces)	Free(map->marksurfaces);
+	if (map->models)		Free(map->models);
+	if (map->textures)
+	{
+		for (i = 0; i < map->num_textures; i++)
+		{
+			if (map->textures[i].ext_rgb)
+				Free(map->textures[i].ext_rgb);
+
+			for (j = 1; j < 4; j++)
+			{
+				if (map->textures[i].rgb_mips[j])
+					Free(map->textures[i].rgb_mips[j]);
+			}
+
+			if (map->textures[i].mips_owned)
+			{
+				for (j = 1; j < 4; j++)
+				{
+					if (map->textures[i].texels[j])
+						Free(map->textures[i].texels[j]);
+				}
+			}
+		}
+		Free(map->textures);
+	}
+	if (map->lightdata_owned && map->lightdata)
+		Free(map->lightdata);
+	if (map->litdata)		Free(map->litdata);
+	if (map->raw)			Free(map->raw);
+
+	Free(map);
+}
+
+U0 QBSPCalcSurfaceExtents(CQMap *map, CQFace *f)
+{//project the verts through the texture axes for the lightmap grid size,
+ //one luxel per 16 texels, extents snap outward
+	CQTexInfo	*ti = &map->texinfo[f->tex_info];
+	CQVertex	*v;
+	F64			 mins[2];
+	F64			 maxs[2];
+	F64			 wmins[3];
+	F64			 wmaxs[3];
+	F64			 val;
+	I64			 i;
+	I64			 j;
+	I64			 e;
+	I64			 bmins;
+	I64			 bmaxs;
+
+	mins[0] = 999999.0;
+	mins[1] = 999999.0;
+	maxs[0] = -999999.0;
+	maxs[1] = -999999.0;
+
+	for (i = 0; i < f->num_edges; i++)
+	{
+		e = map->surfedges[f->first_edge + i];
+		if (e >= 0)
+			v = &map->vertices[map->edges[e].v[0]];
+		else
+			v = &map->vertices[map->edges[-e].v[1]];
+
+		for (j = 0; j < 2; j++)
+		{
+			val = v->pt[0] * ti->vecs[j * 4] +
+				  v->pt[1] * ti->vecs[j * 4 + 1] +
+				  v->pt[2] * ti->vecs[j * 4 + 2] +
+				  ti->vecs[j * 4 + 3];
+
+			if (val < mins[j])
+				mins[j] = val;
+			if (val > maxs[j])
+				maxs[j] = val;
+		}
+	}
+
+	//snap to the 16 texel lightmap grid
+	bmins = ToI64(Floor(mins[0] / 16.0));
+	bmaxs = ToI64(Ceil(maxs[0] / 16.0));
+	f->mins_s   = bmins * 16.0;
+	f->extent_s = (bmaxs - bmins) * 16;
+
+	bmins = ToI64(Floor(mins[1] / 16.0));
+	bmaxs = ToI64(Ceil(maxs[1] / 16.0));
+	f->mins_t   = bmins * 16.0;
+	f->extent_t = (bmaxs - bmins) * 16;
+
+	//bounding sphere: centre of the world-space extent, radius to the
+	//furthest vertex. used to reject faces lost in fog
+	wmins[0] = 1.0e30;
+	wmins[1] = 1.0e30;
+	wmins[2] = 1.0e30;
+	wmaxs[0] = -1.0e30;
+	wmaxs[1] = -1.0e30;
+	wmaxs[2] = -1.0e30;
+
+	for (i = 0; i < f->num_edges; i++)
+	{
+		e = map->surfedges[f->first_edge + i];
+		if (e >= 0)
+			v = &map->vertices[map->edges[e].v[0]];
+		else
+			v = &map->vertices[map->edges[-e].v[1]];
+
+		for (j = 0; j < 3; j++)
+		{
+			if (v->pt[j] < wmins[j])	wmins[j] = v->pt[j];
+			if (v->pt[j] > wmaxs[j])	wmaxs[j] = v->pt[j];
+		}
+	}
+
+	f->radius = 0.0;
+	for (j = 0; j < 3; j++)
+	{
+		f->center[j] = (wmins[j] + wmaxs[j]) * 0.5;
+		val = (wmaxs[j] - wmins[j]) * 0.5;
+		f->radius += val * val;
+	}
+	f->radius = Sqrt(f->radius);
+}
+
+//ANIM_CYCLE, two ticks of the 10hz anim clock per frame
+#define QANIM_CYCLE		2
+
+//fence textures whose mips QBSPFenceMips rebuilt. -1 means it never ran, which
+//is the difference between "no fence textures" and "silently skipped"
+I64 q_fence_fixed = -1;
+
+U8 QPalNearestOpaque(I64 r, I64 g, I64 b)
+{//nearest palette entry excluding 255, which '{' textures reserve as cutout
+	I64 best  = 0;
+	I64 bestd = I64_MAX;
+	I64 i;
+	I64 dr;
+	I64 dg;
+	I64 db;
+	I64 d;
+
+	for (i = 0; i < 255; i++)
+	{
+		dr = r - qpal_rgb[i * 3 + 0];
+		dg = g - qpal_rgb[i * 3 + 1];
+		db = b - qpal_rgb[i * 3 + 2];
+		d  = dr * dr + dg * dg + db * db;
+
+		if (d < bestd)
+		{
+			bestd = d;
+			best  = i;
+		}
+	}
+
+	return best;
+}
+
+//truecolor replacement art can be far larger than the 8bpp original, so the
+//total is capped. 128MB holds a full 512x512 pack with room to spare
+#define QEXT_BUDGET		134217728
+
+I64 q_ext_bytes  = 0;
+I64 q_ext_loaded = 0;
+
+//map name without directory or extension, kept for the exttex report
+U8  q_ext_base[96];
+//OFF by default: every miss costs a directory walk and prints a file-not-found,
+//and a gamedir with no textures/ folder generates one per texture per map
+Bool q_opt_exttex = FALSE;
+
+Bool QExtTexName(U8 *out, U8 *tex_name)
+{//a BSP texture name into a filename RedSea will accept.
+ //
+ //char_bmp_filename (Kernel/StrA.ZC) permits '{', '}' and '#', and rejects
+ //'+', '*', '/', '\\', ':', '?' and '"'. Only the rejected ones need mapping,
+ //so a fence texture keeps its '{' and is probed under its own name.
+ //
+ //the two Quake prefixes that cannot be spelled are SUBSTITUTED, not refused:
+ //  '+' animated frame -> '#'
+ //  '*' liquid         -> '@'
+ //a replacement texture for those is named with the substitute on disk
+	I64  i = 0;
+	U8   ch;
+
+	while (tex_name[i] && i < 15)
+	{
+		ch = tex_name[i];
+
+		if (ch == '+')
+			ch = '#';
+		else if (ch == '*')
+			ch = '@';
+		else if (ch == '/' || ch == '\\' || ch == ':' ||
+				 ch == '"' || ch == '?' || ch < 32)
+		{
+			out[0] = 0;
+			return FALSE;
+		}
+
+		out[i] = ch;
+		i++;
+	}
+
+	out[i] = 0;
+	return ToBool(i > 0);
+}
+
+Bool QExtTexTry(CQTexture *t, U8 *path)
+{
+	U8	*data;
+	CDC	*dc;
+	U32	*out;
+	I64	 size = 0;
+	I64	 w;
+	I64	 h;
+	I64	 x;
+	I64	 y;
+	I64	 need;
+	U32	 pix;
+
+	data = QPakLoad(path, &size);
+	if (!data)
+		return FALSE;
+
+	dc = TGAReadBuf(data, size);
+	Free(data);
+	if (!dc)
+		return FALSE;
+
+	w = dc->width;
+	h = dc->height;
+	if (w < 1 || h < 1)
+	{
+		DCDel(dc);
+		return FALSE;
+	}
+
+	need = w * h * sizeof(U32);
+	if (q_ext_bytes + need > QEXT_BUDGET)
+	{
+		DCDel(dc);
+		return FALSE;
+	}
+
+	out = MAlloc(need);
+	if (!out)
+	{
+		DCDel(dc);
+		return FALSE;
+	}
+
+	for (y = 0; y < h; y++)
+	{
+		for (x = 0; x < w; x++)
+		{
+			//PIXF_TRANSPARENT marks the decoder's cutout texels
+			pix = dc->body[y * dc->width_internal + x];
+			if (pix == PIXF_TRANSPARENT)
+				out[y * w + x] = 0;
+			else
+				out[y * w + x] = (pix & 0x00FFFFFF) | 0x80000000;
+		}
+	}
+
+	DCDel(dc);
+
+	t->ext_rgb = out;
+	t->ext_w   = w;
+	t->ext_h   = h;
+
+	q_ext_bytes += need;
+	q_ext_loaded++;
+	return TRUE;
+}
+
+//RGB mips are the largest allocation the renderer makes. ZealOS has the RAM,
+//but a runaway map should still hit a wall rather than the allocator
+#define QRGBMIP_BUDGET	402653184		//384MB
+
+I64  q_rgbmip_bytes = 0;
+I64  q_rgbmip_count = 0;
+Bool q_opt_rgbmips  = TRUE;
+
+U0 QBSPBuildRGBMips(CQMap *map)
+{//filter the mip chain in RGB from mip 0. the source is the artist's texture;
+ //every level below it in the BSP is a palette re-quantization of a palette
+ //average, which is what makes distant surfaces look noisy
+	CQTexture	*t;
+	U8			*base;
+	U32			*prev;
+	U32			*cur;
+	I64			 i;
+	I64			 m;
+	I64			 x;
+	I64			 y;
+	I64			 j;
+	I64			 sw;
+	I64			 sh;
+	I64			 dw;
+	I64			 dh;
+	I64			 sx;
+	I64			 sy;
+	I64			 texel;
+	I64			 opaque;
+	I64			 r;
+	I64			 g;
+	I64			 b;
+	U32			 px;
+	I64			 need;
+
+	q_rgbmip_bytes = 0;
+	q_rgbmip_count = 0;
+
+	if (!map || !map->textures || !q_opt_rgbmips)
+		return;
+
+	for (i = 0; i < map->num_textures; i++)
+	{
+		t = &map->textures[i];
+
+		if (t->width <= 0 || t->height <= 0 || t->is_sky)
+			goto qrm_next;
+
+		base = t->texels[0];
+		if (!base)
+			goto qrm_next;
+
+		prev = NULL;
+
+		for (m = 1; m < 4; m++)
+		{
+			sw = t->width  >> (m - 1);
+			sh = t->height >> (m - 1);
+			dw = t->width  >> m;
+			dh = t->height >> m;
+
+			if (dw < 1 || dh < 1 || sw < 2 || sh < 2)
+				break;
+
+			need = dw * dh * sizeof(U32);
+			if (q_rgbmip_bytes + need > QRGBMIP_BUDGET)
+				break;
+
+			cur = MAlloc(need);
+			if (!cur)
+				break;
+
+			for (y = 0; y < dh; y++)
+			{
+				for (x = 0; x < dw; x++)
+				{
+					opaque = 0;
+					r = 0;
+					g = 0;
+					b = 0;
+
+					for (j = 0; j < 4; j++)
+					{
+						sx = x * 2 + (j & 1);
+						sy = y * 2 + (j >> 1);
+						if (sx >= sw || sy >= sh)
+							goto qrm_next_tap;
+
+						//level 1 reads the palette source, deeper levels
+						//read the RGB level above so error does not compound
+						if (m == 1)
+						{
+							texel = base[sy * sw + sx];
+							if (t->is_fence && texel == 255)
+								goto qrm_next_tap;
+
+							r += qpal_rgb[texel * 3];
+							g += qpal_rgb[texel * 3 + 1];
+							b += qpal_rgb[texel * 3 + 2];
+							opaque++;
+						}
+						else
+						{
+							px = prev[sy * sw + sx];
+							if (!px)
+								goto qrm_next_tap;
+
+							r += (px >> 16) & 255;
+							g += (px >> 8) & 255;
+							b += px & 255;
+							opaque++;
+						}
+
+qrm_next_tap:
+					}
+
+					if (opaque < 2)
+						cur[y * dw + x] = 0;		//cutout
+					else
+						cur[y * dw + x] = (((r / opaque) & 255) << 16) |
+										  (((g / opaque) & 255) << 8) |
+										   ((b / opaque) & 255) | 0x80000000;
+				}
+			}
+
+			t->rgb_mips[m] = cur;
+			q_rgbmip_bytes += need;
+			prev = cur;
+		}
+
+		if (t->rgb_mips[1])
+			q_rgbmip_count++;
+
+qrm_next:
+	}
+
+	if (q_rgbmip_count)
+		"QBSP: %d rgb mip chains (%d MB)\n", q_rgbmip_count,
+			q_rgbmip_bytes / 1048576;
+}
+
+U0 QBSPExtTextures(CQMap *map, U8 *bsp_name)
+{//Ironwail layout: textures/<mapname>/<texture>.tga wins over textures/<texture>.tga
+	CQTexture	*t;
+	U8			 base[96];
+	U8			 fname[32];
+	U8			 path[160];
+	I64			 i;
+	I64			 len;
+	I64			 st;
+	I64			 probes = 0;
+	U8			 logln[224];
+
+	if (!map || !map->textures || !q_opt_exttex)
+		return;
+
+	//map name without directory or extension
+	base[0] = 0;
+	if (bsp_name)
+	{
+		len = StrLen(bsp_name);
+		st  = 0;
+		for (i = 0; i < len; i++)
+		{
+			if (bsp_name[i] == '/' || bsp_name[i] == '\\')
+				st = i + 1;
+		}
+		if (len > 4 && !StrICompare(bsp_name + len - 4, ".bsp"))
+			len -= 4;
+		if (len > st && len - st < 90)
+		{
+			MemCopy(base, bsp_name + st, len - st);
+			base[len - st] = 0;
+		}
+	}
+
+	//only the WORLD names the textures/<map>/ subdir. an external brush model
+	//loading afterwards would otherwise rename it and the report would describe
+	//the wrong map
+	//the WORLD probes first and names the subdir. QLoadMap clears it, so an
+	//external brush model loading afterwards cannot rename it
+	if (!q_ext_base[0])
+		QStrCopy(q_ext_base, base, 96);
+
+	for (i = 0; i < map->num_textures; i++)
+	{
+		t = &map->textures[i];
+		if (!t->name[0] || t->is_sky)
+			goto qet_next;
+
+		if (!QExtTexName(fname, t->name))
+			goto qet_next;
+
+		if (base[0])
+		{
+			StrPrint(path, "textures/%s/%s.tga", base, fname);
+			if (QExtTexTry(t, path))
+				goto qet_next;
+		}
+
+		StrPrint(path, "textures/%s.tga", fname);
+		if (QExtTexTry(t, path))
+			goto qet_next;
+
+		//the first few misses, with the name as PROBED - a substituted prefix
+		//means the file on disk has to carry the substitute too
+		if (probes < 4)
+		{
+			probes++;
+			StrPrint(logln, "QBSP: no ext tex '%s' - tried textures/%s/%s.tga\n",
+				t->name, base, fname);
+			QLog(logln);
+		}
+
+qet_next:
+	}
+
+	if (q_ext_loaded)
+		"QBSP: %d external textures (%d KB)\n", q_ext_loaded,
+			q_ext_bytes / 1024;
+}
+
+U0 QExtTexReport(CQMap *map)
+{//where the external texture probe looks and what it found, into QUAKELOG.TXT.
+ //the menu can only say "none loaded"; this says which path was tried
+	CQTexture	*t;
+	U8			 fname[32];
+	U8			 line[224];
+	I64			 i;
+	I64			 shown = 0;
+
+	StrPrint(line, "exttex: enabled %d  gamedir '%s'\n",
+		q_opt_exttex, q_game_dir);
+	QLog(line);
+
+	StrPrint(line, "exttex: 1st ::/Apps/QuakePlus/%s/textures/%s/<name>.tga\n",
+		q_game_dir, q_ext_base);
+	QLog(line);
+
+	StrPrint(line, "exttex: 2nd ::/Apps/QuakePlus/%s/textures/<name>.tga\n",
+		q_game_dir);
+	QLog(line);
+
+	StrPrint(line, "exttex: loaded %d (%d KB)\n",
+		q_ext_loaded, q_ext_bytes / 1024);
+	QLog(line);
+
+	if (map && map->textures)
+	{
+		for (i = 0; i < map->num_textures && shown < 16; i++)
+		{
+			t = &map->textures[i];
+			if (!t->name[0] || t->is_sky)
+				goto qer_next;
+
+			shown++;
+
+			//the name as PROBED: '+' and '*' cannot be spelled on disk and are
+			//substituted, so the file has to carry the substitute too
+			if (!QExtTexName(fname, t->name))
+			{
+				StrPrint(line, "  '%s' -> unspellable\n", t->name);
+				QLog(line);
+				goto qer_next;
+			}
+
+			if (t->ext_rgb)
+				StrPrint(line, "  '%s' -> %s.tga LOADED\n", t->name, fname);
+			else
+				StrPrint(line, "  '%s' -> %s.tga miss\n", t->name, fname);
+
+			QLog(line);
+
+qer_next:
+		}
+	}
+
+	QLogFlush;
+}
+
+U0 QBSPFenceMips(CQMap *map)
+{//map compilers average index 255 into its neighbours when they build mips,
+ //so a '{' texture holds no cutout below mip 0 and goes solid with distance.
+ //rebuild each level from its parent, keeping 255 out of the colour average.
+ //
+ //the mip data is rewritten in place inside the map buffer
+	CQTexture	*t;
+	U8			*src;
+	U8			*dst;
+	I64			 i;
+	I64			 m;
+	I64			 x;
+	I64			 y;
+	I64			 sw;
+	I64			 sh;
+	I64			 dw;
+	I64			 dh;
+	I64			 j;
+	I64			 sx;
+	I64			 sy;
+	I64			 texel;
+	I64			 opaque;
+	I64			 r;
+	I64			 g;
+	I64			 b;
+	Bool		 need_fix;
+	Bool		 base255;
+	U8			*nb;
+
+	q_fence_fixed = 0;
+
+	//without the quantizer every rebuilt texel would collapse to index 0
+	if (!map || !map->textures || !qpal_nearest_ready)
+	{
+		q_fence_fixed = -1;
+		return;
+	}
+
+	for (i = 0; i < map->num_textures; i++)
+	{
+		t = &map->textures[i];
+
+		if (t->width <= 0 || t->height <= 0)
+			goto qfm_next_tex;
+
+		//a '{' texture always rebuilds: its cutout is averaged away by the
+		//compiler. any OTHER texture rebuilds only if a mip gained index 255
+		//that mip 0 does not have - that is compiler damage, and 255 is
+		//fullbright so it bypasses the colormap and draws raw salmon
+		if (!t->is_fence)
+		{
+			need_fix = FALSE;
+
+			src = t->texels[0];
+			if (!src)
+				goto qfm_next_tex;
+
+			base255 = FALSE;
+			sw = t->width;
+			sh = t->height;
+			for (j = 0; j < sw * sh; j++)
+			{
+				if (src[j] == 255)
+				{
+					base255 = TRUE;
+					break;
+				}
+			}
+
+			if (base255)
+				goto qfm_next_tex;		//255 is genuine art here
+
+			for (m = 1; m < 4; m++)
+			{
+				dst = t->texels[m];
+				if (!dst)
+					break;
+
+				dw = t->width  >> m;
+				dh = t->height >> m;
+				for (j = 0; j < dw * dh; j++)
+				{
+					if (dst[j] == 255)
+					{
+						need_fix = TRUE;
+						break;
+					}
+				}
+				if (need_fix)
+					break;
+			}
+
+			if (!need_fix)
+				goto qfm_next_tex;
+		}
+
+		q_fence_fixed++;
+
+		for (m = 1; m < 4; m++)
+		{
+			src = t->texels[m - 1];
+			dst = t->texels[m];
+			if (!src || !dst)
+				break;
+
+			sw = t->width  >> (m - 1);
+			sh = t->height >> (m - 1);
+			dw = t->width  >> m;
+			dh = t->height >> m;
+
+			if (dw < 1 || dh < 1 || sw < 2 || sh < 2)
+				break;
+
+			//rewriting in place corrupted whatever texture followed in the
+			//lump: a 16x16 mip3 is 4 bytes and any overrun lands in the next
+			//miptex. each level gets its own buffer instead. src and dst
+			//were already null checked at the top of this loop
+			nb = MAlloc(dw * dh);
+			if (!nb)
+				break;
+
+			for (y = 0; y < dh; y++)
+			{
+				for (x = 0; x < dw; x++)
+				{
+					opaque = 0;
+					r = 0;
+					g = 0;
+					b = 0;
+
+					for (j = 0; j < 4; j++)
+					{
+						sx = x * 2 + (j & 1);
+						sy = y * 2 + (j >> 1);
+						if (sx >= sw || sy >= sh)
+							goto qfm_next_sample;
+
+						texel = src[sy * sw + sx];
+						if (texel == 255)
+							goto qfm_next_sample;
+
+						r += qpal_rgb[texel * 3 + 0];
+						g += qpal_rgb[texel * 3 + 1];
+						b += qpal_rgb[texel * 3 + 2];
+						opaque++;
+
+qfm_next_sample:
+					}
+
+					//half coverage stays solid, so thin foliage and grates
+					//keep their shape instead of eroding one level per mip
+					if (opaque < 2)
+					{
+						//only a real cutout texture may keep 255
+						if (t->is_fence)
+							nb[y * dw + x] = 255;
+						else
+							nb[y * dw + x] = 0;
+					}
+					else
+					{
+						r /= opaque;
+						g /= opaque;
+						b /= opaque;
+
+						texel = QPalNearestRGB(r, g, b);
+
+						//255 is the cutout key, so the quantizer must never
+						//land on it and punch a hole in solid pixels
+						if (texel == 255)
+							texel = QPalNearestOpaque(r, g, b);
+
+						nb[y * dw + x] = texel;
+					}
+				}
+			}
+
+			//the texture now owns this level; the map buffer is untouched
+			t->texels[m] = nb;
+			t->mips_owned = TRUE;
+		}
+
+qfm_next_tex:
+	}
+}
+
+U0 QBSPSequenceTextures(CQMap *map)
+{//Mod_LoadTextures second pass, link "+Nname" into a cycle and
+ //"+ANAME".."+JNAME" into the alternate cycle
+	CQTexture	*t;
+	I64			 anims[10];
+	I64			 alts[10];
+	I64			 i;
+	I64			 j;
+	I64			 c;
+	I64			 num;
+	I64			 max;
+	I64			 altmax;
+
+	for (i = 0; i < map->num_textures; i++)
+	{
+		t = &map->textures[i];
+
+		if (t->name[0] != '+' || t->anim_total)
+			goto qst_next;
+
+		for (j = 0; j < 10; j++)
+		{
+			anims[j] = -1;
+			alts[j]  = -1;
+		}
+
+		max    = 0;
+		altmax = 0;
+
+		//same name from the third char on means same sequence
+		for (j = i; j < map->num_textures; j++)
+		{
+			if (map->textures[j].name[0] != '+')
+				goto qst_scan;
+			if (StrCompare(map->textures[j].name + 2, t->name + 2))
+				goto qst_scan;
+
+			c = map->textures[j].name[1];
+			if ('a' <= c <= 'z')
+				c -= 'a' - 'A';
+
+			if ('0' <= c <= '9')
+			{
+				num = c - '0';
+				anims[num] = j;
+				if (num + 1 > max)
+					max = num + 1;
+			}
+			else if ('A' <= c <= 'J')
+			{
+				num = c - 'A';
+				alts[num] = j;
+				if (num + 1 > altmax)
+					altmax = num + 1;
+			}
+
+qst_scan:
+		}
+
+		//a hole would leave the ring pointing at nothing, leave it unanimated
+		for (j = 0; j < max; j++)
+		{
+			if (anims[j] < 0)
+			{
+				max = 0;
+				break;
+			}
+		}
+
+		for (j = 0; j < altmax; j++)
+		{
+			if (alts[j] < 0)
+			{
+				altmax = 0;
+				break;
+			}
+		}
+
+		for (j = 0; j < max; j++)
+		{
+			map->textures[anims[j]].anim_total = max * QANIM_CYCLE;
+			map->textures[anims[j]].anim_min   = j * QANIM_CYCLE;
+			map->textures[anims[j]].anim_max   = (j + 1) * QANIM_CYCLE;
+			map->textures[anims[j]].anim_next  = anims[(j + 1) % max];
+			if (altmax)
+				map->textures[anims[j]].alt_anims = alts[0];
+		}
+
+		for (j = 0; j < altmax; j++)
+		{
+			map->textures[alts[j]].anim_total = altmax * QANIM_CYCLE;
+			map->textures[alts[j]].anim_min   = j * QANIM_CYCLE;
+			map->textures[alts[j]].anim_max   = (j + 1) * QANIM_CYCLE;
+			map->textures[alts[j]].anim_next  = alts[(j + 1) % altmax];
+			if (max)
+				map->textures[alts[j]].alt_anims = anims[0];
+		}
+
+qst_next:
+	}
+}
+
+U0 QBSPLoadTextures(CQMap *map, U8 *lump, I64 lump_len)
+{//miptex lump: count, offset table (-1 missing), then 40 byte headers each
+ //followed by four 8bpp mip levels. texel pointers borrow the map buffer
+	CQTexture	*t;
+	U8			*p;
+	I64			 count;
+	I64			 ofs;
+	I64			 i;
+	I64			 j;
+
+	map->textures     = NULL;
+	map->num_textures = 0;
+
+	if (lump_len < 4)
+		return;
+
+	count = QRdI32(lump);
+	if (count <= 0 || 4 + count * 4 > lump_len)
+		return;
+
+	map->textures     = CAlloc(count * sizeof(CQTexture));
+	map->num_textures = count;
+
+	for (i = 0; i < count; i++)
+	{
+		t   = &map->textures[i];
+		ofs = QRdI32(lump + 4 + i * 4);
+
+		t->clamp = FALSE;		//world textures tile
+
+		t->anim_total = 0;
+		t->anim_min   = 0;
+		t->anim_max   = 0;
+		t->anim_next  = i;
+		t->alt_anims  = -1;
+
+		//-1 means the map references a texture it doesn't embed
+		if (ofs < 0 || ofs + 40 > lump_len)
+		{
+			t->name[0] = 0;
+			t->width   = 0;
+			t->height  = 0;
+			for (j = 0; j < 4; j++)
+				t->texels[j] = NULL;
+		}
+		else
+		{
+			p = lump + ofs;
+			QRdName(p, t->name, 16);
+			t->width  = QRdU32(p + 16);
+			t->height = QRdU32(p + 20);
+
+			//sky is a name prefix, nothing else marks it
+			t->is_sky = !StrNICompare(t->name, "sky", 3);
+
+			//leading '*' is the compiler's turb mark, same test R_DrawSurface
+			//uses for SURF_DRAWTURB
+			t->is_turb = ToBool(t->name[0] == '*');
+
+			//Ironwail/QS fence textures. the mask is the 8bpp index, so it
+			//survives an external truecolor replacement
+			t->is_fence = ToBool(t->name[0] == '{');
+
+			//qbsp/ericw tool textures. "trigger" is the one qbj3 leaves in
+			//the visible set; the rest are here because any of them showing
+			//up would look the same
+			t->is_tool = ToBool(!StrICompare(t->name, "trigger") ||
+								!StrICompare(t->name, "aaatrigger") ||
+								!StrICompare(t->name, "clip") ||
+								!StrICompare(t->name, "skip") ||
+								!StrICompare(t->name, "hint") ||
+								!StrICompare(t->name, "hintskip") ||
+								!StrICompare(t->name, "nodraw") ||
+								!StrICompare(t->name, "null") ||
+								!StrICompare(t->name, "origin"));
+
+			for (j = 0; j < 4; j++)
+			{
+				t->texels[j] = NULL;
+				if (t->width > 0 && t->height > 0)
+				{
+					I64 mo = QRdU32(p + 24 + j * 4);
+
+					//qbsp writes the four levels packed after the 40 byte
+					//header. an offset that is merely inside the LUMP can
+					//still point at the next texture's pixels, which is how
+					//a 16x16 'white' ends up sampling index 255 at mip 3
+					I64 want = 40;
+					I64 k;
+					I64 msz;
+
+					for (k = 0; k < j; k++)
+						want += (t->width >> k) * (t->height >> k);
+
+					msz = (t->width >> j) * (t->height >> j);
+
+					if (mo == want && msz > 0 && ofs + mo + msz <= lump_len)
+						t->texels[j] = p + mo;
+				}
+			}
+		}
+	}
+
+	QBSPFenceMips(map);
+	QBSPSequenceTextures(map);
+}
+
+U0 QBSPMakeHull0(CQMap *map)
+{//Mod_MakeHull0 - point sized clipping hull off the render tree
+ //
+ //hulls 1 and 2 are in the file, expanded for man and monster boxes. hull 0
+ //isn't: point traces (rockets, gibs, spikes) use the render tree, converted
+ //to clipnode form so one walker handles all of them
+ //
+ //one clipnode per render node, same plane, except a child pointing at a LEAF
+ //becomes that leaf's contents - the clipnode walker signals solidity through
+ //negative children, not by following a leaf index
+ //
+ //appended to the clipnode array, so only the child indices need rebasing
+	CQClipNode	*grown;
+	CQClipNode	*cn;
+	I64			 base = map->num_clipnodes;
+	I64			 total;
+	I64			 child;
+	I64			 leaf;
+	I64			 i;
+	I64			 j;
+
+	if (map->num_nodes < 1)
+		return;
+
+	total = base + map->num_nodes;
+	grown = CAlloc(total * sizeof(CQClipNode));
+
+	if (base > 0)
+		MemCopy(grown, map->clipnodes, base * sizeof(CQClipNode));
+
+	for (i = 0; i < map->num_nodes; i++)
+	{
+		cn            = &grown[base + i];
+		cn->plane_num = map->nodes[i].plane_num;
+
+		for (j = 0; j < 2; j++)
+		{
+			child = map->nodes[i].children[j];
+
+			if (child < 0)
+			{
+				//~(leaf index) in the render tree, emit the contents
+				leaf = -1 - child;
+
+				if (leaf >= 0 && leaf < map->num_leafs)
+					cn->children[j] = map->leafs[leaf].contents;
+				else
+					cn->children[j] = QCONTENTS_SOLID;
+			}
+			else
+				cn->children[j] = base + child;
+		}
+	}
+
+	if (map->clipnodes)
+		Free(map->clipnodes);
+
+	map->clipnodes     = grown;
+	map->num_clipnodes = total;
+
+	//rebase each model's hull 0 root into the appended range
+	for (i = 0; i < map->num_models; i++)
+	{
+		if (map->models[i].head_node[0] >= 0)
+			map->models[i].hull0_head = base + map->models[i].head_node[0];
+		else
+			map->models[i].hull0_head = -1;
+	}
+}
+
+U0 QBSPTryLit(CQMap *map, U8 *bsp_name)
+{//QLIT next to the bsp. software path is mono colormap, so RGB collapses to
+ //luminance and keeps the same lightofs indexing as the BSP lighting lump
+	U8	 lit_name[96];
+	U8	*lit;
+	U8	*mono;
+	U8	*rgb;
+	I64	 lit_size = 0;
+	I64	 mono_size;
+	I64	 i;
+	I64	 n;
+	I64	 r;
+	I64	 g;
+	I64	 b;
+	I64	 len;
+
+	if (!map || !bsp_name || map->lightdata_size <= 0)
+		return;
+
+	len = StrLen(bsp_name);
+	if (len < 5 || len >= 92)
+		return;
+	if (StrICompare(bsp_name + len - 4, ".bsp"))
+		return;
+
+	MemCopy(lit_name, bsp_name, len - 4);
+	lit_name[len - 4] = 0;
+	CatPrint(lit_name, ".lit");
+
+	lit = QPakLoad(lit_name, &lit_size);
+	if (!lit)
+		return;
+
+	mono_size = map->lightdata_size;
+	if (lit_size != 8 + mono_size * 3 ||
+		lit[0] != 'Q' || lit[1] != 'L' || lit[2] != 'I' || lit[3] != 'T' ||
+		QRdI32(lit + 4) != 1)
+	{
+		"QBSP: %s rejected (need QLIT v1, %d RGB bytes)\n",
+			lit_name, mono_size * 3;
+		Free(lit);
+		return;
+	}
+
+	mono = MAlloc(mono_size);
+	rgb  = MAlloc(mono_size * 3);
+	n = mono_size;
+	for (i = 0; i < n; i++)
+	{
+		r = lit[8 + i * 3];
+		g = lit[8 + i * 3 + 1];
+		b = lit[8 + i * 3 + 2];
+		mono[i] = (r + g + b) / 3;
+
+		//kept whole: styles and dlights still run on the mono plane, but the
+		//truecolor path needs the chroma the average throws away
+		rgb[i * 3]     = r;
+		rgb[i * 3 + 1] = g;
+		rgb[i * 3 + 2] = b;
+	}
+	Free(lit);
+
+	map->lightdata = mono;
+	map->lightdata_owned = TRUE;
+	map->litdata = rgb;
+	map->litdata_size = mono_size * 3;
+	"QBSP: lit %s (%d luxels, rgb kept)\n", lit_name, mono_size;
+}
+
+CQMap *QBSPLoad(U8 *name)
+{//pull a map out of the COM search path and decode every lump
+	CQMap		*map;
+	CQFace		*f;
+	CQLeaf		*l;
+	CQNode		*n;
+	CQTexInfo	*ti;
+	CQModel		*m;
+	U8			*d;
+	U8			*rec;
+	I64			 size = 0;
+	I64			 lump_offset[QLUMP_COUNT];
+	I64			 lump_length[QLUMP_COUNT];
+	I64			 i;
+	I64			 j;
+	I64			 c;
+	I64			 ver;
+	I64			 fmt;
+	I64			 edge_sz;
+	I64			 face_sz;
+	I64			 clip_sz;
+	I64			 node_sz;
+	I64			 leaf_sz;
+	I64			 mark_sz;
+
+	d = QPakLoad(name, &size);
+	if (!d)
+	{
+		"QBSP: %s not found\n", name;
+		return NULL;
+	}
+
+	if (size < 4 + QLUMP_COUNT * 8)
+	{
+		"QBSP: %s is too small to be a map\n", name;
+		Free(d);
+		return NULL;
+	}
+
+	ver = QRdI32(d);
+	if (ver == QBSP_VERSION)
+		fmt = QBSP_FMT_29;
+	else if (ver == QBSP2_2PSB)
+		fmt = QBSP_FMT_2PSB;
+	else if (ver == QBSP2_BSP2)
+		fmt = QBSP_FMT_BSP2;
+	else
+	{
+		"QBSP: %s is version %d (0x%X), expected 29 / BSP2 / 2PSB\n",
+			name, ver, ver;
+		Free(d);
+		return NULL;
+	}
+
+	if (fmt == QBSP_FMT_29)
+	{
+		edge_sz = 4;
+		face_sz = 20;
+		clip_sz = 8;
+		node_sz = 24;
+		leaf_sz = 28;
+		mark_sz = 2;
+	}
+	else if (fmt == QBSP_FMT_2PSB)
+	{
+		edge_sz = 8;
+		face_sz = 28;
+		clip_sz = 12;
+		node_sz = 32;
+		leaf_sz = 32;
+		mark_sz = 4;
+	}
+	else
+	{
+		edge_sz = 8;
+		face_sz = 28;
+		clip_sz = 12;
+		node_sz = 44;
+		leaf_sz = 44;
+		mark_sz = 4;
+	}
+
+	for (i = 0; i < QLUMP_COUNT; i++)
+	{
+		lump_offset[i] = QRdI32(d + 4 + i * 8);
+		lump_length[i] = QRdI32(d + 8 + i * 8);
+
+		if (lump_offset[i] < 0 || lump_length[i] < 0 ||
+			lump_offset[i] + lump_length[i] > size)
+		{
+			"QBSP: %s lump %d is out of range\n", name, i;
+			Free(d);
+			return NULL;
+		}
+	}
+
+	map           = CAlloc(sizeof(CQMap));
+	map->raw      = d;
+	map->raw_size = size;
+	map->lightdata_owned = FALSE;
+
+	//--- planes: normal[3], dist, type ---
+	c = lump_length[QLUMP_PLANES] / 20;
+	map->num_planes = c;
+	map->planes     = CAlloc(c * sizeof(CQPlane));
+	for (i = 0; i < c; i++)
+	{
+		rec = d + lump_offset[QLUMP_PLANES] + i * 20;
+		QRdVec(rec, map->planes[i].normal);
+		map->planes[i].dist = QRdF32(rec + 12);
+		map->planes[i].type = QRdI32(rec + 16);
+	}
+
+	//--- vertices ---
+	c = lump_length[QLUMP_VERTICES] / 12;
+	map->num_vertices = c;
+	map->vertices     = CAlloc(c * sizeof(CQVertex));
+	for (i = 0; i < c; i++)
+		QRdVec(d + lump_offset[QLUMP_VERTICES] + i * 12, map->vertices[i].pt);
+
+	//--- edges ---
+	c = lump_length[QLUMP_EDGES] / edge_sz;
+	map->num_edges = c;
+	map->edges     = CAlloc(c * sizeof(CQEdge));
+	for (i = 0; i < c; i++)
+	{
+		rec = d + lump_offset[QLUMP_EDGES] + i * edge_sz;
+		if (fmt == QBSP_FMT_29)
+		{
+			map->edges[i].v[0] = QRdU16(rec);
+			map->edges[i].v[1] = QRdU16(rec + 2);
+		}
+		else
+		{
+			map->edges[i].v[0] = QRdU32(rec);
+			map->edges[i].v[1] = QRdU32(rec + 4);
+		}
+	}
+
+	//--- surfedges: signed edge references ---
+	c = lump_length[QLUMP_SURFEDGES] / 4;
+	map->num_surfedges = c;
+	map->surfedges     = CAlloc(c * sizeof(I64));
+	for (i = 0; i < c; i++)
+		map->surfedges[i] = QRdI32(d + lump_offset[QLUMP_SURFEDGES] + i * 4);
+
+	//--- texinfo: two 4 component axes, then miptex + flags ---
+	c = lump_length[QLUMP_TEXINFO] / 40;
+	map->num_texinfo = c;
+	map->texinfo     = CAlloc(c * sizeof(CQTexInfo));
+	for (i = 0; i < c; i++)
+	{
+		rec = d + lump_offset[QLUMP_TEXINFO] + i * 40;
+		ti  = &map->texinfo[i];
+		for (j = 0; j < 8; j++)
+			ti->vecs[j] = QRdF32(rec + j * 4);
+		ti->miptex = QRdI32(rec + 32);
+		ti->flags  = QRdI32(rec + 36);
+	}
+
+	//--- nodes ---
+	c = lump_length[QLUMP_NODES] / node_sz;
+	map->num_nodes = c;
+	map->nodes     = CAlloc(c * sizeof(CQNode));
+	for (i = 0; i < c; i++)
+	{
+		rec = d + lump_offset[QLUMP_NODES] + i * node_sz;
+		n   = &map->nodes[i];
+		n->plane_num = QRdI32(rec);
+
+		if (fmt == QBSP_FMT_29)
+		{
+			n->children[0] = QRdI16(rec + 4);
+			n->children[1] = QRdI16(rec + 6);
+			for (j = 0; j < 3; j++)
+			{
+				n->mins[j] = ToF64(QRdI16(rec + 8 + j * 2));
+				n->maxs[j] = ToF64(QRdI16(rec + 14 + j * 2));
+			}
+			n->first_face = QRdU16(rec + 20);
+			n->num_faces  = QRdU16(rec + 22);
+		}
+		else if (fmt == QBSP_FMT_2PSB)
+		{
+			n->children[0] = QRdI32(rec + 4);
+			n->children[1] = QRdI32(rec + 8);
+			for (j = 0; j < 3; j++)
+			{
+				n->mins[j] = ToF64(QRdI16(rec + 12 + j * 2));
+				n->maxs[j] = ToF64(QRdI16(rec + 18 + j * 2));
+			}
+			n->first_face = QRdU32(rec + 24);
+			n->num_faces  = QRdU32(rec + 28);
+		}
+		else
+		{
+			n->children[0] = QRdI32(rec + 4);
+			n->children[1] = QRdI32(rec + 8);
+			for (j = 0; j < 3; j++)
+			{
+				n->mins[j] = QRdF32(rec + 12 + j * 4);
+				n->maxs[j] = QRdF32(rec + 24 + j * 4);
+			}
+			n->first_face = QRdU32(rec + 36);
+			n->num_faces  = QRdU32(rec + 40);
+		}
+	}
+
+	//--- clipnodes ---
+	c = lump_length[QLUMP_CLIPNODES] / clip_sz;
+	map->num_clipnodes = c;
+	map->clipnodes     = CAlloc(c * sizeof(CQClipNode));
+	for (i = 0; i < c; i++)
+	{
+		rec = d + lump_offset[QLUMP_CLIPNODES] + i * clip_sz;
+		map->clipnodes[i].plane_num = QRdI32(rec);
+		if (fmt == QBSP_FMT_29)
+		{
+			map->clipnodes[i].children[0] = QRdI16(rec + 4);
+			map->clipnodes[i].children[1] = QRdI16(rec + 6);
+		}
+		else
+		{
+			map->clipnodes[i].children[0] = QRdI32(rec + 4);
+			map->clipnodes[i].children[1] = QRdI32(rec + 8);
+		}
+	}
+
+	//--- leafs ---
+	c = lump_length[QLUMP_LEAFS] / leaf_sz;
+	map->num_leafs = c;
+	map->leafs     = CAlloc(c * sizeof(CQLeaf));
+	for (i = 0; i < c; i++)
+	{
+		rec = d + lump_offset[QLUMP_LEAFS] + i * leaf_sz;
+		l   = &map->leafs[i];
+		l->contents   = QRdI32(rec);
+		l->vis_offset = QRdI32(rec + 4);
+
+		if (fmt == QBSP_FMT_29)
+		{
+			for (j = 0; j < 3; j++)
+			{
+				l->mins[j] = ToF64(QRdI16(rec + 8 + j * 2));
+				l->maxs[j] = ToF64(QRdI16(rec + 14 + j * 2));
+			}
+			l->first_marksurface = QRdU16(rec + 20);
+			l->num_marksurfaces  = QRdU16(rec + 22);
+			for (j = 0; j < 4; j++)
+				l->ambient[j] = rec[24 + j];
+		}
+		else if (fmt == QBSP_FMT_2PSB)
+		{
+			for (j = 0; j < 3; j++)
+			{
+				l->mins[j] = ToF64(QRdI16(rec + 8 + j * 2));
+				l->maxs[j] = ToF64(QRdI16(rec + 14 + j * 2));
+			}
+			l->first_marksurface = QRdU32(rec + 20);
+			l->num_marksurfaces  = QRdU32(rec + 24);
+			for (j = 0; j < 4; j++)
+				l->ambient[j] = rec[28 + j];
+		}
+		else
+		{
+			for (j = 0; j < 3; j++)
+			{
+				l->mins[j] = QRdF32(rec + 8 + j * 4);
+				l->maxs[j] = QRdF32(rec + 20 + j * 4);
+			}
+			l->first_marksurface = QRdU32(rec + 32);
+			l->num_marksurfaces  = QRdU32(rec + 36);
+			for (j = 0; j < 4; j++)
+				l->ambient[j] = rec[40 + j];
+		}
+	}
+
+	//--- marksurfaces ---
+	c = lump_length[QLUMP_MARKSURFACES] / mark_sz;
+	map->num_marksurfaces = c;
+	map->marksurfaces     = CAlloc(c * sizeof(I64));
+	for (i = 0; i < c; i++)
+	{
+		rec = d + lump_offset[QLUMP_MARKSURFACES] + i * mark_sz;
+		if (fmt == QBSP_FMT_29)
+			map->marksurfaces[i] = QRdU16(rec);
+		else
+			map->marksurfaces[i] = QRdU32(rec);
+	}
+
+	//--- faces ---
+	c = lump_length[QLUMP_FACES] / face_sz;
+	map->num_faces = c;
+	map->faces     = CAlloc(c * sizeof(CQFace));
+	for (i = 0; i < c; i++)
+	{
+		rec = d + lump_offset[QLUMP_FACES] + i * face_sz;
+		f   = &map->faces[i];
+		if (fmt == QBSP_FMT_29)
+		{
+			f->plane_num  = QRdU16(rec);
+			f->side       = QRdU16(rec + 2);
+			f->first_edge = QRdI32(rec + 4);
+			f->num_edges  = QRdU16(rec + 8);
+			f->tex_info   = QRdU16(rec + 10);
+			for (j = 0; j < 4; j++)
+				f->styles[j] = rec[12 + j];
+			f->light_offset = QRdI32(rec + 16);
+		}
+		else
+		{
+			f->plane_num  = QRdI32(rec);
+			f->side       = QRdI32(rec + 4);
+			f->first_edge = QRdI32(rec + 8);
+			f->num_edges  = QRdI32(rec + 12);
+			f->tex_info   = QRdI32(rec + 16);
+			for (j = 0; j < 4; j++)
+				f->styles[j] = rec[20 + j];
+			f->light_offset = QRdI32(rec + 24);
+		}
+
+		f->dlight_frame = -1;
+		f->dlight_bits  = 0;
+	}
+
+	//--- models: 0 is worldspawn, the rest are doors, plats, etc ---
+	c = lump_length[QLUMP_MODELS] / 64;
+	map->num_models = c;
+	map->models     = CAlloc(c * sizeof(CQModel));
+	for (i = 0; i < c; i++)
+	{
+		rec = d + lump_offset[QLUMP_MODELS] + i * 64;
+		m   = &map->models[i];
+		QRdVec(rec, m->mins);
+		QRdVec(rec + 12, m->maxs);
+		QRdVec(rec + 24, m->origin);
+		for (j = 0; j < 4; j++)
+			m->head_node[j] = QRdI32(rec + 36 + j * 4);
+		m->vis_leafs  = QRdI32(rec + 52);
+		m->first_face = QRdI32(rec + 56);
+		m->num_faces  = QRdI32(rec + 60);
+	}
+
+	//--- borrowed byte lumps ---
+	map->visdata       = d + lump_offset[QLUMP_VISIBILITY];
+	map->visdata_size  = lump_length[QLUMP_VISIBILITY];
+	map->lightdata     = d + lump_offset[QLUMP_LIGHTING];
+	map->lightdata_size = lump_length[QLUMP_LIGHTING];
+	map->entities      = d + lump_offset[QLUMP_ENTITIES];
+	map->entities_size = lump_length[QLUMP_ENTITIES];
+
+	QBSPTryLit(map, name);
+
+	QBSPLoadTextures(map, d + lump_offset[QLUMP_MIPTEX], lump_length[QLUMP_MIPTEX]);
+
+	//needs both the loaded textures and the map name, so it follows them.
+	//
+	//NOT reset here: QBSPLoad also runs for every external brush model, and
+	//zeroing the totals on those wiped the world's count the moment a b_*.bsp
+	//loaded - the menu then read "none in gamedir" for textures that were in
+	//fact resident. QBSPFree owns the reset
+	QBSPExtTextures(map, name);
+	QBSPBuildRGBMips(map);
+
+	for (i = 0; i < map->num_faces; i++)
+		QBSPCalcSurfaceExtents(map, &map->faces[i]);
+
+	QBSPMakeHull0(map);
+
+	q_map_gen++;
+	return map;
+}
+
+U0 QBSPReport(CQMap *map)
+{//load time sanity dump
+	if (!map)
+	{
+		"QBSP: no map\n";
+		return;
+	}
+
+	"  planes       %6d\n", map->num_planes;
+	"  vertices     %6d\n", map->num_vertices;
+	"  edges        %6d\n", map->num_edges;
+	"  surfedges    %6d\n", map->num_surfedges;
+	"  nodes        %6d\n", map->num_nodes;
+	"  leafs        %6d\n", map->num_leafs;
+	"  texinfo      %6d\n", map->num_texinfo;
+	"  faces        %6d\n", map->num_faces;
+	"  marksurfaces %6d\n", map->num_marksurfaces;
+	"  models       %6d\n", map->num_models;
+	"  textures     %6d\n", map->num_textures;
+	"  visdata      %6d bytes\n", map->visdata_size;
+	"  lightdata    %6d bytes\n", map->lightdata_size;
+	"  entities     %6d bytes\n", map->entities_size;
+}

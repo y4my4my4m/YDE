@@ -1,0 +1,640 @@
+//TrFile.ZC - song construction and disk formats. Depends on TrDef, TrSmp,
+//TrMix, TrMod.
+//
+//YTK3 is a flat sequence of I64 fields and raw blocks in host byte order.
+//Patterns and samples are heap objects now, so the YTK2 habit of dumping one
+//struct is gone.
+
+#define TRF_MAGIC		'YTK3'
+//Version 2 widened the cell from 5 bytes to 6 (split volume column) and
+//added the frequency model fields. Version 3 added instruments, their
+//envelopes and macros, and the wavetable bank; before it, everything the
+//instrument layer holds was lost on save. Older versions still load.
+//Version 4 appends the per-channel arrangement. Earlier files load with every
+//position following the shared order list, which is what they meant.
+#define TRF_VERSION		5
+#define TRF_CELL_V1		5
+
+#define TR_CFG_DIR		"::/Home/Config"
+#define TR_CFG_PATH		"::/Home/Config/YTRACKER.CFG"
+#define TRF_SMPFIELDS	10		//I64 fields after name and length.
+//Fixed header: 8 I64s, the 24 byte title, the order list. A file shorter than
+//this plus both section counts cannot be read at all.
+#define TRF_HDR_BYTES	(13 * 8 + TR_TITLE_LEN + TR_ORDER_MAX)
+
+//YTracker 1's on-disk song, reproduced field for field so the same compiler
+//computes the same size. Notes were MIDI numbers, velocity 0..127.
+class CTrCellV2
+{
+	U8 note, vel, inst;
+};
+
+class CTrSongV2
+{
+	U32			magic;
+	I64			bpm;
+	I64			order_len;
+	U8			order[64];
+	CTrCellV2	pat[16 * 4 * 64];
+};
+
+U0 TrWrI64(U8 **p, I64 v)
+{
+	MemCopy(*p, &v, 8);
+	*p += 8;
+}
+
+U0 TrWrBlk(U8 **p, U8 *src, I64 n)
+{
+	MemCopy(*p, src, n);
+	*p += n;
+}
+
+I64 TrRdI64(U8 **p)
+{
+	I64 v;
+
+	MemCopy(&v, *p, 8);
+	*p += 8;
+
+	return v;
+}
+
+U0 TrRdBlk(U8 **p, U8 *dst, I64 n)
+{
+	MemCopy(dst, *p, n);
+	*p += n;
+}
+
+U0 TrDirOf(U8 *path, U8 *dst, I64 dst_sz)
+{//Directory part of a path, without the trailing slash. Names may contain
+//spaces, so split on the last slash rather than tokenising.
+	I64 i, cut = -1;
+
+	for (i = 0; path[i]; i++)
+		if (path[i] == '/')
+			cut = i;
+	if (cut < 0)
+		return;				//No directory component; leave dst alone.
+	if (cut == 0)
+		cut = 1;			//Root stays "/".
+	if (cut >= dst_sz)
+		cut = dst_sz - 1;
+	MemCopy(dst, path, cut);
+	dst[cut] = 0;
+}
+
+U0 TrConfigSave()
+{//Two paths, as hand-editable key=value text. Written after every successful
+//pick so the setting survives a crash, not only a clean exit.
+	U8 *buf;
+
+	if (!DriveIsWritable)
+		return;
+	DirMake(TR_CFG_DIR);
+	buf = MStrPrint("# YTracker settings - edit freely, reloaded on launch.\n"
+					"songdir %s\n"
+					"sampledir %s\n"
+					"gain %d\n"
+					"scopemode %d\n",
+					tr.dir_song, tr.dir_smp, tr.user_master,
+					tr.scope_mode);
+	FileWrite(TR_CFG_PATH, buf, StrLen(buf));
+	Free(buf);
+}
+
+U0 TrConfigLoad()
+{//Reuses the DE key=value parser; DE is compiled before this app launches and
+//the tracker already draws from de_theme.
+	I64	 size;
+	U8	*body = FileRead(TR_CFG_PATH, &size);
+
+	if (!body)
+		return;
+	DEConfigValStr(body, "songdir",   tr.dir_song, sizeof(tr.dir_song));
+	DEConfigValStr(body, "sampledir", tr.dir_smp,  sizeof(tr.dir_smp));
+	tr.user_master = ClampI64(DEConfigValI64(body, "gain", TR_MASTER_DEFAULT),
+							  8, 256);
+	tr.master = tr.user_master;
+	tr.scope_mode = ClampI64(DEConfigValI64(body, "scopemode",
+											TR_SCOPE_SPLIT),
+							 0, TR_SCOPE_MODES - 1);
+	Free(body);
+	if (!tr.dir_song[0])
+		StrCopy(tr.dir_song, "~");
+	if (!tr.dir_smp[0])
+		StrCopy(tr.dir_smp, "~");
+}
+
+U0 TrSongNew(I64 channels, I64 n_pat, I64 rows)
+{//Blank song with the built-in waveforms already in slots 1..6. TrSongFreeAll
+//clears the per-song playback state.
+	I64 p;
+
+	TrSongFreeAll;
+	MemSet(&tr_song, 0, sizeof(CTrSong));
+	tr_song.channels	= ClampI64(channels, 1, TR_MAX_CHANNELS);
+	tr_song.speed		= 6;
+	tr_song.bpm			= 125;
+	tr_song.order_len	= 1;
+	tr_song.restart		= 0;
+	tr_song.n_patterns	= ClampI64(n_pat, 1, TR_MAX_PATTERNS);
+	tr_song.n_instruments = TRI_COUNT - 1;
+	tr_song.global_vol	= 128;
+	tr_song.mix_vol		= 128;
+	tr_song.linear		= FALSE;
+	tr_song.clock		= TR_STEP_NUM;
+	StrCopy(tr_song.title, "untitled");
+	for (p = 0; p < tr_song.n_patterns; p++)
+		TrPatternAlloc(p, rows);
+	TrSynthBuild;
+	TrMasterDefault;
+	TrChanPanDefault(TRUE);
+	TrChansInit;
+}
+
+I64 TrSongSize()
+{//Byte count TrSongSave emits, plus slack.
+	I64 i, size;
+
+	size = 13 * 8 + TR_TITLE_LEN + TR_ORDER_MAX + 256;
+	//Instrument records and the wavetable bank are written whole.
+	size += 8 + TR_WAVE_SLOTS * sizeof(CTrWave) + 8;
+	//Arrangement: a count then three I64s per overridden position.
+	size += 8 + TR_ORDER_MAX * TR_MAX_CHANNELS * 24;
+	for (i = 1; i < TR_MAX_INSTRUMENTS; i++)
+		if (tr_inst[i])
+			size += 8 + sizeof(CTrInst);
+	size += 8;
+	for (i = 0; i < TR_MAX_PATTERNS; i++)
+		if (tr_pat[i])
+			size += 16 + tr_pat_rows[i] * tr_song.channels * sizeof(CTrCell);
+	size += 8;
+	for (i = 1; i < TR_MAX_SAMPLES; i++)
+		if (tr_smp[i].data)
+			size += 8 + TR_SMP_NAME + (TRF_SMPFIELDS + 1) * 8 +
+					tr_smp[i].len * sizeof(I16);
+
+	return size;
+}
+
+I64 TrNameOk(U8 *path)
+{//FAT32DirNew throws on a stem longer than 8.3 rather than returning an
+//error, so a name has to be screened before it reaches FileWrite. Reading an
+//existing long name is fine; only creating one faults.
+	I64	 stem = 0, ext = 0;
+	Bool dot = FALSE;
+	U8	*p = path, *name = path;
+
+	while (*p)
+	{
+		if (*p == '/' || *p == ':')
+		{
+			name = p + 1;
+			dot	 = FALSE;
+			stem = 0;
+			ext	 = 0;
+		}
+		else if (*p == '.')
+			dot = TRUE;
+		else if (dot)
+			ext++;
+		else
+			stem++;
+		p++;
+	}
+	if (name == path && !*name)
+		return FALSE;
+
+	return stem >= 1 && stem <= 8 && ext <= 3;
+}
+
+U8 *TrSongToBuf(I64 *_size)
+{//The whole song as a YTK3 image, or NULL. Undo snapshots ride on this: the
+//format already round-trips everything a song holds and is covered by the
+//file tests, so a second serialiser would only be a second thing to get
+//wrong.
+	I64	 i, j, n, size = TrSongSize();
+	U8	*buf, *p;
+
+	*_size = 0;
+	buf = MAlloc(size);
+	if (!buf)
+		return NULL;
+	p = buf;
+	TrWrI64(&p, TRF_MAGIC);
+	TrWrI64(&p, TRF_VERSION);
+	TrWrI64(&p, tr_song.channels);
+	TrWrI64(&p, tr_song.n_patterns);
+	TrWrI64(&p, tr_song.order_len);
+	TrWrI64(&p, tr_song.restart);
+	TrWrI64(&p, tr_song.speed);
+	TrWrI64(&p, tr_song.bpm);
+	TrWrI64(&p, tr_song.global_vol);
+	TrWrI64(&p, tr_song.mix_vol);
+	TrWrI64(&p, tr_song.linear);
+	TrWrI64(&p, tr_song.clock);
+	TrWrI64(&p, tr_song.n_instruments);
+	TrWrBlk(&p, tr_song.title, TR_TITLE_LEN);
+	TrWrBlk(&p, tr_song.order, TR_ORDER_MAX);
+
+	n = 0;
+	for (i = 0; i < TR_MAX_PATTERNS; i++)
+		if (tr_pat[i])
+			n++;
+	TrWrI64(&p, n);
+	for (i = 0; i < TR_MAX_PATTERNS; i++)
+		if (tr_pat[i])
+		{
+			TrWrI64(&p, i);
+			TrWrI64(&p, tr_pat_rows[i]);
+			TrWrBlk(&p, tr_pat[i],
+					tr_pat_rows[i] * tr_song.channels * sizeof(CTrCell));
+		}
+
+	//Instruments, then the wavetable bank. Both are version 3 additions.
+	n = 0;
+	for (i = 1; i < TR_MAX_INSTRUMENTS; i++)
+		if (tr_inst[i])
+			n++;
+	TrWrI64(&p, n);
+	for (i = 1; i < TR_MAX_INSTRUMENTS; i++)
+		if (tr_inst[i])
+		{
+			TrWrI64(&p, i);
+			TrWrBlk(&p, tr_inst[i], sizeof(CTrInst));
+		}
+	TrWrI64(&p, TR_WAVE_SLOTS);
+	TrWrBlk(&p, tr_wave, TR_WAVE_SLOTS * sizeof(CTrWave));
+
+	//Arrangement. Only positions that differ from the shared order are worth
+	//storing, so this is a sparse list rather than the whole grid.
+	n = 0;
+	for (i = 0; i < TR_ORDER_MAX; i++)
+		for (j = 0; j < TR_MAX_CHANNELS; j++)
+			if (tr_order_ch[i][j] != TR_ORDER_FOLLOW)
+				n++;
+	TrWrI64(&p, n);
+	for (i = 0; i < TR_ORDER_MAX; i++)
+		for (j = 0; j < TR_MAX_CHANNELS; j++)
+			if (tr_order_ch[i][j] != TR_ORDER_FOLLOW)
+			{
+				TrWrI64(&p, i);
+				TrWrI64(&p, j);
+				TrWrI64(&p, tr_order_ch[i][j]);
+			}
+
+	n = 0;
+	for (i = 1; i < TR_MAX_SAMPLES; i++)
+		if (tr_smp[i].data)
+			n++;
+	TrWrI64(&p, n);
+	for (i = 1; i < TR_MAX_SAMPLES; i++)
+		if (tr_smp[i].data)
+		{
+			TrWrI64(&p, i);
+			TrWrBlk(&p, tr_smp[i].name, TR_SMP_NAME);
+			TrWrI64(&p, tr_smp[i].len);
+			TrWrI64(&p, tr_smp[i].loop_start);
+			TrWrI64(&p, tr_smp[i].loop_len);
+			TrWrI64(&p, tr_smp[i].loop_type);
+			TrWrI64(&p, tr_smp[i].volume);
+			TrWrI64(&p, tr_smp[i].finetune);
+			TrWrI64(&p, tr_smp[i].rel_note);
+			TrWrI64(&p, tr_smp[i].pan);
+			TrWrI64(&p, tr_smp[i].synth);
+			TrWrI64(&p, tr_smp[i].step_mul);
+			TrWrBlk(&p, tr_smp[i].data, tr_smp[i].len * sizeof(I16));
+		}
+
+	*_size = p - buf;
+
+	return buf;
+}
+
+Bool TrSongSave(U8 *path)
+{
+	I64	 size;
+	U8	*buf;
+
+	if (!TrNameOk(path))
+		return FALSE;
+	buf = TrSongToBuf(&size);
+	if (!buf)
+		return FALSE;
+	FileWrite(path, buf, size);
+	Free(buf);
+
+	return TRUE;
+}
+
+Bool TrSongLoadYTK3(U8 *raw, I64 size)
+{//Destroys the current song before parsing; the caller must have sniffed the
+//magic first.
+	I64	 i, j, n, idx, rows, bytes, ver, cells, v, rec, head, tail;
+	I64	 slen, sls, sll, slt, svol, sft, srel, span, ssyn, smul;
+	U8	*p = raw, *lim = raw + size;
+	U8	*base, *mhole, *btail;
+	U8	 sname[32];
+	CTrInst *ip;
+
+	if (size < TRF_HDR_BYTES + 16 || TrRdI64(&p) != TRF_MAGIC)
+		return FALSE;
+	ver = TrRdI64(&p);
+	if (ver > TRF_VERSION)
+		return FALSE;
+
+	TrSongFreeAll;
+	MemSet(&tr_song, 0, sizeof(CTrSong));
+	tr_song.channels	= ClampI64(TrRdI64(&p), 1, TR_MAX_CHANNELS);
+	tr_song.n_patterns	= ClampI64(TrRdI64(&p), 1, TR_MAX_PATTERNS);
+	tr_song.order_len	= ClampI64(TrRdI64(&p), 0, TR_ORDER_MAX);
+	tr_song.restart		= ClampI64(TrRdI64(&p), 0, TR_ORDER_MAX - 1);
+	tr_song.speed		= ClampI64(TrRdI64(&p), 1, 31);
+	tr_song.bpm			= ClampI64(TrRdI64(&p), 32, 255);
+	if (ver >= 2)
+	{
+		tr_song.global_vol	= ClampI64(TrRdI64(&p), 0, 128);
+		tr_song.mix_vol		= ClampI64(TrRdI64(&p), 0, 128);
+		tr_song.linear		= TrRdI64(&p) != 0;
+		tr_song.clock		= TrRdI64(&p);
+		tr_song.n_instruments = ClampI64(TrRdI64(&p), 0, TR_MAX_INSTRUMENTS - 1);
+	}
+	else
+	{//Version 1 predates the frequency model; it was always Amiga MOD.
+		tr_song.global_vol	= 128;
+		tr_song.mix_vol		= 128;
+		tr_song.linear		= FALSE;
+		tr_song.n_instruments = TRI_COUNT - 1;
+	}
+	if (tr_song.clock < 1)
+		tr_song.clock = TR_STEP_NUM;
+	TrRdBlk(&p, tr_song.title, TR_TITLE_LEN);
+	tr_song.title[TR_TITLE_LEN - 1] = 0;
+	TrRdBlk(&p, tr_song.order, TR_ORDER_MAX);
+
+	n = TrRdI64(&p);
+	for (i = 0; i < n; i++)
+	{
+		if (p + 16 > lim)
+			return FALSE;
+		idx		= TrRdI64(&p);
+		rows	= ClampI64(TrRdI64(&p), 1, TR_MAX_ROWS);
+		cells	= rows * tr_song.channels;
+		if (ver >= 2)
+			bytes = cells * sizeof(CTrCell);
+		else
+			bytes = cells * TRF_CELL_V1;
+		if (p + bytes > lim || idx < 0 || idx >= TR_MAX_PATTERNS)
+			return FALSE;
+		if (!TrPatternAlloc(idx, rows))
+			p += bytes;
+		else if (ver >= 2)
+			TrRdBlk(&p, tr_pat[idx], bytes);
+		else
+			for (j = 0; j < cells; j++)
+			{//Version 1 packed note, inst, vol+1, eff, param.
+				tr_pat[idx][j].note		= p[0];
+				tr_pat[idx][j].inst		= p[1];
+				if (p[2])
+				{
+					tr_pat[idx][j].volcmd	= TRV_SET;
+					tr_pat[idx][j].volparam	= ClampI64(p[2] - 1, 0, 64);
+				}
+				tr_pat[idx][j].eff		= p[3];
+				tr_pat[idx][j].param	= p[4];
+				p += TRF_CELL_V1;
+			}
+	}
+
+	//Version 3 stores the instrument layer and the wavetable bank ahead of
+	//the samples. Earlier files have neither; their instruments are the
+	//identity mapping onto samples, which is what a NULL record already means.
+	if (ver >= 3)
+	{
+		if (p + 8 > lim)
+			return FALSE;
+		n = TrRdI64(&p);
+		//Version 5 added TR_MACRO_HIPITCH, the last entry of macro[]. An
+		//older record is this one with that entry cut out: the bytes before
+		//it and the bytes after it are both unchanged, so it reads as two
+		//runs with a zeroed gap between them. rec is what the file holds.
+		rec = sizeof(CTrInst);
+		if (ver < 5)
+			rec -= sizeof(CTrMacro);
+		for (i = 0; i < n; i++)
+		{
+			if (p + 8 + rec > lim)
+				return FALSE;
+			idx = TrRdI64(&p);
+			if (idx < 1 || idx >= TR_MAX_INSTRUMENTS)
+				return FALSE;
+			if (!TrInstAlloc(idx))
+				p += rec;
+			else if (ver >= 5)
+				TrRdBlk(&p, tr_inst[idx], rec);
+			else
+			{
+				ip		= tr_inst[idx];
+				base	= ip;
+				mhole	= &ip->macro[TR_MACRO_COUNT - 1];
+				btail	= &ip->bank;
+				head	= mhole - base;
+				tail	= sizeof(CTrInst) - (btail - base);
+				TrRdBlk(&p, ip, head);
+				MemSet(&ip->macro[TR_MACRO_COUNT - 1], 0, sizeof(CTrMacro));
+				TrRdBlk(&p, &ip->bank, tail);
+			}
+		}
+		if (p + 8 > lim)
+			return FALSE;
+		n = TrRdI64(&p);
+		if (n < 0 || n > TR_WAVE_SLOTS)
+			return FALSE;
+		if (p + n * sizeof(CTrWave) > lim)
+			return FALSE;
+		TrRdBlk(&p, tr_wave, n * sizeof(CTrWave));
+	}
+	//Arrangement, version 4. A version 3 file has none, and every position
+	//following the shared order is exactly what it meant.
+	if (ver >= 4)
+	{
+		if (p + 8 > lim)
+			return FALSE;
+		n = TrRdI64(&p);
+		if (n < 0 || n > TR_ORDER_MAX * TR_MAX_CHANNELS)
+			return FALSE;
+		if (p + n * 24 > lim)
+			return FALSE;
+		for (i = 0; i < n; i++)
+		{
+			idx = TrRdI64(&p);
+			j	= TrRdI64(&p);
+			v	= TrRdI64(&p);
+			if (0 <= idx < TR_ORDER_MAX && 0 <= j < TR_MAX_CHANNELS &&
+				0 <= v < TR_MAX_PATTERNS)
+				tr_order_ch[idx][j] = v;
+		}
+	}
+
+	if (p + 8 > lim)
+		return FALSE;
+	n = TrRdI64(&p);
+	for (i = 0; i < n; i++)
+	{
+		if (p + 8 > lim)
+			return FALSE;
+		idx = TrRdI64(&p);
+		if (idx < 1 || idx >= TR_MAX_SAMPLES)
+			return FALSE;
+		if (p + TR_SMP_NAME + (TRF_SMPFIELDS + 1) * 8 > lim)
+			return FALSE;
+		TrRdBlk(&p, sname, TR_SMP_NAME);
+		sname[TR_SMP_NAME - 1] = 0;
+		slen		= TrRdI64(&p);
+		sls			= TrRdI64(&p);
+		sll			= TrRdI64(&p);
+		slt			= TrRdI64(&p);
+		svol		= TrRdI64(&p);
+		sft			= TrRdI64(&p);
+		srel		= TrRdI64(&p);
+		span		= TrRdI64(&p);
+		ssyn		= TrRdI64(&p);
+		smul		= TrRdI64(&p);
+		bytes = slen * sizeof(I16);
+		if (slen < 0 || p + bytes > lim)
+			return FALSE;
+		//TrSampleAlloc clears the slot, so the header lands afterwards.
+		if (slen > 0 && TrSampleAlloc(idx, slen))
+			TrRdBlk(&p, tr_smp[idx].data, bytes);
+		else
+			p += bytes;
+		MemCopy(tr_smp[idx].name, sname, TR_SMP_NAME);
+		tr_smp[idx].loop_start	= ClampI64(sls, 0, slen);
+		tr_smp[idx].loop_len	= ClampI64(sll, 0, slen - tr_smp[idx].loop_start);
+		tr_smp[idx].loop_type	= ClampI64(slt, 0, TR_LOOP_PINGPONG);
+		tr_smp[idx].volume		= ClampI64(svol, 0, 64);
+		tr_smp[idx].finetune	= ClampI64(sft, -8, 7);
+		tr_smp[idx].rel_note	= ClampI64(srel, -96, 96);
+		tr_smp[idx].pan			= ClampI64(span, 0, 255);
+		tr_smp[idx].synth		= ClampI64(ssyn, 0, TRI_COUNT - 1);
+		tr_smp[idx].step_mul	= smul;
+		if (smul < 1)
+			tr_smp[idx].step_mul = 65536;
+		TrSampleGuard(&tr_smp[idx]);
+	}
+
+	//Bank slots point at samples the file just replaced, so re-render the
+	//wavetables into them rather than trusting whatever landed there.
+	if (ver >= 3)
+		for (i = 0; i < TR_WAVE_SLOTS; i++)
+			if (tr_wave[i].used)
+				TrWaveRender(i);
+
+	TrMasterDefault;
+	TrChansInit;
+
+	return TRUE;
+}
+
+Bool TrSongLoadYTK2(U8 *raw, I64 size)
+{//YTracker 1 songs: 4 channels, 16 patterns, 64 rows, synth voices only.
+	CTrSongV2	*s;
+	CTrCellV2	*oc;
+	CTrCell		*nc;
+	I64			 p, ch, row, i;
+
+	if (size != sizeof(CTrSongV2))
+		return FALSE;
+	s = raw;
+	if (s->magic != 'YTK2')
+		return FALSE;
+
+	TrSongNew(4, 16, 64);
+	tr_song.bpm			= ClampI64(s->bpm, 32, 255);
+	tr_song.speed		= 6;
+	tr_song.order_len	= ClampI64(s->order_len, 0, 64);
+	StrCopy(tr_song.title, "YTK2 import");
+	for (i = 0; i < tr_song.order_len; i++)
+		tr_song.order[i] = s->order[i] & 0x0F;
+	if (!tr_song.order_len)
+		tr_song.order_len = 1;
+
+	for (p = 0; p < 16; p++)
+		for (ch = 0; ch < 4; ch++)
+			for (row = 0; row < 64; row++)
+			{
+				oc = &s->pat[(p * 4 + ch) * 64 + row];
+				nc = TrCell(p, ch, row);
+				if (nc && oc->note)
+				{//Old notes were MIDI numbers; note 1 here is C-0 = MIDI 12.
+					nc->note = ClampI64(oc->note - 11, 1, TR_NOTES);
+					nc->inst = oc->inst;
+					nc->volcmd  = TRV_SET;
+					nc->volparam = ClampI64(oc->vel * 64 / 127, 0, 64);
+				}
+			}
+
+	return TRUE;
+}
+
+I64 TrLoadFile(U8 *path)
+{//Sniff and load by CONTENT, never by extension. 1 = YTK3, 2 = MOD, 3 = YTK2,
+//4 = XM, 5 = IT, 6 = S3M, 7 = FTM, 0 = read but unrecognised, -1 = could not
+//be read.
+//The two failures are reported apart: a name the file layer will not open
+//looks nothing like an unsupported format, and conflating them sends you
+//hunting the wrong problem.
+	I64	 size = 0, ch, n_smp, hdr, kind = 0;
+	U8	*raw = FileRead(path, &size);
+
+	if (!raw)
+		return -1;
+	if (size < 1)
+	{
+		Free(raw);
+		return -1;
+	}
+	if (size >= 8 && !MemCompare(raw, "YTK3", 4))
+	{
+		if (TrSongLoadYTK3(raw, size))
+			kind = 1;
+	}
+	//Magic-bearing formats first. The 15-sample MOD variant has no magic at
+	//all and is accepted on a size heuristic, so it must be tried last or it
+	//can claim another format's file.
+	if (!kind && TrXmProbe(raw, size) > 0 && TrXmLoad(raw, size))
+		kind = 4;
+	if (!kind && TrItProbe(raw, size) > 0 && TrItLoad(raw, size))
+		kind = 5;
+	if (!kind && TrS3mProbe(raw, size) > 0 && TrS3mLoad(raw, size))
+		kind = 6;
+	if (!kind && TrFtmProbe(raw, size) > 0 && TrFtmLoad(raw, size))
+		kind = 7;
+	if (!kind)
+	{
+		ch = TrModProbe(raw, size, &n_smp, &hdr);
+		if (ch > 0 && TrModLoad(raw, size))
+			kind = 2;
+	}
+	if (!kind && TrSongLoadYTK2(raw, size))
+		kind = 3;
+	Free(raw);
+
+	return kind;
+}
+
+I64 TrSampleLoadFile(I64 slot, U8 *path)
+{//WAV into a bank slot. Returns frames, 0 on reject.
+	I64	 size = 0, n;
+	U8	*raw = FileRead(path, &size);
+
+	if (!raw)
+		return 0;
+	n = TrSampleImportWav(slot, raw, size);
+	if (n)
+		TrSampleNameSet(slot, path);
+	Free(raw);
+
+	return n;
+}

@@ -1,901 +1,5 @@
-//YKD Desktop Environment - phase 4.
-//
-//Wallpaper: truecolor DC blotted behind all windows by hanging a draw_it on
-//sys_winmgr_task. GrBlot() honors gr.win_z_buf, so the image only lands on
-//8x8 cells not covered by any window - base OS windows keep working untouched.
-//
-//Taskbar: a real CCtrl on sys_winmgr_task. The WinMgr dispatches clicks on
-//ctrls BEFORE window focus handling, so taskbar clicks are swallowed natively
-//- no passthrough to windows. Drawing happens in the ctrl's draw_it every
-//frame (z-clipped), so the clock and focus highlight are always fresh.
-//
-//Start menu: the YDE chip spawns a task that paints its own panel - see
-//StartMenu.ZC, reached through the de_menu_fp hook so the include order stays
-//one-way.
-//
-//Window policy: gr.reserved_bottom_rows makes WinVert() keep bordered windows
-//above the bar (borderless/fullscreen apps may still cover it, intentionally).
-//The DE task clamps windows that set their rows directly.
-//
-//DEStart; / DEStop; toggle the whole thing at runtime.
-
-#define DE_SAVER_MINS_DEFAULT	15	//Screen saver: on out of the box, 15 min idle.
-
-#define DE_BAR_ROWS			3
-#define DE_BAR_HEIGHT		(DE_BAR_ROWS * FONT_HEIGHT)
-#define DE_BAR_TASKS_MAX	32
-#define DE_BTTN_WIDTH		136
-#define DE_CHIP_WIDTH		56
-
-class CDEGlobals
-{
-	CDC		*wallpaper;
-	CCtrl	*bar, *term_bttn;
-	CTask	*task, *menu_task;
-	U0		(*old_wall_paper)(CTask *task);
-	CTask	*bar_tasks[DE_BAR_TASKS_MAX];
-	I64		 bar_x0[DE_BAR_TASKS_MAX], bar_x1[DE_BAR_TASKS_MAX], bar_count;
-	I64		 chip_x0, chip_x1;
-	I64		 saved_vol;					//Volume before mute, for the toggle.
-	Bool	 muted;						//Master mute state (widget + media key).
-	I64		*media_vol, *media_mute;	//Kernel counters, or NULL on old kernels.
-	I64		 vol_icon_x0, vol_icon_x1;	//Taskbar volume widget hit zones.
-	I64		 vol_bar_x0, vol_bar_x1;
-	I64		 clock_x0, clock_x1;		//Clock hit zone (click -> calendar).
-	I64		 net_x0, net_x1;			//Network tray icon hit zone.
-	F64		 cal_last;					//Debounce for clock -> calendar spawns.
-	CTask	*ctx_task, *ctx_target;		//Right-click menu task + the task it acts on.
-	CTask	*net_task;					//One-shot task that brings the net stack up.
-	CTask	*min_tasks[DE_BAR_TASKS_MAX];//Windows minimized from the taskbar.
-	I64		 min_count;
-	U8		 wallpaper_path[256];		//Current wallpaper, remembered for config.
-	Bool	 on, net_up, glass, cfg_dirty;
-	Bool	 saver_on;					//Screen saver (the YDE demo) enabled.
-	I64		 saver_mins;				//Idle minutes before it kicks in.
-	Bool	 menu_close;				//Ask the start menu to close itself.
-	F64		 menu_last;					//When it last closed, to debounce the chip.
-} de;
-
-//StartMenu.ZC installs the drawn launcher panel here; DE.ZC needs no
-//compile-time knowledge of it. NULL until that file compiles.
-U0 (*de_menu_fp)(U8 *data) = NULL;
-
-#define DE_CFG_DIR		"::/Home/Config"
-#define DE_CFG_PATH		"::/Home/Config/YDE.CFG"
-
-U0 DEConfigSave()
-{//Persist the tweakable desktop settings as a plain key=value text file the
-//user can hand-edit. Called after any settings change.
-	U8 *buf;
-
-	if (!de.on || !DriveIsWritable)
-		return;
-	DirMake(DE_CFG_DIR);
-	buf = MStrPrint(
-		"# YDE desktop settings - edit freely, reloaded on boot.\n"
-		"hue %d\n"
-		"chrome %d\n"
-		"flatmenu %d\n"
-		"glass %d\n"
-		"syslog %d\n"
-		"volume %d\n"
-		"muted %d\n"
-		"saver %d\n"
-		"saverm %d\n"
-		"wallpaper %s\n",
-		de_theme.hue,
-		gr.tc_chrome != 0,
-		gr.tc_flat_menu != 0,
-		de.glass != 0,
-		Bt(&sys_task->display_flags, DISPLAYf_SHOW) != 0,
-		ac97.volume,
-		de.muted != 0,
-		de.saver_on != 0,
-		de.saver_mins,
-		de.wallpaper_path);
-	FileWrite(DE_CFG_PATH, buf, StrLen(buf));
-	Free(buf);
-}
-
-I64 DEConfigValI64(U8 *body, U8 *key, I64 default)
-{//Read "key <int>" from the config text; default if missing.
-	U8	*p = StrFind(key, body);
-	I64	 klen = StrLen(key);
-
-	while (p)
-	{//Match only at line start followed by whitespace (avoid substring hits).
-		if ((p == body || p[-1] == '\n') && (p[klen] == ' ' || p[klen] == '\t'))
-			return Str2I64(p + klen + 1);
-		p = StrFind(key, p + 1);
-	}
-
-	return default;
-}
-
-U0 DEConfigValStr(U8 *body, U8 *key, U8 *out, I64 out_sz)
-{//Read "key <rest-of-line>" into out; out untouched if missing.
-	U8	*p = StrFind(key, body), *e;
-	I64	 klen = StrLen(key), n;
-
-	while (p)
-	{
-		if ((p == body || p[-1] == '\n') && (p[klen] == ' ' || p[klen] == '\t'))
-		{
-			p += klen + 1;
-			e = p;
-			while (*e && *e != '\r' && *e != '\n')
-				e++;
-			n = e - p;
-			if (n > out_sz - 1)
-				n = out_sz - 1;
-			MemCopy(out, p, n);
-			out[n] = 0;
-			return;
-		}
-		p = StrFind(key, p + 1);
-	}
-}
-
-CDC *DEDCScaleNew(CDC *src, I64 w, I64 h, CTask *mem_task=NULL)
-{//Nearest-neighbor scale of a truecolor DC into a new DC. mem_task matters:
-//DCs made from short-lived app tasks die with them.
-	CDC *res = DCNew(w, h, mem_task);
-	I64  x, y, sy;
-	U32 *dst, *srow;
-
-	for (y = 0; y < h; y++)
-	{
-		sy   = y * src->height / h;
-		srow = src->body + sy * src->width_internal;
-		dst  = res->body + y  * res->width_internal;
-		for (x = 0; x < w; x++)
-			dst[x] = srow[x * src->width / w];
-	}
-	res->flags |= DCF_NO_TRANSPARENTS;
-
-	return res;
-}
-
-U0 DEWallpaperDraw(CTask *task, CDC *dc)
-{//Hung on sys_winmgr_task->draw_it. dc is a z-buffered screen alias, so the
-//blot self-clips to the uncovered desktop background.
-	if (de.wallpaper)
-		GrBlot(dc, 0, 0, de.wallpaper);
-}
-
-U0 DEWallpaperLoad(U8 *filename)
-{//PNG wallpaper, scaled to screen if needed. Procedural gradient fallback.
-	CDC *png = PNGRead(filename), *old = de.wallpaper;
-	I64  x, y, r, g, b;
-	U32 *dst;
-
-	if (filename && filename != de.wallpaper_path)
-	{
-		StrCopy(de.wallpaper_path, filename);
-		de.wallpaper_path[255] = 0;
-	}
-
-	if (png)
-	{//Always route through the scaler (1:1 = copy) so the final DC lives on
-	//the SYSTEM heap - callers may be short-lived app tasks (Settings!), and
-	//the wallpaper must outlive them or it turns to garbage.
-		de.wallpaper = DEDCScaleNew(png, GR_WIDTH, GR_HEIGHT, sys_task);
-		DCDel(png);
-	}
-	else
-	{//No PNG found: vertical navy->violet gradient.
-		de.wallpaper = DCNew(GR_WIDTH, GR_HEIGHT, sys_task);
-		for (y = 0; y < GR_HEIGHT; y++)
-		{
-			r = 12 + 30 * y / GR_HEIGHT;
-			g = 10 + 14 * y / GR_HEIGHT;
-			b = 34 + 72 * y / GR_HEIGHT;
-			dst = de.wallpaper->body + y * de.wallpaper->width_internal;
-			for (x = 0; x < GR_WIDTH; x++)
-				dst[x] = r << 16 | g << 8 | b;
-		}
-		de.wallpaper->flags |= DCF_NO_TRANSPARENTS;
-	}
-	de.wallpaper->flags |= DCF_NO_TRANSPARENTS;
-	gr.translucent_bg = de.wallpaper; //Blend base for translucent windows.
-	if (old)
-	{
-		Sleep(50); //Let any in-flight compositor frame drop the old pointer.
-		DCDel(old);
-	}
-}
-
-Bool DEConfigLoad()
-{//Apply saved settings from DE_CFG_PATH. Returns TRUE if a config existed.
-//Called near the end of DEStart, so it overrides the built-in defaults.
-	I64	 size, hue, vol;
-	U8	*body = FileRead(DE_CFG_PATH, &size);
-	U8	 wall[256];
-
-	if (!body)
-		return FALSE;
-
-	hue = DEConfigValI64(body, "hue", de_theme.hue);
-	DEThemeAccentSet(hue);
-
-	if (DEConfigValI64(body, "chrome", 1))
-		GuiChromeTrueColor(de_theme.accent, ColorRGB(0x0A, 0x10, 0x1A), de_theme.accent_dim);
-	else
-		GuiChromePalette;
-
-	GuiMenuBarModern(DEConfigValI64(body, "flatmenu", 0) != 0);
-
-	de.glass = DEConfigValI64(body, "glass", 0) != 0;
-	if (!de.glass)
-		WinOpaque;
-
-	if (DEConfigValI64(body, "syslog", 0))
-		LBts(&sys_task->display_flags, DISPLAYf_SHOW);
-	else
-		LBtr(&sys_task->display_flags, DISPLAYf_SHOW);
-
-	vol = DEConfigValI64(body, "volume", ac97.volume);
-	de.muted = DEConfigValI64(body, "muted", 0) != 0;
-	if (de.muted)
-	{
-		de.saved_vol = vol;
-		AC97MasterVolumeSet(0);
-	}
-	else
-		AC97MasterVolumeSet(vol);
-
-	//Saver defaults match DEStart's: on, 15 minutes. A config written before
-	//those keys existed therefore inherits the new default rather than "off".
-	de.saver_mins = DEConfigValI64(body, "saverm", DE_SAVER_MINS_DEFAULT);
-	if (de.saver_mins < 1)
-		de.saver_mins = 1;
-	de.saver_on = DEConfigValI64(body, "saver", 1) != 0;
-	if (de.saver_on)
-		YDESaverOn(de.saver_mins * 60);	//re-arm the watcher on boot
-
-	wall[0] = 0;
-	DEConfigValStr(body, "wallpaper", wall, sizeof(wall));
-	if (wall[0] && StrCompare(wall, de.wallpaper_path))
-		DEWallpaperLoad(wall);
-
-	Free(body);
-	return TRUE;
-}
-
-extern U0 DEStop(); //Fwd ref for the launcher menu; body at end of file.
-
-// U0 DEMenuTask()
-// {//Launcher menu, runs in its own task so the WinMgr never blocks.
-// 	I64 i = PopUpPickList(
-// 			"New Terminal\0"
-// 			"Web Browser\0"
-// 			"IRC Chat\0"
-// 			"Email (ZMail)\0"
-// 			"Harmony\0"
-// 			"Telnet / BBS\0"
-// 			"ZealAmp\0"
-// 			"YTracker\0"
-// 			"Quake\0"
-// 			"Calculator\0"
-// 			"Calendar\0"
-// 			"Image Viewer\0"
-// 			"Settings\0"
-// 			"File Manager\0"
-// 			"Task Manager\0"
-// 			"PNG Demo\0"
-// 			"TrueColor Demo\0"
-// 			"Demo: Divine Intellect\0"
-// 			"About YDE\0"
-// 			"Reboot\0"
-// 			"Stop DE\0");
-
-// 	switch (i)
-// 	{
-// 		case 0:
-// 			User;
-// 			break;
-// 		case 1:
-// 			if (!de.net_up)
-// 			{//Compile net + TLS + Zinc into the System task once, system-wide.
-// 				Sys("ExeFile(\"::/DE/BrowserBoot\");");
-// 				de.net_up = TRUE;
-// 			}
-// 			User("ZincV3;\n"); //the unified v3 layout engine (LayoutV3.ZC)
-// 			break;
-// 		case 2:
-// 			if (!de.net_up)
-// 			{//IRC needs the same system-wide net stack as the browser.
-// 				Sys("ExeFile(\"::/DE/BrowserBoot\");");
-// 				de.net_up = TRUE;
-// 			}
-// 			User("ExeFile(\"::/DE/yIRC\");\n");
-// 			break;
-// 		case 3:
-// 			if (!de.net_up)
-// 			{//ZMail needs the same system-wide net stack (TCP + TLS).
-// 				Sys("ExeFile(\"::/DE/BrowserBoot\");");
-// 				de.net_up = TRUE;
-// 			}
-// 			User("ExeFile(\"::/DE/ZMail\");\n");
-// 			break;
-// 		case 4:
-// 			if (!de.net_up)
-// 			{//Harmony needs the net stack (TLS + HTTP + WebSocket).
-// 				Sys("ExeFile(\"::/DE/BrowserBoot\");");
-// 				de.net_up = TRUE;
-// 			}
-// 			User("Cd(\"::/Apps/yHarmony\");;ExeFile(\"Run\");\n");
-// 			break;
-// 		case 5:
-// 			if (!de.net_up)
-// 			{//Telnet needs the same system-wide net stack.
-// 				Sys("ExeFile(\"::/DE/BrowserBoot\");");
-// 				de.net_up = TRUE;
-// 			}
-// 			User("ExeFile(\"::/Home/Net/Programs/Telnet/Telnet\");\n");
-// 			break;
-// 		case 6:
-// 			User("Cd(\"::/Apps/ZealAmp\");;ExeFile(\"Run\");\n");
-// 			break;
-// 		case 7:
-// 			User("Cd(\"::/Apps/Tracker\");;ExeFile(\"Run\");\n");
-// 			break;
-// 		case 8:
-// 			User("Cd(\"::/Apps/Quake\");;ExeFile(\"Run\");\n");
-// 			break;
-// 		case 9:
-// 			User("DECalc;\n");
-// 			break;
-// 		case 10:
-// 			User("DECalendar;\n");
-// 			break;
-// 		case 11:
-// 			User("DEViewImage;\n");
-// 			break;
-// 		case 12:
-// 			User("DESettings;\n");
-// 			break;
-// 		case 13:
-// 			User("FileMgr;\n");
-// 			break;
-// 		case 14:
-// 			User("TaskRep;\n");
-// 			break;
-// 		case 15:
-// 			User("PNGDemo;\n");
-// 			break;
-// 		case 16:
-// 			User("ExeFile(\"::/Demo/Graphics/TrueColor/TrueColor\");\n");
-// 			break;
-// 		case 17:
-// 			YDEDemo; //vector intro; any key or mouse move exits
-// 			break;
-// 		case 18:
-// 			PopUpOk("\n     YDE\n\n"
-// 					"The Y Desktop Environment,\n"
-// 					"on a heavily modified ZealOS:\n"
-// 					"1280x720 boot, truecolor,\n"
-// 					"native PNG + AC97 + MP3,\n"
-// 					"TLS 1.3 web browser.\n"
-// 					"No ELFs were harmed.\n\n");
-// 			break;
-// 		case 19:
-// 			if (PopUpNoYes("Reboot?"))
-// 				Reboot;
-// 			break;
-// 		case 20:
-// 			DEStop;
-// 			break;
-// 	}
-// 	de.menu_task = NULL;
-// }
-
-U8 *DEWeekday(I64 d)
-{//0 = Sun .. 6 = Sat.
-	switch (d)
-	{
-		case 1:  return "Mon";
-		case 2:  return "Tue";
-		case 3:  return "Wed";
-		case 4:  return "Thu";
-		case 5:  return "Fri";
-		case 6:  return "Sat";
-		default: return "Sun";
-	}
-}
-
-U8 *DEMonthName(I64 m)
-{//m = 1 .. 12.
-	switch (m)
-	{
-		case 2:  return "Feb";
-		case 3:  return "Mar";
-		case 4:  return "Apr";
-		case 5:  return "May";
-		case 6:  return "Jun";
-		case 7:  return "Jul";
-		case 8:  return "Aug";
-		case 9:  return "Sep";
-		case 10: return "Oct";
-		case 11: return "Nov";
-		case 12: return "Dec";
-		default: return "Jan";
-	}
-}
-
-CColorROPU32 DEColorLerp(CColorROPU32 a, CColorROPU32 b, I64 t, I64 d)
-{//Blend a -> b by the fraction t/d, on the low 24 RGB bits. Returns a fresh pen.
-	I64 ar = a >> 16 & 0xFF, ag = a >> 8 & 0xFF, ab = a & 0xFF;
-	I64 br = b >> 16 & 0xFF, bg = b >> 8 & 0xFF, bb = b & 0xFF;
-
-	if (d < 1)
-		d = 1;
-	return ColorRGB((ar * (d - t) + br * t) / d,
-					(ag * (d - t) + bg * t) / d,
-					(ab * (d - t) + bb * t) / d);
-}
-
-Bool DEIsMinimized(CTask *t)
-{//TRUE if t was minimized from the taskbar.
-	I64 i;
-
-	for (i = 0; i < de.min_count; i++)
-		if (de.min_tasks[i] == t)
-			return TRUE;
-
-	return FALSE;
-}
-
-U0 DEMinDrop(CTask *t)
-{//Remove t from the minimized set, preserving order.
-	I64 i, j = 0;
-
-	for (i = 0; i < de.min_count; i++)
-		if (de.min_tasks[i] != t)
-			de.min_tasks[j++] = de.min_tasks[i];
-	de.min_count = j;
-}
-
-U0 DEMinimize(CTask *t)
-{//Hide a window but keep its (dimmed) taskbar button so it can be restored.
-	if (!TaskValidate(t) || DEIsMinimized(t))
-		return;
-	if (de.min_count < DE_BAR_TASKS_MAX)
-		de.min_tasks[de.min_count++] = t;
-	LBtr(&t->display_flags, DISPLAYf_SHOW);
-	LBts(&sys_semas[SEMA_UPDATE_WIN_Z_BUF], 0);
-}
-
-U0 DERestore(CTask *t)
-{//Un-minimize: show, focus, raise.
-	DEMinDrop(t);
-	if (!TaskValidate(t))
-		return;
-	LBts(&t->display_flags, DISPLAYf_SHOW);
-	LBts(&sys_semas[SEMA_UPDATE_WIN_Z_BUF], 0);
-	WinFocus(t);
-	WinToTop(t);
-}
-
-U0 DEBarTasksUpdate()
-{//Maintain a STABLE-ordered task array. The raw task list is z-order and
-//WinToTop reshuffles it on every focus, so drawing from it made buttons jump.
-	CTask	*t;
-	I64		 i, j;
-	Bool	 found;
-
-	//Drop dead windows from the minimized set first.
-	j = 0;
-	for (i = 0; i < de.min_count; i++)
-		if (TaskValidate(de.min_tasks[i]))
-			de.min_tasks[j++] = de.min_tasks[i];
-	de.min_count = j;
-
-	//Prune dead entries, keeping arrival order. Minimized windows are hidden but
-	//stay in the bar so their (dimmed) button can restore them.
-	j = 0;
-	for (i = 0; i < de.bar_count; i++)
-	{
-		t = de.bar_tasks[i];
-		if (TaskValidate(t) && t != de.task && t != de.menu_task &&
-			(Bt(&t->display_flags, DISPLAYf_SHOW) || DEIsMinimized(t)))
-			de.bar_tasks[j++] = t;
-	}
-	de.bar_count = j;
-
-	//Append newcomers at the end.
-	t = sys_winmgr_task;
-	while ((t = t->next_task) != sys_winmgr_task && de.bar_count < DE_BAR_TASKS_MAX)
-	{
-		if (!TaskValidate(t))
-			break;
-		if ((Bt(&t->display_flags, DISPLAYf_SHOW) || DEIsMinimized(t)) &&
-			t != de.task && t != de.menu_task)
-		{//The start menu paints its own panel - it is not a taskbar window.
-			found = FALSE;
-			for (i = 0; i < de.bar_count; i++)
-				if (de.bar_tasks[i] == t)
-				{
-					found = TRUE;
-					break;
-				}
-			if (!found)
-				de.bar_tasks[de.bar_count++] = t;
-		}
-	}
-}
-
-#define DE_VOL_ICON_W	16
-#define DE_VOL_BAR_W	54
-
-U0 DEVolApply(I64 pct)
-{//Set master volume and leave mute. Config persisted lazily via cfg_dirty
-//because these run in the WinMgr ctrl task, which must not block on I/O.
-	de.muted = FALSE;
-	AC97MasterVolumeSet(ClampI64(pct, 0, 100));
-	de.cfg_dirty = TRUE;
-}
-
-U0 DEVolStep(I64 delta)
-{//Volume-key / scroll bump; unmutes, stepping from the pre-mute level.
-	I64 base = ac97.volume;
-
-	if (de.muted)
-		base = de.saved_vol;
-	de.muted = FALSE;
-	AC97MasterVolumeSet(ClampI64(base + delta, 0, 100));
-	de.cfg_dirty = TRUE;
-}
-
-U0 DEVolMuteToggle()
-{
-	if (de.muted)
-	{
-		de.muted = FALSE;
-		AC97MasterVolumeSet(ClampI64(de.saved_vol, 5, 100));
-	}
-	else
-	{
-		de.saved_vol = ac97.volume;
-		if (de.saved_vol < 5)
-			de.saved_vol = 60; //Was already ~silent; give unmute something.
-		de.muted = TRUE;
-		AC97MasterVolumeSet(0);
-	}
-	de.cfg_dirty = TRUE;
-}
-
-I64 DEVolWidgetDraw(CDC *dc, I64 x, I64 y0)
-{//Compact speaker + level bar in the right tray, left of the clock. Returns
-//the width consumed. Records hit zones for DEBarClick.
-	I64  cy = y0 + DE_BAR_HEIGHT / 2, ix = x, dx, h, level, bx, fill;
-	Bool audible = !de.muted && ac97.volume > 0;
-
-	//Speaker: little body box + a cone widening to the right.
-	dc->color = de_theme.text;
-	if (!audible)
-		dc->color = de_theme.text_dim;
-	GrRect(dc, ix, cy - 2, 3, 5);
-	for (dx = 0; dx < 5; dx++)
-	{
-		h = 5 + dx * 2;
-		GrRect(dc, ix + 3 + dx, cy - h / 2, 1, h);
-	}
-	if (audible)
-	{//Two sound "waves".
-		dc->color = de_theme.accent;
-		GrRect(dc, ix + 10, cy - 2, 1, 5);
-		GrRect(dc, ix + 12, cy - 4, 1, 9);
-	}
-	else
-	{//Muted: red slash over the speaker.
-		dc->color = ColorRGB(0xE0, 0x50, 0x50);
-		GrLine(dc, ix, cy + 5, ix + 13, cy - 5);
-	}
-	de.vol_icon_x0 = ix;
-	de.vol_icon_x1 = ix + DE_VOL_ICON_W - 1;
-
-	//Level bar.
-	bx = ix + DE_VOL_ICON_W;
-	dc->color = de_theme.bttn;
-	GrRect(dc, bx, cy - 4, DE_VOL_BAR_W, 8);
-	level = ac97.volume;
-	if (de.muted)
-		level = 0;
-	fill = level * DE_VOL_BAR_W / 100;
-	if (fill > 0)
-	{
-		dc->color = de_theme.accent;
-		if (de.muted)
-			dc->color = de_theme.text_dim;
-		GrRect(dc, bx, cy - 4, fill, 8);
-	}
-	dc->color = de_theme.bar_edge;
-	GrRect(dc, bx, cy - 4, DE_VOL_BAR_W, 1);
-	GrRect(dc, bx, cy + 3, DE_VOL_BAR_W, 1);
-	de.vol_bar_x0 = bx;
-	de.vol_bar_x1 = bx + DE_VOL_BAR_W - 1;
-
-	return DE_VOL_ICON_W + DE_VOL_BAR_W;
-}
-
-#define DE_NET_W	18
-
-I64 DENetIconDraw(CDC *dc, I64 x, I64 y0)
-{//Little link glyph (two nodes joined by a line) in the right tray. Accent when
-//the net stack is up, dim otherwise. Records the hit zone for DEBarClick.
-	I64 cy = y0 + DE_BAR_HEIGHT / 2;
-
-	if (de.net_up)
-		dc->color = de_theme.accent;
-	else
-		dc->color = de_theme.text_dim;
-	GrRect(dc, x, cy - 5, 5, 5);					//Upper-left node.
-	GrRect(dc, x + DE_NET_W - 5, cy, 5, 5);			//Lower-right node.
-	GrLine(dc, x + 2, cy - 3, x + DE_NET_W - 3, cy + 2);
-	de.net_x0 = x;
-	de.net_x1 = x + DE_NET_W - 1;
-
-	return DE_NET_W;
-}
-
-U0 DEBarDraw(CDC *dc, CCtrl *c)
-{//Taskbar paint, called every frame from the WinMgr ctrl pass. dc is the
-//z-clipped screen alias; the bar strip is reserved, so it always shows.
-	CTask		*t;
-	CDateStruct	 ds;
-	I64			 i, y0 = GR_HEIGHT - DE_BAR_HEIGHT, x = 4, n = 0,
-				 ty = y0 + (DE_BAR_HEIGHT - FONT_HEIGHT) / 2,
-				 clock_x, vol_x, net_x, right_limit,
-				 gy, mx = mouse.pos.x, my = mouse.pos.y,
-				 clk_w, dat_w, blk_w, bw, by, bh = DE_BAR_HEIGHT - 6;
-	Bool		 in_bar = my >= y0, minimized, focused, hover;
-	U8			 buf[STR_LEN], clk[16], dat[24];
-
-	//Gradient bar background, then the accent top edge.
-	for (gy = 0; gy < DE_BAR_HEIGHT; gy++)
-	{
-		dc->color = DEColorLerp(de_theme.bar_bg, de_theme.bar_bg2, gy, DE_BAR_HEIGHT - 1);
-		GrRect(dc, 0, y0 + gy, GR_WIDTH, 1);
-	}
-	dc->color = de_theme.bar_edge;
-	GrRect(dc, 0, y0, GR_WIDTH, 1);
-
-	//YDE launcher chip - hot when the menu is open or the cursor is over it.
-	if (TaskValidate(de.menu_task) || (in_bar && x <= mx <= x + DE_CHIP_WIDTH - 1))
-		dc->color = de_theme.chip_hot;
-	else
-		dc->color = de_theme.chip;
-	GrRect(dc, x, y0 + 4, DE_CHIP_WIDTH, DE_BAR_HEIGHT - 8);
-	dc->color = de_theme.text;
-	GrPrint(dc, x + (DE_CHIP_WIDTH - 3 * FONT_WIDTH) / 2, ty, "YDE");
-	de.chip_x0 = x;
-	de.chip_x1 = x + DE_CHIP_WIDTH - 1;
-	x += DE_CHIP_WIDTH + 10;
-
-	//Right-side tray, laid out from the right edge: clock, then volume, then the
-	//net icon. Compute these first so the task buttons know where to stop. The
-	//clock strings get their own buffers; the button loop reuses buf.
-	Date2Struct(&ds, Now);
-	StrPrint(clk, "%02d:%02d", ds.hour, ds.min);
-	StrPrint(dat, "%s %d %s", DEWeekday(ds.day_of_week), ds.day_of_mon, DEMonthName(ds.mon));
-	clk_w = FONT_WIDTH * StrLen(clk);
-	dat_w = FONT_WIDTH * StrLen(dat);
-	blk_w = clk_w;
-	if (dat_w > blk_w)
-		blk_w = dat_w;
-	clock_x		= GR_WIDTH - blk_w - 8;
-	de.clock_x0	= clock_x;
-	de.clock_x1	= GR_WIDTH - 1;
-	vol_x		= clock_x - (DE_VOL_ICON_W + DE_VOL_BAR_W) - 16;
-	net_x		= vol_x - DE_NET_W - 12;
-	right_limit	= net_x - 8;
-
-	//One button per visible/minimized window task, in stable arrival order.
-	DEBarTasksUpdate;
-	for (i = 0; i < de.bar_count; i++)
-	{
-		t = de.bar_tasks[i];
-		if (x + DE_BTTN_WIDTH >= right_limit)
-		{//Off-bar: unclickable. (No 'continue' in HolyC.)
-			de.bar_x0[i] = -1;
-			de.bar_x1[i] = -1;
-		}
-		else
-		{
-			de.bar_x0[i] = x;
-			de.bar_x1[i] = x + DE_BTTN_WIDTH - 6;
-			bw			= DE_BTTN_WIDTH - 6;
-			by			= y0 + 3;
-			minimized	= DEIsMinimized(t);
-			focused		= t == sys_focus_task && !minimized;
-			hover		= in_bar && de.bar_x0[i] <= mx <= de.bar_x1[i];
-			if (focused)
-				dc->color = de_theme.bttn_focus;
-			else if (hover)
-				dc->color = de_theme.bttn_hot;
-			else
-				dc->color = de_theme.bttn;
-			GrRect(dc, x, by, bw, bh);
-			//Bevel: lighter top edge, darker bottom edge.
-			dc->color = de_theme.bttn_hot;
-			GrRect(dc, x, by, bw, 1);
-			dc->color = de_theme.bar_bg2;
-			GrRect(dc, x, by + bh - 1, bw, 1);
-			//Title (dimmed when minimized).
-			MemCopy(buf, t->task_title, 15);
-			buf[15] = 0;
-			if (minimized)
-				dc->color = de_theme.text_dim;
-			else
-				dc->color = de_theme.text;
-			GrPrint(dc, x + 6, ty, "%s", buf);
-			//Indicator: accent underline when focused, else a small running dot.
-			if (focused)
-			{
-				dc->color = de_theme.accent;
-				GrRect(dc, x, by + bh - 2, bw, 2);
-			}
-			else if (!minimized)
-			{
-				dc->color = de_theme.text_dim;
-				GrRect(dc, x + bw / 2 - 1, by + bh - 3, 2, 2);
-			}
-			x += DE_BTTN_WIDTH;
-			n++;
-		}
-	}
-
-	//Net icon + volume widget (right tray), then the two-line clock.
-	DENetIconDraw(dc, net_x, y0);
-	DEVolWidgetDraw(dc, vol_x, y0);
-	dc->color = de_theme.text;
-	GrPrint(dc, clock_x + (blk_w - clk_w) / 2, y0 + 2, "%s", clk);
-	dc->color = de_theme.text_dim;
-	GrPrint(dc, clock_x + (blk_w - dat_w) / 2, y0 + 2 + FONT_HEIGHT + 1, "%s", dat);
-}
-
-U0 DECalLaunchTask()
-{//Open the calendar without blocking the WinMgr in User()'s TaskWait.
-	User("DECalendar;\n");
-}
-
-U0 DENetUpTask()
-{//Compile the system-wide net stack (net + TLS + Zinc) once, off the hot path.
-	if (!de.net_up)
-	{
-		Sys("ExeFile(\"::/DE/BrowserBoot\");");
-		de.net_up = TRUE;
-	}
-	de.net_task = NULL;
-}
-
-U0 DEBarClick(CCtrl *c, I64 x, I64 y, Bool down)
-{//Native ctrl click routing: the WinMgr swallows these before any window
-//focus change. Runs in the WinMgr task - keep it quick, spawn the slow bits.
-	I64	   i;
-	CTask *t;
-
-	if (!down)
-		return;
-	if (de.chip_x0 <= x <= de.chip_x1)
-	{//Toggle the start menu. It closes itself on the flag rather than being
-	//killed from here, so it always frees its own window and label DCs. The
-	//debounce stops the closing click from immediately re-opening it.
-		if (TaskValidate(de.menu_task))
-			de.menu_close = TRUE;
-		else if (de_menu_fp && tS - de.menu_last > 0.25)
-		{
-			de.menu_close = FALSE;
-			de.menu_task  = Spawn(de_menu_fp, NULL, "Start Menu");
-		}
-		return;
-	}
-	if (de.vol_icon_x0 <= x <= de.vol_icon_x1)
-	{//Speaker icon: toggle mute.
-		DEVolMuteToggle;
-		return;
-	}
-	if (de.vol_bar_x0 <= x <= de.vol_bar_x1)
-	{//Level bar: set volume proportional to the click position.
-		DEVolApply((x - de.vol_bar_x0) * 100 / (de.vol_bar_x1 - de.vol_bar_x0));
-		return;
-	}
-	if (de.net_x0 >= 0 && de.net_x0 <= x <= de.net_x1)
-	{//Net icon: bring the net stack up off the WinMgr hot path (BrowserBoot
-	//compiles net + TLS + Zinc - slow, never inline). Guarded so repeat clicks
-	//can't double-compile.
-		if (!de.net_up && !TaskValidate(de.net_task))
-			de.net_task = Spawn(&DENetUpTask, NULL, "NetUp");
-		return;
-	}
-	if (de.clock_x0 >= 0 && de.clock_x0 <= x <= de.clock_x1)
-	{//Clock: open the calendar from a throwaway task (User() blocks in TaskWait,
-	//so never call it inline). Debounced so a double-click won't stack windows.
-		if (tS - de.cal_last > 1.0)
-		{
-			de.cal_last = tS;
-			Spawn(&DECalLaunchTask, NULL, "Calendar");
-		}
-		return;
-	}
-	for (i = 0; i < de.bar_count; i++)
-		if (de.bar_x0[i] >= 0 && de.bar_x0[i] <= x <= de.bar_x1[i])
-		{
-			t = de.bar_tasks[i];
-			if (TaskValidate(t))
-			{//Taskbar toggle: restore a minimized window, minimize the focused
-			//one, otherwise focus + raise.
-				if (DEIsMinimized(t))
-					DERestore(t);
-				else if (t == sys_focus_task)
-					DEMinimize(t);
-				else
-				{
-					WinFocus(t);
-					WinToTop(t);
-				}
-			}
-			return;
-		}
-}
-
-U0 DECtxMenuTask()
-{//Right-click task-button menu, in its own task so the WinMgr never blocks.
-	CTask *t = de.ctx_target;
-	I64	   i;
-
-	if (TaskValidate(t))
-	{
-		i = PopUpPickList("Focus\0Minimize\0Close\0");
-		if (TaskValidate(t))
-			switch (i)
-			{
-				case 0:
-					WinFocus(t);
-					WinToTop(t);
-					break;
-				case 1:
-					DEMinimize(t);
-					break;
-				case 2:
-					Kill(t);
-					break;
-			}
-	}
-	de.ctx_task = NULL;
-}
-
-U0 DEBarRightClick(CCtrl *c, I64 x, I64 y, Bool down)
-{//Right-click a task button -> Focus / Minimize / Close.
-	I64 i;
-
-	if (!down)
-		return;
-	for (i = 0; i < de.bar_count; i++)
-		if (de.bar_x0[i] >= 0 && de.bar_x0[i] <= x <= de.bar_x1[i])
-		{
-			if (TaskValidate(de.bar_tasks[i]) && !TaskValidate(de.ctx_task))
-			{
-				de.ctx_target = de.bar_tasks[i];
-				de.ctx_task	  = Spawn(&DECtxMenuTask, NULL, "DE Menu");
-			}
-			return;
-		}
-}
-
-U0 DEBarWheel(CCtrl *c, I64 delta)
-{//Scroll over the volume tray to step the volume up/down.
-	I64 mx = mouse.pos.x;
-
-	if (de.vol_icon_x0 <= mx <= de.vol_bar_x1)
-	{
-		if (delta > 0)
-			DEVolStep(4);
-		else
-			DEVolStep(-4);
-	}
-}
+//YDE start-up, shutdown and the background task: window policy, ALT-TAB,
+//media keys, glass follow-focus, debounced config writes.
 
 U0 DEWinPolicyEnforce()
 {//Clamp bordered windows that bypassed WinVert() (e.g. fresh task defaults).
@@ -913,11 +17,9 @@ U0 DEWinPolicyEnforce()
 }
 
 U0 DEAltTab()
-{//<ALT-TAB>: cycle focus through the taskbar's stable task list, wrapping.
-//Tries every slot rather than just the next one: the list keeps MINIMIZED
-//windows (so their button can restore them) and a slot can go stale between
-//rebuilds, and the old version gave up after a single candidate - so one dud
-//entry stopped the cycle dead and it looked like it refused to wrap.
+{//<ALT-TAB>: cycle focus through the taskbar's stable list, wrapping. Every
+//slot is tried, not just the next: the list keeps minimized windows and a slot
+//can go stale between rebuilds, so one dud entry must not stop the cycle.
 	CTask *t;
 	I64	   i, k, cur = -1;
 
@@ -992,8 +94,9 @@ U0 DETaskMain()
 				sys_focus_task != sys_task && !sys_focus_task->draw_it &&
 				!(sys_focus_task->win_inhibit & WIF_SELF_DOC))
 			{
-				if (gr.translucent_task != sys_focus_task)
-					WinTranslucent(sys_focus_task, 205);
+				if (gr.translucent_task != sys_focus_task ||
+					gr.translucent_alpha != de.glass_alpha)
+					WinTranslucent(sys_focus_task, de.glass_alpha);
 			}
 			else if (gr.translucent_task)
 				WinOpaque;
@@ -1039,6 +142,10 @@ public U0 DEStart(U8 *wallpaper_filename="::/DE/Wallpaper.PNG")
 	de.ctx_task			 = NULL;
 	de.ctx_target		 = NULL;
 	de.net_task			 = NULL;
+	de.desk				 = NULL;
+	de.stats_hold		 = FALSE;
+	de.desk_menu_task	 = NULL;
+	de.desk_menu_last	 = 0;
 	de.min_count		 = 0;
 	de.menu_close		 = FALSE;
 	de.menu_last		 = 0;
@@ -1078,6 +185,23 @@ public U0 DEStart(U8 *wallpaper_filename="::/DE/Wallpaper.PNG")
 	TaskDerivedValsUpdate(sys_winmgr_task);
 	de.bar = c;
 
+	//Desktop ctrl: everything above the bar. The WinMgr only runs a task's
+	//ctrls when that task is the topmost window under the cursor, so this fires
+	//on bare desktop only - clicks on windows are untouched. Paints nothing.
+	c = SysCAlloc(sizeof(CCtrl));
+	c->win_task		= sys_winmgr_task;
+	c->flags		= CTRLF_SHOW | CTRLF_CAPTURE_LEFT_MS;
+	c->type			= CTRLT_GENERIC;
+	c->left_click	= &DEDeskClick;
+	c->right_click	= &DEDeskRightClick;
+	c->left			= 0;
+	c->right		= GR_WIDTH - 1;
+	c->top			= 0;
+	c->bottom		= GR_HEIGHT - DE_BAR_HEIGHT - 1;
+	QueueInsert(c, sys_winmgr_task->last_ctrl);
+	TaskDerivedValsUpdate(sys_winmgr_task);
+	de.desk = c;
+
 	if (!gr.tc_chrome) //Truecolor chrome on by default; Settings can revert.
 		GuiChromeTrueColor(de_theme.accent, ColorRGB(0x0A, 0x10, 0x1A), de_theme.accent_dim);
 	//Modern flat title rows stay OFF by default; opt in via Settings.
@@ -1090,8 +214,11 @@ public U0 DEStart(U8 *wallpaper_filename="::/DE/Wallpaper.PNG")
 	//Globals are NOT zeroed by the ZealC JIT, so these need explicit defaults
 	//BEFORE DEConfigLoad - otherwise a machine with no config file arms the
 	//screen saver off heap garbage.
-	de.saver_on	  = TRUE;
-	de.saver_mins = DE_SAVER_MINS_DEFAULT;
+	de.saver_on		= TRUE;
+	de.saver_mins	= DE_SAVER_MINS_DEFAULT;
+	de.stats_enable	= TRUE;
+	de.glass_alpha	= DE_GLASS_ALPHA_DEFAULT;
+	de.glass_blur	= 0;
 
 	de.on = TRUE;
 	//Restore saved hue/chrome/glass/volume/wallpaper if present. On a fresh
@@ -1123,6 +250,10 @@ public U0 DEStop()
 	if (TaskValidate(de.ctx_task))
 		Kill(de.ctx_task);
 	de.ctx_task = NULL;
+	if (TaskValidate(de.desk_menu_task))
+		Kill(de.desk_menu_task);
+	de.desk_menu_task = NULL;
+	de.stats_hold = FALSE;
 	de.net_task = NULL;
 	de.min_count = 0;
 
@@ -1138,6 +269,14 @@ public U0 DEStop()
 		POPFD
 		TaskDerivedValsUpdate(sys_winmgr_task);
 	}
+	if (de.desk)
+	{
+		PUSHFD
+		CLI
+		QueueRemove(de.desk);
+		POPFD
+		TaskDerivedValsUpdate(sys_winmgr_task);
+	}
 	if (de.term_bttn)
 	{
 		de.term_bttn->flags |= CTRLF_SHOW;
@@ -1150,8 +289,14 @@ public U0 DEStop()
 		Free(de.bar);
 		de.bar = NULL;
 	}
+	if (de.desk)
+	{
+		Free(de.desk);
+		de.desk = NULL;
+	}
 	gr.translucent_bg = NULL;
 	WinOpaque;
+	GlassBlur(0);
 	de.glass = FALSE;
 	GuiMenuBarModern(FALSE);
 	GuiChromePalette;

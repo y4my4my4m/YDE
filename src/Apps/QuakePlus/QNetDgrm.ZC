@@ -1,0 +1,845 @@
+// QNetDgrm.ZC - WinQuake net_dgrm framing over UDP.
+//
+// Loopback stays raw CQMsg (QNet.ZC). UDP peers get 8-byte BE headers
+// (DATA/UNREL/ACK) or 4-byte CTL. Reliable is stop-and-wait with EOM chunks.
+// CTL CCREQ/CCREP lives here; server slot alloc is in QNetSv.
+
+//here so this file sits between QNetUdp and QNetSv in Run.ZC
+//compile-time ceiling, sizes the slot tables. the original allows 16
+#define QSV_MAX_CLIENTS		16
+
+//svs.maxclients - how many this SERVER actually accepts. single player is 1,
+//and it is what decides how many edicts get reserved, so it must not be the
+//ceiling: reserving 16 in a solo game shifts every world entity by fifteen
+I64 q_sv_maxclients = 1;
+
+U0 QSvMaxClientsSet(I64 n)
+{//globals aren't zeroed, and this is the init as well as the setter
+	if (n < 1)
+		n = 1;
+	if (n > QSV_MAX_CLIENTS)
+		n = QSV_MAX_CLIENTS;
+
+	q_sv_maxclients = n;
+}
+
+//guest->host has its own sock, server slots are 0..QSV_MAX_CLIENTS-1
+#define QNET_CLIENT_SLOT	(-1)
+#define QNET_PENDING_DEPTH	4
+
+class CQScore
+{
+	U8	name[16];
+	I64	frags;
+	I64	colors;		//shirt<<4 | pants, same as svc_updatecolors
+	Bool active;
+};
+
+CQScore	q_scores[QSV_MAX_CLIENTS];
+
+//rest of WriteDest(); sv.datagram (unreliable broadcast) is in QNet.ZC
+//  MSG_ONE  -> q_sv_client_msg[slot], that client's reliable message
+//  MSG_ALL  -> q_sv_reliable_datagram, reliable to everyone
+//  MSG_INIT -> q_sv_signon, replayed to each client during signon
+CQMsg	q_sv_client_msg[QSV_MAX_CLIENTS];
+CQMsg	q_sv_reliable_datagram;
+CQMsg	q_sv_signon;
+
+U0 QSvClearWriteDests()
+{//globals aren't zeroed, reset every buffer at map start.
+ //sv.signon is NOT cleared here - filled during map load, must survive.
+	I64 i;
+
+	for (i = 0; i < QSV_MAX_CLIENTS; i++)
+		QMsgClear(&q_sv_client_msg[i]);
+
+	QMsgClear(&q_sv_reliable_datagram);
+}
+
+U0 QSvClearSignon()
+{//before the world spawns - makestatic and ambientsound fill sv.signon
+	QMsgClear(&q_sv_signon);
+}
+
+U0 QSvColorsForColormap(I64 cmap, I64 *_top, I64 *_bottom)
+{//.colormap is a CLIENT NUMBER, colors come off the scoreboard
+	I64 colors = 0;
+
+	if (cmap >= 1 && cmap <= QSV_MAX_CLIENTS)
+		colors = q_scores[cmap - 1].colors;
+
+	if (_top)
+		*_top = (colors >> 4) & 15;
+	if (_bottom)
+		*_bottom = colors & 15;
+}
+
+class CQNetSock
+{
+	U32		ip;
+	I64		port;		//peer port - Ironwail is ephemeral, Zeal peers 26000
+	Bool	active;
+	Bool	can_send;
+	U32		send_seq;
+	U32		recv_seq;
+	U32		unrel_send_seq;
+	U32		unrel_recv_seq;
+	U32		ack_seq;
+	I64		send_len;
+	U8		send_msg[QNET_MAX_MSG];
+	F64		last_send_time;
+	I64		send_offset;
+	//multi-chunk reliable reassembly, WinQuake receiveMessage
+	I64		recv_len;
+	U8		recv_msg[QNET_MAX_MSG];
+	I64		pending_count;
+	I64		pending_head;
+	I64		pending_tail;
+	I64		pending_len[QNET_PENDING_DEPTH];
+	//flat - slot i at pending_msg + i * QNET_MAX_MSG, no 2D class arrays
+	U8		pending_msg[QNET_PENDING_DEPTH * QNET_MAX_MSG];
+};
+
+Bool	q_dgrm_pending_logged = FALSE;
+
+//log the first few rx datagrams - tells "nothing arrived" apart from
+//"arrived then dropped"
+#define QNET_DGRM_RX_LOG	12
+I64		q_dgrm_rx_logged = 0;
+U8		q_dgrm_line[128];
+
+CQNetSock	q_net_socks[QSV_MAX_CLIENTS];
+CQNetSock	q_net_client_sock;
+
+//guest CTL handshake state, cleared by QNetDgrmInit and on new connect
+Bool	q_ctl_accepted   = FALSE;
+U8		q_ctl_name[32];
+I64		q_ctl_top        = 0;
+I64		q_ctl_bottom     = 0;
+
+U0 QNetSockClear(CQNetSock *s)
+{
+	if (!s)
+		return;
+
+	s->ip              = 0;
+	s->port            = QNET_PORT_DEFAULT;
+	s->active          = FALSE;
+	s->can_send        = TRUE;
+	s->send_seq        = 0;
+	s->recv_seq        = 0;
+	s->unrel_send_seq  = 0;
+	s->unrel_recv_seq  = 0;
+	s->ack_seq         = 0;
+	s->send_len        = 0;
+	s->last_send_time  = 0.0;
+	s->send_offset     = 0;
+	s->recv_len        = 0;
+	s->pending_count   = 0;
+	s->pending_head    = 0;
+	s->pending_tail    = 0;
+	MemSet(s->send_msg, 0, QNET_MAX_MSG);
+	MemSet(s->recv_msg, 0, QNET_MAX_MSG);
+	MemSet(s->pending_len, 0, QNET_PENDING_DEPTH * sizeof(I64));
+	MemSet(s->pending_msg, 0, QNET_PENDING_DEPTH * QNET_MAX_MSG);
+}
+
+U0 QNetDgrmInit()
+{
+	I64 i;
+
+	q_dgrm_rx_logged = 0;
+
+	for (i = 0; i < QSV_MAX_CLIENTS; i++)
+		QNetSockClear(&q_net_socks[i]);
+
+	QNetSockClear(&q_net_client_sock);
+	q_ctl_accepted   = FALSE;
+	q_ctl_name[0]    = 0;
+	q_ctl_top        = 0;
+	q_ctl_bottom     = 0;
+}
+
+Bool QNetDgrmSendCtl(U32 ip, CQMsg *payload, I64 dest_port=0)
+{//prepend BE len|NETFLAG_CTL, payload stays little-endian MSG_* bytes
+	U8	 pkt[QNET_MAX_DATAGRAM + 4];
+	I64	 total;
+	I64	 dport;
+
+	if (!ip || !payload || payload->overflowed || payload->len < 1)
+		return FALSE;
+
+	total = 4 + payload->len;
+	if (total > QNET_MAX_DATAGRAM + 4)
+		return FALSE;
+
+	dport = dest_port;
+	if (dport < 1)
+		dport = q_udp_from_port;
+	if (dport < 1)
+		dport = QNET_PORT_DEFAULT;
+
+	QNetWriteBigLong(pkt, total | QNETFLAG_CTL);
+	MemCopy(pkt + 4, payload->data, payload->len);
+	if (!QNetUdpEnsureArp(ip))
+		return FALSE;
+	return QNetUdpSendRawTo(pkt, total, ip, dport);
+}
+
+Bool QNetClientCtlConnect(U32 ip)
+{//CCREQ_CONNECT - 0x01, "QUAKE", QNET_CTL_VERSION
+	CQMsg *m = &q_net_cmd;
+
+	if (!ip)
+		return FALSE;
+
+	QMsgClear(m);
+	QMsgWriteByte(m, QCCREQ_CONNECT);
+	QMsgWriteString(m, "QUAKE");
+	QMsgWriteByte(m, QNET_CTL_VERSION);
+	return QNetDgrmSendCtl(ip, m, QNET_PORT_DEFAULT);
+}
+
+//--- host cache (NET_Slist_f / hostcache) -----------------------------------
+//
+//the control channel carries no transaction id, so a CCREP_SERVER_INFO cannot
+//be tied to the CCREQ that caused it. the only pairing available is temporal -
+//a reply counts if it lands on our bound port inside the window a broadcast
+//query opened. outside that window an unsolicited CCREP is dropped, or a stray
+//one from a scan long since finished would sit in the list forever
+
+#define QNET_SLIST_MAX		16
+#define QNET_SLIST_WINDOW	2.0		//seconds a query stays open
+
+class CQHostCache
+{
+	U32		ip;
+	I64		port;
+	U8		addr[32];	//as the server reported it, the dedupe key
+	U8		name[32];
+	U8		map[32];
+	I64		players;
+	I64		max_players;
+};
+
+CQHostCache	q_slist[QNET_SLIST_MAX];
+I64		q_slist_count    = 0;
+F64		q_slist_deadline = 0.0;		//tS past which a reply is unsolicited
+Bool	q_slist_asked    = FALSE;	//a query went out at least once
+
+U0 QSlistInit()
+{//globals aren't zeroed, and a junk count indexes past the table
+	I64 i;
+
+	q_slist_count    = 0;
+	q_slist_deadline = 0.0;
+	q_slist_asked    = FALSE;
+
+	for (i = 0; i < QNET_SLIST_MAX; i++)
+	{
+		q_slist[i].ip          = 0;
+		q_slist[i].port        = QNET_PORT_DEFAULT;
+		q_slist[i].addr[0]     = 0;
+		q_slist[i].name[0]     = 0;
+		q_slist[i].map[0]      = 0;
+		q_slist[i].players     = 0;
+		q_slist[i].max_players = 0;
+	}
+}
+
+I64 QSlistFind(U8 *addr)
+{//the reported address is the identity, not the source ip - one server, one row
+	I64 i;
+
+	if (!addr || !addr[0])
+		return -1;
+
+	for (i = 0; i < q_slist_count; i++)
+	{
+		if (!StrICompare(q_slist[i].addr, addr))
+			return i;
+	}
+
+	return -1;
+}
+
+Bool QNetSlistBroadcast()
+{//Datagram_SearchForHosts - CCREQ_SERVER_INFO to the subnet, returns at once
+ //
+ //frames CTL by hand instead of going through QNetDgrmSendCtl: that one
+ //resolves the destination mac first, and the broadcast address has none
+	CQMsg	*m = &q_net_cmd;
+	U8		 pkt[QNET_MAX_DATAGRAM + 4];
+	I64		 total;
+
+	if (!q_udp_ready)
+		return FALSE;
+
+	QMsgClear(m);
+	QMsgWriteByte(m, QCCREQ_SERVER_INFO);
+	QMsgWriteString(m, "QUAKE");
+	QMsgWriteByte(m, QNET_CTL_VERSION);
+
+	if (m->overflowed || m->len < 1)
+		return FALSE;
+
+	total = 4 + m->len;
+	QNetWriteBigLong(pkt, total | QNETFLAG_CTL);
+	MemCopy(pkt + 4, m->data, m->len);
+
+	//replies arrive over the next second through the ordinary recv path, so
+	//the window has to be open before the send, not after it
+	q_slist_deadline = tS + QNET_SLIST_WINDOW;
+	q_slist_asked    = TRUE;
+
+	return QNetUdpSendRawBroadcast(pkt, total, QNET_PORT_DEFAULT);
+}
+
+Bool QNetSlistSearching()
+{//true while replies are still expected, so an empty table reads as pending
+	if (!q_slist_asked)
+		return FALSE;
+
+	return ToBool(tS < q_slist_deadline);
+}
+
+Bool QNetDgrmIsCtl(U8 *data, I64 len)
+{
+	U32 word;
+	U32 flags;
+	U32 hdr_len;
+
+	if (!data || len < 4)
+		return FALSE;
+
+	word    = QNetReadBigLong(data);
+	flags   = word & ~QNETFLAG_LENGTH_MASK;
+	hdr_len = word & QNETFLAG_LENGTH_MASK;
+	if (hdr_len != len)
+		return FALSE;
+
+	return ToBool(flags & QNETFLAG_CTL);
+}
+
+CQNetSock *QNetDgrmSock(I64 slot)
+{
+	if (slot == QNET_CLIENT_SLOT)
+		return &q_net_client_sock;
+
+	if (slot < 0 || slot >= QSV_MAX_CLIENTS)
+		return NULL;
+
+	return &q_net_socks[slot];
+}
+
+CQNetSock *QNetDgrmSockByIP(U32 ip)
+{
+	I64 i;
+
+	if (!ip)
+		return NULL;
+
+	if (q_net_client_sock.active && q_net_client_sock.ip == ip)
+		return &q_net_client_sock;
+
+	for (i = 0; i < QSV_MAX_CLIENTS; i++)
+	{
+		if (q_net_socks[i].active && q_net_socks[i].ip == ip)
+			return &q_net_socks[i];
+	}
+
+	return NULL;
+}
+
+Bool QNetDgrmSendChunk(CQNetSock *s, Bool resend)
+{//send or resend one reliable fragment from send_msg[send_offset]
+	U8	 pkt[QNET_MAX_DATAGRAM + QNET_HEADERSIZE];
+	I64	 remain;
+	I64	 chunk;
+	I64	 packet_len;
+	U32	 flags;
+	U32	 seq;
+
+	if (!s || !s->ip || s->send_offset >= s->send_len)
+		return FALSE;
+
+	remain = s->send_len - s->send_offset;
+	if (remain > QNET_MAX_DATAGRAM)
+		chunk = QNET_MAX_DATAGRAM;
+	else
+		chunk = remain;
+
+	packet_len = QNET_HEADERSIZE + chunk;
+	flags = QNETFLAG_DATA;
+	if (chunk == remain)
+		flags |= QNETFLAG_EOM;
+
+	if (resend)
+		seq = s->send_seq - 1;
+	else
+		seq = s->send_seq++;
+
+	QNetWriteBigLong(pkt, packet_len | flags);
+	QNetWriteBigLong(pkt + 4, seq);
+	MemCopy(pkt + QNET_HEADERSIZE, s->send_msg + s->send_offset, chunk);
+
+	if (!QNetUdpSendRawTo(pkt, packet_len, s->ip, s->port))
+		return FALSE;
+
+	s->last_send_time = tS;
+	return TRUE;
+}
+
+U0 QNetDgrmFlushPending(CQNetSock *s)
+{
+	I64 idx;
+
+	if (!s || !s->can_send || s->pending_count <= 0)
+		return;
+
+	idx = s->pending_tail;
+	MemCopy(s->send_msg, s->pending_msg + idx * QNET_MAX_MSG, s->pending_len[idx]);
+	s->send_len    = s->pending_len[idx];
+	s->pending_tail = (s->pending_tail + 1) % QNET_PENDING_DEPTH;
+	s->pending_count--;
+	s->send_offset = 0;
+	s->can_send    = FALSE;
+
+	if (!QNetDgrmSendChunk(s, FALSE))
+		s->last_send_time = tS;
+}
+
+Bool QNetDgrmPendingEnqueue(CQNetSock *s, CQMsg *m)
+{
+	I64 idx;
+
+	if (!s || !m || m->len < 1)
+		return FALSE;
+
+	if (s->pending_count >= QNET_PENDING_DEPTH)
+	{
+		if (!q_dgrm_pending_logged)
+		{
+			QLog("net: pending reliable full, drop\n");
+			QLogFlush;
+			q_dgrm_pending_logged = TRUE;
+		}
+		return FALSE;
+	}
+
+	idx = s->pending_head;
+	MemCopy(s->pending_msg + idx * QNET_MAX_MSG, m->data, m->len);
+	s->pending_len[idx] = m->len;
+	s->pending_head = (s->pending_head + 1) % QNET_PENDING_DEPTH;
+	s->pending_count++;
+	return TRUE;
+}
+
+Bool QNetDgrmSendUnreliable(I64 slot, CQMsg *m)
+{
+	CQNetSock	*s;
+	U8			 pkt[QNET_MAX_DATAGRAM + QNET_HEADERSIZE];
+	I64			 packet_len;
+
+	s = QNetDgrmSock(slot);
+	if (!s || !s->active || !s->ip || !m || m->len < 1 || m->overflowed)
+		return FALSE;
+
+	if (m->len > QNET_MAX_DATAGRAM)
+		return FALSE;
+
+	packet_len = QNET_HEADERSIZE + m->len;
+	QNetWriteBigLong(pkt, packet_len | QNETFLAG_UNRELIABLE);
+	QNetWriteBigLong(pkt + 4, s->unrel_send_seq++);
+	MemCopy(pkt + QNET_HEADERSIZE, m->data, m->len);
+
+	return QNetUdpSendRawTo(pkt, packet_len, s->ip, s->port);
+}
+
+Bool QNetDgrmSendReliable(I64 slot, CQMsg *m)
+{//buffer it, send the first chunk, block until ACK - stop-and-wait
+	CQNetSock *s;
+
+	s = QNetDgrmSock(slot);
+	if (!s || !s->active || !s->ip || !m || m->len < 1 || m->overflowed)
+		return FALSE;
+
+	if (m->len > QNET_MAX_MSG)
+		return FALSE;
+
+	if (!s->can_send)
+		return QNetDgrmPendingEnqueue(s, m);
+
+	MemCopy(s->send_msg, m->data, m->len);
+	s->send_len    = m->len;
+	s->send_offset = 0;
+	s->can_send    = FALSE;
+
+	if (!QNetDgrmSendChunk(s, FALSE))
+	{
+		//keep the buffer, Tick resends once UDP/ARP is up
+		s->last_send_time = tS;
+		return FALSE;
+	}
+
+	return TRUE;
+}
+
+U0 QNetDgrmTick(F64 now)
+{//resend the outstanding reliable chunk after 1s of silence
+	I64			 i;
+	CQNetSock	*s;
+
+	for (i = 0; i < QSV_MAX_CLIENTS; i++)
+	{
+		s = &q_net_socks[i];
+		if (s->active && s->pending_count > 0 && s->can_send)
+			QNetDgrmFlushPending(s);
+	}
+
+	s = &q_net_client_sock;
+	if (s->active && s->pending_count > 0 && s->can_send)
+		QNetDgrmFlushPending(s);
+
+	for (i = 0; i < QSV_MAX_CLIENTS; i++)
+	{
+		s = &q_net_socks[i];
+		if (s->active && !s->can_send && s->send_len > 0 &&
+			now - s->last_send_time > 1.0)
+			QNetDgrmSendChunk(s, TRUE);
+	}
+
+	s = &q_net_client_sock;
+	if (s->active && !s->can_send && s->send_len > 0 &&
+		now - s->last_send_time > 1.0)
+		QNetDgrmSendChunk(s, TRUE);
+}
+
+I64 QNetDgrmHandleCtl(U8 *data, I64 len, U32 from_ip)
+{//guest-side CTL replies, 0 = no game message delivered.
+ //server CCREQ is QNetServerHandleCtl in QNetSv.
+	CQMsg	*m = &q_net_cmd;	//scratch, q_net_recv isn't declared yet
+	I64		 cmd;
+	I64		 port;
+	U8		 reason[64];
+	U8		 line[96];
+	//CCREP_SERVER_INFO fields, sized to the host cache row they land in
+	U8		 addr[32];
+	U8		 hname[32];
+	U8		 level[32];
+	I64		 players;
+	I64		 maxp;
+	I64		 ver;
+	I64		 idx;
+
+	if (!data || len < 5 || !QNetDgrmIsCtl(data, len))
+		return 0;
+
+	//server path, leave it for QNetServerHandleCtl
+	if (q_udp_server)
+		return 0;
+
+	QMsgClear(m);
+	MemCopy(m->data, data + 4, len - 4);
+	m->len  = len - 4;
+	m->read = 0;
+
+	cmd = QMsgReadByte(m);
+	if (m->badread)
+		return 0;
+
+	if (cmd == QCCREP_ACCEPT)
+	{
+		port = QMsgReadLong(m);
+		if (m->badread)
+			return 0;
+
+		QNetSockClear(&q_net_client_sock);
+		q_net_client_sock.ip       = from_ip;
+		q_net_client_sock.port     = port;
+		if (q_net_client_sock.port < 1)
+			q_net_client_sock.port = QNET_PORT_DEFAULT;
+		q_net_client_sock.active   = TRUE;
+		q_net_client_sock.can_send = TRUE;
+		q_ctl_accepted = TRUE;
+
+		StrPrint(line, "net: CTL ACCEPT port %d from %d.%d.%d.%d\n",
+			port,
+			from_ip & 255, (from_ip >> 8) & 255,
+			(from_ip >> 16) & 255, (from_ip >> 24) & 255);
+		QLog(line);
+		QLogFlush;
+		return 4;	//guest ACCEPT, caller may send name/color
+	}
+
+	if (cmd == QCCREP_REJECT)
+	{
+		QMsgReadString(m, reason, 64);
+		StrPrint(line, "net: CTL REJECT %s\n", reason);
+		QLog(line);
+		QLogFlush;
+		return 0;
+	}
+
+	if (cmd == QCCREP_SERVER_INFO)
+	{
+		//no transaction id on this channel - the open query window is the
+		//whole of the match. drop anything arriving outside it
+		if (!QNetSlistSearching)
+			return 0;
+
+		QMsgReadString(m, addr, 32);
+		QMsgReadString(m, hname, 32);
+		QMsgReadString(m, level, 32);
+		players = QMsgReadByte(m);
+		maxp    = QMsgReadByte(m);
+		ver     = QMsgReadByte(m);
+		if (m->badread)
+			return 0;
+
+		if (ver != QNET_CTL_VERSION)
+			return 0;
+
+		//the address it ANSWERED FROM wins over the one it advertises. a host
+		//with no local ip set reports 0.0.0.0 and the string is not empty, so
+		//trusting it produced an entry that listed fine and joined nowhere.
+		//from_ip is the address that actually reached us
+		if (from_ip)
+			StrPrint(addr, "%d.%d.%d.%d:%d",
+				from_ip & 255, (from_ip >> 8) & 255,
+				(from_ip >> 16) & 255, (from_ip >> 24) & 255,
+				QNET_PORT_DEFAULT);
+		else if (!addr[0])
+			return 0;
+
+		//a broadcast reaches every server once per query and the query repeats,
+		//so refreshing in place is the common path, appending the rare one
+		idx = QSlistFind(addr);
+		if (idx < 0)
+		{
+			if (q_slist_count >= QNET_SLIST_MAX)
+				return 0;
+			idx = q_slist_count;
+			q_slist_count++;
+			QStrCopy(q_slist[idx].addr, addr, 32);
+		}
+
+		q_slist[idx].ip   = from_ip;
+		q_slist[idx].port = q_udp_from_port;
+		if (q_slist[idx].port < 1)
+			q_slist[idx].port = QNET_PORT_DEFAULT;
+		QStrCopy(q_slist[idx].name, hname, 32);
+		QStrCopy(q_slist[idx].map, level, 32);
+		q_slist[idx].players     = players;
+		q_slist[idx].max_players = maxp;
+		return 0;
+	}
+
+	return 0;
+}
+
+Bool QNetDgrmSendAck(CQNetSock *s, U32 seq)
+{
+	U8 pkt[QNET_HEADERSIZE];
+
+	if (!s || !s->ip)
+		return FALSE;
+
+	QNetWriteBigLong(pkt, QNET_HEADERSIZE | QNETFLAG_ACK);
+	QNetWriteBigLong(pkt + 4, seq);
+	return QNetUdpSendRawTo(pkt, QNET_HEADERSIZE, s->ip, s->port);
+}
+
+I64 QNetDgrmProcess(CQNetSock *s, U8 *buf, I64 len, CQMsg *out)
+{//one framed game packet for an active sock, 0/1/2 as Recv
+	U32	 word;
+	U32	 flags;
+	U32	 hdr_len;
+	U32	 seq;
+	I64	 payload;
+	I64	 remain;
+	I64	 chunk;
+
+	if (!s || !buf || !out || len < 4)
+		return 0;
+
+	word    = QNetReadBigLong(buf);
+	flags   = word & ~QNETFLAG_LENGTH_MASK;
+	hdr_len = word & QNETFLAG_LENGTH_MASK;
+
+	if (hdr_len != len)
+		return 0;
+
+	if (flags & QNETFLAG_CTL)
+		return QNetDgrmHandleCtl(buf, len, s->ip);
+
+	if (len < QNET_HEADERSIZE)
+		return 0;
+
+	seq     = QNetReadBigLong(buf + 4);
+	payload = len - QNET_HEADERSIZE;
+
+	if (flags & QNETFLAG_UNRELIABLE)
+	{
+		if (seq < s->unrel_recv_seq)
+			return 0;
+
+		s->unrel_recv_seq = seq + 1;
+		QMsgClear(out);
+		if (payload > 0)
+		{
+			if (payload > QNET_MAX_MSG)
+				return 0;
+			MemCopy(out->data, buf + QNET_HEADERSIZE, payload);
+			out->len = payload;
+		}
+		return 2;
+	}
+
+	if (flags & QNETFLAG_ACK)
+	{
+		if (seq != s->send_seq - 1)
+			return 0;
+
+		if (seq != s->ack_seq)
+			return 0;
+
+		s->ack_seq++;
+
+		remain = s->send_len - s->send_offset;
+		if (remain > QNET_MAX_DATAGRAM)
+			chunk = QNET_MAX_DATAGRAM;
+		else
+			chunk = remain;
+
+		s->send_offset += chunk;
+		if (s->send_offset < s->send_len)
+			QNetDgrmSendChunk(s, FALSE);
+		else
+		{
+			s->send_len    = 0;
+			s->send_offset = 0;
+			s->can_send    = TRUE;
+			QNetDgrmFlushPending(s);
+		}
+		return 0;
+	}
+
+	if (flags & QNETFLAG_DATA)
+	{
+		QNetDgrmSendAck(s, seq);
+
+		if (seq != s->recv_seq)
+			return 0;
+
+		s->recv_seq++;
+
+		if (payload > 0)
+		{
+			if (s->recv_len + payload > QNET_MAX_MSG)
+			{
+				s->recv_len = 0;
+				return 0;
+			}
+			MemCopy(s->recv_msg + s->recv_len, buf + QNET_HEADERSIZE, payload);
+			s->recv_len += payload;
+		}
+
+		if (flags & QNETFLAG_EOM)
+		{
+			QMsgClear(out);
+			if (s->recv_len > 0)
+			{
+				MemCopy(out->data, s->recv_msg, s->recv_len);
+				out->len = s->recv_len;
+			}
+			s->recv_len = 0;
+			return 1;
+		}
+		return 0;
+	}
+
+	return 0;
+}
+
+I64 QNetDgrmRecv(CQMsg *out, U32 *from_ip)
+{//0 none/ACK/drop, 1 reliable complete, 2 unreliable,
+ //3 server CTL (whole pkt left in out for QNetServerHandleCtl), 4 guest ACCEPT
+	U8			 buf[QNET_MAX_DATAGRAM + QNET_HEADERSIZE];
+	I64			 got;
+	U32			 ip;
+	U32			 word;
+	U32			 flags;
+	U32			 hdr_len;
+	CQNetSock	*s;
+	I64			 ret;
+
+	if (from_ip)
+		*from_ip = 0;
+
+	if (!out)
+		return 0;
+
+	if (!QNetUdpRecvRaw(buf, QNET_MAX_DATAGRAM + QNET_HEADERSIZE, &got, &ip))
+		return 0;
+
+	if (from_ip)
+		*from_ip = ip;
+
+	//log before any drop path, otherwise "arrived then dropped" looks
+	//exactly like "never arrived"
+	if (q_dgrm_rx_logged < QNET_DGRM_RX_LOG)
+	{
+		q_dgrm_rx_logged++;
+
+		StrPrint(q_dgrm_line,
+			"net: rx %d bytes from %d.%d.%d.%d:%d hdr %02X%02X%02X%02X\n",
+			got,
+			ip & 255, (ip >> 8) & 255, (ip >> 16) & 255, (ip >> 24) & 255,
+			q_udp_from_port,
+			buf[0], buf[1], buf[2], buf[3]);
+		QLog(q_dgrm_line);
+		QLogFlush;
+	}
+
+	if (got < 4)
+		return 0;
+
+	word    = QNetReadBigLong(buf);
+	flags   = word & ~QNETFLAG_LENGTH_MASK;
+	hdr_len = word & QNETFLAG_LENGTH_MASK;
+
+	if (hdr_len != got)
+	{
+		//SLIRP pads, so still try CTL if flagged and the payload fits
+		if (!(flags & QNETFLAG_CTL) || hdr_len < 4 || hdr_len > got)
+			return 0;
+		got = hdr_len;
+	}
+
+	if (flags & QNETFLAG_CTL)
+	{
+		//server CCREQ is in QNetSv, hand the whole packet up
+		if (q_udp_server)
+		{
+			QMsgClear(out);
+			if (got > QNET_MAX_MSG)
+				return 0;
+			MemCopy(out->data, buf, got);
+			out->len = got;
+			return 3;
+		}
+		return QNetDgrmHandleCtl(buf, got, ip);
+	}
+
+	s = QNetDgrmSockByIP(ip);
+	if (!s)
+		return 0;
+
+	//NAT and Ironwail source ports drift off 26000, track the peer
+	if (q_udp_from_port >= 1)
+		s->port = q_udp_from_port;
+
+	ret = QNetDgrmProcess(s, buf, got, out);
+	return ret;
+}

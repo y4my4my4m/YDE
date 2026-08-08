@@ -1,0 +1,419 @@
+// UTPal.ZC - SoftDrv 256-colour palette + ARGB blit table.
+//
+// Upstream: Engine/Inc/UnTex.h FColor / UPalette. SoftDrv canvas is P8;
+// draw_it expands through ut_pal_argb into truecolor CDC (Quake/HL1 path).
+// GrPalette is 16-slot legacy only — forced UT dark chrome while SoftDrv
+// runs so Doc/YDE RED cannot wash the window. SettingsPop restores it.
+//
+// UI pens live in reserved high slots (240+) with hardcoded ARGB. BestMatch
+// alone picks ArenaTex reds and paints the menu YDE-red.
+
+U32 ut_pal_argb[256];
+U8  ut_pal_r[256];
+U8  ut_pal_g[256];
+U8  ut_pal_b[256];
+Bool ut_pal_ready = FALSE;
+//Menu activate/deactivate swap the global palette (MenuGr vs ArenaTex). The
+//blit maps the whole indexed plane through it, so a swap recolours the entire
+//frame, HUD included. Locked once a level is live.
+Bool ut_pal_locked = FALSE;
+Bool ut_pal_gr_saved = FALSE;
+CBGR24 ut_pal_gr_backup[COLORS_NUM];
+
+//FlashSprite SoftDrv tables (DrawTile.cpp FlashSprite15/16/32).
+//Host canvas = P8; 8-bit blend LUTs. 16/32 pal mirrors for hi-color math.
+U8  ut_flash8_add[65536];
+U8  ut_flash8_mod[65536];
+U16 ut_flash16_pal[256];	//RGB565 SoftDrv palette words
+U32 ut_flash32_pal[256];	//= ut_pal_argb mirror for FlashSprite32
+U8  ut_rgb_cube[32768];		//5-bit/channel → P8 (Flash table accel)
+Bool ut_flash_ready = FALSE;
+
+// SoftDrv UI pens — reserved indices, never YDE RED/theme consts
+I64 ut_col_black	= 0;
+I64 ut_col_white	= 255;
+I64 ut_col_dim		= 254;
+I64 ut_col_gold		= 253;
+I64 ut_col_health	= 249;
+I64 ut_col_armor	= 248;
+I64 ut_col_ammo		= 247;
+I64 ut_col_frag		= 246;
+I64 ut_col_bar		= 251;
+I64 ut_col_panel	= 252;
+I64 ut_col_edge		= 250;
+I64 ut_col_cross	= 255;
+I64 ut_col_blue0	= 245;
+I64 ut_col_blue1	= 244;
+I64 ut_col_blue2	= 243;
+//UWindow Win95 LookAndFeel pens (debug SoftDrv chrome / ut_menu_fake_laf)
+I64 ut_col_laf_title	= 242;
+I64 ut_col_laf_title2	= 241;
+I64 ut_col_laf_client	= 240;
+I64 ut_col_laf_face	= 239;
+I64 ut_col_laf_hi	= 238;
+I64 ut_col_laf_lo	= 237;
+I64 ut_col_menubar	= 236;
+I64 ut_col_status	= 235;
+I64 ut_col_edit		= 234;
+I64 ut_col_sel		= 233;
+I64 ut_col_label	= 232;
+
+U0 UTPalSet(I64 idx, U8 r, U8 g, U8 b)
+{
+	if (idx < 0 || idx > 255)
+		return;
+	ut_pal_r[idx] = r;
+	ut_pal_g[idx] = g;
+	ut_pal_b[idx] = b;
+	ut_pal_argb[idx] = (r << 16) | (g << 8) | b;
+}
+
+I64 UTPalBestMatch(I64 r, I64 g, I64 b, I64 first)
+{//UPalette::BestMatch, squared RGB distance.
+ //r/g/b are I64, not U8: byte-wide parameters come through miscompiled and
+ //the distance is computed against garbage.
+	//noreg: same register-allocator miscompile as UTPalBuildFlashTables.
+	I64 noreg i;
+	I64 noreg best;
+	I64 noreg best_d;
+	I64 noreg dr;
+	I64 noreg dg;
+	I64 noreg db;
+	I64 noreg d;
+
+	best   = first;
+	best_d = 0x7FFFFFFF;
+	i      = first;
+	while (i < 256)
+	{
+		//& 255 on the palette loads: the byte read comes back widened with
+		//garbage in the high bits, so dr*dr overflows I64 and goes negative,
+		//which then wins the d < best_d test and returns a wrong slot.
+		dr = (ToI64(ut_pal_r[i]) & 255) - (r & 255);
+		dg = (ToI64(ut_pal_g[i]) & 255) - (g & 255);
+		db = (ToI64(ut_pal_b[i]) & 255) - (b & 255);
+		d  = dr * dr + dg * dg + db * db;
+		if (d < best_d)
+		{
+			best_d = d;
+			best   = i;
+		}
+		i++;
+	}
+	return best;
+}
+
+U8 UTPalShadeIndex(U8 texel, F64 shade)
+{//SoftDrv light without lightmaps: dim RGB, re-quantize. Never index*shade.
+	I64 r;
+	I64 g;
+	I64 b;
+	I64 t;
+
+	if (shade >= 0.99)
+		return texel;
+	if (shade < 0.12)
+		shade = 0.12;
+	t = texel & 255;
+	r = ToI64(ToF64(ut_pal_r[t]) * shade);
+	g = ToI64(ToF64(ut_pal_g[t]) * shade);
+	b = ToI64(ToF64(ut_pal_b[t]) * shade);
+	if (r > 255) r = 255;
+	if (g > 255) g = 255;
+	if (b > 255) b = 255;
+	return UTPalBestMatch(r, g, b, 1) & 255;
+}
+
+U8 UTPalBlendAdd(U8 src, U8 dst)
+{//SoftDrv PF_Translucent / STY_Translucent — FlashSprite8 table or compute.
+	I64 r;
+	I64 g;
+	I64 b;
+	I64 i;
+
+	if (ut_flash_ready)
+	{
+		i = (ToI64(src & 255) << 8) | (dst & 255);
+		return ut_flash8_add[i];
+	}
+	r = ToI64(ut_pal_r[src & 255]) + ToI64(ut_pal_r[dst & 255]);
+	g = ToI64(ut_pal_g[src & 255]) + ToI64(ut_pal_g[dst & 255]);
+	b = ToI64(ut_pal_b[src & 255]) + ToI64(ut_pal_b[dst & 255]);
+	if (r > 255) r = 255;
+	if (g > 255) g = 255;
+	if (b > 255) b = 255;
+	return UTPalBestMatch(r & 255, g & 255, b & 255, 1) & 255;
+}
+
+U8 UTPalBlendMod(U8 src, U8 dst)
+{//STY_Modulated / PF_Modulated — FlashSprite8 table or compute.
+	I64 r;
+	I64 g;
+	I64 b;
+	I64 i;
+
+	if (ut_flash_ready)
+	{
+		i = (ToI64(src & 255) << 8) | (dst & 255);
+		return ut_flash8_mod[i];
+	}
+	r = (ToI64(ut_pal_r[src & 255]) * ToI64(ut_pal_r[dst & 255])) / 255;
+	g = (ToI64(ut_pal_g[src & 255]) * ToI64(ut_pal_g[dst & 255])) / 255;
+	b = (ToI64(ut_pal_b[src & 255]) * ToI64(ut_pal_b[dst & 255])) / 255;
+	return UTPalBestMatch(r & 255, g & 255, b & 255, 1) & 255;
+}
+
+U32 UTPalFlash32Add(U32 src, U32 dst)
+{//FlashSprite32Translucent — DWORD RGB add, 0x1010100 saturate.
+	U32 sat;
+	U32 mask;
+
+	sat = src + (0xfefeff & dst);
+	mask = sat & 0x1010100;
+	if (mask)
+		sat = sat | (mask - (mask >> 8));
+	return sat & 0x00FFFFFF;
+}
+
+U16 UTPalFlash16Add(U16 src, U16 dst)
+{//FlashSprite16Translucent — RGB565-ish, 0x10820 saturate.
+	U32 sat;
+	U32 mask;
+
+	sat = ToI64(src) + ((0xFFFFFFFF - 0x10820) & ToI64(dst));
+	mask = sat & 0x10820;
+	if (mask)
+		sat = sat | (mask - (mask >> 5));
+	return sat & 0xFFFF;
+}
+
+U16 UTPalToRGB565(U8 idx)
+{
+	return ut_flash16_pal[idx & 255];
+}
+
+U0 UTPalBuildFlashTables()
+{//SoftDrv DrawTile FlashSprite tables for P8 host + 16/32 pal mirrors.
+ //5-bit RGB cube then 256×256 add/mod. Rebuild after palette change.
+	//noreg + the & 32767 on the cube reads below: without both, the index
+	//reaching the load is not the qi this code computes and the read faults.
+	//qi is <= 32767 by construction, so the mask is a no-op semantically.
+	I64 noreg s;
+	I64 noreg d;
+	I64 noreg i;
+	I64 noreg r;
+	I64 noreg g;
+	I64 noreg b;
+	I64 noreg qi;
+	I64 noreg rs;
+	I64 noreg gs;
+	I64 noreg bs;
+
+	ut_flash_ready = FALSE;
+	//RGB cube: SoftDrv hi-color→P8 remap accel
+	//Single linear walk over the cube index; r/g/b are derived from qi rather
+	//than combined into it. The nested form wrote entries to wrong slots.
+	qi = 0;
+	while (qi < 32768)
+	{
+		r = (qi >> 10) & 31;
+		g = (qi >> 5) & 31;
+		b = qi & 31;
+		ut_rgb_cube[qi] = UTPalBestMatch(
+			(r << 3) | (r >> 2),
+			(g << 3) | (g >> 2),
+			(b << 3) | (b >> 2), 1) & 255;
+		qi++;
+	}
+	s = 0;
+	while (s < 256)
+	{
+		rs = ut_pal_r[s];
+		gs = ut_pal_g[s];
+		bs = ut_pal_b[s];
+		//15/16-bit SoftDrv palette word (5-6-5)
+		ut_flash16_pal[s] =
+			((ToI64(rs) >> 3) << 11) |
+			((ToI64(gs) >> 2) << 5) |
+			(ToI64(bs) >> 3);
+		ut_flash32_pal[s] = ut_pal_argb[s];
+		d = 0;
+		while (d < 256)
+		{
+			i = (s << 8) | d;
+			r = ToI64(rs) + (ToI64(ut_pal_r[d]) & 255);
+			g = ToI64(gs) + (ToI64(ut_pal_g[d]) & 255);
+			b = ToI64(bs) + (ToI64(ut_pal_b[d]) & 255);
+			if (r > 255) r = 255;
+			if (g > 255) g = 255;
+			if (b > 255) b = 255;
+			qi = ((r >> 3) << 10) | ((g >> 3) << 5) | (b >> 3);
+			ut_flash8_add[i] = ut_rgb_cube[qi & 32767];
+			r = (ToI64(rs) * (ToI64(ut_pal_r[d]) & 255)) / 255;
+			g = (ToI64(gs) * (ToI64(ut_pal_g[d]) & 255)) / 255;
+			b = (ToI64(bs) * (ToI64(ut_pal_b[d]) & 255)) / 255;
+			qi = ((r >> 3) << 10) | ((g >> 3) << 5) | (b >> 3);
+			ut_flash8_mod[i] = ut_rgb_cube[qi & 32767];
+			d++;
+		}
+		s++;
+	}
+	ut_flash_ready = TRUE;
+}
+
+U0 UTPalBindUI()
+{//Force UT menu/HUD pens into reserved slots. Dark blue chrome, gold select.
+ //Index 0 stays black (SoftDrv mask / clear).
+	ut_col_black = 0;
+	UTPalSet(0, 0, 0, 0);
+
+	//Form labels on dark panels. Menubar/pulldown use ut_col_white (Blue LAF
+	//retail is black on light BlueBar/BlueMenuArea; SoftDrv lists need white).
+	ut_col_label = 232;
+	UTPalSet(232, 220, 224, 236);
+	ut_col_sel = 233;
+	UTPalSet(233, 64, 112, 200);
+	ut_col_edit = 234;
+	UTPalSet(234, 255, 255, 255);
+	ut_col_status = 235;
+	UTPalSet(235, 48, 72, 168);
+	ut_col_menubar = 236;
+	UTPalSet(236, 168, 168, 176);
+	ut_col_laf_lo = 237;
+	UTPalSet(237, 48, 56, 80);
+	ut_col_laf_hi = 238;
+	UTPalSet(238, 220, 224, 236);
+	ut_col_laf_face = 239;
+	UTPalSet(239, 152, 156, 176);
+	ut_col_laf_client = 240;
+	UTPalSet(240, 176, 180, 200);
+	ut_col_laf_title2 = 241;
+	UTPalSet(241, 96, 128, 220);
+	ut_col_laf_title = 242;
+	UTPalSet(242, 40, 64, 176);
+
+	ut_col_blue2 = 243;
+	UTPalSet(243, 8, 12, 32);
+	ut_col_blue1 = 244;
+	UTPalSet(244, 12, 20, 48);
+	ut_col_blue0 = 245;
+	UTPalSet(245, 20, 32, 72);
+
+	ut_col_frag = 246;
+	UTPalSet(246, 220, 48, 32);
+	ut_col_ammo = 247;
+	UTPalSet(247, 255, 220, 64);
+	ut_col_armor = 248;
+	UTPalSet(248, 64, 160, 255);
+	ut_col_health = 249;
+	UTPalSet(249, 220, 40, 40);
+
+	ut_col_edge = 250;
+	UTPalSet(250, 72, 88, 128);
+	ut_col_bar = 251;
+	UTPalSet(251, 80, 120, 200);
+	ut_col_panel = 252;
+	UTPalSet(252, 16, 24, 56);
+	ut_col_gold = 253;
+	UTPalSet(253, 255, 220, 96);
+	ut_col_dim = 254;
+	UTPalSet(254, 168, 176, 196);
+	ut_col_white = 255;
+	UTPalSet(255, 255, 255, 255);
+	ut_col_cross = ut_col_white;
+}
+
+U0 UTPalGrInstall()
+{//16-slot GrPalette = UT dark chrome. RED slot is dark blue, not health.
+	I64 i;
+	CBGR24 c;
+
+	if (!ut_pal_gr_saved)
+	{
+		GrPaletteGet(ut_pal_gr_backup);
+		ut_pal_gr_saved = TRUE;
+	}
+	i = 0;
+	while (i < COLORS_NUM)
+	{
+		c.b = ut_pal_b[ut_col_panel & 255];
+		c.g = ut_pal_g[ut_col_panel & 255];
+		c.r = ut_pal_r[ut_col_panel & 255];
+		c.pad = 0;
+		gr_palette[i] = c;
+		i++;
+	}
+	c.b = 0;
+	c.g = 0;
+	c.r = 0;
+	c.pad = 0;
+	gr_palette[BLACK] = c;
+	c.b = ut_pal_b[ut_col_blue0 & 255];
+	c.g = ut_pal_g[ut_col_blue0 & 255];
+	c.r = ut_pal_r[ut_col_blue0 & 255];
+	gr_palette[BLUE] = c;
+	gr_palette[RED] = c;
+	c.b = ut_pal_b[ut_col_dim & 255];
+	c.g = ut_pal_g[ut_col_dim & 255];
+	c.r = ut_pal_r[ut_col_dim & 255];
+	gr_palette[DKGRAY] = c;
+	c.b = 255;
+	c.g = 255;
+	c.r = 255;
+	gr_palette[WHITE] = c;
+	GrPaletteSet(gr_palette);
+}
+
+U0 UTPalGrRestore()
+{
+	if (!ut_pal_gr_saved)
+		return;
+	GrPaletteSet(ut_pal_gr_backup);
+	ut_pal_gr_saved = FALSE;
+}
+
+U0 UTPalInstall()
+{//index 0 forced black; UI pens; truecolor blit table ready.
+ //GrPalette install is separate — call UTPalGrInstall after SettingsPush.
+	UTPalSet(0, 0, 0, 0);
+	UTPalBindUI;
+	UTPalBuildFlashTables;
+	ut_pal_ready = TRUE;
+}
+
+U0 UTPalInit()
+{//neutral grey ramp until a UPalette serial loads. Index 0 = black.
+	I64 i;
+	I64 v;
+
+	i = 0;
+	while (i < 256)
+	{
+		v = i;
+		UTPalSet(i, v, v, v);
+		i++;
+	}
+	UTPalSet(0, 0, 0, 0);
+	ut_pal_ready = TRUE;
+	UTPalBindUI;
+	UTPalBuildFlashTables;
+}
+
+Bool UTPalLoadRaw(U8 *data, I64 size)
+{//raw 256 * FColor (R G B A), Intel order from UnTex.h
+	I64 i;
+	U8 *p;
+
+	if (!data || size < 256 * 4)
+		return FALSE;
+	p = data;
+	i = 0;
+	while (i < 256)
+	{
+		UTPalSet(i, p[0], p[1], p[2]);
+		p += 4;
+		i++;
+	}
+	UTPalInstall;
+	return TRUE;
+}

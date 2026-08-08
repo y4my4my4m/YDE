@@ -1,0 +1,1265 @@
+// UTLod.ZC - UMesh / ULodMesh serial + GetFrame skin anim (SoftDrv).
+//
+// Ver>61 TLazyArray: SeekPos INT, TArray (INDEX count + count*elem), Seek(SeekPos).
+// Verts, Tris, Connects and VertLinks are lazy; the other arrays are not.
+// FMeshVert DWORD X:11 Y:11 Z:10. AnimSeq: Name Group Start Num Notifys Rate.
+// FrameVerts/AnimFrames sit after AndFlags=FFFFFFFF OrFlags=0 marker.
+// LodMesh: CollapsePointThus[fv] FaceLevel[faces] Faces CollapseWedge Wedges
+// Materials SpecialFaces ModelVerts SpecialVerts — Faces may be empty on some.
+// A face names its skin through two hops: FMeshFace.MaterialIndex ->
+// Materials[].TextureIndex -> UMesh Textures[]. Full field order and an
+// every-byte check for it live in utils/zctest/utmeshwalk.py.
+
+#define UT_LOD_MAX_VERTS	8192
+#define UT_LOD_MAX_TRIS		16384
+#define UT_LOD_MAX_FRAMES	1024
+#define UT_LOD_MAX_SKIN		16
+#define UT_LOD_MAX_SEQ		128
+#define UT_LOD_MAX_SEQ_FILE	512
+
+class CUTLodSeq
+{
+	U8	 name[32];
+	I64	 start;
+	I64	 num;
+	F64	 rate;
+};
+
+class CUTLodMesh
+{
+	F64	*verts;			//AnimFrames * FrameVerts * 3
+	I64	 frame_verts;
+	I64	 anim_frames;
+	I64	 *tri_i;		//num_tris * 3 (frame-local indices)
+	F64	 *tri_uv;		//num_tris * 6: u0 v0 u1 v1 u2 v2, texels
+	I64	 *tri_mat;		//num_tris: FMeshFace MaterialIndex
+	I64	 num_tris;
+	F64	 scale[3];
+	F64	 origin[3];
+	I64	 rot_yaw;		//RotOrigin.Yaw (Unreal rot units)
+	F64	 draw_origin[3];
+	I64	 draw_yaw;
+	I64	 draw_pitch;	//view-attached meshes need the full basis, not yaw
+	I64	 draw_roll;
+	F64	 frame;
+	I64	 seq_i;
+	CUTLodSeq seq[UT_LOD_MAX_SEQ];
+	I64	 n_seq;
+	CUTTex *skin;	//default skin: first Textures entry that resolves
+	I64	 skin_ref[UT_LOD_MAX_SKIN];	//UMesh Textures object refs
+	I64	 n_skin_ref;
+	CUTTex *skin_tex[UT_LOD_MAX_SKIN];	//skin_ref resolved, same indices
+	I64	 mat_tex[UT_LOD_MAX_SKIN];	//FMeshMaterial TextureIndex into skin_ref
+	I64	 n_mat;
+	//Owner overrides, UnMesh.h UMesh::GetTexture. Character meshes ship an
+	//all-None Textures array and are skinned entirely from these.
+	F64 *vlight;		//frame_verts * 3, FLightManager::Light per vertex
+	F64 *vnorm;			//frame_verts * 3, area-weighted vertex normals
+	Bool vlight_ok;		//static actors light once, not every frame
+	F64  vlight_key[3];	//origin the cache was built for
+	CUTTex *owner_skin;		//AActor.Skin
+	CUTTex *multi_skin[8];	//AActor.MultiSkins
+	Bool loaded;
+	Bool faces_ok;		//TRUE if Faces/Wedges or classic Tris
+	U8	 name[64];
+};
+
+CUTLodMesh	ut_lod_player;
+CUTLodMesh	ut_lod_weapon;
+Bool		ut_lod_ready	= FALSE;
+Bool		ut_lod_zeroed	= FALSE;	//TRUE after first MemSet; Free safe thereafter
+
+U0 UTLodFree(CUTLodMesh *m)
+{
+	if (!m)
+		return;
+	if (m->verts)
+		Free(m->verts);
+	if (m->tri_i)
+		Free(m->tri_i);
+	if (m->tri_uv)
+		Free(m->tri_uv);
+	if (m->tri_mat)
+		Free(m->tri_mat);
+	if (m->vlight)
+		Free(m->vlight);
+	if (m->vnorm)
+		Free(m->vnorm);
+	MemSet(m, 0, sizeof(CUTLodMesh));
+}
+
+U0 UTLodUnpackVert(U32 pack, F64 *out)
+{//FMeshVert: X:11 Y:11 Z:10 signed
+	I64 x;
+	I64 y;
+	I64 z;
+
+	x = pack & 0x7FF;
+	y = (pack >> 11) & 0x7FF;
+	z = (pack >> 22) & 0x3FF;
+	if (x & 0x400)
+		x -= 0x800;
+	if (y & 0x400)
+		y -= 0x800;
+	if (z & 0x200)
+		z -= 0x400;
+	out[0] = ToF64(x);
+	out[1] = ToF64(y);
+	out[2] = ToF64(z);
+}
+
+Bool UTLodReadLazyElems(CUTArc *ar, U8 **out, I64 *out_n, I64 elem_size)
+{//TLazyArray<T> ver>61 eager: SeekPos, INDEX n, n*elem, Seek(SeekPos).
+	I64 seekpos;
+	I64 n;
+	I64 bytes;
+	U8 *p;
+	U8 *dst;
+
+	*out = NULL;
+	*out_n = 0;
+	if (elem_size < 1)
+		return FALSE;
+	if (ar->ver > 61)
+	{
+		seekpos = UTArcI32(ar);
+		n = UTArcIndex(ar);
+		if (ar->err || n < 0 || n > (1 << 24))
+			return FALSE;
+		bytes = n * elem_size;
+		if (bytes < 0 || ar->pos + bytes > ar->size)
+			return FALSE;
+		p = ar->data + ar->pos;
+		dst = CAlloc(bytes + 1);
+		MemCopy(dst, p, bytes);
+		ar->pos += bytes;
+		if (seekpos > 0 && seekpos <= ar->size)
+			ar->pos = seekpos;
+		*out = dst;
+		*out_n = n;
+		return TRUE;
+	}
+	n = UTArcIndex(ar);
+	if (ar->err || n < 0 || n > (1 << 24))
+		return FALSE;
+	bytes = n * elem_size;
+	p = UTArcPtr(ar, bytes);
+	if (!p)
+		return FALSE;
+	dst = CAlloc(bytes + 1);
+	MemCopy(dst, p, bytes);
+	*out = dst;
+	*out_n = n;
+	return TRUE;
+}
+
+Bool UTLodSkipLazy(CUTArc *ar, I64 elem_size)
+{//TLazyArray<T> ver>61: INT skip offset, INDEX n, n*elem. Offset is absolute
+ //in the file, so it is never a valid seek target inside an export slice.
+	I64 n;
+
+	if (ar->ver > 61)
+		UTArcI32(ar);
+	n = UTArcIndex(ar);
+	if (ar->err || n < 0 || n > (1 << 24))
+		return FALSE;
+	if (ar->pos + n * elem_size > ar->size)
+		return FALSE;
+	ar->pos += n * elem_size;
+	return TRUE;
+}
+
+Bool UTLodSkipTArrayWords(CUTArc *ar)
+{
+	I64 n;
+
+	n = UTArcIndex(ar);
+	if (ar->err || n < 0 || n > 200000)
+		return FALSE;
+	if (ar->pos + n * 2 > ar->size)
+		return FALSE;
+	ar->pos += n * 2;
+	return TRUE;
+}
+
+Bool UTLodReadFacesAsTris(CUTArc *ar, CUTLodMesh *m, I64 fv)
+{//Faces + CollapseWedge + Wedges → tri indices into frame verts.
+	I64 nf;
+	I64 nc;
+	I64 nw;
+	I64 i;
+	I64 w0;
+	I64 w1;
+	I64 w2;
+	I64 iv0;
+	I64 iv1;
+	I64 iv2;
+	U8 *faces;
+	U8 *wedges;
+	I64 *tri;
+	F64 *uv;
+	I64 *mat;
+	I64 nt;
+	I64 nm;
+
+	nf = UTArcIndex(ar);
+	if (ar->err || nf < 1 || nf > UT_LOD_MAX_TRIS)
+		return FALSE;
+	if (ar->pos + nf * 8 > ar->size)
+		return FALSE;
+	faces = ar->data + ar->pos;
+	ar->pos += nf * 8;
+	nc = UTArcIndex(ar);
+	if (ar->err || nc < 0 || ar->pos + nc * 2 > ar->size)
+		return FALSE;
+	ar->pos += nc * 2;
+	nw = UTArcIndex(ar);
+	if (ar->err || nw < 3 || nw > 200000)
+		return FALSE;
+	if (ar->pos + nw * 4 > ar->size)
+		return FALSE;
+	wedges = ar->data + ar->pos;
+	ar->pos += nw * 4;
+
+	tri = CAlloc(nf * 3 * sizeof(I64));
+	uv = CAlloc(nf * 6 * sizeof(F64));
+	mat = CAlloc(nf * sizeof(I64));
+	nt = 0;
+	i = 0;
+	while (i < nf)
+	{
+		w0 = UTRdU16(faces + i * 8);
+		w1 = UTRdU16(faces + i * 8 + 2);
+		w2 = UTRdU16(faces + i * 8 + 4);
+		if (w0 < nw && w1 < nw && w2 < nw)
+		{
+			iv0 = UTRdU16(wedges + w0 * 4);
+			iv1 = UTRdU16(wedges + w1 * 4);
+			iv2 = UTRdU16(wedges + w2 * 4);
+			if (iv0 < fv && iv1 < fv && iv2 < fv)
+			{
+				tri[nt * 3] = iv0;
+				tri[nt * 3 + 1] = iv1;
+				tri[nt * 3 + 2] = iv2;
+				//FMeshWedge is iVertex(U16) then U,V bytes; FMeshFace ends
+				//with MaterialIndex. Both were read and thrown away, which
+				//is why meshes could only be drawn in a flat colour.
+				uv[nt * 6]     = ToF64(wedges[w0 * 4 + 2] & 255);
+				uv[nt * 6 + 1] = ToF64(wedges[w0 * 4 + 3] & 255);
+				uv[nt * 6 + 2] = ToF64(wedges[w1 * 4 + 2] & 255);
+				uv[nt * 6 + 3] = ToF64(wedges[w1 * 4 + 3] & 255);
+				uv[nt * 6 + 4] = ToF64(wedges[w2 * 4 + 2] & 255);
+				uv[nt * 6 + 5] = ToF64(wedges[w2 * 4 + 3] & 255);
+				mat[nt] = UTRdU16(faces + i * 8 + 6);
+				nt++;
+			}
+		}
+		i++;
+	}
+	if (nt < 1)
+	{
+		Free(tri);
+		Free(uv);
+		Free(mat);
+		return FALSE;
+	}
+	m->tri_i = tri;
+	m->tri_uv = uv;
+	m->tri_mat = mat;
+	m->num_tris = nt;
+
+	//Materials follows Wedges. FMeshMaterial is PolyFlags(U32) TextureIndex(I32);
+	//TextureIndex selects the UMesh Textures entry, which is why a face's
+	//MaterialIndex alone cannot name a skin.
+	m->n_mat = 0;
+	nm = UTArcIndex(ar);
+	if (!ar->err && nm >= 0 && nm <= UT_LOD_MAX_SKIN &&
+		ar->pos + nm * 8 <= ar->size)
+	{
+		i = 0;
+		while (i < nm)
+		{
+			UTArcU32(ar);				//PolyFlags
+			m->mat_tex[i] = UTArcI32(ar);
+			i++;
+		}
+		m->n_mat = nm;
+	}
+	else
+		ar->err = FALSE;
+	return TRUE;
+}
+
+Bool UTLodFindFrameHeader(CUTArc *ar, I64 nv, I64 *fv, I64 *af)
+{//scan for FrameVerts AnimFrames AndFlags=FFFFFFFF OrFlags=0 with product==nv
+	I64 i;
+	I64 end;
+	I64 f;
+	I64 a;
+	U32 andf;
+	U32 orf;
+
+	*fv = 0;
+	*af = 0;
+	end = ar->size - 24;
+	i = ar->pos;
+	while (i < end)
+	{
+		f = UTRdI32(ar->data + i);
+		a = UTRdI32(ar->data + i + 4);
+		andf = UTRdU32(ar->data + i + 8);
+		orf = UTRdU32(ar->data + i + 12);
+		if (andf == 0xFFFFFFFF && orf == 0 && f > 0 && a > 0 &&
+			f <= UT_LOD_MAX_VERTS && a <= UT_LOD_MAX_FRAMES && f * a == nv)
+		{
+			*fv = f;
+			*af = a;
+			ar->pos = i + 16;
+			return TRUE;
+		}
+		i++;
+	}
+	return FALSE;
+}
+
+Bool UTLodParseAnimSeqs(CUTArc *ar, CUTPackage *pkg, CUTLodMesh *m)
+{
+	I64 nseq;
+	I64 i;
+	I64 ni;
+	I64 nn;
+	I64 j;
+	U8 *nm;
+
+	nseq = UTArcIndex(ar);
+	if (ar->err || nseq < 0 || nseq > UT_LOD_MAX_SEQ_FILE)
+		return FALSE;
+	m->n_seq = 0;
+	i = 0;
+	while (i < nseq)
+	{
+		ni = UTArcIndex(ar);
+		UTArcIndex(ar); //Group
+		if (m->n_seq < UT_LOD_MAX_SEQ)
+		{
+			nm = UTPkgNameStr(pkg, ni);
+			StrPrint(m->seq[m->n_seq].name, "%s", nm);
+			m->seq[m->n_seq].start = UTArcI32(ar);
+			m->seq[m->n_seq].num = UTArcI32(ar);
+		}
+		else
+		{
+			UTArcI32(ar);
+			UTArcI32(ar);
+		}
+		nn = UTArcIndex(ar);
+		if (ar->err || nn < 0 || nn > 64)
+			return FALSE;
+		j = 0;
+		while (j < nn)
+		{
+			UTArcF32(ar);
+			UTArcIndex(ar);
+			j++;
+		}
+		if (m->n_seq < UT_LOD_MAX_SEQ)
+		{
+			m->seq[m->n_seq].rate = UTArcF32(ar);
+			m->n_seq++;
+		}
+		else
+			UTArcF32(ar);
+		i++;
+	}
+	return !ar->err;
+}
+
+Bool UTLodBuildTrisFromClassic(U8 *tri_bytes, I64 nt, CUTLodMesh *m, I64 fv)
+{
+	I64 i;
+	I64 a;
+	I64 b;
+	I64 c;
+	I64 *tri;
+	I64 n;
+
+	if (nt < 1 || nt > UT_LOD_MAX_TRIS)
+		return FALSE;
+	tri = CAlloc(nt * 3 * sizeof(I64));
+	n = 0;
+	i = 0;
+	while (i < nt)
+	{
+		a = UTRdU16(tri_bytes + i * 20);
+		b = UTRdU16(tri_bytes + i * 20 + 2);
+		c = UTRdU16(tri_bytes + i * 20 + 4);
+		if (a < fv && b < fv && c < fv)
+		{
+			tri[n * 3] = a;
+			tri[n * 3 + 1] = b;
+			tri[n * 3 + 2] = c;
+			n++;
+		}
+		i++;
+	}
+	if (n < 1)
+	{
+		Free(tri);
+		return FALSE;
+	}
+	m->tri_i = tri;
+	m->num_tris = n;
+	return TRUE;
+}
+
+Bool UTLodSynthTris(CUTLodMesh *m, I64 fv)
+{//fan from vert0 when face tables absent
+	I64 i;
+	I64 n;
+	I64 *tri;
+
+	if (fv < 3)
+		return FALSE;
+	n = fv - 2;
+	if (n > UT_LOD_MAX_TRIS)
+		n = UT_LOD_MAX_TRIS;
+	tri = CAlloc(n * 3 * sizeof(I64));
+	i = 0;
+	while (i < n)
+	{
+		tri[i * 3] = 0;
+		tri[i * 3 + 1] = i + 1;
+		tri[i * 3 + 2] = i + 2;
+		i++;
+	}
+	m->tri_i = tri;
+	m->num_tris = n;
+	return TRUE;
+}
+
+Bool UTLodSeekCollapse(CUTArc *ar, I64 fv)
+{//after CurPoly/CurVertex: preamble then CollapsePointThus count≈ModelVerts≈fv
+	I64 saved;
+	I64 i;
+	I64 n;
+	I64 end;
+	I64 best_i;
+	I64 best_n;
+	I64 best_diff;
+
+	saved = ar->pos;
+	end = ar->pos + 128;
+	if (end > ar->size)
+		end = ar->size;
+	best_i = -1;
+	best_n = 0;
+	best_diff = fv + 1;
+	i = saved;
+	while (i < end)
+	{
+		ar->pos = i;
+		ar->err = FALSE;
+		n = UTArcIndex(ar);
+		if (!ar->err && n > 0 && n <= fv + 8 && ar->pos + n * 2 <= ar->size)
+		{
+			if (n == fv)
+			{
+				ar->pos += n * 2;
+				return TRUE;
+			}
+			if (n >= fv / 2)
+			{
+				if (fv - n < best_diff)
+				{
+					best_diff = fv - n;
+					best_i = i;
+					best_n = n;
+				}
+			}
+		}
+		i++;
+	}
+	if (best_i >= 0)
+	{
+		ar->pos = best_i;
+		ar->err = FALSE;
+		n = UTArcIndex(ar);
+		ar->pos += n * 2;
+		return TRUE;
+	}
+	ar->pos = saved;
+	ar->err = FALSE;
+	return FALSE;
+}
+
+Bool UTLodLoadExport(CUTPackage *pkg, I64 exp_i, CUTLodMesh *m)
+{
+	CUTArc ar;
+	CUTExport *e;
+	U8 *vbytes;
+	U8 *tbytes;
+	I64 nv;
+	I64 nt;
+	I64 fv;
+	I64 af;
+	I64 i;
+	F64 tmp[3];
+	Bool got_faces;
+	I64 tex_save;
+	I64 k;
+	I64 n;
+	U8 *sk_nm;
+
+	UTLodFree(m);
+	if (!pkg || !m || exp_i < 0 || exp_i >= pkg->export_count)
+		return FALSE;
+	e = &pkg->exports[exp_i];
+	if (!UTPkgArcExport(pkg, exp_i, &ar))
+		return FALSE;
+	UTPropSkipStack(&ar, e->object_flags);
+	if (!UTPropSkipAll(&ar, pkg))
+		ar.err = FALSE;
+
+	//UPrimitive: FBox(25) + FSphere(16)
+	if (ar.pos + 41 <= ar.size)
+		ar.pos += 41;
+
+	vbytes = NULL;
+	nv = 0;
+	if (!UTLodReadLazyElems(&ar, &vbytes, &nv, 4) || nv < 3)
+	{
+		if (vbytes) Free(vbytes);
+		return FALSE;
+	}
+	tbytes = NULL;
+	nt = 0;
+	if (!UTLodReadLazyElems(&ar, &tbytes, &nt, 20))
+	{
+		tbytes = NULL;
+		nt = 0;
+		ar.err = FALSE;
+	}
+
+	if (!UTLodParseAnimSeqs(&ar, pkg, m))
+	{
+		ar.err = FALSE;
+		m->n_seq = 0;
+	}
+
+	//UMesh::Serialize order after AnimSeqs (Engine/Src/UnMesh.cpp):
+	//  Connects, BoundingBox, BoundingSphere, VertLinks, Textures,
+	//  BoundingBoxes, BoundingSpheres, FrameVerts, AnimFrames
+	//Connects and VertLinks are TLazyArray, not TArray: an INT skip offset
+	//precedes the count. Reading that offset as the count desyncs the walk by
+	//4 bytes and Textures is never reached. Textures is the only authoritative
+	//source of a mesh's skins. The frame-header scan stays as the fallback.
+	//Verified forward on all 196 meshes in Botpack.u.
+	tex_save = ar.pos;
+	m->n_skin_ref = 0;
+	if (UTLodSkipLazy(&ar, 8))				//Connects
+	{
+		ar.pos += 25;						//BoundingBox
+		ar.pos += 12;						//BoundingSphere centre
+		if (pkg->file_version > 61)
+			ar.pos += 4;					//radius
+		if (UTLodSkipLazy(&ar, 4))			//VertLinks
+		{
+			n = UTArcIndex(&ar);			//Textures
+			if (!ar.err && n >= 0 && n <= UT_LOD_MAX_SKIN)
+			{
+				k = 0;
+				while (k < n && !ar.err)
+				{
+					m->skin_ref[k] = UTArcIndex(&ar);
+					k++;
+				}
+				m->n_skin_ref = k;
+			}
+			else
+				ar.err = TRUE;
+		}
+		else
+			ar.err = TRUE;
+	}
+	else
+		ar.err = TRUE;
+	if (ar.err || m->n_skin_ref < 1)
+	{
+		ar.err = FALSE;
+		ar.pos = tex_save;
+		m->n_skin_ref = 0;
+	}
+
+	if (!UTLodFindFrameHeader(&ar, nv, &fv, &af))
+	{
+		//fallback: All seq length
+		if (m->n_seq > 0 && m->seq[0].num > 0 && (nv % m->seq[0].num) == 0)
+		{
+			af = m->seq[0].num;
+			fv = nv / af;
+		}
+		else
+		{
+			Free(vbytes);
+			if (tbytes) Free(tbytes);
+			return FALSE;
+		}
+	}
+	else
+	{
+		//Scale Origin RotOrigin CurPoly CurVertex
+		m->scale[0] = UTArcF32(&ar);
+		m->scale[1] = UTArcF32(&ar);
+		m->scale[2] = UTArcF32(&ar);
+		m->origin[0] = UTArcF32(&ar);
+		m->origin[1] = UTArcF32(&ar);
+		m->origin[2] = UTArcF32(&ar);
+		UTArcI32(&ar); //pitch
+		m->rot_yaw = UTArcI32(&ar);
+		UTArcI32(&ar); //roll
+		UTArcI32(&ar); UTArcI32(&ar); //CurPoly CurVertex
+	}
+	if (m->scale[0] == 0.0) m->scale[0] = 1.0;
+	if (m->scale[1] == 0.0) m->scale[1] = 1.0;
+	if (m->scale[2] == 0.0) m->scale[2] = 1.0;
+
+	m->frame_verts = fv;
+	m->anim_frames = af;
+	m->verts = CAlloc(nv * 3 * sizeof(F64));
+	i = 0;
+	while (i < nv)
+	{
+		UTLodUnpackVert(UTRdU32(vbytes + i * 4), tmp);
+		m->verts[i * 3] = tmp[0];
+		m->verts[i * 3 + 1] = tmp[1];
+		m->verts[i * 3 + 2] = tmp[2];
+		i++;
+	}
+	Free(vbytes);
+
+	got_faces = FALSE;
+	m->faces_ok = FALSE;
+	if (nt > 0 && tbytes)
+		got_faces = UTLodBuildTrisFromClassic(tbytes, nt, m, fv);
+	if (tbytes)
+		Free(tbytes);
+
+	if (!got_faces)
+	{
+		if (UTLodSeekCollapse(&ar, fv))
+		{
+			if (UTLodSkipTArrayWords(&ar))
+				got_faces = UTLodReadFacesAsTris(&ar, m, fv);
+		}
+	}
+	if (got_faces)
+		m->faces_ok = TRUE;
+	else
+		UTLodSynthTris(m, fv);
+
+	StrPrint(m->name, "%s", UTPkgNameStr(pkg, e->name_index));
+	m->frame = 0.0;
+	m->seq_i = 0;
+	m->draw_yaw = 0;
+	i = 0;
+	while (i < m->n_seq)
+	{
+		if (!StrCompare(m->seq[i].name, "WalkLg") ||
+			!StrCompare(m->seq[i].name, "WalkLgFr") ||
+			!StrCompare(m->seq[i].name, "Walk") ||
+			!StrCompare(m->seq[i].name, "RunLg") ||
+			!StrCompare(m->seq[i].name, "Still") ||
+			!StrCompare(m->seq[i].name, "All"))
+		{
+			m->seq_i = i;
+			m->frame = ToF64(m->seq[i].start);
+			break;
+		}
+		i++;
+	}
+	//UMesh Textures entries are object refs: negative = import (the skin
+	//lives in another package), positive = export in this one. Resolving by
+	//name through the texture catalog covers both.
+	//Every entry is resolved: a face picks one via Materials[MaterialIndex].
+	//Entry 0 is commonly None (PulseGun3rd is {None, JPulse3rd_01}), so the
+	//default skin is the first entry that resolves, not slot 0.
+	m->skin = NULL;
+	k = 0;
+	while (k < m->n_skin_ref)
+	{
+		m->skin_tex[k] = NULL;
+		if (m->skin_ref[k])
+		{
+			sk_nm = UTLinkObjName(pkg, m->skin_ref[k]);
+			if (sk_nm && sk_nm[0])
+				m->skin_tex[k] = UTLinkLoadTex(sk_nm);
+			UTLog("UTLod: %s tex[%d] '%s' -> %d\n", m->name, k,
+				sk_nm, m->skin_tex[k] != NULL);
+		}
+		if (!m->skin && m->skin_tex[k])
+			m->skin = m->skin_tex[k];
+		k++;
+	}
+	m->loaded = TRUE;
+	UTLog("UTLod: %s verts=%d frames=%d tris=%d fv=%d seqs=%d faces=%d\n",
+		m->name, nv, af, m->num_tris, fv, m->n_seq, m->faces_ok);
+	return TRUE;
+}
+
+Bool UTLodLoadNamed(U8 *pkg_path, U8 *mesh_name, CUTLodMesh *m)
+{
+	CUTPackage *pkg;
+	I64 i;
+	Bool ok;
+
+	pkg = UTPkgLoad(pkg_path);
+	if (!pkg)
+		return FALSE;
+	i = UTPkgFindExport(pkg, "LodMesh", mesh_name);
+	if (i < 0)
+		i = UTPkgFindExport(pkg, "Mesh", mesh_name);
+	if (i < 0)
+		i = UTPkgFindExportClass(pkg, "LodMesh");
+	ok = FALSE;
+	if (i >= 0)
+		ok = UTLodLoadExport(pkg, i, m);
+	UTPkgFree(pkg);
+	return ok;
+}
+
+U0 UTLodSetSeq(CUTLodMesh *m, U8 *name)
+{
+	I64 i;
+
+	if (!m || !m->loaded || !name)
+		return;
+	i = 0;
+	while (i < m->n_seq)
+	{
+		if (!StrCompare(m->seq[i].name, name))
+		{
+			m->seq_i = i;
+			m->frame = ToF64(m->seq[i].start);
+			ut_vm_anim_finished = FALSE;
+			return;
+		}
+		i++;
+	}
+}
+
+U0 UTLodSetSeqFirst(CUTLodMesh *m)
+{//Pick Walk/Run/All/Breath/Still — first matching AnimSeq.
+	if (!m || !m->loaded)
+		return;
+	m->seq_i = -1;
+	UTLodSetSeq(m, "WalkLg");
+	if (m->seq_i >= 0) return;
+	UTLodSetSeq(m, "Walk");
+	if (m->seq_i >= 0) return;
+	UTLodSetSeq(m, "Run");
+	if (m->seq_i >= 0) return;
+	UTLodSetSeq(m, "All");
+	if (m->seq_i >= 0) return;
+	UTLodSetSeq(m, "Breath");
+	if (m->seq_i >= 0) return;
+	UTLodSetSeq(m, "Still");
+	if (m->seq_i >= 0) return;
+	if (m->n_seq > 0)
+	{
+		m->seq_i = 0;
+		m->frame = ToF64(m->seq[0].start);
+	}
+}
+
+U0 UTLodGetFrameVert(CUTLodMesh *m, I64 frame, I64 vi, F64 *out)
+{
+	I64 base;
+	F64 *p;
+	F64 x;
+	F64 y;
+	F64 z;
+	F64 yaw;
+	F64 cy;
+	F64 sy;
+	F64 rx;
+	F64 ry;
+	F64 ax[3];
+	F64 ay[3];
+	F64 az[3];
+
+	if (!m || !m->loaded || vi < 0 || vi >= m->frame_verts)
+	{
+		UTVecSet(out, 0, 0, 0);
+		return;
+	}
+	if (frame < 0) frame = 0;
+	if (frame >= m->anim_frames)
+		frame = m->anim_frames - 1;
+	base = (frame * m->frame_verts + vi) * 3;
+	p = m->verts + base;
+	x = p[0] * m->scale[0];
+	y = p[1] * m->scale[1];
+	z = p[2] * m->scale[2];
+	//Full FRotator basis when the mesh carries pitch or roll: the first-person
+	//weapon is welded to ViewRotation and yaw alone left it world-upright
+	//while its origin swung with the view. UTGetAxes rows are the rotated
+	//axes, so a local point is x*X + y*Y + z*Z.
+	if (m->draw_pitch || m->draw_roll)
+	{
+		UTGetAxes(m->draw_pitch, m->rot_yaw + m->draw_yaw, m->draw_roll,
+			ax, ay, az);
+		out[0] = x * ax[0] + y * ay[0] + z * az[0] +
+			m->origin[0] + m->draw_origin[0];
+		out[1] = x * ax[1] + y * ay[1] + z * az[1] +
+			m->origin[1] + m->draw_origin[1];
+		out[2] = x * ax[2] + y * ay[2] + z * az[2] +
+			m->origin[2] + m->draw_origin[2];
+		return;
+	}
+	//RotOrigin.Yaw then actor draw_yaw (Unreal rot → rad)
+	yaw = ToF64((m->rot_yaw + m->draw_yaw) & 0xFFFF) * UT_ROT2RAD;
+	cy = Cos(yaw);
+	sy = Sin(yaw);
+	rx = x * cy - y * sy;
+	ry = x * sy + y * cy;
+	out[0] = rx + m->origin[0] + m->draw_origin[0];
+	out[1] = ry + m->origin[1] + m->draw_origin[1];
+	out[2] = z + m->origin[2] + m->draw_origin[2];
+}
+
+U0 UTLodGetFrameVertLerp(CUTLodMesh *m, F64 frame, I64 vi, F64 *out)
+{//GetFrame skin — lerp adjacent anim frames for SoftDrv mesh polish.
+	I64 f0;
+	I64 f1;
+	F64 t;
+	F64 a[3];
+	F64 b[3];
+
+	if (!m || !m->loaded)
+	{
+		UTVecSet(out, 0, 0, 0);
+		return;
+	}
+	if (m->anim_frames < 2)
+	{
+		UTLodGetFrameVert(m, 0, vi, out);
+		return;
+	}
+	f0 = ToI64(frame);
+	if (f0 < 0) f0 = 0;
+	if (f0 >= m->anim_frames)
+		f0 = m->anim_frames - 1;
+	f1 = f0 + 1;
+	if (f1 >= m->anim_frames)
+		f1 = 0;
+	t = frame - ToF64(f0);
+	if (t < 0.0) t = 0.0;
+	if (t > 1.0) t = 1.0;
+	UTLodGetFrameVert(m, f0, vi, a);
+	UTLodGetFrameVert(m, f1, vi, b);
+	out[0] = a[0] + (b[0] - a[0]) * t;
+	out[1] = a[1] + (b[1] - a[1]) * t;
+	out[2] = a[2] + (b[2] - a[2]) * t;
+}
+
+U0 UTLodTick(CUTLodMesh *m, F64 dt, F64 fps)
+{
+	CUTLodSeq *s;
+	F64 rate;
+	F64 endf;
+
+	if (!m || !m->loaded || m->anim_frames < 2)
+		return;
+	rate = fps;
+	if (m->seq_i >= 0 && m->seq_i < m->n_seq)
+	{
+		s = &m->seq[m->seq_i];
+		if (s->rate > 0.0)
+			rate = s->rate;
+		m->frame += dt * rate;
+		endf = ToF64(s->start + s->num);
+		if (s->num > 0)
+		{
+			while (m->frame >= endf)
+			{
+				m->frame -= ToF64(s->num);
+				ut_vm_anim_finished = TRUE;
+			}
+			if (m->frame < ToF64(s->start))
+				m->frame = ToF64(s->start);
+			return;
+		}
+	}
+	m->frame += dt * rate;
+	while (m->frame >= ToF64(m->anim_frames))
+		m->frame -= ToF64(m->anim_frames);
+}
+
+U0 UTLodBuildVertLight(CUTLodMesh *m)
+{//= FLightManager::Light (UnLight.cpp), evaluated per vertex once per pose.
+ //  G  = Square(1 + (LightVector | Normal)/LightSize) - 1.5, clamped at 0
+ //  G *= 1 - LightSize * RRadius
+ //  Color += FloatColor * G, then Color = min(Color + Ambient, 1)
+ //The specular term is view dependent and is not computed here; it is absent
+ //rather than approximated. Sampling this per triangle corner, as the old
+ //scalar did, evaluated every light four times per face.
+	I64 nv;
+	I64 i;
+	I64 t;
+	I64 a;
+	I64 b;
+	I64 cc;
+	F64 pa[3];
+	F64 pb[3];
+	F64 pc[3];
+	F64 e0[3];
+	F64 e1[3];
+	F64 nr[3];
+	F64 nl;
+	F64 lv[3];
+	F64 lsq;
+	F64 lsize;
+	F64 dt;
+	F64 g;
+	F64 lr;
+	F64 lg;
+	F64 lb;
+	F64 acc[3];
+	CUTLight *L;
+	I64 li;
+
+	if (!m || !m->loaded || m->frame_verts < 1)
+		return;
+	nv = m->frame_verts;
+	if (!m->vnorm)
+		m->vnorm = CAlloc(nv * 3 * sizeof(F64));
+	if (!m->vlight)
+		m->vlight = CAlloc(nv * 3 * sizeof(F64));
+	MemSet(m->vnorm, 0, nv * 3 * sizeof(F64));
+	//Vertex normals accumulate the unnormalised face normals, so larger faces
+	//weigh more; that is the usual result of summing cross products.
+	t = 0;
+	while (t < m->num_tris)
+	{
+		a = m->tri_i[t * 3];
+		b = m->tri_i[t * 3 + 1];
+		cc = m->tri_i[t * 3 + 2];
+		if (a < nv && b < nv && cc < nv)
+		{
+			UTLodGetFrameVertLerp(m, m->frame, a, pa);
+			UTLodGetFrameVertLerp(m, m->frame, b, pb);
+			UTLodGetFrameVertLerp(m, m->frame, cc, pc);
+			e0[0] = pb[0] - pa[0]; e0[1] = pb[1] - pa[1]; e0[2] = pb[2] - pa[2];
+			e1[0] = pc[0] - pa[0]; e1[1] = pc[1] - pa[1]; e1[2] = pc[2] - pa[2];
+			nr[0] = e0[1] * e1[2] - e0[2] * e1[1];
+			nr[1] = e0[2] * e1[0] - e0[0] * e1[2];
+			nr[2] = e0[0] * e1[1] - e0[1] * e1[0];
+			i = 0;
+			while (i < 3)
+			{
+				m->vnorm[a * 3 + i] += nr[i];
+				m->vnorm[b * 3 + i] += nr[i];
+				m->vnorm[cc * 3 + i] += nr[i];
+				i++;
+			}
+		}
+		t++;
+	}
+	i = 0;
+	while (i < nv)
+	{
+		UTLodGetFrameVertLerp(m, m->frame, i, pa);
+		nl = Sqrt(m->vnorm[i * 3] * m->vnorm[i * 3] +
+			m->vnorm[i * 3 + 1] * m->vnorm[i * 3 + 1] +
+			m->vnorm[i * 3 + 2] * m->vnorm[i * 3 + 2]);
+		if (nl < 0.000001)
+			nl = 1.0;
+		nr[0] = m->vnorm[i * 3] / nl;
+		nr[1] = m->vnorm[i * 3 + 1] / nl;
+		nr[2] = m->vnorm[i * 3 + 2] / nl;
+		acc[0] = 0.0;
+		acc[1] = 0.0;
+		acc[2] = 0.0;
+		li = 0;
+		while (li < ut_light_n)
+		{
+			L = &ut_lights[li];
+			if (L->active && L->radius > 1.0)
+			{
+				lv[0] = L->origin[0] - pa[0];
+				lv[1] = L->origin[1] - pa[1];
+				lv[2] = L->origin[2] - pa[2];
+				lsq = lv[0] * lv[0] + lv[1] * lv[1] + lv[2] * lv[2];
+				if (lsq < L->radius * L->radius)
+				{
+					lsize = Sqrt(lsq);
+					if (lsize < 0.001)
+						lsize = 0.001;
+					dt = (lv[0] * nr[0] + lv[1] * nr[1] +
+						lv[2] * nr[2]) / lsize;
+					g = (1.0 + dt) * (1.0 + dt) - 1.5;
+					if (g < 0.0)
+						g = 0.0;
+					g = g * (1.0 - lsize / L->radius);
+					if (g > 0.0)
+					{
+						UTLightHueRGB(L->hue, L->sat, &lr, &lg, &lb);
+						acc[0] += lr * L->bright * g;
+						acc[1] += lg * L->bright * g;
+						acc[2] += lb * L->bright * g;
+					}
+				}
+			}
+			li++;
+		}
+		t = 0;
+		while (t < 3)
+		{
+			if (acc[t] > 1.0)
+				acc[t] = 1.0;
+			m->vlight[i * 3 + t] = acc[t];
+			t++;
+		}
+		i++;
+	}
+	m->vlight_ok = TRUE;
+	UTVecCopy(m->draw_origin, m->vlight_key);
+}
+
+CUTTex *UTLodFaceTex(CUTLodMesh *m, I64 count)
+{//UnMesh.h UMesh::GetTexture: MultiSkins wins, then Textures[count] for a
+ //nonzero count, then the owner's Skin, then Textures[count]. Slot 0 is
+ //skipped deliberately: BulletBoxM points its material at a None entry and
+ //relies on falling through to Skin.
+	if (!m)
+		return NULL;
+	if (count >= 0 && count < 8 && m->multi_skin[count])
+		return m->multi_skin[count];
+	if (count != 0 && count >= 0 && count < m->n_skin_ref &&
+		m->skin_tex[count])
+		return m->skin_tex[count];
+	if (m->owner_skin)
+		return m->owner_skin;
+	if (count >= 0 && count < m->n_skin_ref)
+		return m->skin_tex[count];
+	return NULL;
+}
+
+U0 UTLodDraw(CUTCanvas *c, CUTLodMesh *m, I64 color)
+{//= SoftDrv DrawGouraudPolygon mesh: frame-lerp + N·L + vertex light.
+	CUTTex *skin;
+	I64 i;
+	I64 a;
+	I64 b;
+	I64 cc;
+	F64 pa[3];
+	F64 pb[3];
+	F64 pc[3];
+	F64 ab[3];
+	F64 ac[3];
+	F64 nrm[3];
+	F64 eye[3];
+	F64 view[3];
+	F64 centroid[3];
+	F64 facing;
+	F64 nlen;
+	F64 sa;
+	F64 sb;
+	F64 sc;
+	F64 face_s;
+	I64 shade;
+	I64 col;
+	I64 prev_flags;
+	F64 us;
+	I64 mi;
+	I64 ti;
+	CUTTex *pick;
+
+	if (!c || !m || !m->loaded)
+		return;
+	//Facet state leaks into the span loop; meshes carry no lightmap and are
+	//lit per vertex.
+	ut_draw_unlit = FALSE;
+	ut_lm_ptr = NULL;
+	if (!m->vlight_ok || m->vlight_key[0] != m->draw_origin[0] ||
+		m->vlight_key[1] != m->draw_origin[1] ||
+		m->vlight_key[2] != m->draw_origin[2])
+		UTLodBuildVertLight(m);
+	UTVecCopy(c->origin, eye);
+	us = 64.0;
+	prev_flags = ut_draw_poly_flags;
+	ut_draw_poly_flags = prev_flags | UT_DRAW_PF_MASKED;
+	i = 0;
+	while (i < m->num_tris)
+	{
+		a = m->tri_i[i * 3];
+		b = m->tri_i[i * 3 + 1];
+		cc = m->tri_i[i * 3 + 2];
+		if (a >= 0 && a < m->frame_verts &&
+			b >= 0 && b < m->frame_verts &&
+			cc >= 0 && cc < m->frame_verts)
+		{
+			UTLodGetFrameVertLerp(m, m->frame, a, pa);
+			UTLodGetFrameVertLerp(m, m->frame, b, pb);
+			UTLodGetFrameVertLerp(m, m->frame, cc, pc);
+			ab[0] = pb[0] - pa[0];
+			ab[1] = pb[1] - pa[1];
+			ab[2] = pb[2] - pa[2];
+			ac[0] = pc[0] - pa[0];
+			ac[1] = pc[1] - pa[1];
+			ac[2] = pc[2] - pa[2];
+			nrm[0] = ab[1] * ac[2] - ab[2] * ac[1];
+			nrm[1] = ab[2] * ac[0] - ab[0] * ac[2];
+			nrm[2] = ab[0] * ac[1] - ab[1] * ac[0];
+			nlen = Sqrt(nrm[0] * nrm[0] + nrm[1] * nrm[1] + nrm[2] * nrm[2]);
+			view[0] = eye[0] - pa[0];
+			view[1] = eye[1] - pa[1];
+			view[2] = eye[2] - pa[2];
+			facing = nrm[0] * view[0] + nrm[1] * view[1] + nrm[2] * view[2];
+			centroid[0] = (pa[0] + pb[0] + pc[0]) / 3.0;
+			centroid[1] = (pa[1] + pb[1] + pc[1]) / 3.0;
+			centroid[2] = (pa[2] + pb[2] + pc[2]) / 3.0;
+			//Vertex light carries N.L already; a second facing term on
+			//top of it was invention. facing survives only to tint the
+			//untextured fallback below.
+			//Per-vertex light from the cache; the scalar sampler ran every
+			//light four times a face and was not the engine's model.
+			sa = m->vlight[a * 3] * 0.299 + m->vlight[a * 3 + 1] * 0.587 +
+				m->vlight[a * 3 + 2] * 0.114;
+			sb = m->vlight[b * 3] * 0.299 + m->vlight[b * 3 + 1] * 0.587 +
+				m->vlight[b * 3 + 2] * 0.114;
+			sc = m->vlight[cc * 3] * 0.299 + m->vlight[cc * 3 + 1] * 0.587 +
+				m->vlight[cc * 3 + 2] * 0.114;
+			face_s = (sa + sb + sc) / 3.0;
+			if (ut_tex_ready && ut_tex_checker.num_mips > 0)
+			{
+				//Wedge UVs from the mesh, not a synthetic mapping. Skin per
+				//face: FMeshFace.MaterialIndex -> Materials[].TextureIndex ->
+				//Textures[]. PulseGunR needs this; its materials are AmmoLed,
+				//JPulseGun_02 and JPulseGun_03.
+				skin = &ut_tex_checker;
+				ti = 0;
+				if (m->tri_mat && m->n_mat > 0)
+				{
+					mi = m->tri_mat[i];
+					if (mi >= 0 && mi < m->n_mat)
+						ti = m->mat_tex[mi];
+				}
+				pick = UTLodFaceTex(m, ti);
+				if (pick && pick->num_mips > 0)
+					skin = pick;
+				else if (m->skin && m->skin->num_mips > 0)
+					skin = m->skin;
+				if (m->tri_uv)
+					UTDrawTriTexShade3(c, pa, pb, pc,
+						m->tri_uv[i * 6], m->tri_uv[i * 6 + 1],
+						m->tri_uv[i * 6 + 2], m->tri_uv[i * 6 + 3],
+						m->tri_uv[i * 6 + 4], m->tri_uv[i * 6 + 5],
+						sa, sb, sc, skin, NULL);
+				else
+					UTDrawTriTexShade3(c, pa, pb, pc,
+						0.0, 0.0, us, 0.0, 0.0, us,
+						sa, sb, sc, skin, NULL);
+			}
+			else
+			{
+				col = color;
+				if (facing < 0.0)
+					col = color / 2;
+				else
+				{
+					col = color + ToI64(ToF64(i & 7) * 3.0);
+					if (col > 250) col = 250;
+				}
+				shade = UTPalShadeIndex(col & 255, face_s);
+				UTDrawTri3(c, pa, pb, pc, shade);
+			}
+		}
+		i++;
+	}
+	ut_draw_poly_flags = prev_flags;
+}
+
+U0 UTLodInit()
+{//Globals not zeroed. Free only after first MemSet (ut_lod_zeroed).
+	if (ut_lod_zeroed)
+	{
+		UTLodFree(&ut_lod_player);
+		UTLodFree(&ut_lod_weapon);
+	}
+	else
+	{
+		MemSet(&ut_lod_player, 0, sizeof(CUTLodMesh));
+		MemSet(&ut_lod_weapon, 0, sizeof(CUTLodMesh));
+		ut_lod_zeroed = TRUE;
+	}
+	ut_lod_ready = FALSE;
+	if (UTLodLoadNamed("::/Apps/UT99/System/Botpack.u", "Soldier",
+		&ut_lod_player))
+		ut_lod_ready = TRUE;
+	else if (UTLodLoadNamed("::/Apps/UT99/System/Botpack.u", "Commando",
+		&ut_lod_player))
+		ut_lod_ready = TRUE;
+	else if (UTLodLoadNamed("::/Apps/UT99/System/UnrealShare.u", "Male3",
+		&ut_lod_player))
+		ut_lod_ready = TRUE;
+	else if (UTLodLoadNamed("::/Apps/UT99/System/UnrealShare.u", "Nali1",
+		&ut_lod_player))
+		ut_lod_ready = TRUE;
+
+	if (ut_lod_player.loaded)
+		UTLodSetSeqFirst(&ut_lod_player);
+
+	//PulseGunR is the right-hand first-person mesh; PulseGun3rd is the
+	//third-person one and is authored at a scale meant to be seen across a
+	//room, not at the PlayerViewOffset distance.
+	if (!UTLodLoadNamed("::/Apps/UT99/System/Botpack.u", "PulseGunR",
+		&ut_lod_weapon))
+		UTLodLoadNamed("::/Apps/UT99/System/Botpack.u", "PulseGun3rd",
+			&ut_lod_weapon);
+	if (!ut_lod_weapon.loaded)
+		UTLodLoadNamed("::/Apps/UT99/System/Botpack.u", "ASMD2M",
+			&ut_lod_weapon);
+	if (!ut_lod_weapon.loaded)
+		UTLodLoadNamed("::/Apps/UT99/System/UnrealShare.u", "ASMDM",
+			&ut_lod_weapon);
+	if (ut_lod_weapon.loaded)
+		UTLodSetSeqFirst(&ut_lod_weapon);
+	UTLog("UTLod: player=%d weapon=%d\n",
+		ut_lod_player.loaded, ut_lod_weapon.loaded);
+}
+
+U0 UTLodExit()
+{
+	if (ut_lod_zeroed)
+	{
+		UTLodFree(&ut_lod_player);
+		UTLodFree(&ut_lod_weapon);
+	}
+	ut_lod_ready = FALSE;
+}
+
+//Weapon.PlayerViewMesh for the held weapon. One slot: switching weapons
+//reloads it, so the mesh always matches ut_weap_cur instead of the PulseGun
+//that was hardcoded at boot.
+U8 ut_lod_weap_mesh_cur[48];
+
+Bool UTLodBindViewMesh(U8 *name)
+{
+	if (!name || !name[0])
+		return ut_lod_weapon.loaded;
+	if (!StrCompare(ut_lod_weap_mesh_cur, name))
+		return ut_lod_weapon.loaded;
+	UTLodFree(&ut_lod_weapon);
+	MemSet(&ut_lod_weapon, 0, sizeof(CUTLodMesh));
+	if (!UTLodLoadNamed("::/Apps/UT99/System/Botpack.u", name, &ut_lod_weapon))
+		UTLodLoadNamed("::/Apps/UT99/System/UnrealShare.u", name,
+			&ut_lod_weapon);
+	if (ut_lod_weapon.loaded)
+	{
+		UTLodSetSeqFirst(&ut_lod_weapon);
+		StrPrint(ut_lod_weap_mesh_cur, "%s", name);
+		UTLog("UTLod: view mesh %s\n", name);
+	}
+	return ut_lod_weapon.loaded;
+}

@@ -1,0 +1,509 @@
+// QFmt.ZC - little-endian readers for on-disk quake structures
+//
+// ZealC is F64-only and its postfix casts are no-ops, so never overlay a class
+// on raw file bytes. pull every field out by hand
+
+U16 QRdU16(U8 *p)
+{
+	return p[0] | (p[1] << 8);
+}
+
+I64 QRdI16(U8 *p)
+{//texinfo and clipnodes store signed shorts
+	I64 v = p[0] | (p[1] << 8);
+
+	if (v & 0x8000)
+		v -= 0x10000;
+
+	return v;
+}
+
+U32 QRdU32(U8 *p)
+{
+	return p[0] | (p[1] << 8) | (p[2] << 16) | (p[3] << 24);
+}
+
+I64 QRdI32(U8 *p)
+{//sign extended 32 bit
+	I64 v = QRdU32(p);
+
+	if (v & 0x80000000)
+		v -= 0x100000000;
+
+	return v;
+}
+
+F64 QF32Bits(U32 b)
+{//binary32 bit pattern -> F64, exact and no pow()
+ //
+ //the reinterpret goes through a postfix pointer cast, not MemCopy. this runs
+ //two or three times per QuakeC statement and the call overhead alone was the
+ //bulk of the VM's cost
+	I64 sgn = b >> 31;
+	I64 exp = (b >> 23) & 0xFF;
+	I64 man = b & 0x7FFFFF;
+	I64 d;
+
+	if (!exp)
+		d = sgn << 63;			//zero or denormal, flush to zero
+	else if (exp == 255)
+		d = sgn << 63;			//no inf/nan in valid map data
+	else
+		d = (sgn << 63) | ((exp + 896) << 52) | (man << 29);	//896 = 1023-127
+
+	return *(&d)(F64 *);
+}
+
+F64 QRdF32(U8 *p)
+{//binary32 at an unaligned byte address
+	return QF32Bits(QRdU32(p));
+}
+
+U32 QWrF32(F64 v)
+{//inverse of QRdF32, the quakec global pool is 32 bit cells written in place
+ //rounds to nearest, underflow to zero, overflow to inf
+	I64 bits;
+	I64 sgn;
+	I64 exp;
+	I64 man;
+
+	bits = *(&v)(I64 *);
+
+	sgn = (bits >> 63) & 1;
+	exp = (bits >> 52) & 0x7FF;
+	man = bits & 0xFFFFFFFFFFFFF;
+
+	if (!exp)
+		return sgn << 31;			//zero or denormal, flush to zero
+
+	if (exp == 0x7FF)
+		return (sgn << 31) | 0x7F800000;	//inf/nan -> inf
+
+	exp -= 896;						//rebias 1023 to 127
+
+	if (exp <= 0)
+		return sgn << 31;			//underflows binary32
+
+	if (exp >= 255)
+		return (sgn << 31) | 0x7F800000;
+
+	//round to nearest on the bit below the 23 bit mantissa
+	man += 0x10000000;
+	if (man > 0xFFFFFFFFFFFFF)
+	{
+		//carried into the exponent
+		man = 0;
+		exp++;
+		if (exp >= 255)
+			return (sgn << 31) | 0x7F800000;
+	}
+
+	return (sgn << 31) | (exp << 23) | (man >> 29);
+}
+
+U0 QRdVec(U8 *p, F64 *out)
+{//three binary32s -> F64[3]
+	out[0] = QRdF32(p);
+	out[1] = QRdF32(p + 4);
+	out[2] = QRdF32(p + 8);
+}
+
+U0 QStrCopy(U8 *dst, U8 *src, I64 max)
+{//no StrNCopy in the kernel, and map values overrun the fixed fields
+	I64 i = 0;
+
+	if (max <= 0)
+		return;
+
+	while (i < max - 1 && src[i])
+	{
+		dst[i] = src[i];
+		i++;
+	}
+
+	dst[i] = 0;
+}
+
+//--- diagnostics -----------------------------------------------------------
+// DocClear on window open wipes startup prints, and a crash takes the console
+// with it. accumulate here and flush to a file that survives both
+
+//FileWrite has no append, so the ENTIRE log lives in memory and a flush
+//rewrites the file from byte 0. a fixed buffer therefore does not wrap - it
+//fills and stays full, and every line after that is discarded with no sign.
+//8K was reached inside one level, which silently ate trace output, the console
+//mirror and the teardown totals
+#define QLOG_CHUNK		65536
+#define QLOG_HARD_MAX	(8 * 1024 * 1024)
+
+//the log file is the record that matters, echo only if the console is readable
+Bool q_log_echo = FALSE;
+
+//set from the console with heapcheck 1, see QHeapCheck
+Bool q_heap_check_on = FALSE;
+
+//"diag 1": the per-second surf/sky/water tick. OFF by default because a flush
+//rewrites the WHOLE log file (FileWrite has no append), so a line per second
+//costs a full rewrite per second and the cost grows with the session
+Bool q_diag = FALSE;
+
+U8	*q_log_buf = NULL;
+I64	 q_log_len = 0;
+I64	 q_log_cap = 0;
+I64	 q_log_dropped = 0;		//lines lost after the hard cap, reported at flush
+
+//bytes already on disk. FileWrite has no append, so a flush rewrites the whole
+//buffer from byte 0 - a caller that flushes per frame writes the entire log
+//every frame, and the cost grows with the log
+I64	 q_log_flushed = 0;
+
+U0 QLogInit()
+{//ZealC IGNORES a declaration initialiser on a global, so the pointer below
+ //starts as garbage. every "have I allocated yet" test here reads it, and a
+ //non-NULL garbage value means the buffer is never allocated and Free() is
+ //handed the garbage - a general protection fault inside the allocator
+	q_log_buf     = NULL;
+	q_log_cap     = 0;
+	q_log_len     = 0;
+	q_log_flushed = 0;
+	q_log_dropped = 0;
+	q_diag        = FALSE;
+}
+
+U0 QLogReset()
+{
+	if (!q_log_buf)
+	{
+		q_log_cap = QLOG_CHUNK;
+		q_log_buf = MAlloc(q_log_cap);
+	}
+
+	q_log_len     = 0;
+	q_log_flushed = 0;
+	q_log_dropped = 0;
+	q_log_buf[0]  = 0;
+}
+
+Bool QLogRoom(I64 need)
+{//grow to hold need bytes, or report there is no room
+	U8 *neu;
+
+	if (!q_log_buf)
+		QLogReset;
+
+	//the allocation can still have failed, and MemCopy below would read NULL
+	if (!q_log_buf || q_log_cap < 1)
+		return FALSE;
+
+	if (need <= q_log_cap)
+		return TRUE;
+
+	if (q_log_cap >= QLOG_HARD_MAX)
+		return FALSE;
+
+	//cap is non-zero by the guard above, so this terminates
+	while (q_log_cap < need && q_log_cap < QLOG_HARD_MAX)
+		q_log_cap += q_log_cap;
+
+	if (q_log_cap > QLOG_HARD_MAX)
+		q_log_cap = QLOG_HARD_MAX;
+
+	neu = MAlloc(q_log_cap);
+	if (!neu)
+		return FALSE;
+
+	MemCopy(neu, q_log_buf, q_log_len + 1);
+	Free(q_log_buf);
+	q_log_buf = neu;
+
+	return ToBool(need <= q_log_cap);
+}
+
+U0 QLog(U8 *s)
+{//one preformatted line, caller does the StrPrint
+	I64 n = StrLen(s);
+
+	if (!QLogRoom(q_log_len + n + 1))
+	{
+		q_log_dropped++;
+		return;
+	}
+
+	MemCopy(q_log_buf + q_log_len, s, n);
+	q_log_len += n;
+	q_log_buf[q_log_len] = 0;
+
+	//echo off by default. appending to the terminal DolDoc grows with the map
+	//and touches OS state from a task whose heap is about to be torn down,
+	//which lines up with the quit-after-playing crash
+	//
+	//HACK: a raw dollar sign (0x24) in a runtime string is a DolDoc command and
+	//eats document structure. it must never appear literally in this source
+	//either - the lexer pairs them before tokenising, across file boundaries,
+	//and surfaces as a syntax error in some unrelated file
+	if (q_log_echo)
+		"%s", s;
+}
+
+//diskwrite 0 from the console, a bisect for the crash on quit after a map has
+//been loaded: still crashing with writes off means the teardown Frees
+Bool q_disk_writes = TRUE;
+
+//set while a startup config is executing. every bind inside default.cfg would
+//otherwise write itself to the user's config, so a mod's defaults would
+//permanently replace the keys the player chose
+Bool q_cfg_exec = FALSE;
+
+U0 QLogFlush()
+{//eager, so a later crash still leaves the evidence on disk
+	if (!q_disk_writes)
+		return;
+
+	//nothing new since the last write, and the write is the whole file
+	if (q_log_len == q_log_flushed)
+		return;
+
+	if (q_log_len > 0)
+	{
+		FileWrite("::/Apps/QuakePlus/QUAKELOG.TXT", q_log_buf, q_log_len);
+		q_log_flushed = q_log_len;
+	}
+}
+
+//--- guarded allocations ---
+//
+//QHeapCheck validates block HEADERS, so it cannot see a write that lands in
+//the middle of a live block - which is what a render overrun does. these pad
+//every large buffer and stamp a magic past the end; whichever one dies names
+//the buffer, and its fill code is small enough to read.
+//
+//the pad is past what the caller asked for, so callers index exactly as before
+#define QGUARD_MAGIC	0x5175616B65477264	//'QuakeGrd'
+#define QGUARD_PAD		32
+
+I64 q_guard_n		= 0;			//live guarded blocks
+I64 q_guard_bad		= 0;
+
+U0 QGuardInit()
+{//declaration initialisers on globals are ignored
+	q_guard_n   = 0;
+	q_guard_bad = 0;
+}
+
+U8 *QGuardAlloc(I64 bytes)
+{//MAlloc plus a trailing magic. Free with QGuardFree, never Free
+	U8 *p;
+
+	if (bytes < 0)
+		return NULL;
+
+	p = MAlloc(bytes + QGUARD_PAD);
+	if (!p)
+		return NULL;
+
+	//size in the pad too, so a report can say how far past the end it ran
+	*(p + bytes)(I64 *)		= QGUARD_MAGIC;
+	*(p + bytes + 8)(I64 *)	= bytes;
+
+	q_guard_n++;
+	return p;
+}
+
+Bool QGuardCheck(U8 *p, I64 bytes, U8 *what)
+{//TRUE when intact. names the buffer and the size it was given
+	U8	 line[160];
+	I64	 magic;
+
+	if (!p)
+		return TRUE;
+
+	magic = *(p + bytes)(I64 *);
+	if (magic == QGUARD_MAGIC)
+		return TRUE;
+
+	q_guard_bad++;
+
+	StrPrint(line, "GUARD BROKEN: %s @%08X size %d, magic %08X\n",
+		what, p, bytes, magic);
+	QLog(line);
+	QLogFlush;
+
+	return FALSE;
+}
+
+U0 QGuardFree(U8 *p, I64 bytes, U8 *what)
+{//check, then release
+	if (!p)
+		return;
+
+	QGuardCheck(p, bytes, what);
+	q_guard_n--;
+	Free(p);
+}
+
+
+I64 QHeapCheck(U8 *where)
+{//walk the task heap, name the bad block and whoever allocated the one before
+ //
+ //off unless the heapcheck cvar is set, the sweep walks every live allocation
+ //and _CONFIG_HEAP_DEBUG slows every MAlloc. a hunting tool, not a monitor
+ //
+ //an overrun runs off one block into the header of the NEXT, so the block that
+ //reports a bad header is the victim and its predecessor is the culprit.
+ //_CONFIG_HEAP_DEBUG carries caller1, the return address that asked for it
+	CMemUsed	*m;
+	CMemUsed	*head;
+	CMemUsed	*prev = NULL;
+	CHeapCtrl	*hc;
+	U8			 line[200];
+	I64			 n = 0;
+
+	hc = Fs->data_heap;
+	if (!hc || !q_heap_check_on)
+		return 0;
+
+#if _CONFIG_HEAP_DEBUG
+	head = (&hc->next_um)(U8 *) - offset(CMemUsed.next);
+	m    = hc->next_um;
+
+	while (m != head)
+	{
+		//cheap tests first. IsInHeapCtrl walks the block list with the heap
+		//locked and interrupts off, O(blocks x mem_blks) if called per block.
+		//owner back-pointer and a sane size catch nearly every overrun alone
+		if (m->hc != hc || m->size < sizeof(CMemUsed) ||
+			m->size > 0x40000000 || !IsInHeapCtrl(m, hc))
+		{
+			StrPrint(line,
+				"HEAP CORRUPT at %s: block %d @%08X size %d\n",
+				where, n, m, m->size);
+			QLog(line);
+
+			if (prev)
+			{
+				StrPrint(line,
+					"  previous block @%08X size %d alloced by %08X / %08X\n",
+					prev, prev->size, prev->caller1, prev->caller2);
+				QLog(line);
+			}
+
+			QLogFlush;
+			return -1;
+		}
+
+		prev = m;
+		n++;
+
+		if (n > 2000000)
+		{
+			StrPrint(line, "HEAP CORRUPT at %s: used list cycles\n", where);
+			QLog(line);
+			QLogFlush;
+			return -1;
+		}
+
+		m = m->next;
+	}
+
+	StrPrint(line, "heap ok at %s: %d blocks\n", where, n);
+	QLog(line);
+	QLogFlush;
+	return n;
+#else
+	if (HeapCtrlWalk(hc))
+		StrPrint(line, "heap ok at %s - FREE LISTS ONLY, "
+			"set _CONFIG_HEAP_DEBUG in KernelA.HH\n", where);
+	else
+		StrPrint(line, "HEAP CORRUPT at %s (free lists)\n", where);
+
+	QLog(line);
+	QLogFlush;
+	return 0;
+#endif
+}
+
+
+F64 QAtoF(U8 *s)
+{//local decimal parser for map entity values and "*N" brush model refs,
+ //kernel string-to-float behaviour isn't trustworthy here
+	F64  sign  = 1.0;
+	F64  value = 0.0;
+	F64  scale = 0.1;
+	I64  i     = 0;
+
+	while (s[i] == ' ' || s[i] == '\t')
+		i++;
+
+	if (s[i] == '-')
+	{
+		sign = -1.0;
+		i++;
+	}
+	else if (s[i] == '+')
+		i++;
+
+	while ('0' <= s[i] <= '9')
+	{
+		value = value * 10.0 + ToF64(s[i] - '0');
+		i++;
+	}
+
+	if (s[i] == '.')
+	{
+		i++;
+		while ('0' <= s[i] <= '9')
+		{
+			value += ToF64(s[i] - '0') * scale;
+			scale *= 0.1;
+			i++;
+		}
+	}
+
+	return sign * value;
+}
+
+U0 QParseVec(U8 *s, F64 *out)
+{//"480 -352 88" -> three F64s
+	U8  tok[64];
+	I64 i = 0;
+	I64 n = 0;
+	I64 k;
+
+	out[0] = 0.0;
+	out[1] = 0.0;
+	out[2] = 0.0;
+
+	while (s[i] && n < 3)
+	{
+		while (s[i] == ' ' || s[i] == '\t')
+			i++;
+
+		k = 0;
+		while (s[i] && s[i] != ' ' && s[i] != '\t' && k < 63)
+		{
+			tok[k] = s[i];
+			k++;
+			i++;
+		}
+		tok[k] = 0;
+
+		if (k > 0)
+		{
+			out[n] = QAtoF(tok);
+			n++;
+		}
+	}
+}
+
+U0 QRdName(U8 *p, U8 *out, I64 max)
+{//fixed width nul padded on-disk name -> nul terminated
+	I64 i = 0;
+
+	while (i < max - 1 && p[i])
+	{
+		out[i] = p[i];
+		i++;
+	}
+
+	out[i] = 0;
+}

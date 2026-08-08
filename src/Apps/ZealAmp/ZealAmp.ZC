@@ -4,7 +4,7 @@
 //z-clipped draw_it DC - no more raw text.fb_alias framebuffer pokes, so the
 //window drags, overlaps and stacks like any other.
 //
-//Audio: native AC'97 driver + mixer (System/AC97.ZC), 48kHz U32 (L16|R16)
+//Audio: native AC'97 driver + mixer (System/Audio/Driver/AC97.ZC), 48kHz U32 (L16|R16)
 //frames. Plays MP3 via the native pure-ZealC decoder (MP3.ZC - dr_mp3 ELF
 //blob replaced entirely), plus 16-bit PCM WAV (any rate, mono or stereo),
 //plus a built-in test-tone generator. <ESC> exits, T = tone.
@@ -30,6 +30,8 @@
 
 #define ZA_RATE			48000
 
+#define ZA_OGG_GAIN		32767.0		//full scale
+
 class CZAmpMedia
 {
 	U8		 title[256];
@@ -44,7 +46,7 @@ class CZAmpMedia
 	//MP3 streaming (decode-ahead): compressed file kept, decoded on the fly.
 	U8		*mp3_src;
 	I64		 mp3_size, src_rate;
-	Bool	 is_mp3, decoding;
+	Bool	 is_mp3, is_ogg, decoding;
 };
 
 class CZAmpMarquee
@@ -432,6 +434,7 @@ U0 ZAMediaFree()
 	zamp.media.pcm_frames = 0;
 	zamp.media.pcm_cap = 0;
 	zamp.media.is_mp3 = FALSE;
+	zamp.media.is_ogg = FALSE;
 }
 
 U0 ZAMediaSet(U32 *pcm, I64 frames, I64 channels, I64 src_khz, U8 *title)
@@ -641,6 +644,168 @@ Bool ZAWavBuf(U8 *raw, I64 size, U8 *filename)
 	return TRUE;
 }
 
+U0 ZAOggDecodeTask()
+{//Decode-ahead: one audio packet at a time, linear-resample to 48kHz, append
+//to pcm_data. Mirrors ZADecodeTask.
+	F64	 phase = 0.0, step;
+	F64	*pcm_l, *pcm_r;
+	I64	 got, i, si, cl, cr, nl, nr;
+	F64	 last_l = 0.0, last_r = 0.0, frac, l, r;
+
+	//longest hop is blocksize1 / 2
+	pcm_l = MAlloc(VM_MAX_N * sizeof(F64));
+	pcm_r = MAlloc(VM_MAX_N * sizeof(F64));
+
+	step = ToF64(ogg_rate) / ZA_RATE;
+
+	while (zamp.media.decoding)
+	{
+		if (!OggNextPacket)
+			break;						//EOF
+
+		if (!VADecode(pcm_l, pcm_r, &got))
+			break;
+
+		if (ogg_channels == 1)
+			for (i = 0; i < got; i++)
+				pcm_r[i] = pcm_l[i];
+
+		//first audio packet primes the lap buffer and yields nothing
+		if (!got)
+			goto zaog_next;
+
+		while (phase < ToF64(got))
+		{
+			si   = phase;
+			frac = phase - ToF64(si);
+
+			if (!si)
+			{
+				cl = ToI64(last_l * ZA_OGG_GAIN);
+				cr = ToI64(last_r * ZA_OGG_GAIN);
+			}
+			else
+			{
+				cl = ToI64(pcm_l[si - 1] * ZA_OGG_GAIN);
+				cr = ToI64(pcm_r[si - 1] * ZA_OGG_GAIN);
+			}
+
+			nl = ToI64(pcm_l[si] * ZA_OGG_GAIN);
+			nr = ToI64(pcm_r[si] * ZA_OGG_GAIN);
+
+			if (zamp.media.pcm_frames >= zamp.media.pcm_cap)
+				break;
+
+			zamp.media.pcm_data[zamp.media.pcm_frames].i16[0] =
+				ClampI64(cl + ToI64((nl - cl) * frac), -32768, 32767);
+			zamp.media.pcm_data[zamp.media.pcm_frames].i16[1] =
+				ClampI64(cr + ToI64((nr - cr) * frac), -32768, 32767);
+			zamp.media.pcm_frames++;
+			phase += step;
+		}
+
+		phase -= ToF64(got);
+		last_l = pcm_l[got - 1];
+		last_r = pcm_r[got - 1];
+
+zaog_next:
+		if (!(zamp.media.pcm_frames & 0x3FFF))
+			Sleep(1);					//yield to the feed task and UI
+	}
+
+	Free(pcm_l);
+	Free(pcm_r);
+	zamp.media.decoding = FALSE;
+	zamp.decode_task    = NULL;
+}
+
+Bool ZAOggOpen(U8 *raw, I64 size, U8 *filename)
+{
+	I64	total, secs, est_frames;
+	U8	title[300];
+
+	OggFree;
+	OggInit;
+	VBFreeAll;
+	VBInit;
+	VSFreeAll;
+	VSInit;
+	VFInit;
+	VMInit;
+
+	if (size < 64)
+		return FALSE;
+
+	ogg_src  = raw;
+	ogg_size = size;
+
+	//OggHeaders walks all three packets; OggOpen would consume the first
+	if (!OggHeaders)
+	{
+		PopUpOk("Vorbis headers rejected.");
+		return FALSE;
+	}
+
+	if (ogg_channels < 1 || ogg_channels > 2 || ogg_blocksize1 > VM_MAX_N)
+	{
+		PopUpOk("Unsupported Vorbis stream layout.");
+		return FALSE;
+	}
+
+	//last page's granule position is the sample count
+	total = OggTotalSamples(raw, size);
+	secs  = total / MaxI64(1, ogg_rate);
+	est_frames = (secs + 8) * ZA_RATE;
+
+	ZAMediaFree;
+	zamp.media.mp3_src	 = raw;			//compressed source, freed by ZAMediaFree
+	zamp.media.mp3_size	 = size;
+	zamp.media.is_ogg	 = TRUE;
+	zamp.media.src_rate	 = ogg_rate;
+	zamp.media.channels	 = ogg_channels;
+	zamp.media.sample_rate_khz = ogg_rate / 1000;
+	zamp.media.bitrate_kbps = ogg_bitrate_nom / 1000;
+	zamp.media.pcm_cap	 = est_frames;
+	zamp.media.pcm_data	 = MAlloc(est_frames * sizeof(U32));
+	zamp.media.pcm_frames = 0;
+
+	//a 7 minute track at 48kHz stereo is 80MB in one block. a failed alloc
+	//leaves the feed task with nothing to read: silence, no crash, no error
+	if (!zamp.media.pcm_data)
+	{
+		StrPrint(title, "ogg: %d MB alloc failed",
+			est_frames * sizeof(U32) / 1024 / 1024);
+		PopUpOk(title);
+		zamp.media.pcm_cap = 0;
+		return FALSE;
+	}
+
+	//grow the packet buffer to its ceiling here, on the task that owns this
+	//heap. the decode task runs on another; MAlloc/Free across that boundary
+	//corrupts the heap, so OggPacketRoom must never reallocate once it starts
+	if (!OggPacketRoom(OGG_MAX_PACKET))
+	{
+		PopUpOk("ogg: packet buffer alloc failed.");
+		return FALSE;
+	}
+
+	zamp.media.runtime_mins = secs / 60;
+	zamp.media.runtime_secs = secs % 60;
+
+	StrCopy(zamp.media.title, ZABasename(filename));
+	StrPrint(title, "1. %s (%02d:%02d) *** ", zamp.media.title,
+		zamp.media.runtime_mins, zamp.media.runtime_secs);
+	ZAMarqueeSet(title);
+	ZASeekTo(0);
+	zamp.media.stopped = FALSE;
+	zamp.media.paused  = FALSE;
+
+	zamp.media.decoding = TRUE;
+	zamp.decode_task = Spawn(&ZAOggDecodeTask, NULL, "ZealAmp Ogg Decode", 2);
+
+	return TRUE;
+}
+
 Bool ZAMp3Open(U8 *raw, I64 size, U8 *filename)
 {//Start decode-ahead MP3 streaming: keep the compressed file, decode one
 //frame to learn the format + prove it's valid, then let ZADecodeTask run.
@@ -704,6 +869,12 @@ Bool ZAOpenFile(U8 *filename)
 	{
 		ok = ZAWavBuf(raw, size, filename); //Copies samples out.
 		Free(raw);
+	}
+	else if (!MemCompare(raw, "OggS", 4))
+	{
+		ok = ZAOggOpen(raw, size, filename); //On success, owns raw for streaming.
+		if (!ok)
+			Free(raw);
 	}
 	else
 	{
