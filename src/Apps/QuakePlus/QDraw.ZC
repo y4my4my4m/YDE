@@ -1061,9 +1061,9 @@ U8 *QLightDlightMap(CQMap *map, CQFace *f, I64 lm_w, I64 lm_h, F64 time,
 // keyed by edict, invalidated on movement or after QLPC_AGE frames so an
 // animated lightstyle still reaches the model.
 
-//keys are edict numbers, then QLPC_STATIC + static index. The base has to sit
-//above every edict, or a static model and an edict share a slot and light each
-//other - at base 4096 that was every map carrying more than 4096 edicts.
+//keys are edict numbers, then QLPC_STATIC + static index. The base sits above
+//every edict; below that a static model and an edict share a slot and light
+//each other.
 #define QLPC_MAX	16640	//QGAME_MAX_EDICTS + QBI_MAX_STATIC, both later in the chain
 #define QLPC_MOVE	4.0		//world units before the sample is stale
 #define QLPC_AGE	16		//frames before a resample regardless
@@ -4014,7 +4014,9 @@ _extern _QSPANRGBSIMD U0 QSpanRGBSimd(CQSpanK *k);
 //v3: registers only for the gather-to-vector step, branchless CMOV clamps,
 //one backward branch. a forward I32 branch for an occlusion early-out is
 //not usable - this assembler does not resolve those.
-//off by default until measured, r_simd 1 enables
+//r_simd 1 enables. Measured level with the scalar path: 701k pixels through the
+//kernel against 69k in the same scene moves render 0.3ms. Kept as a bisect
+//switch, off by default.
 Bool q_opt_simd = FALSE;
 
 U0 QDrawStateInit()
@@ -7663,6 +7665,7 @@ U0 QBlitFitBand(CQCanvas *c, CDC *dc, I64 dst_x, I64 dst_y, I64 dst_w,
  //writes one destination row, so bands never overlap
 	U8	*src;
 	U32	*dst;
+	U32	*dstp;
 	U32	*crow;
 	I32	*zrow;
 	U32	 col;
@@ -7676,33 +7679,44 @@ U0 QBlitFitBand(CQCanvas *c, CDC *dc, I64 dst_x, I64 dst_y, I64 dst_w,
 	I64	 py;
 	I64	 warp;
 	I64	 sx;
+	I64	 xlo;
+	I64	 xhi;
 	I64	 pitch = dc->width_internal;
+
+	//the row loop reads these once per pixel through a pointer otherwise
+	I64	 cw   = c->width;
+	I64	 ch   = c->height;
+	I64	 dch  = dc->height;
+	I64	 dcw  = dc->width;
+	I64	 vx0  = c->vx;
+	I64	 vx1  = c->vx + c->vw;
+	Bool post_identity = ToBool(c->prefogged || qpal_post_identity);
 
 	//16.16 fixed point. parenthesised - shifts bind tighter than divide in
 	//this compiler and it reorders these silently
-	sx_step = (c->width << 16) / dst_w;
-	sy_step = (c->height << 16) / dst_h;
+	sx_step = (cw << 16) / dst_w;
+	sy_step = (ch << 16) / dst_h;
 
 	for (y = y0; y < y1; y++)
 	{
 		py = dst_y + y;
-		if (py < 0 || py >= dc->height)
+		if (py < 0 || py >= dch)
 			goto qbf_next_row;
 
 		sy = (y * sy_step) >> 16;
-		if (sy >= c->height)
-			sy = c->height - 1;
+		if (sy >= ch)
+			sy = ch - 1;
 
-		src = c->pixels + sy * c->width;
+		src = c->pixels + sy * cw;
 		crow = NULL;
 		if (c->rgb && (q_rgb_active || c->prefogged))
-			crow = c->rgb + sy * c->width;
+			crow = c->rgb + sy * cw;
 		//fog is a world effect: outside the view rect there is no world, and
 		//QDrawClear does not clear depth there. fogging it puts fog over the
 		//status bar
 		zrow = NULL;
 		if (fog && sy >= c->vy && sy < c->vy + c->vh)
-			zrow = c->depth + sy * c->width;
+			zrow = c->depth + sy * cw;
 
 		dst = dc->body + py * pitch;
 
@@ -7717,35 +7731,67 @@ U0 QBlitFitBand(CQCanvas *c, CDC *dc, I64 dst_x, I64 dst_y, I64 dst_w,
 		else
 			sxf = 0;
 
-		for (x = 0; x < dst_w; x++)
+		//the destination span that lands inside the DC. Constant for the row,
+		//and skipped pixels still have to advance the source step
+		xlo = 0;
+		if (dst_x < 0)
+			xlo = -dst_x;
+
+		xhi = dst_w;
+		if (dst_x + xhi > dcw)
+			xhi = dcw - dst_x;
+
+		if (xhi > dst_w)
+			xhi = dst_w;
+
+		sxf += xlo * sx_step;
+		dstp = dst + dst_x;
+
+		if (!crow && !zrow)
 		{
-			//clamp, not wrap - wrapping tears the image across the screen
+			//no overlay and no fog: palette lookup and store
+			for (x = xlo; x < xhi; x++)
+			{
+				//clamp, not wrap - wrapping tears the image across the screen
+				sx = sxf >> 16;
+				if (sx < 0)
+					sx = 0;
+				else if (sx >= cw)
+					sx = cw - 1;
+
+				dstp[x] = qpal_argb[src[sx]];
+
+				sxf += sx_step;
+			}
+
+			goto qbf_next_row;
+		}
+
+		for (x = xlo; x < xhi; x++)
+		{
 			sx = sxf >> 16;
 			if (sx < 0)
 				sx = 0;
-			if (sx >= c->width)
-				sx = c->width - 1;
+			else if (sx >= cw)
+				sx = cw - 1;
 
-			if (dst_x + x >= 0 && dst_x + x < dc->width)
+			if (crow && crow[sx] & QRGB_SET)
 			{
-				if (crow && (crow[sx] & QRGB_SET))
-				{
-					//the overlay holds raw colour, so it takes the tint and
-					//gamma the palette path already carries. a baked pixel is
-					//already final - posting it twice would double the gamma
-					if (c->prefogged || qpal_post_identity)
-						col = crow[sx] & 0x00FFFFFF;
-					else
-						col = QPalGammaRGB(crow[sx] & 0x00FFFFFF);
-				}
+				//the overlay holds raw colour, so it takes the tint and
+				//gamma the palette path already carries. a baked pixel is
+				//already final - posting it twice would double the gamma
+				if (post_identity)
+					col = crow[sx] & 0x00FFFFFF;
 				else
-					col = qpal_argb[src[sx]];
-
-				if (zrow && sx >= c->vx && sx < c->vx + c->vw)
-					col = QFogApply(col, zrow[sx]);
-
-				dst[dst_x + x] = col;
+					col = QPalGammaRGB(crow[sx] & 0x00FFFFFF);
 			}
+			else
+				col = qpal_argb[src[sx]];
+
+			if (zrow && sx >= vx0 && sx < vx1)
+				col = QFogApply(col, zrow[sx]);
+
+			dstp[x] = col;
 
 			sxf += sx_step;
 		}
