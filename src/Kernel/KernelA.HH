@@ -4316,6 +4316,18 @@ public class CSysFixedArea
 #define RAWF_SHOW_DOLLAR	4
 #define RAWF_SCROLL 		8
 
+//A glyph is height rows of row_bytes bytes, bit n of a row = column n; a font
+//is 256 glyphs end to end. At 8x8, row_bytes is 1 and a U64[256] table is
+//byte-identical to the bitmap, so sys_font_std is adopted, not converted.
+//FontGlyphRows() is the only reader of this layout.
+public class CFont
+{
+	U8		*name;
+	I64		 width, height;	//glyph box, pixels
+	I64		 row_bytes;		//(width + 7) / 8
+	U8		*bitmap;		//256 * height * row_bytes
+};
+
 public class CTextGlobals
 {
 	I64 	 raw_col, raw_flags;
@@ -4324,8 +4336,20 @@ public class CTextGlobals
 	U64 	*font, *aux_font, screen_size, buffer_size;
 	U8		 border_chars[16];
 	Bool	 is_fb_busy;
+	//Last field. Added after the shipped kernel binary was built; every field
+	//above keeps the offset that binary uses.
+	CFont	*cur_font;		//same glyphs as font, described
 };
 
+//Size of the built-in glyph tables.
+#define KFONT_WIDTH		8
+#define KFONT_HEIGHT	8
+
+//Cell size the kernel is compiled against. At boot KMain redefines both from
+//the selected font; DefineLoad's HashAdd puts the new entry in front, so
+//everything compiled from StartOS onward sees the live size and folds it to a
+//literal. Same mechanism GrGlobals.ZC uses for TEXT_ROWS. Kernel code is AOT
+//and never sees the injected pair; it calls FontW()/FontH().
 #define FONT_WIDTH		8
 #define FONT_HEIGHT 	8
 
