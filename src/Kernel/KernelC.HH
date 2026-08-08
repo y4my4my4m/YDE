@@ -108,6 +108,16 @@ extern			U8		*StrPrintHex(U8 *dst, I64 num;I64 width);
 #help_index "Char;Debugging/Raw Output;TextBase Layer/Char"
 public extern CTextGlobals text;
 
+#help_index "Char;TextBase Layer/Char"
+public extern CFont sys_font, sys_font_alt, sys_font16;
+public extern U0   FontSet(CFont *f);
+public extern U0   FontAltToggle();
+public extern I64  FontW();
+public extern I64  FontH();
+public extern U8  *FontGlyphRows(CFont *f, I64 ch);
+public extern I64  FontRow(CFont *f, I64 ch, I64 row);
+public extern U0   FontInit();
+
 #help_index "Compiler/Lex"
 public extern U0 HashSrcFileSet(CCompCtrl *cc, CHashSrcSym *h, I64 line_num_offset=0);
 
