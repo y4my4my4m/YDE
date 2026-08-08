@@ -56,6 +56,222 @@ U0 QClipLinkClear()
 	MemSet(q_link_set, 0, QCLIP_MAX_LINK);
 }
 
+//--- area tree -------------------------------------------------------------
+//
+// SV_LinkEdict's areanode tree. Every trace used to scan all q_pr_num_edicts;
+// at 8192 edicts and a few thousand traces a frame that is twenty million box
+// tests, and it was the whole server step. The tree descends to the edicts
+// whose boxes can actually overlap the move.
+//
+// Reference hangs an intrusive link_t off the edict. Edicts here are raw bytes
+// with no room for one, so the lists live in parallel arrays keyed by edict
+// number - same O(1) insert and remove, no allocation.
+//
+// Reference uses depth 4 for a few hundred edicts. Eight thousand want more
+// splits or the leaves hold hundreds each.
+#define QAREA_DEPTH		6
+#define QAREA_NODES		128		//2^(DEPTH+1) - 1 = 127
+
+I64		q_area_axis[QAREA_NODES];			//-1 = leaf
+F64		q_area_dist[QAREA_NODES];
+I64		q_area_child[QAREA_NODES * 2];
+I64		q_area_solid_head[QAREA_NODES];		//edict number, -1 = empty
+I64		q_area_trig_head[QAREA_NODES];
+I64		q_area_count = 0;
+
+I64		q_area_node[QCLIP_MAX_LINK];		//which node, -1 = unlinked
+I64		q_area_next[QCLIP_MAX_LINK];
+I64		q_area_prev[QCLIP_MAX_LINK];
+Bool	q_area_trig[QCLIP_MAX_LINK];		//which of the node's two lists
+
+I64 QAreaCreate(I64 depth, F64 *mins, F64 *maxs)
+{//SV_CreateAreaNode. returns the node index
+	I64	n;
+	I64	axis;
+	I64	j;
+	F64	mins1[3];
+	F64	maxs1[3];
+	F64	mins2[3];
+	F64	maxs2[3];
+
+	if (q_area_count >= QAREA_NODES)
+		return 0;
+
+	n = q_area_count;
+	q_area_count++;
+
+	q_area_solid_head[n] = -1;
+	q_area_trig_head[n]  = -1;
+	q_area_child[n * 2]     = -1;
+	q_area_child[n * 2 + 1] = -1;
+
+	if (depth == QAREA_DEPTH)
+	{
+		q_area_axis[n] = -1;
+		return n;
+	}
+
+	//split the longer of x/y, as reference does - z is never chosen, maps are
+	//wider than they are tall
+	if (maxs[0] - mins[0] > maxs[1] - mins[1])
+		axis = 0;
+	else
+		axis = 1;
+
+	q_area_axis[n] = axis;
+	q_area_dist[n] = 0.5 * (maxs[axis] + mins[axis]);
+
+	for (j = 0; j < 3; j++)
+	{
+		mins1[j] = mins[j];		maxs1[j] = maxs[j];
+		mins2[j] = mins[j];		maxs2[j] = maxs[j];
+	}
+
+	maxs1[axis] = q_area_dist[n];
+	mins2[axis] = q_area_dist[n];
+
+	//child 0 is the far side, child 1 the near side - matches the descent in
+	//QAreaLink and the recursion order in QClipToAreaNode
+	q_area_child[n * 2]     = QAreaCreate(depth + 1, mins2, maxs2);
+	q_area_child[n * 2 + 1] = QAreaCreate(depth + 1, mins1, maxs1);
+
+	return n;
+}
+
+U0 QAreaClear(CQMap *map)
+{//SV_ClearWorld. globals aren't zeroed, so this also has to run before any
+ //link, not just on a map change
+	I64	i;
+	F64	mins[3];
+	F64	maxs[3];
+
+	q_area_count = 0;
+
+	for (i = 0; i < QCLIP_MAX_LINK; i++)
+	{
+		q_area_node[i] = -1;
+		q_area_next[i] = -1;
+		q_area_prev[i] = -1;
+		q_area_trig[i] = FALSE;
+	}
+
+	for (i = 0; i < QAREA_NODES; i++)
+	{
+		q_area_axis[i]          = -1;
+		q_area_dist[i]          = 0.0;
+		q_area_child[i * 2]     = -1;
+		q_area_child[i * 2 + 1] = -1;
+		q_area_solid_head[i]    = -1;
+		q_area_trig_head[i]     = -1;
+	}
+
+	//no map yet: q_area_count stays 0 and the trace falls back to a linear pass
+	if (!map)
+		return;
+
+	for (i = 0; i < 3; i++)
+	{
+		mins[i] = map->models[0].mins[i];
+		maxs[i] = map->models[0].maxs[i];
+	}
+
+	QAreaCreate(0, mins, maxs);
+}
+
+U0 QAreaUnlink(I64 ent)
+{//RemoveLink
+	I64 node;
+	I64 nx;
+	I64 pv;
+
+	if (ent < 0 || ent >= QCLIP_MAX_LINK)
+		return;
+
+	node = q_area_node[ent];
+	if (node < 0)
+		return;
+
+	nx = q_area_next[ent];
+	pv = q_area_prev[ent];
+
+	if (pv >= 0)
+		q_area_next[pv] = nx;
+	else if (q_area_trig[ent])
+		q_area_trig_head[node] = nx;
+	else
+		q_area_solid_head[node] = nx;
+
+	if (nx >= 0)
+		q_area_prev[nx] = pv;
+
+	q_area_node[ent] = -1;
+	q_area_next[ent] = -1;
+	q_area_prev[ent] = -1;
+}
+
+U0 QAreaLink(I64 ent, F64 *mins, F64 *maxs, I64 solid)
+{//SV_LinkEdict's tree half. mins/maxs are the finished absmin/absmax
+	I64	 n = 0;
+	I64	 axis;
+	I64	 head;
+	Bool trig;
+
+	if (ent <= 0 || ent >= QCLIP_MAX_LINK)
+		return;
+
+	QAreaUnlink(ent);
+
+	if (!q_area_count)
+		return;
+
+	//SOLID_NOT is not in the world as far as a trace is concerned. QuakeC that
+	//raises .solid without a setorigin/setsize is only picked up by the next
+	//QGameLinkAll - one frame late, and reference has the same property
+	if (solid == QSOLID_NOT_)
+		return;
+
+	//descend to the first node whose split the box crosses
+	while (TRUE)
+	{
+		axis = q_area_axis[n];
+		if (axis < 0)
+			break;
+
+		if (mins[axis] > q_area_dist[n])
+			n = q_area_child[n * 2];
+		else if (maxs[axis] < q_area_dist[n])
+			n = q_area_child[n * 2 + 1];
+		else
+			break;
+
+		if (n < 0)
+		{
+			n = 0;
+			break;
+		}
+	}
+
+	trig = ToBool(solid == QSOLID_TRIGGER_);
+
+	if (trig)
+		head = q_area_trig_head[n];
+	else
+		head = q_area_solid_head[n];
+
+	q_area_trig[ent] = trig;
+	q_area_node[ent] = n;
+	q_area_prev[ent] = -1;
+	q_area_next[ent] = head;
+
+	if (head >= 0)
+		q_area_prev[head] = ent;
+
+	if (trig)
+		q_area_trig_head[n] = ent;
+	else
+		q_area_solid_head[n] = ent;
+}
+
 U0 QClipPrecacheReset()
 {//globals aren't zeroed
 	I64 i;
@@ -323,12 +539,10 @@ U0 QClipMoveToBox(F64 *bmins, F64 *bmaxs, F64 *mins, F64 *maxs, F64 *start,
 		trace->end_pos[i] = start[i] + (end[i] - start[i]) * enter;
 }
 
-U0 QClipToEntities(CQMap *map, F64 *start, F64 *end, F64 *mins, F64 *maxs,
-	I64 pass, Bool nomonsters, CQTrace *trace)
-{//narrow an existing world trace with every solid edict in the way
- //
- //SV_ClipToLinks without the area tree - the edict count is small enough that
- //a linear pass beats maintaining the links
+U0 QClipToOneEdict(CQMap *map, I64 i, F64 *start, F64 *end, F64 *mins,
+	F64 *maxs, I64 pass, Bool nomonsters, F64 *boxmins, F64 *boxmaxs,
+	CQTrace *trace)
+{//SV_ClipMoveToEntity for one candidate, narrowing trace if it hits sooner
 	CQTrace	tr;
 	F64		eorg[3];
 	F64		eofs[3];
@@ -336,33 +550,11 @@ U0 QClipToEntities(CQMap *map, F64 *start, F64 *end, F64 *mins, F64 *maxs,
 	I64		ehull;
 	F64		emins[3];
 	F64		emaxs[3];
-	I64		i;
 	I64		j;
 	I64		solid;
 	I64		model;
-	F64		boxmins[3];
-	F64		boxmaxs[3];
 	Bool	miss;
 
-	//SV_Move's boxmins/boxmaxs: the volume the move sweeps, padded by 1.
-	//without the area tree this is the only cheap reject there is, and the
-	//cost of the scan is edicts times traces - hundreds of each per step
-	for (j = 0; j < 3; j++)
-	{
-		if (end[j] > start[j])
-		{
-			boxmins[j] = start[j] + mins[j] - 1.0;
-			boxmaxs[j] = end[j]   + maxs[j] + 1.0;
-		}
-		else
-		{
-			boxmins[j] = end[j]   + mins[j] - 1.0;
-			boxmaxs[j] = start[j] + maxs[j] + 1.0;
-		}
-	}
-
-	//from 1: QTraceEntity already traced edict 0 through the real world hull
-	for (i = 1; i < q_pr_num_edicts; i++)
 	{
 		if (q_pr_edict_free[i] || i == pass)
 			goto qc_next;
@@ -491,6 +683,81 @@ U0 QClipToEntities(CQMap *map, F64 *start, F64 *end, F64 *mins, F64 *maxs,
 
 qc_next:
 	}
+}
+
+U0 QClipToAreaNode(I64 n, CQMap *map, F64 *start, F64 *end, F64 *mins,
+	F64 *maxs, I64 pass, Bool nomonsters, F64 *boxmins, F64 *boxmaxs,
+	CQTrace *trace)
+{//SV_ClipToLinks. solids only - triggers are on their own list and are never
+ //obstacles, which is the whole reason reference keeps the two apart
+	I64 i;
+	I64 next;
+	I64 axis;
+
+	if (n < 0)
+		return;
+
+	i = q_area_solid_head[n];
+	while (i >= 0)
+	{
+		//read the successor first: a trace must not care, but the list is the
+		//same one QuakeC can relink from a touch further up the call
+		next = q_area_next[i];
+
+		QClipToOneEdict(map, i, start, end, mins, maxs, pass, nomonsters,
+			boxmins, boxmaxs, trace);
+
+		i = next;
+	}
+
+	axis = q_area_axis[n];
+	if (axis < 0)
+		return;
+
+	if (boxmaxs[axis] > q_area_dist[n])
+		QClipToAreaNode(q_area_child[n * 2], map, start, end, mins, maxs,
+			pass, nomonsters, boxmins, boxmaxs, trace);
+
+	if (boxmins[axis] < q_area_dist[n])
+		QClipToAreaNode(q_area_child[n * 2 + 1], map, start, end, mins, maxs,
+			pass, nomonsters, boxmins, boxmaxs, trace);
+}
+
+U0 QClipToEntities(CQMap *map, F64 *start, F64 *end, F64 *mins, F64 *maxs,
+	I64 pass, Bool nomonsters, CQTrace *trace)
+{//narrow an existing world trace with every solid edict in the way
+	I64	i;
+	I64	j;
+	F64	boxmins[3];
+	F64	boxmaxs[3];
+
+	//SV_Move's boxmins/boxmaxs: the volume the move sweeps, padded by 1
+	for (j = 0; j < 3; j++)
+	{
+		if (end[j] > start[j])
+		{
+			boxmins[j] = start[j] + mins[j] - 1.0;
+			boxmaxs[j] = end[j]   + maxs[j] + 1.0;
+		}
+		else
+		{
+			boxmins[j] = end[j]   + mins[j] - 1.0;
+			boxmaxs[j] = start[j] + maxs[j] + 1.0;
+		}
+	}
+
+	if (q_area_count)
+	{
+		QClipToAreaNode(0, map, start, end, mins, maxs, pass, nomonsters,
+			boxmins, boxmaxs, trace);
+		return;
+	}
+
+	//no tree built yet - demo playback and the first frames of a load. from 1:
+	//QTraceEntity already traced edict 0 through the real world hull
+	for (i = 1; i < q_pr_num_edicts; i++)
+		QClipToOneEdict(map, i, start, end, mins, maxs, pass, nomonsters,
+			boxmins, boxmaxs, trace);
 }
 
 U0 QTraceEntity(CQMap *map, F64 *start, F64 *end, F64 *mins, F64 *maxs,
@@ -1294,6 +1561,10 @@ U0 QGameLinkEdict(I64 ent)
 
 		q_link_solid[ent] = ToI64(QPrFieldF(ent, q_fld_solid));
 		q_link_set[ent]   = TRUE;
+
+		//and place it in the area tree on the box just written
+		QAreaLink(ent, &q_link_min[ent * 3], &q_link_max[ent * 3],
+			q_link_solid[ent]);
 	}
 }
 
