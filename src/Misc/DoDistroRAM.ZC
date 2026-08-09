@@ -12,13 +12,152 @@
 
 #define RAMDISTRO_IMAGE		"::/Tmp/RAMDistro.BIN"
 
-U0 MakeRAMDistro(I64 blks=0x30000)
-{//blks: image size in 512-byte blocks (default 96MB). MUST exceed the whole OS
-//tree or the copy silently runs out of space and skips files (scattered),
-//producing an image that boots but crashes reading a missing file. Pass a
-//larger value if the sanity check below fails.
+//Apps larger than this are left out. The image is loaded whole into memory as
+//a Limine module, so game data cannot travel in it: the engines are a few
+//hundred KB of ZealC, their pak/mpq/utx data is gigabytes.
+#define RAMDISTRO_APP_MAX_MB	8
+
+//RedSea needs the allocation bitmap and directory entries on top of file data.
+//Measured overhead is a few percent; 15 leaves room without demanding a
+//needlessly large image.
+#define RAMDISTRO_OVERHEAD_PCT	15
+
+I64 RAMDistroTreeSize(CDirEntry *de)
+{//Bytes a found tree occupies once copied, files rounded up to whole blocks.
+	I64 res = 0;
+
+	while (de)
+	{
+		if (de->attr & RS_ATTR_DIR)
+			res += BLK_SIZE + RAMDistroTreeSize(de->sub);
+		else
+			res += (de->size + BLK_SIZE - 1) & ~(BLK_SIZE - 1);
+		de = de->next;
+	}
+
+	return res;
+}
+
+I64 RAMDistroDirSize(U8 *mask)
+{//Bytes the tree under mask will occupy on the image.
+	CDirEntry	*de	 = FilesFind(mask, FUF_RECURSE);
+	I64			 res = RAMDistroTreeSize(de);
+
+	DirTreeDel(de);
+
+	return res;
+}
+
+I64 RAMDistroAppsSize(I64 max_mb, Bool print)
+{//Total of the apps small enough to ship. Lists what it drops: a silent skip
+//produces an image that boots and then cannot find a game.
+	CDirEntry	*head = FilesFind("::/Apps/*", FUF_JUST_DIRS);
+	CDirEntry	*de	  = head;
+	I64			 res  = 0, sz, max = max_mb * 0x100000;
+	U8			*mask;
+
+	while (de)
+	{
+		mask = MStrPrint("%s/*", de->full_name);
+		sz	 = RAMDistroDirSize(mask);
+		Free(mask);
+
+		if (sz <= max)
+			res += sz;
+		else if (print)
+			"  skipping %-20s %6d MB\n", de->name, sz / 0x100000;
+
+		de = de->next;
+	}
+	DirTreeDel(head);
+
+	return res;
+}
+
+U0 RAMDistroCopyApps(I64 max_mb)
+{//Copy each app that fits. Size decides, not a name list, so apps added later
+//need no edit here.
+	CDirEntry	*head = FilesFind("::/Apps/*", FUF_JUST_DIRS);
+	CDirEntry	*de	  = head;
+	I64			 sz, max = max_mb * 0x100000;
+	U8			*mask, *dst;
+
+	DirMake("A:/Apps");
+	while (de)
+	{
+		mask = MStrPrint("%s/*", de->full_name);
+		sz	 = RAMDistroDirSize(mask);
+		Free(mask);
+
+		if (sz <= max)
+		{
+			dst = MStrPrint("A:/Apps/%s", de->name);
+			CopyTree(de->full_name, dst);
+			Free(dst);
+		}
+
+		de = de->next;
+	}
+	DirTreeDel(head);
+}
+
+Bool RAMDistroSkipDir(U8 *name)
+{//Tmp holds RAMDistro.BIN itself; copying it in would double the image.
+	return ToBool(!StrCompare(name, "Tmp"));
+}
+
+I64 RAMDistroTreesSize(I64 app_max_mb, Bool print)
+{//Bytes every shipped top-level directory will occupy.
+	CDirEntry	*head = FilesFind("::/*", FUF_JUST_DIRS);
+	CDirEntry	*de	  = head;
+	I64			 res  = 0;
+	U8			*mask;
+
+	while (de)
+	{
+		if (!StrCompare(de->name, "Apps"))
+			res += RAMDistroAppsSize(app_max_mb, print);
+		else if (!RAMDistroSkipDir(de->name))
+		{
+			mask = MStrPrint("%s/*", de->full_name);
+			res += RAMDistroDirSize(mask);
+			Free(mask);
+		}
+		de = de->next;
+	}
+	DirTreeDel(head);
+
+	return res;
+}
+
+U0 RAMDistroCopyTrees(I64 app_max_mb)
+{//Every top-level directory. Enumerated, not listed: a directory added to the
+//OS later ships without editing this file.
+	CDirEntry	*head = FilesFind("::/*", FUF_JUST_DIRS);
+	CDirEntry	*de	  = head;
+	U8			*dst;
+
+	while (de)
+	{
+		if (!StrCompare(de->name, "Apps"))
+			RAMDistroCopyApps(app_max_mb);
+		else if (!RAMDistroSkipDir(de->name))
+		{
+			dst = MStrPrint("A:/%s", de->name);
+			CopyTree(de->full_name, dst);
+			Free(dst);
+		}
+		de = de->next;
+	}
+	DirTreeDel(head);
+}
+
+U0 MakeRAMDistro(I64 blks=0x30000, I64 app_max_mb=RAMDISTRO_APP_MAX_MB)
+{//blks: image size in 512-byte blocks (default 96MB).
+//app_max_mb: per-app size ceiling; 0 ships no apps at all.
 	CBlkDev		*bd;
 	CDirEntry	 de;
+	I64			 need, cap;
 
 	if (!DriveIsWritable)
 	{
@@ -26,8 +165,24 @@ U0 MakeRAMDistro(I64 blks=0x30000)
 		return;
 	}
 
+//--- Pre-flight: measure before building, so an oversized tree reports a
+//    number instead of throwing out of FOpen partway through the copy. ---
+	"Measuring source tree...\n";
+	need  = RAMDistroTreesSize(app_max_mb, TRUE);
+	need += need * RAMDISTRO_OVERHEAD_PCT / 100;
+	cap	  = blks * BLK_SIZE;
+
+	"Need ~%d MB, image is %d MB.\n", need / 0x100000, cap / 0x100000;
+	if (need > cap)
+	{
+		"\n$$RED$$Image too small.$$FG$$ Re-run with MakeRAMDistro(0x%X);\n",
+			((need / BLK_SIZE) + 0x1000) & ~0xFFF;
+		"Or lower the per-app ceiling, e.g. MakeRAMDistro(%d, 2);\n", blks;
+		return;
+	}
+
 //--- Fresh RedSea RAM drive A: to assemble the image in ---
-	"Building %d MB RedSea image in RAM drive A:...\n", (blks * BLK_SIZE) / 0x100000;
+	"Building %d MB RedSea image in RAM drive A:...\n", cap / 0x100000;
 	bd = Letter2BlkDev('A', FALSE);
 	if (bd)
 		BlkDevDel(bd);
@@ -39,28 +194,21 @@ U0 MakeRAMDistro(I64 blks=0x30000)
 		return;
 	}
 
-//--- Copy the whole OS tree in (same set as the DVD distro) ---
+//--- Copy the OS tree in ---
 ///Boot is included, unlike the DVD distro where build-iso.sh supplies it: the
 //RAM image is the running root, and installing from it to another disk needs
 ///Boot/Limine-BIOS-HDD.HH (OSInstall.ZC includes it at compile time),
 //Limine-BIOS.SYS and ZealBooter.ELF.
-	CopyTree("::/Boot",		"A:/Boot");
-	CopyTree("::/Home",		"A:/Home");
-	Del("A:/Home/Registry.ZC");		//fresh registry on first boot
-	CopyTree("::/System",	"A:/System");
-	CopyTree("::/Apps",		"A:/Apps");
-	CopyTree("::/Compiler",	"A:/Compiler");
-	CopyTree("::/Demo",		"A:/Demo");
-	CopyTree("::/Doc",		"A:/Doc");
-	CopyTree("::/Kernel",	"A:/Kernel");
-	CopyTree("::/Misc",		"A:/Misc");
+	RAMDistroCopyTrees(app_max_mb);
+	Del("A:/Home/Registry.ZC");			//fresh registry on first boot
 	Copy("::/*", "A:/");				//root files (StartOS.ZC, MakeHome.ZC, ...)
 	DirMake("A:/Tmp");
 	DirMake("A:/Tmp/ScreenShots");
 
 //--- Sanity check: if a file present on the source is missing on A:, the copy
 //    ran out of space. Bail rather than ship a broken image. ---
-	if (FileFind("::/Doc/Start.DD")				&& !FileFind("A:/Doc/Start.DD")				||
+	if (FileFind("::/DE/MakeDE.ZC")				&& !FileFind("A:/DE/MakeDE.ZC")				||
+		FileFind("::/Doc/Start.DD")				&& !FileFind("A:/Doc/Start.DD")				||
 		FileFind("::/StartOS.ZC")				&& !FileFind("A:/StartOS.ZC")				||
 		FileFind("::/Boot/Limine-BIOS-HDD.HH")	&& !FileFind("A:/Boot/Limine-BIOS-HDD.HH"))
 	{

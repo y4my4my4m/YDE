@@ -133,6 +133,16 @@
 #define HDA_CORB_ENTRIES	256
 #define HDA_RIRB_ENTRIES	256
 
+//Every controller/codec handshake is bounded. An HD Audio controller that is
+//really a DSP (Intel SST on recent laptops) enumerates on PCI but never answers
+//verbs until firmware is loaded; unbounded waits there hang the boot.
+#define HDA_SPIN_MAX	100000	//Yield iterations
+#define HDA_WAIT_MS		1000	//Sleep(1) iterations
+
+//Raised by any wait that expired. Aborts bring-up; AudioDev falls through to
+//the next driver.
+Bool hda_fail = FALSE;
+
 class CHDABufDesc
 {//16 bytes: 64-bit address, length, IOC flag.
 	U8	*buf;
@@ -196,9 +206,18 @@ U0 HDAWrU32(I64 rg, U32 val)
 
 U0 HDASyncCORB()
 {//Publish the write pointer and wait for the controller to consume it.
+	I64 guard = 0;
+
 	HDAWrU16(HDA_CORBWP, hda.corb_wp);
 	while ((HDARdU16(HDA_CORBRP) & hda.corb_mask) != hda.corb_wp)
+	{
+		if (++guard > HDA_SPIN_MAX)
+		{
+			hda_fail = TRUE;
+			return;
+		}
 		Yield;
+	}
 }
 
 U0 HDAWriteCORB(I64 cad, I64 nid, U32 val)
@@ -224,11 +243,16 @@ I64 HDADrainRIRB()
 }
 
 I64 HDAReadRIRB()
-{//Block until one response arrives.
-	I64 wp, res;
+{//Wait for one response. Gives up rather than blocking a codec that never answers.
+	I64 wp, res, guard = 0;
 
 	do
 	{
+		if (++guard > HDA_SPIN_MAX)
+		{
+			hda_fail = TRUE;
+			return 0;
+		}
 		Yield;
 		wp = HDARdU16(HDA_RIRBWP) & hda.rirb_mask;
 	}
@@ -242,7 +266,11 @@ I64 HDAReadRIRB()
 }
 
 I64 HDAVerb(I64 cad, I64 nid, U32 val)
-{//One command, one response.
+{//One command, one response. Once a wait has expired every later verb is a
+ //no-op, so an aborted traverse unwinds without re-timing out per widget.
+	if (hda_fail)
+		return 0;
+
 	HDASyncCORB;
 	HDADrainRIRB;
 	HDAWriteCORB(cad, nid, val);
@@ -628,20 +656,28 @@ I64 HDARingSize(I64 rg, I64 *_mask)
 	return ents;
 }
 
-U0 HDACtrlRst()
-{
+Bool HDACtrlRst()
+{//FALSE if the controller will not leave or enter reset.
+	I64 i;
+
 	HDAWrU16(HDA_STATESTS, 0x7FFF);
 
 	HDAWrU32(HDA_GCTL, 0);
-	while (HDARdU32(HDA_GCTL) & 1)
+	for (i = 0; i < HDA_WAIT_MS && HDARdU32(HDA_GCTL) & 1; i++)
 		Sleep(1);
+	if (HDARdU32(HDA_GCTL) & 1)
+		return FALSE;
 
 	HDAWrU32(HDA_GCTL, 1);
-	while (!(HDARdU32(HDA_GCTL) & 1))
+	for (i = 0; i < HDA_WAIT_MS && !(HDARdU32(HDA_GCTL) & 1); i++)
 		Sleep(1);
+	if (!(HDARdU32(HDA_GCTL) & 1))
+		return FALSE;
 
 	//codecs need time to report themselves in STATESTS
 	Sleep(1);
+
+	return TRUE;
 }
 
 U8 *HDAMmioMap(I64 phys)
@@ -672,6 +708,7 @@ Bool HDACtrlStart(I64 bdf)
 	U16 statests;
 
 	MemSet(&hda, 0, sizeof(CHDA));
+	hda_fail	= FALSE;
 	hda.vol		= 256;
 	hda.out_fmt	= HDA_OUT_FMT;
 
@@ -690,7 +727,12 @@ Bool HDACtrlStart(I64 bdf)
 	hda.bar = HDAMmioMap(phys);
 
 	HDAInitStreamLayout;
-	HDACtrlRst;
+	if (!HDACtrlRst)
+	{
+		"[HDA] Controller at bus %d dev %d fun %d would not reset.\n",
+			bus, dev_, fun;
+		return FALSE;
+	}
 
 	//--- CORB / RIRB rings ---
 	hda.corb = CAllocAligned(HDA_CORB_ENTRIES * sizeof(U32), 128, sys_task->code_heap);
@@ -705,11 +747,21 @@ Bool HDACtrlStart(I64 bdf)
 
 	//reset the CORB read pointer: set bit 15, wait for it to read back, clear
 	HDAWrU16(HDA_CORBRP, 0x8000);
-	while (!(HDARdU16(HDA_CORBRP) & 0x8000))
+	for (i = 0; i < HDA_SPIN_MAX && !(HDARdU16(HDA_CORBRP) & 0x8000); i++)
 		Yield;
+	if (!(HDARdU16(HDA_CORBRP) & 0x8000))
+	{
+		"[HDA] CORBRP would not enter reset.\n";
+		return FALSE;
+	}
 	HDAWrU16(HDA_CORBRP, 0x0000);
-	while (HDARdU16(HDA_CORBRP) & 0x8000)
+	for (i = 0; i < HDA_SPIN_MAX && HDARdU16(HDA_CORBRP) & 0x8000; i++)
 		Yield;
+	if (HDARdU16(HDA_CORBRP) & 0x8000)
+	{
+		"[HDA] CORBRP would not leave reset.\n";
+		return FALSE;
+	}
 
 	HDAWrU16(HDA_RIRBWP, 0x8000);	//reset write pointer
 	HDAWrU16(HDA_RINTCNT, 0xFF);
@@ -754,6 +806,13 @@ Bool HDACtrlStart(I64 bdf)
 			hda_afg_in_amp  = 0;
 			hda_afg_out_amp = 0;
 			HDATraverse(hda.cad, 0);
+			if (hda_fail)
+			{//DSP-style controller: enumerates, answers the probe, then stops
+			 //responding. Leave it alone rather than run a half-configured codec.
+				"[HDA] Codec %d stopped responding during setup; skipping.\n",
+					hda.cad;
+				return FALSE;
+			}
 
 			HDAWrU32(hda.ostr + HDA_STRLPIB, 0);
 			HDAWrU32(hda.ostr + HDA_STRCBL, HDA_BDL_ENTRIES * HDA_BUF_BYTES);

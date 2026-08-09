@@ -45,17 +45,11 @@ cp "$KZXE"                   "$TMPISODIR/Boot/Kernel.ZXE"
 cp "$IMG"                    "$TMPISODIR/Boot/RAMDistro.BIN"
 
 # limine.conf: kernel = module 0, OS image = module 1
-cat > "$TMPISODIR/Boot/Limine.CONF" <<'EOF'
-timeout: 1
-interface_resolution: 1024x768
-
-/ZealOS (RAM)
-    protocol: limine
-    resolution: 1024x768
-    path: boot():/Boot/ZealBooter.ELF
-    module_path: boot():/Boot/Kernel.ZXE
-    module_path: boot():/Boot/RAMDistro.BIN
-EOF
+# Derived from zealbooter/limine.conf rather than duplicated: resolution and
+# protocol stay in one place. RAMDistro.BIN is appended as module 1 (the base
+# config's last line is the Kernel.ZXE module, which must stay module 0).
+sed 's|^/ZealOS.*|/ZealOS (RAM)|' ../zealbooter/limine.conf > "$TMPISODIR/Boot/Limine.CONF"
+printf '    module_path: boot():/Boot/RAMDistro.BIN\n' >> "$TMPISODIR/Boot/Limine.CONF"
 
 truncate -s 32K bios_boot.img
 xorriso -as mkisofs -R -r -J -b Boot/Limine-BIOS-CD.BIN \
