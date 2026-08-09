@@ -1,0 +1,809 @@
+//Intel HD Audio hardware layer. Polling driven, no IRQs.
+//
+//Ported from TinkerOS Demo/Snd/HDAudio.HC (github.com/tinkeros/TinkerOS,
+//Unlicense/public domain). Controller bring-up, CORB/RIRB verb exchange and
+//the codec widget-graph walk follow that implementation; the buffer ring and
+//the mixer interface are YDE's.
+//
+//Deviations from upstream:
+//  - Output only. YDE has no capture API, so the input stream, SndWave tone
+//    generator and PC-speaker hooks are absent.
+//  - 16-bit samples, not 32. AudioOutputMix emits U32 L16|R16<<16, which is
+//    byte-identical to HDA 16-bit stereo; a 32-bit stream would need a
+//    conversion pass. Every HDA codec supports 16-bit/48kHz.
+//  - BDL is a cyclic 8-entry ring filled ahead of the play cursor, matching
+//    AC97.ZC latency, instead of upstream's two-buffer ping-pong.
+//  - MMIO reached through dev.uncached_alias; upstream's MemPageTable/InvlPg
+//    cache flip is only needed for BARs parked above 4GB.
+//
+//QEMU needs: -device intel-hda -device hda-duplex,audiodev=<audiodev>
+//
+//Mixing lives in Mixer.ZC. Selected by AudioDev.ZC.
+
+#define HDA_1_CHAN		0
+#define HDA_2_CHAN		1
+
+#define HDA_8_BIT		0
+#define HDA_16_BIT		1
+#define HDA_20_BIT		2
+#define HDA_24_BIT		3
+#define HDA_32_BIT		4
+
+#define HDA_48kHz		0
+
+//chan-1 | bits<<4 | rate<<8. 48kHz stereo 16-bit.
+#define HDA_OUT_FMT		(HDA_2_CHAN + (HDA_16_BIT << 4) + (HDA_48kHz << 8))
+
+//--- controller registers ---
+#define HDA_GCAP		0x00
+#define HDA_GCTL		0x08
+#define HDA_STATESTS	0x0E
+#define HDA_CORBLBASE	0x40
+#define HDA_CORBUBASE	0x44
+#define HDA_CORBWP		0x48
+#define HDA_CORBRP		0x4A
+#define HDA_CORBCTL		0x4C
+#define HDA_CORBSIZE	0x4E
+#define HDA_RIRBLBASE	0x50
+#define HDA_RIRBUBASE	0x54
+#define HDA_RIRBWP		0x58
+#define HDA_RINTCNT		0x5A
+#define HDA_RIRBCTL		0x5C
+#define HDA_RIRBSTS		0x5D
+#define HDA_RIRBSIZE	0x5E
+#define HDA_DPLBASE		0x70
+#define HDA_DPUBASE		0x74
+
+//--- stream descriptor registers, relative to a stream's base ---
+#define HDA_STRCTL		0x00
+#define HDA_STRSTS		0x03
+#define HDA_STRLPIB		0x04
+#define HDA_STRCBL		0x08
+#define HDA_STRLVI		0x0C
+#define HDA_STRFIFOS	0x10
+#define HDA_STRFMT		0x12
+#define HDA_STRBDPL		0x18
+#define HDA_STRBDPU		0x1C
+
+#define HDA_STR_BASE	0x080
+#define HDA_STR_SIZE	0x020
+
+//GCAP reports 0 in/0 out on some emulated controllers; spec default layout
+#define HDA_DFT_ISS		4
+#define HDA_DFT_OSS		4
+
+//--- PCI config ---
+#define HDA_PCI_TCSEL	0x44
+#define HDA_PCI_DEVC	0x78
+#define HDA_DEVC_NOSNOOP	0x0800
+
+//--- codec verbs ---
+#define VERB_GET_PARAM			0xF0000
+#define VERB_CONNECT_SEL_SET	0x70100
+#define VERB_PROCESS_STATE_SET	0x70300
+#define VERB_AMP_GAIN_SET		0x30000
+#define VERB_STREAM_FMT_SET		0x20000
+#define VERB_POWER_STATE_GET	0xF0500
+#define VERB_POWER_STATE_SET	0x70500
+#define VERB_CHAN_STREAM_ID_SET	0x70600
+#define VERB_PIN_WIDGET_CTL_SET	0x70700
+#define VERB_EAPDBTL_ENABLE_SET	0x70C00
+
+//--- codec parameters ---
+#define P_SUBNODE_CNT			0x04
+#define P_AUDIO_WIDGET_CAP		0x09
+#define P_SAMPLE_SIZE_RATE_CAP	0x0A
+#define P_PIN_CAP				0x0C
+#define P_INPUT_AMP_CAP			0x0D
+#define P_CONNECT_LST_LEN		0x0E
+#define P_OUTPUT_AMP_CAP		0x12
+
+//--- widget types, P_AUDIO_WIDGET_CAP bits 23:20 ---
+#define AWT_OUTPUT			0x0
+#define AWT_INPUT			0x1
+#define AWT_PIN_COMPLEX		0x4
+
+//--- widget capability bits ---
+#define AWCAP_IN_AMP		1
+#define AWCAP_OUT_AMP		2
+#define AWCAP_AMP_OVRD		3
+#define AWCAP_CONN_LST		8
+#define AWCAP_POWER			10
+
+//--- pin capability bits ---
+#define PINCAP_HEADPHONE	3
+#define PINCAP_OUTPUT		4
+#define PINCAP_INPUT		5
+#define PINCAP_EAPD			16
+
+//--- pin widget control bits ---
+#define PWC_IN_EN		0x20
+#define PWC_OUT_EN		0x40
+#define PWC_HP_EN		0x80
+
+//stream 1, first channel. Matches the stream number in STRCTL bits 23:20.
+#define HDA_STREAM_TAG	1
+
+//512 frames = 10.6ms at 48kHz; 4 queued ahead is ~42ms, same as AC97.ZC.
+#define HDA_BUF_FRAMES		512
+#define HDA_BUF_BYTES		(HDA_BUF_FRAMES * 4)
+#define HDA_BDL_ENTRIES		8
+#define HDA_TARGET_LEAD		4
+
+#define HDA_CORB_ENTRIES	256
+#define HDA_RIRB_ENTRIES	256
+
+class CHDABufDesc
+{//16 bytes: 64-bit address, length, IOC flag.
+	U8	*buf;
+	U32	 len;
+	U32	 ctrl;
+};
+
+class CHDA
+{
+	U8			*bar;		//uncached alias of the controller MMIO
+	I64			 cad;		//codec address the output path was found on
+	U32			*corb;
+	I64			*rirb;
+	I64			 corb_wp, rirb_rp;
+	I64			 corb_mask, rirb_mask;
+	I64			 iss, oss, bss;
+	I64			 ostr_idx;
+	I64			 ostr;		//stream descriptor offset from bar
+	CHDABufDesc	*bdl;
+	U32			*buf[HDA_BDL_ENTRIES];
+	U32			*posbuf;
+	U32			*opos;		//NULL once DMA position buffer is known bad
+	I64			 wp;		//BDL entry last filled
+	I64			 out_fmt;
+	I64			 vol;		//0..256, applied in software; see HDAVolumeSet
+} hda;
+
+//--- MMIO ------------------------------------------------------------------
+
+U8 HDARdU8(I64 rg)
+{
+	return *(hda.bar + rg)(U8 *);
+}
+
+U0 HDAWrU8(I64 rg, U8 val)
+{
+	*(hda.bar + rg)(U8 *) = val;
+}
+
+U16 HDARdU16(I64 rg)
+{
+	return *(hda.bar + rg)(U16 *);
+}
+
+U0 HDAWrU16(I64 rg, U16 val)
+{
+	*(hda.bar + rg)(U16 *) = val;
+}
+
+U32 HDARdU32(I64 rg)
+{
+	return *(hda.bar + rg)(U32 *);
+}
+
+U0 HDAWrU32(I64 rg, U32 val)
+{
+	*(hda.bar + rg)(U32 *) = val;
+}
+
+//--- CORB / RIRB verb exchange ---------------------------------------------
+
+U0 HDASyncCORB()
+{//Publish the write pointer and wait for the controller to consume it.
+	HDAWrU16(HDA_CORBWP, hda.corb_wp);
+	while ((HDARdU16(HDA_CORBRP) & hda.corb_mask) != hda.corb_wp)
+		Yield;
+}
+
+U0 HDAWriteCORB(I64 cad, I64 nid, U32 val)
+{
+	val |= (cad << 28) + (nid << 20);
+	hda.corb_wp = (hda.corb_wp + 1) & hda.corb_mask;
+	hda.corb[hda.corb_wp] = val;
+}
+
+I64 HDADrainRIRB()
+{//Discard any queued responses; returns the last one seen.
+	I64 wp = HDARdU16(HDA_RIRBWP) & hda.rirb_mask;
+	I64 res = 0;
+
+	while (hda.rirb_rp != wp)
+	{
+		hda.rirb_rp = (hda.rirb_rp + 1) & hda.rirb_mask;
+		res = hda.rirb[hda.rirb_rp];
+	}
+	HDAWrU8(HDA_RIRBSTS, 0x05);
+
+	return res;
+}
+
+I64 HDAReadRIRB()
+{//Block until one response arrives.
+	I64 wp, res;
+
+	do
+	{
+		Yield;
+		wp = HDARdU16(HDA_RIRBWP) & hda.rirb_mask;
+	}
+	while (wp == hda.rirb_rp);
+
+	hda.rirb_rp = (hda.rirb_rp + 1) & hda.rirb_mask;
+	res = hda.rirb[hda.rirb_rp];
+	HDAWrU8(HDA_RIRBSTS, 0x05);
+
+	return res;
+}
+
+I64 HDAVerb(I64 cad, I64 nid, U32 val)
+{//One command, one response.
+	HDASyncCORB;
+	HDADrainRIRB;
+	HDAWriteCORB(cad, nid, val);
+	HDASyncCORB;
+
+	return HDAReadRIRB;
+}
+
+Bool HDAVerbProbe(I64 cad, I64 nid, U32 val)
+{//TRUE if a codec answers at all. An absent codec never writes a response,
+ //so this must time out rather than block like HDAVerb.
+	HDASyncCORB;
+	HDADrainRIRB;
+	HDAWriteCORB(cad, nid, val);
+	HDASyncCORB;
+
+	Sleep(1);
+	if ((HDARdU16(HDA_RIRBWP) & hda.rirb_mask) == hda.rirb_rp)
+		return FALSE;
+	HDAReadRIRB;
+
+	return TRUE;
+}
+
+//--- codec graph -----------------------------------------------------------
+
+I64 HDAAmpMaxGain(U32 cap)
+{
+	if (!cap)
+		return 0x7F;
+
+	return (cap >> 8) & 0x7F;
+}
+
+U0 HDAPowerUp(I64 cad, I64 nid, Bool wait = FALSE)
+{
+	I64 i, st = 0;
+
+	HDAVerb(cad, nid, VERB_POWER_STATE_SET + 0x00);
+	if (!wait)
+		return;
+
+	for (i = 0; i < 100; i++)
+	{
+		st = HDAVerb(cad, nid, VERB_POWER_STATE_GET);
+		if (!(st & 0x0F))
+			return;
+		Sleep(1);
+	}
+	"[HDA] Node 0x%02X never reported D0 (power state 0x%02X).\n", nid, st & 0xFF;
+}
+
+U32 hda_afg_in_amp	= 0;
+U32 hda_afg_out_amp	= 0;
+
+U0 HDATraverse(I64 cad, I64 nid)
+{//Walk the widget graph, power everything up, open every amp to max gain and
+ //bind each DAC to the output stream. Master volume is applied in software, so
+ //the amps are left wide open; see HDAVolumeSet.
+	I64 i, len, aud_cap, type, g;
+	U32 pin_cap;
+	U32 in_amp, out_amp, outer_in_amp, outer_out_amp;
+	I64 pin_ctl;
+
+	aud_cap = HDAVerb(cad, nid, VERB_GET_PARAM + P_SUBNODE_CNT);
+
+	//a node reporting subnodes is a function group, not a widget
+	if (aud_cap.u16[0])
+	{
+		if (nid)
+			HDAPowerUp(cad, nid, TRUE);
+		HDAVerb(cad, nid, VERB_PROCESS_STATE_SET + 0x02);
+
+		outer_in_amp  = hda_afg_in_amp;
+		outer_out_amp = hda_afg_out_amp;
+		if (nid)
+		{
+			hda_afg_in_amp  = HDAVerb(cad, nid, VERB_GET_PARAM + P_INPUT_AMP_CAP);
+			hda_afg_out_amp = HDAVerb(cad, nid, VERB_GET_PARAM + P_OUTPUT_AMP_CAP);
+		}
+
+		for (i = aud_cap.u16[1]; i < aud_cap.u16[1] + aud_cap.u16[0]; i++)
+			HDATraverse(cad, i);
+
+		hda_afg_in_amp  = outer_in_amp;
+		hda_afg_out_amp = outer_out_amp;
+		return;
+	}
+
+	aud_cap = HDAVerb(cad, nid, VERB_GET_PARAM + P_AUDIO_WIDGET_CAP);
+	type	= (aud_cap >> 20) & 15;
+
+	if (Bt(&aud_cap, AWCAP_POWER))
+		HDAPowerUp(cad, nid);
+	HDAVerb(cad, nid, VERB_PROCESS_STATE_SET + 0x02);
+
+	//select the first connection; picking a route needs the pin default
+	//config, which only the config tool upstream parses
+	HDAVerb(cad, nid, VERB_CONNECT_SEL_SET + 0x00);
+
+	if (Bt(&aud_cap, AWCAP_CONN_LST))
+		len = HDAVerb(cad, nid, VERB_GET_PARAM + P_CONNECT_LST_LEN) & 127;
+	else
+		len = 0;
+
+	in_amp  = 0;
+	out_amp = 0;
+	if (Bt(&aud_cap, AWCAP_IN_AMP) || Bt(&aud_cap, AWCAP_OUT_AMP))
+	{
+		if (Bt(&aud_cap, AWCAP_AMP_OVRD))
+		{
+			in_amp  = HDAVerb(cad, nid, VERB_GET_PARAM + P_INPUT_AMP_CAP);
+			out_amp = HDAVerb(cad, nid, VERB_GET_PARAM + P_OUTPUT_AMP_CAP);
+		}
+		else
+		{
+			in_amp  = hda_afg_in_amp;
+			out_amp = hda_afg_out_amp;
+		}
+	}
+
+	//0xB000: set output amp, left and right, index 0
+	if (Bt(&aud_cap, AWCAP_OUT_AMP))
+	{
+		g = HDAAmpMaxGain(out_amp);
+		HDAVerb(cad, nid, VERB_AMP_GAIN_SET + (0xB000 | g));
+	}
+
+	//0x7000: set input amp, left and right. Index 0 unmuted, the rest muted
+	//(0x0080) so unselected sources cannot bleed into the mix.
+	if (Bt(&aud_cap, AWCAP_IN_AMP))
+	{
+		g = HDAAmpMaxGain(in_amp);
+		HDAVerb(cad, nid, VERB_AMP_GAIN_SET + (0x7000 | g));
+		for (i = 1; i < len; i++)
+			HDAVerb(cad, nid, VERB_AMP_GAIN_SET + (0x7080 | (i << 8)));
+	}
+
+	switch (type)
+	{
+		case AWT_OUTPUT:
+			//stream tag in bits 7:4, first channel in bits 3:0
+			HDAVerb(cad, nid, VERB_CHAN_STREAM_ID_SET + (HDA_STREAM_TAG << 4));
+			HDAVerb(cad, nid, VERB_STREAM_FMT_SET + hda.out_fmt);
+			HDAVerb(cad, nid, VERB_PROCESS_STATE_SET + 0x01);
+			break;
+
+		case AWT_INPUT:
+			//unbound: an ADC left on a stream tag writes into memory we do
+			//not own
+			HDAVerb(cad, nid, VERB_CHAN_STREAM_ID_SET + 0x00);
+			break;
+
+		case AWT_PIN_COMPLEX:
+			pin_cap = HDAVerb(cad, nid, VERB_GET_PARAM + P_PIN_CAP);
+			pin_ctl = 0;
+			if (Bt(&pin_cap, PINCAP_OUTPUT))
+			{
+				pin_ctl = PWC_OUT_EN;
+				if (Bt(&pin_cap, PINCAP_HEADPHONE))
+					pin_ctl |= PWC_HP_EN;
+			}
+			else if (Bt(&pin_cap, PINCAP_INPUT))
+				pin_ctl = PWC_IN_EN;
+			HDAVerb(cad, nid, VERB_PIN_WIDGET_CTL_SET + pin_ctl);
+
+			//external amplifier power down: silent outputs on laptops
+			if (Bt(&pin_cap, PINCAP_EAPD))
+				HDAVerb(cad, nid, VERB_EAPDBTL_ENABLE_SET + 0x02);
+			break;
+	}
+}
+
+//--- stream ----------------------------------------------------------------
+
+U0 HDAStreamRst(I64 str)
+{
+	I64 i;
+
+	HDAWrU32(str + HDA_STRCTL, 0);
+	HDAWrU8(str + HDA_STRSTS, 0x1C);
+
+	HDAWrU32(str + HDA_STRCTL, 0x01);
+	for (i = 0; i < 100; i++)
+	{
+		if (HDARdU32(str + HDA_STRCTL) & 0x01)
+			break;
+		Sleep(1);
+	}
+	if (i >= 100)
+		"[HDA] Stream at 0x%03X would not enter reset.\n", str;
+
+	HDAWrU32(str + HDA_STRCTL, 0);
+	for (i = 0; i < 100; i++)
+	{
+		if (!(HDARdU32(str + HDA_STRCTL) & 0x01))
+			return;
+		Sleep(1);
+	}
+	"[HDA] Stream at 0x%03X would not leave reset.\n", str;
+}
+
+U0 HDARun()
+{//stream tag in bits 23:20, RUN in bit 1
+	HDAWrU32(hda.ostr + HDA_STRCTL, (HDA_STREAM_TAG << 20) | 0x02);
+}
+
+U0 HDAStop()
+{
+	HDAWrU32(hda.ostr + HDA_STRCTL, 0);
+}
+
+I64 HDAOutPos()
+{//Byte offset into the cyclic buffer.
+	if (hda.opos)
+		return *hda.opos;
+
+	return HDARdU32(hda.ostr + HDA_STRLPIB);
+}
+
+U0 HDAValidatePosBuf()
+{//The DMA position buffer is optional and some controllers never write it.
+ //Fall back to LPIB when it does not move but LPIB does.
+	I64 p0, l0, l1, i;
+
+	if (!hda.opos)
+		return;
+
+	p0 = *hda.opos;
+	l0 = HDARdU32(hda.ostr + HDA_STRLPIB);
+	l1 = l0;
+
+	for (i = 0; i < 50; i++)
+	{
+		Sleep(1);
+		if (*hda.opos != p0)
+			return;
+		l1 = HDARdU32(hda.ostr + HDA_STRLPIB);
+	}
+
+	if (l1 != l0)
+	{
+		"[HDA] DMA position buffer not counting; using LPIB.\n";
+		hda.opos = NULL;
+	}
+}
+
+//--- mixer feed ------------------------------------------------------------
+
+U0 HDAVolumeSet(I64 pct)
+{//fp_audio_vol_set. Software attenuation: HDA has no single master register,
+ //and walking the amp widgets per change needs the pin default config this
+ //driver does not parse. Codec amps are left at max by HDATraverse.
+	hda.vol = pct * 256 / 100;
+}
+
+U0 HDABufferFill()
+{//Keep HDA_TARGET_LEAD entries filled ahead of the play cursor. The ring is
+ //cyclic and permanently valid, so unlike AC97 there is no last-valid-index to
+ //advance; the only rule is never to write the entry being played.
+	I64  cur = HDAOutPos / HDA_BUF_BYTES;
+	I64  lead;
+	I64  guard = 0;
+	I64  i;
+	U32 *buf;
+
+	cur &= HDA_BDL_ENTRIES - 1;
+	lead = (hda.wp - cur) & (HDA_BDL_ENTRIES - 1);
+
+	while (lead < HDA_TARGET_LEAD && guard < HDA_BDL_ENTRIES)
+	{
+		hda.wp = (hda.wp + 1) & (HDA_BDL_ENTRIES - 1);
+		buf = hda.buf[hda.wp];
+		AudioOutputMix(buf, HDA_BUF_BYTES);
+
+		if (hda.vol < 256)
+		{
+			for (i = 0; i < HDA_BUF_FRAMES; i++)
+			{
+				buf[i].i16[0] = (buf[i].i16[0] * hda.vol) >> 8;
+				buf[i].i16[1] = (buf[i].i16[1] * hda.vol) >> 8;
+			}
+		}
+
+		lead++;
+		guard++;
+	}
+}
+
+U0 HDAMixTask()
+{
+	HDAValidatePosBuf;
+	while (TRUE)
+	{
+		HDABufferFill;
+		Sleep(1);
+	}
+}
+
+//--- controller bring-up ---------------------------------------------------
+
+U0 HDAPCIUpdate(I64 bus, I64 dev_, I64 fun, I64 rg, I64 mask, I64 val)
+{//Read-modify-write a config field narrower than a dword.
+	I64 dw_rg = rg & ~3;
+	I64 shift = (rg & 3) * 8;
+	I64 dw	  = PCIReadU32(bus, dev_, fun, dw_rg);
+
+	dw = dw & ~(mask << shift);
+	dw = dw | ((val & mask) << shift);
+	PCIWriteU32(bus, dev_, fun, dw_rg, dw);
+}
+
+U0 HDAInitPCI(I64 bus, I64 dev_, I64 fun, I64 vendor)
+{
+	//bus master + memory space on, and clear the traffic class select
+	HDAPCIUpdate(bus, dev_, fun, 0x04, 0x0406, 0x0406);
+	HDAPCIUpdate(bus, dev_, fun, HDA_PCI_TCSEL, 0x07, 0x00);
+
+	//vendor errata, upstream HDInitPCI
+	if (vendor == 0x8086)
+		HDAPCIUpdate(bus, dev_, fun, HDA_PCI_DEVC, HDA_DEVC_NOSNOOP, 0);
+	else if (vendor == 0x1002 || vendor == 0x1022)
+		HDAPCIUpdate(bus, dev_, fun, 0x42, 0x07, 0x02);
+	else if (vendor == 0x10DE)
+	{
+		HDAPCIUpdate(bus, dev_, fun, 0x4E, 0x0F, 0x0F);
+		HDAPCIUpdate(bus, dev_, fun, 0x4D, 0x01, 0x01);
+		HDAPCIUpdate(bus, dev_, fun, 0x4C, 0x01, 0x01);
+	}
+}
+
+U0 HDAInitStreamLayout()
+{//Stream descriptor offsets come from GCAP: input streams first, then output.
+	I64 gcap = HDARdU16(HDA_GCAP);
+
+	hda.iss = (gcap >> 8)  & 0x0F;
+	hda.oss = (gcap >> 12) & 0x0F;
+	hda.bss = (gcap >> 3)  & 0x1F;
+
+	if (!hda.iss && !hda.oss)
+	{
+		hda.iss = HDA_DFT_ISS;
+		hda.oss = HDA_DFT_OSS;
+	}
+
+	hda.ostr_idx = hda.iss;
+	hda.ostr	 = HDA_STR_BASE + (hda.ostr_idx * HDA_STR_SIZE);
+}
+
+I64 HDARingSize(I64 rg, I64 *_mask)
+{//Pick the largest ring the controller supports and program the size field.
+	I64 cap  = (HDARdU8(rg) >> 4) & 0x0F;
+	I64 ents;
+
+	if (cap & 0x04)
+	{
+		HDAWrU8(rg, (HDARdU8(rg) & ~0x03) | 0x02);
+		ents = 256;
+	}
+	else if (cap & 0x02)
+	{
+		HDAWrU8(rg, (HDARdU8(rg) & ~0x03) | 0x01);
+		ents = 16;
+	}
+	else if (cap & 0x01)
+	{
+		HDAWrU8(rg, HDARdU8(rg) & ~0x03);
+		ents = 2;
+	}
+	else
+	{//size is fixed; read back what it is
+		cap = HDARdU8(rg) & 0x03;
+		if (cap == 2)
+			ents = 256;
+		else if (cap == 1)
+			ents = 16;
+		else
+			ents = 2;
+	}
+
+	*_mask = ents - 1;
+
+	return ents;
+}
+
+U0 HDACtrlRst()
+{
+	HDAWrU16(HDA_STATESTS, 0x7FFF);
+
+	HDAWrU32(HDA_GCTL, 0);
+	while (HDARdU32(HDA_GCTL) & 1)
+		Sleep(1);
+
+	HDAWrU32(HDA_GCTL, 1);
+	while (!(HDARdU32(HDA_GCTL) & 1))
+		Sleep(1);
+
+	//codecs need time to report themselves in STATESTS
+	Sleep(1);
+}
+
+U8 *HDAMmioMap(I64 phys)
+{//Below 4Gig the uncached alias covers it. Above, ZealBooter has already
+ //identity mapped the BAR: flip its pages uncached, as XhciMmioMap does.
+	I64 *pte, base;
+
+	//PARENTHESISE: ZealC shift precedence differs from C
+	if (phys < (1 << 32))
+		return dev.uncached_alias + phys;
+
+	base = phys & ~(mem_page_size - 1);
+	pte	 = MemPageTable(base);
+	*pte = *pte | 0x10;	//PCD
+	pte	 = MemPageTable(base + mem_page_size);
+	*pte = *pte | 0x10;
+
+	return phys;
+}
+
+Bool HDACtrlStart(I64 bdf)
+{//Bring one controller up. TRUE if a codec answered and the stream is running.
+ //A controller that fails after allocating leaks its rings and buffers: the
+ //state is cleared for the next attempt without freeing. Bounded by the number
+ //of HD Audio controllers present, once, at boot.
+	I64 bus = bdf.u8[2], dev_ = bdf.u8[1], fun = bdf.u8[0];
+	I64 vendor, bar_lo, bar_hi, phys, pos_sz, i;
+	U16 statests;
+
+	MemSet(&hda, 0, sizeof(CHDA));
+	hda.vol		= 256;
+	hda.out_fmt	= HDA_OUT_FMT;
+
+	vendor = PCIReadU32(bus, dev_, fun, 0x0) & 0xFFFF;
+	bar_lo = PCIReadU32(bus, dev_, fun, 0x10);
+	phys   = bar_lo & ~0xF;
+	if ((bar_lo & 0x06) == 0x04)
+	{//64-bit BAR
+		bar_hi = PCIReadU32(bus, dev_, fun, 0x14);
+		phys   = phys + (bar_hi << 32);
+	}
+	if (!phys)
+		return FALSE;
+
+	HDAInitPCI(bus, dev_, fun, vendor);
+	hda.bar = HDAMmioMap(phys);
+
+	HDAInitStreamLayout;
+	HDACtrlRst;
+
+	//--- CORB / RIRB rings ---
+	hda.corb = CAllocAligned(HDA_CORB_ENTRIES * sizeof(U32), 128, sys_task->code_heap);
+	HDAWrU32(HDA_CORBLBASE, hda.corb);
+	HDAWrU32(HDA_CORBUBASE, hda.corb >> 32);
+	HDARingSize(HDA_CORBSIZE, &hda.corb_mask);
+
+	hda.rirb = CAllocAligned(HDA_RIRB_ENTRIES * sizeof(I64), 128, sys_task->code_heap);
+	HDAWrU32(HDA_RIRBLBASE, hda.rirb);
+	HDAWrU32(HDA_RIRBUBASE, hda.rirb >> 32);
+	HDARingSize(HDA_RIRBSIZE, &hda.rirb_mask);
+
+	//reset the CORB read pointer: set bit 15, wait for it to read back, clear
+	HDAWrU16(HDA_CORBRP, 0x8000);
+	while (!(HDARdU16(HDA_CORBRP) & 0x8000))
+		Yield;
+	HDAWrU16(HDA_CORBRP, 0x0000);
+	while (HDARdU16(HDA_CORBRP) & 0x8000)
+		Yield;
+
+	HDAWrU16(HDA_RIRBWP, 0x8000);	//reset write pointer
+	HDAWrU16(HDA_RINTCNT, 0xFF);
+
+	HDAWrU8(HDA_CORBCTL, 0x02);		//DMA run
+	HDAWrU8(HDA_RIRBCTL, 0x03);		//DMA run + response interrupt
+
+	hda.corb_wp = HDARdU16(HDA_CORBWP) & hda.corb_mask;
+	hda.rirb_rp = HDARdU16(HDA_RIRBWP) & hda.rirb_mask;
+
+	//--- DMA position buffer ---
+	pos_sz = 8 * (hda.iss + hda.oss + hda.bss);
+	if (pos_sz < 8)
+		pos_sz = 8;
+	hda.posbuf = CAllocAligned(pos_sz, 128, sys_task->code_heap);
+	HDAWrU32(HDA_DPUBASE, hda.posbuf >> 32);
+	HDAWrU32(HDA_DPLBASE, hda.posbuf | 1);	//bit 0 enables it
+	hda.opos = &hda.posbuf[2 * hda.ostr_idx];
+
+	//--- output stream + BDL ---
+	HDAStreamRst(hda.ostr);
+	hda.bdl = CAllocAligned(HDA_BDL_ENTRIES * sizeof(CHDABufDesc), 128,
+		sys_task->code_heap);
+	HDAWrU32(hda.ostr + HDA_STRBDPL, hda.bdl);
+	HDAWrU32(hda.ostr + HDA_STRBDPU, hda.bdl >> 32);
+
+	for (i = 0; i < HDA_BDL_ENTRIES; i++)
+	{
+		hda.buf[i]		= CAllocAligned(HDA_BUF_BYTES, 128, sys_task->code_heap);
+		hda.bdl[i].buf	= hda.buf[i];
+		hda.bdl[i].len	= HDA_BUF_BYTES;
+		hda.bdl[i].ctrl	= 1;	//IOC
+	}
+
+	//--- find a codec ---
+	statests = HDARdU16(HDA_STATESTS);
+	while (statests)
+	{
+		hda.cad = Bsf(statests);
+		if (HDAVerbProbe(hda.cad, 0, VERB_GET_PARAM + P_SUBNODE_CNT))
+		{
+			hda_afg_in_amp  = 0;
+			hda_afg_out_amp = 0;
+			HDATraverse(hda.cad, 0);
+
+			HDAWrU32(hda.ostr + HDA_STRLPIB, 0);
+			HDAWrU32(hda.ostr + HDA_STRCBL, HDA_BDL_ENTRIES * HDA_BUF_BYTES);
+			HDAWrU16(hda.ostr + HDA_STRLVI, HDA_BDL_ENTRIES - 1);
+			HDAWrU16(hda.ostr + HDA_STRFMT, hda.out_fmt);
+
+			if (!HDARdU16(hda.ostr + HDA_STRFIFOS))
+				"[HDA] Output stream did not accept format 0x%04X.\n",
+					hda.out_fmt;
+
+			hda.wp = 0;
+			HDABufferFill;
+			HDARun;
+
+			"[HDA] Audio up: %04X:%04X bus %d dev %d fun %d, codec %d, "
+				"%d in/%d out streams.\n",
+				vendor, PCIReadU32(bus, dev_, fun, 0x0) >> 16,
+				bus, dev_, fun, hda.cad, hda.iss, hda.oss;
+
+			return TRUE;
+		}
+		Btr(&statests, hda.cad);
+	}
+
+	"[HDA] Controller at bus %d dev %d fun %d has no responding codec.\n",
+		bus, dev_, fun;
+
+	return FALSE;
+}
+
+I64 HDAInit()
+{//0 on success. Tries every HD Audio controller in the machine.
+	I64 i = 0, bdf;
+
+	while (TRUE)
+	{
+		bdf = PCIClassFind(0x040300, i++); //Class 04=multimedia, 03=HD Audio.
+		if (bdf < 0)
+			return -1;
+
+		if (HDACtrlStart(bdf))
+		{
+			audio_dev		 = AUDIO_DEV_HDA;
+			audio_present	 = TRUE;
+			fp_audio_vol_set = &HDAVolumeSet;
+			AudioMasterVolumeSet(audio_volume);
+
+			Spawn(&HDAMixTask, , "HDA Mixer", 1);
+
+			return 0;
+		}
+	}
+}
