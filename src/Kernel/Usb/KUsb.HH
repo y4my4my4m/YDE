@@ -45,6 +45,7 @@
 #define USB_FEAT_EP_HALT		0
 
 //USB classes
+#define USB_CLASS_AUDIO			1
 #define USB_CLASS_HID			3
 #define USB_CLASS_MSD			8
 #define USB_CLASS_HUB			9
@@ -391,9 +392,6 @@ extern U8			 usb_boot_iso_drv_let; //Drive letter of mounted USB install media, 
 public extern U0  UsbRep();
 public extern I64 UsbBootInit();
 public extern U0  UsbBootDriveFallback();
-//Installed by the System audio layer. Kernel AOT code cannot call a symbol
-//that is JIT compiled later, so the mixer reaches the driver through this.
-extern U0 (*fp_usb_audio_fill)(U32 *buf, I64 bytes);
 extern U0 UsbAudioTxCB(CUsbDev *dev, CUsbEP *ep);
 public extern U0  UsbAudioAttach(CUsbDev *dev, CUsbIf *uif);
 public extern U0  UsbAudioDetach(CUsbDev *dev);
