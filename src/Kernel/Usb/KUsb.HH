@@ -198,6 +198,10 @@ class CUsbEPDesc
 #define XHCI_TRB_DATA			3
 #define XHCI_TRB_STATUS			4
 #define XHCI_TRB_ISOCH			5
+
+//Isoch TRB, Start Isoch ASAP. Frame ID is ignored, so an underrun cannot
+//leave the ring pointing at a frame that has already passed.
+#define XHCI_TRBF_SIA			0x80000000
 #define XHCI_TRB_LINK			6
 #define XHCI_TRB_EVENT_DATA		7
 #define XHCI_TRB_NOOP			8
@@ -258,6 +262,7 @@ class CUsbEPDesc
 #define USB_AUTO_KBD			1
 #define USB_AUTO_MOUSE			2
 #define USB_AUTO_ECM			3	//CDC-ECM bulk-IN: receive ethernet frame
+#define USB_AUTO_AUDIO			4	//UAC isoc-OUT: refill and requeue one frame
 
 //XhciEventPoll dispatches to handlers compiled after it.
 extern U0 UsbKbdCB(U8 *dev, U8 *ep);
@@ -386,6 +391,14 @@ extern U8			 usb_boot_iso_drv_let; //Drive letter of mounted USB install media, 
 public extern U0  UsbRep();
 public extern I64 UsbBootInit();
 public extern U0  UsbBootDriveFallback();
+//Installed by the System audio layer. Kernel AOT code cannot call a symbol
+//that is JIT compiled later, so the mixer reaches the driver through this.
+extern U0 (*fp_usb_audio_fill)(U32 *buf, I64 bytes);
+extern U0 UsbAudioTxCB(CUsbDev *dev, CUsbEP *ep);
+public extern U0  UsbAudioAttach(CUsbDev *dev, CUsbIf *uif);
+public extern U0  UsbAudioDetach(CUsbDev *dev);
+public extern Bool UsbAudioPresent();
+
 public extern U0  UsbTaskMain(I64 dummy=0);
 public extern I64  XhciInitAll();
 

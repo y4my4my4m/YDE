@@ -1,0 +1,202 @@
+//USB Audio Class 1.0 output. Streams the system mixer to an isochronous OUT
+//endpoint: any USB-C dongle, headset or DAC, on any machine with USB.
+//
+//UAC1 only. Class 2 uses an explicit feedback endpoint and a different control
+//layout; class 1 covers the bus-powered dongles this is meant for.
+//
+//Descriptor layout walked here (Audio Device Class 1.0, sections 4.5):
+//  IF class 1 subclass 2 alt 0   zero bandwidth, no endpoint
+//  IF class 1 subclass 2 alt N   the streaming setting
+//    CS_INTERFACE AS_GENERAL     (subtype 1) terminal link, delay, format tag
+//    CS_INTERFACE FORMAT_TYPE    (subtype 2) channels, subframe size, rates
+//    ENDPOINT isoc OUT           the audio sink
+//    CS_ENDPOINT EP_GENERAL      (subtype 1) sample-rate control support
+
+#define UAC_SUBCLASS_CONTROL	0x01
+#define UAC_SUBCLASS_STREAMING	0x02
+
+#define UAC_CS_IF_AS_GENERAL	0x01
+#define UAC_CS_IF_FORMAT_TYPE	0x02
+
+#define UAC_FORMAT_TYPE_I		0x01
+#define UAC_PCM_FORMAT_TAG		0x0001
+
+#define UAC_RQ_SET_CUR			0x01
+#define UAC_CS_SAMPLING_FREQ	0x0100	//control selector 1, channel 0
+
+//The mixer emits 48kHz stereo U32 L16|R16, so one millisecond is 48 frames of
+//4 bytes. Full speed schedules one packet per 1ms frame.
+#define UAC_RATE				48000
+#define UAC_FRAME_BYTES			192
+#define UAC_TDS_IN_FLIGHT		3
+
+class CUsbAudio
+{
+	CUsbDev	*dev;
+	CUsbEP	*ep;
+	I64		 if_num;		//streaming interface
+	I64		 alt;			//alternate setting carrying the endpoint
+	I64		 channels;
+	I64		 bits;
+	Bool	 valid;
+	Bool	 running;
+	U8		*buf[UAC_TDS_IN_FLIGHT];
+} usb_audio;
+
+U0 (*fp_usb_audio_fill)(U32 *buf, I64 bytes) = NULL;
+
+public Bool UsbAudioPresent()
+{
+	return ToBool(usb_audio.valid && usb_audio.running);
+}
+
+I64 UsbAudioRateSet(CUsbDev *dev, CUsbEP *ep, I64 rate)
+{//SET_CUR on the endpoint's sampling frequency control. 3-byte little endian.
+	U8 v[3];
+
+	v[0] = rate	      & 0xFF;
+	v[1] = (rate >> 8)  & 0xFF;
+	v[2] = (rate >> 16) & 0xFF;
+
+	return UsbCtrl(dev, USB_RT_HOST_TO_DEV | USB_RT_CLASS | USB_RT_RECIP_EP,
+				   UAC_RQ_SET_CUR, UAC_CS_SAMPLING_FREQ, ep->addr, v, 3);
+}
+
+Bool UsbAudioParse(CUsbDev *dev, CUsbAudio *a)
+{//Find a streaming alt setting with a PCM Format Type I isoc OUT endpoint.
+	U8	*buf = dev->raw_config;
+	I64	 len = dev->raw_config_len, off = 0, dlen, dtype;
+	I64	 cur_if = -1, cur_alt = -1;
+	Bool in_stream = FALSE, have_fmt = FALSE;
+
+	if (!buf || len < 4)
+		return FALSE;
+
+	while (off + 2 <= len)
+	{
+		dlen  = buf[off];
+		dtype = buf[off + 1];
+		if (!dlen)
+			break;
+
+		if (dtype == USB_DESC_IF && off + 9 <= len)
+		{
+			cur_if	  = buf[off + 2];
+			cur_alt	  = buf[off + 3];
+			in_stream = ToBool(buf[off + 5] == USB_CLASS_AUDIO &&
+							   buf[off + 6] == UAC_SUBCLASS_STREAMING &&
+							   cur_alt);
+			have_fmt  = FALSE;
+		}
+		else if (dtype == USB_DESC_CS_IF && in_stream && off + 3 <= len)
+		{
+			if (buf[off + 2] == UAC_CS_IF_FORMAT_TYPE && off + 8 <= len &&
+				buf[off + 3] == UAC_FORMAT_TYPE_I)
+			{//bNrChannels, bSubframeSize, bBitResolution
+				a->channels = buf[off + 4];
+				a->bits		= buf[off + 6];
+				have_fmt	= ToBool(a->channels == 2 && a->bits == 16);
+			}
+		}
+		else if (dtype == USB_DESC_EP && in_stream && have_fmt && off + 6 <= len)
+		{
+			if (!(buf[off + 2] & 0x80) && (buf[off + 3] & 3) == USB_EP_TYPE_ISOCH)
+			{
+				a->if_num = cur_if;
+				a->alt	  = cur_alt;
+				a->ep	  = UsbDevEPByDCI(dev, (buf[off + 2] & 0xF) << 1);
+
+				return ToBool(a->ep != NULL);
+			}
+		}
+		off += dlen;
+	}
+
+	return FALSE;
+}
+
+U0 UsbAudioTxCB(CUsbDev *dev, CUsbEP *ep)
+{//One frame consumed. Refill it before XhciEventPoll requeues the same buffer.
+	no_warn dev;
+
+	if (!fp_usb_audio_fill)
+	{
+		MemSet(ep->auto_buf, 0, ep->auto_len);
+		return;
+	}
+	(*fp_usb_audio_fill)(ep->auto_buf, ep->auto_len);
+}
+
+public U0 UsbAudioAttach(CUsbDev *dev, CUsbIf *uif)
+{//Bound to the audio control interface; the streaming interface is found here.
+	CUsbAudio	*a = &usb_audio;
+	I64			 i, code;
+
+	no_warn uif;
+	if (a->valid)
+		return;						//one output device at a time
+
+	MemSet(a, 0, sizeof(CUsbAudio));
+	a->dev = dev;
+	if (!UsbAudioParse(dev, a))
+	{
+		SysLog("USB: audio device has no 16-bit stereo PCM streaming setting.\n");
+		return;
+	}
+
+	code = UsbSetInterface(dev, a->if_num, a->alt);
+	if (code != XHCI_CC_SUCCESS)
+	{
+		SysLog("USB: audio SET_INTERFACE %d/%d failed (%d).\n",
+			   a->if_num, a->alt, code);
+		return;
+	}
+
+//Not every device implements the sample-rate control; a fixed-48k dongle
+//answers with a stall and still plays.
+	UsbAudioRateSet(dev, a->ep, UAC_RATE);
+
+	for (i = 0; i < UAC_TDS_IN_FLIGHT; i++)
+		a->buf[i] = CAllocAligned(UAC_FRAME_BYTES, 64, sys_task->code_heap);
+
+	a->ep->auto_buf	 = a->buf[0];
+	a->ep->auto_len	 = UAC_FRAME_BYTES;
+	a->ep->auto_kind = USB_AUTO_AUDIO;
+	dev->drv_data	 = a;
+	a->valid		 = TRUE;
+	a->running		 = TRUE;
+
+//Prime the ring. Each completion refills and requeues, so the in-flight count
+//holds steady without a submission counter.
+	for (i = 0; i < UAC_TDS_IN_FLIGHT; i++)
+	{
+		if (fp_usb_audio_fill)
+			(*fp_usb_audio_fill)(a->buf[i], UAC_FRAME_BYTES);
+		XhciIsocQueue(dev, a->ep, a->buf[i], UAC_FRAME_BYTES);
+	}
+
+	"USB: audio out, %d ch %d-bit %dHz, if %d alt %d ep 0x%02X.\n",
+		a->channels, a->bits, UAC_RATE, a->if_num, a->alt, a->ep->addr;
+}
+
+public U0 UsbAudioDetach(CUsbDev *dev)
+{
+	CUsbAudio	*a = &usb_audio;
+	I64			 i;
+
+	if (!a->valid || a->dev != dev)
+		return;
+
+	a->running = FALSE;
+	a->valid   = FALSE;
+	if (a->ep)
+		a->ep->auto_kind = USB_AUTO_NONE;
+	for (i = 0; i < UAC_TDS_IN_FLIGHT; i++)
+	{
+		Free(a->buf[i]);
+		a->buf[i] = NULL;
+	}
+	a->dev		  = NULL;
+	a->ep		  = NULL;
+	dev->drv_data = NULL;
+}
