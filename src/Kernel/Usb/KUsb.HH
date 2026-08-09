@@ -362,6 +362,10 @@ class CUsbDev
 	I64		 hub_ports,		//downstream port count (hubs only)
 			 hub_tt_think,	//TT think time field (0..3)
 			 hub_mtt;		//multi-TT enabled
+//Config descriptor as fetched. Class drivers need the class-specific and
+//alternate-setting records the parser does not keep.
+	U8		*raw_config;
+	I64		 raw_config_len;
 	U8		*drv_data;		//class driver private (CUsbMsd / CUsbHid / CUsbEcm)
 	U8		 desc_name[64];	//product string, ASCII
 };
