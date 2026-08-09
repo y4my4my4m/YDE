@@ -28,7 +28,9 @@ fi
 LIMINE_BINARY_BRANCH="v10.x-binary"
 [ -d limine ] || git clone https://github.com/limine-bootloader/limine.git --branch=$LIMINE_BINARY_BRANCH --depth=1
 make -C limine
-[ -f ../zealbooter/bin/kernel ] || make -C ../zealbooter distclean all
+# Always rebuild: a stale bin/kernel silently ships an old ZealBooter, and the
+# kernel depends on its mem_physical_space stretch to map xHCI BARs above 4GB.
+make -C ../zealbooter distclean all
 
 TMPISODIR=$(mktemp -d)
 trap 'rm -rf "$TMPISODIR"' EXIT
