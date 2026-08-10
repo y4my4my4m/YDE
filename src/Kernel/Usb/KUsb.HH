@@ -383,7 +383,9 @@ class CUsbDev
 //KUsbHub.ZC calls UsbDrvBind from KUsbBoot.ZC, compiled later. Declared after
 //CUsbDev/CUsbIf so the types are known.
 extern U0 UsbDrvBind(CUsbDev *dev);
+extern U0 UsbDrvUnbind(CUsbDev *dev);
 extern U0 UsbHubAttach(CUsbDev *dev, CUsbIf *uif);
+extern U0 UsbHubPortScan(CUsbDev *hub);
 
 //Globals defined in $LK,"KXhci.ZC",A="FF:::/Kernel/Usb/KXhci.ZC,usb_xhci"$.
 extern CXhciGlobals	 usb_hcs[USB_HCS_MAX];
