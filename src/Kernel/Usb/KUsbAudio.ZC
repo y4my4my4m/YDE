@@ -22,12 +22,25 @@
 #define UAC_PCM_FORMAT_TAG		0x0001
 
 #define UAC_RQ_SET_CUR			0x01
-#define UAC_CS_SAMPLING_FREQ	0x0100	//control selector 1, channel 0
+#define UAC_CS_SAMPLING_FREQ	0x0100	//UAC1 selector 1, channel 0
+#define UAC2_CS_SAM_FREQ		0x0100	//UAC2 clock source sampling frequency
 
-//The mixer emits 48kHz stereo U32 L16|R16, so one millisecond is 48 frames of
-//4 bytes. Full speed schedules one packet per 1ms frame.
+//Audio Control entity subtypes used to reach the clock a stream runs on.
+#define UAC_AC_INPUT_TERMINAL	0x02
+#define UAC_AC_FEATURE_UNIT		0x06
+#define UAC2_AC_CLOCK_SOURCE	0x0A
+
+//Feature Unit control selectors. Devices commonly power up muted.
+#define UAC_FU_MUTE				0x0100
+#define UAC_FU_VOLUME			0x0200
+#define UAC_FUS_MAX				4
+
+#define UAC_VER_1				0x0100
+#define UAC_VER_2				0x0200
+
+//The mixer emits 48kHz stereo U32 L16|R16. Bytes per service interval depend on
+//device speed and are computed in UsbAudioParse.
 #define UAC_RATE				48000
-#define UAC_FRAME_BYTES			192
 #define UAC_TDS_IN_FLIGHT		3
 
 class CUsbAudio
@@ -38,41 +51,90 @@ class CUsbAudio
 	I64		 alt;			//alternate setting carrying the endpoint
 	I64		 channels;
 	I64		 bits;
+	I64		 ver;			//bcdADC: UAC_VER_1 or UAC_VER_2
+	I64		 ac_if;			//audio control interface, target of UAC2 requests
+	I64		 clock_id;		//UAC2 clock entity feeding the stream
+	I64		 frame_bytes;	//payload per service interval
+	I64		 fu[UAC_FUS_MAX];
+	I64		 fu_n;
 	Bool	 valid;
 	Bool	 running;
 	U8		*buf[UAC_TDS_IN_FLIGHT];
+	I64		 buf_i;			//buffer the next TD uses
 } usb_audio;
 
 //Installed by the System audio layer. Kernel AOT code cannot call a symbol
 //that is JIT compiled later, so the mixer reaches the driver through this.
 public U0 (*fp_usb_audio_fill)(U32 *buf, I64 bytes) = NULL;
 
+//TDs the controller has completed. Zero after playback starts means the ring
+//stalled: nothing is being consumed.
+public I64 usb_audio_frames = 0;
+
 public Bool UsbAudioPresent()
 {
 	return ToBool(usb_audio.valid && usb_audio.running);
 }
 
-I64 UsbAudioRateSet(CUsbDev *dev, CUsbEP *ep, I64 rate)
-{//SET_CUR on the endpoint's sampling frequency control. 3-byte little endian.
-	U8 v[3];
+I64 UsbAudioRateSet(CUsbDev *dev, CUsbAudio *a, I64 rate)
+{//UAC1 addresses the endpoint with a 3-byte rate. UAC2 addresses a clock entity
+//on the control interface with 4 bytes.
+	U8 v[4];
 
-	v[0] = rate	      & 0xFF;
-	v[1] = (rate >> 8)  & 0xFF;
-	v[2] = (rate >> 16) & 0xFF;
+	v[0] = rate			& 0xFF;
+	v[1] = (rate >> 8)	& 0xFF;
+	v[2] = (rate >> 16)	& 0xFF;
+	v[3] = (rate >> 24)	& 0xFF;
+
+	if (a->ver >= UAC_VER_2)
+		return UsbCtrl(dev, USB_RT_HOST_TO_DEV | USB_RT_CLASS | USB_RT_RECIP_IF,
+					   UAC_RQ_SET_CUR, UAC2_CS_SAM_FREQ,
+					   (a->clock_id << 8) | a->ac_if, v, 4);
 
 	return UsbCtrl(dev, USB_RT_HOST_TO_DEV | USB_RT_CLASS | USB_RT_RECIP_EP,
-				   UAC_RQ_SET_CUR, UAC_CS_SAMPLING_FREQ, ep->addr, v, 3);
+				   UAC_RQ_SET_CUR, UAC_CS_SAMPLING_FREQ, a->ep->addr, v, 3);
+}
+
+U0 UsbAudioUnmute(CUsbDev *dev, CUsbAudio *a)
+{//Clear mute and set 0dB on every feature unit. A unit without the control
+//stalls the request, which is harmless.
+	U8	v[2];
+	I64	i;
+
+	for (i = 0; i < a->fu_n; i++)
+	{
+		v[0] = 0;
+		UsbCtrl(dev, USB_RT_HOST_TO_DEV | USB_RT_CLASS | USB_RT_RECIP_IF,
+				UAC_RQ_SET_CUR, UAC_FU_MUTE,
+				(a->fu[i] << 8) | a->ac_if, v, 1);
+
+		v[0] = 0;			//0dB, 1/256 dB units, signed
+		v[1] = 0;
+		UsbCtrl(dev, USB_RT_HOST_TO_DEV | USB_RT_CLASS | USB_RT_RECIP_IF,
+				UAC_RQ_SET_CUR, UAC_FU_VOLUME,
+				(a->fu[i] << 8) | a->ac_if, v, 2);
+	}
 }
 
 Bool UsbAudioParse(CUsbDev *dev, CUsbAudio *a)
-{//Find a streaming alt setting with a PCM Format Type I isoc OUT endpoint.
+{//Find a streaming alt with a 16-bit stereo PCM isoc OUT endpoint, and the
+//clock that feeds it.
+//
+//Format Type I differs by version:
+//  UAC1  off4 bNrChannels, off5 bSubframeSize, off6 bBitResolution
+//  UAC2  off4 bSubslotSize, off5 bBitResolution; channels live in AS_GENERAL
 	U8	*buf = dev->raw_config;
-	I64	 len = dev->raw_config_len, off = 0, dlen, dtype;
-	I64	 cur_if = -1, cur_alt = -1;
-	Bool in_stream = FALSE, have_fmt = FALSE;
+	I64	 len = dev->raw_config_len, off = 0, dlen, dtype, sub;
+	I64	 cur_if = -1, cur_alt = -1, chans = 0, bits = 0, link = 0;
+	I64	 first_clock = 0;
+	Bool in_stream = FALSE, in_ctrl = FALSE, have_fmt = FALSE;
 
 	if (!buf || len < 4)
 		return FALSE;
+
+	a->ver	   = UAC_VER_1;
+	a->ac_if   = 0;
+	a->clock_id = 0;
 
 	while (off + 2 <= len)
 	{
@@ -85,28 +147,79 @@ Bool UsbAudioParse(CUsbDev *dev, CUsbAudio *a)
 		{
 			cur_if	  = buf[off + 2];
 			cur_alt	  = buf[off + 3];
+			in_ctrl	  = ToBool(buf[off + 5] == USB_CLASS_AUDIO &&
+						   buf[off + 6] == UAC_SUBCLASS_CONTROL);
 			in_stream = ToBool(buf[off + 5] == USB_CLASS_AUDIO &&
-							   buf[off + 6] == UAC_SUBCLASS_STREAMING &&
-							   cur_alt);
-			have_fmt  = FALSE;
+						   buf[off + 6] == UAC_SUBCLASS_STREAMING && cur_alt);
+			if (in_ctrl)
+				a->ac_if = cur_if;
+			have_fmt = FALSE;
+			chans	 = 0;
+			bits	 = 0;
 		}
-		else if (dtype == USB_DESC_CS_IF && in_stream && off + 3 <= len)
+		else if (dtype == USB_DESC_CS_IF && off + 3 <= len)
 		{
-			if (buf[off + 2] == UAC_CS_IF_FORMAT_TYPE && off + 8 <= len &&
-				buf[off + 3] == UAC_FORMAT_TYPE_I)
-			{//bNrChannels, bSubframeSize, bBitResolution
-				a->channels = buf[off + 4];
-				a->bits		= buf[off + 6];
-				have_fmt	= ToBool(a->channels == 2 && a->bits == 16);
+			sub = buf[off + 2];
+			if (in_ctrl)
+			{
+				if (sub == UAC_CS_IF_AS_GENERAL && off + 5 <= len)
+					a->ver = buf[off + 3] | (buf[off + 4] << 8);
+				else if (sub == UAC2_AC_CLOCK_SOURCE && off + 4 <= len &&
+						 !first_clock)
+					first_clock = buf[off + 3];
+				else if (sub == UAC_AC_FEATURE_UNIT && off + 4 <= len &&
+						 a->fu_n < UAC_FUS_MAX)
+					a->fu[a->fu_n++] = buf[off + 3];
+//The stream names a terminal; that terminal names its clock.
+				else if (sub == UAC_AC_INPUT_TERMINAL && off + 8 <= len &&
+						 link && buf[off + 3] == link)
+					a->clock_id = buf[off + 7];
+			}
+			else if (in_stream)
+			{
+				if (sub == UAC_CS_IF_AS_GENERAL && off + 4 <= len)
+				{
+					link = buf[off + 3];
+					if (a->ver >= UAC_VER_2 && off + 11 <= len)
+						chans = buf[off + 10];
+				}
+				else if (sub == UAC_CS_IF_FORMAT_TYPE && off + 6 <= len &&
+						 buf[off + 3] == UAC_FORMAT_TYPE_I)
+				{
+					if (a->ver >= UAC_VER_2)
+						bits = buf[off + 5];
+					else
+					{
+						chans = buf[off + 4];
+						if (off + 7 <= len)
+							bits = buf[off + 6];
+					}
+					have_fmt = ToBool(chans == 2 && bits == 16);
+				}
 			}
 		}
 		else if (dtype == USB_DESC_EP && in_stream && have_fmt && off + 6 <= len)
 		{
 			if (!(buf[off + 2] & 0x80) && (buf[off + 3] & 3) == USB_EP_TYPE_ISOCH)
 			{
-				a->if_num = cur_if;
-				a->alt	  = cur_alt;
-				a->ep	  = UsbDevEPByDCI(dev, (buf[off + 2] & 0xF) << 1);
+				a->if_num	= cur_if;
+				a->alt		= cur_alt;
+				a->channels	= chans;
+				a->bits		= bits;
+				a->ep		= UsbDevEPByDCI(dev, (buf[off + 2] & 0xF) << 1);
+				if (!a->clock_id)
+					a->clock_id = first_clock;
+
+//High speed schedules every 125us microframe, full speed every 1ms frame.
+				if (dev->speed == USB_SPEED_HIGH || dev->speed == USB_SPEED_SUPER)
+					a->frame_bytes = UAC_RATE * 4 / 8000;
+				else
+					a->frame_bytes = UAC_RATE * 4 / 1000;
+
+//A TD longer than wMaxPacketSize babbles and halts the endpoint.
+				if (a->ep && a->ep->max_packet &&
+					a->frame_bytes > a->ep->max_packet)
+					a->frame_bytes = a->ep->max_packet;
 
 				return ToBool(a->ep != NULL);
 			}
@@ -118,8 +231,19 @@ Bool UsbAudioParse(CUsbDev *dev, CUsbAudio *a)
 }
 
 U0 UsbAudioTxCB(CUsbDev *dev, CUsbEP *ep)
-{//One frame consumed. Refill it before XhciEventPoll requeues the same buffer.
+{//One frame consumed. XhciEventPoll requeues ep->auto_buf immediately after this
+//returns, so advance to the next buffer before filling: TDs queued earlier may
+//still be read by the controller.
+	CUsbAudio *a = &usb_audio;
+
 	no_warn dev;
+	usb_audio_frames++;
+
+	if (a->valid)
+	{
+		a->buf_i = (a->buf_i + 1) % UAC_TDS_IN_FLIGHT;
+		ep->auto_buf = a->buf[a->buf_i];
+	}
 
 	if (!fp_usb_audio_fill)
 	{
@@ -127,6 +251,21 @@ U0 UsbAudioTxCB(CUsbDev *dev, CUsbEP *ep)
 		return;
 	}
 	(*fp_usb_audio_fill)(ep->auto_buf, ep->auto_len);
+}
+
+public U0 UsbAudioStat()
+{//Endpoint geometry and ring health in one line each.
+	CUsbAudio *a = &usb_audio;
+
+	if (!a->valid || !a->ep)
+	{
+		"USB audio: not attached.\n";
+		return;
+	}
+	"USB audio: speed %d  ep 0x%02X  mps %d  bInterval %d\n",
+		a->dev->speed, a->ep->addr, a->ep->max_packet, a->ep->interval;
+	"  frame_bytes %d  evts %d  filled %d  last cc %d\n",
+		a->frame_bytes, a->ep->xfer_evts, usb_audio_frames, a->ep->xfer_code;
 }
 
 public U0 UsbAudioAttach(CUsbDev *dev, CUsbIf *uif)
@@ -156,13 +295,14 @@ public U0 UsbAudioAttach(CUsbDev *dev, CUsbIf *uif)
 
 //Not every device implements the sample-rate control; a fixed-48k dongle
 //answers with a stall and still plays.
-	UsbAudioRateSet(dev, a->ep, UAC_RATE);
+	UsbAudioRateSet(dev, a, UAC_RATE);
+	UsbAudioUnmute(dev, a);
 
 	for (i = 0; i < UAC_TDS_IN_FLIGHT; i++)
-		a->buf[i] = CAllocAligned(UAC_FRAME_BYTES, 64, sys_task->code_heap);
+		a->buf[i] = CAllocAligned(a->frame_bytes, 64, sys_task->code_heap);
 
 	a->ep->auto_buf	 = a->buf[0];
-	a->ep->auto_len	 = UAC_FRAME_BYTES;
+	a->ep->auto_len	 = a->frame_bytes;
 	a->ep->auto_kind = USB_AUTO_AUDIO;
 	dev->drv_data	 = a;
 	a->valid		 = TRUE;
@@ -173,12 +313,15 @@ public U0 UsbAudioAttach(CUsbDev *dev, CUsbIf *uif)
 	for (i = 0; i < UAC_TDS_IN_FLIGHT; i++)
 	{
 		if (fp_usb_audio_fill)
-			(*fp_usb_audio_fill)(a->buf[i], UAC_FRAME_BYTES);
-		XhciIsocQueue(dev, a->ep, a->buf[i], UAC_FRAME_BYTES);
+			(*fp_usb_audio_fill)(a->buf[i], a->frame_bytes);
+		XhciIsocQueue(dev, a->ep, a->buf[i], a->frame_bytes);
 	}
+	a->buf_i = UAC_TDS_IN_FLIGHT - 1;
 
-	"USB: audio out, %d ch %d-bit %dHz, if %d alt %d ep 0x%02X.\n",
-		a->channels, a->bits, UAC_RATE, a->if_num, a->alt, a->ep->addr;
+	"USB: audio out UAC%d, %d ch %d-bit %dHz, if %d alt %d ep 0x%02X, "
+	"%d B/interval, clock %d, %d feature unit(s).\n",
+		a->ver >> 8, a->channels, a->bits, UAC_RATE, a->if_num, a->alt,
+		a->ep->addr, a->frame_bytes, a->clock_id, a->fu_n;
 }
 
 public U0 UsbAudioDetach(CUsbDev *dev)

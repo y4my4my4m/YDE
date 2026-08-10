@@ -3724,6 +3724,9 @@ public I64 class CBGR48
 #help_index "Keyboard Devices;Char/Input;StdIn"
 #define KBD_PORT	0x60
 #define KBD_CTRL	0x64
+//8042 status bit 5: the pending byte came from the AUX (mouse) port. Both
+//devices share one output buffer.
+#define KBD_STSF_AUX	0x20
 
 #define KBDC_LED		0xED
 #define KBDC_DISABLE_MS 0xA7

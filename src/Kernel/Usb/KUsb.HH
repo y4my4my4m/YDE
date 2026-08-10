@@ -244,6 +244,9 @@ class CUsbEPDesc
 #define XHCI_CC_TRB_ERR			5
 #define XHCI_CC_STALL			6
 #define XHCI_CC_SHORT_PKT		13
+#define XHCI_CC_RING_UNDERRUN	14	//isoc OUT ring empty at service time
+#define XHCI_CC_RING_OVERRUN	15
+#define XHCI_CC_MISSED_SERVICE	23	//isoc interval passed unserviced
 #define XHCI_CC_TIMEOUT			-1	//ours, not a hardware code
 
 //Endpoint context EP types
@@ -297,7 +300,8 @@ class CUsbEP
 //Sync transfer completion, set by event poll
 	Bool		 xfer_done;
 	I64			 xfer_code,		//xHCI completion code
-				 xfer_residue;	//untransferred bytes
+				 xfer_residue,	//untransferred bytes
+				 xfer_evts;		//transfer events seen, any completion code
 //Async auto-requeue (HID interrupt IN). auto_kind selects the report handler
 //(USB_AUTO_*); dispatched in XhciEventPoll. Avoids a function-pointer struct
 //member (which the ZealC JIT class parser rejects) and keeps late binding.
