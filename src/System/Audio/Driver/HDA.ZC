@@ -79,6 +79,8 @@
 
 //--- codec verbs ---
 #define VERB_GET_PARAM			0xF0000
+#define VERB_GET_CONNECT_LIST	0xF0200
+#define VERB_GET_CONFIG_DEFAULT	0xF1C00
 #define VERB_CONNECT_SEL_SET	0x70100
 #define VERB_PROCESS_STATE_SET	0x70300
 #define VERB_AMP_GAIN_SET		0x30000
@@ -109,6 +111,20 @@
 #define AWCAP_AMP_OVRD		3
 #define AWCAP_CONN_LST		8
 #define AWCAP_POWER			10
+
+//--- pin default config, verb 0xF1C ---
+//bits 31:30 port connectivity
+#define HDA_PORT_JACK		0
+#define HDA_PORT_NONE		1	//no physical connection behind the pin
+#define HDA_PORT_FIXED		2
+#define HDA_PORT_BOTH		3
+//bits 23:20 default device
+#define HDA_DEV_LINE_OUT	0
+#define HDA_DEV_SPEAKER		1
+#define HDA_DEV_HP_OUT		2
+
+//Widgets between an output pin and its DAC.
+#define HDA_ROUTE_DEPTH		8
 
 //--- pin capability bits ---
 #define PINCAP_HEADPHONE	3
@@ -167,6 +183,8 @@ class CHDA
 	U32			*opos;		//NULL once DMA position buffer is known bad
 	I64			 wp;		//BDL entry last filled
 	I64			 out_fmt;
+	I64			 out_pin;	//pin the route was built from
+	I64			 dac;		//DAC feeding out_pin
 } hda;
 
 //--- MMIO ------------------------------------------------------------------
@@ -325,11 +343,80 @@ U0 HDAPowerUp(I64 cad, I64 nid, Bool wait = FALSE)
 U32 hda_afg_in_amp	= 0;
 U32 hda_afg_out_amp	= 0;
 
+//Best-ranked output pin seen by HDATraverse, and its rank.
+I64 hda_pin_best	= 0;
+I64 hda_pin_rank	= 0;
+
+I64 HDAPinRank(I64 cfg)
+{//Preference among output pins from the default config. 0 rejects.
+	I64 conn = (cfg >> 30) & 3, dev = (cfg >> 20) & 15;
+
+	if (conn == HDA_PORT_NONE)
+		return 0;
+	switch (dev)
+	{
+		case HDA_DEV_SPEAKER:	return 3;
+		case HDA_DEV_LINE_OUT:	return 2;
+		case HDA_DEV_HP_OUT:	return 1;
+	}
+
+	return 0;
+}
+
+I64 HDAConnEntry(I64 cad, I64 nid, I64 idx, Bool long_form)
+{//One connection list entry. The range bit is not decoded.
+	I64 res;
+
+	if (long_form)
+	{
+		res = HDAVerb(cad, nid, VERB_GET_CONNECT_LIST + (idx & ~1));
+		return (res >> ((idx & 1) * 16)) & 0x7FFF;
+	}
+	res = HDAVerb(cad, nid, VERB_GET_CONNECT_LIST + (idx & ~3));
+
+	return (res >> ((idx & 3) * 8)) & 0x7F;
+}
+
+I64 HDARouteToDac(I64 cad, I64 nid, I64 depth)
+{//Select, at every widget from nid back to a DAC, the input carrying that DAC.
+//Returns the DAC nid, or 0 when no path exists.
+	I64  caps, type, lst, len, i, child, dac;
+	Bool long_form;
+
+	if (depth > HDA_ROUTE_DEPTH)
+		return 0;
+	caps = HDAVerb(cad, nid, VERB_GET_PARAM + P_AUDIO_WIDGET_CAP);
+	type = (caps >> 20) & 15;
+	if (type == AWT_OUTPUT)
+		return nid;
+	if (!Bt(&caps, AWCAP_CONN_LST))
+		return 0;
+
+	lst		  = HDAVerb(cad, nid, VERB_GET_PARAM + P_CONNECT_LST_LEN);
+	len		  = lst & 127;
+	long_form = ToBool(lst & 0x80);
+	for (i = 0; i < len; i++)
+	{
+		child = HDAConnEntry(cad, nid, i, long_form);
+		if (!child)
+			goto next_conn;
+		dac = HDARouteToDac(cad, child, depth + 1);
+		if (dac)
+		{
+			HDAVerb(cad, nid, VERB_CONNECT_SEL_SET + i);
+			return dac;
+		}
+next_conn:;
+	}
+
+	return 0;
+}
+
 U0 HDATraverse(I64 cad, I64 nid)
 {//Walk the widget graph, power everything up, open every amp to max gain and
  //bind each DAC to the output stream. Master volume is applied in software, so
  //the amps are left wide open; see HDAVolumeSet.
-	I64 i, len, aud_cap, type, g;
+	I64 i, len, aud_cap, type, g, cfg, rank;
 	U32 pin_cap;
 	U32 in_amp, out_amp, outer_in_amp, outer_out_amp;
 	I64 pin_ctl;
@@ -366,8 +453,7 @@ U0 HDATraverse(I64 cad, I64 nid)
 		HDAPowerUp(cad, nid);
 	HDAVerb(cad, nid, VERB_PROCESS_STATE_SET + 0x02);
 
-	//select the first connection; picking a route needs the pin default
-	//config, which only the config tool upstream parses
+	//default to input 0; HDARouteToDac overrides this along the chosen path
 	HDAVerb(cad, nid, VERB_CONNECT_SEL_SET + 0x00);
 
 	if (Bt(&aud_cap, AWCAP_CONN_LST))
@@ -425,14 +511,22 @@ U0 HDATraverse(I64 cad, I64 nid)
 
 		case AWT_PIN_COMPLEX:
 			pin_cap = HDAVerb(cad, nid, VERB_GET_PARAM + P_PIN_CAP);
+			cfg		= HDAVerb(cad, nid, VERB_GET_CONFIG_DEFAULT);
+			rank	= HDAPinRank(cfg);
 			pin_ctl = 0;
-			if (Bt(&pin_cap, PINCAP_OUTPUT))
+			if (Bt(&pin_cap, PINCAP_OUTPUT) && rank)
 			{
 				pin_ctl = PWC_OUT_EN;
 				if (Bt(&pin_cap, PINCAP_HEADPHONE))
 					pin_ctl |= PWC_HP_EN;
+				if (rank > hda_pin_rank)
+				{
+					hda_pin_rank = rank;
+					hda_pin_best = nid;
+				}
 			}
-			else if (Bt(&pin_cap, PINCAP_INPUT))
+			else if (Bt(&pin_cap, PINCAP_INPUT) &&
+					 ((cfg >> 30) & 3) != HDA_PORT_NONE)
 				pin_ctl = PWC_IN_EN;
 			HDAVerb(cad, nid, VERB_PIN_WIDGET_CTL_SET + pin_ctl);
 
@@ -792,6 +886,8 @@ Bool HDACtrlStart(I64 bdf)
 		{
 			hda_afg_in_amp  = 0;
 			hda_afg_out_amp = 0;
+			hda_pin_best	= 0;
+			hda_pin_rank	= 0;
 			HDATraverse(hda.cad, 0);
 			if (hda_fail)
 			{//DSP-style controller: enumerates, answers the probe, then stops
@@ -800,6 +896,20 @@ Bool HDACtrlStart(I64 bdf)
 					hda.cad;
 				return FALSE;
 			}
+
+			hda.out_pin = hda_pin_best;
+			hda.dac		= 0;
+			if (hda.out_pin)
+				hda.dac = HDARouteToDac(hda.cad, hda.out_pin, 0);
+			if (hda.dac)
+			{
+				HDAVerb(hda.cad, hda.dac,
+						VERB_CHAN_STREAM_ID_SET + (HDA_STREAM_TAG << 4));
+				HDAVerb(hda.cad, hda.dac, VERB_STREAM_FMT_SET + hda.out_fmt);
+			}
+			else
+				"[HDA] No DAC path from pin %d; codec left as traversed.\n",
+					hda.out_pin;
 
 			HDAWrU32(hda.ostr + HDA_STRLPIB, 0);
 			HDAWrU32(hda.ostr + HDA_STRCBL, HDA_BDL_ENTRIES * HDA_BUF_BYTES);
@@ -815,9 +925,10 @@ Bool HDACtrlStart(I64 bdf)
 			HDARun;
 
 			"[HDA] Audio up: %04X:%04X bus %d dev %d fun %d, codec %d, "
-				"%d in/%d out streams.\n",
+				"%d in/%d out streams, pin %d -> DAC %d.\n",
 				vendor, PCIReadU32(bus, dev_, fun, 0x0) >> 16,
-				bus, dev_, fun, hda.cad, hda.iss, hda.oss;
+				bus, dev_, fun, hda.cad, hda.iss, hda.oss,
+				hda.out_pin, hda.dac;
 
 			return TRUE;
 		}
