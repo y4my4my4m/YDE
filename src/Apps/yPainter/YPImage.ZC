@@ -1,0 +1,796 @@
+//Layer buffers, blend modes, compositing, document serialization and undo.
+//Depends on YPDef.
+//
+//HolyC binds << >> tighter than * / and binds & ^ | tighter than + -, so mixed
+//bitwise and arithmetic terms below are parenthesized against C habits.
+
+#define YP_UNDO_BUDGET	64 * 1024 * 1024
+
+U0 YPSetName(U8 *dst, U8 *src)
+{
+	I64 i = 0;
+
+	while (src[i] && i < YP_NAME_LEN - 1)
+	{
+		dst[i] = src[i];
+		i++;
+	}
+	dst[i] = 0;
+}
+
+U0 YPDirtyReset()
+{
+	yp.cd_x0 = I64_MAX;
+	yp.cd_y0 = I64_MAX;
+	yp.cd_x1 = I64_MIN;
+	yp.cd_y1 = I64_MIN;
+}
+
+U0 YPDirty(I64 x0, I64 y0, I64 x1, I64 y1)
+{//Rect is [x0,x1) x [y0,y1) in doc coords, clipped to the document.
+	if (x0 < 0)
+		x0 = 0;
+	if (y0 < 0)
+		y0 = 0;
+	if (x1 > yp.doc_w)
+		x1 = yp.doc_w;
+	if (y1 > yp.doc_h)
+		y1 = yp.doc_h;
+	if (x0 >= x1 || y0 >= y1)
+		return;
+
+	if (x0 < yp.cd_x0)
+		yp.cd_x0 = x0;
+	if (y0 < yp.cd_y0)
+		yp.cd_y0 = y0;
+	if (x1 > yp.cd_x1)
+		yp.cd_x1 = x1;
+	if (y1 > yp.cd_y1)
+		yp.cd_y1 = y1;
+	yp.dirty_view = TRUE;
+}
+
+U0 YPDirtyAll()
+{
+	YPDirty(0, 0, yp.doc_w, yp.doc_h);
+}
+
+I64 YPBlendCh(I64 mode, I64 b, I64 s)
+{//Separable blend function B(backdrop, source), both 0..255.
+	I64 d;
+
+	switch (mode)
+	{
+		case YPB_MULTIPLY:
+			return b * s / 255;
+
+		case YPB_SCREEN:
+			return 255 - ((255 - b) * (255 - s) / 255);
+
+		case YPB_OVERLAY:
+			if (b < 128)
+				return 2 * b * s / 255;
+			return 255 - (2 * (255 - b) * (255 - s) / 255);
+
+		case YPB_DARKEN:
+			return MinI64(b, s);
+
+		case YPB_LIGHTEN:
+			return MaxI64(b, s);
+
+		case YPB_ADD:
+			return MinI64(255, b + s);
+
+		case YPB_SUBTRACT:
+			return MaxI64(0, b - s);
+
+		case YPB_DIFFERENCE:
+			return AbsI64(b - s);
+
+		case YPB_DODGE:
+			if (!b)
+				return 0;
+			if (s >= 255)
+				return 255;
+			return MinI64(255, 255 * b / (255 - s));
+
+		case YPB_BURN:
+			if (b >= 255)
+				return 255;
+			if (!s)
+				return 0;
+			return 255 - MinI64(255, 255 * (255 - b) / s);
+
+		case YPB_HARDLIGHT:
+			if (s < 128)
+				return 2 * s * b / 255;
+			return 255 - (2 * (255 - s) * (255 - b) / 255);
+
+		case YPB_SOFTLIGHT:
+			//W3C soft-light. The b <= 63 branch is the cubic approximation the
+			//spec uses in place of the square root near black.
+			if (s <= 127)
+				return b - ((255 - 2 * s) * b * (255 - b) / (255 * 255));
+			if (b <= 63)
+				d = ((16 * b - 12 * 255) * b / 255 + 4 * 255) * b / 255;
+			else
+				d = ToI64(Sqrt(b / 255.0) * 255.0);
+			return b + ((2 * s - 255) * (d - b) / 255);
+	}
+
+	return s;
+}
+
+U0 YPBlendRect(U32 *dst, U32 *src, I64 x0, I64 y0, I64 x1, I64 y1,
+			   I64 mode, I64 opacity)
+{//src OVER dst with a separable blend mode, straight alpha, in place on dst.
+	I64  x, y, w = yp.doc_w, row, sa, da, oa, i,
+		 sc[3], dc[3], bc, ce, num;
+	U32  s, d;
+
+	for (y = y0; y < y1; y++)
+	{
+		row = y * w;
+		for (x = x0; x < x1; x++)
+		{
+			s = src[row + x];
+			sa = (s >> 24 & 0xFF) * opacity / 255;
+			if (!sa)
+				goto blend_next;
+			d = dst[row + x];
+			da = d >> 24 & 0xFF;
+
+			//Opaque source over anything, or anything over an empty backdrop:
+			//the blend function has no backdrop to act on.
+			if (!da)
+			{
+				dst[row + x] = (sa << 24) | (s & 0x00FFFFFF);
+				goto blend_next;
+			}
+			if (sa >= 255 && mode == YPB_NORMAL)
+			{
+				dst[row + x] = 0xFF000000 | (s & 0x00FFFFFF);
+				goto blend_next;
+			}
+
+			sc[0] = s >> 16 & 0xFF;
+			sc[1] = s >> 8  & 0xFF;
+			sc[2] = s	    & 0xFF;
+			dc[0] = d >> 16 & 0xFF;
+			dc[1] = d >> 8  & 0xFF;
+			dc[2] = d	    & 0xFF;
+
+			oa = sa + da - (sa * da / 255);
+			for (i = 0; i < 3; i++)
+			{
+				if (mode == YPB_NORMAL)
+					bc = sc[i];
+				else
+					bc = YPBlendCh(mode, dc[i], sc[i]);
+				//Blend only applies where the backdrop is present.
+				ce = ((255 - da) * sc[i] + da * bc) / 255;
+				num = sa * 255 * ce + (255 - sa) * da * dc[i];
+				sc[i] = ClampI64(num / (255 * oa), 0, 255);
+			}
+			dst[row + x] = (oa << 24) | (sc[0] << 16) | (sc[1] << 8) | sc[2];
+blend_next:
+			;
+		}
+	}
+}
+
+U0 YPCompositeFlush()
+{//Recomposite the dirty rect bottom-up into yp.comp, then clear the rect.
+	I64 		i, y, x0 = yp.cd_x0, y0 = yp.cd_y0, x1 = yp.cd_x1, y1 = yp.cd_y1;
+	CYPLayer   *l;
+
+	if (x0 >= x1 || y0 >= y1)
+		return;
+
+	for (y = y0; y < y1; y++)
+		MemSetU32(&yp.comp[y * yp.doc_w + x0], 0, x1 - x0);
+
+	for (i = 0; i < yp.layer_n; i++)
+	{
+		l = &yp.layer[i];
+		if (l->visible && l->opacity && l->px)
+			YPBlendRect(yp.comp, l->px, x0, y0, x1, y1, l->blend,
+						l->opacity);
+	}
+
+	YPDirtyReset;
+}
+
+U32 *YPBufNew(I64 n)
+{
+	return CAlloc(n * sizeof(U32));
+}
+
+U0 YPLayerFreeAll()
+{
+	I64 i;
+
+	for (i = 0; i < yp.layer_n; i++)
+	{
+		Free(yp.layer[i].px);
+		yp.layer[i].px = NULL;
+	}
+	yp.layer_n = 0;
+	yp.cur = 0;
+}
+
+U0 YPScratchAlloc()
+{//Full-document scratch: composite, pre-stroke snapshot, coverage mask.
+	Free(yp.comp);
+	Free(yp.snap);
+	Free(yp.acc);
+	yp.comp = YPBufNew(yp.doc_w * yp.doc_h);
+	yp.snap = YPBufNew(yp.doc_w * yp.doc_h);
+	yp.acc	= CAlloc(yp.doc_w * yp.doc_h);
+}
+
+U0 YPLayerInit(CYPLayer *l, U8 *name)
+{
+	l->px		 = YPBufNew(yp.doc_w * yp.doc_h);
+	l->blend	 = YPB_NORMAL;
+	l->opacity	 = 255;
+	l->visible	 = TRUE;
+	l->alpha_lock = FALSE;
+	YPSetName(l->name, name);
+}
+
+I64 YPLayerAdd(U8 *name, I64 at=-1)
+{//Insert above layer `at`. Returns the new index, or -1 when full.
+	I64 i;
+
+	if (yp.layer_n >= YP_MAX_LAYERS)
+		return -1;
+	if (at < 0 || at >= yp.layer_n)
+		at = yp.layer_n - 1;
+	at++;
+
+	for (i = yp.layer_n; i > at; i--)
+		MemCopy(&yp.layer[i], &yp.layer[i - 1], sizeof(CYPLayer));
+	MemSet(&yp.layer[at], 0, sizeof(CYPLayer));
+	YPLayerInit(&yp.layer[at], name);
+	yp.layer_n++;
+
+	return at;
+}
+
+U0 YPLayerRemove(I64 i)
+{
+	I64 j;
+
+	if (yp.layer_n <= 1 || i < 0 || i >= yp.layer_n)
+		return;
+	Free(yp.layer[i].px);
+	for (j = i; j < yp.layer_n - 1; j++)
+		MemCopy(&yp.layer[j], &yp.layer[j + 1], sizeof(CYPLayer));
+	yp.layer_n--;
+	MemSet(&yp.layer[yp.layer_n], 0, sizeof(CYPLayer));
+	if (yp.cur >= yp.layer_n)
+		yp.cur = yp.layer_n - 1;
+}
+
+U0 YPLayerSwap(I64 a, I64 b)
+{
+	CYPLayer t;
+
+	if (a < 0 || b < 0 || a >= yp.layer_n || b >= yp.layer_n || a == b)
+		return;
+	MemCopy(&t, &yp.layer[a], sizeof(CYPLayer));
+	MemCopy(&yp.layer[a], &yp.layer[b], sizeof(CYPLayer));
+	MemCopy(&yp.layer[b], &t, sizeof(CYPLayer));
+}
+
+I64 YPLayerDup(I64 i)
+{
+	I64 at;
+	U8	name[YP_NAME_LEN + 8];
+
+	if (i < 0 || i >= yp.layer_n)
+		return -1;
+	StrPrint(name, "%s copy", yp.layer[i].name);
+	at = YPLayerAdd(name, i);
+	if (at < 0)
+		return -1;
+	MemCopy(yp.layer[at].px, yp.layer[i].px,
+			yp.doc_w * yp.doc_h * sizeof(U32));
+	yp.layer[at].blend	 = yp.layer[i].blend;
+	yp.layer[at].opacity = yp.layer[i].opacity;
+
+	return at;
+}
+
+U0 YPLayerMergeDown(I64 i)
+{//Fold layer i into i-1 using i's blend and opacity, then drop i.
+	if (i < 1 || i >= yp.layer_n)
+		return;
+	if (yp.layer[i].visible)
+		YPBlendRect(yp.layer[i - 1].px, yp.layer[i].px, 0, 0,
+					yp.doc_w, yp.doc_h, yp.layer[i].blend,
+					yp.layer[i].opacity);
+	YPLayerRemove(i);
+	yp.cur = i - 1;
+}
+
+U0 YPFlatten()
+{
+	I64 i;
+
+	for (i = yp.layer_n - 1; i > 0; i--)
+		YPLayerMergeDown(i);
+	yp.layer[0].blend	= YPB_NORMAL;
+	yp.layer[0].opacity = 255;
+	yp.layer[0].visible = TRUE;
+	YPSetName(yp.layer[0].name, "Flattened");
+	yp.cur = 0;
+}
+
+U0 YPLayerFillRect(CYPLayer *l, I64 x0, I64 y0, I64 x1, I64 y1, U32 col)
+{//Replaces pixels outright; alpha_lock keeps the existing coverage.
+	I64 x, y, row, a;
+
+	x0 = ClampI64(x0, 0, yp.doc_w);
+	y0 = ClampI64(y0, 0, yp.doc_h);
+	x1 = ClampI64(x1, 0, yp.doc_w);
+	y1 = ClampI64(y1, 0, yp.doc_h);
+
+	for (y = y0; y < y1; y++)
+	{
+		row = y * yp.doc_w;
+		if (l->alpha_lock)
+			for (x = x0; x < x1; x++)
+			{
+				a = l->px[row + x] >> 24 & 0xFF;
+				if (a)
+					l->px[row + x] = (a << 24) | (col & 0x00FFFFFF);
+			}
+		else
+			MemSetU32(&l->px[row + x0], col, x1 - x0);
+	}
+}
+
+U0 YPFlipH()
+{
+	I64 i, x, y, row, w = yp.doc_w;
+	U32 t;
+
+	for (i = 0; i < yp.layer_n; i++)
+		for (y = 0; y < yp.doc_h; y++)
+		{
+			row = y * w;
+			for (x = 0; x < w / 2; x++)
+			{
+				t = yp.layer[i].px[row + x];
+				yp.layer[i].px[row + x] = yp.layer[i].px[row + w - 1 - x];
+				yp.layer[i].px[row + w - 1 - x] = t;
+			}
+		}
+	YPDirtyAll;
+}
+
+U0 YPFlipV()
+{
+	I64  i, y, w = yp.doc_w, h = yp.doc_h, bytes = w * sizeof(U32);
+	U32 *tmp = MAlloc(bytes);
+
+	for (i = 0; i < yp.layer_n; i++)
+		for (y = 0; y < h / 2; y++)
+		{
+			MemCopy(tmp, &yp.layer[i].px[y * w], bytes);
+			MemCopy(&yp.layer[i].px[y * w],
+					&yp.layer[i].px[(h - 1 - y) * w], bytes);
+			MemCopy(&yp.layer[i].px[(h - 1 - y) * w], tmp, bytes);
+		}
+	Free(tmp);
+	YPDirtyAll;
+}
+
+U0 YPDocResize(I64 nw, I64 nh)
+{//Anchors at the top left; content outside the new bounds is dropped.
+	I64  i, y, cw, ch;
+	U32 *nb;
+
+	nw = ClampI64(nw, 1, YP_MAX_DIM);
+	nh = ClampI64(nh, 1, YP_MAX_DIM);
+	cw = MinI64(nw, yp.doc_w);
+	ch = MinI64(nh, yp.doc_h);
+
+	for (i = 0; i < yp.layer_n; i++)
+	{
+		nb = CAlloc(nw * nh * sizeof(U32));
+		for (y = 0; y < ch; y++)
+			MemCopy(&nb[y * nw], &yp.layer[i].px[y * yp.doc_w],
+					cw * sizeof(U32));
+		Free(yp.layer[i].px);
+		yp.layer[i].px = nb;
+	}
+	yp.doc_w = nw;
+	yp.doc_h = nh;
+	YPScratchAlloc;
+	YPDirtyAll;
+}
+
+U0 YPDocNew(I64 w, I64 h)
+{
+	YPLayerFreeAll;
+	yp.doc_w = ClampI64(w, 1, YP_MAX_DIM);
+	yp.doc_h = ClampI64(h, 1, YP_MAX_DIM);
+	YPScratchAlloc;
+
+	MemSet(&yp.layer[0], 0, sizeof(CYPLayer));
+	YPLayerInit(&yp.layer[0], "Background");
+	yp.layer_n = 1;
+	yp.cur = 0;
+	YPLayerFillRect(&yp.layer[0], 0, 0, yp.doc_w, yp.doc_h, 0xFFFFFFFF);
+	YPDirtyAll;
+}
+
+//RLE over U32 pixels. Token is a U16: high bit set means a run of (n & 0x7FFF)
+//copies of the U32 that follows, clear means (n) literal U32s follow.
+#define YP_RLE_RUN	0x8000
+#define YP_RLE_MAX	0x7FFF
+
+I64 YPRLEBound(I64 n)
+{
+	return n * sizeof(U32) + (n / YP_RLE_MAX + 2) * sizeof(U16) + 64;
+}
+
+I64 YPRLEEnc(U32 *src, I64 n, U8 *dst)
+{//Returns bytes written.
+	I64  i = 0, j, run, lit;
+	U8	*p = dst;
+
+	while (i < n)
+	{
+		run = 1;
+		while (i + run < n && src[i + run] == src[i] && run < YP_RLE_MAX)
+			run++;
+		if (run >= 2)
+		{
+			*p(U16 *) = YP_RLE_RUN | run;
+			p += sizeof(U16);
+			*p(U32 *) = src[i];
+			p += sizeof(U32);
+			i += run;
+		}
+		else
+		{
+			//A literal run ends where three equal neighbours start a run worth
+			//encoding.
+			lit = 0;
+			j = i;
+			while (j < n && lit < YP_RLE_MAX)
+			{
+				if (j + 2 < n && src[j] == src[j + 1] && src[j] == src[j + 2])
+					break;
+				lit++;
+				j++;
+			}
+			*p(U16 *) = lit;
+			p += sizeof(U16);
+			MemCopy(p, &src[i], lit * sizeof(U32));
+			p += lit * sizeof(U32);
+			i += lit;
+		}
+	}
+
+	return p - dst;
+}
+
+Bool YPRLEDec(U8 *src, I64 src_size, U32 *dst, I64 n)
+{
+	I64  i = 0, cnt;
+	U8	*p = src, *end = src + src_size;
+
+	while (i < n)
+	{
+		if (p + sizeof(U16) > end)
+			return FALSE;
+		cnt = *p(U16 *);
+		p += sizeof(U16);
+		if (cnt & YP_RLE_RUN)
+		{
+			cnt &= YP_RLE_MAX;
+			if (!cnt || i + cnt > n || p + sizeof(U32) > end)
+				return FALSE;
+			MemSetU32(&dst[i], *p(U32 *), cnt);
+			p += sizeof(U32);
+		}
+		else
+		{
+			if (!cnt || i + cnt > n || p + cnt * sizeof(U32) > end)
+				return FALSE;
+			MemCopy(&dst[i], p, cnt * sizeof(U32));
+			p += cnt * sizeof(U32);
+		}
+		i += cnt;
+	}
+
+	return TRUE;
+}
+
+#define YPT_MAGIC		'YPT1'
+#define YPT_VERSION 	1
+
+class CYPFileHdr
+{
+	U32 magic;
+	U32 version;
+	I64 w, h;
+	I64 layer_n;
+	I64 cur;
+	I64 reserved[4];
+};
+
+class CYPFileLayer
+{
+	U8	name[YP_NAME_LEN];
+	U8	pad[4];
+	I64 blend;
+	I64 opacity;
+	I64 visible;
+	I64 alpha_lock;
+	I64 data_size; 	//RLE bytes that follow
+};
+
+U8 *YPDocSerialize(I64 *_size)
+{//Header, then per layer a CYPFileLayer followed by RLE pixels.
+	I64 		  i, n = yp.doc_w * yp.doc_h, cap, used = 0, enc;
+	U8			 *buf;
+	CYPFileHdr	 *h;
+	CYPFileLayer *fl;
+
+	cap = sizeof(CYPFileHdr) +
+		  yp.layer_n * (sizeof(CYPFileLayer) + YPRLEBound(n));
+	buf = MAlloc(cap);
+
+	h = buf;
+	MemSet(h, 0, sizeof(CYPFileHdr));
+	h->magic	= YPT_MAGIC;
+	h->version	= YPT_VERSION;
+	h->w		= yp.doc_w;
+	h->h		= yp.doc_h;
+	h->layer_n	= yp.layer_n;
+	h->cur		= yp.cur;
+	used = sizeof(CYPFileHdr);
+
+	for (i = 0; i < yp.layer_n; i++)
+	{
+		fl = buf + used;
+		MemSet(fl, 0, sizeof(CYPFileLayer));
+		MemCopy(fl->name, yp.layer[i].name, YP_NAME_LEN);
+		fl->blend	   = yp.layer[i].blend;
+		fl->opacity    = yp.layer[i].opacity;
+		fl->visible    = yp.layer[i].visible;
+		fl->alpha_lock = yp.layer[i].alpha_lock;
+		used += sizeof(CYPFileLayer);
+		enc = YPRLEEnc(yp.layer[i].px, n, buf + used);
+		fl->data_size = enc;
+		used += enc;
+	}
+
+	*_size = used;
+
+	return buf;
+}
+
+Bool YPDocDeserialize(U8 *buf, I64 size)
+{
+	I64 		  i, n, used;
+	CYPFileHdr	 *h = buf;
+	CYPFileLayer *fl;
+
+	if (size < sizeof(CYPFileHdr) || h->magic != YPT_MAGIC)
+		return FALSE;
+	if (h->w < 1 || h->w > YP_MAX_DIM || h->h < 1 || h->h > YP_MAX_DIM)
+		return FALSE;
+	if (h->layer_n < 1 || h->layer_n > YP_MAX_LAYERS)
+		return FALSE;
+
+	YPLayerFreeAll;
+	yp.doc_w = h->w;
+	yp.doc_h = h->h;
+	n = yp.doc_w * yp.doc_h;
+	YPScratchAlloc;
+
+	used = sizeof(CYPFileHdr);
+	for (i = 0; i < h->layer_n; i++)
+	{
+		if (used + sizeof(CYPFileLayer) > size)
+			return FALSE;
+		fl = buf + used;
+		used += sizeof(CYPFileLayer);
+		if (used + fl->data_size > size)
+			return FALSE;
+
+		MemSet(&yp.layer[i], 0, sizeof(CYPLayer));
+		yp.layer[i].px = CAlloc(n * sizeof(U32));
+		MemCopy(yp.layer[i].name, fl->name, YP_NAME_LEN);
+		yp.layer[i].name[YP_NAME_LEN - 1] = 0;
+		yp.layer[i].blend	   = ClampI64(fl->blend, 0, YPB_COUNT - 1);
+		yp.layer[i].opacity    = ClampI64(fl->opacity, 0, 255);
+		yp.layer[i].visible    = fl->visible != 0;
+		yp.layer[i].alpha_lock = fl->alpha_lock != 0;
+		yp.layer_n = i + 1;
+
+		if (!YPRLEDec(buf + used, fl->data_size, yp.layer[i].px, n))
+			return FALSE;
+		used += fl->data_size;
+	}
+
+	yp.cur = ClampI64(h->cur, 0, yp.layer_n - 1);
+	YPDirtyAll;
+
+	return TRUE;
+}
+
+//Undo records store the state BEFORE an edit. Applying one swaps stored and
+//live state, so the same record serves as the redo entry.
+
+I64 yp_undo_bytes;
+
+U0 YPUndoFree(CYPUndo *u)
+{
+	Free(u->px);
+	Free(u->doc);
+	if (u->kind == YPU_PIX)
+		yp_undo_bytes -= u->w * u->h * sizeof(U32);
+	else
+		yp_undo_bytes -= u->doc_size;
+	MemSet(u, 0, sizeof(CYPUndo));
+}
+
+U0 YPUndoClear()
+{
+	I64 i;
+
+	for (i = 0; i < yp.undo_n; i++)
+		YPUndoFree(&yp.undo[i]);
+	yp.undo_n	= 0;
+	yp.undo_pos = 0;
+	yp_undo_bytes = 0;
+}
+
+U0 YPUndoDropOldest()
+{
+	I64 i;
+
+	if (!yp.undo_n)
+		return;
+	YPUndoFree(&yp.undo[0]);
+	for (i = 0; i < yp.undo_n - 1; i++)
+		MemCopy(&yp.undo[i], &yp.undo[i + 1], sizeof(CYPUndo));
+	yp.undo_n--;
+	MemSet(&yp.undo[yp.undo_n], 0, sizeof(CYPUndo));
+	if (yp.undo_pos)
+		yp.undo_pos--;
+}
+
+CYPUndo *YPUndoSlot(U8 *label)
+{//Truncate the redo tail, make room, return the slot to fill.
+	I64 i;
+
+	for (i = yp.undo_pos; i < yp.undo_n; i++)
+		YPUndoFree(&yp.undo[i]);
+	yp.undo_n = yp.undo_pos;
+
+	while (yp.undo_n >= YP_MAX_UNDO ||
+		   (yp_undo_bytes > YP_UNDO_BUDGET && yp.undo_n > 1))
+		YPUndoDropOldest;
+
+	MemSet(&yp.undo[yp.undo_n], 0, sizeof(CYPUndo));
+	YPSetName(yp.undo[yp.undo_n].label, label);
+	yp.undo_n++;
+	yp.undo_pos = yp.undo_n;
+
+	return &yp.undo[yp.undo_n - 1];
+}
+
+U0 YPUndoPushPix(I64 layer, I64 x, I64 y, I64 w, I64 h, U8 *label,
+				 U32 *from=NULL)
+{//Call before writing to the rect. `from` supplies the pre-edit pixels at
+//document stride when the layer has already been overwritten, as after a
+//brush stroke.
+	I64 		j;
+	CYPUndo    *u;
+
+	if (layer < 0 || layer >= yp.layer_n)
+		return;
+	if (!from)
+		from = yp.layer[layer].px;
+	x = ClampI64(x, 0, yp.doc_w);
+	y = ClampI64(y, 0, yp.doc_h);
+	w = ClampI64(w, 0, yp.doc_w - x);
+	h = ClampI64(h, 0, yp.doc_h - y);
+	if (!w || !h)
+		return;
+
+	u = YPUndoSlot(label);
+	u->kind  = YPU_PIX;
+	u->layer = layer;
+	u->x = x;
+	u->y = y;
+	u->w = w;
+	u->h = h;
+	u->px = MAlloc(w * h * sizeof(U32));
+	for (j = 0; j < h; j++)
+		MemCopy(&u->px[j * w], &from[(y + j) * yp.doc_w + x],
+				w * sizeof(U32));
+	yp_undo_bytes += w * h * sizeof(U32);
+}
+
+U0 YPUndoPushDoc(U8 *label)
+{//Call before a structural edit: layer add, delete, reorder, merge, resize.
+	CYPUndo *u = YPUndoSlot(label);
+
+	u->kind = YPU_DOC;
+	u->doc	= YPDocSerialize(&u->doc_size);
+	yp_undo_bytes += u->doc_size;
+}
+
+U0 YPUndoApply(CYPUndo *u)
+{
+	I64  j, w, h;
+	U32 *tmp;
+	U8	*ser;
+	I64  ser_size;
+
+	if (u->kind == YPU_PIX)
+	{
+		if (u->layer >= yp.layer_n)
+			return;
+		w = u->w;
+		h = u->h;
+		tmp = MAlloc(w * h * sizeof(U32));
+		for (j = 0; j < h; j++)
+		{
+			MemCopy(&tmp[j * w],
+					&yp.layer[u->layer].px[(u->y + j) * yp.doc_w + u->x],
+					w * sizeof(U32));
+			MemCopy(&yp.layer[u->layer].px[(u->y + j) * yp.doc_w + u->x],
+					&u->px[j * w], w * sizeof(U32));
+		}
+		Free(u->px);
+		u->px = tmp;
+		YPDirty(u->x, u->y, u->x + w, u->y + h);
+	}
+	else
+	{
+		ser = YPDocSerialize(&ser_size);
+		if (YPDocDeserialize(u->doc, u->doc_size))
+		{
+			yp_undo_bytes += ser_size - u->doc_size;
+			Free(u->doc);
+			u->doc		= ser;
+			u->doc_size = ser_size;
+		}
+		else
+			Free(ser);
+		YPDirtyAll;
+	}
+}
+
+Bool YPUndo()
+{
+	if (yp.undo_pos <= 0)
+		return FALSE;
+	yp.undo_pos--;
+	YPUndoApply(&yp.undo[yp.undo_pos]);
+	yp.modified = TRUE;
+
+	return TRUE;
+}
+
+Bool YPRedo()
+{
+	if (yp.undo_pos >= yp.undo_n)
+		return FALSE;
+	YPUndoApply(&yp.undo[yp.undo_pos]);
+	yp.undo_pos++;
+	yp.modified = TRUE;
+
+	return TRUE;
+}

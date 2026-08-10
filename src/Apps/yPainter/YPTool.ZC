@@ -1,0 +1,340 @@
+//Tools that are not plain brush strokes: flood fill, shapes, gradient, move.
+//Depends on YPDef, YPImage, YPBrush.
+//
+//Everything that deposits the foreground colour writes coverage into yp.acc
+//and commits through YPStrokeFlushRect, so opacity, alpha lock and the eraser
+//behave identically across tools.
+
+U32 YPOver(U32 dst, U32 src, I64 a)
+{//Straight-alpha source-over at coverage a (0..255).
+	I64 sa = ((src >> 24 & 0xFF) * a / 255), da, oa, i, num, sc[3], dc[3];
+
+	if (!sa)
+		return dst;
+	da = dst >> 24 & 0xFF;
+	if (!da)
+		return (sa << 24) | (src & 0x00FFFFFF);
+	if (sa >= 255)
+		return 0xFF000000 | (src & 0x00FFFFFF);
+
+	sc[0] = src >> 16 & 0xFF;
+	sc[1] = src >> 8  & 0xFF;
+	sc[2] = src		  & 0xFF;
+	dc[0] = dst >> 16 & 0xFF;
+	dc[1] = dst >> 8  & 0xFF;
+	dc[2] = dst		  & 0xFF;
+	oa = sa + da - (sa * da / 255);
+	for (i = 0; i < 3; i++)
+	{
+		num = sa * 255 * sc[i] + (255 - sa) * da * dc[i];
+		sc[i] = ClampI64(num / (255 * oa), 0, 255);
+	}
+
+	return (oa << 24) | (sc[0] << 16) | (sc[1] << 8) | sc[2];
+}
+
+U32 YPSample(I64 x, I64 y, Bool merged)
+{
+	if (x < 0 || y < 0 || x >= yp.doc_w || y >= yp.doc_h)
+		return 0;
+	if (merged)
+		return yp.comp[y * yp.doc_w + x];
+
+	return yp.layer[yp.cur].px[y * yp.doc_w + x];
+}
+
+Bool YPColorNear(U32 a, U32 b, I64 tol)
+{//Largest per-channel difference, alpha included.
+	I64 d, t;
+
+	d = AbsI64((a >> 24 & 0xFF) - (b >> 24 & 0xFF));
+	t = AbsI64((a >> 16 & 0xFF) - (b >> 16 & 0xFF));
+	if (t > d)
+		d = t;
+	t = AbsI64((a >> 8 & 0xFF) - (b >> 8 & 0xFF));
+	if (t > d)
+		d = t;
+	t = AbsI64((a & 0xFF) - (b & 0xFF));
+	if (t > d)
+		d = t;
+
+	return d <= tol;
+}
+
+U0 YPFloodFill(I64 sx, I64 sy, U32 col, I64 tol, Bool merged, Bool erase)
+{//Scanline flood over the sampled surface; coverage lands on the active layer.
+	I64  w = yp.doc_w, h = yp.doc_h, n = w * h,
+		 sp = 0, idx, x, y, x1, x2, i;
+	U32  target;
+	U8	*seen;
+	I64 *stack;
+	U32 *src;
+
+	if (sx < 0 || sy < 0 || sx >= w || sy >= h)
+		return;
+	if (merged)
+		src = yp.comp;
+	else
+		src = yp.layer[yp.cur].px;
+	target = src[sy * w + sx];
+
+	//A pixel can be queued once from the row above and once from the row below
+	//before its span marks it seen, so the stack needs room for 2n.
+	seen  = CAlloc(n);
+	stack = MAlloc((2 * n + 16) * sizeof(I64));
+	stack[sp++] = sy * w + sx;
+
+	YPStrokeOpen(col, erase);
+
+	while (sp)
+	{
+		idx = stack[--sp];
+		y = idx / w;
+		x = idx - y * w;
+		if (seen[idx] || !YPColorNear(src[idx], target, tol))
+			goto flood_next;
+
+		x1 = x;
+		while (x1 > 0 && !seen[y * w + x1 - 1] &&
+			   YPColorNear(src[y * w + x1 - 1], target, tol))
+			x1--;
+		x2 = x;
+		while (x2 < w - 1 && !seen[y * w + x2 + 1] &&
+			   YPColorNear(src[y * w + x2 + 1], target, tol))
+			x2++;
+
+		for (i = x1; i <= x2; i++)
+		{
+			seen[y * w + i] = 1;
+			YPAccCover(i, y, 255);
+		}
+
+		if (y > 0)
+			for (i = x1; i <= x2; i++)
+				if (!seen[(y - 1) * w + i] &&
+					YPColorNear(src[(y - 1) * w + i], target, tol))
+					stack[sp++] = (y - 1) * w + i;
+		if (y < h - 1)
+			for (i = x1; i <= x2; i++)
+				if (!seen[(y + 1) * w + i] &&
+					YPColorNear(src[(y + 1) * w + i], target, tol))
+					stack[sp++] = (y + 1) * w + i;
+flood_next:
+		;
+	}
+
+	Free(seen);
+	Free(stack);
+	YPAccCommit;
+	YPStrokeEnd("Fill");
+}
+
+U0 YPPathBegin(I64 x, I64 y)
+{
+	YPStampAt(x, y);
+	yp.stroke_x = x;
+	yp.stroke_y = y;
+	yp.stroke_carry = 0.0;
+}
+
+U0 YPToolLine(I64 x0, I64 y0, I64 x1, I64 y1, U32 col, Bool erase)
+{
+	YPStrokeOpen(col, erase);
+	YPPathBegin(x0, y0);
+	YPStrokeTo(x1, y1);
+	YPStrokeEnd("Line");
+}
+
+U0 YPToolRect(I64 x0, I64 y0, I64 x1, I64 y1, U32 col, Bool erase, Bool fill)
+{
+	I64 x, y, t;
+
+	if (x0 > x1)
+	{
+		t = x0;
+		x0 = x1;
+		x1 = t;
+	}
+	if (y0 > y1)
+	{
+		t = y0;
+		y0 = y1;
+		y1 = t;
+	}
+
+	YPStrokeOpen(col, erase);
+	if (fill)
+	{
+		for (y = y0; y <= y1; y++)
+			for (x = x0; x <= x1; x++)
+				YPAccCover(x, y, 255);
+		YPAccCommit;
+	}
+	else
+	{
+		YPPathBegin(x0, y0);
+		YPStrokeTo(x1, y0);
+		YPStrokeTo(x1, y1);
+		YPStrokeTo(x0, y1);
+		YPStrokeTo(x0, y0);
+	}
+	YPStrokeEnd("Rect");
+}
+
+U0 YPToolEllipse(I64 x0, I64 y0, I64 x1, I64 y1, U32 col, Bool erase, Bool fill)
+{
+	F64 cx = (x0 + x1) / 2.0, cy = (y0 + y1) / 2.0,
+		rx = Abs(x1 - x0) / 2.0, ry = Abs(y1 - y0) / 2.0,
+		nx, ny, d, edge, cov, a, step;
+	I64 x, y, bx0, by0, bx1, by1, steps, i;
+
+	if (rx < 0.5)
+		rx = 0.5;
+	if (ry < 0.5)
+		ry = 0.5;
+
+	YPStrokeOpen(col, erase);
+
+	if (fill)
+	{
+		bx0 = ToI64(cx - rx) - 1;
+		by0 = ToI64(cy - ry) - 1;
+		bx1 = ToI64(cx + rx) + 1;
+		by1 = ToI64(cy + ry) + 1;
+		//Edge width in normalized units, so the falloff is one screen pixel.
+		if (rx < ry)
+			edge = 1.0 / rx;
+		else
+			edge = 1.0 / ry;
+
+		for (y = by0; y <= by1; y++)
+			for (x = bx0; x <= bx1; x++)
+			{
+				nx = (x + 0.5 - cx) / rx;
+				ny = (y + 0.5 - cy) / ry;
+				d = Sqrt(nx * nx + ny * ny);
+				cov = (1.0 - d) / edge + 0.5;
+				if (cov > 1.0)
+					cov = 1.0;
+				if (!yp.anti_alias)
+				{
+					if (cov >= 0.5)
+						cov = 1.0;
+					else
+						cov = 0.0;
+				}
+				if (cov > 0.0)
+					YPAccCover(x, y, ToI64(cov * 255.0));
+			}
+		YPAccCommit;
+	}
+	else
+	{
+		if (rx > ry)
+			steps = ToI64(rx * 8.0);
+		else
+			steps = ToI64(ry * 8.0);
+		steps = ClampI64(steps, 24, 2048);
+		step = 6.28318530718 / steps;
+		YPPathBegin(ToI64(cx + rx), ToI64(cy));
+		for (i = 1; i <= steps; i++)
+		{
+			a = i * step;
+			YPStrokeTo(ToI64(cx + rx * Cos(a)), ToI64(cy + ry * Sin(a)));
+		}
+	}
+	YPStrokeEnd("Ellipse");
+}
+
+U0 YPToolGradient(I64 x0, I64 y0, I64 x1, I64 y1, U32 c0, U32 c1, Bool radial)
+{//Writes colour directly: the acc path carries a single colour only.
+	I64 		x, y, idx, a, i, ch0[4], ch1[4], cc[4], op;
+	F64 		dx = x1 - x0, dy = y1 - y0, len2, t, len;
+	U32 		col;
+	CYPLayer   *l = &yp.layer[yp.cur];
+
+	len2 = dx * dx + dy * dy;
+	if (len2 < 1.0)
+		return;
+	len = Sqrt(len2);
+	op = ClampI64(yp.opacity, 0, 255);
+
+	YPUndoPushPix(yp.cur, 0, 0, yp.doc_w, yp.doc_h, "Gradient");
+
+	ch0[0] = c0 >> 24 & 0xFF;
+	ch0[1] = c0 >> 16 & 0xFF;
+	ch0[2] = c0 >> 8  & 0xFF;
+	ch0[3] = c0		  & 0xFF;
+	ch1[0] = c1 >> 24 & 0xFF;
+	ch1[1] = c1 >> 16 & 0xFF;
+	ch1[2] = c1 >> 8  & 0xFF;
+	ch1[3] = c1		  & 0xFF;
+
+	for (y = 0; y < yp.doc_h; y++)
+		for (x = 0; x < yp.doc_w; x++)
+		{
+			if (radial)
+				t = Sqrt((x - x0) * (x - x0) + (y - y0) * (y - y0)) / len;
+			else
+				t = ((x - x0) * dx + (y - y0) * dy) / len2;
+			if (t < 0.0)
+				t = 0.0;
+			if (t > 1.0)
+				t = 1.0;
+
+			for (i = 0; i < 4; i++)
+				cc[i] = ch0[i] + ToI64((ch1[i] - ch0[i]) * t);
+			col = (cc[0] << 24) | (cc[1] << 16) | (cc[2] << 8) | cc[3];
+
+			idx = y * yp.doc_w + x;
+			a = op;
+			if (l->alpha_lock)
+				a = op * (l->px[idx] >> 24 & 0xFF) / 255;
+			if (a)
+				l->px[idx] = YPOver(l->px[idx], col, a);
+		}
+
+	YPDirtyAll;
+	yp.modified = TRUE;
+}
+
+U0 YPLayerOffset(I64 dx, I64 dy)
+{//Shift the active layer; vacated pixels become transparent.
+	I64  w = yp.doc_w, h = yp.doc_h, x, y, sx, sy;
+	U32 *nb;
+
+	if (!dx && !dy)
+		return;
+	nb = CAlloc(w * h * sizeof(U32));
+	for (y = 0; y < h; y++)
+	{
+		sy = y - dy;
+		if (0 <= sy < h)
+			for (x = 0; x < w; x++)
+			{
+				sx = x - dx;
+				if (0 <= sx < w)
+					nb[y * w + x] = yp.layer[yp.cur].px[sy * w + sx];
+			}
+	}
+	MemCopy(yp.layer[yp.cur].px, nb, w * h * sizeof(U32));
+	Free(nb);
+	YPDirtyAll;
+	yp.modified = TRUE;
+}
+
+U0 YPLayerClear()
+{
+	YPUndoPushPix(yp.cur, 0, 0, yp.doc_w, yp.doc_h, "Clear");
+	MemSetU32(yp.layer[yp.cur].px, 0, yp.doc_w * yp.doc_h);
+	YPDirtyAll;
+	yp.modified = TRUE;
+}
+
+U0 YPLayerFillAll(U32 col)
+{
+	YPUndoPushPix(yp.cur, 0, 0, yp.doc_w, yp.doc_h, "Fill");
+	YPLayerFillRect(&yp.layer[yp.cur], 0, 0, yp.doc_w, yp.doc_h, col);
+	YPDirtyAll;
+	yp.modified = TRUE;
+}
