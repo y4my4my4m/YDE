@@ -42,9 +42,14 @@
 //The mixer emits 48kHz stereo U32 L16|R16. Bytes per service interval depend on
 //device speed and are computed in UsbAudioParse.
 #define UAC_RATE				48000
-//The USB task polls every 2ms and each service interval is 1ms, so a shallow
-//ring underruns on any scheduling jitter. 8 TDs is 8ms of slack.
+//8ms of queued TDs against a 1ms service interval and a 2ms task poll.
 #define UAC_TDS_IN_FLIGHT		8
+
+//Mixer ring. Filled from the USB task loop, drained by the completion callback.
+//4096 frames is 85ms at UAC_RATE. Power of two; the index is masked.
+#define UAC_RING_FRAMES			4096
+#define UAC_RING_MASK			(UAC_RING_FRAMES - 1)
+#define UAC_FEED_CHUNK			240		//5ms per mixer call
 
 class CUsbAudio
 {
@@ -66,6 +71,8 @@ class CUsbAudio
 	Bool	 running;
 	U8		*buf[UAC_TDS_IN_FLIGHT];
 	I64		 buf_i;			//buffer the next TD uses
+	U32		*ring;			//mixer-rate frames, filled by UsbAudioFeed
+	I64		 rd, wr;		//monotonic frame counters; index is masked
 } usb_audio;
 
 //Installed by the System audio layer. Kernel AOT code cannot call a symbol
@@ -75,6 +82,9 @@ public U0 (*fp_usb_audio_fill)(U32 *buf, I64 bytes) = NULL;
 //TDs the controller has completed. Zero after playback starts means the ring
 //stalled: nothing is being consumed.
 public I64 usb_audio_frames = 0;
+
+//Intervals sent as silence with the ring dry.
+public I64 usb_audio_starved = 0;
 
 public Bool UsbAudioPresent()
 {
@@ -94,17 +104,15 @@ I64 UsbAudioRateSet(CUsbDev *dev, CUsbAudio *a, I64 rate)
 	if (a->ver >= UAC_VER_2)
 		return UsbCtrl(dev, USB_RT_HOST_TO_DEV | USB_RT_CLASS | USB_RT_RECIP_IF,
 					   UAC_RQ_SET_CUR, UAC2_CS_SAM_FREQ,
-					   (a->clock_id << 8) | a->ac_if, v, 4);
+					   (a->clock_id << 8) | a->ac_if, v, 4, FALSE);
 
 	return UsbCtrl(dev, USB_RT_HOST_TO_DEV | USB_RT_CLASS | USB_RT_RECIP_EP,
-				   UAC_RQ_SET_CUR, UAC_CS_SAMPLING_FREQ, a->ep->addr, v, 3);
+				   UAC_RQ_SET_CUR, UAC_CS_SAMPLING_FREQ, a->ep->addr, v, 3, FALSE);
 }
 
 I64 UsbAudioRateGet(CUsbDev *dev, CUsbAudio *a)
-{//The rate the device actually runs. SET_CUR is advisory: a device with a fixed
-//clock stalls or ignores it and keeps its own rate, and the alternate setting's
-//wMaxPacketSize is sized for that rate, not the requested one. Returns 0 if
-//unreadable.
+{//Rate the device runs. SET_CUR is advisory; a fixed-clock device keeps its own.
+//Returns 0 if unreadable.
 	U8	v[4];
 	I64	code;
 
@@ -112,10 +120,10 @@ I64 UsbAudioRateGet(CUsbDev *dev, CUsbAudio *a)
 	if (a->ver >= UAC_VER_2)
 		code = UsbCtrl(dev, USB_RT_DEV_TO_HOST | USB_RT_CLASS | USB_RT_RECIP_IF,
 					   UAC_RQ_GET_CUR, UAC2_CS_SAM_FREQ,
-					   (a->clock_id << 8) | a->ac_if, v, 4);
+					   (a->clock_id << 8) | a->ac_if, v, 4, FALSE);
 	else
 		code = UsbCtrl(dev, USB_RT_DEV_TO_HOST | USB_RT_CLASS | USB_RT_RECIP_EP,
-					   UAC_RQ_GET_CUR, UAC_CS_SAMPLING_FREQ, a->ep->addr, v, 3);
+					   UAC_RQ_GET_CUR, UAC_CS_SAMPLING_FREQ, a->ep->addr, v, 3, FALSE);
 	if (code != XHCI_CC_SUCCESS && code != XHCI_CC_SHORT_PKT)
 		return 0;
 
@@ -128,9 +136,8 @@ U0 UsbAudioRateApply(CUsbDev *dev, CUsbAudio *a)
 	if (a->rate < 8000 || a->rate > 192000)
 		a->rate = UAC_RATE;
 
-//The mixer only produces UAC_RATE. A device clocked at an exact multiple is fed
-//by repeating each frame; anything else is left at the mixer rate and will play
-//at the wrong pitch.
+//Mixer produces UAC_RATE only. An exact multiple is fed by repeating frames;
+//any other rate plays at the wrong pitch.
 	a->hold = a->rate / UAC_RATE;
 	if (a->hold < 1 || a->hold * UAC_RATE != a->rate)
 		a->hold = 1;
@@ -156,13 +163,13 @@ U0 UsbAudioUnmute(CUsbDev *dev, CUsbAudio *a)
 		v[0] = 0;
 		UsbCtrl(dev, USB_RT_HOST_TO_DEV | USB_RT_CLASS | USB_RT_RECIP_IF,
 				UAC_RQ_SET_CUR, UAC_FU_MUTE,
-				(a->fu[i] << 8) | a->ac_if, v, 1);
+				(a->fu[i] << 8) | a->ac_if, v, 1, FALSE);
 
 		v[0] = 0;			//0dB, 1/256 dB units, signed
 		v[1] = 0;
 		UsbCtrl(dev, USB_RT_HOST_TO_DEV | USB_RT_CLASS | USB_RT_RECIP_IF,
 				UAC_RQ_SET_CUR, UAC_FU_VOLUME,
-				(a->fu[i] << 8) | a->ac_if, v, 2);
+				(a->fu[i] << 8) | a->ac_if, v, 2, FALSE);
 	}
 }
 
@@ -281,8 +288,7 @@ Bool UsbAudioParse(CUsbDev *dev, CUsbAudio *a)
 	return FALSE;
 }
 
-//Service intervals of built-in tone still to emit. Non-zero bypasses the mixer,
-//so a tone here proves the isoc path independently of the System audio layer.
+//Service intervals of built-in tone still to emit. Non-zero bypasses the mixer.
 //Set from a terminal: usb_audio_selftest = 2000;
 public I64	usb_audio_selftest	= 0;
 I64			usb_audio_phase		= 0;
@@ -307,12 +313,11 @@ U0 UsbAudioToneFill(CUsbEP *ep)
 
 
 U0 UsbAudioTxCB(CUsbDev *dev, CUsbEP *ep)
-{//One frame consumed. XhciEventPoll requeues ep->auto_buf immediately after this
-//returns, so advance to the next buffer before filling: TDs queued earlier may
+{//XhciEventPoll requeues ep->auto_buf on return. Advance first: earlier TDs may
 //still be read by the controller.
 	CUsbAudio	*a = &usb_audio;
 	U32			*p;
-	I64			 i, hold, n_out, n_src;
+	I64			 i, hold, n_out, n_src, ri;
 
 	no_warn dev;
 	usb_audio_frames++;
@@ -341,15 +346,45 @@ U0 UsbAudioTxCB(CUsbDev *dev, CUsbEP *ep)
 		hold = 1;
 	n_out = ep->auto_len / 4;
 	n_src = n_out / hold;
-	(*fp_usb_audio_fill)(ep->auto_buf, n_src * 4);
+	p = ep->auto_buf;
 
-//Expand in place, high index first: p[i / hold] is below i and still holds the
-//mixer's frame when p[i] is written.
+	if (!a->ring || a->wr - a->rd < n_src)
+	{//Ring dry. Emit silence; rd does not advance.
+		usb_audio_starved++;
+		MemSet(p, 0, ep->auto_len);
+		return;
+	}
+
+	ri = a->rd & UAC_RING_MASK;
+	for (i = 0; i < n_src; i++)
+		p[i] = a->ring[(ri + i) & UAC_RING_MASK];
+	a->rd += n_src;
+
+//High index first: p[i / hold] is below i and still unwritten.
 	if (hold > 1)
-	{
-		p = ep->auto_buf;
 		for (i = n_out - 1; i >= 0; i--)
 			p[i] = p[i / hold];
+}
+
+public U0 UsbAudioFeed()
+{//Top the ring up. USB task loop only.
+	CUsbAudio	*a = &usb_audio;
+	I64			 space, run, wi;
+
+	if (!a->valid || !a->ring || !fp_usb_audio_fill)
+		return;
+
+	while (TRUE)
+	{
+		space = UAC_RING_FRAMES - (a->wr - a->rd);
+		if (space < UAC_FEED_CHUNK)
+			return;
+		wi  = a->wr & UAC_RING_MASK;
+		run = UAC_RING_FRAMES - wi;		//mixer writes flat; stop at the wrap
+		if (run > UAC_FEED_CHUNK)
+			run = UAC_FEED_CHUNK;
+		(*fp_usb_audio_fill)(&a->ring[wi], run * 4);
+		a->wr += run;
 	}
 }
 
@@ -368,9 +403,9 @@ public U0 UsbAudioStat()
 	"  dev rate %d  mixer %d  hold %d\n", a->rate, UAC_RATE, a->hold;
 	"  frame_bytes %d  evts %d  filled %d  last cc %d\n",
 		a->frame_bytes, a->ep->xfer_evts, usb_audio_frames, a->ep->xfer_code;
-	"  fill hook 0x%08X  selftest %d\n", fp_usb_audio_fill, usb_audio_selftest;
-//EP state 1=Running 2=Halted 3=Stopped 4=Error. A dequeue pointer that does not
-//track the ring means the controller is reading TRBs we never wrote.
+	"  fill hook 0x%08X  selftest %d  starved %d  ring %d\n",
+		fp_usb_audio_fill, usb_audio_selftest, usb_audio_starved, a->wr - a->rd;
+//EP state 1=Running 2=Halted 3=Stopped 4=Error.
 	octx = XhciDevCtxGet(a->dev, a->ep->dci);
 	"  dci %d  ep state %d  ctx deq 0x%08X  ring 0x%08X  enq %d cyc %d\n",
 		a->ep->dci, octx[0] & 7, octx[2] & 0xFFFFFFF0,
@@ -402,9 +437,7 @@ public U0 UsbAudioAttach(CUsbDev *dev, CUsbIf *uif)
 		return;
 	}
 
-//Bind the endpoint context to this alt's endpoint. Enumeration configured
-//whichever entry sharing this DCI was parsed last, leaving the ring the
-//controller reads different from the one queued here.
+//Bind the endpoint context to this alt's endpoint.
 	code = XhciConfigureEP(dev, a->ep);
 	if (code != XHCI_CC_SUCCESS)
 	{
@@ -420,6 +453,9 @@ public U0 UsbAudioAttach(CUsbDev *dev, CUsbIf *uif)
 
 	for (i = 0; i < UAC_TDS_IN_FLIGHT; i++)
 		a->buf[i] = CAllocAligned(a->frame_bytes, 64, sys_task->code_heap);
+	a->ring = CAllocAligned(UAC_RING_FRAMES * 4, 64, sys_task->code_heap);
+	a->rd	= 0;
+	a->wr	= 0;
 
 	a->ep->auto_buf	 = a->buf[0];
 	a->ep->auto_len	 = a->frame_bytes;
@@ -428,14 +464,15 @@ public U0 UsbAudioAttach(CUsbDev *dev, CUsbIf *uif)
 	a->valid		 = TRUE;
 	a->running		 = TRUE;
 
-//Prime the ring with silence. Each completion refills and requeues, so the
-//in-flight count holds steady without a submission counter.
+//Prime with silence. Each completion refills and requeues, holding the
+//in-flight count steady.
 	for (i = 0; i < UAC_TDS_IN_FLIGHT; i++)
 	{
 		MemSet(a->buf[i], 0, a->frame_bytes);
 		XhciIsocQueue(dev, a->ep, a->buf[i], a->frame_bytes);
 	}
 	a->buf_i = UAC_TDS_IN_FLIGHT - 1;
+	UsbAudioFeed;
 
 	"USB: audio out UAC%d, %d ch %d-bit %dHz, if %d alt %d ep 0x%02X, "
 	"%d B/interval, clock %d, %d feature unit(s).\n",
@@ -460,6 +497,8 @@ public U0 UsbAudioDetach(CUsbDev *dev)
 		Free(a->buf[i]);
 		a->buf[i] = NULL;
 	}
+	Free(a->ring);
+	a->ring = NULL;
 	a->dev		  = NULL;
 	a->ep		  = NULL;
 	dev->drv_data = NULL;
