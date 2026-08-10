@@ -22,6 +22,7 @@
 #define UAC_PCM_FORMAT_TAG		0x0001
 
 #define UAC_RQ_SET_CUR			0x01
+#define UAC_RQ_GET_CUR			0x81
 #define UAC_CS_SAMPLING_FREQ	0x0100	//UAC1 selector 1, channel 0
 #define UAC2_CS_SAM_FREQ		0x0100	//UAC2 clock source sampling frequency
 
@@ -57,6 +58,8 @@ class CUsbAudio
 	I64		 ac_if;			//audio control interface, target of UAC2 requests
 	I64		 clock_id;		//UAC2 clock entity feeding the stream
 	I64		 frame_bytes;	//payload per service interval
+	I64		 rate;			//rate the device reports, not the one requested
+	I64		 hold;			//rate / mixer rate; zero-order hold factor
 	I64		 fu[UAC_FUS_MAX];
 	I64		 fu_n;
 	Bool	 valid;
@@ -95,6 +98,51 @@ I64 UsbAudioRateSet(CUsbDev *dev, CUsbAudio *a, I64 rate)
 
 	return UsbCtrl(dev, USB_RT_HOST_TO_DEV | USB_RT_CLASS | USB_RT_RECIP_EP,
 				   UAC_RQ_SET_CUR, UAC_CS_SAMPLING_FREQ, a->ep->addr, v, 3);
+}
+
+I64 UsbAudioRateGet(CUsbDev *dev, CUsbAudio *a)
+{//The rate the device actually runs. SET_CUR is advisory: a device with a fixed
+//clock stalls or ignores it and keeps its own rate, and the alternate setting's
+//wMaxPacketSize is sized for that rate, not the requested one. Returns 0 if
+//unreadable.
+	U8	v[4];
+	I64	code;
+
+	MemSet(v, 0, sizeof(v));
+	if (a->ver >= UAC_VER_2)
+		code = UsbCtrl(dev, USB_RT_DEV_TO_HOST | USB_RT_CLASS | USB_RT_RECIP_IF,
+					   UAC_RQ_GET_CUR, UAC2_CS_SAM_FREQ,
+					   (a->clock_id << 8) | a->ac_if, v, 4);
+	else
+		code = UsbCtrl(dev, USB_RT_DEV_TO_HOST | USB_RT_CLASS | USB_RT_RECIP_EP,
+					   UAC_RQ_GET_CUR, UAC_CS_SAMPLING_FREQ, a->ep->addr, v, 3);
+	if (code != XHCI_CC_SUCCESS && code != XHCI_CC_SHORT_PKT)
+		return 0;
+
+	return v[0] | (v[1] << 8) | (v[2] << 16) | (v[3] << 24);
+}
+
+U0 UsbAudioRateApply(CUsbDev *dev, CUsbAudio *a)
+{//Size the per-interval payload from the device's own rate.
+	a->rate = UsbAudioRateGet(dev, a);
+	if (a->rate < 8000 || a->rate > 192000)
+		a->rate = UAC_RATE;
+
+//The mixer only produces UAC_RATE. A device clocked at an exact multiple is fed
+//by repeating each frame; anything else is left at the mixer rate and will play
+//at the wrong pitch.
+	a->hold = a->rate / UAC_RATE;
+	if (a->hold < 1 || a->hold * UAC_RATE != a->rate)
+		a->hold = 1;
+
+	if (dev->speed == USB_SPEED_HIGH || dev->speed == USB_SPEED_SUPER)
+		a->frame_bytes = a->rate * 4 / 8000;
+	else
+		a->frame_bytes = a->rate * 4 / 1000;
+
+//A TD longer than wMaxPacketSize babbles and halts the endpoint.
+	if (a->ep->max_packet && a->frame_bytes > a->ep->max_packet)
+		a->frame_bytes = a->ep->max_packet;
 }
 
 U0 UsbAudioUnmute(CUsbDev *dev, CUsbAudio *a)
@@ -262,7 +310,9 @@ U0 UsbAudioTxCB(CUsbDev *dev, CUsbEP *ep)
 {//One frame consumed. XhciEventPoll requeues ep->auto_buf immediately after this
 //returns, so advance to the next buffer before filling: TDs queued earlier may
 //still be read by the controller.
-	CUsbAudio *a = &usb_audio;
+	CUsbAudio	*a = &usb_audio;
+	U32			*p;
+	I64			 i, hold, n_out, n_src;
 
 	no_warn dev;
 	usb_audio_frames++;
@@ -285,7 +335,22 @@ U0 UsbAudioTxCB(CUsbDev *dev, CUsbEP *ep)
 		MemSet(ep->auto_buf, 0, ep->auto_len);
 		return;
 	}
-	(*fp_usb_audio_fill)(ep->auto_buf, ep->auto_len);
+
+	hold = a->hold;
+	if (hold < 1)
+		hold = 1;
+	n_out = ep->auto_len / 4;
+	n_src = n_out / hold;
+	(*fp_usb_audio_fill)(ep->auto_buf, n_src * 4);
+
+//Expand in place, high index first: p[i / hold] is below i and still holds the
+//mixer's frame when p[i] is written.
+	if (hold > 1)
+	{
+		p = ep->auto_buf;
+		for (i = n_out - 1; i >= 0; i--)
+			p[i] = p[i / hold];
+	}
 }
 
 public U0 UsbAudioStat()
@@ -300,6 +365,7 @@ public U0 UsbAudioStat()
 	}
 	"USB audio: speed %d  ep 0x%02X  mps %d  bInterval %d\n",
 		a->dev->speed, a->ep->addr, a->ep->max_packet, a->ep->interval;
+	"  dev rate %d  mixer %d  hold %d\n", a->rate, UAC_RATE, a->hold;
 	"  frame_bytes %d  evts %d  filled %d  last cc %d\n",
 		a->frame_bytes, a->ep->xfer_evts, usb_audio_frames, a->ep->xfer_code;
 	"  fill hook 0x%08X  selftest %d\n", fp_usb_audio_fill, usb_audio_selftest;
@@ -349,6 +415,7 @@ public U0 UsbAudioAttach(CUsbDev *dev, CUsbIf *uif)
 //Not every device implements the sample-rate control; a fixed-48k dongle
 //answers with a stall and still plays.
 	UsbAudioRateSet(dev, a, UAC_RATE);
+	UsbAudioRateApply(dev, a);
 	UsbAudioUnmute(dev, a);
 
 	for (i = 0; i < UAC_TDS_IN_FLIGHT; i++)
@@ -361,19 +428,18 @@ public U0 UsbAudioAttach(CUsbDev *dev, CUsbIf *uif)
 	a->valid		 = TRUE;
 	a->running		 = TRUE;
 
-//Prime the ring. Each completion refills and requeues, so the in-flight count
-//holds steady without a submission counter.
+//Prime the ring with silence. Each completion refills and requeues, so the
+//in-flight count holds steady without a submission counter.
 	for (i = 0; i < UAC_TDS_IN_FLIGHT; i++)
 	{
-		if (fp_usb_audio_fill)
-			(*fp_usb_audio_fill)(a->buf[i], a->frame_bytes);
+		MemSet(a->buf[i], 0, a->frame_bytes);
 		XhciIsocQueue(dev, a->ep, a->buf[i], a->frame_bytes);
 	}
 	a->buf_i = UAC_TDS_IN_FLIGHT - 1;
 
 	"USB: audio out UAC%d, %d ch %d-bit %dHz, if %d alt %d ep 0x%02X, "
 	"%d B/interval, clock %d, %d feature unit(s).\n",
-		a->ver >> 8, a->channels, a->bits, UAC_RATE, a->if_num, a->alt,
+		a->ver >> 8, a->channels, a->bits, a->rate, a->if_num, a->alt,
 		a->ep->addr, a->frame_bytes, a->clock_id, a->fu_n;
 }
 
