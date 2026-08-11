@@ -33,6 +33,32 @@ U32 YPOver(U32 dst, U32 src, I64 a)
 	return (oa << 24) | (sc[0] << 16) | (sc[1] << 8) | sc[2];
 }
 
+U32 YPMix(U32 a, U32 b, I64 t)
+{//All four channels of a toward b by t/255.
+	I64 i, ca, cb, o = 0;
+
+	if (t <= 0)
+		return a;
+	if (t >= 255)
+		return b;
+	for (i = 0; i < 4; i++)
+	{
+		ca = a >> (8 * i) & 0xFF;
+		cb = b >> (8 * i) & 0xFF;
+		o |= ((ca + (cb - ca) * t / 255) & 0xFF) << (8 * i);
+	}
+
+	return o;
+}
+
+I64 YPSelCov(I64 idx)
+{//Coverage by flat index; 255 everywhere when no selection is active.
+	if (!yp.has_sel)
+		return 255;
+
+	return yp.sel[idx];
+}
+
 U32 YPSample(I64 x, I64 y, Bool merged)
 {
 	if (x < 0 || y < 0 || x >= yp.doc_w || y >= yp.doc_h)
@@ -290,6 +316,8 @@ U0 YPToolGradient(I64 x0, I64 y0, I64 x1, I64 y1, U32 c0, U32 c1, Bool radial)
 			a = op;
 			if (l->alpha_lock)
 				a = op * (l->px[idx] >> 24 & 0xFF) / 255;
+			if (yp.has_sel)
+				a = a * yp.sel[idx] / 255;
 			if (a)
 				l->px[idx] = YPOver(l->px[idx], col, a);
 		}
@@ -321,6 +349,287 @@ U0 YPLayerOffset(I64 dx, I64 dy)
 	Free(nb);
 	YPDirtyAll;
 	yp.modified = TRUE;
+}
+
+//Selection. The mask is doc-sized coverage; the outline is cached as merged
+//axis-aligned document-space segments so the marching ants cost a few hundred
+//draw calls a frame instead of one per boundary pixel.
+
+#define YP_POLY_MAX 	4096
+#define YP_SEG_MAX		8192
+
+I64 yp_poly_x[YP_POLY_MAX];
+I64 yp_poly_y[YP_POLY_MAX];
+I64 yp_poly_n;
+
+I32 yp_seg[YP_SEG_MAX][4];	//x0, y0, x1, y1 in document coords
+I64 yp_seg_n;
+
+U0 YPPolyReset()
+{
+	yp_poly_n = 0;
+}
+
+U0 YPPolyAdd(I64 x, I64 y)
+{//Consecutive duplicates carry no shape and would only cost fill work.
+	if (yp_poly_n >= YP_POLY_MAX)
+		return;
+	if (yp_poly_n && yp_poly_x[yp_poly_n - 1] == x &&
+		yp_poly_y[yp_poly_n - 1] == y)
+		return;
+	yp_poly_x[yp_poly_n] = x;
+	yp_poly_y[yp_poly_n] = y;
+	yp_poly_n++;
+}
+
+U0 YPSelApply(I64 x, I64 y, I64 cov, I64 mode)
+{
+	I64 idx, v;
+
+	if (x < 0 || y < 0 || x >= yp.doc_w || y >= yp.doc_h)
+		return;
+	idx = y * yp.doc_w + x;
+	if (mode == YPSEL_SUB)
+		v = yp.sel[idx] - cov;
+	else if (mode == YPSEL_ADD)
+		v = yp.sel[idx] + cov;
+	else
+		v = cov;
+	yp.sel[idx] = ClampI64(v, 0, 255);
+}
+
+U0 YPSelBounds()
+{//Recompute the bounding box and whether anything is selected at all.
+	I64 x, y, w = yp.doc_w, row;
+
+	yp.sx0 = I64_MAX;
+	yp.sy0 = I64_MAX;
+	yp.sx1 = I64_MIN;
+	yp.sy1 = I64_MIN;
+
+	for (y = 0; y < yp.doc_h; y++)
+	{
+		row = y * w;
+		for (x = 0; x < w; x++)
+			if (yp.sel[row + x])
+			{
+				if (x < yp.sx0)
+					yp.sx0 = x;
+				if (y < yp.sy0)
+					yp.sy0 = y;
+				if (x + 1 > yp.sx1)
+					yp.sx1 = x + 1;
+				if (y + 1 > yp.sy1)
+					yp.sy1 = y + 1;
+			}
+	}
+
+	yp.has_sel = yp.sx0 < yp.sx1 && yp.sy0 < yp.sy1;
+	if (!yp.has_sel)
+	{
+		yp.sx0 = 0;
+		yp.sy0 = 0;
+		yp.sx1 = 0;
+		yp.sy1 = 0;
+	}
+	yp.sel_dirty = TRUE;
+}
+
+Bool YPSelIn(I64 x, I64 y)
+{
+	if (x < 0 || y < 0 || x >= yp.doc_w || y >= yp.doc_h)
+		return FALSE;
+
+	return yp.sel[y * yp.doc_w + x] >= 128;
+}
+
+U0 YPSegAdd(I64 x0, I64 y0, I64 x1, I64 y1)
+{
+	if (yp_seg_n >= YP_SEG_MAX)
+		return;
+	yp_seg[yp_seg_n][0] = x0;
+	yp_seg[yp_seg_n][1] = y0;
+	yp_seg[yp_seg_n][2] = x1;
+	yp_seg[yp_seg_n][3] = y1;
+	yp_seg_n++;
+}
+
+U0 YPSelOutline()
+{//Merge runs of boundary edges into whole segments. A rectangular selection
+//comes out as four.
+	I64 x, y, w = yp.doc_w, h = yp.doc_h, run;
+
+	yp_seg_n = 0;
+	if (!yp.has_sel)
+	{
+		yp.sel_dirty = FALSE;
+		return;
+	}
+
+	//Horizontal edges live on row boundaries, between (x, y-1) and (x, y).
+	for (y = 0; y <= h; y++)
+	{
+		x = 0;
+		while (x < w)
+		{
+			if (YPSelIn(x, y) != YPSelIn(x, y - 1))
+			{
+				run = x;
+				while (x < w && YPSelIn(x, y) != YPSelIn(x, y - 1))
+					x++;
+				YPSegAdd(run, y, x, y);
+			}
+			else
+				x++;
+		}
+	}
+
+	//Vertical edges on column boundaries, between (x-1, y) and (x, y).
+	for (x = 0; x <= w; x++)
+	{
+		y = 0;
+		while (y < h)
+		{
+			if (YPSelIn(x, y) != YPSelIn(x - 1, y))
+			{
+				run = y;
+				while (y < h && YPSelIn(x, y) != YPSelIn(x - 1, y))
+					y++;
+				YPSegAdd(x, run, x, y);
+			}
+			else
+				y++;
+		}
+	}
+
+	yp.sel_dirty = FALSE;
+}
+
+U0 YPSelNone()
+{
+	MemSet(yp.sel, 0, yp.doc_w * yp.doc_h);
+	yp.has_sel = FALSE;
+	yp.sx0 = 0;
+	yp.sy0 = 0;
+	yp.sx1 = 0;
+	yp.sy1 = 0;
+	yp.sel_dirty = TRUE;
+}
+
+U0 YPSelAll()
+{
+	MemSet(yp.sel, 255, yp.doc_w * yp.doc_h);
+	yp.has_sel = TRUE;
+	yp.sx0 = 0;
+	yp.sy0 = 0;
+	yp.sx1 = yp.doc_w;
+	yp.sy1 = yp.doc_h;
+	yp.sel_dirty = TRUE;
+}
+
+U0 YPSelInvert()
+{
+	I64 i, n = yp.doc_w * yp.doc_h;
+
+	for (i = 0; i < n; i++)
+		yp.sel[i] = 255 - yp.sel[i];
+	YPSelBounds;
+}
+
+U0 YPSelRect(I64 x0, I64 y0, I64 x1, I64 y1, I64 mode)
+{
+	I64 x, y, t;
+
+	if (x0 > x1)
+	{
+		t = x0;
+		x0 = x1;
+		x1 = t;
+	}
+	if (y0 > y1)
+	{
+		t = y0;
+		y0 = y1;
+		y1 = t;
+	}
+	if (mode == YPSEL_REPLACE)
+		MemSet(yp.sel, 0, yp.doc_w * yp.doc_h);
+
+	for (y = y0; y <= y1; y++)
+		for (x = x0; x <= x1; x++)
+			YPSelApply(x, y, 255, mode);
+	YPSelBounds;
+}
+
+U0 YPSelPoly(I64 mode)
+{//Even-odd scanline fill of the collected point list, sampled at pixel
+//centres so a thin sliver does not vanish.
+	I64  i, j, y, x, n = yp_poly_n, xs[64], xn, t,
+		 y0 = I64_MAX, y1 = I64_MIN;
+	F64  fy, xi;
+
+	if (n < 3)
+		return;
+	if (mode == YPSEL_REPLACE)
+		MemSet(yp.sel, 0, yp.doc_w * yp.doc_h);
+
+	for (i = 0; i < n; i++)
+	{
+		if (yp_poly_y[i] < y0)
+			y0 = yp_poly_y[i];
+		if (yp_poly_y[i] > y1)
+			y1 = yp_poly_y[i];
+	}
+	y0 = ClampI64(y0, 0, yp.doc_h - 1);
+	y1 = ClampI64(y1, 0, yp.doc_h - 1);
+
+	for (y = y0; y <= y1; y++)
+	{
+		fy = y + 0.5;
+		xn = 0;
+		for (i = 0; i < n; i++)
+		{
+			j = i + 1;
+			if (j == n)
+				j = 0;
+			//Half-open in y so a vertex shared by two edges counts once.
+			if ((yp_poly_y[i] <= fy) != (yp_poly_y[j] <= fy))
+			{
+				xi = yp_poly_x[i] + (fy - yp_poly_y[i]) *
+					 (yp_poly_x[j] - yp_poly_x[i]) /
+					 (yp_poly_y[j] - yp_poly_y[i]);
+				if (xn < 64)
+					xs[xn++] = ToI64(xi);
+			}
+		}
+		//Insertion sort: crossing counts are tiny and usually already ordered.
+		for (i = 1; i < xn; i++)
+		{
+			t = xs[i];
+			j = i - 1;
+			while (j >= 0 && xs[j] > t)
+			{
+				xs[j + 1] = xs[j];
+				j--;
+			}
+			xs[j + 1] = t;
+		}
+		for (i = 0; i + 1 < xn; i += 2)
+			for (x = xs[i]; x <= xs[i + 1]; x++)
+				YPSelApply(x, y, 255, mode);
+	}
+
+	YPSelBounds;
+}
+
+I64 YPSelAt(I64 x, I64 y)
+{//Selection coverage at a document pixel; 255 everywhere when none is active.
+	if (!yp.has_sel)
+		return 255;
+	if (x < 0 || y < 0 || x >= yp.doc_w || y >= yp.doc_h)
+		return 0;
+
+	return yp.sel[y * yp.doc_w + x];
 }
 
 U0 YPBoxPass(U32 *src, U32 *dst, I64 r, Bool horiz)
@@ -388,7 +697,7 @@ U0 YPLayerBlur(I64 radius)
 //colour, otherwise the transparent pixels' colour bleeds into the edge and
 //soft borders darken.
 	I64  n = yp.doc_w * yp.doc_h, i, a, pass;
-	U32 *a1, *a2, c;
+	U32 *a1, *a2, c, out;
 	CYPLayer *l = &yp.layer[yp.cur];
 
 	radius = ClampI64(radius, 1, 200);
@@ -416,12 +725,13 @@ U0 YPLayerBlur(I64 radius)
 		c = a1[i];
 		a = c >> 24 & 0xFF;
 		if (!a)
-			l->px[i] = 0;
+			out = 0;
 		else
-			l->px[i] = (a << 24) |
+			out = (a << 24) |
 				(ClampI64((c >> 16 & 0xFF) * 255 / a, 0, 255) << 16) |
 				(ClampI64((c >> 8  & 0xFF) * 255 / a, 0, 255) << 8) |
 				 ClampI64((c 	   & 0xFF) * 255 / a, 0, 255);
+		l->px[i] = YPMix(l->px[i], out, YPSelCov(i));
 	}
 
 	Free(a1);
@@ -443,13 +753,15 @@ U0 YPLayerAdjustHSV(I64 dh, I64 ds, I64 dv)
 	{
 		c = l->px[i];
 		a = c >> 24 & 0xFF;
-		if (a)
+		if (a && YPSelCov(i))
 		{
 			YPRGB2HSV(c, &hh, &ss, &vv);
 			hh += dh;
 			ss *= (100 + ds) / 100.0;
 			vv *= (100 + dv) / 100.0;
-			l->px[i] = (a << 24) | (YPHSV2RGB(hh, ss, vv) & 0x00FFFFFF);
+			l->px[i] = (a << 24) |
+					   (YPMix(c, YPHSV2RGB(hh, ss, vv), YPSelCov(i)) &
+						0x00FFFFFF);
 		}
 	}
 
@@ -467,7 +779,7 @@ U0 YPLayerInvert()
 	for (i = 0; i < n; i++)
 	{
 		c = l->px[i];
-		l->px[i] = (c & 0xFF000000) | (~c & 0x00FFFFFF);
+		l->px[i] = YPMix(c, (c & 0xFF000000) | (~c & 0x00FFFFFF), YPSelCov(i));
 	}
 	YPDirtyAll;
 	yp.modified = TRUE;
@@ -485,7 +797,8 @@ U0 YPLayerDesaturate()
 		c = l->px[i];
 		g = (299 * (c >> 16 & 0xFF) + 587 * (c >> 8 & 0xFF) +
 			 114 * (c & 0xFF)) / 1000;
-		l->px[i] = (c & 0xFF000000) | (g << 16) | (g << 8) | g;
+		l->px[i] = YPMix(c, (c & 0xFF000000) | (g << 16) | (g << 8) | g,
+						 YPSelCov(i));
 	}
 	YPDirtyAll;
 	yp.modified = TRUE;
@@ -493,16 +806,41 @@ U0 YPLayerDesaturate()
 
 U0 YPLayerClear()
 {
+	I64 i, n = yp.doc_w * yp.doc_h, a;
+
 	YPUndoPushPix(yp.cur, 0, 0, yp.doc_w, yp.doc_h, "Clear");
-	MemSetU32(yp.layer[yp.cur].px, 0, yp.doc_w * yp.doc_h);
+	if (!yp.has_sel)
+		MemSetU32(yp.layer[yp.cur].px, 0, n);
+	else
+		for (i = 0; i < n; i++)
+		{
+			//Partial coverage erases proportionally rather than all or nothing.
+			a = yp.layer[yp.cur].px[i] >> 24 & 0xFF;
+			a = a * (255 - yp.sel[i]) / 255;
+			yp.layer[yp.cur].px[i] = (a << 24) |
+									 (yp.layer[yp.cur].px[i] & 0x00FFFFFF);
+		}
 	YPDirtyAll;
 	yp.modified = TRUE;
 }
 
 U0 YPLayerFillAll(U32 col)
 {
+	I64 		i, n = yp.doc_w * yp.doc_h, a;
+	CYPLayer   *l = &yp.layer[yp.cur];
+
 	YPUndoPushPix(yp.cur, 0, 0, yp.doc_w, yp.doc_h, "Fill");
-	YPLayerFillRect(&yp.layer[yp.cur], 0, 0, yp.doc_w, yp.doc_h, col);
+	if (!yp.has_sel)
+		YPLayerFillRect(l, 0, 0, yp.doc_w, yp.doc_h, col);
+	else
+		for (i = 0; i < n; i++)
+		{
+			a = yp.sel[i];
+			if (l->alpha_lock)
+				a = a * (l->px[i] >> 24 & 0xFF) / 255;
+			if (a)
+				l->px[i] = YPOver(l->px[i], col, a);
+		}
 	YPDirtyAll;
 	yp.modified = TRUE;
 }

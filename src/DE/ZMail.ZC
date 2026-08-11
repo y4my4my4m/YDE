@@ -10,12 +10,19 @@
 //to ~9s. The UI task only reads shared state + posts jobs.
 //
 //Screens: Setup (account) -> Inbox list -> Read -> Compose.
-//Credentials live in RAM only; nothing is written to disk.
+//
+//The mailbox is read one ZM_MAX_MSGS page at a time, headers only; a body is
+//fetched when the message is opened. IMAP stores raw messages and the page
+//index under C:/Home/Mail/<user>/, so a message opened once reads back with
+//no network and the list is on screen before the first FETCH answers. POP3
+//sequence numbers are not stable across sessions, so nothing is cached there.
+//
+//The account, including the password, is written in plaintext to ZM_CFG_PATH.
 
 #define ZM_POP_PORT		995
 #define ZM_SMTP_PORT	465
 
-#define ZM_MAX_MSGS		40
+#define ZM_MAX_MSGS		50		//one page of the mailbox, newest first
 #define ZM_FROM_LEN		128
 #define ZM_SUBJ_LEN		192
 #define ZM_DATE_LEN		64
@@ -39,6 +46,7 @@
 #define ZM_JOB_SEND		2
 #define ZM_JOB_DELETE	3
 #define ZM_JOB_SEEN		4	//IMAP: STORE +FLAGS \Seen for target_uid.
+#define ZM_JOB_BODY		5	//Fetch one message body (+ mark it seen).
 
 #define ZM_IMAP_PORT	993
 
@@ -46,6 +54,13 @@
 //The password is stored in plaintext, as with the SSH private key seed.
 #define ZM_CFG_DIR		"C:/Home/Config"
 #define ZM_CFG_PATH		"C:/Home/Config/ZMail.CFG"
+
+//Message store. One directory per account under C:/Home/Mail, holding the
+//raw RFC822 text of every message that has been opened plus INDEX.TXT, the
+//header listing of the last page fetched. IMAP only: POP3 sequence numbers
+//are not stable across sessions, so nothing there is worth keying a file on.
+#define ZM_MAIL_DIR		"C:/Home/Mail"
+#define ZM_ACCT_LEN		160
 
 #define ZM_ROW_H		(FONT_HEIGHT + 4)
 
@@ -80,7 +95,7 @@ class CZMailMsg
 	U8	 subject[ZM_SUBJ_LEN];
 	U8	 date[ZM_DATE_LEN];
 	U8	*body;				//Decoded plain text (MAlloc, ZM_BODY_MAX cap).
-	I64	 body_len;
+	I64	 body_len;			//Zero until the body job lands; headers come first.
 };
 
 class CZMailConn
@@ -116,9 +131,14 @@ class CZMailGlobals
 	CZMailField	 fields[10];
 	I64			 num_fields, f_focus;
 
-	//Inbox.
+	//Inbox. One page at a time: msgs[] holds server sequence numbers
+	//page_first..page_last, newest first.
 	CZMailMsg	 msgs[ZM_MAX_MSGS];
 	I64			 num_msgs, sel, view_scroll, list_scroll;
+	I64			 srv_total;		//EXISTS (IMAP) / STAT count (POP).
+	I64			 page_first, page_last;
+	I64			 page_req;		//Newest sequence wanted; 0 = newest page.
+	U8			 acct_dir[ZM_ACCT_LEN];
 
 	//Compose.
 	U8			 c_to[ZM_ADDR_LEN], c_subj[ZM_SUBJ_LEN];
@@ -133,6 +153,8 @@ class CZMailGlobals
 	Bool		 worker_quit;
 	I64			 del_num;		//Server index (POP) for a DELETE job.
 	I64			 target_uid;	//IMAP UID for DELETE / mark-seen jobs.
+	I64			 body_uid;		//UID (IMAP) or sequence (POP) for a BODY job.
+	I64			 body_slot;		//msgs[] index the body belongs to.
 	U8			 status[140];	//Worker progress, drawn on the UI.
 	Bool		 status_err;
 	U8			 last_reply[220];	//Last raw server reply line (for errors).
@@ -717,16 +739,13 @@ U0 ZMailExtractText(U8 *raw, U8 *ctype, U8 *out, I64 outmax)
 	StrCopy(out, "(no text/plain part)");
 }
 
-U0 ZMailParseMsg(CZMailMsg *m, U8 *raw)
-{
-	U8	 ctype[160], enc_from[ZM_FROM_LEN], enc_subj[ZM_SUBJ_LEN];
+U0 ZMailParseHdr(CZMailMsg *m, U8 *raw)
+{//From/Subject/Date only. A header-only FETCH returns exactly these lines.
+	U8	 enc_from[ZM_FROM_LEN], enc_subj[ZM_SUBJ_LEN];
 
 	ZMailHeaderVal(raw, "From", enc_from, sizeof(enc_from));
 	ZMailHeaderVal(raw, "Subject", enc_subj, sizeof(enc_subj));
 	ZMailHeaderVal(raw, "Date", m->date, ZM_DATE_LEN);
-	ZMailHeaderVal(raw, "Content-Type", ctype, sizeof(ctype));
-	if (!ctype[0])
-		StrCopy(ctype, "text/plain");
 
 	ZMailDecodeWord(m->from, ZM_FROM_LEN, enc_from);
 	ZMailDecodeWord(m->subject, ZM_SUBJ_LEN, enc_subj);
@@ -735,10 +754,195 @@ U0 ZMailParseMsg(CZMailMsg *m, U8 *raw)
 		StrCopy(m->subject, "(no subject)");
 	if (!m->from[0])
 		StrCopy(m->from, "(unknown sender)");
+}
 
-	m->body = MAlloc(ZM_BODY_MAX + 4, zmail.ui_task);
-	ZMailExtractText(raw, ctype, m->body, ZM_BODY_MAX);
-	m->body_len = StrLen(m->body);
+U0 ZMailParseBody(CZMailMsg *m, U8 *raw)
+{//Decoded text out of a full message. body is published last: the draw task
+//reads it without a lock and treats non-NULL as complete.
+	U8	 ctype[160];
+	U8	*out;
+
+	if (m->body)
+		return;
+	ZMailHeaderVal(raw, "Content-Type", ctype, sizeof(ctype));
+	if (!ctype[0])
+		StrCopy(ctype, "text/plain");
+	out = MAlloc(ZM_BODY_MAX + 4, zmail.ui_task);
+	ZMailExtractText(raw, ctype, out, ZM_BODY_MAX);
+	m->body_len = StrLen(out);
+	m->body = out;
+}
+
+U0 ZMailParseMsg(CZMailMsg *m, U8 *raw)
+{
+	ZMailParseHdr(m, raw);
+	ZMailParseBody(m, raw);
+}
+
+Bool ZMailIsPop()
+{
+	return !StrICompare(zmail.proto, "pop3") || !StrICompare(zmail.proto, "pop");
+}
+
+/***** message store *****/
+
+U0 ZMailAcctDir()
+{//C:/Home/Mail/<user>, with anything that is not a filename character folded
+//to '_'. Empty when the drive is read-only or no account is set.
+	I64	 n = 0;
+	U8	*p = zmail.user;
+
+	zmail.acct_dir[0] = 0;
+	if (!zmail.user[0] || !DriveIsWritable || ZMailIsPop)
+		return;
+	DirMake(ZM_MAIL_DIR);
+	StrCopy(zmail.acct_dir, ZM_MAIL_DIR "/");
+	n = StrLen(zmail.acct_dir);
+	while (*p && n < ZM_ACCT_LEN - 12)
+	{
+		if ('A' <= *p <= 'Z' || 'a' <= *p <= 'z' || '0' <= *p <= '9')
+			zmail.acct_dir[n++] = *p;
+		else
+			zmail.acct_dir[n++] = '_';
+		p++;
+	}
+	zmail.acct_dir[n] = 0;
+	DirMake(zmail.acct_dir);
+}
+
+U0 ZMailCachePath(U8 *out, I64 uid)
+{//Raw message file for an IMAP UID.
+	StrPrint(out, "%s/U%d.EML", zmail.acct_dir, uid);
+}
+
+U0 ZMailCacheWrite(I64 uid, U8 *raw, I64 len)
+{
+	U8 path[ZM_ACCT_LEN + 32];
+
+	if (!zmail.acct_dir[0] || uid <= 0 || len <= 0)
+		return;
+	ZMailCachePath(path, uid);
+	FileWrite(path, raw, len);
+}
+
+U8 *ZMailCacheRead(I64 uid)
+{//Caller Frees. NULL when the message is not on disk.
+	U8	 path[ZM_ACCT_LEN + 32];
+	I64	 size;
+
+	if (!zmail.acct_dir[0] || uid <= 0)
+		return NULL;
+	ZMailCachePath(path, uid);
+	if (!FileFind(path))
+		return NULL;
+	return FileRead(path, &size);
+}
+
+U0 ZMailIndexSave()
+{//INDEX.TXT: header line "total<TAB>first<TAB>last", then one line per message
+//in the page: uid seq seen date from subject, tab separated. Read back by
+//ZMailIndexLoad so the list is up before the first FETCH answers.
+	U8			*buf, path[ZM_ACCT_LEN + 32];
+	CZMailMsg	*m;
+	I64			 i, n, cap, t = 0;
+
+	if (!zmail.acct_dir[0] || !zmail.num_msgs)
+		return;
+	cap = 128 + zmail.num_msgs * (ZM_FROM_LEN + ZM_SUBJ_LEN + ZM_DATE_LEN + 64);
+	buf = MAlloc(cap, zmail.ui_task);
+	StrPrint(buf, "%d\t%d\t%d\n", zmail.srv_total, zmail.page_first,
+			 zmail.page_last);
+	n = StrLen(buf);
+	for (i = 0; i < zmail.num_msgs; i++)
+	{
+		m = &zmail.msgs[i];
+		StrPrint(buf + n, "%d\t%d\t%d\t%s\t%s\t%s\n", m->uid, m->svr_num,
+				 m->seen, m->date, m->from, m->subject);
+		//A tab inside a header would split the line into the wrong fields.
+		while (buf[n])
+		{
+			if (buf[n] == '\t' && ++t > 5)
+				buf[n] = ' ';
+			n++;
+		}
+		t = 0;
+	}
+	StrPrint(path, "%s/INDEX.TXT", zmail.acct_dir);
+	FileWrite(path, buf, n);
+	Free(buf);
+}
+
+U8 *ZMailIndexField(U8 *p, U8 *out, I64 max)
+{//Copy up to the next tab or newline; returns the start of the next field,
+//or NULL at end of line.
+	I64 n = 0;
+
+	while (*p && *p != '\t' && *p != '\n')
+	{
+		if (n < max - 1)
+			out[n++] = *p;
+		p++;
+	}
+	out[n] = 0;
+	if (*p == '\t')
+		return p + 1;
+	if (*p == '\n')
+		return NULL;
+	return NULL;
+}
+
+U0 ZMailIndexLoad()
+{//Populate the list from INDEX.TXT. Bodies stay NULL: opening one pulls it
+//from the cache directory or the server.
+	U8			 path[ZM_ACCT_LEN + 32], f[ZM_SUBJ_LEN];
+	U8			*body, *line, *next, *q;
+	CZMailMsg	*m;
+	I64			 size;
+
+	if (!zmail.acct_dir[0] || zmail.num_msgs)
+		return;
+	StrPrint(path, "%s/INDEX.TXT", zmail.acct_dir);
+	if (!FileFind(path))
+		return;
+	body = FileRead(path, &size);
+	if (!body)
+		return;
+	q = ZMailIndexField(body, f, sizeof(f));
+	zmail.srv_total = Str2I64(f);
+	if (q)
+		q = ZMailIndexField(q, f, sizeof(f));
+	zmail.page_first = Str2I64(f);
+	if (q)
+		ZMailIndexField(q, f, sizeof(f));
+	zmail.page_last = Str2I64(f);
+
+	line = StrFirstOcc(body, "\n");
+	while (line && line[1] && zmail.num_msgs < ZM_MAX_MSGS)
+	{
+		next = StrFirstOcc(line + 1, "\n");
+		q = line + 1;
+		m = &zmail.msgs[zmail.num_msgs];
+		MemSet(m, 0, sizeof(CZMailMsg));
+		q = ZMailIndexField(q, f, sizeof(f));
+		m->uid = Str2I64(f);
+		if (q)
+			q = ZMailIndexField(q, f, sizeof(f));
+		m->svr_num = Str2I64(f);
+		if (q)
+			q = ZMailIndexField(q, f, sizeof(f));
+		m->seen = ToBool(Str2I64(f));
+		if (q)
+			q = ZMailIndexField(q, f, sizeof(f));
+		StrCopy(m->date, f);
+		if (q)
+			q = ZMailIndexField(q, f, sizeof(f));
+		StrCopy(m->from, f);
+		if (q)
+			ZMailIndexField(q, m->subject, ZM_SUBJ_LEN);
+		zmail.num_msgs++;
+		line = next;
+	}
+	Free(body);
 }
 
 /***** POP3 fetch (worker) *****/
@@ -767,18 +971,86 @@ U0 ZMailFreeMsgs()
 		}
 }
 
-Bool ZMailIsPop()
-{
-	return !StrICompare(zmail.proto, "pop3") || !StrICompare(zmail.proto, "pop");
+
+I64 ZMailPopReadDot(CZMailConn *c, U8 *raw, I64 cap)
+{//Read a dot-terminated POP3 multiline response into raw. Returns the length,
+//or -1 if the connection died mid-message.
+	U8	 line[ZM_LINE_MAX];
+	I64	 n = 0, len;
+
+	while (TRUE)
+	{
+		if (ZMailGetLine(c, line, sizeof(line)) < 0)
+			return -1;
+		if (line[0] == '.' && !line[1])
+			break;				//End-of-message dot.
+		if (line[0] == '.')
+		{//Undo dot-stuffing. The regions overlap, so copy forwards by hand.
+			len = 0;
+			while (line[len + 1])
+			{
+				line[len] = line[len + 1];
+				len++;
+			}
+			line[len] = 0;
+		}
+		len = StrLen(line);
+		if (n + len + 2 < cap)
+		{
+			MemCopy(raw + n, line, len);
+			n += len;
+			raw[n++] = '\r';
+			raw[n++] = '\n';
+		}
+	}
+	raw[n] = 0;
+
+	return n;
+}
+
+Bool ZMailPopLogin(CZMailConn *c, I64 *total_out)
+{//Greeting, USER/PASS, STAT. *total_out gets the message count.
+	U8 line[ZM_LINE_MAX];
+
+	if (!ZMailPopOk(c, line, sizeof(line)))
+	{
+		ZMailStatus("No POP3 greeting.", TRUE);
+		return FALSE;
+	}
+	ZMailStatus("Authenticating...", FALSE);
+	ZMailSendF(c, "USER %s\r\n", zmail.user);
+	if (!ZMailPopOk(c, line, sizeof(line)))
+	{
+		ZMailStatus("USER rejected.", TRUE);
+		return FALSE;
+	}
+	ZMailSendF(c, "PASS %s\r\n", zmail.pass);
+	if (!ZMailPopOk(c, line, sizeof(line)))
+	{
+		ZMailStatus("Login failed (bad password / app password needed).", TRUE);
+		return FALSE;
+	}
+	if (!total_out)
+		return TRUE;
+	ZMailSend(c, "STAT\r\n");			//"+OK count size".
+	if (!ZMailPopOk(c, line, sizeof(line)))
+	{
+		ZMailStatus("STAT failed.", TRUE);
+		return FALSE;
+	}
+	*total_out = Str2I64(line + 4);
+
+	return TRUE;
 }
 
 U0 ZMailDoFetchPop()
-{
+{//Headers only, one page. TOP n 0 is headers with zero body lines; the body
+//arrives on demand through ZM_JOB_BODY.
 	CZMailConn	*c;
 	U8			 line[ZM_LINE_MAX];
 	U8			*raw;
 	I64			 port = Str2I64(zmail.recv_port_s);
-	I64			 total, want, first, i, rawlen;
+	I64			 total = 0, first, last, i, rawlen;
 	CZMailMsg	*m;
 
 	if (port <= 0)
@@ -790,37 +1062,12 @@ U0 ZMailDoFetchPop()
 		ZMailStatus("POP3 connect/TLS failed.", TRUE);
 		return;
 	}
-	if (!ZMailPopOk(c, line, sizeof(line)))
+	if (!ZMailPopLogin(c, &total))
 	{
-		ZMailStatus("No POP3 greeting.", TRUE);
 		ZMailConnClose(c);
 		return;
 	}
-	ZMailStatus("Authenticating...", FALSE);
-	ZMailSendF(c, "USER %s\r\n", zmail.user);
-	if (!ZMailPopOk(c, line, sizeof(line)))
-	{
-		ZMailStatus("USER rejected.", TRUE);
-		ZMailConnClose(c);
-		return;
-	}
-	ZMailSendF(c, "PASS %s\r\n", zmail.pass);
-	if (!ZMailPopOk(c, line, sizeof(line)))
-	{
-		ZMailStatus("Login failed (bad password / app password needed).", TRUE);
-		ZMailConnClose(c);
-		return;
-	}
-
-	//STAT: "+OK count size".
-	ZMailSend(c, "STAT\r\n");
-	if (!ZMailPopOk(c, line, sizeof(line)))
-	{
-		ZMailStatus("STAT failed.", TRUE);
-		ZMailConnClose(c);
-		return;
-	}
-	total = Str2I64(line + 4);
+	zmail.srv_total = total;
 	ZMailFreeMsgs;
 	if (total <= 0)
 	{
@@ -830,48 +1077,81 @@ U0 ZMailDoFetchPop()
 		return;
 	}
 
-	want = total;
-	if (want > ZM_MAX_MSGS)
-		want = ZM_MAX_MSGS;
-	first = total - want + 1;
+	last = total;
+	if (0 < zmail.page_req < total)
+		last = zmail.page_req;
+	first = last - ZM_MAX_MSGS + 1;
+	if (first < 1)
+		first = 1;
+	zmail.page_first = first;
+	zmail.page_last  = last;
 	raw = MAlloc(ZM_RAW_MAX + 4, zmail.ui_task);
 
 	//Newest first.
-	for (i = total; i >= first; i--)
+	for (i = last; i >= first; i--)
 	{
-		ZMailStatusF(FALSE, "Fetching %d of %d...", total - i + 1, want);
-		ZMailSendF(c, "RETR %d\r\n", i);
+		ZMailStatusF(FALSE, "Headers %d of %d...", last - i + 1, last - first + 1);
+		ZMailSendF(c, "TOP %d 0\r\n", i);
 		if (!ZMailPopOk(c, line, sizeof(line)))
-			goto retr_done;		//Server refused this one; stop cleanly.
-		rawlen = 0;
-		while (TRUE)
-		{
-			if (ZMailGetLine(c, line, sizeof(line)) < 0)
-				goto retr_done;	//Connection died mid-message.
-			if (line[0] == '.' && !line[1])
-				break;			//End-of-message dot.
-			if (line[0] == '.')
-				MemCopy(line, line + 1, StrLen(line));	//Undo dot-stuffing.
-			if (rawlen + StrLen(line) + 2 < ZM_RAW_MAX)
-			{
-				MemCopy(raw + rawlen, line, StrLen(line));
-				rawlen += StrLen(line);
-				raw[rawlen++] = '\r';
-				raw[rawlen++] = '\n';
-			}
-		}
-		raw[rawlen] = 0;
+			goto retr_done;		//No TOP support, or the server refused.
+		rawlen = ZMailPopReadDot(c, raw, ZM_RAW_MAX);
+		if (rawlen < 0)
+			goto retr_done;		//Connection died mid-message.
 		m = &zmail.msgs[zmail.num_msgs];
 		MemSet(m, 0, sizeof(CZMailMsg));
 		m->svr_num = i;
-		ZMailParseMsg(m, raw);
+		m->seen = TRUE;			//POP3 has no server-side read state.
+		ZMailParseHdr(m, raw);
 		zmail.num_msgs++;		//After the slot is fully built (draw reads it).
 	}
 retr_done:
 	Free(raw);
 	ZMailSend(c, "QUIT\r\n");
 	ZMailConnClose(c);
-	ZMailStatusF(FALSE, "%d message(s).", zmail.num_msgs);
+	ZMailStatusF(FALSE, "%d-%d of %d.", first, last, total);
+}
+
+U0 ZMailDoBodyPop()
+{//RETR the selected message. body_uid holds its sequence number.
+	CZMailConn	*c;
+	U8			 line[ZM_LINE_MAX];
+	U8			*raw;
+	I64			 port = Str2I64(zmail.recv_port_s), rawlen;
+	CZMailMsg	*m;
+
+	if (zmail.body_slot < 0 || zmail.body_slot >= zmail.num_msgs)
+		return;
+	m = &zmail.msgs[zmail.body_slot];
+	if (port <= 0)
+		port = ZM_POP_PORT;
+	ZMailStatus("Loading message...", FALSE);
+	c = ZMailConnect(zmail.recv_host, port);
+	if (!c)
+	{
+		ZMailStatus("Message: connect failed.", TRUE);
+		return;
+	}
+	if (!ZMailPopLogin(c, NULL))
+	{
+		ZMailConnClose(c);
+		return;
+	}
+	ZMailSendF(c, "RETR %d\r\n", zmail.body_uid);
+	if (!ZMailPopOk(c, line, sizeof(line)))
+	{
+		ZMailStatus("RETR refused.", TRUE);
+		ZMailSend(c, "QUIT\r\n");
+		ZMailConnClose(c);
+		return;
+	}
+	raw = MAlloc(ZM_RAW_MAX + 4, zmail.ui_task);
+	rawlen = ZMailPopReadDot(c, raw, ZM_RAW_MAX);
+	if (rawlen > 0 && m->svr_num == zmail.body_uid)
+		ZMailParseBody(m, raw);
+	Free(raw);
+	ZMailSend(c, "QUIT\r\n");
+	ZMailConnClose(c);
+	ZMailStatus("", FALSE);
 }
 
 /***** IMAP fetch/delete/seen (worker) *****/
@@ -957,13 +1237,30 @@ Bool ZMailImapLogin(CZMailConn *c, I64 *tagn, I64 *total_out)
 	}
 }
 
+U0 ZMailMsgsReverse()
+{//The server answers a range in ascending sequence; the list wants newest
+//first.
+	CZMailMsg	 t;
+	I64			 i = 0, j = zmail.num_msgs - 1;
+
+	while (i < j)
+	{
+		MemCopy(&t, &zmail.msgs[i], sizeof(CZMailMsg));
+		MemCopy(&zmail.msgs[i], &zmail.msgs[j], sizeof(CZMailMsg));
+		MemCopy(&zmail.msgs[j], &t, sizeof(CZMailMsg));
+		i++;
+		j--;
+	}
+}
+
 U0 ZMailDoFetchImap()
-{
+{//One page of headers in a single FETCH. Bodies are left out: BODY.PEEK[] on
+//a range pulls whole mailboxes down the wire.
 	CZMailConn	*c;
 	U8			 line[ZM_LINE_MAX], tag[16];
 	U8			*raw, *p;
 	I64			 port = Str2I64(zmail.recv_port_s);
-	I64			 total = 0, want, first, seq, tagn = 0, size, uid, tl, stored;
+	I64			 total = 0, first, last, seq, tagn = 0, size, uid, tl, stored;
 	Bool		 seen;
 	CZMailMsg	*m;
 
@@ -984,6 +1281,7 @@ U0 ZMailDoFetchImap()
 		return;
 	}
 
+	zmail.srv_total = total;
 	ZMailFreeMsgs;
 	if (total <= 0)
 	{
@@ -993,62 +1291,153 @@ U0 ZMailDoFetchImap()
 		return;
 	}
 
-	want = total;
-	if (want > ZM_MAX_MSGS)
-		want = ZM_MAX_MSGS;
-	first = total - want + 1;
-	raw = MAlloc(ZM_RAW_MAX + 4, zmail.ui_task);
+	last = total;
+	if (0 < zmail.page_req < total)
+		last = zmail.page_req;
+	first = last - ZM_MAX_MSGS + 1;
+	if (first < 1)
+		first = 1;
+	zmail.page_first = first;
+	zmail.page_last  = last;
 
-	//Newest first. One FETCH per message keeps the literal parsing simple.
-	for (seq = total; seq >= first; seq--)
+	raw = MAlloc(ZM_RAW_MAX + 4, zmail.ui_task);
+	ZMailStatusF(FALSE, "Headers %d-%d of %d...", first, last, total);
+	tagn++;
+	StrPrint(tag, "a%d", tagn);
+	tl = StrLen(tag);
+	ZMailSendF(c, "%s FETCH %d:%d "
+			   "(UID FLAGS BODY.PEEK[HEADER.FIELDS (FROM SUBJECT DATE)])\r\n",
+			   tag, first, last);
+	while (TRUE)
 	{
-		ZMailStatusF(FALSE, "Fetching %d of %d...", total - seq + 1, want);
-		tagn++;
-		StrPrint(tag, "a%d", tagn);
-		tl = StrLen(tag);
-		ZMailSendF(c, "%s FETCH %d (UID FLAGS BODY.PEEK[])\r\n", tag, seq);
-		size = 0;
-		uid = 0;
-		seen = FALSE;
-		stored = 0;
-		while (TRUE)
+		if (ZMailGetLine(c, line, sizeof(line)) < 0)
+			goto imap_done;			//Connection died.
+		if (line[0] == '*' && StrFind("FETCH", line))
 		{
-			if (ZMailGetLine(c, line, sizeof(line)) < 0)
-				goto imap_done;		//Connection died.
-			if (line[0] == '*' && StrFind("FETCH", line))
+			seq = Str2I64(line + 2);
+			uid = 0;
+			seen = FALSE;
+			stored = 0;
+			if (StrFind("\\Seen", line))
+				seen = TRUE;
+			p = StrFind("UID ", line);
+			if (p)
+				uid = Str2I64(p + 4);
+			p = StrFind("{", line);		//Literal size marker.
+			if (p)
 			{
-				if (StrFind("\\Seen", line))
-					seen = TRUE;
-				p = StrFind("UID ", line);
-				if (p)
-					uid = Str2I64(p + 4);
-				p = StrFind("{", line);		//Literal size marker.
-				if (p)
-				{
-					size = Str2I64(p + 1);
-					stored = ZMailReadStore(c, raw, size, ZM_RAW_MAX - 1);
-					raw[stored] = 0;
-				}
+				size = Str2I64(p + 1);
+				stored = ZMailReadStore(c, raw, size, ZM_RAW_MAX - 1);
+				raw[stored] = 0;
 			}
-			if (!StrNCompare(line, tag, tl) && line[tl] == ' ')
-				break;				//Tagged reply: this FETCH is done.
+			if (stored > 0 && zmail.num_msgs < ZM_MAX_MSGS)
+			{
+				m = &zmail.msgs[zmail.num_msgs];
+				MemSet(m, 0, sizeof(CZMailMsg));
+				m->svr_num = seq;
+				m->uid = uid;
+				m->seen = seen;
+				ZMailParseHdr(m, raw);
+				zmail.num_msgs++;	//After the slot is fully built.
+			}
 		}
-		if (stored > 0)
-		{
-			m = &zmail.msgs[zmail.num_msgs];
-			MemSet(m, 0, sizeof(CZMailMsg));
-			m->svr_num = seq;
-			m->uid = uid;
-			m->seen = seen;
-			ZMailParseMsg(m, raw);
-			zmail.num_msgs++;		//After the slot is fully built.
-		}
+		if (!StrNCompare(line, tag, tl) && line[tl] == ' ')
+			break;					//Tagged reply: the range is done.
 	}
 imap_done:
 	Free(raw);
+	ZMailMsgsReverse;
 	ZMailSendF(c, "a%d LOGOUT\r\n", ++tagn);
 	ZMailConnClose(c);
-	ZMailStatusF(FALSE, "%d message(s).", zmail.num_msgs);
+	ZMailIndexSave;
+	ZMailStatusF(FALSE, "%d-%d of %d.", first, last, total);
+}
+
+U0 ZMailDoBodyImap()
+{//Body of one message by UID, then \Seen in the same session. Served from
+//the cache directory when the message has been opened before.
+	CZMailConn	*c;
+	U8			 line[ZM_LINE_MAX], tag[16];
+	U8			*raw, *p, *cached;
+	I64			 port = Str2I64(zmail.recv_port_s);
+	I64			 tagn = 0, size, tl, stored = 0;
+	CZMailMsg	*m;
+
+	if (zmail.body_slot < 0 || zmail.body_slot >= zmail.num_msgs)
+		return;
+	m = &zmail.msgs[zmail.body_slot];
+	if (m->uid != zmail.body_uid)
+		return;					//List moved under the job.
+
+	cached = ZMailCacheRead(zmail.body_uid);
+	if (cached)
+	{
+		ZMailParseBody(m, cached);
+		Free(cached);
+		ZMailStatus("", FALSE);
+		return;
+	}
+
+	if (port <= 0)
+		port = ZM_IMAP_PORT;
+	ZMailStatus("Loading message...", FALSE);
+	c = ZMailConnect(zmail.recv_host, port);
+	if (!c)
+	{
+		ZMailStatus("Message: connect failed.", TRUE);
+		return;
+	}
+	if (!ZMailImapLogin(c, &tagn, NULL))
+	{
+		ZMailStatus("Message: login failed.", TRUE);
+		ZMailConnClose(c);
+		return;
+	}
+	raw = MAlloc(ZM_RAW_MAX + 4, zmail.ui_task);
+	tagn++;
+	StrPrint(tag, "a%d", tagn);
+	tl = StrLen(tag);
+	ZMailSendF(c, "%s UID FETCH %d (BODY.PEEK[])\r\n", tag, zmail.body_uid);
+	while (TRUE)
+	{
+		if (ZMailGetLine(c, line, sizeof(line)) < 0)
+			goto body_done;
+		if (line[0] == '*' && StrFind("FETCH", line))
+		{
+			p = StrFind("{", line);
+			if (p)
+			{
+				size = Str2I64(p + 1);
+				stored = ZMailReadStore(c, raw, size, ZM_RAW_MAX - 1);
+				raw[stored] = 0;
+			}
+		}
+		if (!StrNCompare(line, tag, tl) && line[tl] == ' ')
+			break;
+	}
+	if (stored > 0)
+	{
+		ZMailCacheWrite(zmail.body_uid, raw, stored);
+		ZMailParseBody(m, raw);
+		tagn++;
+		StrPrint(tag, "a%d", tagn);
+		ZMailSendF(c, "%s UID STORE %d +FLAGS (\\Seen)\r\n", tag,
+				   zmail.body_uid);
+		ZMailImapTagged(c, tag);
+	}
+body_done:
+	Free(raw);
+	ZMailSendF(c, "a%d LOGOUT\r\n", ++tagn);
+	ZMailConnClose(c);
+	ZMailStatus("", FALSE);
+}
+
+U0 ZMailDoBody()
+{
+	if (ZMailIsPop())
+		ZMailDoBodyPop;
+	else
+		ZMailDoBodyImap;
 }
 
 U0 ZMailDoFetch()
@@ -1326,6 +1715,13 @@ U0 ZMailWorker(I64)
 			ZMailDoSeen;
 			zmail.job_active = FALSE;
 		}
+		else if (zmail.job_req == ZM_JOB_BODY)
+		{
+			zmail.job_req = ZM_JOB_NONE;
+			zmail.job_active = TRUE;
+			ZMailDoBody;
+			zmail.job_active = FALSE;
+		}
 		else
 			Sleep(40);
 	}
@@ -1519,12 +1915,10 @@ U0 ZMailDrawList(CTask *task, CDC *dc)
 			dc->color = de_theme.accent;
 			GrRect(dc, x + 4, y + ZM_ROW_H / 2 - 2, 4, 4);
 		}
-		StrCopy(from, m->from);
-		if (StrLen(from) > 24)
-			from[24] = 0;
-		StrCopy(subj, m->subject);
-		if (StrLen(subj) > 60)
-			subj[60] = 0;
+		MemCopy(from, m->from, MinI64(StrLen(m->from), 24));
+		from[MinI64(StrLen(m->from), 24)] = 0;
+		MemCopy(subj, m->subject, MinI64(StrLen(m->subject), 60));
+		subj[MinI64(StrLen(m->subject), 60)] = 0;
 		StrPrint(buf, "%-24s  %s", from, subj);
 		if (i == zmail.sel)
 			dc->color = de_theme.text;
@@ -1536,9 +1930,20 @@ U0 ZMailDrawList(CTask *task, CDC *dc)
 		y += ZM_ROW_H;
 	}
 
+	//Page position, right of the title bar.
+	if (zmail.srv_total > 0)
+	{
+		dc->color = de_theme.text_dim;
+		StrPrint(buf, "%d-%d of %d", zmail.page_first, zmail.page_last,
+				 zmail.srv_total);
+		GrPrint(dc, task->pix_width - 16 - StrLen(buf) * FONT_WIDTH, 10,
+				"%s", buf);
+	}
+
 	//Bottom help/status bar.
 	ZMailStatusBar(task, dc, botbar,
-			"ENTER read  C compose  R refresh  X delete  S setup  ESC quit");
+			"ENTER read  PGDN older  PGUP newer  C compose  R refresh  "
+			"X delete  S setup  ESC quit");
 }
 
 U0 ZMailDrawView(CTask *task, CDC *dc)
@@ -1577,6 +1982,15 @@ U0 ZMailDrawView(CTask *task, CDC *dc)
 	dc->color = de_theme.panel_edge;
 	GrRect(dc, x, y, w, 1);
 	y += 6;
+
+	if (!m->body)
+	{
+		dc->color = de_theme.text_dim;
+		if (zmail.job_active)
+			GrPrint(dc, x, y, "Loading message...");
+		else
+			GrPrint(dc, x, y, "Body not loaded. Press ENTER again.");
+	}
 
 	//Body: wrap each source line to the window, honour scroll.
 	cpl = w / FONT_WIDTH;
@@ -1766,7 +2180,9 @@ U0 ZMailStartFetch()
 		return;
 	}
 	ZMailConfigSave;		//Persist the account so it survives a reboot.
+	ZMailAcctDir;
 	zmail.scr = ZM_SCR_LIST;
+	zmail.page_req = 0;
 	zmail.sel = 0;
 	if (!ZMailPostJob(ZM_JOB_FETCH))
 		ZMailStatus("Busy...", FALSE);
@@ -1880,10 +2296,19 @@ U0 ZMailOpenSel()
 	if (zmail.sel < 0 || zmail.sel >= zmail.num_msgs)
 		return;
 	m = &zmail.msgs[zmail.sel];
-	//Sync \Seen to the IMAP server (best effort; skipped if the worker is
-	//busy). POP has no server-side read state, so this no-ops there.
-	if (!m->seen && !ZMailIsPop() && !zmail.job_active)
+	//Headers arrive first; the body is fetched on open and cached on disk.
+	//The IMAP job also sets \Seen, in the same session.
+	if (!m->body)
 	{
+		zmail.body_slot = zmail.sel;
+		zmail.body_uid  = m->uid;
+		if (ZMailIsPop)
+			zmail.body_uid = m->svr_num;
+		if (!ZMailPostJob(ZM_JOB_BODY))
+			ZMailStatus("Busy...", FALSE);
+	}
+	else if (!m->seen && !ZMailIsPop)
+	{//Body was already in hand, so the flag never went out with a fetch.
 		zmail.target_uid = m->uid;
 		ZMailPostJob(ZM_JOB_SEEN);
 	}
@@ -1903,6 +2328,7 @@ U0 ZMailReply()
 {
 	CZMailMsg	*m;
 	U8			*p, *lt, *gt;
+	I64			 i;
 
 	if (zmail.sel < 0 || zmail.sel >= zmail.num_msgs)
 		return;
@@ -1920,7 +2346,12 @@ U0 ZMailReply()
 	else
 		StrCopy(zmail.c_to, m->from);
 	if (StrNICompare(m->subject, "Re:", 3))
-		StrPrint(zmail.c_subj, "Re: %s", m->subject);
+	{//"Re: " + a full-length subject overruns the field by four bytes.
+		StrCopy(zmail.c_subj, "Re: ");
+		i = MinI64(StrLen(m->subject), ZM_SUBJ_LEN - 5);
+		MemCopy(zmail.c_subj + 4, m->subject, i);
+		zmail.c_subj[4 + i] = 0;
+	}
 	else
 		StrCopy(zmail.c_subj, m->subject);
 	zmail.c_body[0] = 0;
@@ -1940,6 +2371,22 @@ U0 ZMailDeleteSel()
 	ZMailPostJob(ZM_JOB_DELETE);
 }
 
+U0 ZMailPageTo(I64 newest)
+{//Fetch the page whose newest message is this server sequence. 0 = the newest
+//page. Clamped to the mailbox.
+	if (zmail.job_active)
+		return;
+	if (newest > zmail.srv_total)
+		newest = 0;
+	if (0 < newest < ZM_MAX_MSGS)
+		newest = ZM_MAX_MSGS;
+	zmail.page_req = newest;
+	zmail.sel = 0;
+	zmail.list_scroll = 0;
+	if (ZMailPostJob(ZM_JOB_FETCH))
+		ZMailStatus("Fetching...", FALSE);
+}
+
 U0 ZMailListKey(I64 ch, I64 sc)
 {
 	if (ch == CH_ESC || ch == CH_SHIFT_ESC)
@@ -1950,6 +2397,7 @@ U0 ZMailListKey(I64 ch, I64 sc)
 		ZMailComposeNew;
 	else if (ch == 'r' || ch == 'R')
 	{
+		zmail.page_req = 0;
 		if (ZMailPostJob(ZM_JOB_FETCH))
 			ZMailStatus("Refreshing...", FALSE);
 	}
@@ -1967,6 +2415,10 @@ U0 ZMailListKey(I64 ch, I64 sc)
 			zmail.sel = 0;
 		else if (sc == SC_END)
 			zmail.sel = zmail.num_msgs - 1;
+		else if (sc == SC_PAGE_DOWN && zmail.page_first > 1)
+			ZMailPageTo(zmail.page_first - 1);		//Older.
+		else if (sc == SC_PAGE_UP && zmail.page_last < zmail.srv_total)
+			ZMailPageTo(zmail.page_last + ZM_MAX_MSGS);
 	}
 }
 
@@ -2349,9 +2801,12 @@ public U0 ZMail()
 	StrCopy(zmail.smtp_port_s, "465");
 	ZMailConfigLoad;	//A saved account overrides the defaults above.
 	ZMailFieldsInit;
-	//Saved account with a password: skip straight to the inbox + fetch.
+	ZMailAcctDir;
+	//Saved account with a password: skip straight to the inbox + fetch. The
+	//cached index draws the list while the first FETCH is still in the air.
 	if (zmail.recv_host[0] && zmail.user[0] && zmail.pass[0])
 	{
+		ZMailIndexLoad;
 		zmail.scr = ZM_SCR_LIST;
 		zmail.job_req = ZM_JOB_FETCH;
 	}

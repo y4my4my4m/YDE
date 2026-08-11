@@ -64,6 +64,7 @@
 #define ZGXM_CONSOLE	15
 #define ZGXM_TTF		16
 #define ZGXM_V3			17
+#define ZGXM_MT			18
 
 //Scalable TrueType text via System/Gr/GrFont. FALSE => 8x8 bitmap fallback
 //(if the font file is missing). Set once at startup from grf_ui_font.ok.
@@ -211,6 +212,73 @@ class CGxGlobals
 	Bool	 js_done[ZINC_EXT_JS_MAX];
 	I64		 js_ran;		//Next queue index to execute.
 } gx;
+
+//One engine, one browser. gx, the DOM, the JS interpreter, the CSS globals and
+//the history arrays are all file-scope: a second ZincGX zeroes them under the
+//first. The launcher hands its URL to the live instance instead of starting a
+//second engine.
+CTask *zinc_gx_task  = NULL;
+U8    *zinc_open_req = NULL;	//sys-heap URL for the live instance to open
+
+//Worker tasks (image decode, HTTP+TLS fetch, external script fetch) run on a
+//core other than the one laying out and painting. mp_count is 1 on a
+//uniprocessor boot and Spawn THROWS 'MultCore' for a target_cpu outside it.
+Bool zinc_mt = TRUE;			//globals are not zeroed by the JIT
+I64  zinc_mt_rr = 0;			//round robin over cores 1..mp_count-1
+
+CTask *GxWorkerSpawn(U0 (*fp)(U8 *data), U8 *name)
+{
+	I64 core = -1;				//-1: spawn on this core
+
+	if (zinc_mt && mp_count > 1)
+	{
+		core = 1 + zinc_mt_rr % (mp_count - 1);
+		zinc_mt_rr++;
+	}
+
+	return Spawn(fp, NULL, name, core);
+}
+
+Bool ZincHandOff(U8 *start_url)
+{//TRUE when a browser is already up: raise it and give it the URL.
+	if (!TaskValidate(zinc_gx_task) || zinc_gx_task == Fs)
+		return FALSE;
+	if (start_url && !zinc_open_req)
+		zinc_open_req = StrNew(start_url, sys_task);
+	LBts(&zinc_gx_task->display_flags, DISPLAYf_SHOW);
+	WinToTop(zinc_gx_task);
+	WinFocus(zinc_gx_task);
+	WinZBufUpdate;
+
+	return TRUE;
+}
+
+#define ZINC_CFG_DIR	"::/Home/Config"
+#define ZINC_CFG_PATH	"::/Home/Config/Zinc.CFG"
+
+U0 ZincCfgSave()
+{//One key per line, hand-editable.
+	U8 buf[128];
+
+	if (!DriveIsWritable)
+		return;
+	DirMake(ZINC_CFG_DIR);
+	StrPrint(buf, "# Zinc browser settings\nmulticore %d\n", zinc_mt != 0);
+	FileWrite(ZINC_CFG_PATH, buf, StrLen(buf));
+}
+
+U0 ZincCfgLoad()
+{
+	I64  size;
+	U8  *body = FileRead(ZINC_CFG_PATH, &size), *p;
+
+	if (!body)
+		return;
+	p = StrFirstOcc(body, "multicore");
+	if (p)
+		zinc_mt = ToBool(Str2I64(p + 9));
+	Free(body);
+}
 
 //JS console drawer state. Deliberately NOT inside gx: ZincGX() MemSets that
 //whole struct, and anything else that ever resets it would silently close the
@@ -3810,6 +3878,7 @@ U0 GxMenuPush()
 			 "  JSConsole(MESSAGE_CMD,ZGXM_CONSOLE);"
 			 "  ScalableText(MESSAGE_CMD,ZGXM_TTF);"
 			 "  LayoutV3(MESSAGE_CMD,ZGXM_V3);"
+			 "  Multicore(MESSAGE_CMD,ZGXM_MT);"
 			 "}");
 	//WIG_TASK_DEFAULT inhibits the menu; WIG_USER_TASK_DEFAULT does not. Clear
 	//the bit either way, the browser may be spawned with either group.
@@ -3830,6 +3899,7 @@ U0 GxMenuSync()
 	GxMenuCheck("View/JSConsole", zinc_con_open);
 	GxMenuCheck("View/ScalableText", zinc_ttf);
 	GxMenuCheck("View/LayoutV3", zinc_v3);
+	GxMenuCheck("View/Multicore", zinc_mt);
 }
 
 U0 GxMenuTabNext()
@@ -3888,6 +3958,12 @@ U0 GxMenuCmd(I64 cmd)
 			}
 			break;
 		case ZGXM_V3:		Layout3(!zinc_v3);						break;
+		case ZGXM_MT:
+			//Takes effect on the next worker spawn: running tasks stay where
+			//they are.
+			zinc_mt = !zinc_mt;
+			ZincCfgSave;
+			break;
 	}
 }
 
@@ -3897,7 +3973,12 @@ public U0 ZincGX(U8 *start_url=NULL)
 	I64	 msg, a1, a2, view_h, vi, nav_chain = 0, cancel_deadline = 0, ti, tn;
 	U8	 title[80];
 
+	if (ZincHandOff(start_url))
+		return;
+
 	MemSet(&gx, 0, sizeof(CGxGlobals));
+	zinc_gx_task = Fs;
+	ZincCfgLoad;
 	gx.ops = CAlloc(sizeof(CGxOp) * GX_OPS_MAX);
 	gx.fetch = TRUE;
 	gx.last_wheel = mouse.pos.z;
@@ -3946,6 +4027,11 @@ public U0 ZincGX(U8 *start_url=NULL)
 	DocCursor(OFF);
 	DocClear;
 	StrCopy(Fs->task_title, "ZincGX");
+	if (Fs->win_width < TEXT_COLS * 3 / 4)
+	{//Launched into a pop-up window: take a usable one.
+		WinHorz(2, TEXT_COLS - 3);
+		WinVert(1, TEXT_ROWS - 2);
+	}
 	Fs->win_inhibit = Fs->win_inhibit | WIF_FOCUS_TASK_MS_L_D;
 	WinFocus;
 	zinc_note[0] = 0;
@@ -3962,13 +4048,23 @@ public U0 ZincGX(U8 *start_url=NULL)
 
 	Fs->draw_it = &GxDrawIt;
 	GxMenuPush;
-	gx.img_task = Spawn(&GxImgTask, NULL, "ZincGX Images", 3);
+	gx.img_task = GxWorkerSpawn(&GxImgTask, "ZincGX Images");
 	//The image task does NOT keep-alive: its sockets would be freed cross-task
 	//by the main task's HttpConnsClose on navigation -> RX-interrupt reboot.
 	//It sends Connection: close and closes each socket itself.
 
 	while (!gx.quit)
 	{
+		//Another launch handed this instance a URL: open it in a new tab.
+		if (zinc_open_req && !gx.fetch && !gx.loading)
+		{
+			Free(gx.pending_nav);
+			gx.pending_nav = StrNew(zinc_open_req);
+			Free(zinc_open_req);
+			zinc_open_req = NULL;
+			gx.tab_new = TRUE;
+		}
+
 		//A background image finished decoding: relayout to use its real size.
 		if (gx.img_dirty && !gx.fetch && !gx.loading)
 		{
@@ -4018,7 +4114,7 @@ public U0 ZincGX(U8 *start_url=NULL)
 				net_abort = FALSE; // clear any stale abort from a prior fetch
 				cancel_deadline = 0;
 				StrCopy(zinc_note, "Loading...");
-				gx.load_task = Spawn(&GxFetchTask, NULL, "ZincGX Fetch", 4);
+				gx.load_task = GxWorkerSpawn(&GxFetchTask, "ZincGX Fetch");
 				while (gx.loading)
 				{
 					while (msg = MessageScan(&a1, &a2))
@@ -4141,7 +4237,7 @@ public U0 ZincGX(U8 *start_url=NULL)
 				title[44] = 0; //Tab strip label (CGxTab.title is 48).
 				StrCopy(gx.tab[gx.tab_cur].title, title);
 				if (zinc_js_queue_count && !gx.js_task)
-					gx.js_task = Spawn(&GxJsFetchTask, NULL, "ZincGX JS", 4);
+					gx.js_task = GxWorkerSpawn(&GxJsFetchTask, "ZincGX JS");
 			}
 			if (gx.fetch)
 				goto gx_next;
@@ -4604,6 +4700,12 @@ gx_next:
 	}
 
 	//Teardown.
+	zinc_gx_task = NULL;
+	if (zinc_open_req)
+	{
+		Free(zinc_open_req);
+		zinc_open_req = NULL;
+	}
 	Fs->draw_it = NULL;
 	MenuPop;
 	http_pool_task = NULL;	// stop pooling before this task dies; ZincPageFree
@@ -4638,6 +4740,8 @@ public U0 ZincV3(U8 *start_url=NULL)
 {//Browser with the UNIFIED v3 layout engine (LayoutV3.ZC). Same chrome, same
 //fetch/paint pipeline - only the layout dispatch differs. Flag restored on
 //exit so a subsequent plain ZincGX gets the default engine.
+	if (ZincHandOff(start_url))
+		return;	//zinc_v3 steers the LIVE instance; do not touch it on a handoff
 	zinc_v3 = TRUE;
 	ZincGX(start_url);
 	zinc_v3 = FALSE;
