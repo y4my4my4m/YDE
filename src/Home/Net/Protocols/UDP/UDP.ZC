@@ -7,6 +7,7 @@ UDP Socket Functions
 U0 UDPGlobalsInit()
 {
 	udp_globals.bound_socket_tree = NULL;
+	udp_bound_tree_lock           = 0;
 }
 
 I64 UDPPacketAllocate(U8 **frame_out,
@@ -229,46 +230,71 @@ I64 UDPSocketClose(CUDPSocket *udp_socket)
 { // close, pop, and free the socket from the bound tree.
 	CUDPTreeNode		*head = udp_globals.bound_socket_tree;
 	CUDPTreeNode		*node;
+	CUDPTreeNode		*dead_node = NULL;
 	CUDPTreeQueue		*queue;
 	CUDPMessageQueue	*message;
 
 	SocketClose(udp_socket->socket); // TODO: testing on closing a socket while another task is using it
 	// after low-level socket close, even if protocol level socket fails close, it is now disabled (state is close request)
 
+	//Re-read: SocketClose above can yield, and another task's close re-roots the
+	//tree and frees the node this frame was entered with.
+	head = udp_globals.bound_socket_tree;
+
 	//an unbound socket is ordinary - a failed bind, or a second close. must NOT
 	//Debug() here, that halts the machine. unlink if linked, free either way.
+
+	PUSHFD
+	CLI
+	while (LBts(&udp_bound_tree_lock, 0))
+		PAUSE
+
 	node  = UDPTreeNodeFind(udp_socket->bound_to, head);
 	queue = NULL;
 
 	if (node)
+	{
 		queue = UDPTreeNodeQueueSocketFind(udp_socket, node);
 
-	if (node && queue)
-	{
-		UDPTreeNodeQueueSocketSinglePop(udp_socket, node);
+		if (queue)
+		{
+			QueueRemove(queue);
 
-		if (node->queue == node->queue->next)
-		{ // if we popped the only queue on the node, remove the node.
-			if (node == head)
-			{ // head is the global. if node is the global, change it and add branches.
-				if (node->left)
-				{
-					udp_globals.bound_socket_tree = head = node->left;
-					if (node->right)
-						UDPTreeNodeAdd(node->right, head);
+			if (node->queue == node->queue->next)
+			{ // if we popped the only queue on the node, remove the node.
+				if (node == head)
+				{ // head is the global. if node is the global, change it and add branches.
+					if (node->left)
+					{
+						udp_globals.bound_socket_tree = head = node->left;
+						if (node->right)
+							UDPTreeNodeAdd(node->right, head);
+					}
+					else if (node->right)
+						udp_globals.bound_socket_tree = node->right;
+					else
+						udp_globals.bound_socket_tree = NULL;
 				}
-				else if (node->right)
-					udp_globals.bound_socket_tree = node->right;
-				else
-					udp_globals.bound_socket_tree = NULL;
-			}
-			else // if node is not the global, just pop it from the tree
-				UDPTreeNodeSinglePop(node->value, head);
+				else // if node is not the global, just pop it from the tree
+					UDPTreeNodeSinglePop(node->value, head);
 
-			Free(node);
+				dead_node = node;
+			}
 		}
 	}
-	else
+
+	LBtr(&udp_bound_tree_lock, 0);
+	POPFD
+
+	// Freed outside the guarded section: the RX interrupt can be walking the tree
+	// on another core, and Free is not allocation-free.
+	if (dead_node)
+	{
+		Free(dead_node->queue);
+		Free(dead_node);
+	}
+
+	if (!queue)
 		NetErr("UDP SOCKET CLOSE: socket was not bound; freeing anyway.");
 
 	//teardown always runs, or a failed bind leaks the socket and its queue
@@ -486,16 +512,32 @@ I64 UDPHandler(CIPV4Packet *packet)
 		return error;
 	}
 
+	head = udp_globals.bound_socket_tree;
+
 	//nothing bound - drop quietly. a peer that keeps sending at a rebooted
 	//guest floods the log with orphan datagrams otherwise.
 	if (!head)
 		return -1;
 
-	node = UDPTreeNodeFind(destination_port, head);
+	// Guarded against a concurrent UDPSocketClose: it unlinks the node inside the
+	// same guard and only frees it once the guard is released.
+	PUSHFD
+	CLI
+	while (LBts(&udp_bound_tree_lock, 0))
+		PAUSE
+
+	queue = NULL;
+	node  = UDPTreeNodeFind(destination_port, head);
+
+	if (node)
+		queue = UDPTreeNodeQueueIPV4Find(packet->source_ip_address, node); // TODO: make sure bit order is correct here!!
+
+	LBtr(&udp_bound_tree_lock, 0);
+	POPFD
+
 	if (!node)
 		return -1;
 
-	queue = UDPTreeNodeQueueIPV4Find(packet->source_ip_address, node); // TODO: make sure bit order is correct here!!
 	if (!queue)
 	{
 		//the lookup already falls back to INADDR_ANY, so nothing wants this

@@ -3,6 +3,7 @@ U0 TCPGlobalsInit()
 {
 	tcp_globals.bound_socket_tree = NULL;
 	tcp_globals.next_source_port  = 0;
+	tcp_bound_tree_lock           = 0;
 }
 
 Bool IsTCPStateSync(CTCPSocket *tcp_socket)
@@ -685,6 +686,8 @@ I64 TCPSocketBind(CTCPSocket *tcp_socket, CSocketAddressStorage *address)
 { // Binds a TCP socket to address, which contains the local port and remote address to use.
 	CTCPTreeNode	   *head = tcp_globals.bound_socket_tree;
 	CTCPTreeNode	   *temp_node;
+	CTCPTreeNode	   *spare;
+	I64					bind_err = 0;
 	CSocketAddressIPV4 *ipv4_address;
 	CSocketAddressIPV4 *ipv4_destination;
 	CSocketAddressIPV4 *ipv4_source;
@@ -753,6 +756,23 @@ I64 TCPSocketBind(CTCPSocket *tcp_socket, CSocketAddressStorage *address)
 			break;
 	}
 
+	// The tree is walked from the RX interrupt and mutated from tasks, so the
+	// links move under the same guard TCPSocketClose uses. Without it a bind
+	// racing the handler hands BSTAdd a half-linked node and faults there.
+	//
+	// The guarded section holds links only: TCPTreeNodeInit allocates, which
+	// blocks, so the node is built first and released afterwards if the port
+	// turned out to be taken. NetErr prints, so it also stays outside.
+	spare = TCPTreeNodeInit;
+	spare->value = port;
+
+	PUSHFD
+	CLI
+	while (LBts(&tcp_bound_tree_lock, 0))
+		PAUSE
+
+	head = tcp_globals.bound_socket_tree;
+
 	if (head)
 	{
 		// look for our port.
@@ -764,38 +784,56 @@ I64 TCPSocketBind(CTCPSocket *tcp_socket, CSocketAddressStorage *address)
 			{
 				case AF_INET:
 					if (TCPTreeNodeQueueIPV4Find(ipv4_destination->address.address, temp_node, TRUE))
-					{
-						NetErr("TCP SOCKET BIND: Address already in Bound Socket Tree !");
-						return -1;
-					}
-					else
-					{ // if no address match, free to add socket to the node queue
-						NetDebug("TCP SOCKET BIND: No address match, adding socket to node queue");
+						bind_err = 1;	// address already bound
+					else // if no address match, free to add socket to the node queue
 						TCPTreeNodeQueueAdd(tcp_socket, temp_node);
-					}
 
 					break;
 
 				case AF_INET6:
-					NetErr("TCP SOCKET BIND: FIXME, IPV6 TCP BIND");
+					bind_err = 2;
 					break;
 
 				case AF_UNSPEC:
-					NetErr("TCP SOCKET BIND: Error, AF_UNSPEC TCP BIND -- found in bound tree");
+					bind_err = 3;
 					break;
 			}
 		}
 		else
 		{ // if we get no node back from port search, we didn't find it and are free to add a new node.
-			temp_node = TCPTreeNodeParamAdd(port, head); // add new node with port, return its *.
-			TCPTreeNodeQueueAdd(tcp_socket, temp_node);
+			TCPTreeNodeAdd(spare, head);
+			TCPTreeNodeQueueAdd(tcp_socket, spare);
+			spare = NULL;
 		}
 	}
 	else // if no bound sockets, we init the tree as a new node
 	{
-		tcp_globals.bound_socket_tree = head = TCPTreeNodeParamInit(port); //... shouuuld be in L.E .. ?
-		TCPTreeNodeQueueAdd(tcp_socket, head); // add the tcp socket to the port queue
-		// maybe more checks to do before this, dunno rn.
+		tcp_globals.bound_socket_tree = head = spare;
+		TCPTreeNodeQueueAdd(tcp_socket, spare); // add the tcp socket to the port queue
+		spare = NULL;
+	}
+
+	LBtr(&tcp_bound_tree_lock, 0);
+	POPFD
+
+	if (spare)
+	{ // port was already in the tree, or the family is unsupported
+		Free(spare->queue);
+		Free(spare);
+	}
+	switch (bind_err)
+	{
+		case 1:
+			NetErr("TCP SOCKET BIND: Address already in Bound Socket Tree !");
+			return -1;
+
+		case 2:
+			NetErr("TCP SOCKET BIND: FIXME, IPV6 TCP BIND");
+			break;
+
+		case 3:
+			NetErr("TCP SOCKET BIND: Error, AF_UNSPEC TCP BIND -- found in bound tree");
+			break;
 	}
 
 
@@ -820,7 +858,8 @@ I64 TCPSocketClose(CTCPSocket *tcp_socket)
 {
 	CTCPTreeNode		*head = tcp_globals.bound_socket_tree;
 	CTCPTreeNode		*node;
-	CTCPTreeQueue		*queue;
+	CTCPTreeNode		*dead_node = NULL;
+	CTCPTreeQueue		*queue = NULL;
 	CTCPAckQueue		*send_buffer;
 	CTCPAcceptQueue		*pending;
 	CSocketAddressIPV4	*address = &tcp_socket->source_address;
@@ -889,11 +928,52 @@ I64 TCPSocketClose(CTCPSocket *tcp_socket)
 
 	// remove from bound list, free associated allocs
 
+	// The state waits above sleep. Another task's close can replace the root and
+	// free the node in the meantime, so the tree is re-read here, not at entry.
+	head = tcp_globals.bound_socket_tree;
+
+	PUSHFD
+	CLI
+	while (LBts(&tcp_bound_tree_lock, 0))
+		PAUSE
+
 	node = TCPTreeNodeFind(EndianU16(address->port), head);
 
 	if (node)
+	{
 		queue = TCPTreeNodeQueueSocketFind(tcp_socket, node);
-	else
+
+		if (queue)
+		{
+			QueueRemove(queue);
+
+			if (node->queue == node->queue->next)
+			{ // if we popped the only queue on the node, remove the node.
+				if (node == head)
+				{ // head is the global. if node is the global, change it and add branches.
+					if (node->left)
+					{
+						tcp_globals.bound_socket_tree = head = node->left;
+						if (node->right)
+							TCPTreeNodeAdd(node->right, head);
+					}
+					else if (node->right)
+						tcp_globals.bound_socket_tree = node->right;
+					else
+						tcp_globals.bound_socket_tree = NULL;
+				}
+				else // if node is not the global, just pop it from the tree
+					TCPTreeNodeSinglePop(node->value, head);
+
+				dead_node = node;
+			}
+		}
+	}
+
+	LBtr(&tcp_bound_tree_lock, 0);
+	POPFD
+
+	if (!node)
 	{
 		NetErr("TCP SOCKET CLOSE: socket was not bound - not halting.");
 		return -1;
@@ -901,27 +981,12 @@ I64 TCPSocketClose(CTCPSocket *tcp_socket)
 
 	if (queue)
 	{
-		TCPTreeNodeQueueSocketSinglePop(tcp_socket, node);
-
-		if (node->queue == node->queue->next)
-		{ // if we popped the only queue on the node, remove the node.
-			if (node == head)
-			{ // head is the global. if node is the global, change it and add branches.
-				if (node->left)
-				{
-					tcp_globals.bound_socket_tree = head = node->left;
-					if (node->right)
-						TCPTreeNodeAdd(node->right, head);
-				}
-				else if (node->right)
-					tcp_globals.bound_socket_tree = node->right;
-				else
-					tcp_globals.bound_socket_tree = NULL;
-			}
-			else // if node is not the global, just pop it from the tree
-				TCPTreeNodeSinglePop(node->value, head);
-
-			Free(node);
+		// Freed outside the guarded section: the RX interrupt can be walking the
+		// tree on another core, and Free is not allocation-free.
+		if (dead_node)
+		{
+			Free(dead_node->queue);
+			Free(dead_node);
 		}
 
 		Free(tcp_socket->socket);
@@ -1036,6 +1101,9 @@ I64 TCPSocketConnect(CTCPSocket *tcp_socket, CSocketAddressStorage *address)
 			NetErr("TCP SOCKET CONNECT: Error, AF_UNSPEC TCP CONNECT -- param family");
 			break;
 	}
+
+	// Re-read: the tree can have been re-rooted since this frame was entered.
+	head = tcp_globals.bound_socket_tree;
 
 	if (head)
 	{
