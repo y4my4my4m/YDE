@@ -17,6 +17,7 @@ compiled at boot.
 - Images: PNG, JPG, GIF, WEBP, TGA, SVG
 - Audio: MP3, Ogg Vorbis, WAV, MOD, AC97, HDA, USB audio
 - Net: TCP/IP, DHCP, DNS, HTTP, TLS 1.3, WebSocket, SSH, git, IRC, IMAP/SMTP
+- Storage: AHCI/SATA, ATAPI, USB mass storage, NVMe
 - 8x8 and 8x16 system fonts, switchable at runtime
 
 ![](/screenshots/yde-startmenu.png)
