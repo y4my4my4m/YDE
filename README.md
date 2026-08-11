@@ -7,9 +7,9 @@ The Y Desktop Environment, on a heavily modified [ZealOS](https://github.com/Zea
 
 ## What it is
 
-A truecolor compositing desktop that runs inside the OS it is written in. The
-window manager, the toolkit, the decoders and the applications are all ZealC
-source in this tree, compiled at boot.
+A truecolor compositing desktop that runs on ZealOS. The window manager, the
+toolkit, the decoders and the applications are all ZealC source in this tree,
+compiled at boot.
 
 - Compositor with per-window glass blur (optional), z-buffered wallpaper
 - Taskbar, start menu, settings, palette editor, calendar, calculator
@@ -21,6 +21,10 @@ source in this tree, compiled at boot.
 
 ![](/screenshots/yde-startmenu.png)
 
+![](/screenshots/yde-zemail.png)
+
+![](/screenshots/yde-ypainter.png)
+
 ## Ports
 
 QuakePlus (Fitz/QS/Ironwail-class), Half-Life (GoldSrc, software
@@ -29,6 +33,8 @@ renderer), Diablo (Devilution-like with some DevilutionX features). Native, no e
 ![](/screenshots/yde-quake.png)
 
 ![](/screenshots/yde-hl1.png)
+
+![](/screenshots/yde-diablo.png)
 
 ## YTracker
 
