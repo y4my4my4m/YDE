@@ -382,6 +382,13 @@ extern			Bool			 AHCIAtapiBlank(CBlkDev *bd, Bool minimal=TRUE);
 extern			Bool			 DiscEject(U8 drv_let);
 extern			Bool			 DiscLoad( U8 drv_let);
 
+extern			I64				 NVMeCapMqes(U64 cap);
+extern			I64				 NVMeCapTo(  U64 cap);
+extern			I64				 NVMeCapDstrd(U64 cap);
+public extern	U0				 NVMeInit();
+extern			Bool			 NVMeBlksRead( CBlkDev *bd, U8 *buf, I64 blk, I64 count);
+extern			Bool			 NVMeBlksWrite(CBlkDev *bd, U8 *buf, I64 blk, I64 count);
+
 public extern	CBlkDevGlobals	 blkdev;
 
 #help_index "Graphics/Color"

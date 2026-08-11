@@ -23,12 +23,15 @@
 #define TLS_HS_CERTIFICATE			0x0B
 #define TLS_HS_CERTIFICATE_VERIFY	0x0F
 #define TLS_HS_FINISHED				0x14
+#define TLS_HS_KEY_UPDATE			0x18
 
 #define TLS_CIPHER_CHACHA20			0x1303
 #define TLS_GROUP_X25519			0x001D
 
-#define TLS_RECORD_MAX				17000	// 2^14 fragment + AEAD overhead + slack
+#define TLS_CIPHERTEXT_MAX			16640	// RFC 8446 5.2: TLSCiphertext.length <= 2^14 + 256
+#define TLS_RECORD_MAX				17000	// fragment buffer: ciphertext max + slack
 #define TLS_FLIGHT_MAX				65536	// server handshake flight reassembly
+#define TLS_POSTHS_MAX				8192	// post-handshake message reassembly
 #define TLS_TIMEOUT					12000	// ms
 
 //readers poll net_abort to bail out before the socket timeout expires.
@@ -36,6 +39,10 @@
 Bool net_abort = FALSE;
 #define NET_READ_STALL_MS			9000	// give up if no bytes arrive for this long
 #define NET_READ_POLL_MS			400		// per-recv socket timeout: poll cadence for abort checks
+//a record is atomic: abandoning one mid-way loses the stream, there is no
+//resync point. Once bytes of a record are in hand the budget stretches to
+//cover the peer's retransmission backoff (RFC 6298: 1, 2, 4, 8, 16 s).
+#define TLS_RECORD_STALL_MS			32000
 
 class CTLS
 {
@@ -52,6 +59,9 @@ class CTLS
 	U8			 client_fin_key[32];			// handshake-phase Finished keys
 	U8			 server_fin_key[32];
 
+	U8			 client_ap_secret[32];			// current application traffic secrets;
+	U8			 server_ap_secret[32];			// input to the next "traffic upd"
+
 	U64			 send_seq;	// per-direction AEAD record counters, reset on rekey
 	U64			 recv_seq;
 
@@ -59,7 +69,16 @@ class CTLS
 	I64			 rbuf_len;
 	I64			 rbuf_pos;
 
+	U8			*ph_buf;	// post-handshake message reassembly
+	I64			 ph_len;
+	I64			 ph_skip;	// bytes of an oversized message left to discard
+
+	I64			 recv_records;	// diagnostics, quoted in every failure line
+	I64			 recv_bytes;
+
 	Bool		 established;
+	Bool		 failed;		// record stream desynced; all further reads fail
+	Bool		 peer_closed;	// close_notify seen
 };
 
 U0 TLSBuildNonce(U8 *iv, U64 seq, U8 *nonce_out)
@@ -73,7 +92,10 @@ U0 TLSBuildNonce(U8 *iv, U64 seq, U8 *nonce_out)
 I64 TLSReadN(CTLS *tls, U8 *buf, I64 n)
 { //read exactly n bytes or fail. socket timeout (-1) is not an error, it is
   //the poll tick: keep waiting until the stall deadline or net_abort.
+  //nothing read yet: NET_READ_STALL_MS, the caller's idle budget. Partway
+  //through: TLS_RECORD_STALL_MS, since the peer is mid-send.
 	I64 got = 0, r;
+	I64 started	 = counts.jiffies;
 	I64 deadline = counts.jiffies + NET_READ_STALL_MS * JIFFY_FREQ / 1000;
 
 	while (got < n)
@@ -84,16 +106,21 @@ I64 TLSReadN(CTLS *tls, U8 *buf, I64 n)
 		if (r > 0)
 		{
 			got += r;
-			deadline = counts.jiffies + NET_READ_STALL_MS * JIFFY_FREQ / 1000;
+			deadline = counts.jiffies + TLS_RECORD_STALL_MS * JIFFY_FREQ / 1000;
 		}
 		else if (r == 0)
 		{ // peer closed the connection mid-record
-			NetErr("TLS: peer closed wanting %d more bytes.", n - got);
+			NetErr("TLS: peer closed at %d/%d bytes of a record; "
+				   "%d records / %d app bytes read.",
+				   got, n, tls->recv_records, tls->recv_bytes);
 			return -1;
 		}
 		else if (counts.jiffies > deadline)
 		{ // stalled too long with no data
-			NetErr("TLS: read stalled wanting %d more bytes.", n - got);
+			NetErr("TLS: read stalled at %d/%d bytes after %d ms; "
+				   "%d records / %d app bytes read.",
+				   got, n, (counts.jiffies - started) * 1000 / JIFFY_FREQ,
+				   tls->recv_records, tls->recv_bytes);
 			return -1;
 		}
 		//r < 0 within deadline: timeout tick, keep waiting
@@ -101,20 +128,24 @@ I64 TLSReadN(CTLS *tls, U8 *buf, I64 n)
 	return got;
 }
 
-I64 TLSRecordRecv(CTLS *tls, U8 *type_out, U8 *frag, I64 *frag_len_out)
+I64 TLSRecordRecv(CTLS *tls, U8 *hdr_out, U8 *type_out, U8 *frag, I64 *frag_len_out)
 { // read one TLS record: 5-byte header + fragment. frag must hold TLS_RECORD_MAX.
-	U8	header[5];
+  // hdr_out keeps the 5 header bytes verbatim; they are the AEAD AAD.
 	I64	length;
 
-	if (TLSReadN(tls, header, 5) < 0)
+	if (TLSReadN(tls, hdr_out, 5) < 0)
 		return -1;
 
-	*type_out = header[0];
-	length	  = header[3] << 8 | header[4];
+	*type_out = hdr_out[0];
+	length	  = hdr_out[3] << 8 | hdr_out[4];
 
-	if (length < 0 || length > TLS_RECORD_MAX)
-	{
-		NetErr("TLS: record length %d out of range.", length);
+	if (length > TLS_CIPHERTEXT_MAX)
+	{ // record_overflow. The fragment stays unread, so the stream is unusable.
+		NetErr("TLS: record_overflow, type 0x%02X length %d > %d; "
+			   "%d records / %d app bytes read.",
+			   hdr_out[0], length, TLS_CIPHERTEXT_MAX,
+			   tls->recv_records, tls->recv_bytes);
+		tls->failed = TRUE;
 		return -1;
 	}
 
@@ -122,33 +153,33 @@ I64 TLSRecordRecv(CTLS *tls, U8 *type_out, U8 *frag, I64 *frag_len_out)
 		return -1;
 
 	*frag_len_out = length;
+	tls->recv_records++;
 	return 0;
 }
 
-I64 TLSRecordDecrypt(U8 *key, U8 *iv, U64 seq, U8 *frag, I64 frag_len,
+I64 TLSRecordDecrypt(U8 *key, U8 *iv, U64 seq, U8 *hdr, U8 *frag, I64 frag_len,
 					 U8 *inner_out, I64 *inner_len_out, U8 *content_type_out)
 { // AEAD-open an encrypted record. AAD = the record header as it arrived.
 	U8	nonce[12];
-	U8	aad[5];
 	I64	ct_len = frag_len - 16;
 	I64	i;
 
 	if (ct_len < 0)
 	{
-		NetErr("TLS: encrypted record too short.");
+		NetErr("TLS: encrypted record is %d bytes, under the 16 byte tag, seq %d.",
+			   frag_len, seq);
 		return -1;
 	}
 
-	aad[0] = TLS_REC_APPLICATION_DATA;
-	aad[1] = 0x03;
-	aad[2] = 0x03;
-	aad[3] = frag_len >> 8 & 0xFF;
-	aad[4] = frag_len & 0xFF;
-
 	TLSBuildNonce(iv, seq, nonce);
 
-	if (!AEADOpen(key, nonce, aad, 5, frag, ct_len, frag + ct_len, inner_out))
+	if (!AEADOpen(key, nonce, hdr, 5, frag, ct_len, frag + ct_len, inner_out))
+	{
+		NetErr("TLS: AEAD open failed, seq %d, %d ciphertext bytes, "
+			   "header %02X %02X%02X %02X%02X.",
+			   seq, ct_len, hdr[0], hdr[1], hdr[2], hdr[3], hdr[4]);
 		return -1;
+	}
 
 	//strip trailing zero padding; last non-zero byte is the content type
 	i = ct_len - 1;
@@ -156,7 +187,7 @@ I64 TLSRecordDecrypt(U8 *key, U8 *iv, U64 seq, U8 *frag, I64 frag_len,
 		i--;
 	if (i < 0)
 	{
-		NetErr("TLS: decrypted record is all padding.");
+		NetErr("TLS: decrypted record is all padding, %d bytes, seq %d.", ct_len, seq);
 		return -1;
 	}
 
@@ -269,6 +300,158 @@ U0 TLSDeriveTrafficKeys(U8 *secret, U8 *key_out, U8 *iv_out)
 {
 	TLSHKDFExpandLabel(secret, "key", "", 0, key_out, 32);
 	TLSHKDFExpandLabel(secret, "iv",  "", 0, iv_out, 12);
+}
+
+U8 *TLSAlertName(I64 desc)
+{ // RFC 8446 6.2 AlertDescription
+	if (desc == 0)   return "close_notify";
+	if (desc == 10)  return "unexpected_message";
+	if (desc == 20)  return "bad_record_mac";
+	if (desc == 22)  return "record_overflow";
+	if (desc == 40)  return "handshake_failure";
+	if (desc == 42)  return "bad_certificate";
+	if (desc == 43)  return "unsupported_certificate";
+	if (desc == 44)  return "certificate_revoked";
+	if (desc == 45)  return "certificate_expired";
+	if (desc == 46)  return "certificate_unknown";
+	if (desc == 47)  return "illegal_parameter";
+	if (desc == 48)  return "unknown_ca";
+	if (desc == 49)  return "access_denied";
+	if (desc == 50)  return "decode_error";
+	if (desc == 51)  return "decrypt_error";
+	if (desc == 70)  return "protocol_version";
+	if (desc == 71)  return "insufficient_security";
+	if (desc == 80)  return "internal_error";
+	if (desc == 86)  return "inappropriate_fallback";
+	if (desc == 90)  return "user_canceled";
+	if (desc == 109) return "missing_extension";
+	if (desc == 110) return "unsupported_extension";
+	if (desc == 112) return "unrecognized_name";
+	if (desc == 113) return "bad_certificate_status_response";
+	if (desc == 115) return "unknown_psk_identity";
+	if (desc == 116) return "certificate_required";
+	if (desc == 120) return "no_application_protocol";
+	return "unassigned";
+}
+
+U0 TLSUpdateReadKeys(CTLS *tls)
+{ // RFC 8446 4.6.3: secret_N+1 = Expand-Label(secret_N, "traffic upd", "", 32)
+	U8 next[32];
+
+	TLSHKDFExpandLabel(tls->server_ap_secret, "traffic upd", "", 0, next, 32);
+	MemCopy(tls->server_ap_secret, next, 32);
+	TLSDeriveTrafficKeys(tls->server_ap_secret, tls->server_key, tls->server_iv);
+	tls->recv_seq = 0;
+}
+
+U0 TLSUpdateWriteKeys(CTLS *tls)
+{
+	U8 next[32];
+
+	TLSHKDFExpandLabel(tls->client_ap_secret, "traffic upd", "", 0, next, 32);
+	MemCopy(tls->client_ap_secret, next, 32);
+	TLSDeriveTrafficKeys(tls->client_ap_secret, tls->client_key, tls->client_iv);
+	tls->send_seq = 0;
+}
+
+U0 TLSPostHandshakeMsg(CTLS *tls, I64 type, U8 *body, I64 len)
+{ // one reassembled post-handshake handshake message. None of these are folded
+  // into the transcript hash.
+	U8 msg[5];
+
+	if (type == TLS_HS_NEW_SESSION_TICKET)
+	{
+		NetLog("TLS: NewSessionTicket, %d bytes, no resumption, ignored.", len);
+		return;
+	}
+
+	if (type == TLS_HS_KEY_UPDATE)
+	{
+		if (len != 1)
+		{
+			NetErr("TLS: KeyUpdate body is %d bytes, expected 1.", len);
+			tls->failed = TRUE;
+			return;
+		}
+
+		if (body[0] > 1)
+		{ //RFC 8446 4.6.3 demands illegal_parameter here. Read as 0 instead:
+		  //the byte is already authenticated, so it means a broken peer, and
+		  //dropping the stream over it costs more than it buys.
+			NetWarn("TLS: KeyUpdate request_update %d out of range, read as 0.", body[0]);
+		}
+
+		if (body[0] == 1)
+		{ //the reply travels under the old write keys, then ours rotate
+			msg[0] = TLS_HS_KEY_UPDATE;
+			msg[1] = 0x00; msg[2] = 0x00; msg[3] = 0x01;
+			msg[4] = 0x00;				// update_not_requested
+			if (TLSRecordSendEncrypted(tls, TLS_REC_HANDSHAKE, msg, 5) < 0)
+				NetErr("TLS: KeyUpdate reply failed to send.");
+			TLSUpdateWriteKeys(tls);
+		}
+
+		TLSUpdateReadKeys(tls);
+		NetLog("TLS: KeyUpdate(request_update=%d) applied at %d records / %d app bytes.",
+			   body[0], tls->recv_records, tls->recv_bytes);
+		return;
+	}
+
+	NetWarn("TLS: post-handshake type %d, %d bytes, unhandled.", type, len);
+}
+
+U0 TLSPostHandshakeFeed(CTLS *tls, U8 *data, I64 len)
+{ // records split these messages arbitrarily and pack several into one record
+	I64 off = 0, n, msg_len, msg_total;
+
+	if (!tls->ph_buf)
+		tls->ph_buf = MAlloc(TLS_POSTHS_MAX);
+
+	while (off < len)
+	{
+		if (tls->ph_skip)
+		{
+			n = len - off;
+			if (n > tls->ph_skip)
+				n = tls->ph_skip;
+			tls->ph_skip -= n;
+			off += n;
+			goto ph_more; // no 'continue' in ZealC
+		}
+
+		n = len - off;
+		if (n > TLS_POSTHS_MAX - tls->ph_len)
+			n = TLS_POSTHS_MAX - tls->ph_len;
+		MemCopy(tls->ph_buf + tls->ph_len, data + off, n);
+		tls->ph_len += n;
+		off += n;
+
+		while (tls->ph_len >= 4)
+		{
+			msg_len	  = tls->ph_buf[1] << 16 | tls->ph_buf[2] << 8 | tls->ph_buf[3];
+			msg_total = msg_len + 4;
+			if (msg_total > tls->ph_len)
+				break; // message continues in a later record
+
+			TLSPostHandshakeMsg(tls, tls->ph_buf[0], tls->ph_buf + 4, msg_len);
+
+			tls->ph_len -= msg_total;
+			if (tls->ph_len) // MemCopy only goes forward; dst < src
+				MemCopy(tls->ph_buf, tls->ph_buf + msg_total, tls->ph_len);
+		}
+
+		if (tls->ph_len == TLS_POSTHS_MAX)
+		{ // one message wider than the buffer: drop the whole of it
+			msg_len	  = tls->ph_buf[1] << 16 | tls->ph_buf[2] << 8 | tls->ph_buf[3];
+			msg_total = msg_len + 4;
+			NetWarn("TLS: post-handshake type %d is %d bytes, over the %d byte "
+					"reassembly buffer; discarded.",
+					tls->ph_buf[0], msg_total, TLS_POSTHS_MAX);
+			tls->ph_skip = msg_total - tls->ph_len;
+			tls->ph_len	 = 0;
+		}
+ph_more:;
+	}
 }
 
 I64 TLSBuildClientHello(U8 *out, U8 *hostname, U8 *client_random, U8 *session_id, U8 *pubkey)
@@ -446,7 +629,6 @@ U0 TLSComputeHandshakeKeys(CTLS *tls, U8 *shared_secret)
 U0 TLSComputeAppKeys(CTLS *tls, U8 *th_after_server_fin)
 { // handshake -> master secret, derive c/s application traffic keys
 	U8	derived[32], master[32], psk[32], empty_hash[32];
-	U8	client_ap[32], server_ap[32];
 
 	SHA256("", 0, empty_hash);
 	TLSDeriveSecret(tls->handshake_secret, "derived", empty_hash, derived);
@@ -454,11 +636,11 @@ U0 TLSComputeAppKeys(CTLS *tls, U8 *th_after_server_fin)
 	MemSet(psk, 0, 32);
 	HKDFExtract(derived, 32, psk, 32, master);
 
-	TLSDeriveSecret(master, "c ap traffic", th_after_server_fin, client_ap);
-	TLSDeriveSecret(master, "s ap traffic", th_after_server_fin, server_ap);
+	TLSDeriveSecret(master, "c ap traffic", th_after_server_fin, tls->client_ap_secret);
+	TLSDeriveSecret(master, "s ap traffic", th_after_server_fin, tls->server_ap_secret);
 
-	TLSDeriveTrafficKeys(client_ap, tls->client_key, tls->client_iv);
-	TLSDeriveTrafficKeys(server_ap, tls->server_key, tls->server_iv);
+	TLSDeriveTrafficKeys(tls->client_ap_secret, tls->client_key, tls->client_iv);
+	TLSDeriveTrafficKeys(tls->server_ap_secret, tls->server_key, tls->server_iv);
 
 	tls->send_seq = 0;
 	tls->recv_seq = 0;
@@ -471,6 +653,7 @@ I64 TLSReadServerFlight(CTLS *tls, U8 *th_after_sfin_out)
 	U8	*inner = MAlloc(TLS_RECORD_MAX);
 	U8	*hs = MAlloc(TLS_FLIGHT_MAX);
 	I64	 hs_len = 0, hs_pos = 0;
+	U8	 hdr[5];
 	U8	 wire_type, content_type;
 	I64	 frag_len, inner_len;
 	I64	 msg_type, msg_len, msg_total;
@@ -481,7 +664,7 @@ I64 TLSReadServerFlight(CTLS *tls, U8 *th_after_sfin_out)
 
 	while (!done)
 	{
-		if (TLSRecordRecv(tls, &wire_type, frag, &frag_len) < 0)
+		if (TLSRecordRecv(tls, hdr, &wire_type, frag, &frag_len) < 0)
 		{ result = -1; break; }
 
 		//no 'continue' in ZealC: skip-record uses goto next_rec
@@ -491,10 +674,10 @@ I64 TLSReadServerFlight(CTLS *tls, U8 *th_after_sfin_out)
 		if (wire_type == TLS_REC_ALERT)
 		{
 			if (frag_len >= 2)
-				TLSDiag("TLS: server alert during handshake: level=%d desc=%d.",
-					   frag[0], frag[1]);
+				TLSDiag("TLS: server alert during handshake: level=%d desc=%d (%s).",
+					   frag[0], frag[1], TLSAlertName(frag[1]));
 			else
-				TLSDiag("TLS: server alert during handshake (short).");
+				TLSDiag("TLS: server alert during handshake, %d bytes.", frag_len);
 			result = -1; break;
 		}
 
@@ -505,7 +688,7 @@ I64 TLSReadServerFlight(CTLS *tls, U8 *th_after_sfin_out)
 		}
 
 		if (TLSRecordDecrypt(tls->server_key, tls->server_iv, tls->recv_seq,
-							 frag, frag_len, inner, &inner_len, &content_type) < 0)
+							 hdr, frag, frag_len, inner, &inner_len, &content_type) < 0)
 		{ result = -1; break; }
 		tls->recv_seq++;
 
@@ -514,7 +697,8 @@ I64 TLSReadServerFlight(CTLS *tls, U8 *th_after_sfin_out)
 
 		if (hs_len + inner_len > TLS_FLIGHT_MAX)
 		{
-			NetErr("TLS: server handshake flight too large.");
+			NetErr("TLS: server handshake flight over %d bytes (%d + %d).",
+				   TLS_FLIGHT_MAX, hs_len, inner_len);
 			result = -1; break;
 		}
 		MemCopy(hs + hs_len, inner, inner_len);
@@ -592,6 +776,7 @@ CTLS *TLSConnect(U8 *hostname, CTCPSocket *sock)
 	U8		 client_priv[32], client_pub[32], client_random[32], session_id[32];
 	U8		 server_pub[32], shared[32];
 	U8		 th_after_sfin[32];
+	U8		 hdr[5];
 	U8		 wire_type;
 	I64		 ch_len, frag_len;
 	U8		 ccs = 0x01;
@@ -620,15 +805,15 @@ CTLS *TLSConnect(U8 *hostname, CTCPSocket *sock)
 	//ServerHello arrives as a plaintext handshake record
 	do
 	{
-		if (TLSRecordRecv(tls, &wire_type, frag, &frag_len) < 0)
+		if (TLSRecordRecv(tls, hdr, &wire_type, frag, &frag_len) < 0)
 			goto tls_fail;
 		if (wire_type == TLS_REC_ALERT)
 		{
 			if (frag_len >= 2)
-				TLSDiag("TLS: server alert instead of ServerHello: level=%d desc=%d.",
-						frag[0], frag[1]);
+				TLSDiag("TLS: server alert instead of ServerHello: level=%d desc=%d (%s).",
+						frag[0], frag[1], TLSAlertName(frag[1]));
 			else
-				TLSDiag("TLS: server alert instead of ServerHello (short).");
+				TLSDiag("TLS: server alert instead of ServerHello, %d bytes.", frag_len);
 			goto tls_fail;
 		}
 	}
@@ -683,7 +868,7 @@ I64 TLSWrite(CTLS *tls, U8 *data, I64 len)
 { // send application data, fragmenting to the record size limit
 	I64 off = 0, chunk;
 
-	if (!tls || !tls->established)
+	if (!tls || !tls->established || tls->failed)
 		return -1;
 
 	while (off < len)
@@ -702,13 +887,16 @@ I64 TLSWrite(CTLS *tls, U8 *data, I64 len)
 
 I64 TLSRead(CTLS *tls, U8 *out, I64 max)
 { // return up to max bytes of application data. 0 = clean close, -1 = error.
-  //post-handshake NewSessionTicket and CCS are eaten here; alerts end the stream.
+  //post-handshake NewSessionTicket, KeyUpdate and CCS are eaten here. Only
+  //close_notify and fatal alerts end the stream.
 	U8	*frag;
 	U8	*inner;
+	U8	 hdr[5];
 	U8	 wire_type, content_type;
 	I64	 frag_len, inner_len, take;
+	I64	 level, desc;
 
-	if (!tls || !tls->established)
+	if (!tls || !tls->established || tls->failed)
 		return -1;
 
 	//drain rbuf leftovers before touching the socket
@@ -727,40 +915,111 @@ I64 TLSRead(CTLS *tls, U8 *out, I64 max)
 		return take;
 	}
 
+	if (tls->peer_closed)
+		return 0;
+
 	frag  = MAlloc(TLS_RECORD_MAX);
 	inner = MAlloc(TLS_RECORD_MAX);
 
 	while (TRUE)
 	{
-		if (TLSRecordRecv(tls, &wire_type, frag, &frag_len) < 0)
-		{ Free(frag); Free(inner); return -1; }
+		if (TLSRecordRecv(tls, hdr, &wire_type, frag, &frag_len) < 0)
+		{ tls->failed = TRUE; Free(frag); Free(inner); return -1; }
 
 		//no 'continue' in ZealC: skip-record uses goto next_rec2
 		if (wire_type == TLS_REC_CHANGE_CIPHER_SPEC)
 			goto next_rec2;
 
+		if (wire_type == TLS_REC_ALERT)
+		{ //plaintext alert. Illegal post-handshake, sent anyway on abrupt teardown
+			level = 0; desc = 0;
+			if (frag_len >= 2)
+			{ level = frag[0]; desc = frag[1]; }
+			NetErr("TLS: plaintext alert level=%d desc=%d (%s), %d bytes; "
+				   "%d records / %d app bytes read.",
+				   level, desc, TLSAlertName(desc), frag_len,
+				   tls->recv_records, tls->recv_bytes);
+			tls->failed = TRUE;
+			Free(frag); Free(inner);
+			return -1;
+		}
+
+		if (wire_type != TLS_REC_APPLICATION_DATA)
+		{
+			NetErr("TLS: unexpected record type 0x%02X, %d bytes; "
+				   "%d records / %d app bytes read.",
+				   wire_type, frag_len, tls->recv_records, tls->recv_bytes);
+			tls->failed = TRUE;
+			Free(frag); Free(inner);
+			return -1;
+		}
+
 		if (TLSRecordDecrypt(tls->server_key, tls->server_iv, tls->recv_seq,
-							 frag, frag_len, inner, &inner_len, &content_type) < 0)
-		{ Free(frag); Free(inner); return -1; }
+							 hdr, frag, frag_len, inner, &inner_len, &content_type) < 0)
+		{
+			NetErr("TLS: decrypt failed on record %d, seq %d; "
+				   "%d app bytes read. Keys or record framing are out of step.",
+				   tls->recv_records, tls->recv_seq, tls->recv_bytes);
+			tls->failed = TRUE;
+			Free(frag); Free(inner);
+			return -1;
+		}
 		tls->recv_seq++;
 
 		if (content_type == TLS_REC_ALERT)
-		{ //any alert ends the stream; close_notify is level 1 desc 0
-			if (inner_len >= 2)
-				TLSDiag("TLS: server ALERT level=%d desc=%d.", inner[0], inner[1]);
-			else
-				TLSDiag("TLS: server ALERT (short).");
+		{
+			if (inner_len < 2)
+			{
+				NetErr("TLS: alert record is %d bytes, expected 2; "
+					   "%d records / %d app bytes read.",
+					   inner_len, tls->recv_records, tls->recv_bytes);
+				tls->failed = TRUE;
+				Free(frag); Free(inner);
+				return -1;
+			}
+
+			level = inner[0];
+			desc  = inner[1];
+
+			if (!desc)
+			{ // close_notify: the only orderly end of stream
+				NetLog("TLS: close_notify at %d records / %d app bytes.",
+					   tls->recv_records, tls->recv_bytes);
+				tls->peer_closed = TRUE;
+				Free(frag); Free(inner);
+				return 0;
+			}
+
+			if (level == 1)
+			{ //warning: user_canceled and unknown warnings leave the stream intact
+				NetWarn("TLS: warning alert desc=%d (%s) at %d records / %d app bytes, "
+						"reading on.",
+						desc, TLSAlertName(desc), tls->recv_records, tls->recv_bytes);
+				goto next_rec2;
+			}
+
+			NetErr("TLS: fatal alert level=%d desc=%d (%s); "
+				   "%d records / %d app bytes read.",
+				   level, desc, TLSAlertName(desc),
+				   tls->recv_records, tls->recv_bytes);
+			tls->failed = TRUE;
 			Free(frag); Free(inner);
-			return 0;
+			return -1;
 		}
 
 		if (content_type == TLS_REC_HANDSHAKE)
-			goto next_rec2; // NewSessionTicket / key update: ignore
+		{
+			TLSPostHandshakeFeed(tls, inner, inner_len);
+			if (tls->failed)
+			{ Free(frag); Free(inner); return -1; }
+			goto next_rec2;
+		}
 
 		if (content_type == TLS_REC_APPLICATION_DATA)
 		{
 			if (!inner_len)
 				goto next_rec2; // empty record: padding, not end of stream
+			tls->recv_bytes += inner_len;
 			take = inner_len;
 			if (take > max)
 			{ // stash the remainder for the next call
@@ -777,6 +1036,9 @@ I64 TLSRead(CTLS *tls, U8 *out, I64 max)
 			return take;
 		}
 
+		NetWarn("TLS: inner content type 0x%02X, %d bytes, skipped.",
+				content_type, inner_len);
+
 next_rec2:;
 	}
 }
@@ -788,7 +1050,7 @@ U0 TLSClose(CTLS *tls)
 	if (!tls)
 		return;
 
-	if (tls->established)
+	if (tls->established && !tls->failed)
 	{
 		close_notify[0] = 0x01; // warning
 		close_notify[1] = 0x00; // close_notify
@@ -799,6 +1061,7 @@ U0 TLSClose(CTLS *tls)
 		TCPSocketClose(tls->sock);
 
 	Free(tls->rbuf);
+	Free(tls->ph_buf);
 	Free(tls);
 }
 

@@ -15,7 +15,7 @@
 class CHttpUrl
 {
 	U8	 host[256];
-	U8	 path[1024];
+	U8	 path[4096];	//script bundle URLs run past 3.5 KB of query
 	U16	 port;
 	Bool is_https;
 };
@@ -27,6 +27,12 @@ class CHttpResponse
 	U8	*body;        // NUL-terminated for convenience
 	I64	 body_length; // actual byte count (body may contain NULs)
 	U8	*final_url;   // URL after redirects (HttpNav sets it); NULL if none
+	I64	 recv_length; // encoded bytes received, before de-chunk and gunzip
+	I64	 expect_length; // Content-Length as sent, -1 when unstated
+	Bool truncated;   // the body is a prefix: framing unsatisfied, the size cap
+	                  // clipped it, or a gzip member failed part-way. a document
+	                  // still renders from a prefix, a script cannot, so the
+	                  // caller decides - HTTP delivers what arrived and says so.
 };
 
 U0 HttpResponseFree(CHttpResponse *response)
@@ -87,9 +93,10 @@ I64 HttpUrlParse(U8 *url, CHttpUrl *out)
 
 	if (*p)
 	{ // remainder starting at '/' is the path
-		if (StrLen(p) > 1023)
+		if (StrLen(p) > 4095)
 		{
-			NetErr("HTTP URL PARSE: Path too long.");
+			NetErr("HTTP URL PARSE: path %d bytes, max 4095, host %s.",
+				   StrLen(p), out->host);
 			return -1;
 		}
 		StrCopy(out->path, p);
@@ -390,16 +397,20 @@ public U0 HttpCookiesShow()
 
 /* ---- chunked transfer-encoding (RFC 7230 4.1) ---- */
 
-I64 HttpDechunk(U8 *body, I64 len)
+I64 HttpDechunk(U8 *body, I64 len, Bool *_complete)
 { //decode chunked in place: <hex-size>[;ext]\r\n<data>\r\n ... 0\r\n\r\n.
-  //returns decoded length.
+  //returns decoded length. *_complete = the terminating 0-chunk was reached,
+  //so the decoded bytes are the whole body and not a prefix.
 	U8	*src = body, *dst = body, *end = body + len;
 	I64	 chunk;
 	U8	 c;
+	Bool any;
 
+	*_complete = FALSE;
 	while (src < end)
 	{
 		chunk = 0;
+		any = FALSE;
 		while (src < end) // hex chunk size
 		{
 			c = *src;
@@ -411,6 +422,7 @@ I64 HttpDechunk(U8 *body, I64 len)
 				chunk = chunk * 16 + (c - 'A' + 10);
 			else
 				break;
+			any = TRUE;
 			src++;
 		}
 		while (src < end && *src != '\n') // skip to end of the size line (past any ;ext)
@@ -418,7 +430,11 @@ I64 HttpDechunk(U8 *body, I64 len)
 		if (src < end)
 			src++; // past '\n'
 		if (chunk <= 0)
-			break; // last chunk (0) or malformed
+		{//a parsed 0 terminates the body; no digits at all is a malformed stream
+			if (any)
+				*_complete = TRUE;
+			break;
+		}
 		if (src + chunk > end)
 			chunk = end - src; // truncated response
 		MemCopy(dst, src, chunk);
@@ -484,11 +500,12 @@ I64 HttpGzipMemberData(U8 *src, I64 src_len, I64 start, U8 *_flg)
 	return pos;
 }
 
-U8 *HttpGunzip(U8 *src, I64 src_len, I64 *_out_len)
+U8 *HttpGunzip(U8 *src, I64 src_len, I64 *_out_len, Bool *_partial)
 { //concatenated gzip members through the shared DEFLATE inflater. returns an
   //MAlloc'ed NUL-terminated buffer, or NULL when nothing decoded. output grows
   //on demand: the trailer ISIZE is a starting size, not an allocation contract,
-  //and a member that fails mid-way keeps the bytes it did produce.
+  //and a member that fails mid-way keeps the bytes it did produce. *_partial
+  //flags that case: the bytes are a prefix, not a body.
 	I64			 dpos, isize, cap, used = 0, member = 0;
 	U64			 consumed, produced;
 	U8			 flg;
@@ -498,6 +515,7 @@ U8 *HttpGunzip(U8 *src, I64 src_len, I64 *_out_len)
 	Bool		 stop = FALSE, retrying;
 
 	*_out_len = 0;
+	*_partial = FALSE;
 	HttpHexHead(src, src_len, hex);
 
 	dpos = HttpGzipMemberData(src, src_len, 0, &flg);
@@ -567,6 +585,7 @@ U8 *HttpGunzip(U8 *src, I64 src_len, I64 *_out_len)
 				   member, uz.error, uz.error_line, used);
 			NetErr("HTTP GUNZIP: src_len %d data@%d FLG 0x%02X ISIZE %d cap %d head [%s]",
 				   src_len, dpos, flg, isize, cap, hex);
+			*_partial = TRUE;
 			stop = TRUE;
 		}
 		else
@@ -597,7 +616,7 @@ U8 *HttpUrlResolve(CHttpUrl *base, U8 *href)
   //schemes (mailto:, javascript:, ...).
 	U8	*result, *last_slash, *scan;
 	U8	*scheme = "http";
-	U8	 dir[1024];
+	U8	 dir[4096];
 	I64	 default_port = HTTP_PORT_DEFAULT;
 	I64	 dir_len;
 
@@ -640,8 +659,12 @@ U8 *HttpUrlResolve(CHttpUrl *base, U8 *href)
 		last_slash[1] = 0; // keep through the final '/'
 	dir_len = StrLen(dir);
 
-	if (dir_len + StrLen(href) > 1000)
+	if (dir_len + StrLen(href) > 4000)
+	{
+		NetErr("HTTP URL RESOLVE: %d + %d bytes over the 4000 byte path limit.",
+			   dir_len, StrLen(href));
 		return NULL;
+	}
 
 	if (base->port == default_port)
 		result = MStrPrint("%s://%s%s%s", scheme, base->host, dir, href);
@@ -973,6 +996,7 @@ CHttpResponse *HttpRequestRaw(CHttpUrl *url, U8 *method="GET",
 	Bool		   aborted;
 	CHttpConn	  *conn;
 	Bool		   reused, have_hdr, is_chunked, complete, keep_ok, poolable;
+	Bool		   clipped, gz_partial, chunk_ok;
 	I64			   content_len, hdr_len, body_have;
 	U8			  *hval, *conn_val;
 	U8			   save_ch;
@@ -1099,6 +1123,9 @@ http_fresh:
 	have_hdr = FALSE;
 	is_chunked = FALSE;
 	complete = FALSE;
+	clipped = FALSE;
+	gz_partial = FALSE;
+	chunk_ok = FALSE;
 	keep_ok = FALSE;
 	content_len = -1;
 	hdr_len = 0;
@@ -1185,8 +1212,11 @@ http_fresh:
 			}
 			if (buf_used >= HTTP_BODY_MAX)
 			{ // giant response: stop here rather than exhaust memory / freeze
-				NetErr("HTTP %s: Response exceeded %d bytes, truncating.",
-					   method, HTTP_BODY_MAX);
+				clipped = TRUE;
+				NetErr("HTTP %s: %s:%d%s clipped at the %d byte cap; "
+					   "%d bytes read, Content-Length %d.",
+					   method, url->host, url->port, url->path, HTTP_BODY_MAX,
+					   buf_used, content_len);
 				break;
 			}
 		}
@@ -1238,10 +1268,6 @@ http_fresh:
 		return NULL;
 	}
 
-	if (!complete && !aborted && buf_used && (is_chunked || content_len >= 0))
-		NetErr("HTTP %s: response ended outside its framing. %d bytes, chunked %d, "
-			   "Content-Length %d.", method, buf_used, is_chunked, content_len);
-
 	if (buf_used < 12)
 	{
 		NetErr("HTTP %s: Empty or truncated response (%d bytes).", method, buf_used);
@@ -1269,6 +1295,17 @@ http_fresh:
 	MemCopy(response->body, header_end + 4, response->body_length);
 	response->body[response->body_length] = 0;
 
+	//A prefix must never reach a caller looking like a whole body. Each
+	//decoding stage below can also find its input cut; the verdict is reported
+	//once, after all of them.
+	response->recv_length	= response->body_length;
+	response->expect_length = content_len;
+	if (clipped)
+		response->truncated = TRUE;
+	else if (!is_chunked && content_len >= 0 && StrCompare(method, "HEAD") &&
+			 response->recv_length < content_len)
+		response->truncated = TRUE;
+
 	//"HTTP/1.x NNN ..." - status follows the first space
 	status_ptr = StrFind(" ", response->headers);
 	if (status_ptr)
@@ -1283,7 +1320,13 @@ http_fresh:
 	if (encoding)
 	{
 		if (StrIMatch("chunked", encoding))
-			response->body_length = HttpDechunk(response->body, response->body_length);
+		{
+			response->body_length = HttpDechunk(response->body,
+												response->body_length, &chunk_ok);
+			response->recv_length = response->body_length;
+			if (!chunk_ok)
+				response->truncated = TRUE;
+		}
 		Free(encoding);
 	}
 
@@ -1292,18 +1335,23 @@ http_fresh:
 	{
 		if (StrIMatch("gzip", encoding))
 		{
-			unzipped = HttpGunzip(response->body, response->body_length, &unzipped_len);
+			unzipped = HttpGunzip(response->body, response->body_length,
+								  &unzipped_len, &gz_partial);
 			if (unzipped)
 			{
 				Free(response->body);
 				response->body		  = unzipped;
 				response->body_length = unzipped_len;
+				if (gz_partial)
+					response->truncated = TRUE; //a cut gzip stream still inflates
 			}
 			else
 			{//never hand raw gzip bytes to the HTML parser - binary garbage
-			//crashes the renderer
+			//crashes the renderer. the placeholder is a document, so callers
+			//that need the real bytes have to see this as a failed body
 				NetErr("HTTP %s: gzip decode failed; discarding %d compressed bytes.",
 					   method, response->body_length);
+				response->truncated = TRUE;
 				Free(response->body);
 				response->body = StrNew("<html><body><p>[gzip decode failed]</p></body></html>");
 				response->body_length = StrLen(response->body);
@@ -1311,6 +1359,13 @@ http_fresh:
 		}
 		Free(encoding);
 	}
+
+	if (response->truncated)
+		NetErr("HTTP %s: TRUNCATED %s:%d%s -> %d. %d encoded bytes of %d "
+			   "declared, %d after decode. cap-clipped %d, gzip cut %d.",
+			   method, url->host, url->port, url->path, response->status,
+			   response->recv_length, content_len, response->body_length,
+			   clipped, gz_partial);
 
 	NetLog("HTTP %s: %s:%d%s -> %d, %d body bytes.",
 		   method, url->host, url->port, url->path, response->status,

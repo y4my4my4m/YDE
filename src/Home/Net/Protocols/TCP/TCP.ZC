@@ -22,6 +22,22 @@ Bool IsTCPStateSync(CTCPSocket *tcp_socket)
 	}
 }
 
+I64 TCPReceiveWindow(CTCPSocket *tcp_socket)
+{ // free octets in the RX ring, clamped to the 16-bit header field. One slot is
+  // reserved so write_position == read_position means empty rather than full.
+	I64 mask		= tcp_socket->receive_buffer_size - 1;
+	I64 used		= (tcp_socket->write_position - tcp_socket->read_position) & mask;
+	I64 free_space	= tcp_socket->receive_buffer_size - used - 1;
+
+	if (free_space < 0)
+		free_space = 0;
+
+	if (free_space > 0xFFFF)
+		free_space = 0xFFFF;
+
+	return free_space;
+}
+
 // TODO: Merge IPV4Checksum, TCPChecksumPartial, and TCPChecksumFinal into 1.
 //		 All use same alg.
 U16 TCPChecksumPartial(U32 sum, U8 *header, I64 length)
@@ -72,7 +88,8 @@ I64 TCPPacketAllocate(U8 **frame_out,
 					  U32  seq_num,
 					  U32  ack_num,
 					  U8   flags,
-					  I64  length)
+					  I64  length,
+					  U16  window)
 {
 	U8			*tcp_frame;
 	I64			 de_index;
@@ -101,7 +118,7 @@ I64 TCPPacketAllocate(U8 **frame_out,
 	header->ack_num				= EndianU32(ack_num);
 	header->data_offset			= (sizeof(CTCPHeader) / 4) << 4; // ???
 	header->flags				= flags;
-	header->window_size			= EndianU16(TCP_WINDOW_SIZE / 2);// TODO: What is window size supposed to be ?
+	header->window_size			= EndianU16(window);
 	header->checksum			= 0;
 	header->urgent_pointer		= 0;
 
@@ -168,7 +185,8 @@ I64 TCPSend(U32 source_ip,
 									 seq_num,
 									 ack_num,
 									 flags,
-									 0);
+									 0,
+									 0); // no socket: RST generation, window is not meaningful
 	if (de_index < 0)
 	{
 		NetErr("TCP SEND: TCP Packet Allocate failed.");
@@ -193,6 +211,7 @@ I64 TCPSendFlags(CTCPSocket *tcp_socket, U8 flags)
 	I64						 de_index;
 	CTCPAckQueue			*send_buffer	 = NULL;
 	CTCPAckQueue		   **send_buffer_ptr = NULL;
+	I64						 window			 = TCPReceiveWindow(tcp_socket);
 
 	NetDebug("TCP SEND FLAGS: Attempting Send using param TCP socket");
 
@@ -217,7 +236,8 @@ I64 TCPSendFlags(CTCPSocket *tcp_socket, U8 flags)
 												 tcp_socket->next_send_seq_num,
 												 tcp_socket->next_recv_seq_num,
 												 flags,
-												 0);
+												 0,
+												 window);
 					if (de_index < 0)
 					{
 						NetErr("TCP SEND FLAGS: TCP Packet Allocate failed.");
@@ -246,6 +266,8 @@ I64 TCPSendFlags(CTCPSocket *tcp_socket, U8 flags)
 
 	// at this point, a TCP packet has been allocated.
 	// TODO: Is there a better way to manage links across different address types?
+
+	tcp_socket->receive_window = window; // SEQ validation compares against the window last advertised
 
 	if (Bt(&flags, TCPf_SYN))
 		tcp_socket->next_send_seq_num++;
@@ -320,6 +342,7 @@ I64 TCPSendData(CTCPSocket *tcp_socket, U8 flags, U8 *data, I64 length)
 	CSocketAddressIPV6		*source_ipv6;
 	I64						 de_index;
 	CTCPAckQueue			*send_buffer;
+	I64						 window = TCPReceiveWindow(tcp_socket);
 
 	NetDebug("TCP SEND DATA: Attempting Send using param TCP socket");
 
@@ -344,7 +367,8 @@ I64 TCPSendData(CTCPSocket *tcp_socket, U8 flags, U8 *data, I64 length)
 												 tcp_socket->next_send_seq_num,
 												 tcp_socket->next_recv_seq_num,
 												 flags,
-												 length);
+												 length,
+												 window);
 					if (de_index < 0)
 					{
 						NetLog("TCP SEND DATA: TCP Packet Allocate failed.");
@@ -373,6 +397,8 @@ I64 TCPSendData(CTCPSocket *tcp_socket, U8 flags, U8 *data, I64 length)
 
 	// at this point, a TCP packet has been allocated.
 	// TODO: Is there a better way to manage links across different address types?
+
+	tcp_socket->receive_window = window; // SEQ validation compares against the window last advertised
 
 	if (length)
 		MemCopy(payload_frame, data, length);
@@ -1229,6 +1255,7 @@ I64 TCPSocketReceive(CTCPSocket *tcp_socket, U8 *buffer, I64 length)
 	I64 read_total = 0;
 	I64 step;
 	I64 timeout;
+	I64 threshold;
 
 	if (!SocketReceive(tcp_socket->socket))
 	{
@@ -1278,8 +1305,7 @@ I64 TCPSocketReceive(CTCPSocket *tcp_socket, U8 *buffer, I64 length)
 		MemCopy(buffer, tcp_socket->receive_buffer + read_position, step);
 		buffer += step;
 		length -= step;
-//		read_position = (read_position + step) & (tcp_socket->receive_buffer_size - 1);
-		read_position = (read_position + step) % tcp_socket->receive_buffer_size;
+		read_position = (read_position + step) & (tcp_socket->receive_buffer_size - 1);
 		read_total += step;
 	}
 
@@ -1298,6 +1324,28 @@ I64 TCPSocketReceive(CTCPSocket *tcp_socket, U8 *buffer, I64 length)
 	}
 
 	tcp_socket->read_position = read_position;
+
+	// RFC 1122 4.2.3.3: announce a reopened window only once min(MSS, buffer/2)
+	// is free, not in the increments a byte-at-a-time reader would produce.
+	threshold = tcp_socket->receive_buffer_size / 2;
+
+	if (threshold > tcp_socket->max_segment_size)
+		threshold = tcp_socket->max_segment_size;
+
+	if (tcp_socket->receive_window < threshold &&
+		TCPReceiveWindow(tcp_socket) >= threshold &&
+		IsTCPStateSync(tcp_socket))
+	{
+		if (tcp_socket->receive_drops)
+		{
+			NetWarn("TCP SOCKET RECEIVE: %d octets were dropped while the receive buffer was full.",
+					tcp_socket->receive_drops);
+			tcp_socket->receive_drops = 0;
+		}
+
+		// Bare ACK. Without it the peer waits out its persist timer.
+		TCPSendFlags(tcp_socket, TCPF_ACK);
+	}
 
 	return read_total;
 }

@@ -38,6 +38,7 @@
 #define JS_MAX_DEPTH		48
 #define JS_MAX_ARGS			16
 #define JS_WRITE_BUF		131072
+#define JS_TEXT_MAX			65536	// textContent / innerText read cap
 
 /* value types */
 #define JV_UNDEF	0
@@ -369,6 +370,9 @@
 #define JSN_STR_LOCALECMP	349	// str.localeCompare(other): byte order
 #define JSN_STYLE_SET		350	// style.setProperty(name, value)
 #define JSN_CONSOLE_NOOP	351	// console.group/time/count/...: accepted, silent
+#define JSN_NOOP_TRUE		352	// generic no-op -> true
+#define JSN_XHR_ADDLISTEN	353	// xhr.addEventListener(type, fn) -> on<type>
+#define JSN_XHR_REMLISTEN	354	// xhr.removeEventListener(type)
 
 /* token types */
 #define JT_EOF		0
@@ -610,6 +614,16 @@ extern U0 JsElemCollect(CJsInterp *ji, CZNode *root, I64 mode, U8 *key,
 // budget that would have shown the parse error explaining it.
 I64 js_soft_errs  = 0;
 I64 js_parse_errs = 0;
+I64 js_undef_errs = 0;	// misses on an already-undefined receiver: downstream
+
+// Distinct runtime warnings remembered per script. A miss inside a loop
+// repeats until it has evicted every other line from the 160-line console
+// ring; the budgets alone do not stop that, because they count emissions.
+#define JS_WARN_KEEP	32
+#define JS_WARN_LEN		192	// = JS_CON_COLS: a longer line cannot reach the ring
+
+U8	js_warn_seen[JS_WARN_KEEP][JS_WARN_LEN];
+I64	js_warn_n = 0;
 
 U8 *JsAlloc(CJsInterp *ji, I64 size)
 {
@@ -2984,6 +2998,26 @@ Bool JsStyleProp(U8 *style, U8 *key, U8 *out, I64 max)
 	return found;
 }
 
+CJsVal *JsUrlAbs(CJsInterp *ji, U8 *rel)
+{ // src/href/action reflect the RESOLVED url, not the markup value. Minified
+  // code slices these, so a relative value produces a wrong answer instead of
+  // a visible failure.
+	CJsVal	 *v;
+	CHttpUrl  base;
+	U8		 *abs = NULL;
+
+	if (!rel || !*rel)
+		return JsStrV(ji, "");
+	if (ji->url && HttpUrlParse(ji->url, &base) >= 0)
+		abs = HttpUrlResolve(&base, rel);
+	if (!abs)
+		return JsStrV(ji, rel); // unparseable base: the markup value stands
+	v = JsStrV(ji, abs);
+	Free(abs);
+
+	return v;
+}
+
 CJsVal *JsMemberGet(CJsInterp *ji, CJsVal *obj, U8 *name)
 {
 	CJsVal *v, *trap, *tgt;
@@ -3332,10 +3366,16 @@ CJsVal *JsMemberGet(CJsInterp *ji, CJsVal *obj, U8 *name)
 			node = obj->node;
 			if (!StrCompare(name, "innerHTML") || !StrCompare(name, "textContent") ||
 				!StrCompare(name, "innerText"))
-			{
+			{ // heap, not the 1KB stack buffer this function shares with every
+			  // other member read: a container's text runs past that, and the
+			  // truncation reads back as valid data. JsStrV copies out, so the
+			  // arena only ever holds the actual length.
+				attr = MAlloc(JS_TEXT_MAX + 8);
 				len = 0;
-				ZNodeTextCollect(node, buf, 1020, &len);
-				return JsStrV(ji, buf);
+				ZNodeTextCollect(node, attr, JS_TEXT_MAX, &len);
+				v = JsStrV(ji, attr);
+				Free(attr);
+				return v;
 			}
 			if (!StrCompare(name, "value"))
 			{
@@ -3603,6 +3643,52 @@ CJsVal *JsMemberGet(CJsInterp *ji, CJsVal *obj, U8 *name)
 				return JsNumV(ji, 0);
 			if (!StrCompare(name, "offsetParent"))
 				return JsNullV(ji);
+			// Reflected DOMString attributes. The IDL makes an absent one "",
+			// never undefined - undefined here becomes an undefined RECEIVER a
+			// few frames later, where nothing names the property that produced
+			// it. id/className/value above already do this.
+			len = -1;
+			if (!StrCompare(name, "src") || !StrCompare(name, "href") ||
+				!StrCompare(name, "action"))
+				len = 1; // URL-valued: resolved against the document
+			else if (!StrCompare(name, "alt") || !StrCompare(name, "title") ||
+					 !StrCompare(name, "name") || !StrCompare(name, "rel") ||
+					 !StrCompare(name, "placeholder") ||
+					 !StrCompare(name, "target") || !StrCompare(name, "lang") ||
+					 !StrCompare(name, "dir") || !StrCompare(name, "content") ||
+					 !StrCompare(name, "media") || !StrCompare(name, "charset") ||
+					 !StrCompare(name, "enctype"))
+				len = 0;
+			if (len >= 0)
+			{
+				attr = ZNodeAttr(node, name);
+				if ((!attr || !*attr) && ji->url &&
+					!StrCompare(name, "action") && !StrCompare(node->tag, "form"))
+					return JsStrV(ji, ji->url); // HTMLFormElement.action: absent
+				if (!attr)						// or empty is the document URL
+					return JsStrV(ji, "");
+				if (len)
+					return JsUrlAbs(ji, attr);
+				return JsStrV(ji, attr);
+			}
+			if (!StrCompare(name, "type") || !StrCompare(name, "method"))
+			{ // limited-value reflections: absent means the element's default,
+			  // not "". A page routing on el.type must not see an input as ""
+				attr = ZNodeAttr(node, name);
+				if (attr)
+					return JsStrV(ji, attr);
+				if (!StrCompare(name, "method"))
+				{
+					if (!StrCompare(node->tag, "form"))
+						return JsStrV(ji, "get");
+					return JsStrV(ji, "");
+				}
+				if (!StrCompare(node->tag, "input"))
+					return JsStrV(ji, "text");
+				if (!StrCompare(node->tag, "button"))
+					return JsStrV(ji, "submit");
+				return JsStrV(ji, "");
+			}
 			attr = ZNodeAttr(node, name);
 			if (attr)
 				return JsStrV(ji, attr);
@@ -3633,6 +3719,15 @@ CJsVal *JsMemberGet(CJsInterp *ji, CJsVal *obj, U8 *name)
 				return JsNativeV(ji, JSN_XHR_OPEN);
 			if (!StrCompare(name, "send"))
 				return JsNativeV(ji, JSN_XHR_SEND);
+			if (!StrCompare(name, "addEventListener"))
+				return JsNativeV(ji, JSN_XHR_ADDLISTEN);
+			if (!StrCompare(name, "removeEventListener"))
+				return JsNativeV(ji, JSN_XHR_REMLISTEN);
+			if (!StrCompare(name, "abort") ||
+				!StrCompare(name, "overrideMimeType"))
+				return JsNativeV(ji, JSN_NOOP_UNDEF); // the fetch already blocked
+			if (!StrCompare(name, "dispatchEvent"))
+				return JsNativeV(ji, JSN_NOOP_TRUE); // "not cancelled"
 			if (!StrCompare(name, "setRequestHeader"))
 				return JsNativeV(ji, JSN_XHR_SETREQHDR);
 			if (!StrCompare(name, "getAllResponseHeaders"))
@@ -4100,6 +4195,125 @@ U8 *JsTypeTag(CJsVal *v)
 	return "?";
 }
 
+U8 *JsNidName(I64 nid)
+{ // JSO_* flavour of a JV_OBJ. "OBJ:6" names nothing; "OBJ/xhr" names the host
+  // object that is missing the member.
+	switch [nid]
+	{
+		case JSO_PLAIN:		return "plain";
+		case JSO_DOCUMENT:	return "document";
+		case JSO_LOCATION:	return "location";
+		case JSO_WINDOW:	return "window";
+		case JSO_ELEMENT:	return "element";
+		case JSO_STYLE:		return "style";
+		case JSO_XHR:		return "xhr";
+		case JSO_PROMISE:	return "promise";
+		case JSO_CLASSLIST:	return "classlist";
+		case JSO_PROXY:		return "proxy";
+		case JSO_DATASET:	return "dataset";
+		case JSO_CANVAS2D:	return "canvas2d";
+	}
+	return "?";
+}
+
+U0 JsValTag(CJsVal *v, U8 *out)
+{ // "UNDEF", "ARR", "OBJ/xhr". out holds 32 bytes.
+	if (v && v->type == JV_OBJ)
+		StrPrint(out, "OBJ/%s", JsNidName(v->native_id));
+	else
+		StrCopy(out, JsTypeTag(v));
+}
+
+U0 JsPathCat(U8 *out, I64 max, U8 *s)
+{ // bounded append: a minified name is short, but nothing guarantees it
+	I64 n = StrLen(out);
+
+	if (!s)
+		s = "?";
+	while (*s && n < max - 1)
+	{
+		out[n] = *s;
+		n++;
+		s++;
+	}
+	out[n] = 0;
+}
+
+U0 JsExprPath(CJsNode *n, U8 *out, I64 max)
+{ // Source shape of an expression, root first: "navigator", "a.b.c", "f().x",
+  // "a[]". A receiver that reads UNDEF is only actionable once you know which
+  // expression produced it. Nothing is evaluated: this runs on an error path,
+  // and the receiver's side effects have already happened.
+	CJsNode *chain[6];
+	I64		 n_seg = 0, i;
+
+	out[0] = 0;
+	while (n && n_seg < 6)
+	{
+		chain[n_seg] = n;
+		n_seg++;
+		if (n->type == JN_MEMBER || n->type == JN_INDEX ||
+			n->type == JN_CALL || n->type == JN_NEW)
+			n = n->a;
+		else
+			n = NULL;
+	}
+	if (!n_seg)
+	{
+		JsPathCat(out, max, "?");
+		return;
+	}
+	i = n_seg - 1;
+	while (i >= 0)
+	{
+		n = chain[i];
+		if (n->type == JN_MEMBER)
+		{
+			JsPathCat(out, max, ".");
+			JsPathCat(out, max, n->str);
+		}
+		else if (n->type == JN_INDEX)
+			JsPathCat(out, max, "[]");
+		else if (n->type == JN_CALL)
+			JsPathCat(out, max, "()");
+		else if (n->type == JN_NEW)
+			JsPathCat(out, max, "new ");
+		else if (n->type == JN_IDENT)
+			JsPathCat(out, max, n->str);
+		else if (n->type == JN_SUPER)
+			JsPathCat(out, max, "super");
+		else
+			JsPathCat(out, max, "(expr)");
+		i--;
+	}
+}
+
+Bool JsWarnFirst(U8 *msg)
+{ // FALSE when this exact line already went out for this script
+	I64 i, k;
+
+	i = 0;
+	while (i < js_warn_n)
+	{
+		if (!StrCompare(js_warn_seen[i], msg))
+			return FALSE;
+		i++;
+	}
+	if (js_warn_n < JS_WARN_KEEP)
+	{
+		k = 0;
+		while (msg[k] && k < JS_WARN_LEN - 1)
+		{
+			js_warn_seen[js_warn_n][k] = msg[k];
+			k++;
+		}
+		js_warn_seen[js_warn_n][k] = 0;
+		js_warn_n++;
+	}
+
+	return TRUE;
+}
+
 U0 JsWhy(CJsInterp *ji, CJsNode *tgt, CJsVal *v, U8 *out)
 { // How the target was reached and what it resolved to. "ident unbound" (no
   // binding in any scope) and "ident UNDEF" (bound, holds undefined) are
@@ -4108,7 +4322,7 @@ U0 JsWhy(CJsInterp *ji, CJsNode *tgt, CJsVal *v, U8 *out)
   // and proto say whether it at least LOOKS constructible.
 	CJsVal *ctor, *proto;
 	U8	   *how = "expr";
-	U8		cf, pf;
+	U8		cf, pf, tag[32];
 
 	if (tgt && tgt->type == JN_IDENT)
 	{
@@ -4139,36 +4353,77 @@ U0 JsWhy(CJsInterp *ji, CJsNode *tgt, CJsVal *v, U8 *out)
 			pf = 'o';
 		else if (proto)
 			pf = 'x';
-		StrPrint(out, "%s OBJ nid=%d ctor=%c proto=%c", how, v->native_id, cf, pf);
+		StrPrint(out, "%s OBJ/%s ctor=%c proto=%c",
+				 how, JsNidName(v->native_id), cf, pf);
 		return;
 	}
-	StrPrint(out, "%s %s", how, JsTypeTag(v));
+	JsValTag(v, tag);
+	StrPrint(out, "%s %s", how, tag);
 }
 
 U0 JsNotCallableWarn(CJsInterp *ji, U8 *kind, CJsNode *tgt, U8 *name,
 					 CJsVal *v, CJsVal *base)
-{
-	U8 buf[192], why[96];
+{ // One line. base names the receiver's flavour, src the expression that
+  // produced it: together they separate "this host object lacks the member"
+  // from "the chain already collapsed further up". Buffers live here, not in
+  // JsEval's frame, which recurses per AST node.
+	U8 buf[JS_WARN_LEN], why[96], tag[32];
 
-	if (++js_soft_errs > 24)
-		return;
+	// assembled with the bounded appender throughout: name and the property
+	// names in the path come from the page and have no length limit
 	JsWhy(ji, tgt, v, why);
-	StrPrint(buf, "%s '%s': %s", kind, name, why);
+	buf[0] = 0;
+	JsPathCat(buf, JS_WARN_LEN, kind);
+	JsPathCat(buf, JS_WARN_LEN, " '");
+	JsPathCat(buf, JS_WARN_LEN, name);
+	JsPathCat(buf, JS_WARN_LEN, "': ");
+	JsPathCat(buf, JS_WARN_LEN, why);
 	if (base)
-		CatPrint(buf, " base=%s:%d", JsTypeTag(base), base->native_id);
+	{
+		JsValTag(base, tag);
+		JsPathCat(buf, JS_WARN_LEN, " base=");
+		JsPathCat(buf, JS_WARN_LEN, tag);
+	}
+	why[0] = 0;
+	if (tgt && (tgt->type == JN_MEMBER || tgt->type == JN_INDEX))
+		JsExprPath(tgt->a, why, 72); // the receiver the name was read off
+	else if (tgt && (tgt->type == JN_CALL || tgt->type == JN_NEW))
+		JsExprPath(tgt, why, 72); // no name to print: the callee expression
+	if (why[0])
+	{
+		JsPathCat(buf, JS_WARN_LEN, " src=");
+		JsPathCat(buf, JS_WARN_LEN, why);
+	}
 	JsScrub(buf);
+	if (!JsWarnFirst(buf))
+		return;
+	// A miss on an undefined receiver is downstream of an earlier failure, not
+	// a root cause. Its own small budget keeps the misses that name a real host
+	// object from being crowded out of the console ring.
+	if (base && (base->type == JV_UNDEF || base->type == JV_NULL))
+	{
+		if (++js_undef_errs > 8)
+			return;
+	}
+	else if (++js_soft_errs > 24)
+		return;
 	JsConsoleAdd("warn", buf);
 	NetLog("JS: %s", buf);
 }
 
 U0 JsArgClipWarn(U8 *name)
 { // arguments past JS_MAX_ARGS are dropped, not passed as undefined
-	U8 buf[192];
+	U8 buf[JS_WARN_LEN], head[32];
 
+	StrPrint(head, "args clipped at %d: ", JS_MAX_ARGS);
+	buf[0] = 0;
+	JsPathCat(buf, JS_WARN_LEN, head);
+	JsPathCat(buf, JS_WARN_LEN, name);
+	JsScrub(buf);
+	if (!JsWarnFirst(buf))
+		return;
 	if (++js_soft_errs > 24)
 		return;
-	StrPrint(buf, "args clipped at %d: %s", JS_MAX_ARGS, name);
-	JsScrub(buf);
 	JsConsoleAdd("warn", buf);
 	NetLog("JS: %s", buf);
 }
@@ -6444,6 +6699,13 @@ U0 JsXhrFire(CJsInterp *ji, CJsVal *xhr)
 		JsCall(ji, cb, xhr, NULL, 0);
 	}
 
+	cb = JsPropGet(xhr, "onloadend"); // fires on both outcomes
+	if (cb && (cb->type == JV_FUNC || cb->type == JV_NATIVE))
+	{
+		ji->steps = 0; ji->depth = 0; ji->flow = JF_NORMAL; ji->env = ji->genv;
+		JsCall(ji, cb, xhr, NULL, 0);
+	}
+
 	if (ji->has_err)
 	{
 		NetLog("%s", ji->err);
@@ -6496,6 +6758,8 @@ U0 JsXhrSend(CJsInterp *ji, CJsVal *xhr, CJsVal *body_val)
 	if (r)
 	{
 		JsPropSet(ji, xhr, "status", JsNumV(ji, r->status));
+		if (200 <= r->status < 300)
+			JsPropSet(ji, xhr, "statusText", JsStrV(ji, "OK"));
 		JsPropSet(ji, xhr, "responseText", JsStrV(ji, r->body));
 		JsPropSet(ji, xhr, "response", JsStrV(ji, r->body));
 		if (r->headers)
@@ -7035,6 +7299,40 @@ CJsInterp *JsInterpNew(CZNode *dom_root, U8 *url)
 	JsPropSet(ji, math, "mark",		  JsNativeV(ji, JSN_NOOP_UNDEF));
 	JsPropSet(ji, math, "measure",	  JsNativeV(ji, JSN_NOOP_UNDEF));
 	JsPropSet(ji, math, "getEntriesByType", JsNativeV(ji, JSN_NOOP_ARR));
+	JsPropSet(ji, math, "getEntriesByName", JsNativeV(ji, JSN_NOOP_ARR));
+	JsPropSet(ji, math, "getEntries",	  JsNativeV(ji, JSN_NOOP_ARR));
+	JsPropSet(ji, math, "clearMarks",	  JsNativeV(ji, JSN_NOOP_UNDEF));
+	JsPropSet(ji, math, "clearMeasures",  JsNativeV(ji, JSN_NOOP_UNDEF));
+	// performance.timing: every field 0. Pages difference two of these; 0 - 0
+	// is a plausible duration, undefined - undefined is NaN and poisons every
+	// value downstream of it.
+	subtle = JsValNew(ji, JV_OBJ);
+	JsPropSet(ji, subtle, "navigationStart",	JsNumV(ji, 0));
+	JsPropSet(ji, subtle, "unloadEventStart",	JsNumV(ji, 0));
+	JsPropSet(ji, subtle, "unloadEventEnd",		JsNumV(ji, 0));
+	JsPropSet(ji, subtle, "redirectStart",		JsNumV(ji, 0));
+	JsPropSet(ji, subtle, "redirectEnd",		JsNumV(ji, 0));
+	JsPropSet(ji, subtle, "fetchStart",			JsNumV(ji, 0));
+	JsPropSet(ji, subtle, "domainLookupStart",	JsNumV(ji, 0));
+	JsPropSet(ji, subtle, "domainLookupEnd",	JsNumV(ji, 0));
+	JsPropSet(ji, subtle, "connectStart",		JsNumV(ji, 0));
+	JsPropSet(ji, subtle, "connectEnd",			JsNumV(ji, 0));
+	JsPropSet(ji, subtle, "secureConnectionStart", JsNumV(ji, 0));
+	JsPropSet(ji, subtle, "requestStart",		JsNumV(ji, 0));
+	JsPropSet(ji, subtle, "responseStart",		JsNumV(ji, 0));
+	JsPropSet(ji, subtle, "responseEnd",		JsNumV(ji, 0));
+	JsPropSet(ji, subtle, "domLoading",			JsNumV(ji, 0));
+	JsPropSet(ji, subtle, "domInteractive",		JsNumV(ji, 0));
+	JsPropSet(ji, subtle, "domContentLoadedEventStart", JsNumV(ji, 0));
+	JsPropSet(ji, subtle, "domContentLoadedEventEnd",	JsNumV(ji, 0));
+	JsPropSet(ji, subtle, "domComplete",		JsNumV(ji, 0));
+	JsPropSet(ji, subtle, "loadEventStart",		JsNumV(ji, 0));
+	JsPropSet(ji, subtle, "loadEventEnd",		JsNumV(ji, 0));
+	JsPropSet(ji, math, "timing", subtle);
+	subtle = JsValNew(ji, JV_OBJ);
+	JsPropSet(ji, subtle, "type",		   JsNumV(ji, 0)); // TYPE_NAVIGATE
+	JsPropSet(ji, subtle, "redirectCount", JsNumV(ji, 0));
+	JsPropSet(ji, math, "navigation", subtle);
 	JsEnvDeclare(ji, ji->genv, "performance", math);
 
 	math = JsValNew(ji, JV_OBJ); // Reflect (maps onto existing property/call semantics)
@@ -7077,6 +7375,9 @@ CJsInterp *JsInterpNew(CZNode *dom_root, U8 *url)
 	JsPropSet(ji, math, "deviceMemory",	JsNumV(ji, 8));
 	JsPropSet(ji, math, "pdfViewerEnabled", JsBoolV(ji, TRUE));
 	JsPropSet(ji, math, "javaEnabled",	JsNativeV(ji, JSN_NOOP_FALSE));
+	// sendBeacon queues analytics on unload. Nothing is sent; the caller reads
+	// only the "was it queued" boolean, and false makes pages retry over XHR.
+	JsPropSet(ji, math, "sendBeacon",	JsNativeV(ji, JSN_NOOP_TRUE));
 	date = JsArrV(ji); // navigator.languages
 	JsArrPush(ji, date, JsStrV(ji, "en-US"));
 	JsArrPush(ji, date, JsStrV(ji, "en"));
@@ -7224,6 +7525,8 @@ Bool JsRunEx(CJsInterp *ji, U8 *src, CJsVal **_last)
 	ji->env		= ji->genv;
 	js_soft_errs  = 0; // fresh log budgets per script
 	js_parse_errs = 0;
+	js_undef_errs = 0;
+	js_warn_n	  = 0;
 
 	if (!JsLex(ji, src))
 	{

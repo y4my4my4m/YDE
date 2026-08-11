@@ -11,6 +11,7 @@
 // where the small window + ring interaction wedged the transfer. 64 KB gives
 // ample headroom (advertised window = /2 = 32 KB, still within the U16 field)
 // and restores large-image downloads. Costs 64 KB per live socket.
+// Ring indices are masked, so this must be a power of two.
 #define TCP_WINDOW_SIZE	65536
 
 #define TCP_MSS			536 // Max Segment Size default
@@ -95,6 +96,7 @@ class CTCPSocket
 	I64						 read_position;  // position in RX buffer Socket calls have read up to
 	I64						 receive_buffer_size;
 	U8						*receive_buffer;
+	U32						 receive_drops;	// octets discarded since the window last reopened
 };
 
 

@@ -1,9 +1,12 @@
 Bool TCPHandleValidSEQ(CTCPSocket *tcp_socket, CTCPHeader *header, U32 segment_seq_num, I64 length, U8 *data)
 {// returns the value of must_ack, used later in TCPHandleSocket. Copies data to receive buffer.
 	Bool must_ack = FALSE;
+	I64  mask;
+	I64  seq_offset;
 	I64  write_position;
 	I64  next_position;
-	I64  i;
+	I64  i = 0;
+	U32  fin_seq;
 
 //	tcp_socket->send_window = header->window_size;
 	tcp_socket->send_window = EndianU16(header->window_size);
@@ -18,26 +21,51 @@ Bool TCPHandleValidSEQ(CTCPSocket *tcp_socket, CTCPHeader *header, U32 segment_s
 
 			NetDebug("TCP HANDLE VALID SEQ: Updating data in receive buffer.");
 
-			// TODO: review while loops, make sure we DO NOT HANG INTERRUPT HANDLER.
-			write_position = tcp_socket->write_position;
+			mask			= tcp_socket->receive_buffer_size - 1;
+			write_position	= tcp_socket->write_position;
+			fin_seq			= (segment_seq_num + length) & 0xFFFFFFFF; // a FIN occupies the octet past the payload
 
-			while (length && segment_seq_num != tcp_socket->next_recv_seq_num)
+			// Octets of this segment already delivered. Half the sequence space
+			// or more means the segment starts ahead of RCV.NXT.
+			seq_offset = (tcp_socket->next_recv_seq_num - segment_seq_num) & 0xFFFFFFFF;
+
+			if (seq_offset >= 0x80000000)
+			{ // gap. No reassembly queue: drop it, duplicate-ACK so the peer retransmits before its RTO.
+				length = 0;
+				must_ack = TRUE;
+			}
+			else if (seq_offset > 0)
 			{
-				segment_seq_num = (segment_seq_num + 1) & 0xFFFFFFFF;
-				data++;
-				length--;
+				if (seq_offset >= length)
+				{ // wholly retransmitted, already in the ring. ACK: the peer lost the previous one.
+					length = 0;
+					must_ack = TRUE;
+				}
+				else
+				{ // partial overlap. Skip the octets already delivered.
+					data += seq_offset;
+					length -= seq_offset;
+				}
 			}
 
 			for (i = 0; i < length; i++)
 			{
-//				next_position = (write_position + 1) & (tcp_socket->receive_buffer_size - 1);
-				next_position = (write_position + 1) % tcp_socket->receive_buffer_size;
+				next_position = (write_position + 1) & mask;
 
 				if (next_position == tcp_socket->read_position)
-					break; // ...?
+					break;
 
 				tcp_socket->receive_buffer[write_position] = data[i];
 				write_position = next_position;
+			}
+
+			if (i < length)
+			{ // the dropped octets stay unacknowledged, so the peer retransmits them
+				if (!tcp_socket->receive_drops)
+					NetWarn("TCP HANDLE VALID SEQ: Receive buffer full, dropping %d of %d octets.",
+							length - i, length);
+
+				tcp_socket->receive_drops += length - i;
 			}
 
 			tcp_socket->write_position = write_position;
@@ -46,7 +74,8 @@ Bool TCPHandleValidSEQ(CTCPSocket *tcp_socket, CTCPHeader *header, U32 segment_s
 			if (i > 0)
 				must_ack = TRUE;
 
-			if (Bt(&header->flags, TCPf_FIN))
+			// A FIN behind a gap or behind dropped octets would close a truncated stream.
+			if (Bt(&header->flags, TCPf_FIN) && tcp_socket->next_recv_seq_num == fin_seq)
 			{
 				must_ack = TRUE;
 				tcp_socket->next_recv_seq_num++;
@@ -257,6 +286,8 @@ U0 TCPHandleSocket(CTCPSocket *tcp_socket, CIPV4Packet *packet, CTCPHeader *head
 
 			if (is_seq_valid)
 				must_ack |= TCPHandleValidSEQ(tcp_socket, header, segment_seq_num, length, data);
+			else if (!Bt(&header->flags, TCPf_RST) && IsTCPStateSync(tcp_socket))
+				must_ack = TRUE; // RFC 793: an unacceptable segment is answered with an ACK carrying RCV.NXT
 
 			if (must_ack)
 				TCPSendFlags(tcp_socket, TCPF_ACK);
