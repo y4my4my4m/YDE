@@ -1,59 +1,68 @@
-# YDE + ZealOS
+# YDE
 
-[![Discord](https://img.shields.io/discord/934200098144022609?color=7289DA&label=Discord&logo=discord&logoColor=white)](https://discord.gg/rK6U3xdr7D) [![](https://img.shields.io/badge/wiki-documentation-forestgreen)](https://zeal-operating-system.github.io/ZealOS-wiki/) [![Build ZealOS ISOs](https://github.com/Zeal-Operating-System/ZealOS/actions/workflows/build.yml/badge.svg)](https://github.com/Zeal-Operating-System/ZealOS/actions/workflows/build.yml)
+The Y Desktop Environment, on a heavily modified [ZealOS](https://github.com/Zeal-Operating-System/ZealOS).
+64-bit, ring-0, single address space, written in ZealC. No ELFs, no libc, no X.
 
-The Zeal Operating System is a modernized fork of the 64-bit Temple Operating System. Guiding principles of development include transparency, full user control, and adherence to public-domain/open-source implementations.
+![](/screenshots/yde-desktop.png)
 
-![](/screenshots/screenshot2.png)
+## What it is
 
-ZealOS strives to be simple, documented, and require as little of a knowledge gap as possible. One person should be able to comprehend the entire system in at least a semi-detailed way within a few days of study.
+A truecolor compositing desktop that runs inside the OS it is written in. The
+window manager, the toolkit, the decoders and the applications are all ZealC
+source in this tree, compiled at boot.
 
-**Simplify, don't complicate; make accessible, don't obfuscate.**
+- Compositor with per-window glass blur (optional), z-buffered wallpaper
+- Taskbar, start menu, settings, palette editor, calendar, calculator
+- yViewer image viewer, yPainter, YTracker, ZMail, yIRC, Zinc web browser
+- Images: PNG, JPG, GIF, WEBP, TGA, SVG
+- Audio: MP3, Ogg Vorbis, WAV, MOD, AC97, HDA, USB audio
+- Net: TCP/IP, DHCP, DNS, HTTP, TLS 1.3, WebSocket, SSH, git, IRC, IMAP/SMTP
+- 8x8 and 8x16 system fonts, switchable at runtime
 
-Features in development include:
-  - [32-bit color VBE graphics](https://github.com/TempleProgramming/HolyGL)
-  - Fully-functional AHCI support
-  - Network card drivers and a networking stack
-  - UEFI booting via [BSD2-licensed Limine bootloader](https://github.com/limine-bootloader/limine) and [Public Domain ZealBooter prekernel](/zealbooter/src/zealbooter.c)
+![](/screenshots/yde-startmenu.png)
 
-[Changes include](https://zeal-operating-system.github.io/Doc/ChangeLog.DD.html):
-  - 60 FPS
-  - VBE graphics with variable resolutions
-  - Reformatted code for readability
-  - Added comments and documentation
-  - HolyC -> ZealC
-  - System-wide renaming for clarity
+## Ports
 
-## Getting started
+QuakePlus (Fitz/QS/Ironwail-class), Half-Life (GoldSrc, software
+renderer), Diablo (Devilution-like with some DevilutionX features). Native, no emulation.
 
-### Prerequisites
+![](/screenshots/yde-quake.png)
 
-- For running in a VM: Intel VT-x/AMD-V acceleration enabled in your BIOS settings. (Required to virtualize any 64-bit operating system properly.)
-    * If using Windows, [Hyper-V must be enabled.](https://docs.microsoft.com/en-us/virtualization/hyper-v-on-windows/quick-start/enable-hyper-v#enable-the-hyper-v-role-through-settings)
-- Working knowledge of the C programming language.
+![](/screenshots/yde-hl1.png)
 
-To create a Distro ISO, run the `build-iso` script. Check the Wiki guide for details on [building an ISO](https://zeal-operating-system.github.io/ZealOS-wiki/Building-an-ISO). After creating an ISO, see the Wiki guides on installing in [VirtualBox](https://zeal-operating-system.github.io/ZealOS-wiki/Installing-(Virtualbox)), [VMWare](https://zeal-operating-system.github.io/ZealOS-wiki/Installing-(VMWare)), and [bare-metal](https://zeal-operating-system.github.io/ZealOS-wiki/Installing-(Bare%E2%80%90metal)).
+## YTracker
 
-### Contributing
+A sample tracker written for YDE. NES-style waveforms are generated into
+looping samples at startup, so one voice path drives chiptune and imported PCM
+alike: portamento, vibrato and arpeggio work on both.
 
-There are two ways to contribute. The first way involves everything happening inside the OS, as intended by Terry. After you've built the latest ISO, installed to a VM, made your changes, and powered off the VM, you can run the `sync` script to merge your changes to the repo.
+![](/screenshots/yde-ytracker1.png)
 
-Alternatively, you can edit repo files using an external editor, outside of the OS.
+![](/screenshots/yde-ytracker2.png)
 
-Afterwards, you can make a pull request on the `master` branch.
+![](/screenshots/yde-tracker3.png)
 
-## Background
+## Build and run
 
-In around November of 2019, [VoidNV](https://web.archive.org/web/20210414181948/https://github.com/VoidNV) forked [ZenithOS](https://web.archive.org/web/20200811190005/https://github.com/VoidNV/ZenithOS) from TempleOS. [Releases of pre-git ZenithOS are currently archived on the mega.nz website.](https://mega.nz/#F!ZIEGmSRQ!qvL6Wk6THzE-dazkfT6N3Q) The repository was removed in August of 2020, and reuploaded to [ZenithOS](https://web.archive.org/web/20210630230454/https://github.com/ZenithOS/ZenithOS). The latest archived [front page](https://web.archive.org/web/20200811190005/https://github.com/VoidNV/ZenithOS/), [master.zip](https://web.archive.org/web/20200811190054/https://codeload.github.com/VoidNV/ZenithOS/zip/master), and [related links](https://web.archive.org/web/*/https://github.com/VoidNV/ZenithOS/*) can be found on archive.org.
+```sh
+build/build-iso.sh      # distro ISO
+build/launchvm.sh       # QEMU, KVM, AC97, rtl8139
+build/sync.sh           # merge changes made inside the VM back to the repo
+```
 
-In July of 2021, ZealOS was forked from ZenithOS.
+Requires VT-x/AMD-V. The ISO installs to a qcow2 disk; after that, boot the
+disk and sync in either direction.
 
-## Screenshots
+## Layout
 
-Network Report, Gopher Client, FTP Client, GrDir, and AutoComplete, with Stars wallpaper
+```
+src/Kernel      AOT kernel: memory, tasks, FS, USB, fonts
+src/Compiler    ZealC compiler
+src/System      graphics, audio, net, decoders
+src/DE          the desktop
+src/Apps        ports and applications
+```
 
-![](/screenshots/screenshot3.png)
+## License
 
-32-bit color!
-
-![](/screenshots/screenshot1.png)
+Public domain, as upstream. ZealOS is a fork of TempleOS by Terry A. Davis.
