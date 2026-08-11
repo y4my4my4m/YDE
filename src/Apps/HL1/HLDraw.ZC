@@ -124,6 +124,11 @@ I64	hl_rs_beams		= 0;	//beams submitted
 I64	hl_rs_beam_px	= 0;	//beam ribbon pixels stepped
 I64	hl_rs_lightpoint	= 0;	//R_LightPoint traces, one BSP trace each
 
+//TSC deltas, reset with the counters. Cheap enough to leave in the frame path.
+I64	hl_tsc_clear	= 0;
+I64	hl_tsc_world	= 0;
+I64	hl_tsc_blit		= 0;
+
 //off by default: the readout is a Print and costs a line of output a frame
 Bool hl_rs_enable = FALSE;
 
@@ -149,6 +154,9 @@ U0 HLRSpeedsReset()
 	hl_rs_beams		= 0;
 	hl_rs_beam_px		= 0;
 	hl_rs_lightpoint	= 0;
+	hl_tsc_clear		= 0;
+	hl_tsc_world		= 0;
+	hl_tsc_blit			= 0;
 }
 
 U0 HLRSpeedsPrint()
@@ -167,6 +175,8 @@ U0 HLRSpeedsPrint()
 	"efx   spr %d px %d part %d lightpt %d\n",
 		hl_rs_sprites, hl_rs_sprite_px, hl_rs_part_px, hl_rs_lightpoint;
 	"beam  %d px %d\n", hl_rs_beams, hl_rs_beam_px;
+	"kcyc  clear %d world %d blit %d\n",
+		hl_tsc_clear / 1000, hl_tsc_world / 1000, hl_tsc_blit / 1000;
 }
 
 U0 HLRSpeeds(Bool on = TRUE)
@@ -1401,6 +1411,9 @@ U0 HLDrawClear(CHLCanvas *c, I64 color_index)
 	I64	 y0;
 	I64	 x1;
 	I64	 y1;
+	I64	 t_clear;
+
+	t_clear = TSCGet;
 
 	x0 = c->vx;
 	y0 = c->vy;
@@ -1454,6 +1467,9 @@ U0 HLDrawClear(CHLCanvas *c, I64 color_index)
 	}
 
 	HLRSpeedsReset;
+
+	//after the reset, so all three timers cover the same frame
+	hl_tsc_clear += TSCGet - t_clear;
 
 	hl_draw_frame++;
 }
@@ -4024,11 +4040,13 @@ U0 HLDrawWorld(CHLCanvas *c, CHLMap *map, CHLVisState *vs)
  //
  //scroll_speed 35: world "scroll*" faces have no entity to encode speed in
  //rendercolor. Quake-compatible default from DrawGLPoly.
-	I64 i;
+	I64 i, t0 = TSCGet;
 
 	for (i = 0; i < vs->face_count; i++)
 		HLDrawFace(c, map, vs->face_list[i], NULL, 0, NULL, 0, 255,
 			0.0, 35.0);
+
+	hl_tsc_world += TSCGet - t0;
 }
 
 U0 HLDrawBrushModel(CHLCanvas *c, CHLMap *map, I64 model_index,
@@ -4270,9 +4288,27 @@ U32 HLDispCorrect(U32 rgb)
 			hl_disp_b[rgb & 255];
 }
 
-U0 HLDrawBlitFit(CHLCanvas *c, CDC *dc, I64 dst_x, I64 dst_y, I64 dst_w,
-	I64 dst_h)
-{//stretch the canvas into any destination rect
+#define HLROW_BANDS		16
+#define HLROW_MIN_ROWS	64		//below this the IPI costs more than the work
+
+class CHLRowJob
+{
+	CHLCanvas	*c;
+	CDC			*dc;
+	I64			 y0, y1;
+	I64			 dst_x, dst_y, dst_w, dst_h;
+};
+
+CHLRowJob	 hl_blit_job[HLROW_BANDS];
+CJob		*hl_blit_cmd[HLROW_BANDS];
+I64			 hl_mt_cores = 0;
+Bool		 hl_mt_init	 = FALSE;
+Bool		 hl_r_mtblit = TRUE;
+hl_r_mtblit = TRUE;
+
+U0 HLBlitFitBand(CHLCanvas *c, CDC *dc, I64 dst_x, I64 dst_y, I64 dst_w,
+	I64 dst_h, I64 y0, I64 y1)
+{//stretch rows y0..y1 of the canvas into the destination rect
  //
  //the source step is fixed point so any render size fills the same rectangle.
  //integer-only scaling displays higher render resolutions smaller
@@ -4296,7 +4332,7 @@ U0 HLDrawBlitFit(CHLCanvas *c, CDC *dc, I64 dst_x, I64 dst_y, I64 dst_w,
 	//Identity display table (no gamma/tint) copies whole rows.
 	if (dst_w == c->width && dst_h == c->height && hl_warp_amount <= 0.0)
 	{
-		for (y = 0; y < dst_h; y++)
+		for (y = y0; y < y1; y++)
 		{
 			py = dst_y + y;
 
@@ -4328,7 +4364,7 @@ qbf_1to1_next:
 	sx_step = (c->width << 16) / dst_w;
 	sy_step = (c->height << 16) / dst_h;
 
-	for (y = 0; y < dst_h; y++)
+	for (y = y0; y < y1; y++)
 	{
 		py = dst_y + y;
 		if (py < 0 || py >= dc->height)
@@ -4369,6 +4405,80 @@ qbf_1to1_next:
 
 qbf_next_row:
 	}
+}
+
+I64 HLBlitFitJob(U8 *data)
+{
+	CHLRowJob *j = data;
+
+	HLBlitFitBand(j->c, j->dc, j->dst_x, j->dst_y, j->dst_w, j->dst_h,
+		j->y0, j->y1);
+
+	return 0;
+}
+
+U0 HLDrawBlitFit(CHLCanvas *c, CDC *dc, I64 dst_x, I64 dst_y, I64 dst_w,
+	I64 dst_h)
+{//split the stretch across cores by destination row band
+	I64 bands, i, t0;
+
+	if (dst_w < 1 || dst_h < 1)
+		return;
+
+	t0 = TSCGet;
+
+	if (!hl_mt_init)
+	{//mp_count is 1 on a uniprocessor boot, and JobQueue THROWS for a
+	 //target_cpu outside it
+		hl_mt_init	= TRUE;
+		hl_mt_cores	= mp_count - 1;
+		if (hl_mt_cores < 0)
+			hl_mt_cores = 0;
+	}
+
+	//A 1:1 identity blit is a MemCopy per row: memory bound, so bands only add
+	//an IPI and a JobResGet spin each.
+	if (dst_w == c->width && dst_h == c->height && hl_warp_amount <= 0.0 &&
+		hl_disp_identity)
+	{
+		HLBlitFitBand(c, dc, dst_x, dst_y, dst_w, dst_h, 0, dst_h);
+		hl_tsc_blit += TSCGet - t0;
+		return;
+	}
+
+	bands = 1;
+	if (hl_r_mtblit && hl_mt_cores > 0 && dst_h >= HLROW_MIN_ROWS)
+	{
+		bands = hl_mt_cores + 1;
+		if (bands > HLROW_BANDS)
+			bands = HLROW_BANDS;
+	}
+
+	if (bands > 1)
+	{
+		for (i = 1; i < bands; i++)
+		{
+			hl_blit_job[i].c	 = c;
+			hl_blit_job[i].dc	 = dc;
+			hl_blit_job[i].dst_x = dst_x;
+			hl_blit_job[i].dst_y = dst_y;
+			hl_blit_job[i].dst_w = dst_w;
+			hl_blit_job[i].dst_h = dst_h;
+			hl_blit_job[i].y0	 = dst_h * i / bands;
+			hl_blit_job[i].y1	 = dst_h * (i + 1) / bands;
+
+			hl_blit_cmd[i] = JobQueue(&HLBlitFitJob, &hl_blit_job[i], i, 0);
+		}
+
+		HLBlitFitBand(c, dc, dst_x, dst_y, dst_w, dst_h, 0, dst_h / bands);
+
+		for (i = 1; i < bands; i++)
+			JobResGet(hl_blit_cmd[i]);
+	}
+	else
+		HLBlitFitBand(c, dc, dst_x, dst_y, dst_w, dst_h, 0, dst_h);
+
+	hl_tsc_blit += TSCGet - t0;
 }
 
 //--- decals ----------------------------------------------------------------
