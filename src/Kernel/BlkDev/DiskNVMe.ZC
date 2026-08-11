@@ -1,0 +1,373 @@
+//NVMe 1.4 driver. Polled, one I/O queue pair per controller, PRP transfers.
+//Mirrors DiskAHCI.ZC in shape: probe in NVMeInit, per-device state in
+//blkdev.nvme_ctrls, block access through NVMeBlksRead/NVMeBlksWrite.
+//
+//Namespaces whose LBA size is not BLK_SIZE are skipped: the block layer has
+//one block size per drive and every caller assumes BLK_SIZE.
+
+#define NVME_SPIN_MAX		2000000		//poll iterations before a command fails
+#define NVME_MAX_XFER_BLKS	128			//blocks per command, PRP list bounded
+
+U32 *NVMeDoorbell(CNVMeCtrl *c, I64 qid, Bool is_cq)
+{//Doorbells start at BAR0 + 0x1000, spaced 4 << CAP.DSTRD bytes, submission
+//then completion for each queue id.
+	return c->regs(U8 *) + 0x1000 + (2 * qid + is_cq) * (4 << c->db_stride);
+}
+
+Bool NVMeWaitReady(CNVMeCtrl *c, Bool want, I64 timeout_ms)
+{//CSTS.RDY follows CC.EN. CAP.TO gives the controller's own limit.
+	I64 i;
+
+	for (i = 0; i < timeout_ms; i++)
+	{
+		if (c->regs->csts & 2)			//CSTS.CFS: fatal, never becomes ready
+			return FALSE;
+		if (ToBool(c->regs->csts & 1) == want)
+			return TRUE;
+		Sleep(1);
+	}
+
+	return FALSE;
+}
+
+Bool NVMeCmdRun(CNVMeCtrl *c, Bool admin, CNVMeCmd *cmd, I64 *status_out)
+{//Submit one command and poll its completion. The caller holds the drive lock,
+//so a single outstanding command per queue is enough.
+	CNVMeCmd	*sq;
+	CNVMeCQE	*cq, *cqe;
+	I64			 depth = NVME_Q_DEPTH, qid = NVME_IO_QID, spins;
+	I64			*tail, *head;
+	Bool		*phase;
+	U16			 cid;
+
+	if (admin)
+	{
+		sq	  = c->asq;
+		cq	  = c->acq;
+		qid	  = 0;
+		tail  = &c->a_tail;
+		head  = &c->a_head;
+		phase = &c->a_phase;
+	}
+	else
+	{
+		sq	  = c->iosq;
+		cq	  = c->iocq;
+		tail  = &c->i_tail;
+		head  = &c->i_head;
+		phase = &c->i_phase;
+	}
+
+	cid = c->cid++ & 0xFFFF;
+	cmd->cdw0 = cmd->cdw0 & 0xFFFF | cid << 16;
+	MemCopy(&sq[*tail], cmd, sizeof(CNVMeCmd));
+	*tail = (*tail + 1) % depth;
+	*NVMeDoorbell(c, qid, FALSE) = *tail;
+
+	cqe = &cq[*head];
+	for (spins = 0; spins < NVME_SPIN_MAX; spins++)
+	{
+		if (ToBool(cqe->status & 1) == *phase)
+		{
+			if (status_out)
+				*status_out = cqe->status >> 1;
+			*head = (*head + 1) % depth;
+			if (!*head)
+				*phase = !*phase;		//queue wrapped: the tag inverts
+			*NVMeDoorbell(c, qid, TRUE) = *head;
+
+			return ToBool(!(cqe->status >> 1));
+		}
+		if (!(spins & 0xFFF))
+			Yield;
+	}
+	if (status_out)
+		*status_out = -1;
+
+	return FALSE;
+}
+
+Bool NVMePrpSet(CNVMeCtrl *c, CNVMeCmd *cmd, U8 *buf, I64 bytes)
+{//PRP1 is the first (possibly offset) page. Anything past the second page
+//needs a PRP list, one entry per page, capped at a page of entries.
+	I64	 off = buf & (NVME_PAGE - 1), first, pages, i;
+	U8	*p;
+
+	cmd->prp1 = buf;
+	cmd->prp2 = 0;
+	first = NVME_PAGE - off;
+	if (bytes <= first)
+		return TRUE;
+	p = buf + first;
+	if (bytes - first <= NVME_PAGE)
+	{
+		cmd->prp2 = p;
+		return TRUE;
+	}
+	pages = (bytes - first + NVME_PAGE - 1) / NVME_PAGE;
+	if (pages > NVME_PRPS_PER_PAGE)
+		return FALSE;
+	for (i = 0; i < pages; i++)
+		c->prp_list[i] = p + i * NVME_PAGE;
+	cmd->prp2 = c->prp_list;
+
+	return TRUE;
+}
+
+Bool NVMeIdentify(CNVMeCtrl *c, I64 nsid, I64 cns, U8 *out)
+{//4096-byte identify payload into out.
+	CNVMeCmd cmd;
+
+	MemSet(&cmd, 0, sizeof(CNVMeCmd));
+	cmd.cdw0  = NVME_ADM_IDENTIFY;
+	cmd.nsid  = nsid;
+	cmd.cdw10 = cns;
+	if (!NVMePrpSet(c, &cmd, out, 4096))
+		return FALSE;
+
+	return NVMeCmdRun(c, TRUE, &cmd, NULL);
+}
+
+Bool NVMeQueuesCreate(CNVMeCtrl *c)
+{//Ask for one I/O pair, then create the completion queue before the
+//submission queue that points at it.
+	CNVMeCmd cmd;
+
+	MemSet(&cmd, 0, sizeof(CNVMeCmd));
+	cmd.cdw0  = NVME_ADM_SET_FEAT;
+	cmd.cdw10 = NVME_FEAT_NUM_QUEUES;
+	cmd.cdw11 = 0;						//zero based: one of each
+	if (!NVMeCmdRun(c, TRUE, &cmd, NULL))
+		return FALSE;
+
+	MemSet(&cmd, 0, sizeof(CNVMeCmd));
+	cmd.cdw0  = NVME_ADM_CREATE_CQ;
+	cmd.prp1  = c->iocq;
+	cmd.cdw10 = (NVME_Q_DEPTH - 1) << 16 | NVME_IO_QID;
+	cmd.cdw11 = 1;						//PC, interrupts disabled
+	if (!NVMeCmdRun(c, TRUE, &cmd, NULL))
+		return FALSE;
+
+	MemSet(&cmd, 0, sizeof(CNVMeCmd));
+	cmd.cdw0  = NVME_ADM_CREATE_SQ;
+	cmd.prp1  = c->iosq;
+	cmd.cdw10 = (NVME_Q_DEPTH - 1) << 16 | NVME_IO_QID;
+	cmd.cdw11 = NVME_IO_QID << 16 | 1;	//bound to that CQ, PC
+	if (!NVMeCmdRun(c, TRUE, &cmd, NULL))
+		return FALSE;
+
+	return TRUE;
+}
+
+Bool NVMeCtrlInit(CNVMeCtrl *c, I64 bdf)
+{//Reset, admin queues, then one I/O queue pair.
+	U64	 cap, bar;
+	U32	 pci_cmd;
+	I64	 to_ms;
+
+	c->bdf = bdf;
+	pci_cmd = PCIReadU32(bdf.u8[2], bdf.u8[1], bdf.u8[0], PCIR_COMMAND);
+	PCIWriteU32(bdf.u8[2], bdf.u8[1], bdf.u8[0], PCIR_COMMAND, pci_cmd | 6);
+	bar = PCIReadU32(bdf.u8[2], bdf.u8[1], bdf.u8[0], PCIR_BASE0) & ~0xF;
+	bar |= PCIReadU32(bdf.u8[2], bdf.u8[1], bdf.u8[0], PCIR_BASE1)(U64) << 32;
+	if (!bar)
+	{
+		"NVMe: BAR0 not assigned.\n";
+		return FALSE;
+	}
+	c->regs = dev.uncached_alias + bar;
+
+	cap = c->regs->cap;
+	c->db_stride = NVME_CAP_DSTRD(cap);
+	to_ms = NVME_CAP_TO(cap) * 500;
+	if (to_ms < 500)
+		to_ms = 500;
+	if (NVME_CAP_MQES(cap) < NVME_Q_DEPTH - 1)
+	{
+		"NVMe: queue depth %d unsupported.\n", NVME_Q_DEPTH;
+		return FALSE;
+	}
+
+	c->regs->cc = c->regs->cc & ~1;				//CC.EN off
+	if (!NVMeWaitReady(c, FALSE, to_ms))
+	{
+		"NVMe: controller stuck ready.\n";
+		return FALSE;
+	}
+
+	c->asq		= CAllocAligned(sizeof(CNVMeCmd) * NVME_Q_DEPTH, NVME_PAGE, sys_task->code_heap);
+	c->acq		= CAllocAligned(sizeof(CNVMeCQE) * NVME_Q_DEPTH, NVME_PAGE, sys_task->code_heap);
+	c->iosq		= CAllocAligned(sizeof(CNVMeCmd) * NVME_Q_DEPTH, NVME_PAGE, sys_task->code_heap);
+	c->iocq		= CAllocAligned(sizeof(CNVMeCQE) * NVME_Q_DEPTH, NVME_PAGE, sys_task->code_heap);
+	c->prp_list	= CAllocAligned(NVME_PAGE, NVME_PAGE, sys_task->code_heap);
+	c->a_tail	= 0;
+	c->a_head	= 0;
+	c->i_tail	= 0;
+	c->i_head	= 0;
+	c->cid		= 0;
+	c->a_phase	= TRUE;				//a fresh CQE arrives with phase 1
+	c->i_phase	= TRUE;
+
+	c->regs->aqa = (NVME_Q_DEPTH - 1) << 16 | (NVME_Q_DEPTH - 1);
+	c->regs->asq = c->asq;
+	c->regs->acq = c->acq;
+	c->regs->cc  = NVME_CC_IOCQES | NVME_CC_IOSQES | NVME_CC_AMS_RR |
+				   NVME_CC_MPS_4K | NVME_CC_CSS_NVM | 1;
+	if (!NVMeWaitReady(c, TRUE, to_ms))
+	{
+		"NVMe: controller did not become ready.\n";
+		return FALSE;
+	}
+	if (!NVMeQueuesCreate(c))
+	{
+		"NVMe: I/O queue creation failed.\n";
+		return FALSE;
+	}
+	c->valid = TRUE;
+
+	return TRUE;
+}
+
+Bool NVMeNsMount(CNVMeCtrl *c, I64 nsid, U8 *ident)
+{//Identify Namespace: NSZE at 0, FLBAS at 26, LBA format table at 128.
+//LBADS is the log2 of the LBA size in bytes.
+	CBlkDev	*bd;
+	CNVMeNs	*ns;
+	U32		 lbaf;
+	I64		 blocks, lba_bytes, fmt;
+
+	if (!NVMeIdentify(c, nsid, NVME_IDENT_NS, ident))
+		return FALSE;
+	blocks = *(ident(U64 *));
+	if (!blocks)
+		return FALSE;
+	fmt	 = ident[26] & 0xF;
+	lbaf = *(ident + 128 + fmt * 4)(U32 *);
+	lba_bytes = 1 << (lbaf >> 16 & 0xFF);
+	if (lba_bytes != BLK_SIZE)
+	{
+		"NVMe: namespace %d has %d-byte LBAs, skipped.\n", nsid, lba_bytes;
+		return FALSE;
+	}
+
+	ns = CAlloc(sizeof(CNVMeNs), sys_task->code_heap);
+	ns->ctrl	  = c;
+	ns->nsid	  = nsid;
+	ns->blocks	  = blocks;
+	ns->lba_bytes = lba_bytes;
+
+	bd = BlkDevNextFreeSlot(DriveNextFreeLet('K'), BDT_NVME);
+	bd->nvme_ns	   = ns;
+	bd->max_blk	   = blocks - 1;
+	bd->port_num   = nsid;
+	bd->max_reads  = NVME_MAX_XFER_BLKS;
+	bd->max_writes = NVME_MAX_XFER_BLKS;
+	"NVMe: namespace %d, %d blocks, drive %C:.\n",
+		nsid, blocks, bd->first_drive_let;
+
+	return ToBool(BlkDevAdd(bd, , FALSE, TRUE) > 0);
+}
+
+Bool NVMeXfer(CBlkDev *bd, U8 *buf, I64 blk, I64 count, Bool write)
+{//One namespace read or write, split into PRP-sized commands.
+	CNVMeNs		*ns = bd->nvme_ns;
+	CNVMeCtrl	*c;
+	CNVMeCmd	 cmd;
+	I64			 n, status;
+
+	if (!ns || !ns->ctrl || !ns->ctrl->valid)
+		return FALSE;
+	c = ns->ctrl;
+	while (count > 0)
+	{
+		n = count;
+		if (n > NVME_MAX_XFER_BLKS)
+			n = NVME_MAX_XFER_BLKS;
+		MemSet(&cmd, 0, sizeof(CNVMeCmd));
+		if (write)
+			cmd.cdw0 = NVME_IO_WRITE;
+		else
+			cmd.cdw0 = NVME_IO_READ;
+		cmd.nsid  = ns->nsid;
+		cmd.cdw10 = blk & 0xFFFFFFFF;
+		cmd.cdw11 = blk >> 32;
+		cmd.cdw12 = n - 1;				//zero based block count
+		if (!NVMePrpSet(c, &cmd, buf, n * ns->lba_bytes))
+			return FALSE;
+		if (!NVMeCmdRun(c, FALSE, &cmd, &status))
+		{
+			if (write)
+				"NVMe: write ns %d blk %d failed, status 0x%X.\n",
+					ns->nsid, blk, status;
+			else
+				"NVMe: read ns %d blk %d failed, status 0x%X.\n",
+					ns->nsid, blk, status;
+			return FALSE;
+		}
+		buf	  += n * ns->lba_bytes;
+		blk	  += n;
+		count -= n;
+	}
+
+	return TRUE;
+}
+
+Bool NVMeBlksRead(CBlkDev *bd, U8 *buf, I64 blk, I64 count)
+{
+	return NVMeXfer(bd, buf, blk, count, FALSE);
+}
+
+Bool NVMeBlksWrite(CBlkDev *bd, U8 *buf, I64 blk, I64 count)
+{
+	return NVMeXfer(bd, buf, blk, count, TRUE);
+}
+
+U0 NVMeInit()
+{//Class 01 subclass 08 prog-if 02. Every controller's active namespaces are
+//mounted at the next free letter in the NVMe range.
+	CNVMeCtrl	*c;
+	U8			*ident;
+	U32			*ns_list;
+	I64			 bdf, i, n, nsid, found = 0;
+
+	"______________________\n";
+	//Two 4096-byte identify payloads: the namespace list and one namespace.
+	ident = CAllocAligned(8192, NVME_PAGE, sys_task->code_heap);
+	for (n = 0; n < NVME_MAX_CTRLS; n++)
+	{
+		bdf = PCIClassFind(PCIC_STORAGE << 16 | PCISC_NVM << 8 | PCIPI_NVME, n);
+		if (bdf == -1)
+			break;
+		"NVMe: controller %d found\n", n;
+		c = &blkdev.nvme_ctrls[n];
+		MemSet(c, 0, sizeof(CNVMeCtrl));
+		if (!NVMeCtrlInit(c, bdf))
+			break;
+		blkdev.nvme_ctrl_count = n + 1;
+
+		if (!NVMeIdentify(c, 0, NVME_IDENT_CTRL, ident))
+		{
+			"NVMe: Identify Controller failed.\n";
+			break;
+		}
+		//Active namespace list: U32 ids, ascending, zero terminated.
+		if (!NVMeIdentify(c, 0, NVME_IDENT_NS_LIST, ident))
+		{
+			"NVMe: namespace list failed.\n";
+			break;
+		}
+		ns_list = ident;
+		for (i = 0; i < 1024 && found < NVME_MAX_NS; i++)
+		{
+			nsid = ns_list[i];
+			if (!nsid)
+				break;
+			if (NVMeNsMount(c, nsid, ident + 4096))
+				found++;
+		}
+	}
+	if (!found)
+		"NVMe: no namespaces mounted.\n";
+	Free(ident);
+	"______________________\n\n";
+}

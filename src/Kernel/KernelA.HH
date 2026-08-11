@@ -2685,6 +2685,8 @@ class CSMBIOSBatteryInfo
 //PCI subclass codes
 #define PCISC_ETHERNET	0x0
 #define PCISC_AHCI		0x6
+#define PCISC_NVM		0x8
+#define PCIPI_NVME		0x2
 
 //PCI I/O ports
 #define PCI_ADDR	0xCF8
@@ -2845,6 +2847,89 @@ class CAHCIHba
 	U8			reserved[116],
 				vendor[96];
 	CAHCIPort	ports[32];
+};
+
+//NVMe 1.4. Controller registers are BAR0; everything here is polled, as with
+//AHCI, because the kernel has no MSI support.
+#define NVME_MAX_CTRLS		4
+#define NVME_MAX_NS			4		//drive letters K..N
+#define NVME_Q_DEPTH		64		//entries per queue, admin and I/O
+#define NVME_PAGE			4096
+#define NVME_PRPS_PER_PAGE	(NVME_PAGE / 8)
+
+//CAP (0x00) fields.
+#define NVME_CAP_MQES(c)	((c) & 0xFFFF)			//max queue entries - 1
+#define NVME_CAP_TO(c)		((c) >> 24 & 0xFF)		//RDY timeout, 500ms units
+#define NVME_CAP_DSTRD(c)	((c) >> 32 & 0xF)		//doorbell stride
+
+//CC (0x14) fields.
+#define NVME_CCf_EN			0
+#define NVME_CC_CSS_NVM		(0 << 4)
+#define NVME_CC_MPS_4K		(0 << 7)
+#define NVME_CC_AMS_RR		(0 << 11)
+#define NVME_CC_IOSQES		(6 << 16)				//64-byte SQ entry
+#define NVME_CC_IOCQES		(4 << 20)				//16-byte CQ entry
+
+//CSTS (0x1C) fields.
+#define NVME_CSTSf_RDY		0
+#define NVME_CSTSf_CFS		1						//controller fatal status
+
+//Opcodes.
+#define NVME_ADM_DEL_SQ		0x00
+#define NVME_ADM_CREATE_SQ	0x01
+#define NVME_ADM_DEL_CQ		0x04
+#define NVME_ADM_CREATE_CQ	0x05
+#define NVME_ADM_IDENTIFY	0x06
+#define NVME_ADM_SET_FEAT	0x09
+#define NVME_IO_WRITE		0x01
+#define NVME_IO_READ		0x02
+#define NVME_IO_FLUSH		0x00
+
+#define NVME_IDENT_NS		0x00	//CNS: this namespace
+#define NVME_IDENT_CTRL		0x01	//CNS: controller
+#define NVME_IDENT_NS_LIST	0x02	//CNS: active namespace list
+#define NVME_FEAT_NUM_QUEUES 0x07
+
+#define NVME_IO_QID			1		//one I/O queue pair is enough when polled
+
+class CNVMeRegs
+{//BAR0 register layout. Doorbells start at 0x1000.
+	U64	cap;
+	U32	vs, intms, intmc, cc, rsvd0, csts, nssr, aqa;
+	U64	asq, acq;
+};
+
+class CNVMeCmd
+{//Submission queue entry, 64 bytes.
+	U32	cdw0;			//opcode | fuse << 8 | cid << 16
+	U32	nsid;
+	U64	rsvd2, mptr;
+	U64	prp1, prp2;
+	U32	cdw10, cdw11, cdw12, cdw13, cdw14, cdw15;
+};
+
+class CNVMeCQE
+{//Completion queue entry, 16 bytes. Bit 0 of status is the phase tag.
+	U32	dw0, dw1;
+	U16	sq_head, sq_id, cid, status;
+};
+
+class CNVMeCtrl
+{
+	CNVMeRegs	*regs;			//uncached alias of BAR0
+	CNVMeCmd	*asq, *iosq;
+	CNVMeCQE	*acq, *iocq;
+	U64			*prp_list;		//one page, used when a transfer spans > 2 pages
+	I64			 bdf, db_stride;
+	I64			 a_tail, a_head, i_tail, i_head, cid;
+	Bool		 a_phase, i_phase;	//phase tag a fresh CQE carries
+	Bool		 valid;
+};
+
+class CNVMeNs
+{
+	CNVMeCtrl	*ctrl;
+	I64			 nsid, blocks, lba_bytes;
 };
 
 #define FISt_H2D	0x27
@@ -3335,7 +3420,8 @@ public class CDirEntry
 #define BDT_ISO_FILE_WRITE		4
 #define BDT_ATAPI 				5
 #define BDT_USB 				6
-#define BDT_TYPES_NUM 			7
+#define BDT_NVME				7
+#define BDT_TYPES_NUM 			8
 
 #define BDf_REMOVABLE 			0
 #define BDf_INITIALIZED 		1
@@ -3388,6 +3474,7 @@ public class CBlkDev
 				 port_num;
 	U16 		*dev_id_record;
 	F64 		 last_time;
+	CNVMeNs		*nvme_ns;	//BDT_NVME only. Last: keeps the offsets above fixed.
 };
 
 //Drive locked_flags
@@ -3493,6 +3580,8 @@ public class CBlkDevGlobals
 				ins_port;// Installed-from CD/DVD controller.
 	Bool		dvd_boot_is_good,
 				ahci64;
+	CNVMeCtrl	nvme_ctrls[NVME_MAX_CTRLS];
+	I64			nvme_ctrl_count;
 };
 
 #help_index "File/Internal"
