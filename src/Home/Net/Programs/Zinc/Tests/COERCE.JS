@@ -85,6 +85,51 @@ var b2 = 1;
 b2 &&= 6;
 console.log(b2);
 
+// ---- Number.isX does not coerce; the bare globals do ----
+// The guard for this exists in the engine; what went missing was the selector
+// that turns it on, so Number.isFinite silently behaved like global isFinite.
+console.log(Number.isFinite("1"));
+console.log(Number.isFinite(1));
+console.log(Number.isFinite(1 / 0));
+console.log(Number.isFinite(null));
+console.log(Number.isFinite(true));
+console.log(isFinite("1"));
+console.log(isFinite(null));
+console.log(Number.isNaN("NaN"));
+console.log(Number.isNaN(NaN));
+console.log(isNaN("NaN"));
+console.log(Number.isInteger("4"));
+console.log(Number.isInteger(4));
+
+// ---- ToNumber(String) is not parseFloat ----
+// The whole string must be a numeric literal. Returning 0 for one that is not
+// is worse than returning NaN: 0 is a plausible number, so it survives the
+// isNaN() check a page uses to validate input and lands in the arithmetic.
+console.log(Number("12"));
+console.log(Number(" 12 "));
+console.log(Number(""));
+console.log(Number("   "));
+console.log(Number("12abc"));
+console.log(Number("abc"));
+console.log(Number("NaN"));
+console.log(Number("Infinity"));
+console.log(Number("-Infinity"));
+console.log(Number("1e3"));
+console.log(Number("1e"));
+console.log(Number("."));
+console.log(Number(".5"));
+console.log(Number("0x10"));
+console.log(Number("-0x10"));
+console.log(+"7");
+console.log(+"7px");
+console.log("3" * 2);
+console.log("3px" * 2);
+console.log(isNaN("abc"));
+console.log(isNaN("12"));
+// parseFloat and parseInt DO stop at the first byte they cannot use
+console.log(parseFloat("2.5rem"));
+console.log(parseInt("17px"));
+
 // ---- safe integer boundary ----
 console.log(Number.isSafeInteger(9007199254740991));
 console.log(Number.isSafeInteger(9007199254740992));

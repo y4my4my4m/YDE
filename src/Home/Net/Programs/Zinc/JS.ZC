@@ -604,6 +604,7 @@ extern CJsListener *JsListenerAdd(CJsInterp *ji, CZNode *node, U8 *type,
 extern U0 JsStyleIngest(CJsInterp *ji, CZNode *node);
 // JsToNum sits just above the JSNum include but needs its decimal parser.
 extern F64 JsStr2F64(U8 *s);
+extern F64 JsStrToNumber(U8 *s);
 // JsAssignTo delegates [a, b] = c / ({a} = c) to the binder, defined below it.
 extern U0 JsPatBind(CJsInterp *ji, CJsNode *pat, CJsVal *val, Bool declare);
 // JsMemberGet (document.forms / images / links) collects; defined far below.
@@ -617,6 +618,7 @@ extern U0 JsElemCollect(CJsInterp *ji, CZNode *root, I64 mode, U8 *key,
 // budget that would have shown the parse error explaining it.
 I64 js_soft_errs  = 0;
 I64 js_parse_errs = 0;
+I64 js_script_n = 0;	// scripts handed to the interpreter, per page
 I64 js_undef_errs = 0;	// misses on an already-undefined receiver: downstream
 
 // Distinct runtime warnings remembered per script. A miss inside a loop
@@ -998,7 +1000,7 @@ F64 JsToNum(CJsVal *v)
 		case JV_NUM:
 			return v->num;
 		case JV_STR:
-			return JsStr2F64(v->str);
+			return JsStrToNumber(v->str);
 	}
 
 	return 0;
@@ -4354,6 +4356,22 @@ U0 JsValTag(CJsVal *v, U8 *out)
 		StrCopy(out, JsTypeTag(v));
 }
 
+CJsNode *JsExprRoot(CJsNode *n)
+{ // leftmost node of a member/index/call chain: the binding the whole thing
+  // hangs off. Depth-capped, evaluates nothing.
+	I64 depth = 0;
+
+	while (n && depth < 8 &&
+		   (n->type == JN_MEMBER || n->type == JN_INDEX ||
+			n->type == JN_CALL || n->type == JN_NEW))
+	{
+		n = n->a;
+		depth++;
+	}
+
+	return n;
+}
+
 U0 JsExprPath(CJsNode *n, U8 *out, I64 max)
 { // Source shape of an expression, root first: "navigator", "a.b.c", "f().x",
   // "a[]". A receiver that reads UNDEF is only actionable once you know which
@@ -4508,6 +4526,13 @@ U0 JsNotCallableWarn(CJsInterp *ji, U8 *kind, CJsNode *tgt, U8 *name,
 	{
 		JsPathCat(buf, JS_WARN_LEN, " src=");
 		JsPathCat(buf, JS_WARN_LEN, why);
+		// Whether the chain's root name is bound AT ALL. Without this, a
+		// namespace that no script ever created and one that exists but was
+		// never populated print the same line, and they are different bugs:
+		// the first is a script that did not arrive or did not run.
+		tgt = JsExprRoot(tgt);
+		if (tgt && tgt->type == JN_IDENT && !JsEnvGet(ji, tgt->str))
+			JsPathCat(buf, JS_WARN_LEN, " !rootunbound");
 	}
 	JsScrub(buf);
 	if (!JsWarnFirst(buf))
@@ -7326,12 +7351,16 @@ CJsInterp *JsInterpNew(CZNode *dom_root, U8 *url)
 	scr = JsGlobalNative(ji, "Number", JSN_NUMBER);
 	JsPropSet(ji, scr, "isInteger",		JsNativeM(ji, JSN_NUM_ISINT, 0));
 	JsPropSet(ji, scr, "isSafeInteger",	JsNativeM(ji, JSN_NUM_ISINT, 1));
-	JsPropSet(ji, scr, "isFinite",		JsNativeV(ji, JSN_NUM_ISFINITE));
+	// _m 1 = do not coerce. JSN_NUM_ISFINITE serves the global isFinite too,
+	// and that one DOES coerce, so the difference is the selector.
+	JsPropSet(ji, scr, "isFinite",		JsNativeM(ji, JSN_NUM_ISFINITE, 1));
 	JsPropSet(ji, scr, "isNaN",			JsNativeV(ji, JSN_NUM_ISNAN));
 	JsPropSet(ji, scr, "parseFloat",	JsNativeV(ji, JSN_PARSEFLOAT));
 	JsPropSet(ji, scr, "parseInt",		JsNativeV(ji, JSN_PARSEINT));
-	JsPropSet(ji, scr, "MAX_SAFE_INTEGER", JsNumV(ji, 9007199254740991.0));
-	JsPropSet(ji, scr, "MIN_SAFE_INTEGER", JsNumV(ji, -9007199254740991.0));
+	// +/-(2^53 - 1) as bit patterns, like MAX_VALUE below. Written as a decimal
+	// literal the constant came out as 2^53.
+	JsPropSet(ji, scr, "MAX_SAFE_INTEGER", JsNumV(ji, JsNumConst(0x433FFFFFFFFFFFFF)));
+	JsPropSet(ji, scr, "MIN_SAFE_INTEGER", JsNumV(ji, JsNumConst(0xC33FFFFFFFFFFFFF)));
 	JsPropSet(ji, scr, "MAX_VALUE",  JsNumV(ji, JsNumConst(0x7FEFFFFFFFFFFFFF)));
 	JsPropSet(ji, scr, "MIN_VALUE",  JsNumV(ji, JsNumConst(0x0000000000000001)));
 	JsPropSet(ji, scr, "EPSILON",	 JsNumV(ji, JsNumConst(0x3CB0000000000000)));
@@ -7554,6 +7583,14 @@ CJsInterp *JsInterpNew(CZNode *dom_root, U8 *url)
 
 	// JSO_WINDOW falls through to the global env, so window.X and a bare X are
 	// the same lookup: declaring these once covers both spellings
+	// A classic script's top-level `this` IS the global object, strict mode
+	// included: the binding comes from the realm's global environment record,
+	// not from the call. Without it `this.ns = this.ns || {}` writes into
+	// undefined, so every script mints a private namespace and the script that
+	// populates it and the script that reads it hold different objects.
+	// A plain f() call finds this same binding up the scope chain, which is
+	// the sloppy-mode rule the same code depends on.
+	JsEnvDeclare(ji, ji->genv, "this",		 ji->win_obj);
 	JsEnvDeclare(ji, ji->genv, "globalThis", ji->win_obj);
 	JsEnvDeclare(ji, ji->genv, "self",	 ji->win_obj);
 	JsEnvDeclare(ji, ji->genv, "top",	 ji->win_obj);
@@ -7586,6 +7623,7 @@ CJsInterp *JsInterpNew(CZNode *dom_root, U8 *url)
 	JsPropSet(ji, math, "from",	   JsNativeV(ji, JSN_ARRAY_FROM));
 	JsPropSet(ji, math, "of",	   JsNativeV(ji, JSN_ARRAY_OF));
 
+	js_script_n = 0; // per-page script counter, for JsScriptReport
 	math = JsValNew(ji, JV_OBJ); // localStorage: in-memory, session-wide store
 	JsPropSet(ji, math, "getItem",	  JsNativeV(ji, JSN_LS_GET));
 	JsPropSet(ji, math, "setItem",	  JsNativeV(ji, JSN_LS_SET));
@@ -7613,6 +7651,41 @@ U0 JsInterpFree(CJsInterp *ji)
 	Free(ji);
 }
 
+
+U0 JsScriptReport(CJsInterp *ji, U8 *src, I64 nparsed, I64 nran, U8 *how)
+{ // One line per script the interpreter is GIVEN: bytes that arrived, how much
+  // of it parsed, how much of it ran, and how it ended. A script the fetch or
+  // the script path refused never reaches here and so produces NO line, and
+  // absence is the signal: from the page's side an undelivered script and a
+  // script that ran and defined nothing look identical.
+	U8	buf[JS_WARN_LEN], head[40];
+	I64 i = 0, k = 0;
+
+	js_script_n++;
+	while (src && src[i] && k < 32)
+	{ // first run of non-space source, to line this up with the fetch log
+		if (src[i] > ' ')
+		{
+			head[k] = src[i];
+			k++;
+		}
+		i++;
+	}
+	head[k] = 0;
+	StrPrint(buf, "script[%d] %dB parsed=%d ran=%d perr=%d %s head=",
+			 js_script_n, StrLen(src), nparsed, nran, js_parse_errs, how);
+	JsPathCat(buf, JS_WARN_LEN, head);
+	if (ji->has_err)
+	{ // the message that stopped it, on the same line as the counts
+		JsPathCat(buf, JS_WARN_LEN, " err=");
+		JsPathCat(buf, JS_WARN_LEN, ji->err);
+	}
+	JsScrub(buf);
+	NetLog("JS: %s", buf);
+	if (js_script_n <= 16)
+		JsConsoleAdd("script", buf);
+}
+
 Bool JsRunEx(CJsInterp *ji, U8 *src, CJsVal **_last)
 { // lex + parse + run one script; errors are logged, never fatal.
   // _last, when given, receives the value of the last statement that completed
@@ -7620,7 +7693,7 @@ Bool JsRunEx(CJsInterp *ji, U8 *src, CJsVal **_last)
   // a throw, an empty source, or a lex failure.
 	CJsNode *stmt, *head, *tail;
 	CJsVal	*val;
-	I64		 before;
+	I64		 before, nparsed = 0, nran = 0;
 
 	if (_last)
 		*_last = NULL;
@@ -7628,7 +7701,8 @@ Bool JsRunEx(CJsInterp *ji, U8 *src, CJsVal **_last)
 		return TRUE;
 	if (StrLen(src) > JS_MAX_SRC)
 	{
-		NetLog("JS: script too big, skipped.");
+		js_parse_errs = 0;
+		JsScriptReport(ji, src, 0, 0, "SKIPPED-too-big");
 		return FALSE;
 	}
 
@@ -7647,6 +7721,7 @@ Bool JsRunEx(CJsInterp *ji, U8 *src, CJsVal **_last)
 	if (!JsLex(ji, src))
 	{
 		NetLog("%s", ji->err);
+		JsScriptReport(ji, src, 0, 0, "LEXFAIL");
 		if (ji->toks)
 		{ // token array is a plain CAlloc, not arena: free on every exit
 			Free(ji->toks);
@@ -7673,6 +7748,7 @@ Bool JsRunEx(CJsInterp *ji, U8 *src, CJsVal **_last)
 			else
 				head = stmt;
 			tail = stmt;
+			nparsed++;
 		}
 		if (ji->pos == before)
 			ji->pos++;
@@ -7702,8 +7778,15 @@ Bool JsRunEx(CJsInterp *ji, U8 *src, CJsVal **_last)
 			NetLog("JS: uncaught exception."); // log, then keep executing
 		}
 		ji->flow = JF_NORMAL; // stray top-level break/return/throw
+		nran++;
 		stmt = stmt->next;
 	}
+	if (ji->has_err)
+		JsScriptReport(ji, src, nparsed, nran, "ABORTED");
+	else if (nran < nparsed)
+		JsScriptReport(ji, src, nparsed, nran, "STOPPED");
+	else
+		JsScriptReport(ji, src, nparsed, nran, "ok");
 
 	JsFlushWrites(ji);
 
