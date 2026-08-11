@@ -119,8 +119,13 @@ U0 YhProfileAdd(U8 *id, U8 *name, U8 *av_url=NULL)
 
 	if (YhProfileFind(id) >= 0)
 		return;
+	//Wrap: overwrite the oldest slot. Resetting num_profiles as well would
+	//drop every other entry, and the poll would refetch all of them forever.
 	if (i >= YH_MAX_PROFILES)
-		i = yh.num_profiles = 0;	//Wrap: cheap eviction.
+	{
+		i = yh.prof_next;
+		yh.prof_next = (yh.prof_next + 1) % YH_MAX_PROFILES;
+	}
 	MemCopy(yh.profiles[i].id, id, MinI64(StrLen(id), YH_UUID_LEN - 1));
 	yh.profiles[i].id[MinI64(StrLen(id), YH_UUID_LEN - 1)] = 0;
 	MemCopy(yh.profiles[i].name, name, MinI64(StrLen(name), YH_NAME_LEN - 1));
@@ -137,6 +142,10 @@ U0 YhProfileAdd(U8 *id, U8 *name, U8 *av_url=NULL)
 
 /***** REST helpers *****/
 
+//Auth.ZC is included after this file and the compiler is single pass, so the
+//401 retry below needs the declaration up front.
+extern U0 YhTokenRefresh();
+
 CYhJson *YhRest(U8 *method, U8 *path_fmt, U8 *body=NULL, ...)
 {//One PostgREST/GoTrue call. path_fmt is printed with argv, then prefixed
 //with the instance URL. Returns the parsed JSON tree (caller YhjFree's) or
@@ -150,6 +159,16 @@ CYhJson *YhRest(U8 *method, U8 *path_fmt, U8 *body=NULL, ...)
 	url = MStrPrint("%s%s", yh.f_url, path);
 	Free(path);
 	resp = HttpReq(url, method, body, "application/json", yh.hdrs);
+	if (resp && resp->status == 401 && !yh.in_refresh && yh.refresh[0])
+	{//Expired mid-session: refresh once and replay. yh.in_refresh stops the
+	//refresh call itself from recursing here, and a failed refresh falls
+	//through to the message below rather than looping.
+		HttpResponseFree(resp);
+		yh.in_refresh = TRUE;
+		YhTokenRefresh;
+		yh.in_refresh = FALSE;
+		resp = HttpReq(url, method, body, "application/json", yh.hdrs);
+	}
 	Free(url);
 	if (!resp)
 	{
@@ -159,7 +178,7 @@ CYhJson *YhRest(U8 *method, U8 *path_fmt, U8 *body=NULL, ...)
 	if (resp->status == 401)
 	{
 		HttpResponseFree(resp);
-		YhStatus("401: session expired.");
+		YhStatus("401: session expired - use /reconnect or restart.");
 		return NULL;
 	}
 	if (resp->status < 200 || resp->status >= 300)
@@ -499,11 +518,12 @@ U0 YhFetchReactions(I64 ci)
 	CYhLine	*ln;
 	CYhJson	*json, *ej, *row;
 	U8		 ids[1700], eids[1300];
-	U8		 enames[32][32], eid_list[32][YH_UUID_LEN];
-	I64		 eimg[32];
+	U8		 enames[YH_EMOJI_MAX][YH_EMOJI_NAME];
+	U8		 eid_list[YH_EMOJI_MAX][YH_UUID_LEN];
+	I64		 eimg[YH_EMOJI_MAX];
 	I64		 n_emoji = 0;
 	U8		*mid, *eid, *nm;
-	I64		 i, j, k, first, cnt;
+	I64		 i, j, k, b, first, cnt;
 	U8		 chip[64], abs[YH_IMG_URL_LEN];
 
 	if (!ch->lines)
@@ -538,8 +558,9 @@ U0 YhFetchReactions(I64 ci)
 		return;
 	}
 
-	//Distinct emoji ids -> names.
-	eids[0] = 0;
+	//Distinct emoji ids. Collection is bounded by the arrays, not by the URL:
+	//the names are looked up in batches below, so a busy channel no longer
+	//loses every reaction past the first handful.
 	row = json->child;
 	while (row)
 	{
@@ -550,26 +571,32 @@ U0 YhFetchReactions(I64 ci)
 			for (j = 0; j < n_emoji; j++)
 				if (!StrCompare(eid_list[j], eid))
 					k = j;
-			if (k < 0 && n_emoji < 16)	//16 max: keeps the in.() URL under 1024.
+			if (k < 0 && n_emoji < YH_EMOJI_MAX)
 			{
-				StrCopy(eid_list[n_emoji], eid);
+				YhCopyN(eid_list[n_emoji], eid, YH_UUID_LEN);
 				StrCopy(enames[n_emoji], "?");
 				eimg[n_emoji] = -1;
 				n_emoji++;
-				if (StrLen(eids) + 40 < sizeof(eids))
-				{
-					if (*eids)
-						CatPrint(eids, ",");
-					CatPrint(eids, "%s", eid);
-				}
 			}
 		}
 		row = row->next;
 	}
-	if (*eids)
+	//YH_EMOJI_BATCH ids a request: CHttpUrl.path is 1024 bytes and a longer
+	//in.() list makes the whole query fail silently.
+	for (b = 0; b < n_emoji; b += YH_EMOJI_BATCH)
 	{
-		ej = YhRest("GET", "/rest/v1/emojis?id=in.(%s)&select=id,name,url",
-					NULL, eids);
+		eids[0] = 0;
+		for (j = b; j < n_emoji && j < b + YH_EMOJI_BATCH; j++)
+			if (StrLen(eids) + YH_UUID_LEN + 1 < sizeof(eids))
+			{
+				if (*eids)
+					CatPrint(eids, ",");
+				CatPrint(eids, "%s", eid_list[j]);
+			}
+		ej = NULL;
+		if (*eids)
+			ej = YhRest("GET", "/rest/v1/emojis?id=in.(%s)&select=id,name,url",
+						NULL, eids);
 		if (ej)
 		{
 			row = ej->child;
@@ -580,8 +607,13 @@ U0 YhFetchReactions(I64 ci)
 				for (j = 0; j < n_emoji; j++)
 					if (!StrCompare(eid_list[j], eid))
 					{
-						MemCopy(enames[j], nm, MinI64(StrLen(nm), 31));
-						enames[j][MinI64(StrLen(nm), 31)] = 0;
+						YhCopyN(enames[j], nm, YH_EMOJI_NAME);
+						//The pill token is "img~name~count|": a name carrying
+						//a delimiter forges the fields after it, and the img
+						//field indexes the image cache.
+						for (k = 0; enames[j][k]; k++)
+							if (enames[j][k] == '~' || enames[j][k] == '|')
+								enames[j][k] = '_';
 						if (*YhjStr(YhjGet(row, "url")))
 						{//The pill shows the actual emoji image (12x12).
 							YhImgAbs(YhjStr(YhjGet(row, "url")), abs, sizeof(abs), "emojis");
@@ -666,10 +698,13 @@ U0 YhFetchMessages(I64 ci, Bool initial)
 			if (*YhjStr(YhjGet(row, "user_id")) &&
 				!YhProfileName(YhjStr(YhjGet(row, "user_id"))))
 			{
-				if (*missing)
-					CatPrint(missing, ",");
-				if (StrLen(missing) + 40 < sizeof(missing))
+				if (StrLen(missing) + YH_UUID_LEN + 1 < sizeof(missing))
+				{//Guard covers the separator too: appending it first meant
+				//every row past the cap still added a byte.
+					if (*missing)
+						CatPrint(missing, ",");
 					CatPrint(missing, "%s", YhjStr(YhjGet(row, "user_id")));
+				}
 			}
 		}
 		row = row->next;
@@ -821,7 +856,7 @@ U0 YhEmojiLoad()
 					k = j;
 			if (k < 0)
 			{
-				StrCopy(yh.em_ids[yh.em_n], id);
+				YhCopyN(yh.em_ids[yh.em_n], id, YH_UUID_LEN);
 				MemCopy(yh.em_names[yh.em_n], nm, MinI64(StrLen(nm), 31));
 				yh.em_names[yh.em_n][MinI64(StrLen(nm), 31)] = 0;
 				url = YhjStr(YhjGet(row, "url"));
@@ -989,6 +1024,9 @@ U0 YhSendMessage(U8 *text)
 	{//Prefer: return=representation gives the row back: echo it and bump the
 	 //watermark so realtime/poll won't show it twice.
 		if (json->child)
+			//esc accumulates the missing-profile ids; YhMsgRowAdd appends to
+			//it, so it has to start empty. Locals are not zeroed.
+			esc[0] = 0;
 			YhMsgRowAdd(yh.cur_chan, json->child, esc, sizeof(esc));
 		YhjFree(json);
 		yh.reply_to[0] = 0;	//One-shot.
@@ -1053,7 +1091,7 @@ I64 YhUserSearch(U8 *query)
 		if (*uid && *nm)
 		{
 			YhProfileAdd(uid, nm, YhjStr(YhjGet(row, "avatar_url")));
-			StrCopy(yh.fl_ids[n], uid);
+			YhCopyN(yh.fl_ids[n], uid, YH_UUID_LEN);
 			MemCopy(yh.menu_items[n], nm, MinI64(StrLen(nm), 35));
 			yh.menu_items[n][MinI64(StrLen(nm), 35)] = 0;
 			n++;
@@ -1083,7 +1121,7 @@ I64 YhServerBrowse()
 		nm = YhjStr(YhjGet(row, "name"), "server");
 		if (*sid)
 		{
-			StrCopy(yh.fl_ids[n], sid);
+			YhCopyN(yh.fl_ids[n], sid, YH_UUID_LEN);
 			MemCopy(yh.menu_items[n], nm, MinI64(StrLen(nm), 35));
 			yh.menu_items[n][MinI64(StrLen(nm), 35)] = 0;
 			n++;
@@ -1354,7 +1392,7 @@ U0 YhFetchDMs()
 		cid = YhjStr(YhjGet(row, "conversation_id"));
 		if (*cid)
 		{
-			StrCopy(my_convos[n_convo], cid);
+			YhCopyN(my_convos[n_convo], cid, YH_UUID_LEN);
 			other[n_convo][0] = 0;
 			extra[n_convo] = 0;
 			n_convo++;
@@ -1387,7 +1425,7 @@ U0 YhFetchDMs()
 				if (!StrCompare(my_convos[i], cid))
 				{
 					if (!other[i][0])
-						StrCopy(other[i], uid);
+						YhCopyN(other[i], uid, YH_UUID_LEN);
 					else
 						extra[i]++;	//Group DM: count additional members.
 				}

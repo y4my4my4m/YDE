@@ -101,6 +101,9 @@ I64 UDPSocketBind(CUDPSocket *udp_socket, CSocketAddressStorage *address_source)
 {
 	CUDPTreeNode	   *head = udp_globals.bound_socket_tree;
 	CUDPTreeNode	   *temp_node;
+	CUDPTreeNode	   *spare;
+	CUDPTreeQueue	   *spare_entry;
+	I64					bind_err = 0;
 	CSocketAddressIPV4 *ipv4_source;
 	CSocketAddressIPV4 *ipv4_receive;
 	CSocketAddressIPV6 *ipv6_source;
@@ -166,6 +169,20 @@ I64 UDPSocketBind(CUDPSocket *udp_socket, CSocketAddressStorage *address_source)
 
 	// at this point, Socket and Address have matching family values
 
+	// Same guard as UDPSocketClose and UDPHandler: the walk in BSTAdd, not just
+	// its final link store, has to be inside it. Node and queue entry are built
+	// first so the guarded section allocates nothing.
+	spare = UDPTreeNodeInit;
+	spare->value = port;
+	spare_entry = UDPTreeQueueEntryInit(udp_socket);
+
+	PUSHFD
+	CLI
+	while (LBts(&udp_bound_tree_lock, 0))
+		PAUSE
+
+	head = udp_globals.bound_socket_tree;
+
 	if (head)
 	{
 		// look for our port.
@@ -177,37 +194,67 @@ I64 UDPSocketBind(CUDPSocket *udp_socket, CSocketAddressStorage *address_source)
 			{
 				case AF_INET:
 					if (UDPTreeNodeQueueIPV4Find(ipv4_receive->address.address, temp_node, TRUE))
-					{
-						NetErr("UDP SOCKET BIND: Address already in Bound Socket Tree !");
-						return -1;
-					}
+						bind_err = 1;	// address already bound
 					else
 					{ // if no address match, free to add socket to the node queue
-						UDPTreeNodeQueueAdd(udp_socket, temp_node);
+						QueueInsert(spare_entry, temp_node->queue->last);
+						spare_entry = NULL;
 					}
 
 					break;
 
 				case AF_INET6:
-					NetErr("UDP SOCKET BIND: FIXME, IPV6 UDP BIND");
+					bind_err = 2;
 					break;
 
 				case AF_UNSPEC:
-					NetErr("UDP SOCKET BIND: Error, AF_UNSPEC UDP BIND -- found in bound tree");
+					bind_err = 3;
 					break;
 			}
 		}
 		else
 		{ // if we get no node back from port search, we didn't find it and are free to add a new node.
-			temp_node = UDPTreeNodeParamAdd(port, head); // add new node with port, return its *.
-			UDPTreeNodeQueueAdd(udp_socket, temp_node);
+			UDPTreeNodeAdd(spare, head);
+			QueueInsert(spare_entry, spare->queue->last);
+			spare = NULL;
+			spare_entry = NULL;
 		}
 	}
 	else // if no bound sockets, we init the tree as a new node
 	{
-		udp_globals.bound_socket_tree = head = UDPTreeNodeParamInit(port); //... shouuuld be in L.E .. ?
-		UDPTreeNodeQueueAdd(udp_socket, head); // add the udp socket to the port queue
-		// maybe more checks to do before this, dunno rn.
+		udp_globals.bound_socket_tree = head = spare;
+		QueueInsert(spare_entry, spare->queue->last); // add the udp socket to the port queue
+		spare = NULL;
+		spare_entry = NULL;
+	}
+
+	LBtr(&udp_bound_tree_lock, 0);
+	POPFD
+
+	BSTCorruptionReport;
+
+	if (spare)
+	{ // port was already in the tree, or the family is unsupported
+		Free(spare->queue);
+		Free(spare);
+	}
+
+	if (spare_entry)
+		Free(spare_entry);
+
+	switch (bind_err)
+	{
+		case 1:
+			NetErr("UDP SOCKET BIND: Address already in Bound Socket Tree !");
+			return -1;
+
+		case 2:
+			NetErr("UDP SOCKET BIND: FIXME, IPV6 UDP BIND");
+			break;
+
+		case 3:
+			NetErr("UDP SOCKET BIND: Error, AF_UNSPEC UDP BIND -- found in bound tree");
+			break;
 	}
 
 	udp_socket->bound_to = port;
@@ -285,6 +332,13 @@ I64 UDPSocketClose(CUDPSocket *udp_socket)
 
 	LBtr(&udp_bound_tree_lock, 0);
 	POPFD
+
+	BSTCorruptionReport;
+
+	// The socket is unlinked above, so no new reference can be taken. An interrupt
+	// on another core can still be inside UDPHandler with the one it took.
+	while (udp_socket->handler_refs)
+		Sleep(1);
 
 	// Freed outside the guarded section: the RX interrupt can be walking the tree
 	// on another core, and Free is not allocation-free.
@@ -489,6 +543,19 @@ I64 UDPSocketSendTo(CUDPSocket *udp_socket, U8 *buffer, I64 len, CSocketAddressS
 
 // UDPSocketSetOpt ?
 
+U0 UDPHandlerRefRelease(CUDPSocket *udp_socket)
+{ // drop the reference UDPHandler took under the bound-tree guard
+	PUSHFD
+	CLI
+	while (LBts(&udp_bound_tree_lock, 0))
+		PAUSE
+
+	udp_socket->handler_refs--;
+
+	LBtr(&udp_bound_tree_lock, 0);
+	POPFD
+}
+
 I64 UDPHandler(CIPV4Packet *packet)
 { // TODO: Need either two UDP handlers for IPv4/IPv6, or logic changes if IPV6 is desired.
 	U16					 source_port;
@@ -527,25 +594,28 @@ I64 UDPHandler(CIPV4Packet *packet)
 		PAUSE
 
 	queue = NULL;
+	udp_socket = NULL;
 	node  = UDPTreeNodeFind(destination_port, head);
 
 	if (node)
 		queue = UDPTreeNodeQueueIPV4Find(packet->source_ip_address, node); // TODO: make sure bit order is correct here!!
 
+	if (queue)
+	{ // the reference is taken while the entry is still linked, so
+	  // UDPSocketClose cannot have started freeing the socket.
+		udp_socket = queue->socket;
+		udp_socket->handler_refs++;
+	}
+
 	LBtr(&udp_bound_tree_lock, 0);
 	POPFD
 
-	if (!node)
-		return -1;
+	BSTCorruptionReport;
 
-	if (!queue)
-	{
-		//the lookup already falls back to INADDR_ANY, so nothing wants this
-		//datagram. dropped silently, same as the !head case.
+	//the lookup already falls back to INADDR_ANY, so nothing wants this
+	//datagram. dropped silently, same as the !head case.
+	if (!udp_socket)
 		return -1;
-	}
-
-	udp_socket = queue->socket;
 
 	messages_head = udp_socket->receive_queue;
 
@@ -553,12 +623,16 @@ I64 UDPHandler(CIPV4Packet *packet)
 	//the NetHandler interrupt, so a linked message must never be half-built.
 	message = CAlloc(sizeof(CUDPMessageQueue));
 	if (!message)
+	{
+		UDPHandlerRefRelease(udp_socket);
 		return -1;
+	}
 
 	message->data = CAlloc(length);
 	if (!message->data)
 	{
 		Free(message);
+		UDPHandlerRefRelease(udp_socket);
 		return -1;
 	}
 
@@ -595,6 +669,8 @@ I64 UDPHandler(CIPV4Packet *packet)
 
 	LBtr(&udp_socket->receive_lock, 0);
 	POPFD
+
+	UDPHandlerRefRelease(udp_socket);
 
 	return error;
 }

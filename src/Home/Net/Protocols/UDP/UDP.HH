@@ -19,6 +19,7 @@ class CUDPSocket
 	I64						 receive_timeout_ms;
 	I64						 receive_max_timeout;
 	U16						 bound_to;			// represents the currently bound port
+	I64						 handler_refs;		// UDPHandler is inside this socket; close waits for zero
 };
 
 #define UDP_RECV_QUEUE_MAX	32

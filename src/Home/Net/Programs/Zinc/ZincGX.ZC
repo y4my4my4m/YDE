@@ -197,6 +197,14 @@ class CGxGlobals
 	//which lets the main task and the WinMgr task both read a clear flag and
 	//both proceed.
 	I64		 lock_flags;
+	//Right-click context menu. Window-pixel chrome, NOT a display-list op: the
+	//drawer paints it without the ops lock and the page keeps loading under it.
+	//menu_url is this struct's own copy of the target - the op it was read from
+	//is freed by the next layout.
+	Bool	 menu_on;
+	I64		 menu_kind, menu_n, menu_sel;
+	I64		 menu_x, menu_y, menu_w, menu_h;
+	U8		*menu_url;
 	I64		 last_wheel;
 	U8		*pending_nav;	//StrNew'd target set by click handlers.
 	//Cancellable fetch: ZincLoad runs in a child task.
@@ -990,27 +998,77 @@ U0 GxWidgetLabel(CZNode *node, U8 *out, I64 max)
 	}
 	if (!v)
 		v = ZNodeAttr(node, "value");
-	if (!v && !StrCompare(node->tag, "button") && node->first_child &&
-		node->first_child->type == ZH_TEXT)
-		v = node->first_child->text;
+	if (!v && !StrCompare(node->tag, "button"))
+	{//<button>'s label is its content, which is usually wrapped in spans/icons
+		I64 tl = 0;
+
+		ZNodeTextCollect(node, out, max - 1, &tl);
+		if (tl >= max - 1)
+		{//cut at a code point boundary: a severed tail renders as .notdef boxes
+			while (tl > 0 && (out[tl - 1] & 0xC0) == 0x80)
+				tl--;
+			if (tl > 0 && out[tl - 1] >= 0xC0)
+				tl--;
+		}
+		while (tl > 0 && out[tl - 1] == ' ')
+			tl--;
+		out[tl] = 0;
+		return;
+	}
 	if (!v)
 		v = "";
 	len = StrLen(v);
 	if (len > max - 1)
+	{//back off to a lead byte: a severed UTF-8 tail renders as .notdef boxes
 		len = max - 1;
+		while (len > 0 && (v[len] & 0xC0) == 0x80)
+			len--;
+	}
 	MemCopy(out, v, len);
 	out[len] = 0;
 }
 
-U0 GxWidget(CZNode *node, I64 kind)
-{
+U0 GxWidget(CZNode *node, I64 kind, CZStyle *style)
+{//Form widget: intrinsic size is the label plus padding, and the label is
+//rasterized through the SAME font path as body text (GrFontRenderCovDC, which
+//carries the UTF-8 decode and the grf_cjk fallback). op->sc holds that coverage
+//DC; op->bg_px/bg_py are its offset inside the box (the GXO_BOX-only slots are
+//free here). Without a scalable font the 8x8 path renders it at paint time.
 	CGxOp	*op;
 	CZStyle	 wa;
+	CGrFont	*wf;
+	CDC		*ldc = NULL;
 	U8		 label[64];
-	I64		 w, h = 20;
+	U8		*sat;
+	I64		 w, h, px, lw, lh, padx, pady, tcol, avail, chw, nch;
 
 	GxRunFlush;
 	GxWidgetLabel(node, label, 48);
+	ZCssApply(node, &wa); // honor the page's own widget styling
+
+	px = 16;
+	if (style && style->fsize >= 8)
+		px = ClampI64(style->fsize, 8, 120);
+	wf = GrFontPick(FALSE);
+	if (style && style->mono == 1)
+		wf = GrFontPick(TRUE);
+	lw = StrLen(label) * FONT_WIDTH;
+	lh = FONT_HEIGHT;
+	if (zinc_ttf)
+	{
+		lw = GrFontWidth(wf, px, label);
+		lh = GrFontLineH(wf, px);
+	}
+
+	padx = 8;
+	pady = 3;
+	if (kind == GXW_TEXT || kind == GXW_AREA || kind == GXW_SELECT)
+		padx = 6;
+	if (wa.pl > 0 || wa.pr > 0)
+		padx = MaxI64(wa.pl, wa.pr);
+	if (wa.pt > 0 || wa.pb > 0)
+		pady = MaxI64(wa.pt, wa.pb);
+
 	if (kind == GXW_CHECK || kind == GXW_RADIO)
 	{
 		w = 14;
@@ -1018,22 +1076,82 @@ U0 GxWidget(CZNode *node, I64 kind)
 	}
 	else
 	{
-		w = MaxI64(60, StrLen(label) * FONT_WIDTH + 16);
+		w = lw + 2 * padx;
+		h = lh + 2 * pady;
+		if (kind == GXW_TEXT || kind == GXW_AREA || kind == GXW_SELECT)
+			w = MaxI64(w, 120);	//a field is sized by its box, not by its value
+		else
+			w = MaxI64(w, 40);
+		h = MaxI64(h, 20);
 		if (kind == GXW_AREA)
-			h = 40;
+			h = MaxI64(h, 40);
+		if (kind == GXW_TEXT || kind == GXW_AREA)
+		{//size= (input) / cols= + rows= (textarea): the HTML intrinsic size
+			chw = FONT_WIDTH;
+			if (zinc_ttf)
+				chw = MaxI64(1, GrFontAdvPx(wf, '0', px));
+			sat = ZNodeAttr(node, "size");
+			if (kind == GXW_AREA)
+				sat = ZNodeAttr(node, "cols");
+			if (sat)
+			{
+				nch = Str2I64(sat);
+				if (1 <= nch <= 300)
+					w = nch * chw + 2 * padx;
+			}
+			sat = ZNodeAttr(node, "rows");
+			if (sat && kind == GXW_AREA)
+			{
+				nch = Str2I64(sat);
+				if (1 <= nch <= 100)
+					h = nch * lh + 2 * pady;
+			}
+		}
+		avail = gx.wrap_w - (GX_MARGIN + gx.indent);
+		if (avail < 40)
+			avail = 40;
+		if (wa.width > 0)
+			w = wa.width;
+		else if (wa.width < 0)
+			w = avail * -wa.width / 100;
+		if (wa.height > 0)
+			h = wa.height;	//percent heights encode as -(3000+n): px only here
 		if (gx.flex_stretch_w > w)
 			w = gx.flex_stretch_w; // stretched flex-column item: fill the column
 	}
 	if (gx.x + w > gx.wrap_w)
 		GxNewline(0);
+
+	tcol = 0x202124;	//UA widget text
+	if (wa.fg >= 0)
+		tcol = GrColorResolve(GxPenBg(wa.fg, de_theme.text)) & 0xFFFFFF;
+	if (zinc_ttf && label[0] && kind != GXW_CHECK && kind != GXW_RADIO)
+	{
+		ldc = GrFontRenderCovDC(wf, px, tcol, label);
+		if (ldc)
+		{
+			lw = ldc->width;
+			lh = ldc->height;
+		}
+	}
+
 	op = GxOpAdd(GXO_WIDGET, gx.x, gx.y, w, h);
 	if (op)
 	{
 		op->node  = node;
 		op->wkind = kind;
 		op->text  = StrNew(label);
-		ZCssApply(node, &wa); // honor the page's own widget styling
+		op->sc    = ldc;	//owned; GxOpsReset frees it (type != GXO_IMG)
 		op->radius = wa.radius;
+		//Label placement: buttons centre it, fields left-align it at the padding.
+		if (kind == GXW_SUBMIT || kind == GXW_BUTTON || kind == GXW_SELECT)
+			op->bg_px = MaxI64(1, (w - lw) / 2);
+		else
+			op->bg_px = padx;
+		op->bg_py = MaxI64(0, (h - lh) / 2);
+		if (kind == GXW_AREA)
+			op->bg_py = pady;	//a textarea's text starts at the top
+		op->bg_sw = px;		//label font size, for the field editor's re-render
 		if (wa.bg >= 0)
 		{ // author background wins over the light UA default
 			op->has_bg = TRUE;
@@ -1046,6 +1164,8 @@ U0 GxWidget(CZNode *node, I64 kind)
 		op->sh_col = wa.fg; // widget TEXT color rides in sh_col (-1 = UA default;
 							// GXO_WIDGET has no box-shadow, the slot is free)
 	}
+	else if (ldc)
+		DCDel(ldc);
 	gx.x += w + FONT_WIDTH;
 	if (h + GX_LINE_LEAD > gx.line_h)
 		gx.line_h = h + GX_LINE_LEAD;
@@ -1434,34 +1554,34 @@ U0 GxNode(CZNode *node, CZStyle *inherited)
 		if (!StrICompare(type, "hidden"))
 			return;
 		if (!StrICompare(type, "checkbox"))
-			GxWidget(node, GXW_CHECK);
+			GxWidget(node, GXW_CHECK, &style);
 		else if (!StrICompare(type, "radio"))
-			GxWidget(node, GXW_RADIO);
+			GxWidget(node, GXW_RADIO, &style);
 		else if (!StrICompare(type, "submit") || !StrICompare(type, "image"))
-			GxWidget(node, GXW_SUBMIT);
+			GxWidget(node, GXW_SUBMIT, &style);
 		else if (!StrICompare(type, "button"))
-			GxWidget(node, GXW_BUTTON);
+			GxWidget(node, GXW_BUTTON, &style);
 		else
-			GxWidget(node, GXW_TEXT);
+			GxWidget(node, GXW_TEXT, &style);
 		return;
 	}
 	if (!StrCompare(node->tag, "button"))
 	{
 		type = ZNodeAttr(node, "type");
 		if (type && !StrICompare(type, "button"))
-			GxWidget(node, GXW_BUTTON);
+			GxWidget(node, GXW_BUTTON, &style);
 		else
-			GxWidget(node, GXW_SUBMIT);
+			GxWidget(node, GXW_SUBMIT, &style);
 		return;
 	}
 	if (!StrCompare(node->tag, "select"))
 	{
-		GxWidget(node, GXW_SELECT);
+		GxWidget(node, GXW_SELECT, &style);
 		return;
 	}
 	if (!StrCompare(node->tag, "textarea"))
 	{
-		GxWidget(node, GXW_AREA);
+		GxWidget(node, GXW_AREA, &style);
 		return;
 	}
 
@@ -2831,6 +2951,113 @@ U0 GxConsoleShow()
 	zinc_con_scroll = 0;
 }
 
+#define GXCTX_PAGE		0
+#define GXCTX_LINK		1
+#define GXCTX_IMG		2
+#define GX_CTX_ITEM_H	(FONT_HEIGHT + 8)
+#define GX_CTX_PAD		8
+
+I64 GxCtxCount(I64 kind)
+{
+	if (kind == GXCTX_LINK)
+		return 3;
+	if (kind == GXCTX_IMG)
+		return 2;
+
+	return 6;
+}
+
+U8 *GxCtxItem(I64 kind, I64 i)
+{
+	if (kind == GXCTX_LINK)
+	{
+		if (i == 0)
+			return "Open Link";
+		if (i == 1)
+			return "Download Link";
+		return "Copy Link URL";
+	}
+	if (kind == GXCTX_IMG)
+	{
+		if (i == 0)
+			return "Download Image";
+		return "Copy Image URL";
+	}
+	if (i == 0)
+		return "Back";
+	if (i == 1)
+		return "Forward";
+	if (i == 2)
+		return "Reload";
+	if (i == 3)
+		return "JS Console";
+	if (i == 4)
+		return "Save Page";
+
+	return "Copy Page URL";
+}
+
+U0 GxCtxClose()
+{
+	gx.menu_on	= FALSE;
+	gx.menu_sel = -1;
+	Free(gx.menu_url); //NULL-safe
+	gx.menu_url = NULL;
+}
+
+I64 GxCtxHit(I64 x, I64 y)
+{//Item index at window pixel (x, y); -1 outside the panel.
+	if (!gx.menu_on)
+		return -1;
+	if (!(gx.menu_x <= x < gx.menu_x + gx.menu_w &&
+		  gx.menu_y <= y < gx.menu_y + gx.menu_h))
+		return -1;
+
+	return ClampI64((y - gx.menu_y - 2) / GX_CTX_ITEM_H, 0, gx.menu_n - 1);
+}
+
+U0 GxCtxHover(I64 x, I64 y)
+{//Hover moves the highlight. Called from the main task: the drawer only reads
+ //menu state, so it never has to be locked against this.
+	I64 i = GxCtxHit(x, y);
+
+	if (i >= 0)
+		gx.menu_sel = i;
+}
+
+U0 GxCtxDraw(CDC *dc)
+{//Painted last, over the page ops and the chrome. Reads menu state only; a
+ //frame that races an open/close draws the previous state, not a bad pointer -
+ //the labels are literals.
+	I64 i, y;
+
+	if (!gx.menu_on)
+		return;
+	dc->color = de_theme.panel;
+	GrRect(dc, gx.menu_x, gx.menu_y, gx.menu_w, gx.menu_h);
+	dc->color = de_theme.panel_edge;
+	GrRect(dc, gx.menu_x, gx.menu_y, gx.menu_w, 1);
+	GrRect(dc, gx.menu_x, gx.menu_y + gx.menu_h - 1, gx.menu_w, 1);
+	GrRect(dc, gx.menu_x, gx.menu_y, 1, gx.menu_h);
+	GrRect(dc, gx.menu_x + gx.menu_w - 1, gx.menu_y, 1, gx.menu_h);
+	y = gx.menu_y + 2;
+	for (i = 0; i < gx.menu_n; i++)
+	{
+		if (i == gx.menu_sel)
+		{
+			dc->color = de_theme.bttn_hot;
+			GrRect(dc, gx.menu_x + 1, y, gx.menu_w - 2, GX_CTX_ITEM_H);
+			dc->color = de_theme.accent;
+			GrRect(dc, gx.menu_x + 1, y, 2, GX_CTX_ITEM_H);
+		}
+		dc->color = de_theme.text;
+		GrPrint(dc, gx.menu_x + GX_CTX_PAD,
+				y + (GX_CTX_ITEM_H - FONT_HEIGHT) / 2, "%s",
+				GxCtxItem(gx.menu_kind, i));
+		y += GX_CTX_ITEM_H;
+	}
+}
+
 U0 GxDrawIt(CTask *task, CDC *dc)
 {
 	I64	 i, oy, view_top = GX_CHROME_H, mx, my, wr, zpass;
@@ -2854,6 +3081,7 @@ U0 GxDrawIt(CTask *task, CDC *dc)
 	{//Layout rebuilding: ops are in flux, draw chrome only.
 		LBtr(&gx.lock_flags, GXLKf_DRAW);
 		GxDrawChrome(dc);
+		GxCtxDraw(dc);
 		return;
 	}
 
@@ -3046,7 +3274,7 @@ U0 GxDrawIt(CTask *task, CDC *dc)
 					GrRect(dc, op->x, oy + op->h - 1, op->w, 1);
 					GrRect(dc, op->x, oy, 1, op->h);
 					GrRect(dc, op->x + op->w - 1, oy, 1, op->h);
-					vis = MaxI64(1, (op->w - 12) / FONT_WIDTH);
+					vis = MaxI64(1, (op->w - 2 * op->bg_px) / FONT_WIDTH);
 					fstart = 0;
 					if (gx.field_caret > vis) //horizontal scroll to keep caret shown
 						fstart = gx.field_caret - vis;
@@ -3058,24 +3286,31 @@ U0 GxDrawIt(CTask *task, CDC *dc)
 					if (gx.field_selall && gx.field_len)
 					{
 						dc->color = de_theme.bttn_focus;
-						GrRect(dc, op->x + 5, fy - 1, fn * FONT_WIDTH, FONT_HEIGHT + 2);
+						GrRect(dc, op->x + op->bg_px - 1, fy - 1, fn * FONT_WIDTH,
+							   FONT_HEIGHT + 2);
 					}
 					dc->color = ColorRGB(0x20, 0x21, 0x24); // dark: field is white now
-					GrPrint(dc, op->x + 6, fy, "%s", buf);
+					GrPrint(dc, op->x + op->bg_px, fy, "%s", buf);
 					if (!gx.field_selall && Blink)
 					{
-						cx2 = op->x + 6 + (gx.field_caret - fstart) * FONT_WIDTH;
+						cx2 = op->x + op->bg_px + (gx.field_caret - fstart) * FONT_WIDTH;
 						dc->color = de_theme.accent;
 						GrRect(dc, cx2, fy, 1, FONT_HEIGHT);
 					}
 				}
 				else if (op->wkind != GXW_CHECK && op->wkind != GXW_RADIO)
-				{ // author color if styled, else dark UA text on the light default
-					if (op->sh_col >= 0)
-						dc->color = GxPenBg(op->sh_col, de_theme.text);
+				{//Label: the coverage DC built at layout when the scalable font
+				 //is up (UTF-8 + CJK fallback), the 8x8 path otherwise.
+					if (op->sc)
+						GxBlotBlend(dc, op->x + op->bg_px, oy + op->bg_py, op->sc);
 					else
-						dc->color = ColorRGB(0x20, 0x21, 0x24);
-					GrPrint(dc, op->x + 6, oy + (op->h - FONT_HEIGHT) / 2, "%s", op->text);
+					{ // author color if styled, else dark UA text on the light default
+						if (op->sh_col >= 0)
+							dc->color = GxPenBg(op->sh_col, de_theme.text);
+						else
+							dc->color = ColorRGB(0x20, 0x21, 0x24);
+						GrPrint(dc, op->x + op->bg_px, oy + op->bg_py, "%s", op->text);
+					}
 				}
 				break;
 		}
@@ -3127,6 +3362,7 @@ gx_draw_next:;
 	// shape from the focused task (e.g. a `sys_cursor_shape` global the compositor
 	// reads) - a kernel change, not a Zinc-local one. Left for that pass.
 	GxDrawChrome(dc);
+	GxCtxDraw(dc);
 }
 
 //--- Input -------------------------------------------------------------------
@@ -3544,6 +3780,25 @@ U0 GxFieldCommit()
 	node->value = StrNew(gx.field_buf);
 	Free(gx.field_op->text);
 	gx.field_op->text = StrNew(gx.field_buf);
+	//Rebuild the label DC so the committed value paints through the scalable
+	//font, like every other widget label.
+	if (gx.field_op->sc)
+	{
+		DCDel(gx.field_op->sc);
+		gx.field_op->sc = NULL;
+	}
+	if (zinc_ttf && gx.field_buf[0] && gx.field_op->bg_sw >= 8)
+	{
+		I64 tc = 0x202124;
+
+		if (gx.field_op->sh_col >= 0)
+			tc = gx.field_op->sh_col;
+		gx.field_op->sc = GrFontRenderCovDC(GrFontPick(FALSE), gx.field_op->bg_sw,
+											tc, gx.field_buf);
+		if (gx.field_op->sc)
+			gx.field_op->bg_py = MaxI64(0, (gx.field_op->h -
+											gx.field_op->sc->height) / 2);
+	}
 
 	//Fire input/change handlers (addEventListener or el.oninput/onchange). The
 	//guard stops a handler that itself commits a field from recursing forever.
@@ -3964,13 +4219,127 @@ U0 GxDownload(U8 *abs_url)
 	HttpResponseFree(r);
 }
 
-U0 GxRightClick(I64 x, I64 y)
-{ // context menu: link/image actions under the cursor, page actions otherwise.
-  // PopUpPickList appends its own CANCEL entry; the lists here must not.
-	I64	 i, cy, pick;
-	CGxOp *op;
-	U8	*link = NULL, *img = NULL, *abs;
+U0 GxCtxOpen(I64 kind, U8 *url_new, I64 x, I64 y)
+{//Panel top-left at the click point. It flips to the other side of the cursor
+ //when it would overhang the content area, then clamps to it.
+	I64 i, n = GxCtxCount(kind), len, wide = 0;
+	I64 cr = Fs->pix_width - GX_SBAR_W;
+	I64 ct = GX_CHROME_H, cb = Fs->pix_height - GX_STATUS_H;
 
+	GxCtxClose;
+	for (i = 0; i < n; i++)
+	{
+		len = StrLen(GxCtxItem(kind, i));
+		if (len > wide)
+			wide = len;
+	}
+	gx.menu_kind = kind;
+	gx.menu_url  = url_new;
+	gx.menu_n	 = n;
+	gx.menu_sel  = -1;
+	gx.menu_w	 = wide * FONT_WIDTH + 2 * GX_CTX_PAD;
+	gx.menu_h	 = n * GX_CTX_ITEM_H + 4;
+	if (x + gx.menu_w > cr)
+		x -= gx.menu_w;
+	if (y + gx.menu_h > cb)
+		y -= gx.menu_h;
+	gx.menu_x = ClampI64(x, 0, MaxI64(0, cr - gx.menu_w));
+	gx.menu_y = ClampI64(y, ct, MaxI64(ct, cb - gx.menu_h));
+	gx.menu_on = TRUE;
+}
+
+U0 GxCtxAct(I64 i)
+{//Close first, then run item i: the menu must be gone before a blocking
+ //download. The action owns the copied target.
+	I64	 kind = gx.menu_kind;
+	U8	*u = gx.menu_url;
+
+	gx.menu_url = NULL;
+	GxCtxClose;
+	if (i < 0 || i >= GxCtxCount(kind))
+	{
+		Free(u);
+		return;
+	}
+	if (kind == GXCTX_LINK)
+	{
+		if (i == 0)
+		{
+			GxNavTo(u); //takes ownership
+			return;
+		}
+		if (i == 1)
+			GxDownload(u);
+		else
+			GxClipSet(u);
+	}
+	else if (kind == GXCTX_IMG)
+	{
+		if (i == 0)
+			GxDownload(u);
+		else
+			GxClipSet(u);
+	}
+	else
+	{
+		if (i == 0)
+			GxNavTo(StrNew("b"));
+		else if (i == 1)
+			GxNavTo(StrNew("f"));
+		else if (i == 2)
+			GxNavTo(StrNew("r"));
+		else if (i == 3)
+		{
+			GxConsoleShow;
+		}
+		else if (i == 4)
+			GxDownload(gx.url);
+		else
+			GxClipSet(gx.url);
+	}
+	Free(u);
+}
+
+Bool GxCtxKey(I64 ch, I64 sc)
+{//TRUE: the key belonged to the open menu. Unhandled character keys dismiss it
+ //and go on to their normal handler.
+	if (!gx.menu_on)
+		return FALSE;
+	if (ch == CH_ESC || ch == CH_SHIFT_ESC)
+	{
+		GxCtxClose;
+		return TRUE;
+	}
+	if (ch == '\n')
+	{
+		GxCtxAct(gx.menu_sel);
+		return TRUE;
+	}
+	if (!ch)
+	{
+		if (sc.u8[0] == SC_CURSOR_UP)
+			gx.menu_sel = ClampI64(gx.menu_sel - 1, 0, gx.menu_n - 1);
+		else if (sc.u8[0] == SC_CURSOR_DOWN)
+			gx.menu_sel = ClampI64(gx.menu_sel + 1, 0, gx.menu_n - 1);
+		return TRUE;
+	}
+	GxCtxClose;
+
+	return FALSE;
+}
+
+U0 GxRightClick(I64 x, I64 y)
+{//Context menu at the cursor: link actions over a link, image actions over an
+ //image, page actions otherwise. A second right-click dismisses it.
+	I64	 i, cy;
+	CGxOp *op;
+	U8	*link = NULL, *img = NULL;
+
+	if (gx.menu_on)
+	{
+		GxCtxClose;
+		return;
+	}
 	if (y < GX_CHROME_H || y >= Fs->pix_height - GX_STATUS_H)
 		return;
 	cy = y - GX_CHROME_H + gx.scroll;
@@ -3985,57 +4354,35 @@ U0 GxRightClick(I64 x, I64 y)
 				img = op->img_url;
 		}
 	}
-
+	//The menu outlives the ops it was opened over, so resolve and copy now.
 	if (link)
-	{
-		pick = PopUpPickList("Open Link\0Download Link\0Copy Link URL\0");
-		abs = ZincResolveLink(link);
-		if (pick == 0)
-		{
-			GxNavTo(abs); // takes ownership
-			return;
-		}
-		if (pick == 1)
-			GxDownload(abs);
-		else if (pick == 2)
-			GxClipSet(abs);
-		Free(abs);
-		return;
-	}
-	if (img)
-	{
-		pick = PopUpPickList("Download Image\0Copy Image URL\0");
-		if (pick == 0)
-			GxDownload(img);
-		else if (pick == 1)
-			GxClipSet(img);
-		return;
-	}
-	// ONE literal: adjacent string literals concatenate by LENGTH, so a
-	// NUL-separated list split across two would collapse to its first entry
-	pick = PopUpPickList("Back\0Forward\0Reload\0JS Console\0Save Page\0Copy Page URL\0");
-	switch (pick)
-	{
-		case 0: GxNavTo(StrNew("b")); break;
-		case 1: GxNavTo(StrNew("f")); break;
-		case 2: GxNavTo(StrNew("r")); break;
-		case 3: GxConsoleShow;		  break;
-		case 4: GxDownload(gx.url);   break;
-		case 5: GxClipSet(gx.url);	  break;
-	}
+		GxCtxOpen(GXCTX_LINK, ZincResolveLink(link), x, y);
+	else if (img)
+		GxCtxOpen(GXCTX_IMG, StrNew(img), x, y);
+	else
+		GxCtxOpen(GXCTX_PAGE, NULL, x, y);
 }
 
-U0 GxClick(I64 x, I64 y)
-{
+Bool GxClick(I64 x, I64 y)
+{//TRUE: the context menu took the click - nothing under it activates.
 	I64 w = Fs->pix_width, view_h = Fs->pix_height - GX_CHROME_H - GX_STATUS_H;
-	I64 th, tyy;
+	I64 th, tyy, hit;
 
+	if (gx.menu_on)
+	{
+		hit = GxCtxHit(x, y);
+		if (hit >= 0)
+			GxCtxAct(hit);
+		else
+			GxCtxClose;
+		return TRUE;
+	}
 	if (y < GX_TAB_H)
 	{//Tab strip.
 		GxFieldBlur;
 		gx.url_focus = FALSE;
 		GxTabClick(x);
-		return;
+		return FALSE;
 	}
 	if (y < GX_CHROME_H)
 	{//Chrome.
@@ -4058,17 +4405,19 @@ U0 GxClick(I64 x, I64 y)
 			gx.url_caret = ClampI64((x - 132 + FONT_WIDTH / 2) / FONT_WIDTH,
 									0, gx.url_len);
 		}
-		return;
+		return FALSE;
 	}
 	if (x >= w - GX_SBAR_W && gx.doc_h > view_h)
 	{//Scrollbar: jump.
 		gx.scroll = ClampI64((y - GX_CHROME_H) * gx.doc_h / view_h - view_h / 2,
 							 0, gx.doc_h - view_h);
-		return;
+		return FALSE;
 	}
 	gx.url_focus = FALSE;
 	if (y < Fs->pix_height - GX_STATUS_H)
 		GxClickContent(x, y);
+
+	return FALSE;
 }
 
 CZNode *GxMetaRefreshNode(CZNode *node, I64 depth)
@@ -4205,6 +4554,8 @@ U0 GxMenuCmd(I64 cmd)
 {//Menu dispatch. Navigation goes through GxNavTo/pending_nav exactly like the
 //chrome buttons: no network call runs on this path, the main loop owns fetching.
 	I64 view_h = Fs->pix_height - GX_CHROME_H - GX_STATUS_H;
+
+	GxCtxClose;
 
 	switch (cmd)
 	{
@@ -4363,6 +4714,7 @@ public U0 ZincGX(U8 *start_url=NULL)
 
 		if (gx.fetch)
 		{
+			GxCtxClose;	//its target belongs to the outgoing page
 			GxOpsLock;		//Ops reference the old DOM; park the drawer.
 			GxOpsReset;
 			while (gx.img_busy && TaskValidate(gx.img_task))
@@ -4555,6 +4907,7 @@ public U0 ZincGX(U8 *start_url=NULL)
 		//Tab strip requests (set by GxTabClick).
 		if (gx.tab_new || gx.tab_go >= 0 || gx.tab_close >= 0)
 		{
+			GxCtxClose;
 			if (gx.tab_new)
 			{
 				//New tab opens to the RIGHT of the rightmost tab (browser convention).
@@ -4714,6 +5067,10 @@ public U0 ZincGX(U8 *start_url=NULL)
 			}
 		}
 
+		if (gx.menu_on)
+			GxCtxHover(mouse.pos.x - Fs->pix_left - Fs->scroll_x,
+					   mouse.pos.y - Fs->pix_top - Fs->scroll_y);
+
 		//Wheel scroll - only when THIS window has focus (the wheel counter is
 		//global; without the gate an unfocused browser scrolled underneath).
 		view_h = Fs->pix_height - GX_CHROME_H - GX_STATUS_H;
@@ -4758,7 +5115,8 @@ public U0 ZincGX(U8 *start_url=NULL)
 			switch (msg)
 			{
 				case MESSAGE_MS_L_DOWN:
-					GxClick(a1, a2);
+					if (GxClick(a1, a2))
+						break;	//context menu took it
 					//Begin a potential text-selection drag in the page area.
 					gx.sel_x0 = mouse.pos.x - Fs->pix_left - Fs->scroll_x;
 					gx.sel_y0 = mouse.pos.y - Fs->pix_top - Fs->scroll_y
@@ -4780,6 +5138,8 @@ public U0 ZincGX(U8 *start_url=NULL)
 					GxMenuCmd(a1);
 					break;
 				case MESSAGE_KEY_DOWN:
+					if (GxCtxKey(a1, a2))
+						break;
 					if (gx.field_op)
 					{//Inline text-field editing: same keys as the URL bar.
 						if (a1 == '\n')

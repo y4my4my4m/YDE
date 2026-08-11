@@ -687,6 +687,7 @@ I64 TCPSocketBind(CTCPSocket *tcp_socket, CSocketAddressStorage *address)
 	CTCPTreeNode	   *head = tcp_globals.bound_socket_tree;
 	CTCPTreeNode	   *temp_node;
 	CTCPTreeNode	   *spare;
+	CTCPTreeQueue	   *spare_entry;
 	I64					bind_err = 0;
 	CSocketAddressIPV4 *ipv4_address;
 	CSocketAddressIPV4 *ipv4_destination;
@@ -760,11 +761,12 @@ I64 TCPSocketBind(CTCPSocket *tcp_socket, CSocketAddressStorage *address)
 	// links move under the same guard TCPSocketClose uses. Without it a bind
 	// racing the handler hands BSTAdd a half-linked node and faults there.
 	//
-	// The guarded section holds links only: TCPTreeNodeInit allocates, which
-	// blocks, so the node is built first and released afterwards if the port
-	// turned out to be taken. NetErr prints, so it also stays outside.
+	// The guarded section holds links only: CAlloc takes the heap spinlock and
+	// NetErr prints, so the node and the queue entry are built first and the
+	// unused ones released afterwards.
 	spare = TCPTreeNodeInit;
 	spare->value = port;
+	spare_entry = TCPTreeQueueEntryInit(tcp_socket);
 
 	PUSHFD
 	CLI
@@ -785,8 +787,11 @@ I64 TCPSocketBind(CTCPSocket *tcp_socket, CSocketAddressStorage *address)
 				case AF_INET:
 					if (TCPTreeNodeQueueIPV4Find(ipv4_destination->address.address, temp_node, TRUE))
 						bind_err = 1;	// address already bound
-					else // if no address match, free to add socket to the node queue
-						TCPTreeNodeQueueAdd(tcp_socket, temp_node);
+					else
+					{ // if no address match, free to add socket to the node queue
+						QueueInsert(spare_entry, temp_node->queue->last);
+						spare_entry = NULL;
+					}
 
 					break;
 
@@ -802,25 +807,32 @@ I64 TCPSocketBind(CTCPSocket *tcp_socket, CSocketAddressStorage *address)
 		else
 		{ // if we get no node back from port search, we didn't find it and are free to add a new node.
 			TCPTreeNodeAdd(spare, head);
-			TCPTreeNodeQueueAdd(tcp_socket, spare);
+			QueueInsert(spare_entry, spare->queue->last);
 			spare = NULL;
+			spare_entry = NULL;
 		}
 	}
 	else // if no bound sockets, we init the tree as a new node
 	{
 		tcp_globals.bound_socket_tree = head = spare;
-		TCPTreeNodeQueueAdd(tcp_socket, spare); // add the tcp socket to the port queue
+		QueueInsert(spare_entry, spare->queue->last); // add the tcp socket to the port queue
 		spare = NULL;
+		spare_entry = NULL;
 	}
 
 	LBtr(&tcp_bound_tree_lock, 0);
 	POPFD
+
+	BSTCorruptionReport;
 
 	if (spare)
 	{ // port was already in the tree, or the family is unsupported
 		Free(spare->queue);
 		Free(spare);
 	}
+
+	if (spare_entry)
+		Free(spare_entry);
 	switch (bind_err)
 	{
 		case 1:
@@ -973,11 +985,18 @@ I64 TCPSocketClose(CTCPSocket *tcp_socket)
 	LBtr(&tcp_bound_tree_lock, 0);
 	POPFD
 
+	BSTCorruptionReport;
+
 	if (!node)
 	{
 		NetErr("TCP SOCKET CLOSE: socket was not bound - not halting.");
 		return -1;
 	}
+
+	// The socket is unlinked above, so no new reference can be taken. An interrupt
+	// on another core can still be inside TCPHandleSocket with the one it took.
+	while (tcp_socket->handler_refs)
+		Sleep(1);
 
 	if (queue)
 	{
@@ -1032,6 +1051,9 @@ I64 TCPSocketConnect(CTCPSocket *tcp_socket, CSocketAddressStorage *address)
 	U16					source_port = EndianU16(0x8000 + tcp_globals.next_source_port++ & 0x7FFF);
 	CTCPTreeNode	   *head = tcp_globals.bound_socket_tree;
 	CTCPTreeNode	   *temp_node;
+	CTCPTreeNode	   *spare;
+	CTCPTreeQueue	   *spare_entry;
+	I64					connect_err = 0;
 	CSocketAddressIPV4 *ipv4_address;
 	CSocketAddressIPV4 *ipv4_destination;
 	CSocketAddressIPV4 *ipv4_source;
@@ -1102,7 +1124,18 @@ I64 TCPSocketConnect(CTCPSocket *tcp_socket, CSocketAddressStorage *address)
 			break;
 	}
 
-	// Re-read: the tree can have been re-rooted since this frame was entered.
+	// Same guard as TCPSocketBind and TCPSocketClose: the walk in BSTAdd, not
+	// just its final link store, has to be inside it. Node and queue entry are
+	// built first so the guarded section allocates nothing.
+	spare = TCPTreeNodeInit;
+	spare->value = port;
+	spare_entry = TCPTreeQueueEntryInit(tcp_socket);
+
+	PUSHFD
+	CLI
+	while (LBts(&tcp_bound_tree_lock, 0))
+		PAUSE
+
 	head = tcp_globals.bound_socket_tree;
 
 	if (head)
@@ -1116,38 +1149,67 @@ I64 TCPSocketConnect(CTCPSocket *tcp_socket, CSocketAddressStorage *address)
 			{
 				case AF_INET:
 					if (TCPTreeNodeQueueIPV4Find(ipv4_destination->address.address, temp_node, TRUE))
-					{
-						NetErr("TCP SOCKET CONNECT: Address already in Bound Socket Tree !");
-						return -1;
-					}
+						connect_err = 1;	// address already bound
 					else
 					{ // if no address match, free to add socket to the node queue
-						NetDebug("TCP SOCKET CONNECT: No address match, adding socket to node queue");
-						TCPTreeNodeQueueAdd(tcp_socket, temp_node);
+						QueueInsert(spare_entry, temp_node->queue->last);
+						spare_entry = NULL;
 					}
 
 					break;
 
 				case AF_INET6:
-					NetErr("TCP SOCKET CONNECT: FIXME, IPV6 TCP CONNECT");
+					connect_err = 2;
 					break;
 
 				case AF_UNSPEC:
-					NetErr("TCP SOCKET CONNECT: Error, AF_UNSPEC TCP CONNECT -- found in bound tree");
+					connect_err = 3;
 					break;
 			}
 		}
 		else
 		{ // if we get no node back from port search, we didn't find it and are free to add a new node.
-			temp_node = TCPTreeNodeParamAdd(port, head); // add new node with port, return its *.
-			TCPTreeNodeQueueAdd(tcp_socket, temp_node);
+			TCPTreeNodeAdd(spare, head);
+			QueueInsert(spare_entry, spare->queue->last);
+			spare = NULL;
+			spare_entry = NULL;
 		}
 	}
 	else // if no bound sockets, we init the tree as a new node
 	{
-		tcp_globals.bound_socket_tree = head = TCPTreeNodeParamInit(port); //... shouuuld be in L.E .. ?
-		TCPTreeNodeQueueAdd(tcp_socket, head); // add the tcp socket to the port queue
-		// maybe more checks to do before this, dunno rn.
+		tcp_globals.bound_socket_tree = head = spare;
+		QueueInsert(spare_entry, spare->queue->last); // add the tcp socket to the port queue
+		spare = NULL;
+		spare_entry = NULL;
+	}
+
+	LBtr(&tcp_bound_tree_lock, 0);
+	POPFD
+
+	BSTCorruptionReport;
+
+	if (spare)
+	{ // port was already in the tree, or the family is unsupported
+		Free(spare->queue);
+		Free(spare);
+	}
+
+	if (spare_entry)
+		Free(spare_entry);
+
+	switch (connect_err)
+	{
+		case 1:
+			NetErr("TCP SOCKET CONNECT: Address already in Bound Socket Tree !");
+			return -1;
+
+		case 2:
+			NetErr("TCP SOCKET CONNECT: FIXME, IPV6 TCP CONNECT");
+			break;
+
+		case 3:
+			NetErr("TCP SOCKET CONNECT: Error, AF_UNSPEC TCP CONNECT -- found in bound tree");
+			break;
 	}
 
 	tcp_socket->connection_time = tS;
