@@ -2857,11 +2857,6 @@ class CAHCIHba
 #define NVME_PAGE			4096
 #define NVME_PRPS_PER_PAGE	(NVME_PAGE / 8)
 
-//CAP (0x00) fields.
-#define NVME_CAP_MQES(c)	((c) & 0xFFFF)			//max queue entries - 1
-#define NVME_CAP_TO(c)		((c) >> 24 & 0xFF)		//RDY timeout, 500ms units
-#define NVME_CAP_DSTRD(c)	((c) >> 32 & 0xF)		//doorbell stride
-
 //CC (0x14) fields.
 #define NVME_CCf_EN			0
 #define NVME_CC_CSS_NVM		(0 << 4)
