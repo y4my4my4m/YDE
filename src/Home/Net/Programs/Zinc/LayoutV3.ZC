@@ -23,6 +23,92 @@ public U0 Layout3(Bool on)
 	gx.relayout = TRUE;
 }
 
+I64 v3_mb_open = 0;	// bottom margin already advanced past the flow cursor
+I64 v3_mb_y = -1;	// the y it left the cursor at; a different y means content
+					// intervened and the next top margin does not collapse
+
+/* ---- inline text ---- */
+
+I64 V3RunW(U8 *w, I64 len, CZStyle *st, I64 scale)
+{ // pixel advance of len bytes in st's font
+	if (zinc_ttf)
+		return GrFontRunW(GrFontPick(st->mono == 1), GxFontPx(st), w, len);
+	return len * FONT_WIDTH * scale;
+}
+
+U0 V3Word(U8 *w, I64 len, CZStyle *st, I64 scale)
+{ // GxWord, plus a hard break for a word wider than the whole line box
+  // (CSS overflow-wrap:anywhere). GxWord alone paints such a word past
+  // gx.wrap_w, so a long URL or identifier crosses into the neighbouring
+  // table cell / flex item.
+	I64 line_w, room, lo, hi, mid, n;
+
+	line_w = gx.wrap_w - (GX_MARGIN + gx.indent);
+	if (line_w < 16 || len * GxFontPx(st) <= line_w ||
+		V3RunW(w, len, st, scale) <= line_w)
+	{ // font px is an upper bound per byte, so the cheap test skips the measure
+		GxWord(w, len, st, scale);
+		return;
+	}
+	while (len > 0)
+	{
+		room = gx.wrap_w - gx.x;
+		if (room < 16 || room * 4 < line_w)
+		{
+			GxNewline(0);
+			room = gx.wrap_w - gx.x;
+		}
+		if (V3RunW(w, len, st, scale) <= room)
+		{
+			GxWord(w, len, st, scale);
+			return;
+		}
+		lo = 1;
+		hi = len;
+		while (lo < hi)
+		{ // longest prefix still fitting the space left on this line
+			mid = (lo + hi + 1) / 2;
+			if (V3RunW(w, mid, st, scale) <= room)
+				lo = mid;
+			else
+				hi = mid - 1;
+		}
+		n = lo;
+		while (n > 1 && (w[n] & 0xC0) == 0x80)
+			n--; // 10xxxxxx is a UTF-8 continuation byte: never split there
+		GxWord(w, n, st, scale);
+		GxNewline(0);
+		w += n;
+		len -= n;
+	}
+}
+
+U0 V3Text(U8 *text, CZStyle *st, I64 scale, Bool pre)
+{ // GxText's word split routed through V3Word. white-space:pre keeps GxText:
+  // preformatted lines overflow by definition.
+	U8	*p = text, *start;
+	I64	 len;
+
+	if (!text)
+		return;
+	if (pre)
+	{
+		GxText(text, st, scale, TRUE);
+		return;
+	}
+	while (*p)
+	{
+		while (*p == ' ' || *p == '\n' || *p == '\t' || *p == '\r')
+			p++;
+		start = p;
+		while (*p && *p != ' ' && *p != '\n' && *p != '\t' && *p != '\r')
+			p++;
+		len = p - start;
+		if (len)
+			V3Word(start, len, st, scale);
+	}
+}
+
 /* ---- measurement (dry run) ---- */
 
 U0 V3Measure(CZNode *node, CZStyle *inh, I64 avail, I64 *w_out, I64 *h_out)
@@ -1325,6 +1411,39 @@ U0 V3Columns(CZNode *node, CZStyle *kid, I64 ncols)
 	gx.line_h = FONT_HEIGHT + GX_LINE_LEAD;
 }
 
+U0 V3EdgeRects(I64 box_op, I64 edge0, I64 mask)
+{ // lay the reserved GXO_RECT strips onto the box's final geometry. GXO_BOX
+  // paints all four sides or none, so anything short of that is drawn here.
+	CGxOp	*b = &gx.ops[box_op];
+	I64		 bx = b->x, by = b->y, bw = b->w, bh = b->h, i, k = edge0;
+
+	for (i = 0; i < 4; i++)
+		if (mask & (1 << i))
+		{
+			if (k >= gx.op_count)
+				return;
+			gx.ops[k].x = bx;
+			gx.ops[k].y = by;
+			gx.ops[k].w = bw;
+			gx.ops[k].h = bh;
+			if (i == 0)
+				gx.ops[k].h = 1;
+			else if (i == 1)
+			{
+				gx.ops[k].x = bx + bw - 1;
+				gx.ops[k].w = 1;
+			}
+			else if (i == 2)
+			{
+				gx.ops[k].y = by + bh - 1;
+				gx.ops[k].h = 1;
+			}
+			else
+				gx.ops[k].w = 1;
+			k++;
+		}
+}
+
 /* ---- the unified box ---- */
 
 U0 V3Block(CZNode *node, CZStyle *style, CZStyle *author)
@@ -1340,6 +1459,7 @@ U0 V3Block(CZNode *node, CZStyle *style, CZStyle *author)
 	I64		 box_y0, dx, dy, mw, mh, x0, saved_y, saved_indent, saved_wrapa;
 	I64		 save_cbx, save_cby, save_cbw, save_cbh, save_curbg;
 	I64		 eff_h, eff_h_cb, save_anch, flt_inset;
+	I64		 bsid, edge0, edge_m, esi, esn;
 	Bool	 boxed, is_body, is_abs, is_flex, is_flex_col, is_posn, spr_fixed;
 	Bool	 is_list, is_li, is_table;
 
@@ -1462,7 +1582,14 @@ U0 V3Block(CZNode *node, CZStyle *style, CZStyle *author)
 	}
 	else
 	{
-		gx.y += mt_eff;
+		// adjacent siblings collapse: the larger of the two margins separates
+		// them. v3_mb_y is where the previous block's bottom margin left the
+		// cursor; a different y means content came between.
+		if (0 < v3_mb_open <= 80 && gx.y == v3_mb_y)
+			gx.y += MaxI64(0, mt_eff - v3_mb_open);
+		else
+			gx.y += mt_eff;
+		v3_mb_open = 0;
 		gx.indent += ml_eff;
 		flt_inset = 0;
 		if (gx_float_n)
@@ -1509,6 +1636,11 @@ U0 V3Block(CZNode *node, CZStyle *style, CZStyle *author)
 	op0 = gx.op_count;
 	box_op = -1;
 	box_y0 = gx.y;
+	bsid = author->bord_sides;
+	if (!bsid && author->border >= 0)
+		bsid = 15; // border-color with no side longhand: all four
+	edge0 = -1;
+	edge_m = 0;
 	if (boxed)
 	{
 		op = GxOpAdd(GXO_BOX, GX_MARGIN + gx.indent - 3, gx.y - 2,
@@ -1518,7 +1650,7 @@ U0 V3Block(CZNode *node, CZStyle *style, CZStyle *author)
 			box_op = gx.op_count - 1;
 			op->has_bg = author->bg >= 0;
 			op->fg = GxPenBg(author->bg, de_theme.win_bg);
-			op->ul = author->border >= 0;
+			op->ul = bsid == 15;
 			op->bg = GxPenBg(author->border, de_theme.panel_edge);
 			op->grad = author->grad;
 			op->sh_col = author->sh_col;
@@ -1536,6 +1668,22 @@ U0 V3Block(CZNode *node, CZStyle *style, CZStyle *author)
 				op->bg_sh  = author->bg_sh;
 				op->bg_rep = author->bg_repeat;
 			}
+		}
+		if (box_op >= 0 && bsid && bsid != 15)
+		{ // reserve one strip per declared side; geometry lands in V3EdgeRects
+			edge0 = gx.op_count;
+			edge_m = bsid;
+			esn = 0;
+			for (esi = 0; esi < 4; esi++)
+				if (edge_m & (1 << esi))
+				{
+					esn++;
+					op = GxOpAdd(GXO_RECT, 0, 0, 0, 0);
+					if (op)
+						op->fg = GxPenBg(author->border, de_theme.panel_edge);
+				}
+			if (gx.op_count - edge0 != esn)
+				edge0 = -1; // op list full mid-run: the slots are not ours
 		}
 		gx.line_start_op = gx.op_count;
 		kid.bg = -1;
@@ -1639,6 +1787,8 @@ U0 V3Block(CZNode *node, CZStyle *style, CZStyle *author)
 	}
 	else if (box_op >= 0)
 		gx.line_start_op = gx.op_count;
+	if (edge0 >= 0 && box_op >= 0)
+		V3EdgeRects(box_op, edge0, edge_m);
 
 	if (is_abs)
 	{ // restore the flow as if we were never here
@@ -1650,6 +1800,8 @@ U0 V3Block(CZNode *node, CZStyle *style, CZStyle *author)
 	else
 	{
 		gx.y += mb_eff;
+		v3_mb_open = mb_eff;
+		v3_mb_y = gx.y;
 		if (save_wrap)
 		{
 			gx.wrap_w = save_wrap;
@@ -1756,7 +1908,7 @@ U0 V3Node(CZNode *node, CZStyle *inh)
 		return;
 	if (node->type == ZH_TEXT)
 	{
-		GxText(node->text, inh, GxScaleOf(inh), inh->pre == 1);
+		V3Text(node->text, inh, GxScaleOf(inh), inh->pre == 1);
 		return;
 	}
 	if (ZnTagSkipped(node->tag))
@@ -1988,8 +2140,10 @@ U0 V3Node(CZNode *node, CZStyle *inh)
 	{
 		attr = ZNodeAttr(node, "href");
 		if (attr && *attr)
-		{ // link container: children flow inline with link styling + href
-			if (style.fg < 0)
+		{ // link container: children flow inline with link styling + href.
+		  // The UA link colour outranks an inherited one (body{color:...}) and
+		  // yields to any author rule that colours the <a> itself.
+			if (author.fg < 0)
 				style.fg = 0x4EA3FF;
 			GxRunFlush;
 			gx.link_depth++;

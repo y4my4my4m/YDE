@@ -436,22 +436,40 @@ I64 HttpDechunk(U8 *body, I64 len)
 
 /* ---- gzip (RFC 1952) ---- */
 
-U8 *HttpGunzip(U8 *src, I64 src_len, I64 *_out_len)
-{ //one gzip member via the shared DEFLATE inflater. returns MAlloc'ed
-  //NUL-terminated buffer, or NULL.
-	I64			pos = 10, isize;
-	U8			flg;
-	U8		   *out;
-	CInflate	uz;
+#define HTTP_GUNZIP_MAX		33554432	// 32MB ceiling on one inflated body
 
-	*_out_len = 0;
-	if (src_len < 18 || src[0] != 0x1F || src[1] != 0x8B || src[2] != 8)
-		return NULL;
-	flg = src[3];
+U0 HttpHexHead(U8 *src, I64 len, U8 *out)
+{ //first 16 bytes as "1F 8B 08 ". out holds 49 bytes.
+	U8	*digits = "0123456789ABCDEF";
+	I64	 i, n = len;
+
+	if (n > 16)
+		n = 16;
+	for (i = 0; i < n; i++)
+	{
+		out[i * 3]	   = digits[(src[i] >> 4) & 15];
+		out[i * 3 + 1] = digits[src[i] & 15];
+		out[i * 3 + 2] = ' ';
+	}
+	out[n * 3] = 0;
+}
+
+I64 HttpGzipMemberData(U8 *src, I64 src_len, I64 start, U8 *_flg)
+{ //offset of the DEFLATE data of the member at start, or -1. RFC 1952 2.3:
+  //10-byte fixed header, then FEXTRA/FNAME/FCOMMENT/FHCRC per FLG.
+	I64	pos = start + 10;
+	U8	flg;
+
+	*_flg = 0;
+	if (start < 0 || start + 18 > src_len ||
+		src[start] != 0x1F || src[start + 1] != 0x8B || src[start + 2] != 8)
+		return -1;
+	flg = src[start + 3];
+	*_flg = flg;
 	if (flg & 4)
 	{ // FEXTRA
 		if (pos + 2 > src_len)
-			return NULL;
+			return -1;
 		pos += 2 + (src[pos] | (src[pos + 1] << 8));
 	}
 	if (flg & 8) // FNAME
@@ -461,33 +479,115 @@ U8 *HttpGunzip(U8 *src, I64 src_len, I64 *_out_len)
 	if (flg & 2) // FHCRC
 		pos += 2;
 	if (pos >= src_len - 8)
-		return NULL;
+		return -1;
 
-	//trailer ISIZE = uncompressed length mod 2^32
+	return pos;
+}
+
+U8 *HttpGunzip(U8 *src, I64 src_len, I64 *_out_len)
+{ //concatenated gzip members through the shared DEFLATE inflater. returns an
+  //MAlloc'ed NUL-terminated buffer, or NULL when nothing decoded. output grows
+  //on demand: the trailer ISIZE is a starting size, not an allocation contract,
+  //and a member that fails mid-way keeps the bytes it did produce.
+	I64			 dpos, isize, cap, used = 0, member = 0;
+	U64			 consumed, produced;
+	U8			 flg;
+	U8			*out, *bigger;
+	U8			 hex[64];
+	CInflate	 uz;
+	Bool		 stop = FALSE, retrying;
+
+	*_out_len = 0;
+	HttpHexHead(src, src_len, hex);
+
+	dpos = HttpGzipMemberData(src, src_len, 0, &flg);
+	if (dpos < 0)
+	{
+		NetErr("HTTP GUNZIP: not a gzip stream. src_len %d head [%s]",
+			   src_len, hex);
+		return NULL;
+	}
+
+	//ISIZE is the last member's uncompressed length mod 2^32
 	isize = src[src_len - 4] | (src[src_len - 3] << 8) |
 			(src[src_len - 2] << 16) | (src[src_len - 1] << 24);
-	if (isize < 0 || isize > 0x2000000) // 32MB sanity cap
+	cap = isize;
+	if (cap < 65536 || cap > HTTP_GUNZIP_MAX)
+		cap = src_len * 6; // no usable hint: typical HTML DEFLATE ratio
+	if (cap < 65536)
+		cap = 65536;
+	if (cap > HTTP_GUNZIP_MAX)
+		cap = HTTP_GUNZIP_MAX;
+
+	out = MAlloc(cap + 1);
+	if (!out)
 	{
-		NetErr("HTTP GUNZIP: Implausible ISIZE %d.", isize);
+		NetErr("HTTP GUNZIP: cannot allocate %d bytes.", cap + 1);
 		return NULL;
 	}
 
-	out = MAlloc(isize + 1);
-	if (!out)
+	while (!stop)
 	{
-		NetErr("HTTP GUNZIP: Cannot allocate %d bytes.", isize + 1);
-		return NULL;
+		member++;
+		retrying = TRUE;
+		while (retrying)
+		{
+			MemSet(&uz, 0, sizeof(CInflate));
+			consumed = 0;
+			produced = 0;
+			uz_inflate_data(&uz, out + used, cap - used, src, src_len, dpos,
+							&consumed, &produced);
+			retrying = FALSE;
+			if (uz.error != ZINFL_OK && cap < HTTP_GUNZIP_MAX &&
+				(uz.error_line == 489 || uz.error_line == 541 ||
+				 uz.error_line == 586))
+			{ //output overflow. a member is a self-contained DEFLATE stream, so
+			  //redoing it against a larger buffer reproduces the same bytes
+				cap *= 2;
+				if (cap > HTTP_GUNZIP_MAX)
+					cap = HTTP_GUNZIP_MAX;
+				bigger = MAlloc(cap + 1);
+				if (bigger)
+				{
+					MemCopy(bigger, out, used);
+					Free(out);
+					out = bigger;
+					retrying = TRUE;
+				}
+				else
+					NetErr("HTTP GUNZIP: cannot grow output to %d bytes.", cap + 1);
+			}
+		}
+
+		used += produced;
+
+		if (uz.error != ZINFL_OK)
+		{
+			NetErr("HTTP GUNZIP: member %d inflate error %d at line %d, kept %d bytes.",
+				   member, uz.error, uz.error_line, used);
+			NetErr("HTTP GUNZIP: src_len %d data@%d FLG 0x%02X ISIZE %d cap %d head [%s]",
+				   src_len, dpos, flg, isize, cap, hex);
+			stop = TRUE;
+		}
+		else
+		{
+			dpos = HttpGzipMemberData(src, src_len, consumed + 8, &flg);
+			if (dpos < 0) // CRC32 + ISIZE, then either another member or the end
+				stop = TRUE;
+		}
 	}
-	MemSet(&uz, 0, sizeof(CInflate));
-	uz_inflate_data(&uz, out, isize, src, src_len - 8, pos);
-	if (uz.error != UPNG_EOK)
+
+	if (!used)
 	{
-		NetErr("HTTP GUNZIP: Inflate error %d at line %d.", uz.error, uz.error_line);
 		Free(out);
 		return NULL;
 	}
-	out[isize] = 0;
-	*_out_len = isize;
+
+	if (member > 1)
+		NetLog("HTTP GUNZIP: %d gzip members, %d bytes out.", member, used);
+
+	out[used] = 0;
+	*_out_len = used;
 
 	return out;
 }
@@ -830,10 +930,26 @@ I64 HttpChunkedComplete(U8 *body, I64 len)
 			return -1;
 		p++; // past the size line's \n
 		if (chunk == 0)
-		{ // final chunk: complete once its closing CRLF (or trailer end) is in
-			if (p >= end)
-				return -1;
-			return 1;
+		{ //trailer section: zero or more header lines, then an empty one. the
+		  //whole of it has to be consumed or it prefixes the next response on
+		  //a pooled connection
+			while (p < end)
+			{
+				if (*p == '\n')
+					return 1;
+				if (*p == '\r')
+				{
+					if (p + 1 >= end)
+						return -1;
+					return 1; // CRLF (or a malformed CR): end of the trailer
+				}
+				while (p < end && *p != '\n')
+					p++;
+				if (p >= end)
+					return -1;
+				p++;
+			}
+			return -1;
 		}
 		if (p + chunk + 2 > end)
 			return -1; // chunk data (+ its CRLF) not fully here yet
@@ -1122,6 +1238,10 @@ http_fresh:
 		return NULL;
 	}
 
+	if (!complete && !aborted && buf_used && (is_chunked || content_len >= 0))
+		NetErr("HTTP %s: response ended outside its framing. %d bytes, chunked %d, "
+			   "Content-Length %d.", method, buf_used, is_chunked, content_len);
+
 	if (buf_used < 12)
 	{
 		NetErr("HTTP %s: Empty or truncated response (%d bytes).", method, buf_used);
@@ -1182,7 +1302,8 @@ http_fresh:
 			else
 			{//never hand raw gzip bytes to the HTML parser - binary garbage
 			//crashes the renderer
-				NetErr("HTTP %s: gzip decode failed; discarding compressed body.", method);
+				NetErr("HTTP %s: gzip decode failed; discarding %d compressed bytes.",
+					   method, response->body_length);
 				Free(response->body);
 				response->body = StrNew("<html><body><p>[gzip decode failed]</p></body></html>");
 				response->body_length = StrLen(response->body);
