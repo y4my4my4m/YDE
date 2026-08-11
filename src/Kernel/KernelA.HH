@@ -2919,6 +2919,7 @@ class CNVMeCtrl
 	I64			 a_tail, a_head, i_tail, i_head, cid;
 	Bool		 a_phase, i_phase;	//phase tag a fresh CQE carries
 	Bool		 valid;
+	I64			 max_blks;			//per-command cap, from Identify Controller MDTS
 	U8			 serial[21], model[41];	//Identify Controller SN at 4, MN at 24
 };
 
