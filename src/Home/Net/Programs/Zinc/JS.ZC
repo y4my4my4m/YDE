@@ -373,6 +373,9 @@
 #define JSN_NOOP_TRUE		352	// generic no-op -> true
 #define JSN_XHR_ADDLISTEN	353	// xhr.addEventListener(type, fn) -> on<type>
 #define JSN_XHR_REMLISTEN	354	// xhr.removeEventListener(type)
+#define JSN_FN_TOSTR		355	// Function.prototype.toString
+#define JSN_MAP_ENTRIES	356	// map.entries / keys / values; _m selects
+#define JSN_SET_ENTRIES	357	// set.entries / keys / values; _m selects
 
 /* token types */
 #define JT_EOF		0
@@ -633,6 +636,22 @@ U8 *JsAlloc(CJsInterp *ji, I64 size)
 	ji->allocs = h;
 
 	return h(U8 *) + sizeof(CJsAllocHdr);
+}
+
+U0 JsPathCat(U8 *out, I64 max, U8 *s)
+{ // bounded append. Every caller pastes page-supplied names into a fixed
+  // buffer, and a name has no length limit.
+	I64 n = StrLen(out);
+
+	if (!s)
+		s = "?";
+	while (*s && n < max - 1)
+	{
+		out[n] = *s;
+		n++;
+		s++;
+	}
+	out[n] = 0;
 }
 
 U8 *JsStrDup(CJsInterp *ji, U8 *s)
@@ -999,6 +1018,79 @@ U8 *JsNumToStr(CJsInterp *ji, F64 n)
 	return JsStrDup(ji, buf);
 }
 
+I64 JsFuncArity(CJsVal *fn)
+{ // Function.length: the parameters before the first default or rest
+	CJsNode *param;
+	I64		 n = 0;
+
+	if (!fn || fn->type != JV_FUNC || !fn->func)
+		return 0;
+	param = fn->func(CJsNode *)->a;
+	while (param)
+	{
+		if (param->op == 1 || param->a)
+			return n; // a rest parameter or a default value ends the count
+		n++;
+		param = param->next;
+	}
+
+	return n;
+}
+
+U0 JsFuncSrcText(CJsVal *fn, U8 *out, I64 max)
+{ // Function.prototype.toString. The body text is not kept past the parse, so
+  // the signature is rebuilt from the AST and the body stands in as [code].
+  // Only a real native carries the "[native code]" marker: a page probing
+  // whether a builtin has been polyfilled must not read a user function as
+  // native, and dependency injectors read the parameter list out of this.
+	CJsNode *node, *param;
+	CJsVal	*nm;
+	Bool	 first = TRUE;
+
+	out[0] = 0;
+	JsPathCat(out, max, "function ");
+	if (!fn || fn->type == JV_NATIVE)
+	{
+		if (fn)
+		{
+			nm = JsPropGet(fn, "_name"); // the binding name JsGlobalNative stashed
+			if (nm && nm->type == JV_STR)
+				JsPathCat(out, max, nm->str);
+		}
+		JsPathCat(out, max, "() { [native code] }");
+		return;
+	}
+	node = NULL;
+	if (fn->type == JV_FUNC && fn->func)
+		node = fn->func(CJsNode *);
+	if (node && node->str)
+		JsPathCat(out, max, node->str);
+	JsPathCat(out, max, "(");
+	if (node)
+	{
+		param = node->a;
+		while (param)
+		{
+			if (!first)
+				JsPathCat(out, max, ", ");
+			if (param->op == 2)
+				JsPathCat(out, max, "{}"); // destructured: the pattern is elided
+			else
+			{
+				if (param->op == 1)
+					JsPathCat(out, max, "...");
+				if (param->str)
+					JsPathCat(out, max, param->str);
+				else
+					JsPathCat(out, max, "_");
+			}
+			first = FALSE;
+			param = param->next;
+		}
+	}
+	JsPathCat(out, max, ") { [code] }");
+}
+
 U8 *JsToStr(CJsInterp *ji, CJsVal *v)
 {
 	U8	   *out, *piece;
@@ -1016,7 +1108,12 @@ U8 *JsToStr(CJsInterp *ji, CJsVal *v)
 		case JV_NUM:	return JsNumToStr(ji, v->num);
 		case JV_STR:	return v->str;
 		case JV_FUNC:
-		case JV_NATIVE:	return "function";
+		case JV_NATIVE:
+			// same text as fn.toString(): `"" + fn` and fn.toString() are the
+			// same probe in page code and must not disagree
+			out = JsAlloc(ji, 256);
+			JsFuncSrcText(v, out, 256);
+			return out;
 		case JV_ARR:
 			len = 1;
 			for (i = 0; i < v->count; i++)
@@ -2509,7 +2606,15 @@ CJsNode *JsParseStmt(CJsInterp *ji)
 			if (!StrCompare(ji->toks[k].str, "in"))
 				node->op = 1;
 			ji->pos = k + 1;
-			node->a = JsParseAssign(ji);
+			// Asymmetric on purpose. for-in is `for ( lhs in Expression )`, so
+			// `for (k in a, b)` is legal and enumerates b - Closure's object
+			// helper emits exactly that. for-of is `for ( lhs of
+			// AssignmentExpression )`, so `for (x of a, b)` is a SyntaxError
+			// and the comma must be left for the caller.
+			if (node->op)
+				node->a = JsParseExpr(ji);
+			else
+				node->a = JsParseAssign(ji);
 			if (!JsEatPunct(ji, ')'))
 				JsParseErr(ji, "expected ) after for-of");
 			node->d = JsParseStmt(ji);
@@ -3193,12 +3298,20 @@ CJsVal *JsMemberGet(CJsInterp *ji, CJsVal *obj, U8 *name)
 					return v;
 				return JsStrV(ji, "");
 			}
+			if (!StrCompare(name, "length"))
+				return JsNumV(ji, 0); // no parameter list to count
+			if (!StrCompare(name, "toString") ||
+				!StrCompare(name, "toLocaleString"))
+				return JsNativeV(ji, JSN_FN_TOSTR);
+			if (!StrCompare(name, "valueOf"))
+				return JsNativeV(ji, JSN_VALUEOF); // hands back the function
 			return JsUndefV(ji);
 		case JV_FUNC:
 			if (!StrCompare(name, "call"))	return JsNativeV(ji, JSN_FN_CALL);
 			if (!StrCompare(name, "apply"))	return JsNativeV(ji, JSN_FN_APPLY);
 			if (!StrCompare(name, "bind"))	return JsNativeV(ji, JSN_FN_BIND);
-			if (!StrCompare(name, "length"))	return JsNumV(ji, 0);
+			if (!StrCompare(name, "length"))
+				return JsNumV(ji, JsFuncArity(obj));
 			if (!StrCompare(name, "name"))
 			{
 				if (obj->func && obj->func(CJsNode *)->str)
@@ -3207,7 +3320,12 @@ CJsVal *JsMemberGet(CJsInterp *ji, CJsVal *obj, U8 *name)
 			}
 			v = JsPropGet(obj, name); // fn.prototype and assigned static props
 			if (v)
-				return v;
+				return v;			  // an assigned one shadows the builtins below
+			if (!StrCompare(name, "toString") ||
+				!StrCompare(name, "toLocaleString"))
+				return JsNativeV(ji, JSN_FN_TOSTR);
+			if (!StrCompare(name, "valueOf"))
+				return JsNativeV(ji, JSN_VALUEOF); // hands back the function
 			return JsUndefV(ji);
 		case JV_OBJ:
 			break;
@@ -4222,21 +4340,6 @@ U0 JsValTag(CJsVal *v, U8 *out)
 		StrPrint(out, "OBJ/%s", JsNidName(v->native_id));
 	else
 		StrCopy(out, JsTypeTag(v));
-}
-
-U0 JsPathCat(U8 *out, I64 max, U8 *s)
-{ // bounded append: a minified name is short, but nothing guarantees it
-	I64 n = StrLen(out);
-
-	if (!s)
-		s = "?";
-	while (*s && n < max - 1)
-	{
-		out[n] = *s;
-		n++;
-		s++;
-	}
-	out[n] = 0;
 }
 
 U0 JsExprPath(CJsNode *n, U8 *out, I64 max)

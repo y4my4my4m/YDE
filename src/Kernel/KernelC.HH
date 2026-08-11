@@ -389,6 +389,7 @@ extern			I64				 NVMeCapMpsMin(U64 cap);
 public extern	U0				 NVMeInit();
 extern			Bool			 NVMeBlksRead( CBlkDev *bd, U8 *buf, I64 blk, I64 count);
 extern			Bool			 NVMeBlksWrite(CBlkDev *bd, U8 *buf, I64 blk, I64 count);
+public extern	Bool			 NVMeFlush(U8 drv_let=0);
 
 public extern	CBlkDevGlobals	 blkdev;
 
