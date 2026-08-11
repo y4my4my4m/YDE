@@ -21,9 +21,14 @@ compiled at boot.
 
 ![](/screenshots/yde-startmenu.png)
 
+Email client:
 ![](/screenshots/yde-zemail.png)
 
+Paint:
 ![](/screenshots/yde-ypainter.png)
+
+Browser:
+![](/screenshots/yde-zinc.png)
 
 ## Ports
 

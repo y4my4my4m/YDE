@@ -36,7 +36,7 @@
 #define JS_MAX_SRC			2097152	// = HTTP_BODY_MAX: bigger can't arrive anyway
 #define JS_MAX_STEPS		2000000
 #define JS_MAX_DEPTH		48
-#define JS_MAX_ARGS			8
+#define JS_MAX_ARGS			16
 #define JS_WRITE_BUF		131072
 
 /* value types */
@@ -436,7 +436,7 @@
 #define JN_WHILE	19
 #define JN_FOR		20
 #define JN_BLOCK	21
-#define JN_FUNC		22
+#define JN_FUNC		22	// op caches the body hoist scan: 0 unknown, 1 decls, 2 none
 #define JN_RETURN	23
 #define JN_BREAK	24
 #define JN_EXPR		25
@@ -569,6 +569,7 @@ class CJsInterp
 	CJsVal	*doc_obj, *loc_obj, *win_obj;
 	U8		 err[144];
 	Bool	 has_err;
+	Bool	 parse_err;		// a statement failed to parse; cleared by JsParseResync
 	CJsTok	*toks;
 	U8		*src_text;	// original source (for raw-source parse-error logging)
 	I64		 tok_count, pos;
@@ -604,9 +605,11 @@ extern U0 JsElemCollect(CJsInterp *ji, CZNode *root, I64 mode, U8 *key,
 
 /* ---- arena ---- */
 
-// Soft parse-error budget: unrecognized primaries are skipped, not fatal.
-// First few are logged per script (reset in JsRun) so gaps stay visible.
-I64 js_soft_errs = 0;
+// Per-script log budgets, both reset in JsRunEx. Parse and runtime diagnostics
+// count separately: a page that warns on every `new` must not exhaust the
+// budget that would have shown the parse error explaining it.
+I64 js_soft_errs  = 0;
+I64 js_parse_errs = 0;
 
 U8 *JsAlloc(CJsInterp *ji, I64 size)
 {
@@ -1090,6 +1093,130 @@ CJsNode *JsNode(CJsInterp *ji, I64 type)
 
 /* ---- parser ---- */
 
+/* ---- parse diagnostics ---- */
+
+// Readable names for multi-char puncts JP_EQ2(256)..JP_INSTOF(289), for logs.
+U8 *jp_desc[34] = {
+	"==", "!=", "===", "!==", "<=", ">=", "&&", "||", "++", "--",
+	"+=", "-=", "*=", "/=", "%=", "=>", "...", "?.", "??", "<<",
+	">>", ">>>", "**", "&&=", "||=", "??=", "&=", "|=", "^=", "<<=",
+	">>=", "**=", "in", "instanceof"
+};
+
+U0 JsScrub(U8 *s)
+{ // dollars are live DolDoc commands in the log; control chars break the ring
+	while (*s)
+	{
+		if (*s == 0x24 || *s < ' ')
+			*s = '?';
+		s++;
+	}
+}
+
+U0 JsSrcWindow(CJsInterp *ji, I64 pos, U8 *out)
+{ // RAW source around token `pos`, 44 chars of lead-in then ">|<" then 56 more.
+  // Token windows say where recovery landed; the lead-in says what broke.
+  // out >= 112.
+	I64	 i, o = 0, off, back;
+
+	out[0] = 0;
+	if (!ji->src_text || pos < 0 || pos >= ji->tok_count)
+		return;
+	off	 = ji->toks[pos].src;
+	back = off;
+	if (back > 44)
+		back = 44;
+	for (i = off - back; i < off + 56 && ji->src_text[i]; i++)
+	{
+		if (i == off)
+		{
+			out[o++] = '>';
+			out[o++] = '|';
+			out[o++] = '<';
+		}
+		out[o++] = ji->src_text[i];
+	}
+	out[o] = 0;
+	JsScrub(out);
+}
+
+U0 JsTokDesc(CJsInterp *ji, I64 idx, U8 *out)
+{ // short printable form of one token, for parse diagnostics. out >= 32 bytes
+  // (a JT_NUM prints as a full I64).
+	CJsTok *t;
+	I64		n;
+
+	out[0] = 0;
+	if (idx < 0 || idx >= ji->tok_count)
+		return;
+	t = &ji->toks[idx];
+	if (t->type == JT_IDENT || t->type == JT_STR)
+	{
+		n = StrLen(t->str);
+		if (n > 12)
+			n = 12;
+		MemCopy(out, t->str, n);
+		out[n] = 0;
+	}
+	else if (t->type == JT_NUM)
+		StrPrint(out, "%d", ToI64(t->num));
+	else if (t->type == JT_REGEX)
+		StrPrint(out, "/re/");
+	else if (t->punct < 256)
+		StrPrint(out, "%c", t->punct);
+	else if (t->punct >= JP_EQ2 && t->punct <= JP_INSTOF)
+		StrCopy(out, jp_desc[t->punct - JP_EQ2]); // readable multi-char op
+	else
+		StrPrint(out, "#%d", t->punct);
+}
+
+U0 JsParseErr(CJsInterp *ji, U8 *msg)
+{ // A construct the parser cannot handle. NOT JsErr: has_err ends the script,
+  // which leaves every function declared after the failure undefined and turns
+  // one bad construct into a dead bundle. The caller resyncs instead.
+	U8	buf[224], tk[32];
+
+	ji->parse_err = TRUE;
+	if (++js_parse_errs > 12)
+		return;
+	JsTokDesc(ji, ji->pos - 1, tk);
+	StrPrint(buf, "%s @%d: after '%s' at '", msg, ji->pos, tk);
+	JsTokDesc(ji, ji->pos, tk);
+	CatPrint(buf, "%s'", tk);
+	JsScrub(buf);
+	JsConsoleAdd("parse", buf);
+	NetLog("JS: %s", buf);
+	JsSrcWindow(ji, ji->pos, buf);
+	JsConsoleAdd("parse", buf);
+	NetLog("JS:  src: %s", buf);
+}
+
+U0 JsParseResync(CJsInterp *ji)
+{ // Drop tokens to the end of the failed statement and clear the error. Stops
+  // BEFORE a closer that belongs to the enclosing block, so the caller's own
+  // loop still sees its '}'.
+	I64 dep = 0;
+
+	ji->parse_err = FALSE;
+	while (JsTok(ji)->type != JT_EOF)
+	{
+		if (JsIsPunct(ji, '(') || JsIsPunct(ji, '[') || JsIsPunct(ji, '{'))
+			dep++;
+		else if (JsIsPunct(ji, ')') || JsIsPunct(ji, ']') || JsIsPunct(ji, '}'))
+		{
+			if (!dep)
+				return;
+			dep--;
+		}
+		else if (!dep && JsIsPunct(ji, ';'))
+		{
+			ji->pos++;
+			return;
+		}
+		ji->pos++;
+	}
+}
+
 CJsNode *JsParseArgs(CJsInterp *ji)
 { // '(' already eaten; returns arg list, eats ')'
 	CJsNode *head = NULL, *tail = NULL, *arg;
@@ -1099,6 +1226,8 @@ CJsNode *JsParseArgs(CJsInterp *ji)
 		return NULL;
 	do
 	{
+		if (JsIsPunct(ji, ')'))
+			break; // trailing comma: f(a, b,)
 		if (JsEatPunct(ji, JP_SPREAD))
 		{ // f(...arr): spread argument, flattened at call time
 			arg = JsNode(ji, JN_SPREAD);
@@ -1107,7 +1236,8 @@ CJsNode *JsParseArgs(CJsInterp *ji)
 		else
 			arg = JsParseAssign(ji);
 		if (!arg)
-			return head;
+			break; // run the ')' recovery below: an unconsumed ')' reaches the
+				   // statement parser as a stray ')'
 		if (tail)
 			tail->next = arg;
 		else
@@ -1137,7 +1267,8 @@ CJsNode *JsParseClass(CJsInterp *ji)
   // BOTH statement and expression positions (minified code uses class exprs).
 	CJsNode *node = JsNode(ji, JN_CLASS), *item, *mtail = NULL;
 	CJsTok	*t;
-	I64		 acc; // member accessor kind: 0 none, 1 get, 2 set
+	I64		 acc, dep; // acc = member accessor kind: 0 none, 1 get, 2 set
+	Bool	 stat;	   // `static` member: JN_CLASS puts it on the constructor
 
 	t = JsTok(ji);
 	if (t->type == JT_IDENT && StrCompare(t->str, "extends"))
@@ -1149,16 +1280,33 @@ CJsNode *JsParseClass(CJsInterp *ji)
 		node->c = JsParseAssign(ji); // superclass expr; JN_CLASS links prototypes
 	if (!JsEatPunct(ji, '{'))
 		return node;
-	while (!JsIsPunct(ji, '}') && JsTok(ji)->type != JT_EOF && !ji->has_err)
+	while (!JsIsPunct(ji, '}') && JsTok(ji)->type != JT_EOF && !ji->parse_err)
 	{
 		if (JsEatPunct(ji, ';'))
 		{ /* stray semicolons between members */ }
+		else if (JsIsKw(ji, "static") && ji->toks[ji->pos + 1].type == JT_PUNCT &&
+				 ji->toks[ji->pos + 1].punct == '{')
+		{ // `static { ... }` initialiser: balanced-skip. Its side effects are
+		  // lost; the member parser below would take '{' as a bad member name
+		  // and abandon the class.
+			ji->pos += 2;
+			dep = 1;
+			while (dep > 0 && JsTok(ji)->type != JT_EOF)
+			{
+				if (JsIsPunct(ji, '{'))
+					dep++;
+				else if (JsIsPunct(ji, '}'))
+					dep--;
+				ji->pos++;
+			}
+		}
 		else
 		{
 			// eat modifier keywords (static/async/get/set) when another member
 			// token follows, else the modifier IS the member name. get/set also
 			// mark the member as an accessor for the prototype object.
 			acc = 0;
+			stat = FALSE;
 			while (JsTok(ji)->type == JT_IDENT &&
 				   (!StrCompare(JsTok(ji)->str, "static") ||
 					!StrCompare(JsTok(ji)->str, "async") ||
@@ -1174,6 +1322,8 @@ CJsNode *JsParseClass(CJsInterp *ji)
 					acc = 1;
 				else if (!StrCompare(JsTok(ji)->str, "set"))
 					acc = 2;
+				else if (!StrCompare(JsTok(ji)->str, "static"))
+					stat = TRUE;
 				ji->pos++;
 			}
 			JsEatPunct(ji, '*'); // generator method
@@ -1182,7 +1332,7 @@ CJsNode *JsParseClass(CJsInterp *ji)
 			{ // computed member name [expr]() - name discarded
 				JsParseAssign(ji);
 				if (!JsEatPunct(ji, ']'))
-					JsErr(ji, "expected ] in class member");
+					JsParseErr(ji, "expected ] in class member");
 				item->str = "_computed";
 			}
 			else
@@ -1190,7 +1340,7 @@ CJsNode *JsParseClass(CJsInterp *ji)
 				t = JsTok(ji);
 				if (t->type != JT_IDENT && t->type != JT_STR && t->type != JT_NUM)
 				{
-					JsErr(ji, "bad class member");
+					JsParseErr(ji, "bad class member");
 					break;
 				}
 				ji->pos++;
@@ -1199,8 +1349,9 @@ CJsNode *JsParseClass(CJsInterp *ji)
 				else
 					item->str = t->str;
 			}
-			if (acc)
-				item->op = acc; // get/set member: JN_CLASS builds an accessor
+			item->op = acc; // 1 get / 2 set: JN_CLASS builds an accessor
+			if (stat)
+				item->op += 4; // op 4/5/6: member of the constructor
 			if (JsIsPunct(ji, '('))
 				item->a = JsParseFunc(ji, FALSE); // method (params){body}
 			else
@@ -1221,67 +1372,11 @@ CJsNode *JsParseClass(CJsInterp *ji)
 	return node;
 }
 
-// Readable names for multi-char puncts JP_EQ2(256)..JP_INSTOF(289), for logs.
-U8 *jp_desc[34] = {
-	"==", "!=", "===", "!==", "<=", ">=", "&&", "||", "++", "--",
-	"+=", "-=", "*=", "/=", "%=", "=>", "...", "?.", "??", "<<",
-	">>", ">>>", "**", "&&=", "||=", "??=", "&=", "|=", "^=", "<<=",
-	">>=", "**=", "in", "instanceof"
-};
-
-U0 JsSrcSnippet(CJsInterp *ji, I64 pos, U8 *out)
-{ // ~56 chars of RAW source at token `pos` - pinpoints the exact failing construct
-  // (token-window logs only show where recovery lands, not the root). out >= 64.
-	U8	*s;
-	I64	 i;
-	out[0] = 0;
-	if (!ji->src_text || pos < 0 || pos >= ji->tok_count)
-		return;
-	s = ji->src_text + ji->toks[pos].src;
-	for (i = 0; i < 56 && s[i] && s[i] != '\n'; i++)
-	{
-		if (s[i] == 0x24)
-			out[i] = '?'; // dollar = live DolDoc command in the log
-		else
-			out[i] = s[i];
-	}
-	out[i] = 0;
-}
-
-U0 JsTokDesc(CJsInterp *ji, I64 idx, U8 *out)
-{ // short printable form of one token, for parse diagnostics. out >= 16 bytes.
-	CJsTok *t;
-	I64		n;
-
-	out[0] = 0;
-	if (idx < 0 || idx >= ji->tok_count)
-		return;
-	t = &ji->toks[idx];
-	if (t->type == JT_IDENT || t->type == JT_STR)
-	{
-		n = StrLen(t->str);
-		if (n > 12)
-			n = 12;
-		MemCopy(out, t->str, n);
-		out[n] = 0;
-	}
-	else if (t->type == JT_NUM)
-		StrPrint(out, "%d", ToI64(t->num));
-	else if (t->type == JT_REGEX)
-		StrPrint(out, "/re/");
-	else if (t->punct < 256)
-		StrPrint(out, "%c", t->punct);
-	else if (t->punct >= JP_EQ2 && t->punct <= JP_INSTOF)
-		StrCopy(out, jp_desc[t->punct - JP_EQ2]); // readable multi-char op
-	else
-		StrPrint(out, "#%d", t->punct);
-}
-
 CJsNode *JsParsePrimary(CJsInterp *ji)
 {
 	CJsTok	*t = JsTok(ji);
-	CJsNode *node, *item, *tail, *supcall, *dflt;
-	U8		 numkey[24], embuf[96], emtk[16];
+	CJsNode *node, *item, *tail, *supcall, *dflt, *wrap;
+	U8		 numkey[24], embuf[224], emtk[32];
 	I64		 emk, open_pos;
 	I64		 acc; // object-literal accessor kind: 0 none, 1 get, 2 set
 
@@ -1328,9 +1423,47 @@ CJsNode *JsParsePrimary(CJsInterp *ji)
 					ji->pos++;		// eat 'target'
 				return JsNode(ji, JN_UNDEFLIT);
 			}
-			// real construction: JN_CALL sees the JN_NEW wrapper and constructs
+			// `new MemberExpression Arguments`: the whole a.b.C chain and the
+			// argument list belong to the new-expression, so both are absorbed
+			// here. Left to the postfix loop, `new a.b.C()` constructs `a` and
+			// reads .b.C off the result.
 			node = JsNode(ji, JN_NEW);
 			node->a = JsParsePrimary(ji);
+			while (node->a && !ji->parse_err)
+			{
+				if (JsEatPunct(ji, '.'))
+				{
+					t = JsTok(ji);
+					if (t->type != JT_IDENT)
+					{
+						JsParseErr(ji, "expected name after .");
+						return node;
+					}
+					ji->pos++;
+					wrap = JsNode(ji, JN_MEMBER);
+					wrap->a	  = node->a;
+					wrap->str = t->str;
+					node->a = wrap;
+				}
+				else if (JsEatPunct(ji, '['))
+				{
+					wrap = JsNode(ji, JN_INDEX);
+					wrap->a = node->a;
+					wrap->b = JsParseExpr(ji);
+					if (!JsEatPunct(ji, ']'))
+						JsParseErr(ji, "expected ] in new");
+					node->a = wrap;
+				}
+				else
+					break;
+			}
+			if (JsEatPunct(ji, '('))
+			{ // built here, not by the postfix loop, so JN_CALL sees JN_NEW
+				supcall = JsNode(ji, JN_CALL);
+				supcall->a = node;
+				supcall->b = JsParseArgs(ji); // eats ')'
+				return supcall;
+			}
 			return node;
 		}
 		if (JsEatKw(ji, "true"))
@@ -1386,25 +1519,21 @@ CJsNode *JsParsePrimary(CJsInterp *ji)
 		if (!JsEatPunct(ji, ')'))
 		{ // desync RECOVERY: balanced-skip to this group's ) instead of a hard
 		  // abort, and log the window so the offending construct is identifiable.
-			StrPrint(embuf, "paren@%d:", ji->pos);
-			for (emk = ji->pos - 4; emk <= ji->pos + 2 && StrLen(embuf) < 84; emk++)
+			if (++js_parse_errs <= 12)
 			{
-				if (emk >= 0)
-				{
-					JsTokDesc(ji, emk, emtk);
-					CatPrint(embuf, " %s", emtk);
-				}
-			}
-			for (emk = 0; embuf[emk]; emk++)
-				if (embuf[emk] == 0x24)
-					embuf[emk] = '?';
-			if (++js_soft_errs <= 12)
-			{
+				StrPrint(embuf, "paren@%d: no ) at '", ji->pos);
+				JsTokDesc(ji, ji->pos, emtk);
+				CatPrint(embuf, "%s' after '", emtk);
+				JsTokDesc(ji, ji->pos - 1, emtk);
+				CatPrint(embuf, "%s'", emtk);
+				JsScrub(embuf);
 				JsConsoleAdd("parse", embuf);
 				NetLog("JS: %s", embuf);
-				JsSrcSnippet(ji, open_pos, embuf);
+				JsSrcWindow(ji, open_pos, embuf);
+				JsConsoleAdd("parse", embuf);
 				NetLog("JS:  open( at: %s", embuf); // the unclosed '(' = the ROOT
-				JsSrcSnippet(ji, ji->pos, embuf);
+				JsSrcWindow(ji, ji->pos, embuf);
+				JsConsoleAdd("parse", embuf);
 				NetLog("JS:  stop@: %s", embuf); // where ')' was expected
 			}
 			emk = 1;
@@ -1440,7 +1569,7 @@ CJsNode *JsParsePrimary(CJsInterp *ji)
 				else
 					item = JsParseAssign(ji);
 				if (!item)
-					return node;
+					break; // fall into the ']' recovery below
 				if (tail)
 					tail->next = item;
 				else
@@ -1506,13 +1635,13 @@ CJsNode *JsParsePrimary(CJsInterp *ji)
 					item = JsNode(ji, JN_PROP);
 					item->b = JsParseAssign(ji);
 					if (!JsEatPunct(ji, ']'))
-						JsErr(ji, "expected ] in computed key");
+						JsParseErr(ji, "expected ] in computed key");
 					if (JsEatPunct(ji, ':'))
 						item->a = JsParseAssign(ji);
 					else if (JsIsPunct(ji, '('))
 						item->a = JsParseFunc(ji, FALSE);
 					else
-						JsErr(ji, "expected : after computed key");
+						JsParseErr(ji, "expected : after computed key");
 				}
 				else
 				{
@@ -1532,8 +1661,8 @@ CJsNode *JsParsePrimary(CJsInterp *ji)
 					}
 					else
 					{
-						JsErr(ji, "bad object key");
-						return node;
+						JsParseErr(ji, "bad object key");
+						break; // fall into the '}' recovery below
 					}
 					if (JsEatPunct(ji, ':'))
 						item->a = JsParseAssign(ji);
@@ -1586,29 +1715,30 @@ CJsNode *JsParsePrimary(CJsInterp *ji)
 	// SOFT error: skip the token and keep parsing. One unrecognized construct
 	// must not kill a 400KB bundle - the damage stays local to this expression
 	// (callers treat the NULL as an empty node; JsRun's anti-stall advances).
-	// Log a WINDOW of surrounding tokens so the exact construct is identifiable.
-	StrPrint(embuf, "skip@%d:", ji->pos);
-	emk = ji->pos - 4;
-	if (emk < 0)
-		emk = 0;
-	while (emk <= ji->pos + 3 && StrLen(embuf) < 84)
+	// Three lines: the token window, then the raw source around the offset with
+	// the failing byte marked. The window says where recovery landed, the
+	// source says what construct produced it.
+	if (++js_parse_errs <= 12)
 	{
-		JsTokDesc(ji, emk, emtk);
-		if (emk == ji->pos)
-			CatPrint(embuf, " >%s<", emtk);
-		else
-			CatPrint(embuf, " %s", emtk);
-		emk++;
-	}
-	for (emk = 0; embuf[emk]; emk++)
-		if (embuf[emk] == 0x24)
-			embuf[emk] = '?'; // dollars are live DolDoc commands in the log
-	if (++js_soft_errs <= 12)
-	{
+		StrPrint(embuf, "skip@%d:", ji->pos);
+		emk = ji->pos - 5;
+		if (emk < 0)
+			emk = 0;
+		while (emk <= ji->pos + 4 && StrLen(embuf) < 150)
+		{
+			JsTokDesc(ji, emk, emtk);
+			if (emk == ji->pos)
+				CatPrint(embuf, " >%s<", emtk);
+			else
+				CatPrint(embuf, " %s", emtk);
+			emk++;
+		}
+		JsScrub(embuf);
 		JsConsoleAdd("parse", embuf);
 		NetLog("JS: %s", embuf);
-		JsSrcSnippet(ji, ji->pos, embuf);
-		NetLog("JS:  src: %s", embuf); // raw source at the desync
+		JsSrcWindow(ji, ji->pos, embuf);
+		JsConsoleAdd("parse", embuf);
+		NetLog("JS:  src: %s", embuf); // raw source around the desync
 	}
 	ji->pos++;
 
@@ -1622,7 +1752,7 @@ CJsNode *JsParsePostfix(CJsInterp *ji)
 	Bool	 going = TRUE;
 	I64		 dep;
 
-	while (node && going && !ji->has_err)
+	while (node && going && !ji->parse_err)
 	{
 		if (JsEatPunct(ji, JP_OPTCHAIN))
 		{ // a?.b: approximated as a.b (member-get on undef already yields undef,
@@ -1643,7 +1773,7 @@ CJsNode *JsParsePostfix(CJsInterp *ji)
 			t = JsTok(ji);
 			if (t->type != JT_IDENT)
 			{
-				JsErr(ji, "expected name after .");
+				JsParseErr(ji, "expected name after .");
 				return node;
 			}
 			ji->pos++;
@@ -1705,7 +1835,7 @@ CJsNode *JsParseUnary(CJsInterp *ji)
 
 	if (ji->depth > 80)
 	{
-		JsErr(ji, "expression too deep");
+		JsParseErr(ji, "expression too deep");
 		ji->pos++;
 		return NULL;
 	}
@@ -1800,7 +1930,7 @@ CJsNode *JsParseBinLevel(CJsInterp *ji, I64 level)
 	else
 		node = JsParseBinLevel(ji, level - 1);
 
-	while (node && going && !ji->has_err)
+	while (node && going && !ji->parse_err)
 	{
 		op = -1;
 		if (level == 4 && JsTok(ji)->type == JT_IDENT)
@@ -1894,7 +2024,7 @@ CJsNode *JsParseCond(CJsInterp *ji)
 		wrap->a = node;
 		wrap->b = JsParseAssign(ji);
 		if (!JsEatPunct(ji, ':'))
-			JsErr(ji, "expected : in ?:");
+			JsParseErr(ji, "expected : in ?:");
 		wrap->c = JsParseAssign(ji);
 		node = wrap;
 	}
@@ -2073,6 +2203,9 @@ CJsNode *JsParseBlock(CJsInterp *ji)
 	{
 		before = ji->pos;
 		stmt = JsParseStmt(ji);
+		if (ji->parse_err)
+			JsParseResync(ji); // keep the partial statement: a half-parsed
+							   // function declaration still DEFINES the name
 		if (stmt)
 		{
 			if (tail)
@@ -2104,13 +2237,13 @@ CJsNode *JsParseFunc(CJsInterp *ji, Bool need_name)
 	}
 	else if (need_name)
 	{
-		JsErr(ji, "function needs a name");
+		JsParseErr(ji, "function needs a name");
 		return NULL;
 	}
 
 	if (!JsEatPunct(ji, '('))
 	{
-		JsErr(ji, "expected ( after function");
+		JsParseErr(ji, "expected ( after function");
 		return node;
 	}
 	if (!JsEatPunct(ji, ')'))
@@ -2139,7 +2272,7 @@ CJsNode *JsParseFunc(CJsInterp *ji, Bool need_name)
 				t = JsTok(ji);
 				if (t->type != JT_IDENT)
 				{
-					JsErr(ji, "bad parameter");
+					JsParseErr(ji, "bad parameter");
 					return node;
 				}
 				ji->pos++;
@@ -2158,11 +2291,11 @@ CJsNode *JsParseFunc(CJsInterp *ji, Bool need_name)
 		}
 		while (JsEatPunct(ji, ','));
 		if (!JsEatPunct(ji, ')'))
-			JsErr(ji, "expected ) after params");
+			JsParseErr(ji, "expected ) after params");
 	}
 	if (!JsEatPunct(ji, '{'))
 	{
-		JsErr(ji, "expected { in function");
+		JsParseErr(ji, "expected { in function");
 		return node;
 	}
 	node->b = JsParseBlock(ji);
@@ -2214,7 +2347,7 @@ CJsNode *JsParseVar(CJsInterp *ji)
 		{
 			if (t->type != JT_IDENT)
 			{
-				JsErr(ji, "bad var name");
+				JsParseErr(ji, "bad var name");
 				return node;
 			}
 			ji->pos++;
@@ -2289,10 +2422,10 @@ CJsNode *JsParseStmt(CJsInterp *ji)
 	{
 		node = JsNode(ji, JN_IF);
 		if (!JsEatPunct(ji, '('))
-			JsErr(ji, "expected ( after if");
+			JsParseErr(ji, "expected ( after if");
 		node->a = JsParseExpr(ji);
 		if (!JsEatPunct(ji, ')'))
-			JsErr(ji, "expected ) after if");
+			JsParseErr(ji, "expected ) after if");
 		node->b = JsParseStmt(ji);
 		if (JsEatKw(ji, "else"))
 			node->c = JsParseStmt(ji);
@@ -2302,18 +2435,19 @@ CJsNode *JsParseStmt(CJsInterp *ji)
 	{
 		node = JsNode(ji, JN_WHILE);
 		if (!JsEatPunct(ji, '('))
-			JsErr(ji, "expected ( after while");
+			JsParseErr(ji, "expected ( after while");
 		node->a = JsParseExpr(ji);
 		if (!JsEatPunct(ji, ')'))
-			JsErr(ji, "expected ) after while");
+			JsParseErr(ji, "expected ) after while");
 		node->b = JsParseStmt(ji);
 		return node;
 	}
 	if (JsEatKw(ji, "for"))
 	{
 		node = JsNode(ji, JN_FOR);
+		JsEatKw(ji, "await"); // for await (x of y): our async is synchronous
 		if (!JsEatPunct(ji, '('))
-			JsErr(ji, "expected ( after for");
+			JsParseErr(ji, "expected ( after for");
 		// for ( [var|let|const] binding of|in iterable ) body
 		// binding may be a plain name OR a destructuring pattern [i,o] / {a,b}
 		k = ji->pos;
@@ -2363,7 +2497,7 @@ CJsNode *JsParseStmt(CJsInterp *ji)
 			ji->pos = k + 1;
 			node->a = JsParseAssign(ji);
 			if (!JsEatPunct(ji, ')'))
-				JsErr(ji, "expected ) after for-of");
+				JsParseErr(ji, "expected ) after for-of");
 			node->d = JsParseStmt(ji);
 			return node;
 		}
@@ -2394,7 +2528,7 @@ CJsNode *JsParseStmt(CJsInterp *ji)
 		if (!JsIsPunct(ji, ')'))
 			node->c = JsParseExpr(ji);
 		if (!JsEatPunct(ji, ')'))
-			JsErr(ji, "expected ) after for");
+			JsParseErr(ji, "expected ) after for");
 		node->d = JsParseStmt(ji);
 		return node;
 	}
@@ -2426,10 +2560,10 @@ CJsNode *JsParseStmt(CJsInterp *ji)
 		node = JsNode(ji, JN_DO);
 		node->a = JsParseStmt(ji);
 		if (!JsEatKw(ji, "while") || !JsEatPunct(ji, '('))
-			JsErr(ji, "expected while ( after do body");
+			JsParseErr(ji, "expected while ( after do body");
 		node->b = JsParseExpr(ji);
 		if (!JsEatPunct(ji, ')'))
-			JsErr(ji, "expected ) after do-while");
+			JsParseErr(ji, "expected ) after do-while");
 		JsEatPunct(ji, ';');
 		return node;
 	}
@@ -2437,14 +2571,14 @@ CJsNode *JsParseStmt(CJsInterp *ji)
 	{
 		node = JsNode(ji, JN_SWITCH);
 		if (!JsEatPunct(ji, '('))
-			JsErr(ji, "expected ( after switch");
+			JsParseErr(ji, "expected ( after switch");
 		node->a = JsParseExpr(ji);
 		if (!JsEatPunct(ji, ')'))
-			JsErr(ji, "expected ) after switch");
+			JsParseErr(ji, "expected ) after switch");
 		if (!JsEatPunct(ji, '{'))
-			JsErr(ji, "expected { after switch");
+			JsParseErr(ji, "expected { after switch");
 		mtail = NULL;
-		while (!ji->has_err && !JsEatPunct(ji, '}') && JsTok(ji)->type != JT_EOF)
+		while (!ji->parse_err && !JsEatPunct(ji, '}') && JsTok(ji)->type != JT_EOF)
 		{
 			item = JsNode(ji, JN_CASE);
 			if (JsEatKw(ji, "default"))
@@ -2453,13 +2587,13 @@ CJsNode *JsParseStmt(CJsInterp *ji)
 				item->a = JsParseExpr(ji);
 			else
 			{
-				JsErr(ji, "expected case/default in switch");
+				JsParseErr(ji, "expected case/default in switch");
 				return node;
 			}
 			if (!JsEatPunct(ji, ':'))
-				JsErr(ji, "expected : after case");
+				JsParseErr(ji, "expected : after case");
 			ctail = NULL;
-			while (!ji->has_err && !JsIsKw(ji, "case") && !JsIsKw(ji, "default") &&
+			while (!ji->parse_err && !JsIsKw(ji, "case") && !JsIsKw(ji, "default") &&
 				   !JsIsPunct(ji, '}') && JsTok(ji)->type != JT_EOF)
 			{
 				stmt2 = JsParseStmt(ji);
@@ -2882,8 +3016,10 @@ CJsVal *JsMemberGet(CJsInterp *ji, CJsVal *obj, U8 *name)
 		}
 		return JsMemberGet(ji, tgt, name); // no trap: forward
 	}
-	if (obj->type == JV_OBJ || obj->type == JV_ARR)
-	{
+	if (obj->type == JV_OBJ || obj->type == JV_ARR ||
+		obj->type == JV_FUNC || obj->type == JV_NATIVE)
+	{ // JV_FUNC/JV_NATIVE too: `static get x()` and Object.defineProperty on a
+	  // constructor put accessors on a function object
 		acc = JsAccessorFind(obj, name);
 		if (acc && acc->getter)
 			return JsCall(ji, acc->getter(CJsVal *), obj, NULL, 0);
@@ -3576,6 +3712,24 @@ U0 JsMemberSet(CJsInterp *ji, CJsVal *obj, U8 *name, CJsVal *val)
 	U8	   *s;
 	U8		kebab[64], style_buf[512];
 
+	if (obj->type == JV_FUNC || obj->type == JV_NATIVE)
+	{ // functions carry ordinary properties: statics (Ctor.of = fn), namespaces
+	  // (new Ctor.Inner()), polyfills (Array.from = fn) and the ES5 inheritance
+	  // idiom Ctor.prototype = Object.create(Base.prototype). None of the DOM
+	  // handling below applies to them.
+		acc = JsAccessorFind(obj, name);
+		if (acc)
+		{
+			if (acc->setter)
+			{
+				targs[0] = val;
+				JsCall(ji, acc->setter(CJsVal *), obj, targs, 1);
+			}
+			return;
+		}
+		JsPropSet(ji, obj, name, val);
+		return;
+	}
 	if (obj->type != JV_OBJ)
 		return;
 
@@ -3927,6 +4081,98 @@ U8 *JsCtorName(CJsNode *n)
 	return "(expr)";
 }
 
+U8 *JsTypeTag(CJsVal *v)
+{ // JV_* tag of a value, for the not-callable diagnostics
+	if (!v)
+		return "NOVAL";
+	switch [v->type]
+	{
+		case JV_UNDEF:	return "UNDEF";
+		case JV_NULL:	return "NULL";
+		case JV_BOOL:	return "BOOL";
+		case JV_NUM:	return "NUM";
+		case JV_STR:	return "STR";
+		case JV_FUNC:	return "FUNC";
+		case JV_NATIVE:	return "NATIVE";
+		case JV_OBJ:	return "OBJ";
+		case JV_ARR:	return "ARR";
+	}
+	return "?";
+}
+
+U0 JsWhy(CJsInterp *ji, CJsNode *tgt, CJsVal *v, U8 *out)
+{ // How the target was reached and what it resolved to. "ident unbound" (no
+  // binding in any scope) and "ident UNDEF" (bound, holds undefined) are
+  // different bugs: the first is a missing declaration or a lost hoist, the
+  // second a declaration that ran and produced nothing. For an object, ctor
+  // and proto say whether it at least LOOKS constructible.
+	CJsVal *ctor, *proto;
+	U8	   *how = "expr";
+	U8		cf, pf;
+
+	if (tgt && tgt->type == JN_IDENT)
+	{
+		how = "ident";
+		if (!JsEnvGet(ji, tgt->str))
+		{
+			StrCopy(out, "ident unbound");
+			return;
+		}
+	}
+	else if (tgt && tgt->type == JN_MEMBER)
+		how = "member";
+	else if (tgt && tgt->type == JN_INDEX)
+		how = "index";
+	else if (tgt && tgt->type == JN_CALL)
+		how = "callres";
+	if (v && v->type == JV_OBJ)
+	{
+		cf = '-';
+		pf = '-';
+		ctor  = JsPropGet(v, "constructor");
+		proto = JsPropGet(v, "prototype");
+		if (ctor && (ctor->type == JV_FUNC || ctor->type == JV_NATIVE))
+			cf = 'f';
+		else if (ctor)
+			cf = 'x';
+		if (proto && proto->type == JV_OBJ)
+			pf = 'o';
+		else if (proto)
+			pf = 'x';
+		StrPrint(out, "%s OBJ nid=%d ctor=%c proto=%c", how, v->native_id, cf, pf);
+		return;
+	}
+	StrPrint(out, "%s %s", how, JsTypeTag(v));
+}
+
+U0 JsNotCallableWarn(CJsInterp *ji, U8 *kind, CJsNode *tgt, U8 *name,
+					 CJsVal *v, CJsVal *base)
+{
+	U8 buf[192], why[96];
+
+	if (++js_soft_errs > 24)
+		return;
+	JsWhy(ji, tgt, v, why);
+	StrPrint(buf, "%s '%s': %s", kind, name, why);
+	if (base)
+		CatPrint(buf, " base=%s:%d", JsTypeTag(base), base->native_id);
+	JsScrub(buf);
+	JsConsoleAdd("warn", buf);
+	NetLog("JS: %s", buf);
+}
+
+U0 JsArgClipWarn(U8 *name)
+{ // arguments past JS_MAX_ARGS are dropped, not passed as undefined
+	U8 buf[192];
+
+	if (++js_soft_errs > 24)
+		return;
+	StrPrint(buf, "args clipped at %d: %s", JS_MAX_ARGS, name);
+	JsScrub(buf);
+	JsConsoleAdd("warn", buf);
+	NetLog("JS: %s", buf);
+}
+
 Bool JsArrMethod(U8 *nm)
 { // methods that normally return an ARRAY - when the call target is missing we
   // soft-return [] (not undefined) so a minified chain x.slice().map().filter()
@@ -3969,23 +4215,26 @@ CJsNode *JsSynthSuperCtor(CJsInterp *ji)
 	return fnode;
 }
 
-CJsVal *JsConstruct(CJsInterp *ji, CJsVal *fn, CJsVal **args, I64 argc, U8 *name)
-{ // new-expression: fresh object, prototype link, constructor call with this
+CJsVal *JsConstruct(CJsInterp *ji, CJsVal *fn, CJsVal **args, I64 argc,
+					CJsNode *tgt, U8 *name)
+{ // new-expression: fresh object, prototype link, constructor call with this.
+  // tgt is the constructor's AST node (may be NULL); it only feeds the
+  // diagnostic, which needs to tell an unbound name from a bound undefined.
 	CJsVal *obj, *pr, *r;
-	U8		buf[80];
-	I64		i;
 
+	if (fn && fn->type == JV_NATIVE && fn->native_id == JSN_FN_BOUND)
+	{ // a bound function is a constructor: [[Construct]] forwards to the
+	  // target and the bound this is discarded.
+		pr = JsPropGet(fn, "_t");
+		if (pr)
+			return JsConstruct(ji, pr, args, argc, tgt, name);
+	}
 	if (!fn || (fn->type != JV_FUNC && fn->type != JV_NATIVE))
 	{ // pragmatic leniency: `new <non-constructor>` yields a fresh empty object
 	  // instead of aborting the whole bundle. Minified code news up refs that
 	  // resolve to undefined/polyfills; a hard throw killed the entire script
 	  // (grok/chatgpt: "'e' is not a constructor" took the page down). Log it.
-		StrPrint(buf, "new: '%s' not a constructor (soft {})", name);
-		for (i = 0; buf[i]; i++)
-			if (buf[i] == 0x24)
-				buf[i] = '?';
-		JsConsoleAdd("warn", buf);
-		NetLog("%s", buf);
+		JsNotCallableWarn(ji, "new", tgt, name, fn, NULL);
 		return JsValNew(ji, JV_OBJ);
 	}
 	obj = JsValNew(ji, JV_OBJ);
@@ -4236,7 +4485,7 @@ CJsVal *JsEval(CJsInterp *ji, CJsNode *node)
 	CJsNode *child, *item, *stmp;
 	CJsProp *prp;
 	I64		 i, argc, op, k;
-	U8		 one[2], nmbuf[80];
+	U8		 one[2];
 
 	if (!node || ji->has_err)
 		return JsUndefV(ji);
@@ -4537,7 +4786,10 @@ CJsVal *JsEval(CJsInterp *ji, CJsNode *node)
 					}
 					child = child->next;
 				}
-				return JsConstruct(ji, fn, argv, argc, JsCtorName(node->a->a));
+				if (child)
+					JsArgClipWarn(JsCtorName(node->a->a));
+				return JsConstruct(ji, fn, argv, argc, node->a->a,
+								   JsCtorName(node->a->a));
 			}
 			if (node->a && node->a->type == JN_SUPER)
 			{ // super(args): the PARENT constructor run against the SAME `this`,
@@ -4600,24 +4852,13 @@ CJsVal *JsEval(CJsInterp *ji, CJsNode *node)
 				}
 				child = child->next;
 			}
+			if (child)
+				JsArgClipWarn(JsCtorName(node->a));
 			if (!fn || (fn->type != JV_FUNC && fn->type != JV_NATIVE))
 			{ // SOFT: log which member/global is missing, but return undefined and
 			  // keep running (a?.b(), optional calls, and unknown APIs stay local).
-				StrPrint(nmbuf, "not a function: %s", JsCtorName(node->a));
-				for (i = 0; nmbuf[i]; i++)
-					if (nmbuf[i] == 0x24)
-						nmbuf[i] = '?';
-				if (++js_soft_errs <= 12)
-				{
-					if (obj)
-						NetLog("JS: %s (obj t=%d nid=%d)",
-							   nmbuf, obj->type, obj->native_id);
-					else
-					{
-						JsConsoleAdd("warn", nmbuf);
-						NetLog("JS: %s", nmbuf);
-					}
-				}
+				JsNotCallableWarn(ji, "call", node->a, JsCtorName(node->a),
+								  fn, obj);
 				if (JsArrMethod(JsCtorName(node->a)))
 					return JsValNew(ji, JV_ARR); // keep array chains alive
 				return JsUndefV(ji);
@@ -4788,7 +5029,7 @@ CJsVal *JsEval(CJsInterp *ji, CJsNode *node)
 			return JsEval(ji, node->a);
 		case JN_NEW: // new X (no argument parens)
 			fn = JsEval(ji, node->a);
-			return JsConstruct(ji, fn, NULL, 0, JsCtorName(node->a));
+			return JsConstruct(ji, fn, NULL, 0, node->a, JsCtorName(node->a));
 		case JN_THROW:
 			ji->exc = JsEval(ji, node->a);
 			ji->flow = JF_THROW;
@@ -4942,6 +5183,11 @@ CJsVal *JsEval(CJsInterp *ji, CJsNode *node)
 			child = node->a;
 			while (child)
 			{
+				if (child->op >= 4)
+				{ // static: applied below, once the constructor exists
+					child = child->next;
+					goto js_class_next;
+				}
 				fn = JsEval(ji, child->a); // JN_FUNC: closure value
 				if (child->op == 1)
 				{ // get x() on the prototype: fires for every instance through
@@ -4971,18 +5217,115 @@ js_class_next:;
 				v->func = stmp(U64);
 				v->fenv = ji->env(U64); // the class env, for %superctor
 			}
-			ji->env = saved_env;
 			if (!v)
 				v = JsNativeV(ji, JSN_EVT_NOOP); // default empty constructor
 			JsPropSet(ji, v, "prototype", obj);
 			if (sv)
 				v->proto = sv; // static members inherit too (Dog.fromName etc)
+			child = node->a;
+			while (child)
+			{ // statics belong to the constructor, not the prototype. Still in
+			  // the class env, so a static method closes over %superctor.
+				if (child->op >= 4)
+				{
+					fn = JsEval(ji, child->a);
+					if (child->op == 5)
+						JsAccessorDefine(ji, v, child->str, fn, NULL);
+					else if (child->op == 6)
+						JsAccessorDefine(ji, v, child->str, NULL, fn);
+					else
+						JsPropSet(ji, v, child->str, fn);
+				}
+				child = child->next;
+			}
+			ji->env = saved_env;
 			if (node->str)
 				JsEnvDeclare(ji, ji->env, node->str, v);
 			return v;
 	}
 
 	return JsUndefV(ji);
+}
+
+/* ---- function-declaration hoisting ----
+   A `function f(){}` statement binds f for the WHOLE enclosing function or
+   script, not from the statement onwards. Evaluating declarations in source
+   order leaves every forward reference undefined, which surfaces as
+   "new 'f': ident unbound" on the first minified bundle that calls a helper
+   declared below its use. JsCall hoists a callee's body on entry and JsRunEx
+   hoists the top level; nested function bodies are therefore reached exactly
+   once, when they run. Block-level declarations bind at function scope
+   (Annex B), which is what unannotated bundles expect. */
+
+extern Bool JsHoistList(CJsInterp *ji, CJsNode *list, CJsEnv *env);
+
+Bool JsHoistStmt(CJsInterp *ji, CJsNode *n, CJsEnv *env)
+{ // one statement: descends into the forms that can hold a declaration, never
+  // into a nested function body. TRUE when it bound at least one name.
+	CJsEnv	*saved;
+	CJsNode *c;
+	Bool	 any = FALSE;
+
+	if (!n)
+		return FALSE;
+	if (n->type == JN_FUNC)
+	{
+		if (!n->str)
+			return FALSE; // function expression: nothing to bind here
+		saved = ji->env;
+		ji->env = env;
+		JsEval(ji, n); // JN_FUNC declares the name and captures env as closure
+		ji->env = saved;
+		return TRUE;
+	}
+	if (n->type == JN_BLOCK)
+		any = JsHoistList(ji, n->a, env);
+	else if (n->type == JN_IF)
+	{
+		any = JsHoistStmt(ji, n->b, env);
+		if (JsHoistStmt(ji, n->c, env))
+			any = TRUE;
+	}
+	else if (n->type == JN_WHILE)
+		any = JsHoistStmt(ji, n->b, env);
+	else if (n->type == JN_DO)
+		any = JsHoistStmt(ji, n->a, env);
+	else if (n->type == JN_FOR || n->type == JN_FOROF)
+		any = JsHoistStmt(ji, n->d, env);
+	else if (n->type == JN_TRY)
+	{
+		any = JsHoistStmt(ji, n->a, env);
+		if (JsHoistStmt(ji, n->b, env))
+			any = TRUE;
+		if (JsHoistStmt(ji, n->c, env))
+			any = TRUE;
+	}
+	else if (n->type == JN_SWITCH)
+	{
+		c = n->b;
+		while (c)
+		{
+			if (JsHoistList(ji, c->b, env))
+				any = TRUE;
+			c = c->next;
+		}
+	}
+
+	return any;
+}
+
+Bool JsHoistList(CJsInterp *ji, CJsNode *list, CJsEnv *env)
+{
+	Bool any = FALSE;
+
+	while (list && !ji->has_err)
+	{
+		if (JsHoistStmt(ji, list, env))
+			any = TRUE;
+		list = list->next;
+	}
+
+	return any;
 }
 
 /* ---- calls ---- */
@@ -6460,6 +6803,15 @@ CJsVal *JsCall(CJsInterp *ji, CJsVal *fn, CJsVal *this_val,
 		param = param->next;
 		i++;
 	}
+	// func->op caches the scan: a hot callee must not re-walk its whole body on
+	// every call just to discover it declares nothing.
+	if (func->b && func->b->type == JN_BLOCK && func->op != 2)
+	{
+		if (JsHoistList(ji, func->b->a, call_env))
+			func->op = 1;
+		else
+			func->op = 2;
+	}
 	ji->ret_val = NULL;
 
 	JsEval(ji, func->b);
@@ -6850,7 +7202,7 @@ Bool JsRunEx(CJsInterp *ji, U8 *src, CJsVal **_last)
   // _last, when given, receives the value of the last statement that completed
   // normally - that is what a REPL echoes back. NULL for a script that ended on
   // a throw, an empty source, or a lex failure.
-	CJsNode *stmt;
+	CJsNode *stmt, *head, *tail;
 	CJsVal	*val;
 	I64		 before;
 
@@ -6865,11 +7217,13 @@ Bool JsRunEx(CJsInterp *ji, U8 *src, CJsVal **_last)
 	}
 
 	ji->has_err = FALSE;
+	ji->parse_err = FALSE;
 	ji->steps	= 0;
 	ji->depth	= 0;
 	ji->flow	= JF_NORMAL;
 	ji->env		= ji->genv;
-	js_soft_errs = 0; // fresh soft-error log budget per script
+	js_soft_errs  = 0; // fresh log budgets per script
+	js_parse_errs = 0;
 
 	if (!JsLex(ji, src))
 	{
@@ -6882,25 +7236,25 @@ Bool JsRunEx(CJsInterp *ji, U8 *src, CJsVal **_last)
 		return FALSE;
 	}
 
-	while (JsTok(ji)->type != JT_EOF && !ji->has_err)
+	// Parse the whole script into one statement list before running any of it:
+	// hoisting needs every top-level declaration in hand, and a bundle's first
+	// statement routinely calls a function declared near the end.
+	head = NULL;
+	tail = NULL;
+	while (JsTok(ji)->type != JT_EOF)
 	{
 		before = ji->pos;
 		stmt = JsParseStmt(ji);
+		if (ji->parse_err)
+			JsParseResync(ji);
 		if (stmt)
 		{
-			val = JsEval(ji, stmt);
-			if (_last && ji->flow == JF_NORMAL)
-				*_last = val;
-		}
-		if (ji->flow == JF_THROW)
-		{ // the thrown value is what you actually want to see
-			if (ji->exc)
-				JsConsoleAdd("THROW", JsToStr(ji, ji->exc));
+			if (tail)
+				tail->next = stmt;
 			else
-				JsConsoleAdd("THROW", "uncaught exception");
-			NetLog("JS: uncaught exception."); // log, then keep executing
+				head = stmt;
+			tail = stmt;
 		}
-		ji->flow = JF_NORMAL; // stray top-level break/return/throw
 		if (ji->pos == before)
 			ji->pos++;
 	}
@@ -6910,6 +7264,26 @@ Bool JsRunEx(CJsInterp *ji, U8 *src, CJsVal **_last)
 	  // what makes big-bundle caps affordable (toks = 32B x source chars).
 		Free(ji->toks);
 		ji->toks = NULL;
+	}
+
+	JsHoistList(ji, head, ji->genv);
+
+	stmt = head;
+	while (stmt && !ji->has_err)
+	{
+		val = JsEval(ji, stmt);
+		if (_last && ji->flow == JF_NORMAL)
+			*_last = val;
+		if (ji->flow == JF_THROW)
+		{ // the thrown value is what you actually want to see
+			if (ji->exc)
+				JsConsoleAdd("THROW", JsToStr(ji, ji->exc));
+			else
+				JsConsoleAdd("THROW", "uncaught exception");
+			NetLog("JS: uncaught exception."); // log, then keep executing
+		}
+		ji->flow = JF_NORMAL; // stray top-level break/return/throw
+		stmt = stmt->next;
 	}
 
 	JsFlushWrites(ji);
