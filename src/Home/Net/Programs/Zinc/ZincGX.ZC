@@ -66,6 +66,10 @@
 #define ZGXM_V3			17
 #define ZGXM_MT			18
 
+//gx.lock_flags. See the field's declaration for the ordering rule.
+#define GXLKf_BUSY		0	//gx.ops is being rewritten
+#define GXLKf_DRAW		1	//GxDrawIt is inside its op walk
+
 //Scalable TrueType text via System/Gr/GrFont. FALSE => 8x8 bitmap fallback
 //(if the font file is missing). Set once at startup from grf_ui_font.ok.
 Bool zinc_ttf = FALSE;
@@ -91,6 +95,7 @@ class CGxOp
 	U8				*img_url;	//GXO_IMG: absolute URL (MAlloc'ed).
 	I64				 radius;	//GXO_WIDGET: border-radius px (-1 = unset).
 	Bool			 bold, ul, has_bg;
+	Bool			 sc_cached;	//GXO_BOX: sc is the image cache's, not this op's.
 	Bool			 cov;		//GXO_TEXT: sc is a COVERAGE DC (alpha in the top
 								//byte) - composite with GxBlotBlend, not GrBlot.
 	I16				 bg_px, bg_py, bg_sw, bg_sh;	//GXO_BOX: CSS background-position/size (CSS.ZC encoding).
@@ -102,12 +107,14 @@ class CGxOp
 	Bool			 pinned;						//position:fixed - ignores scroll.
 };
 
-//Decoded-image cache, keyed by absolute URL. Persists across relayout so we
+//Decoded-image cache, keyed by (url, w, h). Persists across relayout so we
 //fetch each image once. CDCs owned here, freed on page change.
 class CGxImg
 {
 	U8	*url;
 	CDC	*dc;		//NULL = fetched-and-failed (don't retry); absent = todo.
+	I64	 w, h;		//Render size of dc; 0 = the decoded source itself.
+	I64	 gen;		//gx.img_gen at the last layout that used this entry.
 	Bool fetched;
 };
 
@@ -180,16 +187,29 @@ class CGxGlobals
 	U8		 run[GX_RUN_MAX];
 	I64		 run_len, run_x, run_y, run_scale;
 	CZStyle	 run_style;
-	Bool	 run_link, busy; //busy: layout in flux; draw_it must not read ops.
+	Bool	 run_link;
+	//gx.ops, gx.op_count and every DC an op borrows (image cache, image view)
+	//are written only between GxOpsLock and GxOpsUnlock. GxDrawIt claims
+	//GXLKf_DRAW before it tests GXLKf_BUSY and drops it after its last op read,
+	//so either the lock waits the drawer out or the drawer paints chrome only.
+	//Both sides set with LBts: the locked op orders the store ahead of the load
+	//that follows it. Plain stores may sit in the store buffer past that load,
+	//which lets the main task and the WinMgr task both read a clear flag and
+	//both proceed.
+	I64		 lock_flags;
 	I64		 last_wheel;
 	U8		*pending_nav;	//StrNew'd target set by click handlers.
 	//Cancellable fetch: ZincLoad runs in a child task.
 	CTask	*load_task;
+	//Bumped when the main loop stops waiting on load_task. A fetch whose seq no
+	//longer matches publishes nothing.
+	I64		 fetch_seq;
 	U8		 load_url[256];
 	Bool	 loading, cancel;
 	//Image cache + async fetch.
 	CGxImg	 img[GX_IMG_CACHE];
 	I64		 img_count;
+	I64		 img_gen;		//Bumped per GxLayout; stamps cache entries in use.
 	CTask	*img_task;
 	Bool	 img_dirty;		//An image finished; relayout wanted.
 	Bool	 img_busy;		//Img task is mid fetch/decode; don't free cache.
@@ -286,34 +306,92 @@ U0 ZincCfgLoad()
 Bool zinc_con_open = FALSE;		//globals are not zeroed by the JIT
 I64	 zinc_con_scroll = 0;
 
-CGxImg *GxImgFind(U8 *url)
-{
+CGxImg *GxImgFind(U8 *url, I64 w, I64 h)
+{//Identity is (url, w, h). w/h 0 asks for the decoded source; >0 asks for the
+//derived DC rendered at that size, so a resize rebuilds the scale from the
+//source instead of going back to the network.
 	I64 i;
 
 	for (i = 0; i < gx.img_count; i++)
-		if (!StrCompare(gx.img[i].url, url))
+		if (gx.img[i].w == w && gx.img[i].h == h && gx.img[i].url &&
+			!StrCompare(gx.img[i].url, url))
+		{
+			gx.img[i].gen = gx.img_gen;
 			return &gx.img[i];
+		}
 	return NULL;
 }
 
-CGxImg *GxImgGet(U8 *url)
-{//Find or create a cache slot for url. Append is lock-free vs the image task
-//(single writer = the layout task): fully initialize the slot, THEN publish it
-//by bumping img_count, so the concurrent reader never sees a half-built entry.
-	CGxImg *e = GxImgFind(url);
-	I64		i;
+CGxImg *GxImgGet(U8 *url, I64 w, I64 h)
+{//Find or create a cache slot. Append is lock-free vs the image task (single
+//writer = the layout task): fully initialize the slot, THEN publish it by
+//bumping img_count, so the concurrent reader never sees a half-built entry.
+	CGxImg *e = GxImgFind(url, w, h);
+	I64		i, oldest;
 
 	if (e)
 		return e;
 	if (gx.img_count >= GX_IMG_CACHE)
-		return NULL;
+	{//Full: take the least recently laid-out DERIVED slot (w > 0). Every op that
+	//borrowed one died in this layout's GxOpsReset, and a generation older than
+	//the current one means this layout has not re-attached it. Sources (w == 0)
+	//are never recycled: they hold the network decode. fetched clears last, so
+	//the image task cannot see the slot while its url is being swapped.
+		e = NULL;
+		oldest = gx.img_gen;
+		for (i = 0; i < gx.img_count; i++)
+			if (gx.img[i].w > 0 && gx.img[i].gen < oldest)
+			{
+				oldest = gx.img[i].gen;
+				e = &gx.img[i];
+			}
+		if (!e)
+			return NULL;
+		if (e->dc)
+			DCDel(e->dc);
+		e->dc = NULL;
+		Free(e->url);
+		e->url = StrNew(url);
+		e->w = w;
+		e->h = h;
+		e->gen = gx.img_gen;
+		e->fetched = FALSE;
+		return e;
+	}
 	i = gx.img_count;
 	e = &gx.img[i];
 	e->dc = NULL;
 	e->fetched = FALSE;
+	e->w = w;
+	e->h = h;
+	e->gen = gx.img_gen;
 	e->url = StrNew(url);
 	gx.img_count = i + 1; // publish last
 	return e;
+}
+
+U0 GxImgCacheDropDom()
+{//The svg: and data: keys are DOM pointers printed as hex. Once the page is
+//freed those addresses are reusable, so a later page allocating at one of them
+//hits a stale entry and gets the wrong picture. Slots are emptied in place;
+//GxImgFind skips a NULL url.
+	I64 i;
+
+	for (i = 0; i < gx.img_count; i++)
+		if (gx.img[i].url &&
+			(!StrNCompare(gx.img[i].url, "svg:", 4) ||
+			 !StrNCompare(gx.img[i].url, "data:", 5)))
+		{
+			Free(gx.img[i].url);
+			gx.img[i].url = NULL;
+			if (gx.img[i].dc)
+				DCDel(gx.img[i].dc);
+			gx.img[i].dc		= NULL;
+			gx.img[i].fetched	= FALSE;
+			gx.img[i].w			= 0;
+			gx.img[i].h			= 0;
+			gx.img[i].gen		= 0;
+		}
 }
 
 U0 GxImgCacheFree()
@@ -449,6 +527,24 @@ CColorROPU32 GxPenBg(I64 rgb, CColorROPU32 def)
 	return ColorRGB(rgb >> 16 & 0xFF, rgb >> 8 & 0xFF, rgb & 0xFF);
 }
 
+U0 GxOpsLock()
+{//Claim gx.ops against GxDrawIt. The spin is bounded: a drawer that faulted
+//mid-frame leaves GXLKf_DRAW raised and must not wedge the main loop.
+	I64 spin = 200;
+
+	LBts(&gx.lock_flags, GXLKf_BUSY);
+	while (Bt(&gx.lock_flags, GXLKf_DRAW) && spin > 0)
+	{
+		Sleep(1);
+		spin--;
+	}
+}
+
+U0 GxOpsUnlock()
+{
+	LBtr(&gx.lock_flags, GXLKf_BUSY);
+}
+
 U0 GxOpsReset()
 {
 	I64 i;
@@ -467,8 +563,9 @@ U0 GxOpsReset()
 	{
 		Free(gx.ops[i].text);
 		Free(gx.ops[i].img_url);
-		//GXO_IMG sc is borrowed from the image cache - don't free it here.
-		if (gx.ops[i].sc && gx.ops[i].type != GXO_IMG)
+		//GXO_IMG sc, and a GXO_BOX background that got a cached derived DC,
+		//are borrowed from the image cache - don't free those here.
+		if (gx.ops[i].sc && gx.ops[i].type != GXO_IMG && !gx.ops[i].sc_cached)
 			DCDel(gx.ops[i].sc);
 	}
 	gx.op_count = 0;
@@ -1124,11 +1221,11 @@ U0 GxNode(CZNode *node, CZStyle *inherited)
 		if (sw < 1) sw = 1;
 		if (sh < 1) sh = 1;
 
-		StrPrint(skey, "svg:%X:%d", node->text, sw);
-		ge = GxImgFind(skey);
+		StrPrint(skey, "svg:%X", node->text);
+		ge = GxImgFind(skey, sw, sh);
 		if (!ge)
 		{
-			ge = GxImgGet(skey);
+			ge = GxImgGet(skey, sw, sh);
 			if (ge)
 			{
 				shint = gx.page_fg; // currentColor hint (light on our dark chrome)
@@ -1176,10 +1273,10 @@ U0 GxNode(CZNode *node, CZStyle *inherited)
 		{//Inline data: URI image (base64/%-encoded PNG/JPEG/SVG). Decode once,
 		//cache keyed by the src pointer (node attr storage is stable).
 			StrPrint(dkey, "data:%X", src);
-			ce = GxImgFind(dkey);
+			ce = GxImgFind(dkey, 0, 0);
 			if (!ce)
 			{
-				ce = GxImgGet(dkey);
+				ce = GxImgGet(dkey, 0, 0);
 				if (ce)
 				{
 					ce->fetched = TRUE;
@@ -1215,7 +1312,7 @@ U0 GxNode(CZNode *node, CZStyle *inherited)
 		if (src && *src)
 		{
 			abs = ZincResolveLink(src); //MAlloc'ed absolute URL.
-			ce = GxImgGet(abs);
+			ce = GxImgGet(abs, 0, 0);
 			if (ce && ce->dc)
 			{//Decoded: reserve real (fit-scaled) size, blit in draw_it.
 				iw = ce->dc->width;
@@ -2173,14 +2270,25 @@ CDC *GxGradientDC(I64 gi, I64 bw, I64 bh)
 	return dst;
 }
 
+CDC *GxBgDCBuild(CGxOp *op, CDC *src, I64 bw, I64 bh)
+{//Sprite/positioned/sized/repeat-x/y/no-repeat crops a sub-rect; anything else
+//keeps the stretch-to-box default. Caller owns the result (sys_task).
+	if (op->bg_px != ZCSS_OFF_UNSET || op->bg_py != ZCSS_OFF_UNSET ||
+		op->bg_sw != 0 || op->bg_sh != 0 || op->bg_rep >= 1)
+		return GxBgSpriteDC(src, bw, bh, op->bg_px, op->bg_py,
+							op->bg_sw, op->bg_sh, op->bg_rep);
+	return DEDCScaleNew(src, bw, bh, sys_task);
+}
+
 U0 GxBgImgAttach()
 {//Post-layout: give every CSS-background box its picture. Box heights are
-//final only now. Cached images attach immediately (scaled to the box, owned
-//by the op - GxOpsReset frees non-GXO_IMG sc); new URLs queue for GxImgTask,
-//whose img_dirty relayout brings them in.
+//final only now. The box-sized DC is itself a cache entry keyed on the source
+//decode plus the box size, so a relayout at the same size reuses it; new URLs
+//queue for GxImgTask, whose img_dirty relayout brings them in.
 	I64		 i, bw, bh;
 	CGxOp	*op;
-	CGxImg	*ce;
+	CGxImg	*ce, *de;
+	U8		 bkey[80];
 
 	for (i = 0; i < gx.op_count; i++)
 	{
@@ -2189,7 +2297,7 @@ U0 GxBgImgAttach()
 			goto gx_bg_next;
 		if (op->img_url)
 		{
-			ce = GxImgGet(op->img_url);
+			ce = GxImgGet(op->img_url, 0, 0);
 			if (ce && !ce->fetched && !StrNICompare(op->img_url, "data:", 5))
 			{//Inline data: URI backgrounds decode right here, no network.
 				ce->fetched = TRUE;
@@ -2201,14 +2309,29 @@ U0 GxBgImgAttach()
 			 //wider element unpainted. Track the viewport instead.
 				bw = MinI64(op->w, MaxI64(1024, Fs->pix_width));
 				bh = MinI64(op->h, MaxI64(1024, Fs->pix_height));
-				if (op->bg_px != ZCSS_OFF_UNSET || op->bg_py != ZCSS_OFF_UNSET ||
-					op->bg_sw != 0 || op->bg_sh != 0 || op->bg_rep >= 1)
-					//Sprite/positioned/sized/repeat-x/y/no-repeat: crop a sub-rect.
-					op->sc = GxBgSpriteDC(ce->dc, bw, bh, op->bg_px, op->bg_py,
-										  op->bg_sw, op->bg_sh, op->bg_rep);
-				else
-					//Plain background image: keep the stretch-to-box default.
-					op->sc = DEDCScaleNew(ce->dc, bw, bh, sys_task);
+				//Key carries every parameter that changes the pixels; the size is
+				//the cache identity's w/h.
+				StrPrint(bkey, "bg:%X:%d:%d:%d:%d:%d", ce->dc, op->bg_px,
+						 op->bg_py, op->bg_sw, op->bg_sh, op->bg_rep);
+				de = GxImgFind(bkey, bw, bh);
+				if (!de)
+				{
+					de = GxImgGet(bkey, bw, bh);
+					if (de)
+					{
+						de->fetched = TRUE;
+						de->dc = GxBgDCBuild(op, ce->dc, bw, bh);
+					}
+				}
+				if (de && de->dc)
+				{
+					op->sc = de->dc;
+					op->sc_cached = TRUE;
+				}
+				else if (!de)
+					//Cache full with nothing recyclable: per-op copy, freed with
+					//the display list.
+					op->sc = GxBgDCBuild(op, ce->dc, bw, bh);
 			}
 		}
 		else if (zinc_gradients && op->grad >= 0 && op->grad < zcss_grad_count && op->w > 2 && op->h > 2)
@@ -2265,19 +2388,21 @@ U0 GxLayout()
 {
 	CZStyle root;
 
+	gx.img_gen++;	//stamps every cache entry this layout touches
+
 	if (gx.iv_dc)
 	{//Direct image view replaces the DOM render entirely.
-		gx.busy = TRUE;
+		GxOpsLock;
 		GxOpsReset;
 		GxImgViewLayout;
 		gx.last_w = Fs->pix_width;
 		if (gx.scroll > gx.doc_h)
 			gx.scroll = 0;
-		gx.busy = FALSE;
+		GxOpsUnlock;
 		return;
 	}
 
-	gx.busy = TRUE;
+	GxOpsLock;
 	GxOpsReset;
 	GxFloatReset;
 	GxPageStyle;
@@ -2327,7 +2452,7 @@ U0 GxLayout()
 	gx.doc_h = gx.y + gx.line_h + 16;
 	if (gx.scroll > gx.doc_h)
 		gx.scroll = 0;
-	gx.busy = FALSE;
+	GxOpsUnlock;
 }
 
 //--- Drawing -----------------------------------------------------------------
@@ -2677,14 +2802,16 @@ U0 GxDrawIt(CTask *task, CDC *dc)
 	mx = mouse.pos.x - task->pix_left - task->scroll_x;
 	my = mouse.pos.y - task->pix_top - task->scroll_y;
 
-	if (gx.page_has_bg && !gx.busy)
+	if (gx.page_has_bg && !Bt(&gx.lock_flags, GXLKf_BUSY))
 		dc->color = GxPenBg(gx.page_bg, de_theme.win_bg);
 	else
 		dc->color = de_theme.win_bg;
 	GrRect(dc, 0, 0, task->pix_width, task->pix_height);
 
-	if (gx.busy)
+	LBts(&gx.lock_flags, GXLKf_DRAW);	//claimed before the test below
+	if (Bt(&gx.lock_flags, GXLKf_BUSY))
 	{//Layout rebuilding: ops are in flux, draw chrome only.
+		LBtr(&gx.lock_flags, GXLKf_DRAW);
 		GxDrawChrome(dc);
 		return;
 	}
@@ -2951,6 +3078,7 @@ gx_draw_next:;
 	}
 
 	gx.hover_href = hover;
+	LBtr(&gx.lock_flags, GXLKf_DRAW);	//last read of gx.ops / the image cache
 	// TODO(cursor): we know the hover context here (hover != NULL over a link,
 	// over a text run = I-beam, else arrow) but ZealOS draws ONE system pointer
 	// sprite in the kernel compositor with no per-task/per-context API. Switching
@@ -2999,7 +3127,7 @@ U0 GxJsReset()
 	gx.js_ran = 0;
 }
 
-U0 GxJsFetchTask()
+U0 GxJsFetchWork()
 {//Background: fetch queued external scripts one by one, in document order.
 //Bodies land in the sys-task heap so they survive this task's death; the
 //MAIN task runs them (the JS interp + DOM live in its heap).
@@ -3019,13 +3147,39 @@ U0 GxJsFetchTask()
 		HttpResponseFree(r);
 		gx.js_done[i] = TRUE;
 	}
+}
+
+U0 GxJsFetchTask()
+{//A throw unwinds past HttpRequestRaw's close, so the socket this task opened
+//would stay registered with the TCP RX interrupt while the task heap goes
+//away. Only the owning task may close it: do that here, on every exit.
+	try
+		GxJsFetchWork;
+	catch
+		PutExcept;
+	HttpInflightRelease;
 	gx.js_task = NULL;
 }
 
-U0 GxFetchTask()
+U0 GxEndCB()
+{//task_end_cb: runs on Kill as well as a clean exit. http_pool_task is a bare
+//CTask pointer, and a later task allocated at this address would inherit
+//permission to park sockets.
+//
+//TaskEnd does not call this - it points the task's rip at it and resumes, so
+//there is no return address on the stack. Exit, or the return lands in garbage.
+	if (http_pool_task == Fs)
+		http_pool_task = NULL;
+	if (zinc_gx_task == Fs)
+		zinc_gx_task = NULL;
+	Exit;
+}
+
+U0 GxFetchWork()
 {//Blocking network fetch ONLY. No DOM parsing here (heap would die with us).
 	CHttpResponse	*r;
 	U8				*ct;
+	I64				 seq = gx.fetch_seq;
 
 	gx_fetch_body = NULL;
 	gx_fetch_status = 0;
@@ -3035,6 +3189,13 @@ U0 GxFetchTask()
 	gx_fetch_ok = FALSE;
 	gx_fetch_final[0] = 0;
 	r = ZincNavFetch(gx.load_url); // POSTs the pending form body if one is queued
+	if (seq != gx.fetch_seq)
+	{//Orphaned: the main loop gave up waiting and may have started another
+	//fetch. The gx_fetch_* slots belong to that one now.
+		if (r)
+			HttpResponseFree(r);
+		return;
+	}
 	if (r && r->body)
 	{
 		gx_fetch_status = r->status;
@@ -3076,11 +3237,34 @@ U0 GxFetchTask()
 	}
 	if (r)
 		HttpResponseFree(r);
-	gx.loading = FALSE;
-	gx.load_task = NULL;
 }
 
-U0 GxImgTask()
+U0 GxFetchTask()
+{//Same socket release as GxJsFetchTask, and the flags the main loop waits on
+//clear on the throw path too. An orphaned run releases its socket and exits
+//without touching state a newer fetch owns.
+	I64 seq = gx.fetch_seq;
+
+	try
+		GxFetchWork;
+	catch
+		PutExcept;
+	HttpInflightRelease;
+	if (seq == gx.fetch_seq)
+	{
+		gx.loading = FALSE;
+		gx.load_task = NULL;
+	}
+}
+
+Bool GxImgCancel()
+{//Navigation or teardown wants the page gone. The image worker tests this
+//between images and between the fetch and the decode; a decoder call already
+//entered runs to completion.
+	return gx.quit || gx.fetch || gx.loading;
+}
+
+U0 GxImgLoop()
 {//Background: fetch + decode each pending <img> once, cache by URL, then
 //flag a relayout so real dimensions are used. PNG only (our decoder).
 	I64			 i, iw, ih, sf;
@@ -3094,12 +3278,12 @@ U0 GxImgTask()
 			break;	//Checked up top too: teardown waits out img_busy, then
 					//this task must not claim another fetch.
 		//Gate on page teardown (gx.fetch) / body fetch (gx.loading) ONLY, NOT
-		//on gx.busy. v2 layout holds gx.busy for long, frequent windows; gating
+		//on the ops lock. v2 layout holds it for long, frequent windows; gating
 		//on it starved image fetches to one-per-relayout (images looked broken).
 		//Fetching alongside layout is safe: GxImgGet publishes new cache slots
 		//last (lock-free append) and the teardown at gx.fetch waits out img_busy
 		//before freeing the cache.
-		if (gx.fetch || gx.loading)
+		if (GxImgCancel())
 		{
 			Sleep(30);
 			goto img_loop;
@@ -3110,7 +3294,7 @@ U0 GxImgTask()
 		//keeps the free from yanking slots mid-iteration now that we run
 		//concurrently with layout.
 		gx.img_busy = TRUE;
-		if (gx.fetch || gx.loading)
+		if (GxImgCancel())
 		{//Teardown raced in after the gate above; back off before touching cache.
 			gx.img_busy = FALSE;
 			Sleep(30);
@@ -3133,9 +3317,15 @@ U0 GxImgTask()
 		if (!StrNICompare(ce->url, "http", 4))
 		{
 			r = HttpGet(ce->url);
-			if (!r)
+			if (!r && !GxImgCancel())
 				r = HttpGet(ce->url); //Retry once: a parked keep-alive socket
 									  //may have gone stale server-side.
+			if (r && GxImgCancel())
+			{//Page is being left: drop the body instead of spending a decode on
+			//it. The teardown is blocked on img_busy until this iteration ends.
+				HttpResponseFree(r);
+				r = NULL;
+			}
 			if (r && r->status == 200 && r->body_length > 8)
 			{//Sniff by content: PNG (0x89 P N G) or JPEG (FFD8).
 				dc = NULL;
@@ -3185,7 +3375,7 @@ U0 GxImgTask()
 				NetLog("IMG: HTTP %d len=%d %s", r->status, r->body_length, ce->url);
 				StrPrint(zinc_note, "img HTTP %d", r->status);
 			}
-			else
+			else if (!GxImgCancel())
 			{
 				NetLog("IMG: no response %s", ce->url);
 				StrCopy(zinc_note, "img: no response");
@@ -3198,6 +3388,17 @@ img_loop:
 		if (gx.quit)
 			break;
 	}
+}
+
+U0 GxImgTask()
+{//Same socket release as GxJsFetchTask. img_busy clears on the throw path too:
+//navigation and teardown block on it.
+	try
+		GxImgLoop;
+	catch
+		PutExcept;
+	HttpInflightRelease;
+	gx.img_busy = FALSE;
 }
 
 U8	gx_clip[256];
@@ -3340,7 +3541,7 @@ U0 GxTabSaveCur(U8 *current)
 	CGxTab *t = &gx.tab[gx.tab_cur];
 	I64		i;
 
-	gx.busy = TRUE;
+	GxOpsLock;
 	GxOpsReset;		//Commits any focused field; empties the display list.
 	gx.hover_href = NULL;
 	t->used = TRUE;
@@ -3374,7 +3575,7 @@ U0 GxTabSaveCur(U8 *current)
 	zinc_fwd_count = 0;
 	GxJsReset;		//Still-pending external scripts are dropped (ran ones live
 					//on inside the parked interpreter).
-	gx.busy = FALSE;
+	GxOpsUnlock;
 }
 
 U8 *GxTabLoadCur()
@@ -3971,6 +4172,7 @@ public U0 ZincGX(U8 *start_url=NULL)
 {
 	U8	*current, *target, *sub, *meta_url;
 	I64	 msg, a1, a2, view_h, vi, nav_chain = 0, cancel_deadline = 0, ti, tn;
+	I64	 win_cols, win_rows, win_left, win_top;
 	U8	 title[80];
 
 	if (ZincHandOff(start_url))
@@ -3986,6 +4188,7 @@ public U0 ZincGX(U8 *start_url=NULL)
 	gx.tab[0].used = TRUE;
 	gx.tab_go = -1;
 	gx.tab_close = -1;
+	Fs->task_end_cb = &GxEndCB;
 	http_pool_task = Fs; //this task is persistent: it alone may keep-alive.
 					     //Spawned/killable fetch tasks never pool (their socket
 					     //would dangle when the task dies -> RX-interrupt crash).
@@ -4027,11 +4230,14 @@ public U0 ZincGX(U8 *start_url=NULL)
 	DocCursor(OFF);
 	DocClear;
 	StrCopy(Fs->task_title, "ZincGX");
-	if (Fs->win_width < TEXT_COLS * 3 / 4)
-	{//Launched into a pop-up window: take a usable one.
-		WinHorz(2, TEXT_COLS - 3);
-		WinVert(1, TEXT_ROWS - 2);
-	}
+	//Centred, three quarters of the screen. The launcher hands over whatever
+	//geometry a pop-up defaults to.
+	win_cols = TEXT_COLS * 3 / 4;
+	win_rows = (TEXT_ROWS - 1) * 3 / 4;
+	win_left = (TEXT_COLS - win_cols) / 2;
+	win_top  = (TEXT_ROWS - win_rows) / 2;
+	WinHorz(win_left, win_left + win_cols - 1);
+	WinVert(win_top, win_top + win_rows - 1);
 	Fs->win_inhibit = Fs->win_inhibit | WIF_FOCUS_TASK_MS_L_D;
 	WinFocus;
 	zinc_note[0] = 0;
@@ -4074,10 +4280,10 @@ public U0 ZincGX(U8 *start_url=NULL)
 
 		if (gx.fetch)
 		{
-			gx.busy = TRUE; //Ops reference the old DOM; park the drawer.
+			GxOpsLock;		//Ops reference the old DOM; park the drawer.
 			GxOpsReset;
-			while (gx.img_busy) //Wait out any in-flight image fetch.
-				Sleep(5);
+			while (gx.img_busy && TaskValidate(gx.img_task))
+				Sleep(5);		//Wait out any in-flight image fetch.
 			GxImgCacheFree; //New page: drop old decoded images.
 			GxImgViewFree;	//New page: leave any direct-image view.
 			GxJsReset;		//New page: drop queued/fetched external scripts.
@@ -4114,6 +4320,7 @@ public U0 ZincGX(U8 *start_url=NULL)
 				net_abort = FALSE; // clear any stale abort from a prior fetch
 				cancel_deadline = 0;
 				StrCopy(zinc_note, "Loading...");
+				gx.fetch_seq++;
 				gx.load_task = GxWorkerSpawn(&GxFetchTask, "ZincGX Fetch");
 				while (gx.loading)
 				{
@@ -4139,8 +4346,13 @@ public U0 ZincGX(U8 *start_url=NULL)
 						if (!cancel_deadline)
 							cancel_deadline = counts.jiffies + 800 * JIFFY_FREQ / 1000;
 						else if (counts.jiffies > cancel_deadline)
-						{
-							Kill(gx.load_task);
+						{//Orphan it, never Kill it. A socket lives on its
+						//owner's heap and the TCP RX interrupt walks the global
+						//socket list, so freeing that heap out from under an
+						//open connection is a use-after-free in interrupt
+						//context. The task releases its own socket and exits;
+						//the sequence bump makes its results dead on arrival.
+							gx.fetch_seq++;
 							gx.load_task = NULL;
 							gx.loading = FALSE;
 							gx_fetch_ok = FALSE;
@@ -4289,14 +4501,15 @@ public U0 ZincGX(U8 *start_url=NULL)
 				{//The last tab can't be closed (use the window close for that).
 					if (gx.tab_close == gx.tab_cur)
 					{//Close the LIVE tab: tear its page down, hop to another.
-						gx.busy = TRUE;
+						GxOpsLock;
 						GxOpsReset;
-						while (gx.img_busy)
+						while (gx.img_busy && TaskValidate(gx.img_task))
 							Sleep(5);
 						GxImgViewFree;
+						GxImgCacheDropDom;
 						GxJsReset;
 						ZincPageFree;
-						gx.busy = FALSE;
+						GxOpsUnlock;
 						while (zinc_back_count)
 							Free(zinc_back[--zinc_back_count]);
 						while (zinc_fwd_count)
@@ -4710,14 +4923,15 @@ gx_next:
 	MenuPop;
 	http_pool_task = NULL;	// stop pooling before this task dies; ZincPageFree
 							// below closes any sockets it parked
-	while (gx.img_busy)		// let an in-flight image fetch finish before we
-		Sleep(5);			// kill the task under it
+	while (gx.img_busy && TaskValidate(gx.img_task))
+		Sleep(5);			// let an in-flight image fetch finish before the Kill
 	if (TaskValidate(gx.img_task))
 		Kill(gx.img_task);
 	if (TaskValidate(gx.load_task))
 		Kill(gx.load_task);
 	GxJsReset;
 	zinc_defer_ext_js = FALSE; //classic Zinc keeps its blocking fetches
+	GxOpsLock;				//detaching draw_it above does not drain a call already in it
 	GxOpsReset;
 	GxImgCacheFree;
 	GxImgViewFree;

@@ -568,6 +568,22 @@ class CHttpConn
 };
 
 CHttpConn http_conns[HTTP_CONN_MAX];
+
+#define HTTP_INFLIGHT_MAX	8
+
+class CHttpInflight
+{//The connection a task currently holds open inside HttpRequestRaw. A throw
+//unwinds past the close at the bottom of that function, and a socket may only
+//be closed by the task that created it: the TCP RX interrupt walks the global
+//socket list, so a cross-task close makes it read freed memory. The owning
+//task's catch handler calls HttpInflightRelease to close its own.
+	CTask		*task;
+	CHttpConn	*conn;
+	CTCPSocket	*sock;
+	CTLS		*tls;
+};
+
+CHttpInflight http_inflight[HTTP_INFLIGHT_MAX];
 I64		  http_conn_lock = 0;	 // statically initialized; JIT zeroes nothing
 Bool	  http_conn_init = FALSE;
 
@@ -583,7 +599,11 @@ public CTask *http_pool_task = NULL;
 //walk freed memory -> triple fault. pool only from the task that closes.
 Bool HttpMayPool()
 {
-	return http_pool_task && Fs == http_pool_task;
+	//TaskValidate, because ZincGX can be killed rather than exited and leave
+	//this set. It catches a freed task, not a new one allocated at the same
+	//address: the owner clears the global from its task_end_cb for that.
+	return http_pool_task && TaskValidate(http_pool_task) &&
+		   Fs == http_pool_task;
 }
 
 U0 HttpConnLockAcq()
@@ -603,6 +623,7 @@ U0 HttpConnInitOnce()
 	if (!http_conn_init)
 	{
 		MemSet(http_conns, 0, sizeof(http_conns));
+		MemSet(http_inflight, 0, sizeof(http_inflight));
 		http_conn_init = TRUE;
 	}
 	HttpConnLockRel;
@@ -644,6 +665,67 @@ U0 HttpConnKill(CHttpConn *c)
 	c->alive = FALSE;
 	c->busy = FALSE;
 	HttpConnLockRel;
+}
+
+U0 HttpInflightSet(CHttpConn *conn, CTCPSocket *sock, CTLS *tls)
+{//One slot per task: a task runs one request at a time.
+	I64 i, pick = -1;
+
+	HttpConnInitOnce;
+	HttpConnLockAcq;
+	for (i = 0; (i < HTTP_INFLIGHT_MAX) && (pick < 0); i++)
+		if (http_inflight[i].task == Fs)
+			pick = i;
+	for (i = 0; (i < HTTP_INFLIGHT_MAX) && (pick < 0); i++)
+		if (!http_inflight[i].task)
+			pick = i;
+	if (pick >= 0)
+	{
+		http_inflight[pick].conn = conn;
+		http_inflight[pick].sock = sock;
+		http_inflight[pick].tls	 = tls;
+		http_inflight[pick].task = Fs;	//published last
+	}
+	HttpConnLockRel;
+}
+
+U0 HttpInflightClear()
+{
+	I64 i;
+
+	HttpConnInitOnce;
+	HttpConnLockAcq;
+	for (i = 0; i < HTTP_INFLIGHT_MAX; i++)
+		if (http_inflight[i].task == Fs)
+			http_inflight[i].task = NULL;
+	HttpConnLockRel;
+}
+
+public U0 HttpInflightRelease()
+{//Close whatever request this task left open. Call it from a catch handler in
+//the task that ran the request, never from another task.
+	CHttpConn	*conn = NULL;
+	CTCPSocket	*sock = NULL;
+	CTLS		*tls  = NULL;
+	I64			 i;
+
+	HttpConnInitOnce;
+	HttpConnLockAcq;
+	for (i = 0; i < HTTP_INFLIGHT_MAX; i++)
+		if (http_inflight[i].task == Fs)
+		{
+			conn = http_inflight[i].conn;
+			sock = http_inflight[i].sock;
+			tls	 = http_inflight[i].tls;
+			http_inflight[i].task = NULL;	//claim before closing
+		}
+	HttpConnLockRel;					//HttpConnKill takes the same lock
+	if (conn)
+		HttpConnKill(conn);
+	else if (tls)
+		TLSClose(tls);					//closes the socket too
+	else if (sock)
+		TCPSocketClose(sock);
 }
 
 U0 HttpConnGive(CHttpConn *reuse, U8 *host, U16 port, Bool is_tls,
@@ -822,6 +904,7 @@ http_fresh:
 			}
 		}
 	}
+	HttpInflightSet(conn, sock, tls);
 
 	cookie_hdr = HttpCookieHeaderBuild(url); // "" or "Cookie: ...\r\n"
 	if (!extra_hdrs)
@@ -1010,12 +1093,14 @@ http_fresh:
 	{ //server idle-closed the parked connection; drop it and retry once
 	  //on a fresh one
 		NetLog("HTTP %s: cached connection stale; reconnecting.", method);
+		HttpInflightClear;
 		HttpConnKill(conn);
 		conn = NULL;
 		Free(buf);
 		goto http_fresh;
 	}
 
+	HttpInflightClear; // every path below this point has released the socket
 	if (poolable && complete && keep_ok && !aborted)
 		HttpConnGive(conn, url->host, url->port, url->is_https, sock, tls);
 	else if (conn)
