@@ -341,6 +341,10 @@ I64			q_prep_chunks	= 0;	//cores the geometry split across
 I64			q_px_alpha		= 0;	//pixels that went through the alpha blend
 I64			q_px_simd		= 0;	//pixels the SSE2 kernel took
 
+//face/band pairs the row bins hand the fill. an unbinned pass visits
+//face_count * bands
+I64			q_bin_entries	= 0;
+
 //.alpha for the surface being drawn, 0..255. set around a brush entity and
 //restored after, as q_draw_vis is. 255 is opaque and costs nothing extra
 I64			q_draw_alpha	= 255;
@@ -1469,6 +1473,7 @@ U0 QDrawClear(CQCanvas *c, I64 color_index)
 	q_tsc_face          = 0;
 	q_prep_chunks       = 0;
 	q_px_simd           = 0;
+	q_bin_entries       = 0;
 	c->prefogged        = FALSE;
 	q_occ_tested        = 0;
 	q_occ_rejected      = 0;
@@ -1996,6 +2001,13 @@ class CQFacePrep
 	I64	 ext_shift;
 	I64	 frame;
 
+	//QDrawPolygon's row range for this face, screen rows, clamped to the
+	//view. y_min > y_max covers no row. ext_frame stamps the GEOMETRY pass,
+	//so a face the cache pass never reached still carries a valid extent
+	I64	 y_min;
+	I64	 y_max;
+	I64	 ext_frame;
+
 	CQTexture	*tex;
 	I64			 count;
 	I64			 lm_w;
@@ -2024,6 +2036,25 @@ class CQFacePrep
 
 CQFacePrep	*q_face_prep	= NULL;
 I64			 q_face_prep_n	= 0;
+
+//--- per-band row bins ---
+//
+//the banded fill repeats the face walk on every core, so each band reaches
+//QDrawPolygon for every visible face and most bail there after an O(vertex)
+//extent scan. a bin holds only the faces whose rows meet its band.
+//
+//QBAND_MAX rows of q_band_bin_cap face indices. built by walking
+//vs->face_list in order, so a bin stays front to back and the depth test
+//resolves coplanar ties to the same face it does unbinned
+I32			*q_band_bin		= NULL;
+I64			 q_band_bin_cap	= 0;	//entries per band
+I64			 q_band_bin_n[QBAND_MAX];
+I64			 q_band_bin_y0[QBAND_MAX];
+I64			 q_band_bin_y1[QBAND_MAX];
+
+//bands the bins describe. 0 outside the banded pass, which sends a nested
+//draw and the single band path down the full face list
+I64			 q_band_bin_bands = 0;
 
 CQSurfCache	 q_surf[QSURF_SLOTS];
 I64			*q_face_surf	= NULL;		//face index -> slot, -1 for none
@@ -2300,6 +2331,14 @@ U0 QSurfCacheSetMap(CQMap *map)
 		q_face_prep_n = 0;
 	}
 
+	if (q_band_bin)
+	{
+		Free(q_band_bin);
+		q_band_bin     = NULL;
+		q_band_bin_cap = 0;
+	}
+	q_band_bin_bands = 0;
+
 	if (map && map->num_faces > 0)
 	{
 		q_face_surf_n = map->num_faces;
@@ -2313,6 +2352,16 @@ U0 QSurfCacheSetMap(CQMap *map)
 		q_face_prep_n = map->num_faces;
 		q_face_prep   = MAlloc(q_face_prep_n * sizeof(CQFacePrep));
 		MemSet(q_face_prep, 0, q_face_prep_n * sizeof(CQFacePrep));
+
+		//QVisMarkLeaves stops emitting at QVIS_MAX_FACES and stamps each face
+		//once, so no bin can hold more entries than either bound
+		q_band_bin_cap = q_face_prep_n;
+		if (q_band_bin_cap > QVIS_MAX_FACES)
+			q_band_bin_cap = QVIS_MAX_FACES;
+
+		q_band_bin = MAlloc(QBAND_MAX * q_band_bin_cap * sizeof(I32));
+		if (!q_band_bin)
+			q_band_bin_cap = 0;
 	}
 }
 
@@ -4211,6 +4260,10 @@ U0 QDrawStateInit()
 	q_bm_faces     = 0;
 	q_px_simd      = 0;
 	q_px_occ       = 0;
+	q_bin_entries    = 0;
+	q_band_bin       = NULL;
+	q_band_bin_cap   = 0;
+	q_band_bin_bands = 0;
 	q_px_alpha     = 0;
 	q_draw_alpha   = 255;
 	q_draw_ent     = -1;
@@ -7146,6 +7199,39 @@ U0 QDrawSkyPolygon(CQCanvas *c, CQScreenVert *v, I64 count, CQTexture *tex,
 //supplies the cached surface, so a band worker never reaches QSurfCacheGet
 Bool q_face_prep_use = TRUE;
 
+U0 QFacePrepExtent(CQCanvas *c, CQFacePrep *fp, CQScreenVert *v, I64 count)
+{//QDrawPolygon's row range, taken while the projected verts are in hand.
+ //same clamp against the view, so the two agree on which rows exist
+	F64	y_lo = 1.0e30;
+	F64	y_hi = -1.0e30;
+	I64	i;
+	I64	r0;
+	I64	r1;
+
+	if (count < 3)
+		return;
+
+	for (i = 0; i < count; i++)
+	{
+		if (v[i].y < y_lo)
+			y_lo = v[i].y;
+		if (v[i].y > y_hi)
+			y_hi = v[i].y;
+	}
+
+	r0 = ToI64(Ceil(y_lo));
+	r1 = ToI64(Floor(y_hi));
+
+	if (r0 < c->vy)
+		r0 = c->vy;
+	if (r1 >= c->vy + c->vh)
+		r1 = c->vy + c->vh - 1;
+
+	fp->y_min     = r0;
+	fp->y_max     = r1;
+	fp->ext_frame = q_surf_frame;
+}
+
 U0 QDrawFace(CQCanvas *c, CQMap *map, I64 face_index, F64 *offset = NULL,
 	I64 ent_frame = 0, I64 band_y0 = -1, I64 band_y1 = -1,
 	I64 prep_mode = QFP_INLINE, I64 band = 0)
@@ -7329,7 +7415,13 @@ U0 QDrawFace(CQCanvas *c, CQMap *map, I64 face_index, F64 *offset = NULL,
 	if (tex->is_sky)
 	{
 		if (prep_mode == QFP_GEOM)
+		{
+			//QDrawSkyPolygon clamps its rows exactly as QDrawPolygon does
+			if (q_face_prep && face_index < q_face_prep_n)
+				QFacePrepExtent(c, &q_face_prep[face_index], scr, count);
+
 			return;
+		}
 
 		QDrawSkyPolygon(c, scr, count, tex, band_y0, band_y1, band);
 
@@ -7436,6 +7528,10 @@ U0 QDrawFace(CQCanvas *c, CQMap *map, I64 face_index, F64 *offset = NULL,
 
 				if (count <= QFP_MAX_VERTS)
 					MemCopy(fp->verts, scr, count * sizeof(CQScreenVert));
+
+				//stamped even past QFP_MAX_VERTS: that face redraws from a
+				//recomputed projection, which lands on the same rows
+				QFacePrepExtent(c, fp, scr, count);
 			}
 
 			return;
@@ -7633,16 +7729,94 @@ I64 QDrawWorldPrepJob(U8 *data)
 	return 0;
 }
 
-U0 QDrawWorldBand(CQCanvas *c, CQMap *map, CQVisState *vs,
-	I64 y0, I64 y1, I64 band)
-{//every face submitted, only this band's rows filled. the walk is repeated
- //per core and the FILL divides, which is the whole point - the walk is a
- //fraction of a millisecond and the fill is most of the frame
-	I64 i;
-	I64 t0 = TSCGet;
+U0 QDrawWorldBin(CQVisState *vs, I64 y0, I64 rows, I64 bands)
+{//the visible face list into per-band row bins.
+ //
+ //walked in vs->face_list order and appended, so every bin comes out front to
+ //back. the depth test is strict, so a coplanar tie goes to whichever face is
+ //drawn first and that has to stay the same face
+	CQFacePrep	*fp;
+	I64			 i;
+	I64			 b;
+	I64			 face;
+	I64			 lo;
+	I64			 hi;
+
+	q_band_bin_bands = 0;
+
+	if (!q_band_bin || bands < 1 || bands > QBAND_MAX || rows < 1 ||
+		vs->face_count > q_band_bin_cap)
+		return;
+
+	//the same split QDrawWorld hands the jobs
+	for (b = 0; b < bands; b++)
+	{
+		q_band_bin_n[b]  = 0;
+		q_band_bin_y0[b] = y0 + rows * b / bands;
+		q_band_bin_y1[b] = y0 + rows * (b + 1) / bands - 1;
+	}
 
 	for (i = 0; i < vs->face_count; i++)
-		QDrawFace(c, map, vs->face_list[i], NULL, 0, y0, y1, QFP_USE, band);
+	{
+		face = vs->face_list[i];
+
+		//no extent this frame - a face the geometry pass returned early on,
+		//or one whose record the map swap dropped - goes in EVERY band. an
+		//extra visit costs one bail, a missing one loses the face
+		lo = 0;
+		hi = bands - 1;
+
+		if (q_face_prep && face >= 0 && face < q_face_prep_n)
+		{
+			fp = &q_face_prep[face];
+			if (fp->ext_frame == q_surf_frame)
+			{
+				while (lo <= hi && q_band_bin_y1[lo] < fp->y_min)
+					lo++;
+				while (hi >= lo && q_band_bin_y0[hi] > fp->y_max)
+					hi--;
+			}
+		}
+
+		for (b = lo; b <= hi; b++)
+		{
+			q_band_bin[b * q_band_bin_cap + q_band_bin_n[b]] = face;
+			q_band_bin_n[b]++;
+			q_bin_entries++;
+		}
+	}
+
+	q_band_bin_bands = bands;
+}
+
+U0 QDrawWorldBand(CQCanvas *c, CQMap *map, CQVisState *vs,
+	I64 y0, I64 y1, I64 band)
+{//this band's rows, from this band's bin. the FILL divides across cores and
+ //the walk does not, so the walk has to shrink with the rows the band owns
+ //
+ //a row range no bin describes - a nested draw, a single band pass, a face
+ //list too large to bin - falls back to the whole list
+	I64 i;
+	I64 n;
+	I64 base;
+	I64 t0 = TSCGet;
+
+	if (q_band_bin && band >= 0 && band < q_band_bin_bands &&
+		y0 == q_band_bin_y0[band] && y1 == q_band_bin_y1[band])
+	{
+		n    = q_band_bin_n[band];
+		base = band * q_band_bin_cap;
+
+		for (i = 0; i < n; i++)
+			QDrawFace(c, map, q_band_bin[base + i], NULL, 0, y0, y1,
+				QFP_USE, band);
+	}
+	else
+	{
+		for (i = 0; i < vs->face_count; i++)
+			QDrawFace(c, map, vs->face_list[i], NULL, 0, y0, y1, QFP_USE,
+				band);
+	}
 
 	//summed here, not around QDrawWorld: every band adds to q_tsc_span, so the
 	//divisor has to cover the same set of cores
@@ -7669,6 +7843,10 @@ U0 QDrawWorld(CQCanvas *c, CQMap *map, CQVisState *vs,
 	I64 chunks;
 	I64 faces = vs->face_count;
 	I64 q_tsc_mark_w;
+
+	//a bin describes one frame's face list and one row split; nothing before
+	//the build may answer from the last frame's
+	q_band_bin_bands = 0;
 
 	//GEOMETRY: transform, clip and project every visible face. pure over the
 	//map and the view, and each face owns its record, so the list splits
@@ -7744,6 +7922,8 @@ U0 QDrawWorld(CQCanvas *c, CQMap *map, CQVisState *vs,
 		QDrawWorldBand(c, map, vs, y0, y1, 0);
 		return;
 	}
+
+	QDrawWorldBin(vs, y0, rows, bands);
 
 	for (i = 1; i < bands; i++)
 	{
