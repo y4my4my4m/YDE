@@ -6,12 +6,9 @@
 #define TCP_RTO_MIN		0.2
 #define TCP_RTO_MAX		10
 
-// RX ring buffer + advertised window per socket. 8 KB was tiny: large HTTPS
-// bodies (100r's 84 KB PNGs) truncated at exactly 8*8192 = 65536, the point
-// where the small window + ring interaction wedged the transfer. 64 KB gives
-// ample headroom (advertised window = /2 = 32 KB, still within the U16 field)
-// and restores large-image downloads. Costs 64 KB per live socket.
-// Ring indices are masked, so this must be a power of two.
+// RX ring buffer + advertised window per socket. Advertised window = /2 = 32 KB,
+// still within the U16 field. Costs 64 KB per live socket. Ring indices are
+// masked, so this must be a power of two.
 #define TCP_WINDOW_SIZE	65536
 
 #define TCP_MSS			536 // Max Segment Size default

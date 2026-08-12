@@ -1,7 +1,4 @@
-//USB + xHCI definitions. Kernel AOT USB stack:
-//xHCI host controller, HID boot keyboard/mouse, mass storage, USB boot media.
-//Included by Kernel.PRJ (AOT). May also be JIT-included for class defs;
-//globals are extern-declared here and defined in KXhci.ZC.
+//USB + xHCI definitions. Globals are extern-declared here and defined in KXhci.ZC.
 
 #help_index "USB"
 
@@ -10,7 +7,6 @@
 #define USB_IFS_MAX				6
 #define USB_HCS_MAX				4	//xHCI controllers driven at once
 
-//USB descriptor types
 #define USB_DESC_DEV			1
 #define USB_DESC_CONFIG			2
 #define USB_DESC_STR			3
@@ -18,7 +14,6 @@
 #define USB_DESC_EP				5
 #define USB_DESC_HID			0x21
 
-//USB standard requests
 #define USB_RQ_GET_STATUS		0
 #define USB_RQ_CLEAR_FEATURE	1
 #define USB_RQ_SET_FEATURE		3
@@ -41,16 +36,13 @@
 #define USB_RT_RECIP_EP			0x02
 #define USB_RT_RECIP_OTHER		0x03	//hub port requests
 
-//USB feature selectors
 #define USB_FEAT_EP_HALT		0
 
-//USB classes
 #define USB_CLASS_AUDIO			1
 #define USB_CLASS_HID			3
 #define USB_CLASS_MSD			8
 #define USB_CLASS_HUB			9
 
-//HID
 #define USB_HID_SUBCLASS_BOOT	1
 #define USB_HID_PROTO_KBD		1
 #define USB_HID_PROTO_MOUSE		2
@@ -58,13 +50,11 @@
 #define USB_HID_RQ_SET_IDLE		10
 #define USB_HID_RQ_SET_PROTOCOL	11
 
-//MSD
 #define USB_MSD_SUBCLASS_SCSI	6
 #define USB_MSD_PROTO_BOT		0x50
 #define USB_MSD_RQ_RESET		0xFF
 #define USB_MSD_RQ_GET_MAX_LUN	0xFE
 
-//CDC / Ethernet Networking Control Model
 #define USB_CLASS_COMM			0x02	//CDC communications (control interface)
 #define USB_CLASS_CDC_DATA		0x0A	//CDC data interface (bulk endpoints)
 #define USB_CDC_SUBCLASS_ECM	0x06	//Ethernet Networking Control Model
@@ -77,7 +67,6 @@
 #define USB_CDC_PACKET_TYPE_DIRECTED		0x04
 #define USB_CDC_PACKET_TYPE_BROADCAST		0x08
 
-//Hub class
 #define USB_DESC_HUB			0x29	//hub descriptor (USB2)
 #define USB_DESC_SSHUB			0x2A	//SuperSpeed hub descriptor
 //SuperSpeed hubs must be told their tier before they can route (USB 3.x 10.14.2.7).
@@ -103,7 +92,6 @@
 #define USB_SPEED_HIGH			3
 #define USB_SPEED_SUPER			4
 
-//Endpoint attribute transfer types
 #define USB_EP_TYPE_CTRL		0
 #define USB_EP_TYPE_ISOCH		1
 #define USB_EP_TYPE_BULK		2
@@ -136,8 +124,6 @@ class CUsbEPDesc
 	U16	max_packet;
 	U8	interval;
 };
-
-//======================== xHCI ========================
 
 #define XHCI_PCI_CLASS			0x0C0330
 
@@ -183,7 +169,6 @@ class CUsbEPDesc
 #define XHCI_PORTSC_PLC			0x00400000
 #define XHCI_PORTSC_CEC			0x00800000
 #define XHCI_PORTSC_CHANGE_BITS	0x00FE0000
-//Write-1-to-clear + preserve mask: RW bits we must not clobber when writing.
 //Writing PORTSC: preserve PP, write change bits only to clear them.
 
 //Runtime register byte offsets (interrupter 0)
@@ -200,8 +185,7 @@ class CUsbEPDesc
 #define XHCI_TRB_STATUS			4
 #define XHCI_TRB_ISOCH			5
 
-//Isoch TRB, Start Isoch ASAP. Frame ID is ignored, so an underrun cannot
-//leave the ring pointing at a frame that has already passed.
+//Start Isoch ASAP; frame ID ignored.
 #define XHCI_TRBF_SIA			0x80000000
 #define XHCI_TRB_LINK			6
 #define XHCI_TRB_EVENT_DATA		7
@@ -287,9 +271,8 @@ class CXhciRing
 
 class CUsbEP
 {
-//ring is a POINTER, not embedded: CUsbEP is itself embedded by value in CUsbDev,
-//and the ZealC JIT class parser rejects two-level by-value class nesting
-//(CUsbDev -> CUsbEP -> CXhciRing). Keeping ring a pointer flattens CUsbEP.
+//ring is a pointer: the ZealC JIT class parser rejects two-level by-value class
+//nesting (CUsbDev -> CUsbEP -> CXhciRing).
 	CXhciRing	*ring;
 	I64			 dci,			//xHCI device context index
 				 addr,			//USB endpoint address (with 0x80 dir bit)
@@ -297,14 +280,12 @@ class CUsbEP
 				 max_packet,
 				 interval;		//descriptor bInterval
 	Bool		 valid;
-//Sync transfer completion, set by event poll
 	Bool		 xfer_done;
 	I64			 xfer_code,		//xHCI completion code
 				 xfer_residue,	//untransferred bytes
 				 xfer_evts;		//transfer events seen, any completion code
-//Async auto-requeue (HID interrupt IN). auto_kind selects the report handler
-//(USB_AUTO_*); dispatched in XhciEventPoll. Avoids a function-pointer struct
-//member (which the ZealC JIT class parser rejects) and keeps late binding.
+//auto_kind selects the report handler (USB_AUTO_*), dispatched in XhciEventPoll;
+//the ZealC JIT class parser rejects a function-pointer member.
 	U8			*auto_buf;
 	I64			 auto_len,
 				 auto_kind;
@@ -338,7 +319,6 @@ class CXhciGlobals
 	I64			 evt_deq, evt_cycle;
 	I64			 lock,			//ring enqueue lock
 				 poll_lock;		//event ring consumer lock (boot inline poll vs USB task)
-//Command completion, set by event poll
 	Bool		 cmd_done;
 	I64			 cmd_code, cmd_slot;
 	CXhciTRB	*cmd_trb;		//pending command TRB
@@ -372,16 +352,15 @@ class CUsbDev
 	I64		 hub_ports,		//downstream port count (hubs only)
 			 hub_tt_think,	//TT think time field (0..3)
 			 hub_mtt;		//multi-TT enabled
-//Config descriptor as fetched. Class drivers need the class-specific and
-//alternate-setting records the parser does not keep.
+//Config descriptor as fetched; the parser keeps neither class-specific nor
+//alternate-setting records.
 	U8		*raw_config;
 	I64		 raw_config_len;
 	U8		*drv_data;		//class driver private (CUsbMsd / CUsbHid / CUsbEcm)
 	U8		 desc_name[64];	//product string, ASCII
 };
 
-//KUsbHub.ZC calls UsbDrvBind from KUsbBoot.ZC, compiled later. Declared after
-//CUsbDev/CUsbIf so the types are known.
+//Declared after CUsbDev/CUsbIf; KUsbBoot.ZC compiles later.
 extern U0 UsbDrvBind(CUsbDev *dev);
 extern U0 UsbDrvUnbind(CUsbDev *dev);
 extern U0 UsbHubAttach(CUsbDev *dev, CUsbIf *uif);
@@ -406,8 +385,7 @@ public extern Bool UsbAudioPresent();
 public extern U0  UsbTaskMain(I64 dummy=0);
 public extern I64  XhciInitAll();
 
-//CDC-ECM NIC interface for $LK,"UsbEcm.ZC",A="FF:::/Home/Net/Drivers/UsbEcm.ZC"$.
-//Operates on the first bound NIC.
+//CDC-ECM NIC interface for $LK,"UsbEcm.ZC",A="FF:::/Home/Net/Drivers/UsbEcm.ZC"$. First bound NIC only.
 public extern U0   UsbEcmRep();
 public extern Bool UsbEcmPresent();
 public extern U0   UsbEcmMacAddr(U8 *out6);

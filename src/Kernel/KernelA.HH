@@ -1043,8 +1043,7 @@ public class CHashGlobalVar:CHashSrcSym
 
 #help_index "DolDoc"
 //See $LK,"TextBase Layer",A="HI:TextBase Layer"$.
-//Bit 26 flags a truecolor text cell: its fg/bg come from the RGB planes
-//$LK,"gr.text_fg",A="FF:::/System/Gr/GrGlobals.ZC,text_fg"$/text_bg, not the palette nibbles. Bit 27 is reserved.
+//Bit 26 flags a truecolor text cell: fg/bg come from the $LK,"gr.text_fg",A="FF:::/System/Gr/GrGlobals.ZC,text_fg"$/text_bg planes, not the palette nibbles. Bit 27 reserved.
 #define ATTRF_TRUE_COLOR	0x04000000
 #define ATTRf_TRUE_COLOR	26
 
@@ -1105,9 +1104,8 @@ public class CHashGlobalVar:CHashSrcSym
 
 #define DOCT_TYPES_NUM			43
 
-//Marker OR'd into a doldoc.hash cmd's user_data0 for the $FG24/$BG24 truecolor
-//variants of $FG/$BG. Their doc entry stays DOCT_FOREGROUND/BACKGROUND but the
-//attr is flagged $LK,"ROPF_TRUE_COLOR",A="MN:ROPF_TRUE_COLOR"$ and holds a 0xRRGGBB. Above all DOCT_ values.
+//OR'd into a doldoc.hash cmd's user_data0 for $FG24/$BG24. Doc entry stays
+//DOCT_FOREGROUND/BACKGROUND; attr is $LK,"ROPF_TRUE_COLOR",A="MN:ROPF_TRUE_COLOR"$ and holds 0xRRGGBB. Above all DOCT_ values.
 #define DOC_TC_CMD_FLAG 		0x100
 
 //CDocEntry.type flags upper bits
@@ -2849,8 +2847,7 @@ class CAHCIHba
 	CAHCIPort	ports[32];
 };
 
-//NVMe 1.4. Controller registers are BAR0; everything here is polled, as with
-//AHCI, because the kernel has no MSI support.
+//NVMe 1.4. Controller registers are BAR0; polled, no MSI.
 #define NVME_MAX_CTRLS		4
 #define NVME_MAX_NS			4		//drive letters K..N
 #define NVME_Q_DEPTH		64		//entries per queue, admin and I/O
@@ -2885,7 +2882,7 @@ class CAHCIHba
 #define NVME_IDENT_NS_LIST	0x02	//CNS: active namespace list
 #define NVME_FEAT_NUM_QUEUES 0x07
 
-#define NVME_IO_QID			1		//one I/O queue pair is enough when polled
+#define NVME_IO_QID			1
 
 class CNVMeRegs
 {//BAR0 register layout. Doorbells start at 0x1000.
@@ -3748,8 +3745,7 @@ public class CDevGlobals
 #define ROPF_DITHER 				0x40000000
 #define ROPF_PROBABILITY_DITHER 	0x80000000
 
-//True color pen: low 24 bits of the CColorROPU32 are 0xRRGGBB.
-//Bits 25-26 hold the ROPB_ raster op.  No dither with true color.
+//True color pen: low 24 bits of the CColorROPU32 are 0xRRGGBB, bits 25-26 the ROPB_ raster op.
 #define ROPF_TRUE_COLOR 			0x01000000
 #define ROPf_TC_ROP 				25
 
@@ -3776,8 +3772,7 @@ public class CDevGlobals
 #define COLOR_INVALID	16
 #define COLOR_MONO		0xFF
 
-//Native 32-bit pixel format of $LK,"CDC",A="MN:CDC"$ image bodies: 0xFFRRGGBB.
-//High byte zero is a normal opaque color; nonzero high byte is a flag.
+//Native 32-bit pixel format of $LK,"CDC",A="MN:CDC"$ image bodies: 0xFFRRGGBB. Nonzero high byte is a flag.
 #define PIXF_TRANSPARENT	0xFF000000 //Also serves as COLOR_MONO "on" mask pix.
 #define PIXF_INVALID		0xFD000000 //Pix val that never occurs on screen.
 #define PIX_FLAGS_MASK		0xFF000000
@@ -3810,8 +3805,7 @@ public I64 class CBGR48
 #help_index "Keyboard Devices;Char/Input;StdIn"
 #define KBD_PORT	0x60
 #define KBD_CTRL	0x64
-//8042 status bit 5: the pending byte came from the AUX (mouse) port. Both
-//devices share one output buffer.
+//8042 status bit 5: pending byte came from the AUX (mouse) port.
 #define KBD_STSF_AUX	0x20
 
 #define KBDC_LED		0xED
@@ -4409,9 +4403,8 @@ public class CSysFixedArea
 #define RAWF_SCROLL 		8
 
 //A glyph is height rows of row_bytes bytes, bit n of a row = column n; a font
-//is 256 glyphs end to end. At 8x8, row_bytes is 1 and a U64[256] table is
-//byte-identical to the bitmap, so sys_font_std is adopted, not converted.
-//FontGlyphRows() is the only reader of this layout.
+//is 256 glyphs end to end. At 8x8 row_bytes is 1 and the bitmap is byte-identical
+//to a U64[256] table.
 public class CFont
 {
 	U8		*name;
@@ -4428,20 +4421,15 @@ public class CTextGlobals
 	U64 	*font, *aux_font, screen_size, buffer_size;
 	U8		 border_chars[16];
 	Bool	 is_fb_busy;
-	//Last field. Added after the shipped kernel binary was built; every field
-	//above keeps the offset that binary uses.
-	CFont	*cur_font;		//same glyphs as font, described
+	//Last field: every field above keeps the offset the shipped kernel binary uses.
+	CFont	*cur_font;
 };
 
-//Size of the built-in glyph tables.
 #define KFONT_WIDTH		8
 #define KFONT_HEIGHT	8
 
-//Cell size the kernel is compiled against. At boot KMain redefines both from
-//the selected font; DefineLoad's HashAdd puts the new entry in front, so
-//everything compiled from StartOS onward sees the live size and folds it to a
-//literal. Same mechanism GrGlobals.ZC uses for TEXT_ROWS. Kernel code is AOT
-//and never sees the injected pair; it calls FontW()/FontH().
+//Cell size the kernel is compiled against. KMain redefines both at boot from the
+//selected font; AOT kernel code never sees the redefinition and calls FontW()/FontH().
 #define FONT_WIDTH		8
 #define FONT_HEIGHT 	8
 
