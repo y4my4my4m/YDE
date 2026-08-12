@@ -12,6 +12,12 @@ for (a = 0, b = 9; a < 2; a++, b--) ;
 console.log(a + "," + b);
 console.log((console.log("seq-first"), "seq-last"));
 
+// (0, o.m)(x): sequence in callee position, detaching a method from its receiver
+var seqobj = { v: 10, m: function (d) { return 40 + d; } };
+var seqdet = (0, seqobj.m);
+console.log(seqdet(2));
+console.log((0, seqobj.m)(2));
+
 // nested ternaries, both branches
 var t = n > 1 ? n > 2 ? "hi" : "mid" : "lo";
 console.log(t);

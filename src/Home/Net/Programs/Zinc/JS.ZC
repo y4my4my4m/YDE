@@ -34,7 +34,13 @@
 	Needs: HTML.ZC. No literal dollar signs allowed in this file. */
 
 #define JS_MAX_SRC			2097152	// = HTTP_BODY_MAX: bigger can't arrive anyway
-#define JS_MAX_STEPS		2000000
+// A 240KB bundle's init legitimately runs tens of millions of nodes, so the
+// step count is now only a backstop; the real guard is wall clock, because
+// what must be bounded is how long the browser is unresponsive, and the cost
+// of a step varies by two orders of magnitude between a + and a regex match.
+#define JS_MAX_STEPS		200000000
+#define JS_MAX_SECS			20.0
+#define JS_TIME_CHECK		0xFFFF	// steps between clock reads
 #define JS_MAX_DEPTH		48
 #define JS_MAX_ARGS			16
 #define JS_WRITE_BUF		131072
@@ -64,6 +70,7 @@
 #define JSO_PROXY		9	// new Proxy(t, h); slots _ptarget / _phandler
 #define JSO_DATASET	10	// el.dataset: camelCase <-> data-* attributes
 #define JSO_CANVAS2D	11	// ctx from canvas.getContext("2d"); node = the canvas
+#define JSO_PROTO	12	// X.prototype; num holds the JV_* type it serves
 
 /* native function ids */
 #define JSN_ALERT			1
@@ -376,6 +383,10 @@
 #define JSN_FN_TOSTR		355	// Function.prototype.toString
 #define JSN_MAP_ENTRIES	356	// map.entries / keys / values; _m selects
 #define JSN_SET_ENTRIES	357	// set.entries / keys / values; _m selects
+#define JSN_OBJ_IS			358	// Object.is(a, b): SameValue
+#define JSN_URL_CTOR		359	// new URL(href [, base])
+#define JSN_EVAL			360	// eval(src) in the global environment
+#define JSN_BOOLEAN			361	// Boolean(x): ToBoolean
 
 /* token types */
 #define JT_EOF		0
@@ -572,6 +583,8 @@ class CJsInterp
 	Bool	 dom_dirty;
 	Bool	 evt_prevented;	// last dispatched event called preventDefault()
 	I64		 steps, depth, flow;
+	F64		 t_deadline;	// tS past which the running script is cut off
+	F64		 t_start;		// tS when this entry began, for the cost report
 	CJsVal	*ret_val;
 	CJsVal	*doc_obj, *loc_obj, *win_obj;
 	U8		 err[144];
@@ -580,6 +593,10 @@ class CJsInterp
 	CJsTok	*toks;
 	U8		*src_text;	// original source (for raw-source parse-error logging)
 	I64		 tok_count, pos;
+	I64		 lex_end;		// bytes the lexer consumed; < StrLen(src) = stopped early
+	I64		 lex_cmt;		// of those, bytes inside comments
+	U8		*blk;			// current bump-allocation block
+	I64		 blk_used;		// bytes taken from it
 	CJsTimer	*timers;		// setTimeout/setInterval/async-XHR queue
 	CJsListener	*listeners;		// addEventListener + el.onX handlers
 	I64			 next_timer_id;
@@ -620,6 +637,7 @@ I64 js_soft_errs  = 0;
 I64 js_parse_errs = 0;
 I64 js_script_n = 0;	// scripts handed to the interpreter, per page
 I64 js_undef_errs = 0;	// misses on an already-undefined receiver: downstream
+I64 js_tok_dropped = 0;	// tokens thrown away by parse-error recovery, per script
 
 // Distinct runtime warnings remembered per script. A miss inside a loop
 // repeats until it has evicted every other line from the 160-line console
@@ -630,14 +648,48 @@ I64 js_undef_errs = 0;	// misses on an already-undefined receiver: downstream
 U8	js_warn_seen[JS_WARN_KEEP][JS_WARN_LEN];
 I64	js_warn_n = 0;
 
+U0 JsBudgetReset(CJsInterp *ji)
+{ // a fresh step and time budget for one top-level entry: a script, a timer
+  // callback, an XHR completion. Each is its own unit of "how long may the
+  // browser be busy", so each restarts the clock.
+	ji->steps = 0;
+	ji->t_start = tS;
+	ji->t_deadline = tS + JS_MAX_SECS;
+}
+
+#define JS_ARENA_BLK	65536	// bump-allocation block
+
 U8 *JsAlloc(CJsInterp *ji, I64 size)
-{
-	CJsAllocHdr *h = CAlloc(size + sizeof(CJsAllocHdr));
+{ // Bump allocation out of 64KB blocks. EVERY value, property and scope entry
+  // comes through here, so one CAlloc apiece put a heap allocation on the path
+  // of every intermediate result: `i + 1` inside a loop cost one, and so did
+  // each undefined returned for a missing property. The arena is released whole
+  // by JsInterpFree, so individual objects need no header and are never freed
+  // on their own. Blocks come from CAlloc, and each byte is handed out once, so
+  // callers still get zeroed memory.
+	CJsAllocHdr *h;
+	U8			*r;
 
-	h->next = ji->allocs;
-	ji->allocs = h;
+	size = (size + 7) & (-8); // every result stays 8-byte aligned
+	if (size > JS_ARENA_BLK - sizeof(CJsAllocHdr))
+	{ // oversized (a long string): its own block, chained the same way
+		h = CAlloc(size + sizeof(CJsAllocHdr));
+		h->next = ji->allocs;
+		ji->allocs = h;
+		return h(U8 *) + sizeof(CJsAllocHdr);
+	}
+	if (!ji->blk || ji->blk_used + size > JS_ARENA_BLK)
+	{
+		h = CAlloc(JS_ARENA_BLK);
+		h->next = ji->allocs;
+		ji->allocs = h;
+		ji->blk = h(U8 *);
+		ji->blk_used = sizeof(CJsAllocHdr);
+	}
+	r = ji->blk + ji->blk_used;
+	ji->blk_used += size;
 
-	return h(U8 *) + sizeof(CJsAllocHdr);
+	return r;
 }
 
 U0 JsPathCat(U8 *out, I64 max, U8 *s)
@@ -1169,7 +1221,11 @@ Bool JsIdentCh(I64 ch, Bool first)
 /* ---- parser helpers ---- */
 
 CJsTok *JsTok(CJsInterp *ji)
-{
+{ // clamped to the EOF slot. Recovery paths advance pos freely, and reading
+  // past the array is a fault rather than a syntax error.
+	if (ji->pos >= ji->tok_count && ji->tok_count > 0)
+		return &ji->toks[ji->tok_count - 1];
+
 	return &ji->toks[ji->pos];
 }
 
@@ -1320,7 +1376,7 @@ U0 JsParseResync(CJsInterp *ji)
 { // Drop tokens to the end of the failed statement and clear the error. Stops
   // BEFORE a closer that belongs to the enclosing block, so the caller's own
   // loop still sees its '}'.
-	I64 dep = 0;
+	I64 dep = 0, from = ji->pos;
 
 	ji->parse_err = FALSE;
 	while (JsTok(ji)->type != JT_EOF)
@@ -1336,10 +1392,12 @@ U0 JsParseResync(CJsInterp *ji)
 		else if (!dep && JsIsPunct(ji, ';'))
 		{
 			ji->pos++;
+			js_tok_dropped += ji->pos - from;
 			return;
 		}
 		ji->pos++;
 	}
+	js_tok_dropped += ji->pos - from;
 }
 
 CJsNode *JsParseArgs(CJsInterp *ji)
@@ -1502,7 +1560,7 @@ CJsNode *JsParsePrimary(CJsInterp *ji)
 	CJsTok	*t = JsTok(ji);
 	CJsNode *node, *item, *tail, *supcall, *dflt, *wrap;
 	U8		 numkey[24], embuf[224], emtk[32];
-	I64		 emk, open_pos;
+	I64		 emk, emk2, open_pos;
 	I64		 acc; // object-literal accessor kind: 0 none, 1 get, 2 set
 
 	if (t->type == JT_NUM)
@@ -1662,6 +1720,7 @@ CJsNode *JsParsePrimary(CJsInterp *ji)
 				NetLog("JS:  stop@: %s", embuf); // where ')' was expected
 			}
 			emk = 1;
+			emk2 = ji->pos;
 			while (emk > 0 && JsTok(ji)->type != JT_EOF)
 			{
 				if (JsIsPunct(ji, '(') || JsIsPunct(ji, '[') || JsIsPunct(ji, '{'))
@@ -1671,6 +1730,11 @@ CJsNode *JsParsePrimary(CJsInterp *ji)
 					emk--;
 				ji->pos++;
 			}
+			// balance-skipping out of an unclosed '(' discards everything to the
+			// matching ')'. For the IIFE a bundle is wrapped in that is the whole
+			// program, so the count has to be visible: the script still parses
+			// and runs, it just has almost nothing left in it.
+			js_tok_dropped += ji->pos - emk2;
 		}
 		return node;
 	}
@@ -3137,6 +3201,78 @@ CJsVal *JsUrlAbs(CJsInterp *ji, U8 *rel)
 	return v;
 }
 
+CJsVal *JsProtoStandin(CJsInterp *ji, I64 type)
+{ // an empty value of `type`, used only to resolve X.prototype.m through the
+  // one dispatch table that already serves `"s".m` and `[].m`. The methods are
+  // this-based natives, so the value handed back works through .call/.apply.
+	if (type == JV_ARR)
+		return JsArrV(ji);
+	if (type == JV_STR)
+		return JsStrV(ji, "");
+	if (type == JV_NUM)
+		return JsNumV(ji, 0);
+	if (type == JV_BOOL)
+		return JsBoolV(ji, FALSE);
+	if (type == JV_NATIVE)
+		return JsNativeV(ji, JSN_EVT_NOOP);
+
+	return JsValNew(ji, JV_OBJ);
+}
+
+U0 JsProtoAttach(CJsInterp *ji, CJsVal *ctor, I64 type)
+{ // hang a reachable X.prototype off a constructor. JSO_PROTO resolves member
+  // reads against an empty value of `type`, so the prototype exposes exactly
+  // the methods the type already dispatches, with no second table to drift.
+	CJsVal *proto;
+
+	if (!ctor)
+		return;
+	proto = JsValNew(ji, JV_OBJ);
+	proto->native_id = JSO_PROTO;
+	proto->num = type;
+	JsPropSet(ji, proto, "constructor", ctor);
+	JsPropSet(ji, ctor, "prototype", proto);
+}
+
+CJsVal *JsUrlNew(CJsInterp *ji, U8 *href, U8 *base)
+{ // new URL(href [, base]). The components come out of JsUrlPart, the same
+  // splitter `location` uses, so there is one URL parser here and not two.
+	CJsVal	 *v;
+	CHttpUrl  bu;
+	U8		 *abs = NULL;
+	U8		  buf[600];
+
+	if (!href)
+		href = "";
+	if (!base || !*base)
+		base = ji->url;
+	if (base && HttpUrlParse(base, &bu) >= 0)
+		abs = HttpUrlResolve(&bu, href);
+	if (!abs)
+		abs = StrNew(href);
+	v = JsValNew(ji, JV_OBJ);
+	JsPropSet(ji, v, "href", JsStrV(ji, abs));
+	JsUrlPart(abs, 0, buf);
+	JsPropSet(ji, v, "protocol", JsStrV(ji, buf));
+	JsUrlPart(abs, 1, buf);
+	JsPropSet(ji, v, "host", JsStrV(ji, buf));
+	JsUrlPart(abs, 2, buf);
+	JsPropSet(ji, v, "hostname", JsStrV(ji, buf));
+	JsUrlPart(abs, 3, buf);
+	JsPropSet(ji, v, "port", JsStrV(ji, buf));
+	JsUrlPart(abs, 4, buf);
+	JsPropSet(ji, v, "pathname", JsStrV(ji, buf));
+	JsUrlPart(abs, 5, buf);
+	JsPropSet(ji, v, "search", JsStrV(ji, buf));
+	JsUrlPart(abs, 6, buf);
+	JsPropSet(ji, v, "hash", JsStrV(ji, buf));
+	JsUrlPart(abs, 7, buf);
+	JsPropSet(ji, v, "origin", JsStrV(ji, buf));
+	Free(abs);
+
+	return v;
+}
+
 CJsVal *JsMemberGet(CJsInterp *ji, CJsVal *obj, U8 *name)
 {
 	CJsVal *v, *trap, *tgt;
@@ -3319,6 +3455,9 @@ CJsVal *JsMemberGet(CJsInterp *ji, CJsVal *obj, U8 *name)
 				return JsNativeV(ji, JSN_FN_TOSTR);
 			if (!StrCompare(name, "valueOf"))
 				return JsNativeV(ji, JSN_VALUEOF); // hands back the function
+			if (!StrCompare(name, "hasOwnProperty") ||
+				!StrCompare(name, "propertyIsEnumerable"))
+				return JsNativeV(ji, JSN_OBJ_HASOWN); // functions carry props
 			return JsUndefV(ji);
 		case JV_FUNC:
 			if (!StrCompare(name, "call"))	return JsNativeV(ji, JSN_FN_CALL);
@@ -3340,6 +3479,9 @@ CJsVal *JsMemberGet(CJsInterp *ji, CJsVal *obj, U8 *name)
 				return JsNativeV(ji, JSN_FN_TOSTR);
 			if (!StrCompare(name, "valueOf"))
 				return JsNativeV(ji, JSN_VALUEOF); // hands back the function
+			if (!StrCompare(name, "hasOwnProperty") ||
+				!StrCompare(name, "propertyIsEnumerable"))
+				return JsNativeV(ji, JSN_OBJ_HASOWN); // functions carry props
 			return JsUndefV(ji);
 		case JV_OBJ:
 			break;
@@ -3349,6 +3491,16 @@ CJsVal *JsMemberGet(CJsInterp *ji, CJsVal *obj, U8 *name)
 
 	switch (obj->native_id)
 	{
+		case JSO_PROTO:
+			// Object.prototype.hasOwnProperty.call(o, k) and
+			// Array.prototype.slice.call(a) are in every transpiled bundle, so
+			// the prototype has to be a reachable object carrying the methods.
+			// Own properties first: `constructor`, and anything a polyfill
+			// assigned onto it.
+			v = JsPropGet(obj, name);
+			if (v)
+				return v;
+			return JsMemberGet(ji, JsProtoStandin(ji, ToI64(obj->num)), name);
 		case JSO_CANVAS2D:
 			// ctx state (fillStyle/strokeStyle/font/lineWidth/globalAlpha) is
 			// held as ordinary props on the object, so a plain lookup is right.
@@ -4302,9 +4454,23 @@ U0 JsAssignTo(CJsInterp *ji, CJsNode *target, CJsVal *val)
 }
 
 U8 *JsCtorName(CJsNode *n)
-{ // best-effort name of a `new` target, for the diagnostic
+{ // best-effort name of a `new`/call target, for the diagnostic
+	CJsNode *c;
+	I64		 depth = 0;
+
+	// (0, a.b)(): the callee is a sequence whose last element is the function
+	while (n && n->type == JN_SEQ && n->a && depth < 8)
+	{
+		c = n->a;
+		while (c->next)
+			c = c->next;
+		n = c;
+		depth++;
+	}
 	if (n && (n->type == JN_IDENT || n->type == JN_MEMBER) && n->str)
 		return n->str;
+	if (n && n->type == JN_FUNC)
+		return "(fn)";
 	return "(expr)";
 }
 
@@ -4344,6 +4510,7 @@ U8 *JsNidName(I64 nid)
 		case JSO_PROXY:		return "proxy";
 		case JSO_DATASET:	return "dataset";
 		case JSO_CANVAS2D:	return "canvas2d";
+		case JSO_PROTO:		return "prototype";
 	}
 	return "?";
 }
@@ -4472,6 +4639,12 @@ U0 JsWhy(CJsInterp *ji, CJsNode *tgt, CJsVal *v, U8 *out)
 		how = "index";
 	else if (tgt && tgt->type == JN_CALL)
 		how = "callres";
+	else if (tgt && tgt->type == JN_SEQ)
+		how = "seq";
+	else if (tgt && tgt->type == JN_FUNC)
+		how = "fnexpr";
+	else if (tgt && tgt->type == JN_COND)
+		how = "cond";
 	if (v && v->type == JV_OBJ)
 	{
 		cf = '-';
@@ -4889,6 +5062,16 @@ CJsVal *JsEval(CJsInterp *ji, CJsNode *node)
 	{
 		JsErr(ji, "script ran too long");
 		return JsUndefV(ji);
+	}
+	if (!(ji->steps & JS_TIME_CHECK))
+	{ // Yield here as well as in the lexer: a bundle's synchronous init runs for
+	  // seconds, and the rest of the system must not stop for it.
+		Yield;
+		if (tS > ji->t_deadline)
+		{
+			JsErr(ji, "script ran too long (wall clock)");
+			return JsUndefV(ji);
+		}
 	}
 
 	switch (node->type)
@@ -5407,6 +5590,7 @@ CJsVal *JsEval(CJsInterp *ji, CJsNode *node)
 			// JN_CLASS overwrites this with its own prototype object.
 			fproto = JsValNew(ji, JV_OBJ);
 			JsPropSet(ji, v, "prototype", fproto);
+			JsPropSet(ji, fproto, "constructor", v); // instance.constructor
 			if (node->str)
 				JsEnvDeclare(ji, ji->env, node->str, v);
 			return v;
@@ -5615,6 +5799,7 @@ js_class_next:;
 			if (!v)
 				v = JsNativeV(ji, JSN_EVT_NOOP); // default empty constructor
 			JsPropSet(ji, v, "prototype", obj);
+			JsPropSet(ji, obj, "constructor", v); // instance.constructor
 			if (sv)
 				v->proto = sv; // static members inherit too (Dog.fromName etc)
 			child = node->a;
@@ -5798,7 +5983,7 @@ U0 JsMicroDrain(CJsInterp *ji)
 		ji->micro_head = m->next;
 		if (!ji->micro_head)
 			ji->micro_tail = NULL;
-		ji->steps = 0;
+		JsBudgetReset(ji);
 		ji->depth = 0;
 		ji->flow = JF_NORMAL;
 		ji->env = ji->genv;
@@ -6825,7 +7010,7 @@ U0 JsXhrFire(CJsInterp *ji, CJsVal *xhr)
 	cb = JsPropGet(xhr, "onreadystatechange");
 	if (cb && (cb->type == JV_FUNC || cb->type == JV_NATIVE))
 	{
-		ji->steps = 0; ji->depth = 0; ji->flow = JF_NORMAL; ji->env = ji->genv;
+		JsBudgetReset(ji); ji->depth = 0; ji->flow = JF_NORMAL; ji->env = ji->genv;
 		JsCall(ji, cb, xhr, NULL, 0);
 	}
 
@@ -6835,14 +7020,14 @@ U0 JsXhrFire(CJsInterp *ji, CJsVal *xhr)
 		cb = JsPropGet(xhr, "onerror");
 	if (cb && (cb->type == JV_FUNC || cb->type == JV_NATIVE))
 	{
-		ji->steps = 0; ji->depth = 0; ji->flow = JF_NORMAL; ji->env = ji->genv;
+		JsBudgetReset(ji); ji->depth = 0; ji->flow = JF_NORMAL; ji->env = ji->genv;
 		JsCall(ji, cb, xhr, NULL, 0);
 	}
 
 	cb = JsPropGet(xhr, "onloadend"); // fires on both outcomes
 	if (cb && (cb->type == JV_FUNC || cb->type == JV_NATIVE))
 	{
-		ji->steps = 0; ji->depth = 0; ji->flow = JF_NORMAL; ji->env = ji->genv;
+		JsBudgetReset(ji); ji->depth = 0; ji->flow = JF_NORMAL; ji->env = ji->genv;
 		JsCall(ji, cb, xhr, NULL, 0);
 	}
 
@@ -6949,7 +7134,7 @@ Bool JsDispatchEvent(CJsInterp *ji, CZNode *node, U8 *type, Bool bubbles=TRUE)
 		if (l->active && l->node == cur && !StrCompare(l->type, type))
 		{
 			ji->has_err = FALSE;
-			ji->steps = 0; ji->depth = 0; ji->flow = JF_NORMAL; ji->env = ji->genv;
+			JsBudgetReset(ji); ji->depth = 0; ji->flow = JF_NORMAL; ji->env = ji->genv;
 			a1 = evt;
 			// `this` inside a handler is the node the handler is ON
 			// (currentTarget), not the node the event started from
@@ -6996,7 +7181,7 @@ U0 JsEventLoopPump(CJsInterp *ji)
 		if (t->active && now >= t->due)
 		{
 			ji->has_err = FALSE;
-			ji->steps = 0; ji->depth = 0; ji->flow = JF_NORMAL; ji->env = ji->genv;
+			JsBudgetReset(ji); ji->depth = 0; ji->flow = JF_NORMAL; ji->env = ji->genv;
 			if (t->is_xhr)
 			{
 				t->active = FALSE;
@@ -7127,6 +7312,115 @@ Bool JsNodeContains(CZNode *root, CZNode *target)
 		child = child->next;
 	}
 	return FALSE;
+}
+
+U0 JsThrowText(CJsInterp *ji, CJsVal *exc, U8 *out, I64 max)
+{ // an Error object stringifies to "[object Object]", which names nothing.
+  // name and message are what the page actually put in it.
+	CJsVal *nm, *msg;
+
+	out[0] = 0;
+	if (!exc)
+	{
+		JsPathCat(out, max, "uncaught exception");
+		return;
+	}
+	if (exc->type == JV_OBJ)
+	{
+		nm	= JsPropGet(exc, "name");
+		msg = JsPropGet(exc, "message");
+		if (nm || msg)
+		{
+			if (nm)
+				JsPathCat(out, max, JsToStr(ji, nm));
+			if (nm && msg)
+				JsPathCat(out, max, ": ");
+			if (msg)
+				JsPathCat(out, max, JsToStr(ji, msg));
+			return;
+		}
+	}
+	JsPathCat(out, max, JsToStr(ji, exc));
+}
+
+CJsVal *JsEvalString(CJsInterp *ji, U8 *src)
+{ // eval(src): runs as a script in the GLOBAL environment. The caller's local
+  // scope is NOT threaded in, so this is indirect-eval semantics - which is
+  // what the (0, eval)(s) idiom in bundles asks for anyway; a direct eval that
+  // reads its caller's locals is not supported.
+  // This runs while an outer script is mid-evaluation and shares the one lexer
+  // and parser state, so all of it is saved and put back. The step and time
+  // budgets are deliberately NOT reset: an eval inside a loop must not be able
+  // to buy itself a fresh one.
+	CJsTok	*save_toks;
+	U8		*save_src;
+	I64		 save_tc, save_pos, save_flow, before;
+	Bool	 save_perr;
+	CJsEnv	*save_env;
+	CJsNode *stmt, *head, *tail;
+	CJsVal	*val, *cur;
+
+	if (!src || !*src || ji->has_err)
+		return JsUndefV(ji);
+	save_toks = ji->toks;
+	save_src  = ji->src_text;
+	save_tc	  = ji->tok_count;
+	save_pos  = ji->pos;
+	save_perr = ji->parse_err;
+	save_env  = ji->env;
+	save_flow = ji->flow;
+
+	ji->toks = NULL;
+	ji->parse_err = FALSE;
+	ji->flow = JF_NORMAL;
+	val = JsUndefV(ji);
+	if (JsLex(ji, src))
+	{
+		head = NULL;
+		tail = NULL;
+		while (JsTok(ji)->type != JT_EOF)
+		{
+			before = ji->pos;
+			stmt = JsParseStmt(ji);
+			if (ji->parse_err)
+				JsParseResync(ji);
+			if (stmt)
+			{
+				if (tail)
+					tail->next = stmt;
+				else
+					head = stmt;
+				tail = stmt;
+			}
+			if (ji->pos == before)
+				ji->pos++;
+		}
+		ji->env = ji->genv;
+		JsHoistList(ji, head, ji->genv);
+		stmt = head;
+		while (stmt && !ji->has_err && ji->flow != JF_THROW)
+		{ // a statement (if / var / block) evaluates to nothing and must not
+		  // clear the value: an empty completion keeps the previous one. The
+		  // value only ever comes from an expression statement, so eval of a
+		  // bare `if (c) { 9 }` yields undefined where a real engine yields 9.
+			cur = JsEval(ji, stmt);
+			if (cur)
+				val = cur;
+			stmt = stmt->next;
+		}
+	}
+	if (ji->toks)
+		Free(ji->toks);
+	ji->toks	  = save_toks;
+	ji->src_text  = save_src;
+	ji->tok_count = save_tc;
+	ji->pos		  = save_pos;
+	ji->parse_err = save_perr;
+	ji->env		  = save_env;
+	if (ji->flow != JF_THROW)
+		ji->flow = save_flow; // a throw crosses out; a stray return does not
+
+	return val;
 }
 
 #include "JSNative"
@@ -7323,7 +7617,11 @@ CJsInterp *JsInterpNew(CZNode *dom_root, U8 *url)
 	JsPropSet(ji, console_obj, "clear",	JsNativeV(ji, JSN_CONSOLE_NOOP));
 	JsEnvDeclare(ji, ji->genv, "console", console_obj);
 
-	JsGlobalNative(ji, "Date", JSN_DATE_CTOR); // new Date(); Date.now via member case
+	// A plain-object prototype: enough to reach the generic Object methods off
+	// it, which is what `RegExp.prototype.hasOwnProperty.call(...)` needs. It
+	// does not carry the type's own methods, since instances of these are
+	// JV_OBJ and their methods hang off the instance.
+	JsProtoAttach(ji, JsGlobalNative(ji, "Date", JSN_DATE_CTOR), JV_OBJ);
 	date = NULL; // (local kept for the compiler; the old Date object is retired)
 
 	JsGlobalNative(ji, "alert",		 JSN_ALERT);
@@ -7345,10 +7643,12 @@ CJsInterp *JsInterpNew(CZNode *dom_root, U8 *url)
 	// String and Number are callable natives; JsMemberGet's JV_NATIVE arm reads
 	// plain props off them, so the statics hang there directly
 	scr = JsGlobalNative(ji, "String", JSN_STRING);
+	JsProtoAttach(ji, scr, JV_STR);
 	JsPropSet(ji, scr, "fromCharCode",  JsNativeV(ji, JSN_STR_FROMCHAR));
 	JsPropSet(ji, scr, "fromCodePoint", JsNativeV(ji, JSN_STR_FROMCHAR));
 
 	scr = JsGlobalNative(ji, "Number", JSN_NUMBER);
+	JsProtoAttach(ji, scr, JV_NUM);
 	JsPropSet(ji, scr, "isInteger",		JsNativeM(ji, JSN_NUM_ISINT, 0));
 	JsPropSet(ji, scr, "isSafeInteger",	JsNativeM(ji, JSN_NUM_ISINT, 1));
 	// _m 1 = do not coerce. JSN_NUM_ISFINITE serves the global isFinite too,
@@ -7381,15 +7681,15 @@ CJsInterp *JsInterpNew(CZNode *dom_root, U8 *url)
 	JsGlobalNative(ji, "XMLHttpRequest",JSN_XHR_NEW);
 	JsGlobalNative(ji, "Promise",		JSN_PROMISE_CTOR);
 	JsGlobalNative(ji, "fetch",			JSN_FETCH);
-	JsGlobalNative(ji, "Map",			JSN_MAP_CTOR);
+	JsProtoAttach(ji, JsGlobalNative(ji, "Map", JSN_MAP_CTOR), JV_OBJ);
 	JsGlobalNative(ji, "WeakMap",		JSN_MAP_CTOR);
-	JsGlobalNative(ji, "Set",			JSN_SET_CTOR);
+	JsProtoAttach(ji, JsGlobalNative(ji, "Set", JSN_SET_CTOR), JV_OBJ);
 	JsGlobalNative(ji, "WeakSet",		JSN_SET_CTOR);
-	JsGlobalNative(ji, "Error",			JSN_ERROR_CTOR);
+	JsProtoAttach(ji, JsGlobalNative(ji, "Error", JSN_ERROR_CTOR), JV_OBJ);
 	JsGlobalNative(ji, "TypeError",		JSN_ERROR_CTOR);
 	JsGlobalNative(ji, "RangeError",	JSN_ERROR_CTOR);
 	JsGlobalNative(ji, "SyntaxError",	JSN_ERROR_CTOR);
-	JsGlobalNative(ji, "RegExp",		JSN_REGEXP_CTOR);
+	JsProtoAttach(ji, JsGlobalNative(ji, "RegExp", JSN_REGEXP_CTOR), JV_OBJ);
 	JsGlobalNative(ji, "MutationObserver",		JSN_OBSERVER_CTOR);
 	JsGlobalNative(ji, "IntersectionObserver",	JSN_OBSERVER_CTOR);
 	JsGlobalNative(ji, "ResizeObserver",		JSN_OBSERVER_CTOR);
@@ -7560,6 +7860,7 @@ CJsInterp *JsInterpNew(CZNode *dom_root, U8 *url)
 	JsEnvDeclare(ji, ji->genv, "JSON", math);
 
 	math = JsValNew(ji, JV_OBJ); // Object namespace
+	JsPropSet(ji, math, "is",	  JsNativeV(ji, JSN_OBJ_IS));
 	JsPropSet(ji, math, "keys",   JsNativeV(ji, JSN_OBJ_KEYS));
 	JsPropSet(ji, math, "assign", JsNativeV(ji, JSN_OBJ_ASSIGN));
 	JsPropSet(ji, math, "values",  JsNativeV(ji, JSN_OBJ_VALUES));
@@ -7579,6 +7880,7 @@ CJsInterp *JsInterpNew(CZNode *dom_root, U8 *url)
 	JsPropSet(ji, math, "isSealed",		 JsNativeV(ji, JSN_OBJ_ISFROZEN));
 	JsPropSet(ji, math, "isExtensible",	 JsNativeV(ji, JSN_OBJ_ISFROZEN));
 	JsPropSet(ji, math, "hasOwn",		 JsNativeV(ji, JSN_OBJ_HASOWN));
+	JsProtoAttach(ji, math, JV_OBJ);
 	JsEnvDeclare(ji, ji->genv, "Object", math);
 
 	// JSO_WINDOW falls through to the global env, so window.X and a bare X are
@@ -7618,7 +7920,12 @@ CJsInterp *JsInterpNew(CZNode *dom_root, U8 *url)
 	JsGlobalNative(ji, "requestIdleCallback", JSN_SETTIMEOUT);
 	JsGlobalNative(ji, "cancelIdleCallback",  JSN_CLEARTIMER);
 
+	JsGlobalNative(ji, "eval", JSN_EVAL);
+	JsProtoAttach(ji, JsGlobalNative(ji, "Function", JSN_EVT_NOOP), JV_NATIVE);
+	JsProtoAttach(ji, JsGlobalNative(ji, "Boolean", JSN_BOOLEAN), JV_BOOL);
+	JsGlobalNative(ji, "URL", JSN_URL_CTOR);
 	math = JsGlobalNative(ji, "Array", JSN_ARRAY_CTOR);
+	JsProtoAttach(ji, math, JV_ARR);
 	JsPropSet(ji, math, "isArray", JsNativeV(ji, JSN_ARR_ISARR));
 	JsPropSet(ji, math, "from",	   JsNativeV(ji, JSN_ARRAY_FROM));
 	JsPropSet(ji, math, "of",	   JsNativeV(ji, JSN_ARRAY_OF));
@@ -7672,8 +7979,11 @@ U0 JsScriptReport(CJsInterp *ji, U8 *src, I64 nparsed, I64 nran, U8 *how)
 		i++;
 	}
 	head[k] = 0;
-	StrPrint(buf, "script[%d] %dB parsed=%d ran=%d perr=%d %s head=",
-			 js_script_n, StrLen(src), nparsed, nran, js_parse_errs, how);
+	StrPrint(buf, "script[%d] %dB lexed=%d cmt=%d toks=%d parsed=%d ran=%d "
+			 "perr=%d dropped=%d steps=%d ms=%d %s head=",
+			 js_script_n, StrLen(src), ji->lex_end, ji->lex_cmt, ji->tok_count,
+			 nparsed, nran, js_parse_errs, js_tok_dropped, ji->steps,
+			 ToI64((tS - ji->t_start) * 1000.0), how);
 	JsPathCat(buf, JS_WARN_LEN, head);
 	if (ji->has_err)
 	{ // the message that stopped it, on the same line as the counts
@@ -7686,6 +7996,41 @@ U0 JsScriptReport(CJsInterp *ji, U8 *src, I64 nparsed, I64 nran, U8 *how)
 		JsConsoleAdd("script", buf);
 }
 
+U0 JsLexEndCheck(CJsInterp *ji, U8 *src)
+{ // The lex loop runs `while (*p)`, so it can only stop on the terminator. A
+  // different end offset means a scanner advanced p past it, and the token
+  // stream then just stops: the parser meets EOF inside whatever was open and
+  // the script still reports as having run.
+	U8	buf[224], win[96];
+	I64 total = StrLen(src), i, k = 0, from;
+
+	if (ji->lex_end == total)
+		return;
+	from = ji->lex_end - 24;
+	if (from < 0)
+		from = 0;
+	for (i = from; i < ji->lex_end + 40 && src[i] && k < 72; i++)
+	{
+		if (i == ji->lex_end)
+		{
+			win[k] = '>';
+			k++;
+			win[k] = '|';
+			k++;
+			win[k] = '<';
+			k++;
+		}
+		win[k] = src[i];
+		k++;
+	}
+	win[k] = 0;
+	StrPrint(buf, "LEX ENDED at %d of %d: ", ji->lex_end, total);
+	JsPathCat(buf, 224, win);
+	JsScrub(buf);
+	JsConsoleAdd("lex", buf);
+	NetLog("JS: %s", buf);
+}
+
 Bool JsRunEx(CJsInterp *ji, U8 *src, CJsVal **_last)
 { // lex + parse + run one script; errors are logged, never fatal.
   // _last, when given, receives the value of the last statement that completed
@@ -7694,11 +8039,14 @@ Bool JsRunEx(CJsInterp *ji, U8 *src, CJsVal **_last)
 	CJsNode *stmt, *head, *tail;
 	CJsVal	*val;
 	I64		 before, nparsed = 0, nran = 0;
+	U8		 thrbuf[192];
 
 	if (_last)
 		*_last = NULL;
 	if (!src || !*src)
 		return TRUE;
+	ji->lex_end = 0; // zeroed here so the report cannot quote a previous script
+	ji->lex_cmt = 0; // on a path where the lexer never ran
 	if (StrLen(src) > JS_MAX_SRC)
 	{
 		js_parse_errs = 0;
@@ -7708,7 +8056,7 @@ Bool JsRunEx(CJsInterp *ji, U8 *src, CJsVal **_last)
 
 	ji->has_err = FALSE;
 	ji->parse_err = FALSE;
-	ji->steps	= 0;
+	JsBudgetReset(ji);
 	ji->depth	= 0;
 	ji->flow	= JF_NORMAL;
 	ji->env		= ji->genv;
@@ -7717,6 +8065,7 @@ Bool JsRunEx(CJsInterp *ji, U8 *src, CJsVal **_last)
 	js_undef_errs = 0;
 	js_warn_n	  = 0;
 	js_re_warned  = 0;
+	js_tok_dropped = 0;
 
 	if (!JsLex(ji, src))
 	{
@@ -7729,6 +8078,8 @@ Bool JsRunEx(CJsInterp *ji, U8 *src, CJsVal **_last)
 		}
 		return FALSE;
 	}
+
+	JsLexEndCheck(ji, src);
 
 	// Parse the whole script into one statement list before running any of it:
 	// hoisting needs every top-level declaration in hand, and a bundle's first
@@ -7771,11 +8122,10 @@ Bool JsRunEx(CJsInterp *ji, U8 *src, CJsVal **_last)
 			*_last = val;
 		if (ji->flow == JF_THROW)
 		{ // the thrown value is what you actually want to see
-			if (ji->exc)
-				JsConsoleAdd("THROW", JsToStr(ji, ji->exc));
-			else
-				JsConsoleAdd("THROW", "uncaught exception");
-			NetLog("JS: uncaught exception."); // log, then keep executing
+			JsThrowText(ji, ji->exc, thrbuf, 192);
+			JsScrub(thrbuf);
+			JsConsoleAdd("THROW", thrbuf);
+			NetLog("JS: uncaught throw: %s", thrbuf);
 		}
 		ji->flow = JF_NORMAL; // stray top-level break/return/throw
 		nran++;

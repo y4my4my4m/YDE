@@ -1,29 +1,77 @@
 /***** image pipeline *****/
 
+I64 YhImgEvict()
+{//Slot index to reuse once the cache is full, or -1 if nothing may be taken.
+//Only finished entries (ready or failed) are candidates: a queued one is what
+//the loader task is working on. The most recent YH_IMG_KEEP lookups are also
+//spared, since those are what the draw pass is blitting right now - taking one
+//would free a DC mid-GrBlot.
+	I64 i, oldest = -1, best = 0;
+
+	for (i = 0; i < yh.img_count; i++)
+		if ((yh.imgs[i].state == 2 || yh.imgs[i].state == 3) &&
+			yh.imgs[i].used + YH_IMG_KEEP < yh.img_clock)
+			if (oldest < 0 || yh.imgs[i].used < best)
+			{
+				oldest = i;
+				best = yh.imgs[i].used;
+			}
+
+	return oldest;
+}
+
 I64 YhImgGet(U8 *url, I64 maxw, I64 maxh)
 {//Cache index for a URL, enqueueing a background fetch on first sight.
-//-1 when the URL is empty or the cache is full.
+//-1 when the URL is empty, or when the cache is full of entries too recent to
+//evict.
 	I64		 i;
 	CYhImg	*im;
 
 	if (!url || !*url)
 		return -1;
+	yh.img_clock++;
 	for (i = 0; i < yh.img_count; i++)
 		if (!StrCompare(yh.imgs[i].url, url))
 		{
-			if (yh.imgs[i].state == 3 &&
+			yh.imgs[i].used = yh.img_clock;
+			if (yh.imgs[i].state == 3 && !yh.imgs[i].no_retry &&
 				counts.jiffies > yh.imgs[i].fail_t + 20 * JIFFY_FREQ)
 				yh.imgs[i].state = 1;	//Retry failures every ~20s (DNS flake).
 			return i;
 		}
 	if (yh.img_count >= YH_IMG_MAX)
-		return -1;
+	{//Full. Without eviction the cache wedged here for the rest of the session
+	//and every later avatar, emoji and attachment silently failed to load.
+		i = YhImgEvict;
+		if (i < 0)
+		{
+			NetLog("yHarmony img: cache full (%d), nothing evictable yet",
+				   YH_IMG_MAX);
+			return -1;
+		}
+		if (yh.imgs[i].dc)
+			DCDel(yh.imgs[i].dc);
+		yh.imgs[i].dc = NULL;
+		yh.imgs[i].url[0] = 0;
+		yh.imgs[i].state = 0;
+		im = &yh.imgs[i];
+		MemCopy(im->url, url, MinI64(StrLen(url), YH_IMG_URL_LEN - 1));
+		im->url[MinI64(StrLen(url), YH_IMG_URL_LEN - 1)] = 0;
+		im->maxw = maxw;
+		im->maxh = maxh;
+		im->no_retry = FALSE;
+		im->used = yh.img_clock;
+		im->state = 1;	//Last write: the loader keys off this.
+		return i;
+	}
 	im = &yh.imgs[yh.img_count];
+	im->used = yh.img_clock;
 	MemCopy(im->url, url, MinI64(StrLen(url), YH_IMG_URL_LEN - 1));
 	im->url[MinI64(StrLen(url), YH_IMG_URL_LEN - 1)] = 0;
 	im->dc = NULL;
 	im->maxw = maxw;
 	im->maxh = maxh;
+	im->no_retry = FALSE;
 	im->state = 1;	//Last write: the loader keys off this.
 	return yh.img_count++;
 }
@@ -32,13 +80,16 @@ U0 YhImgAbs(U8 *src, U8 *dst, I64 max, U8 *bucket="avatars")
 {//Turn any stored image reference into a fetchable https URL, or blank dst
 //(= skip) when it can't be fetched. Handles:
 //  http(s)://...            kept (+ imgproxy render/image -> raw object)
-//  /path                    prefixed with the instance host
+//  /path                    prefixed with the instance host (f_host)
+//  /storage/...             prefixed with the Supabase project URL (f_url)
 //  bucket/path OR uuid/f    a bare Supabase STORAGE OBJECT PATH -> built into
-//                           https://{host}/storage/v1/object/public/{bucket}/..
-//                           (this is the bug that ARP'd a UUID as a hostname:
-//                            avatar_url/media rows can be bare storage paths)
+//                           {f_url}/storage/v1/object/public/{bucket}/..
+//                           (avatar_url/media rows can be bare storage paths)
 //  blob:/data:/garbage      NOT fetchable -> dst = "" (loader skips it)
-	U8	*p, *q, *base, *built;
+//Storage lives on f_url, not on f_host: the instance web host answers
+///storage/v1/... with a 404, or with its SPA index.html at 200.
+	U8	*p, *q, *base, *built, *root;
+	U8	 sbase[168];
 	I64	 n;
 
 	dst[0] = 0;
@@ -53,26 +104,56 @@ U0 YhImgAbs(U8 *src, U8 *dst, I64 max, U8 *bucket="avatars")
 	if (!StrNICompare(src, "http://", 7) || !StrNICompare(src, "https://", 8))
 		built = MStrPrint("%s", src);
 	else if (!StrNICompare(src, "blob:", 5) || !StrNICompare(src, "data:", 5))
+	{
+		NetLog("yHarmony img: skip, client-only ref %s", src);
 		return;	//Client-only / inline: unfetchable, skip.
-	else if (src[0] == '/' && yh.f_host[0])
-		built = MStrPrint("https://%s%s", yh.f_host, src);
-	else if (yh.f_host[0])
-	{//Bare storage path. Strip a leading "public/" or "{bucket}/" if the row
-	 //already carries one, then build the canonical public object URL.
-		base = src;
-		if (!StrNICompare(base, "public/", 7))
-			base += 7;
-		built = MStrPrint("https://%s/storage/v1/object/public/%s/%s",
-						  yh.f_host, bucket, base);
+	}
+	else
+	{//A stored reference, not a URL. Only a non-storage "/path" belongs to
+	 //the instance host; everything else is a storage object key.
+		if (src[0] == '/' && StrNICompare(src, "/storage/", 9))
+			root = yh.f_host;
+		else if (yh.f_url[0])
+			root = yh.f_url;
+		else
+			root = yh.f_host;
+		if (*root)
+		{
+			if (StrFind("://", root))
+				YhCopyN(sbase, root, sizeof(sbase));
+			else
+				StrPrint(sbase, "https://%s", root);
+			n = StrLen(sbase);
+			while (n && sbase[n - 1] == '/')
+				sbase[--n] = 0;
+			if (src[0] == '/')
+				built = MStrPrint("%s%s", sbase, src);
+			else
+			{//Bare storage path. Drop a "public/" or "{bucket}/" the row already
+			 //carries, then build the canonical public object URL.
+				base = src;
+				if (!StrNICompare(base, "public/", 7))
+					base += 7;
+				n = StrLen(bucket);
+				if (!StrNICompare(base, bucket, n) && base[n] == '/')
+					base += n + 1;
+				built = MStrPrint("%s/storage/v1/object/public/%s/%s",
+								  sbase, bucket, base);
+			}
+		}
 	}
 	if (!built)
+	{
+		NetLog("yHarmony img: skip, no instance host for %s", src);
 		return;
+	}
 	YhCopyN(dst, built, max);
 	Free(built);
 	//A truncated URL fetches nothing useful; drop it rather than request a
 	//half URL.
 	if (StrLen(dst) >= max - 1)
 	{
+		NetLog("yHarmony img: skip, URL truncated at %d for %s", max, src);
 		dst[0] = 0;
 		return;
 	}
@@ -97,7 +178,10 @@ U0 YhImgAbs(U8 *src, U8 *dst, I64 max, U8 *bucket="avatars")
 	//a hostname-less path). Blank it so we never ARP/DNS a non-host.
 	p = StrFind("://", dst);
 	if (!p)
+	{
+		NetLog("yHarmony img: skip, no scheme in %s (src %s)", dst, src);
 		dst[0] = 0;
+	}
 	else
 	{
 		q = StrFirstOcc(p + 3, "/");	//End of host.
@@ -109,8 +193,58 @@ U0 YhImgAbs(U8 *src, U8 *dst, I64 max, U8 *bucket="avatars")
 			if (*base == '.')
 				n = 1;
 		if (!n)
+		{
+			NetLog("yHarmony img: skip, hostless %s (src %s)", dst, src);
 			dst[0] = 0;
+		}
+		else
+			NetLog("yHarmony img: url %s (src %s)", dst, src);
 	}
+}
+
+U0 YhImgSnip(U8 *dst, U8 *body, I64 len, I64 max)
+{//Up to max-1 body bytes as one printable log line. Control bytes and 0x24
+//(opens a DolDoc command in the log pane) fold to '.'.
+	I64 n = 0;
+	U8	c;
+
+	if (body)
+		while (n < len && n < max - 1)
+		{
+			c = body[n];
+			if (c < 32 || c > 126 || c == 0x24)
+				c = '.';
+			dst[n] = c;
+			n++;
+		}
+	dst[n] = 0;
+}
+
+Bool YhImgIsHtml(U8 *body, I64 len)
+{//A markup document where an image was asked for: an error page, or an SPA
+//index served at 200 in place of a missing object.
+	I64 i = 0;
+
+	if (!body)
+		return FALSE;
+	while (i < len && (body[i] == ' ' || body[i] == '\t' || body[i] == '\n' ||
+					   body[i] == '\r'))
+		i++;
+	if (i >= len)
+		return FALSE;
+	return !StrNICompare(body + i, "<!DOCTYPE", 9) ||
+		   !StrNICompare(body + i, "<html", 5) ||
+		   !StrNICompare(body + i, "<head", 5) ||
+		   !StrNICompare(body + i, "<!--", 4);
+}
+
+Bool YhImgFatal(CHttpResponse *resp)
+{//A status the same request keeps returning. 408 and 429 are the two 4xx that
+//time changes.
+	if (!resp)
+		return FALSE;
+	return 400 <= resp->status < 500 &&
+		   resp->status != 408 && resp->status != 429;
 }
 
 U0 YhImgLoaderTask()
@@ -118,12 +252,14 @@ U0 YhImgLoaderTask()
 //then scaled into a DC on the UI task's heap (survives us).
 	I64		 i, w, h, tries, pick;
 	U8		 fetch_url[YH_IMG_URL_LEN];
+	U8		 snip[104];
 	U8		*p;
 	CYhImg	*im;
 	CHttpResponse *resp;
 	CDC		*raw, *fit;
-	Bool	 found;
+	Bool	 found, perm;
 
+	NetLog("yHarmony img: loader up (r2), %d cached", yh.img_count);
 	while (!yh.quit)
 	{
 		//Priority: process FRESH requests (state 1) before retrying stale
@@ -136,7 +272,7 @@ U0 YhImgLoaderTask()
 		if (pick < 0)
 		{//No fresh work: promote ONE stale failure that's aged out.
 			for (i = 0; i < yh.img_count && pick < 0; i++)
-				if (yh.imgs[i].state == 3 &&
+				if (yh.imgs[i].state == 3 && !yh.imgs[i].no_retry &&
 					counts.jiffies > yh.imgs[i].fail_t + 20 * JIFFY_FREQ)
 				{
 					yh.imgs[i].state = 1;
@@ -151,6 +287,7 @@ U0 YhImgLoaderTask()
 			{
 				found = TRUE;
 				raw = NULL;
+				perm = FALSE;
 				//Cache keys may carry a "#suffix" (e.g. the lightbox wants
 				//the same URL at full size): strip it before fetching.
 				StrCopy(fetch_url, im->url);
@@ -160,8 +297,11 @@ U0 YhImgLoaderTask()
 				//DNS/TLS to media + federated hosts is flaky in the VM; retry
 				//a couple times before giving up (matches HTTP.ZC's connect
 				//retry). Remote hosts (wasabi/CDNs) may still never resolve.
+				//A 4xx is the server's settled answer: asking again only costs
+				//two more TLS handshakes.
 				resp = HttpGet(fetch_url);
-				for (tries = 0; tries < 2 && (!resp || resp->status != 200); tries++)
+				for (tries = 0; tries < 2 && (!resp || resp->status != 200) &&
+					 !YhImgFatal(resp); tries++)
 				{
 					if (resp)
 						HttpResponseFree(resp);
@@ -174,8 +314,13 @@ U0 YhImgLoaderTask()
 				if (!resp)
 					NetLog("yHarmony img: no response %s", fetch_url);
 				else if (resp->status != 200)
-					NetLog("yHarmony img: HTTP %d (%d bytes) %s",
-						   resp->status, resp->body_length, fetch_url);
+				{//The body names the reason. Supabase storage reports a missing
+				 //object as HTTP 400 with a JSON statusCode of 404.
+					YhImgSnip(snip, resp->body, resp->body_length, sizeof(snip));
+					NetLog("yHarmony img: HTTP %d (%d bytes) %s | %s",
+						   resp->status, resp->body_length, fetch_url, snip);
+					perm = YhImgFatal(resp);
+				}
 				else if (resp->truncated)
 					NetLog("yHarmony img: truncated, %d of %d bytes %s",
 						   resp->recv_length, resp->expect_length, fetch_url);
@@ -188,22 +333,31 @@ U0 YhImgLoaderTask()
 					{
 						raw = PNGReadBuf(resp->body, resp->body_length);
 						if (!raw)
+						{
 							NetLog("yHarmony img: PNG decode FAILED (%d bytes) %s",
 								   resp->body_length, fetch_url);
+							perm = TRUE;
+						}
 					}
 					else if (resp->body[0] == 0xFF && resp->body[1] == 0xD8)
 					{
 						raw = JPGReadBuf(resp->body, resp->body_length);
 						if (!raw)
+						{
 							NetLog("yHarmony img: JPG decode FAILED (%d bytes) %s",
 								   resp->body_length, fetch_url);
+							perm = TRUE;
+						}
 					}
 					else if (!MemCompare(resp->body, "GIF8", 4))
 					{
 						raw = GIFReadBuf(resp->body, resp->body_length);
 						if (!raw)
+						{
 							NetLog("yHarmony img: GIF decode FAILED (%d bytes) %s",
 								   resp->body_length, fetch_url);
+							perm = TRUE;
+						}
 					}
 					else if (resp->body_length > 12 &&
 							 !MemCompare(resp->body, "RIFF", 4) &&
@@ -211,14 +365,28 @@ U0 YhImgLoaderTask()
 					{
 						raw = WEBPReadBuf(resp->body, resp->body_length);
 						if (!raw)
+						{
 							NetLog("yHarmony img: WEBP decode FAILED (%d bytes) %s",
 								   resp->body_length, fetch_url);
+							perm = TRUE;
+						}
 					}
 					else
-						NetLog("yHarmony img: unknown format, first bytes "
-							   "%02X %02X %02X %02X, %d bytes %s",
-							   resp->body[0], resp->body[1], resp->body[2],
-							   resp->body[3], resp->body_length, fetch_url);
+					{//A 200 that is not an image. A retry returns the same bytes.
+						YhImgSnip(snip, resp->body, resp->body_length, sizeof(snip));
+						if (YhImgIsHtml(resp->body, resp->body_length))
+							NetLog("yHarmony img: server returned HTML, not an image "
+								   "(%d bytes) %s | %s",
+								   resp->body_length, fetch_url, snip);
+						else
+							NetLog("yHarmony img: unknown format, first bytes "
+								   "%02X %02X %02X %02X, %d bytes %s | %s",
+								   resp->body[0], resp->body[1], resp->body[2],
+								   resp->body[3], resp->body_length, fetch_url, snip);
+						if (resp->final_url && StrCompare(resp->final_url, fetch_url))
+							NetLog("yHarmony img: served from %s", resp->final_url);
+						perm = TRUE;
+					}
 				}
 				if (resp)
 					HttpResponseFree(resp);
@@ -244,9 +412,17 @@ U0 YhImgLoaderTask()
 					DCDel(raw);
 					im->dc = fit;
 					if (fit)
-						im->state = 2;	//Last write: the draw keys off this.
-					else
 					{
+						NetLog("yHarmony img: ready %dx%d slot %d %s",
+							   w, h, i, fetch_url);
+						im->state = 2;	//Last write: the draw keys off this.
+					}
+					else
+					{//Decoded but the scale allocation failed. This was the one
+					//path with no message: a 200, a good decode and nothing on
+					//screen looked identical to a fetch that never happened.
+						NetLog("yHarmony img: scale FAILED %dx%d (ui_task %s) %s",
+							   w, h, TaskValidate(yh.ui_task), fetch_url);
 						im->fail_t = counts.jiffies;
 						im->state = 3;
 					}
@@ -256,7 +432,8 @@ U0 YhImgLoaderTask()
 					if (raw)
 						DCDel(raw);
 					im->fail_t = counts.jiffies;
-					im->state = 3;	//Failed; retried by YhImgGet in ~20s.
+					im->no_retry = perm;
+					im->state = 3;	//Failed; re-queued in ~20s unless no_retry.
 				}
 			}
 		}
