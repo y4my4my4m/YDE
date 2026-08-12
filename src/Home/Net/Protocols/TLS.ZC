@@ -6,7 +6,8 @@
 	-	NO certificate validation. The connection is ENCRYPTED but the server
 		is NOT AUTHENTICATED: this stops passive eavesdropping but not an
 		active man-in-the-middle. Do not use for anything security-critical.
-	-	No session resumption, no HelloRetryRequest, no client auth.
+	-	PSK session resumption with (EC)DHE (RFC 8446 4.6.1, 4.2.11).
+		No 0-RTT/early_data, no HelloRetryRequest, no client auth.
 
 	CryptoSelfTest; checks the primitives against RFC known-answer vectors.
 	The handshake itself is only verifiable against a real server. */
@@ -25,6 +26,11 @@
 #define TLS_HS_FINISHED				0x14
 #define TLS_HS_KEY_UPDATE			0x18
 
+#define TLS_EXT_SERVER_NAME			0x0000
+#define TLS_EXT_KEY_SHARE			0x0033
+#define TLS_EXT_PSK_MODES			0x002D
+#define TLS_EXT_PRE_SHARED_KEY		0x0029
+
 #define TLS_CIPHER_CHACHA20			0x1303
 #define TLS_GROUP_X25519			0x001D
 
@@ -32,6 +38,8 @@
 #define TLS_RECORD_MAX				17000	// fragment buffer: ciphertext max + slack
 #define TLS_FLIGHT_MAX				65536	// server handshake flight reassembly
 #define TLS_POSTHS_MAX				8192	// post-handshake message reassembly
+//worst-case ClientHello: 216 fixed + hostname + ticket identity.
+#define TLS_CH_MAX					4096
 #define TLS_TIMEOUT					12000	// ms
 
 //readers poll net_abort to bail out before the socket timeout expires.
@@ -43,6 +51,177 @@ Bool net_abort = FALSE;
 //resync point. Once bytes of a record are in hand the budget stretches to
 //cover the peer's retransmission backoff (RFC 6298: 1, 2, 4, 8, 16 s).
 #define TLS_RECORD_STALL_MS			32000
+
+#define TLS_TICKET_SLOTS			8		// resumption cache entries
+#define TLS_TICKET_MAX				2048	// largest ticket identity kept
+#define TLS_HOST_MAX				64
+#define TLS_TICKET_LIFETIME_MAX		604800	// RFC 8446 4.6.1 ceiling, seconds
+
+class CTLSTicket
+{
+	U8	 host[TLS_HOST_MAX];	// empty = free slot
+	U8	 psk[32];				// already through "resumption"; all a binder needs
+	U8	*ticket;				// opaque identity, replayed verbatim
+	I64	 ticket_len;
+	I64	 age_add;				// obfuscated_ticket_age offset, 32 bits
+	I64	 obtained;				// counts.jiffies at arrival
+	I64	 lifetime;				// jiffies
+	I64	 stamp;					// LRU key
+};
+
+//ZealC drops declaration initialisers on globals in AOT, so zero these as code.
+CTLSTicket tls_tickets[TLS_TICKET_SLOTS];
+I64 tls_ticket_lock;
+MemSet(tls_tickets, 0, sizeof(CTLSTicket) * TLS_TICKET_SLOTS);
+MemSet(&tls_ticket_lock, 0, sizeof(I64));
+
+U0 TLSTicketLock()
+{ //the cache is global; concurrent fetch tasks must not detach the same slot
+  //and free one ticket twice. Bounded, as in GxOpsLock: a task that faulted
+  //holding it must not wedge the next caller. Held only across MemCopy/HKDF.
+	I64 spin = 200;
+
+	while (LBts(&tls_ticket_lock, 0) && spin > 0)
+	{
+		Sleep(1);
+		spin--;
+	}
+}
+
+U0 TLSTicketUnlock()
+{
+	LBtr(&tls_ticket_lock, 0);
+}
+
+U0 TLSTicketWipe(CTLSTicket *t)
+{
+	Free(t->ticket);
+	t->ticket	  = NULL;
+	t->ticket_len = 0;
+	t->host[0]	  = 0;
+}
+
+U0 TLSTicketDiscard(CTLSTicket *t)
+{ // free a detached copy from TLSTicketTake
+	if (!t)
+		return;
+	Free(t->ticket);
+	Free(t);
+}
+
+CTLSTicket *TLSTicketTake(U8 *host)
+{ // newest live ticket for host, DETACHED: the slot is cleared and the caller
+  // owns the copy. RFC 8446 8.1 allows each ticket one use, so a handshake that
+  // fails cannot put it back. NULL when nothing is cached.
+	CTLSTicket *out;
+	I64 i, best = -1, age;
+
+	TLSTicketLock;
+
+	for (i = 0; i < TLS_TICKET_SLOTS; i++)
+	{
+		if (!tls_tickets[i].host[0])
+			goto tkt_next; // no 'continue' in ZealC
+
+		age = counts.jiffies - tls_tickets[i].obtained;
+		if (age > tls_tickets[i].lifetime)
+		{
+			NetLog("TLS: ticket for %s expired (%d s old, lifetime %d s), dropped.",
+				   tls_tickets[i].host, age / JIFFY_FREQ,
+				   tls_tickets[i].lifetime / JIFFY_FREQ);
+			TLSTicketWipe(&tls_tickets[i]);
+			goto tkt_next;
+		}
+
+		if (StrICompare(tls_tickets[i].host, host))
+			goto tkt_next;
+
+		if (best < 0 || tls_tickets[i].stamp > tls_tickets[best].stamp)
+			best = i;
+tkt_next:;
+	}
+
+	if (best < 0)
+	{
+		TLSTicketUnlock;
+		return NULL;
+	}
+
+	out = MAlloc(sizeof(CTLSTicket));
+	MemCopy(out, &tls_tickets[best], sizeof(CTLSTicket));
+	tls_tickets[best].ticket  = NULL;	// ownership moves to the caller
+	tls_tickets[best].host[0] = 0;
+
+	TLSTicketUnlock;
+	return out;
+}
+
+U0 TLSTicketStore(U8 *host, U8 *res_master, U8 *nonce, I64 nonce_len,
+				  U8 *ticket, I64 ticket_len, I64 lifetime_s, I64 age_add)
+{ // PSK = Expand-Label(res master, "resumption", ticket_nonce, 32), RFC 8446 4.6.1
+	I64 i, slot = -1;
+	I64 host_len = StrLen(host);
+
+	if (host_len < 1 || host_len >= TLS_HOST_MAX)
+	{
+		NetLog("TLS: hostname length %d outside 1..%d; ticket not cached.",
+			   host_len, TLS_HOST_MAX - 1);
+		return;
+	}
+
+	if (ticket_len < 1 || ticket_len > TLS_TICKET_MAX)
+	{
+		NetLog("TLS: ticket for %s is %d bytes, outside 1..%d; not cached.",
+			   host, ticket_len, TLS_TICKET_MAX);
+		return;
+	}
+
+	if (lifetime_s < 1)
+	{
+		NetLog("TLS: ticket for %s has lifetime 0; not cached.", host);
+		return;
+	}
+	if (lifetime_s > TLS_TICKET_LIFETIME_MAX)
+		lifetime_s = TLS_TICKET_LIFETIME_MAX;
+
+	TLSTicketLock;
+
+	for (i = 0; i < TLS_TICKET_SLOTS; i++)
+		if (!tls_tickets[i].host[0])
+		{
+			slot = i;
+			break;
+		}
+
+	if (slot < 0)
+	{ // full: drop the least recently stored entry
+		slot = 0;
+		for (i = 1; i < TLS_TICKET_SLOTS; i++)
+			if (tls_tickets[i].stamp < tls_tickets[slot].stamp)
+				slot = i;
+		NetLog("TLS: ticket cache full, evicting %s to make room for %s.",
+			   tls_tickets[slot].host, host);
+		TLSTicketWipe(&tls_tickets[slot]);
+	}
+
+	tls_tickets[slot].ticket = MAlloc(ticket_len);
+	MemCopy(tls_tickets[slot].ticket, ticket, ticket_len);
+	tls_tickets[slot].ticket_len = ticket_len;
+	MemCopy(tls_tickets[slot].host, host, host_len + 1);
+
+	TLSHKDFExpandLabel(res_master, "resumption", nonce, nonce_len,
+					   tls_tickets[slot].psk, 32);
+
+	tls_tickets[slot].age_add  = age_add & 0xFFFFFFFF;
+	tls_tickets[slot].lifetime = lifetime_s * JIFFY_FREQ;
+	tls_tickets[slot].obtained = counts.jiffies;
+	tls_tickets[slot].stamp	   = counts.jiffies;
+
+	TLSTicketUnlock;
+
+	NetLog("TLS: ticket stored for %s, slot %d, %d byte identity, lifetime %d s.",
+		   host, slot, ticket_len, lifetime_s);
+}
 
 class CTLS
 {
@@ -61,6 +240,14 @@ class CTLS
 
 	U8			 client_ap_secret[32];			// current application traffic secrets;
 	U8			 server_ap_secret[32];			// input to the next "traffic upd"
+
+	U8			 host[TLS_HOST_MAX];	// key into the ticket cache
+	U8			 psk[32];				// offered PSK, valid while psk_offered
+	U8			 master_secret[32];
+	U8			 res_master[32];		// resumption master secret
+	Bool		 psk_offered;
+	Bool		 resumed;				// server echoed pre_shared_key
+	Bool		 res_master_ok;
 
 	U64			 send_seq;	// per-direction AEAD record counters, reset on rekey
 	U64			 recv_seq;
@@ -357,11 +544,56 @@ U0 TLSUpdateWriteKeys(CTLS *tls)
 U0 TLSPostHandshakeMsg(CTLS *tls, I64 type, U8 *body, I64 len)
 { // one reassembled post-handshake handshake message. None of these are folded
   // into the transcript hash.
-	U8 msg[5];
+	U8	msg[5];
+	U8	*nonce, *ticket;
+	I64	 p, lifetime, age_add, nonce_len, tkt_len, ext_len;
 
 	if (type == TLS_HS_NEW_SESSION_TICKET)
-	{
-		NetLog("TLS: NewSessionTicket, %d bytes, no resumption, ignored.", len);
+	{ //RFC 8446 4.6.1: lifetime(4) age_add(4) nonce(1+n) ticket(2+n) ext(2+n)
+		if (!tls->res_master_ok)
+		{
+			NetErr("TLS: NewSessionTicket before the resumption secret exists.");
+			return;
+		}
+		if (len < 13)
+		{
+			NetErr("TLS: NewSessionTicket is %d bytes, under the 13 byte minimum.", len);
+			return;
+		}
+
+		lifetime = body[0] << 24 | body[1] << 16 | body[2] << 8 | body[3];
+		age_add	 = body[4] << 24 | body[5] << 16 | body[6] << 8 | body[7];
+
+		p		  = 8;
+		nonce_len = body[p++];
+		if (p + nonce_len + 2 > len)
+		{
+			NetErr("TLS: NewSessionTicket nonce %d bytes overruns %d.", nonce_len, len);
+			return;
+		}
+		nonce = body + p;
+		p += nonce_len;
+
+		tkt_len = body[p] << 8 | body[p + 1];
+		p += 2;
+		if (p + tkt_len + 2 > len)
+		{
+			NetErr("TLS: NewSessionTicket identity %d bytes overruns %d.", tkt_len, len);
+			return;
+		}
+		ticket = body + p;
+		p += tkt_len;
+
+		ext_len = body[p] << 8 | body[p + 1];
+		p += 2;
+		if (p + ext_len > len)
+		{
+			NetErr("TLS: NewSessionTicket extensions %d bytes overrun %d.", ext_len, len);
+			return;
+		}
+
+		TLSTicketStore(tls->host, tls->res_master, nonce, nonce_len,
+					   ticket, tkt_len, lifetime, age_add);
 		return;
 	}
 
@@ -454,13 +686,18 @@ ph_more:;
 	}
 }
 
-I64 TLSBuildClientHello(U8 *out, U8 *hostname, U8 *client_random, U8 *session_id, U8 *pubkey)
-{ // returns handshake-message length (type+len+body); out holds the message
+I64 TLSBuildClientHello(U8 *out, U8 *hostname, U8 *client_random, U8 *session_id,
+						U8 *pubkey, CTLSTicket *tkt, I64 *trunc_len_out)
+{ /* returns handshake-message length (type+len+body); out holds the message.
+	 tkt NULL builds the plain ClientHello, byte for byte as before. Otherwise
+	 psk_key_exchange_modes and pre_shared_key are appended and trunc_len_out
+	 receives the length the binder is computed over. */
 	U8	*body = out + 4; // leave room for handshake header
 	I64	 b = 0;
 	I64	 ext_start, ext_len_pos, ext_len;
 	I64	 host_len = StrLen(hostname);
 	I64	 sni_list_len, total;
+	I64	 ids_len, psk_len, age_ms, obf_age;
 
 	//--- ClientHello body ---
 	body[b++] = 0x03; body[b++] = 0x03;          // legacy_version TLS1.2
@@ -523,6 +760,43 @@ I64 TLSBuildClientHello(U8 *out, U8 *hostname, U8 *client_random, U8 *session_id
 	body[b++] = host_len & 0xFF;
 	MemCopy(body + b, hostname, host_len); b += host_len;
 
+	//psk_key_exchange_modes then pre_shared_key. RFC 8446 4.2.11: pre_shared_key
+	//MUST be the last extension in the ClientHello.
+	*trunc_len_out = 0;
+	if (tkt)
+	{
+		body[b++] = 0x00; body[b++] = 0x2D;
+		body[b++] = 0x00; body[b++] = 0x02;
+		body[b++] = 0x01;                         // 1 mode
+		body[b++] = 0x01;                         // psk_dhe_ke
+
+		ids_len = 2 + tkt->ticket_len + 4;        // identity + obfuscated age
+		psk_len = 2 + ids_len + 2 + 1 + 32;       // identities + binders
+		age_ms  = (counts.jiffies - tkt->obtained) * 1000 / JIFFY_FREQ;
+		obf_age = (age_ms + tkt->age_add) & 0xFFFFFFFF;
+
+		body[b++] = 0x00; body[b++] = 0x29;
+		body[b++] = psk_len >> 8 & 0xFF;
+		body[b++] = psk_len & 0xFF;
+		body[b++] = ids_len >> 8 & 0xFF;
+		body[b++] = ids_len & 0xFF;
+		body[b++] = tkt->ticket_len >> 8 & 0xFF;
+		body[b++] = tkt->ticket_len & 0xFF;
+		MemCopy(body + b, tkt->ticket, tkt->ticket_len); b += tkt->ticket_len;
+		body[b++] = obf_age >> 24 & 0xFF;
+		body[b++] = obf_age >> 16 & 0xFF;
+		body[b++] = obf_age >> 8 & 0xFF;
+		body[b++] = obf_age & 0xFF;
+
+		//the binder hash stops here, before the binders list. The length in the
+		//handshake header below still counts the binders.
+		*trunc_len_out = b + 4;
+
+		body[b++] = 0x00; body[b++] = 33;         // binders list length
+		body[b++] = 32;                           // one SHA-256 binder
+		MemSet(body + b, 0, 32); b += 32;         // patched in by the caller
+	}
+
 	ext_len = b - ext_start;
 	body[ext_len_pos]	  = ext_len >> 8 & 0xFF;
 	body[ext_len_pos + 1] = ext_len & 0xFF;
@@ -537,12 +811,34 @@ I64 TLSBuildClientHello(U8 *out, U8 *hostname, U8 *client_random, U8 *session_id
 	return total;
 }
 
-I64 TLSParseServerHello(U8 *msg, I64 len, U8 *server_pub_out)
-{ // extract the server's x25519 key_share; returns 0 ok, -1 fail
+U0 TLSClientHelloBinder(U8 *psk, U8 *ch, I64 trunc_len, U8 *binder_out)
+{ /* RFC 8446 4.2.11.2. Checked against the RFC 8448 section 4 trace:
+	 early        = HKDF-Extract(0, PSK)
+	 binder_key   = Derive-Secret(early, "res binder", H(""))
+	 finished_key = Expand-Label(binder_key, "finished", "", 32)
+	 binder       = HMAC(finished_key, H(ClientHello truncated before binders)) */
+	U8 zero[32], early[32], binder_key[32], fin_key[32];
+	U8 empty_hash[32], th[32];
+
+	MemSet(zero, 0, 32);
+	HKDFExtract(zero, 0, psk, 32, early);   // salt 0, IKM = PSK
+
+	SHA256("", 0, empty_hash);
+	TLSDeriveSecret(early, "res binder", empty_hash, binder_key);
+	TLSHKDFExpandLabel(binder_key, "finished", "", 0, fin_key, 32);
+
+	SHA256(ch, trunc_len, th);
+	HMACSHA256(fin_key, 32, th, 32, binder_out);
+}
+
+I64 TLSParseServerHello(U8 *msg, I64 len, U8 *server_pub_out, Bool *psk_accepted_out)
+{ // extract the x25519 key_share and whether the PSK was taken; 0 ok, -1 fail
 	I64 p = 0;
 	I64 sid_len, ext_total, ext_end, ext_type, ext_len, cipher, key_end;
-	I64 group, key_len;
+	I64 group, key_len, selected;
 	Bool have_key = FALSE;
+
+	*psk_accepted_out = FALSE;
 
 	p += 2;         // legacy_version
 	p += 32;        // random
@@ -574,7 +870,7 @@ I64 TLSParseServerHello(U8 *msg, I64 len, U8 *server_pub_out)
 		ext_len	 = msg[p + 2] << 8 | msg[p + 3];
 		p += 4;
 
-		if (ext_type == 0x0033) // key_share
+		if (ext_type == TLS_EXT_KEY_SHARE)
 		{
 			if (p + 4 > ext_end) return -1;
 			group	= msg[p] << 8 | msg[p + 1];
@@ -584,6 +880,23 @@ I64 TLSParseServerHello(U8 *msg, I64 len, U8 *server_pub_out)
 				MemCopy(server_pub_out, msg + p + 4, 32);
 				have_key = TRUE;
 			}
+		}
+
+		if (ext_type == TLS_EXT_PRE_SHARED_KEY)
+		{ // selected_identity, an index into the list we offered
+			if (ext_len != 2 || p + 2 > ext_end)
+			{
+				NetErr("TLS: ServerHello pre_shared_key is %d bytes, expected 2.", ext_len);
+				return -1;
+			}
+			selected = msg[p] << 8 | msg[p + 1];
+			if (selected)
+			{
+				NetErr("TLS: server chose PSK identity %d; only identity 0 was offered.",
+					   selected);
+				return -1;
+			}
+			*psk_accepted_out = TRUE;
 		}
 
 		p += ext_len;
@@ -604,7 +917,9 @@ U0 TLSComputeHandshakeKeys(CTLS *tls, U8 *shared_secret)
 	U8	th[32];
 
 	MemSet(psk, 0, 32);
-	HKDFExtract(psk, 0, psk, 32, early_secret);   // salt 0, IKM 0
+	if (tls->resumed)
+		MemCopy(psk, tls->psk, 32); // RFC 8446 7.1: the PSK replaces the zero IKM
+	HKDFExtract(psk, 0, psk, 32, early_secret);   // salt 0
 
 	SHA256("", 0, empty_hash);
 	TLSDeriveSecret(early_secret, "derived", empty_hash, derived);
@@ -635,6 +950,7 @@ U0 TLSComputeAppKeys(CTLS *tls, U8 *th_after_server_fin)
 
 	MemSet(psk, 0, 32);
 	HKDFExtract(derived, 32, psk, 32, master);
+	MemCopy(tls->master_secret, master, 32);
 
 	TLSDeriveSecret(master, "c ap traffic", th_after_server_fin, tls->client_ap_secret);
 	TLSDeriveSecret(master, "s ap traffic", th_after_server_fin, tls->server_ap_secret);
@@ -644,6 +960,16 @@ U0 TLSComputeAppKeys(CTLS *tls, U8 *th_after_server_fin)
 
 	tls->send_seq = 0;
 	tls->recv_seq = 0;
+}
+
+U0 TLSComputeResumptionSecret(CTLS *tls)
+{ // RFC 8446 4.6.1: res master covers the transcript through the CLIENT Finished,
+  // one message later than the application keys. Call after TLSSendClientFinished.
+	U8 th[32];
+
+	TLSTranscriptHash(tls, th);
+	TLSDeriveSecret(tls->master_secret, "res master", th, tls->res_master);
+	tls->res_master_ok = TRUE;
 }
 
 I64 TLSReadServerFlight(CTLS *tls, U8 *th_after_sfin_out)
@@ -761,7 +1087,7 @@ I64 TLSSendClientFinished(CTLS *tls, U8 *th_after_sfin)
 	msg[1] = 0x00; msg[2] = 0x00; msg[3] = 32;
 	MemCopy(msg + 4, verify, 32);
 
-	//fold into transcript; unused after this, no resumption
+	//fold into transcript: the resumption secret hashes through this message
 	SHA256Update(&tls->transcript, msg, 36);
 
 	return TLSRecordSendEncrypted(tls, TLS_REC_HANDSHAKE, msg, 36);
@@ -770,15 +1096,17 @@ I64 TLSSendClientFinished(CTLS *tls, U8 *th_after_sfin)
 CTLS *TLSConnect(U8 *hostname, CTCPSocket *sock)
 { // Run a full TLS 1.3 handshake over an already-connected TCP socket.
   // Returns a CTLS ready for TLSWrite/TLSRead, or NULL on failure.
-	CTLS	*tls = CAlloc(sizeof(CTLS));
-	U8		*ch = MAlloc(2048);
-	U8		*frag = MAlloc(TLS_RECORD_MAX);
+	CTLS	   *tls = CAlloc(sizeof(CTLS));
+	U8		   *ch = MAlloc(TLS_CH_MAX);
+	U8		   *frag = MAlloc(TLS_RECORD_MAX);
+	CTLSTicket *tkt;
 	U8		 client_priv[32], client_pub[32], client_random[32], session_id[32];
 	U8		 server_pub[32], shared[32];
-	U8		 th_after_sfin[32];
+	U8		 th_after_sfin[32], binder[32];
 	U8		 hdr[5];
 	U8		 wire_type;
-	I64		 ch_len, frag_len;
+	I64		 ch_len, frag_len, trunc_len, host_len;
+	Bool	 psk_accepted = FALSE;
 	U8		 ccs = 0x01;
 
 	tls->sock = sock;
@@ -791,8 +1119,32 @@ CTLS *TLSConnect(U8 *hostname, CTCPSocket *sock)
 	CryptoRandBytes(client_random, 32);
 	CryptoRandBytes(session_id, 32);
 
+	host_len = StrLen(hostname);
+	if (host_len < TLS_HOST_MAX)
+		MemCopy(tls->host, hostname, host_len + 1);
+
+	//a cached ticket is spent here whatever happens next: RFC 8446 8.1
+	tkt = TLSTicketTake(hostname);
+	if (tkt)
+	{
+		MemCopy(tls->psk, tkt->psk, 32);
+		tls->psk_offered = TRUE;
+		TLSDiag("TLS: offering a session ticket for %s, %d byte identity, %d s old.",
+				hostname, tkt->ticket_len,
+				(counts.jiffies - tkt->obtained) / JIFFY_FREQ);
+	}
+
 	//ClientHello
-	ch_len = TLSBuildClientHello(ch, hostname, client_random, session_id, client_pub);
+	ch_len = TLSBuildClientHello(ch, hostname, client_random, session_id, client_pub,
+								 tkt, &trunc_len);
+	if (tkt)
+	{ //binder last, over the message truncated before the binders list
+		TLSClientHelloBinder(tkt->psk, ch, trunc_len, binder);
+		MemCopy(ch + ch_len - 32, binder, 32);
+	}
+	TLSTicketDiscard(tkt);
+	tkt = NULL;
+
 	if (tls_verbose)
 		TLSHexDump("TLS CLIENTHELLO", ch, ch_len); // wire debug (TLSTest only)
 	SHA256Update(&tls->transcript, ch, ch_len);
@@ -828,9 +1180,23 @@ CTLS *TLSConnect(U8 *hostname, CTCPSocket *sock)
 
 	SHA256Update(&tls->transcript, frag, frag_len);
 
-	if (TLSParseServerHello(frag + 4, frag_len - 4, server_pub) < 0)
+	if (TLSParseServerHello(frag + 4, frag_len - 4, server_pub, &psk_accepted) < 0)
 		goto tls_fail;
 	TLSDiag("TLS STAGE 2: ServerHello parsed, x25519 key_share found.");
+
+	if (psk_accepted && !tls->psk_offered)
+	{
+		NetErr("TLS: server sent pre_shared_key without an offer.");
+		goto tls_fail;
+	}
+	tls->resumed = psk_accepted;
+	if (tls->psk_offered)
+	{
+		if (tls->resumed)
+			TLSDiag("TLS: resumed with %s, full handshake skipped.", hostname);
+		else
+			TLSDiag("TLS: server declined the ticket for %s, full handshake.", hostname);
+	}
 
 	//key exchange + handshake keys
 	X25519(shared, client_priv, server_pub);
@@ -848,8 +1214,9 @@ CTLS *TLSConnect(U8 *hostname, CTCPSocket *sock)
 		goto tls_fail;
 	TLSDiag("TLS STAGE 5: client Finished sent.");
 
-	//switch to application keys
+	//switch to application keys, then the secret future tickets hang off
 	TLSComputeAppKeys(tls, th_after_sfin);
+	TLSComputeResumptionSecret(tls);
 	tls->established = TRUE;
 
 	Free(ch);
