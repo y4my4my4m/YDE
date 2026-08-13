@@ -95,6 +95,7 @@ class CTCPSocket
 	U8						*receive_buffer;
 	U32						 receive_drops;	// octets discarded since the window last reopened
 	I64						 handler_refs;	// TCPHandler is inside this socket; close waits for zero
+	I64						 close_lock;	// set once by the first closer, never cleared
 };
 
 

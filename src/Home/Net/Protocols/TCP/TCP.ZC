@@ -150,19 +150,22 @@ U0 TCPPacketFinish(I64			  de_index,
 
 	if (send_buffer_out)
 	{
-		send_buffer = CAlloc(sizeof(CTCPAckQueue));
+		// sys_task heap: linked into tcp_socket->ack_queue, which the RX interrupt reaches
+		send_buffer = CAlloc(sizeof(CTCPAckQueue), sys_task);
 
 		send_buffer->time_sent			= tS;
 		send_buffer->retries			= 0;
 		send_buffer->start_seq_num		= EndianU32(header->seq_num);
 		send_buffer->end_seq_num		= 0; // must set this upstream
 		send_buffer->tcp_packet_size	= sizeof(CTCPHeader) + length;
-		send_buffer->tcp_packet			= CAlloc(sizeof(CTCPHeader) + length);
+		send_buffer->tcp_packet			= CAlloc(sizeof(CTCPHeader) + length, sys_task);
 
 		MemCopy(send_buffer->tcp_packet, frame, sizeof(CTCPHeader) + length);
 
 		*send_buffer_out = send_buffer; // set output param as new send buffer
 	}
+
+	Free(pseudoheader);
 
 	IPV4PacketFinish(de_index);
 }
@@ -460,11 +463,18 @@ I64 TCPPacketParse(CTCPHeader **header_out,
 				   CIPV4Packet *packet)
 {
 	CTCPHeader		 *header		= packet->data;
-	I64				  header_length	= (header->data_offset >> 4) * 4; // ?? why
+	I64				  header_length;
 //	U32				  checksum, sum;
 //	CTCPPseudoHeader *pseudoheader	= CAlloc(sizeof(CTCPPseudoHeader));
 
-	// TODO: Validate packet->length !
+	if (packet->length < sizeof(CTCPHeader))
+		return -1;
+
+	// data offset counts 32-bit words in the top nibble, 5 minimum
+	header_length = (header->data_offset >> 4) * 4;
+
+	if (header_length < sizeof(CTCPHeader) || header_length > packet->length)
+		return -1;
 
 	// Verify Checksum:
 /*	NetWarn("DEBUG: TCPPACKETPARSE:		0x%X = checksum from packet, verifying...", EndianU16(header->checksum));
@@ -657,14 +667,15 @@ U0 TCPCheckACKQueue(CTCPSocket *tcp_socket)
 
 CTCPSocket TCPSocket(U16 domain=AF_UNSPEC)
 {
+	// sys_task heap throughout: the RX interrupt reaches all of this through the bound-socket tree, and Kill releases a task's data_heap without running its catch
 	U16					 type			= SOCKET_STREAM;
-	CTCPSocket			*tcp_socket		= CAlloc(sizeof(CTCPSocket));
-	CTCPAckQueue		*ack_queue		= CAlloc(sizeof(CTCPAckQueue));
-	CTCPAcceptQueue		*accept_queue	= CAlloc(sizeof(CTCPAcceptQueue));
+	CTCPSocket			*tcp_socket		= CAlloc(sizeof(CTCPSocket), sys_task);
+	CTCPAckQueue		*ack_queue		= CAlloc(sizeof(CTCPAckQueue), sys_task);
+	CTCPAcceptQueue		*accept_queue	= CAlloc(sizeof(CTCPAcceptQueue), sys_task);
 	CSocketAddressIPV4	*ipv4_address;
 	CSocketAddressIPV6	*ipv6_address;
 
-	tcp_socket->socket	= Socket(domain, type);
+	tcp_socket->socket	= Socket(domain, type, sys_task);
 	tcp_socket->state	= TCP_STATE_CLOSED;
 
 	tcp_socket->source_address.family = domain; // INET, INET6, or unspecified
@@ -683,11 +694,11 @@ CTCPSocket TCPSocket(U16 domain=AF_UNSPEC)
 		case AF_INET6:
 			ipv6_address = &tcp_socket->source_address;
 			NetErr("TCP SOCKET: FIXME, IPV6 not implemented yet");
-			return NULL;
+			goto ts_fail;
 
 		case AF_UNSPEC:
 			NetErr("TCP SOCKET: Error TCP Socket to AF_UNSPEC");
-			return NULL;
+			goto ts_fail;
 	}
 
 	QueueInit(ack_queue);  // init send buffer queue head
@@ -697,11 +708,19 @@ CTCPSocket TCPSocket(U16 domain=AF_UNSPEC)
 	tcp_socket->accept_queue = accept_queue;
 
 	tcp_socket->receive_buffer_size = TCP_WINDOW_SIZE;
-	tcp_socket->receive_buffer = CAlloc(TCP_WINDOW_SIZE);
+	tcp_socket->receive_buffer = CAlloc(TCP_WINDOW_SIZE, sys_task);
 
 	tcp_socket->max_segment_size = TCP_MSS;
 
 	return tcp_socket;
+
+ts_fail:
+	Free(tcp_socket->socket);
+	Free(accept_queue);
+	Free(ack_queue);
+	Free(tcp_socket);
+
+	return NULL;
 }
 
 I64 TCPSocketBind(CTCPSocket *tcp_socket, CSocketAddressStorage *address)
@@ -776,7 +795,11 @@ I64 TCPSocketBind(CTCPSocket *tcp_socket, CSocketAddressStorage *address)
 
 		case AF_UNSPEC:
 			NetErr("TCP SOCKET BIND: Error, AF_UNSPEC TCP BIND -- param family");
-			break;
+			return -1;
+
+		default: // port is the tree key and only the cases above set it
+			NetErr("TCP SOCKET BIND: Error, unknown address family %d.", address->family);
+			return -1;
 	}
 
 	// the tree is walked from the RX interrupt and mutated from tasks, so links move under the same guard TCPSocketClose uses. The guarded section holds links only: CAlloc takes the heap spinlock and NetErr prints, so the node and the queue entry are built first
@@ -882,16 +905,76 @@ I64 TCPSocketBind(CTCPSocket *tcp_socket, CSocketAddressStorage *address)
 	return 0;
 }
 
+U0 TCPSocketRelease(CTCPSocket *tcp_socket)
+{ // the socket must already be unreachable from the bound tree
+	CTCPAckQueue	*send_buffer;
+	CTCPAcceptQueue	*pending;
+
+	if (!tcp_socket)
+		return;
+
+	Free(tcp_socket->socket);
+	tcp_socket->socket = NULL;
+
+	NetWarn("TCP SOCKET RELEASE: Freeing socket, ACK queue, accept() queue, & receive buffer.");
+	Free(tcp_socket->receive_buffer);
+	tcp_socket->receive_buffer = NULL;
+
+	if (tcp_socket->ack_queue)
+	{
+		send_buffer = tcp_socket->ack_queue->next;
+		while (send_buffer != tcp_socket->ack_queue)
+		{
+			NetWarn("TCP SOCKET RELEASE: Freeing send buffer @ 0x%0X", send_buffer);
+			QueueRemove(send_buffer);
+			Free(send_buffer->tcp_packet);
+			Free(send_buffer);
+			send_buffer = tcp_socket->ack_queue->next;
+		}
+
+		Free(tcp_socket->ack_queue);
+		tcp_socket->ack_queue = NULL;
+	}
+
+	if (tcp_socket->accept_queue)
+	{
+		pending = tcp_socket->accept_queue->next;
+		while (pending != tcp_socket->accept_queue)
+		{
+			NetWarn("TCP SOCKET RELEASE: Freeing pending connection @ 0x%0X", pending);
+			QueueRemove(pending);
+			Free(pending);
+			pending = tcp_socket->accept_queue->next;
+		}
+
+		Free(tcp_socket->accept_queue);
+		tcp_socket->accept_queue = NULL;
+	}
+
+	Free(tcp_socket);
+}
+
 I64 TCPSocketClose(CTCPSocket *tcp_socket)
 {
 	CTCPTreeNode		*head = tcp_globals.bound_socket_tree;
 	CTCPTreeNode		*node;
 	CTCPTreeNode		*dead_node = NULL;
+	CTCPTreeNode		*stuck_node = NULL;
+	I64					 stuck_value = 0;
 	CTCPTreeQueue		*queue = NULL;
-	CTCPAckQueue		*send_buffer;
-	CTCPAcceptQueue		*pending;
-	CSocketAddressIPV4	*address = &tcp_socket->source_address;
+	CSocketAddressIPV4	*address;
 	I64					 timeout;
+
+	if (!tcp_socket)
+		return -1;
+
+	if (LBts(&tcp_socket->close_lock, 0))
+	{
+		NetErr("TCP SOCKET CLOSE: Socket already closing.");
+		return -1;
+	}
+
+	address = &tcp_socket->source_address;
 
 	SocketClose(tcp_socket->socket); // TODO: testing on closing a socket while another task is using it
 
@@ -956,13 +1039,13 @@ I64 TCPSocketClose(CTCPSocket *tcp_socket)
 
 	// remove from bound list, free associated allocs
 
-	// the state waits above sleep, and another task's close can replace the root and free the node meanwhile, so the tree is re-read here, not at entry
-	head = tcp_globals.bound_socket_tree;
-
 	PUSHFD
 	CLI
 	while (LBts(&tcp_bound_tree_lock, 0))
 		PAUSE
+
+	// the state waits above sleep, and another task's close can replace the root and free the node meanwhile, so the tree is read inside the guard, not at entry
+	head = tcp_globals.bound_socket_tree;
 
 	node = TCPTreeNodeFind(EndianU16(address->port), head);
 
@@ -988,11 +1071,17 @@ I64 TCPSocketClose(CTCPSocket *tcp_socket)
 						tcp_globals.bound_socket_tree = node->right;
 					else
 						tcp_globals.bound_socket_tree = NULL;
-				}
-				else
-					TCPTreeNodeSinglePop(node->value, head);
 
-				dead_node = node;
+					dead_node = node;
+				}
+				// BSTPop refuses a root and abandons a corrupt walk. A node it leaves linked must not be freed: the next walk would read it
+				else if (TCPTreeNodeSinglePop(node->value, head) == node)
+					dead_node = node;
+				else
+				{
+					stuck_node	= node;
+					stuck_value	= node->value;
+				}
 			}
 		}
 	}
@@ -1002,15 +1091,21 @@ I64 TCPSocketClose(CTCPSocket *tcp_socket)
 
 	BSTCorruptionReport;
 
-	if (!node)
-	{
-		NetErr("TCP SOCKET CLOSE: socket was not bound - not halting.");
-		return -1;
-	}
+	if (stuck_node)
+		NetErr("TCP SOCKET CLOSE: Single-pop refused node 0x%0X at port %d. Node retained, queue empty.",
+			   stuck_node, stuck_value);
 
 	// the socket is unlinked above, so no new reference can be taken; an interrupt on another core can still be inside TCPHandleSocket with the one it took
 	while (tcp_socket->handler_refs)
 		Sleep(1);
+
+	// a socket is only ever linked at the port in its own source_address
+	if (!node)
+	{
+		NetErr("TCP SOCKET CLOSE: socket was not bound - not halting.");
+		TCPSocketRelease(tcp_socket);
+		return -1;
+	}
 
 	if (queue)
 	{
@@ -1021,37 +1116,13 @@ I64 TCPSocketClose(CTCPSocket *tcp_socket)
 			Free(dead_node);
 		}
 
-		Free(tcp_socket->socket);
-
-		NetWarn("TCP SOCKET CLOSE: Freeing socket, ACK queue, accept() queue, & receive buffer.");
-		Free(tcp_socket->receive_buffer);
-
-		send_buffer = tcp_socket->ack_queue->next;
-		while (send_buffer != tcp_socket->ack_queue)
-		{
-			NetWarn("TCP SOCKET CLOSE: Freeing send buffer @ 0x%0X", send_buffer);
-			QueueRemove(send_buffer);
-			Free(send_buffer->tcp_packet);
-			Free(send_buffer);
-			send_buffer = tcp_socket->ack_queue->next;
-		}
-
-		pending = tcp_socket->accept_queue->next;
-		while (pending != tcp_socket->accept_queue)
-		{
-			NetWarn("TCP SOCKET CLOSE: Freeing pending connection @ 0x%0X", pending);
-			QueueRemove(pending);
-			Free(pending);
-			pending = tcp_socket->accept_queue->next;
-		}
-
-
-		Free(tcp_socket);
+		TCPSocketRelease(tcp_socket);
 		Free(queue);
 	}
 	else
 	{
 		NetErr("TCP SOCKET CLOSE: no queue for socket - not halting.");
+		TCPSocketRelease(tcp_socket);
 		return -1;
 	}
 	
@@ -1134,7 +1205,11 @@ I64 TCPSocketConnect(CTCPSocket *tcp_socket, CSocketAddressStorage *address)
 
 		case AF_UNSPEC:
 			NetErr("TCP SOCKET CONNECT: Error, AF_UNSPEC TCP CONNECT -- param family");
-			break;
+			return -1;
+
+		default: // port is the tree key and only the cases above set it
+			NetErr("TCP SOCKET CONNECT: Error, unknown address family %d.", address->family);
+			return -1;
 	}
 
 	// same guard as TCPSocketBind and TCPSocketClose: the walk in BSTAdd, not just its final link store, is inside it. Node and queue entry are built first
@@ -1347,6 +1422,7 @@ CTCPSocket *TCPSocketAccept(CTCPSocket *tcp_socket)
 
 	if (TCPSocketBind(new_socket, &ipv4_address) == -1)
 	{
+		TCPSocketRelease(new_socket); // never entered the tree
 		Free(pending);
 		return NULL;
 	}

@@ -8,6 +8,8 @@
 #define USB_ECM_FRAME_MAX	2048	//>= ETHERNET_FRAME_SIZE, the net stack's buffer
 #define USB_ECM_RXQ			16		//RX ring depth (power of two)
 #define USB_ECM_TXQ			16		//TX ring depth (power of two)
+#define USB_ECM_TX_TIMEOUT	1.0		//seconds a single TX TRB may stay in flight
+#define USB_ECM_TX_BUDGET	0.002	//seconds UsbEcmTick may spend draining TX per call
 
 class CUsbEcmFrame
 {
@@ -22,6 +24,9 @@ class CUsbEcm
 	CUsbEP			*bulk_in, *bulk_out, *int_ep;
 	I64				 data_if_num, comm_if_num, data_alt;
 	U8				 mac[6];
+//TX in flight on bulk_out, owned by UsbEcmTick. Must precede rxq: the attach MemSet stops there.
+	Bool			 tx_busy, tx_zlp, tx_retried;
+	F64				 tx_deadline;
 //UsbEcmRxCB produces (USB task), UsbEcmRecv consumes (net task).
 	CUsbEcmFrame	*rxq;
 	I64				 rxq_head,		//consumer index
@@ -135,10 +140,21 @@ public I64 UsbEcmSend(U8 *frame, I64 len)
 	return 0;
 }
 
+public Bool UsbEcmTxFull()
+{//TRUE when the next UsbEcmSend would drop. Advisory: another producer can fill the ring first.
+	CUsbEcm *ecm = UsbEcmFirst;
+
+	if (!ecm || !ecm->valid)
+		return TRUE;
+
+	return ((ecm->txq_tail + 1) & (USB_ECM_TXQ - 1)) == ecm->txq_head;
+}
+
 U0 UsbEcmTick()
-{//USB task only.
+{//USB task only. Submits one TX TRB per slot and polls for completion within a per-call budget.
 	CUsbEcm			*ecm;
 	CUsbEcmFrame	*slot;
+	F64				 budget = tS + USB_ECM_TX_BUDGET;
 	I64				 i, len, code;
 
 	for (i = 0; i < USB_ECMS_MAX; i++)
@@ -146,24 +162,67 @@ U0 UsbEcmTick()
 		ecm = &usb_ecms[i];
 		if (!ecm->valid)
 			goto next_ecm;
-		while (ecm->txq_head != ecm->txq_tail)
+
+		while (TRUE)
 		{
+			if (!ecm->tx_busy)
+			{
+				if (ecm->txq_head == ecm->txq_tail)
+					break;
+				slot = &ecm->txq[ecm->txq_head];
+				if (!slot->len)
+					break;	//producer still copying
+				ecm->tx_busy	 = TRUE;
+				ecm->tx_zlp		 = FALSE;
+				ecm->tx_retried	 = FALSE;
+				ecm->tx_deadline = tS + USB_ECM_TX_TIMEOUT;
+				XhciBulkSubmit(ecm->dev, ecm->bulk_out, slot->data, slot->len);
+			}
+
+			if (!ecm->bulk_out->xfer_done)
+			{
+				if (tS < budget && tS < ecm->tx_deadline)
+				{
+					XhciEventPoll(ecm->dev->hc);
+					Yield;
+					goto tx_more;
+				}
+				if (tS < ecm->tx_deadline)
+					break;	//still in flight, retested next tick
+				code = XHCI_CC_TIMEOUT;
+			}
+			else
+				code = ecm->bulk_out->xfer_code;
+
 			slot = &ecm->txq[ecm->txq_head];
 			len  = slot->len;
-			if (!len)
-				break;	//producer still copying
-			code = XhciBulkXfer(ecm->dev, ecm->bulk_out, slot->data, len, 1.0);
-			if (code == XHCI_CC_STALL)
+
+			if (code == XHCI_CC_STALL && !ecm->tx_retried)
 			{
 				UsbClearHalt(ecm->dev, ecm->bulk_out);
-				code = XhciBulkXfer(ecm->dev, ecm->bulk_out, slot->data, len, 1.0);
+				ecm->tx_retried	 = TRUE;
+				ecm->tx_deadline = tS + USB_ECM_TX_TIMEOUT;
+				XhciBulkSubmit(ecm->dev, ecm->bulk_out, slot->data, len);
+				goto tx_more;
 			}
+
 //A frame that exactly fills the last packet needs a zero-length packet to end the transfer.
-			if ((code == XHCI_CC_SUCCESS || code == XHCI_CC_SHORT_PKT) &&
-				!(len % ecm->bulk_out->max_packet))
-				XhciBulkXfer(ecm->dev, ecm->bulk_out, slot->data, 0, 1.0);
-			slot->len = 0;
-			ecm->txq_head = (ecm->txq_head + 1) & (USB_ECM_TXQ - 1);
+			if (!ecm->tx_zlp && (code == XHCI_CC_SUCCESS || code == XHCI_CC_SHORT_PKT) &&
+				ecm->bulk_out->max_packet && !(len % ecm->bulk_out->max_packet))
+			{
+				ecm->tx_zlp		 = TRUE;
+				ecm->tx_deadline = tS + USB_ECM_TX_TIMEOUT;
+				XhciBulkSubmit(ecm->dev, ecm->bulk_out, slot->data, 0);
+				goto tx_more;
+			}
+
+			slot->len		= 0;
+			ecm->txq_head	= (ecm->txq_head + 1) & (USB_ECM_TXQ - 1);
+			ecm->tx_busy	= FALSE;
+
+			if (tS >= budget)
+				break;
+tx_more:;
 		}
 next_ecm:;
 	}

@@ -59,8 +59,17 @@ I64 UDPPacketParse(U16 *source_port_out,
 	// check ip protocol? probably redundant
 
 	CUDPHeader *header = packet->data;
+	I64			udp_length;
 
-	// TODO: Validate packet length !
+	if (packet->length < sizeof(CUDPHeader))
+		return -1;
+
+	// length field spans header plus payload, 8 minimum. Same test as Linux
+	// __udp4_lib_rcv; the payload length comes from it, not from the IP length
+	udp_length = EndianU16(header->length);
+
+	if (udp_length < sizeof(CUDPHeader) || udp_length > packet->length)
+		return -1;
 
 //	NetDebug("UDP PACKET PARSE: Caught packet, src  port: 0x%0X (B.E.)", header->source_port);
 //	NetDebug("UDP PACKET PARSE: Caught packet, dest port: 0x%0X (B.E.)", header->destination_port);
@@ -72,8 +81,8 @@ I64 UDPPacketParse(U16 *source_port_out,
 //	NetDebug("UDP PACKET PARSE: Source Port output:      0x%0X (L.E.)", *source_port_out);
 //	NetDebug("UDP PACKET PARSE: Destination Port Output: 0x%0X (L.E.)", *destination_port_out);
 
-	*data_out	= packet->data   + sizeof(CUDPHeader);
-	*length_out	= packet->length - sizeof(CUDPHeader);
+	*data_out	= packet->data + sizeof(CUDPHeader);
+	*length_out	= udp_length   - sizeof(CUDPHeader);
 
 	return 0;
 
@@ -81,14 +90,15 @@ I64 UDPPacketParse(U16 *source_port_out,
 
 CUDPSocket *UDPSocket(U16 domain=AF_UNSPEC)
 {
+	// sys_task heap throughout: the RX interrupt reaches all of this through the bound-socket tree, and Kill releases a task's data_heap without running its catch
 	U16			type = SOCKET_DATAGRAM;
-	CUDPSocket *udp_socket = CAlloc(sizeof(CUDPSocket));
+	CUDPSocket *udp_socket = CAlloc(sizeof(CUDPSocket), sys_task);
 
-	udp_socket->socket = Socket(domain, type);
-	
+	udp_socket->socket = Socket(domain, type, sys_task);
+
 	udp_socket->receive_address.family = domain; // INET, INET6, or unspecified
 
-	udp_socket->receive_queue = CAlloc(sizeof(CUDPMessageQueue));
+	udp_socket->receive_queue = CAlloc(sizeof(CUDPMessageQueue), sys_task);
 	QueueInit(udp_socket->receive_queue); // acts as head. add messages to but don't remove head.
 	udp_socket->receive_queue_depth = 0;
 	udp_socket->receive_lock        = 0;
@@ -163,8 +173,11 @@ I64 UDPSocketBind(CUDPSocket *udp_socket, CSocketAddressStorage *address_source)
 
 		case AF_UNSPEC:
 			NetErr("UDP SOCKET BIND: Error, AF_UNSPEC UDP BIND -- param family");
+			return -1;
 
-			break;
+		default: // port is the tree key and only the cases above set it
+			NetErr("UDP SOCKET BIND: Error, unknown address family %d.", address_source->family);
+			return -1;
 	}
 
 	// at this point, Socket and Address have matching family values
@@ -276,14 +289,22 @@ I64 UDPSocketClose(CUDPSocket *udp_socket)
 	CUDPTreeNode		*head = udp_globals.bound_socket_tree;
 	CUDPTreeNode		*node;
 	CUDPTreeNode		*dead_node = NULL;
+	CUDPTreeNode		*stuck_node = NULL;
+	I64					 stuck_value = 0;
 	CUDPTreeQueue		*queue;
 	CUDPMessageQueue	*message;
 
+	if (!udp_socket)
+		return -1;
+
+	if (LBts(&udp_socket->close_lock, 0))
+	{
+		NetErr("UDP SOCKET CLOSE: Socket already closing.");
+		return -1;
+	}
+
 	SocketClose(udp_socket->socket); // TODO: testing on closing a socket while another task is using it
 	// after low-level socket close, even if protocol level socket fails close, it is now disabled (state is close request)
-
-	// re-read: SocketClose above can yield, and another task's close re-roots the tree and frees the node this frame was entered with
-	head = udp_globals.bound_socket_tree;
 
 	// an unbound socket is ordinary: a failed bind, or a second close. Must NOT Debug() here, that halts the machine
 
@@ -291,6 +312,9 @@ I64 UDPSocketClose(CUDPSocket *udp_socket)
 	CLI
 	while (LBts(&udp_bound_tree_lock, 0))
 		PAUSE
+
+	// read inside the guard: SocketClose above can yield, and another task's close re-roots the tree and frees the node this frame was entered with
+	head = udp_globals.bound_socket_tree;
 
 	node  = UDPTreeNodeFind(udp_socket->bound_to, head);
 	queue = NULL;
@@ -317,11 +341,17 @@ I64 UDPSocketClose(CUDPSocket *udp_socket)
 						udp_globals.bound_socket_tree = node->right;
 					else
 						udp_globals.bound_socket_tree = NULL;
-				}
-				else
-					UDPTreeNodeSinglePop(node->value, head);
 
-				dead_node = node;
+					dead_node = node;
+				}
+				// BSTPop refuses a root and abandons a corrupt walk. A node it leaves linked must not be freed: the next walk would read it
+				else if (UDPTreeNodeSinglePop(node->value, head) == node)
+					dead_node = node;
+				else
+				{
+					stuck_node	= node;
+					stuck_value	= node->value;
+				}
 			}
 		}
 	}
@@ -330,6 +360,10 @@ I64 UDPSocketClose(CUDPSocket *udp_socket)
 	POPFD
 
 	BSTCorruptionReport;
+
+	if (stuck_node)
+		NetErr("UDP SOCKET CLOSE: Single-pop refused node 0x%0X at port %d. Node retained, queue empty.",
+			   stuck_node, stuck_value);
 
 	// the socket is unlinked above, so no new reference can be taken; an interrupt on another core can still be inside UDPHandler with the one it took
 	while (udp_socket->handler_refs)
@@ -346,6 +380,7 @@ I64 UDPSocketClose(CUDPSocket *udp_socket)
 		NetErr("UDP SOCKET CLOSE: socket was not bound; freeing anyway.");
 
 	Free(udp_socket->socket);
+	udp_socket->socket = NULL;
 
 	if (udp_socket->receive_queue)
 	{
@@ -359,6 +394,7 @@ I64 UDPSocketClose(CUDPSocket *udp_socket)
 		}
 
 		Free(udp_socket->receive_queue);
+		udp_socket->receive_queue = NULL;
 	}
 
 	udp_socket->receive_queue_depth = 0;
@@ -606,14 +642,15 @@ I64 UDPHandler(CIPV4Packet *packet)
 	messages_head = udp_socket->receive_queue;
 
 	// build COMPLETE before linking: recvfrom runs in a task while this runs in the NetHandler interrupt, so a linked message must never be half-built
-	message = CAlloc(sizeof(CUDPMessageQueue));
+	// sys_task heap: the current task here is whichever task the RX interrupt hit
+	message = CAlloc(sizeof(CUDPMessageQueue), sys_task);
 	if (!message)
 	{
 		UDPHandlerRefRelease(udp_socket);
 		return -1;
 	}
 
-	message->data = CAlloc(length);
+	message->data = CAlloc(length, sys_task);
 	if (!message->data)
 	{
 		Free(message);
