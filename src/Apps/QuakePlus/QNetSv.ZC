@@ -16,6 +16,8 @@
 #define QSU_WEAPONFRAME		4096
 #define QSU_ARMOR			8192
 #define QSU_WEAPON			16384
+#define QSU_EXTEND1			32768	//1<<15, a third mask byte follows
+#define QSU_WEAPON2			65536	//1<<16, weapon modelindex high byte
 
 #define QDEFAULT_VIEWHEIGHT	22.0
 
@@ -556,6 +558,7 @@ U0 QNetWriteClientdata(CQMsg *m, I64 ent)
 	F64	 inflictor_org[3];
 	I64	 inflictor;
 	I64	 bits = 0;
+	I64	 weapon_idx;
 	I64	 items;
 	I64	 dmg_take;
 	I64	 dmg_save;
@@ -621,8 +624,26 @@ U0 QNetWriteClientdata(CQMsg *m, I64 ent)
 	if (QPrFieldF(ent, q_fld_armorvalue) != 0.0)	bits |= QSU_ARMOR;
 	if (QPrFieldF(ent, q_fld_weapon) != 0.0)		bits |= QSU_WEAPON;
 
+	weapon_idx = 0;
+	if (bits & QSU_WEAPON)
+		weapon_idx =
+			QBiPrecacheModel(QPrStr(QPrFieldI(ent, q_fld_weaponmodel)));
+
+	//666 carries the weapon modelindex high byte in SU_WEAPON2, which lives
+	//in the third mask byte behind SU_EXTEND1
+	if (q_sv_protocol != QNET_PROTOCOL_NQ)
+	{
+		if ((bits & QSU_WEAPON) && (weapon_idx & 0xFF00))
+			bits |= QSU_WEAPON2;
+		if (bits >= 65536)
+			bits |= QSU_EXTEND1;
+	}
+
 	QMsgWriteByte(m, QSVC_CLIENTDATA);
 	QMsgWriteShort(m, bits);
+
+	if (bits & QSU_EXTEND1)
+		QMsgWriteByte(m, (bits >> 16) & 255);
 
 	if (bits & QSU_VIEWHEIGHT)
 		QMsgWriteChar(m, ToI64(QPrFieldF(ent, q_fld_view_ofs + 2)));
@@ -644,8 +665,7 @@ U0 QNetWriteClientdata(CQMsg *m, I64 ent)
 	if (bits & QSU_ARMOR)
 		QMsgWriteByte(m, ToI64(QPrFieldF(ent, q_fld_armorvalue)));
 	if (bits & QSU_WEAPON)
-		QMsgWriteByte(m,
-			QBiPrecacheModel(QPrStr(QPrFieldI(ent, q_fld_weaponmodel))));
+		QMsgWriteByte(m, weapon_idx & 255);
 
 	//health is a signed short
 	QMsgWriteShort(m, ToI64(QPrFieldF(ent, q_fld_health)));
@@ -657,6 +677,10 @@ U0 QNetWriteClientdata(CQMsg *m, I64 ent)
 
 	//standard_quake: plain number here, a bit field in the mission packs
 	QMsgWriteByte(m, ToI64(QPrFieldF(ent, q_fld_weapon)));
+
+	//the widened fields trail the whole protocol 15 payload
+	if (bits & QSU_WEAPON2)
+		QMsgWriteByte(m, (weapon_idx >> 8) & 255);
 }
 
 
@@ -879,17 +903,22 @@ Bool QNetServerFrame(I64 client_ent, F64 time)
 			if (!QNetDgrmSendUnreliable(i, &q_net_datagram))
 				ok = FALSE;
 
-			if (q_sv_client_msg[i].overflowed)
+				//QBiWireRoom refuses the write before QMsgWriteByte can flag
+				//the buffer, so the backlog itself is the overflow test
+			if (q_sv_client_msg[i].overflowed ||
+				q_sv_client_msg[i].len > QNET_MAX_MSG - QNET_MAX_DATAGRAM)
 			{
 				QMsgClear(&q_sv_client_msg[i]);
 				q_sv_clients[i].drop_asap = TRUE;
 				goto qsf_next;
 			}
 
-			if (q_sv_client_msg[i].len > 0)
+				//SV_SendClientMessages: hold the buffer while the reliable
+				//channel is busy, clear it only once the sock takes it
+			if ((q_sv_client_msg[i].len > 0) && QNetDgrmCanSend(i))
 			{
-				QNetDgrmSendReliable(i, &q_sv_client_msg[i]);
-				QMsgClear(&q_sv_client_msg[i]);
+				if (QNetDgrmSendReliable(i, &q_sv_client_msg[i]))
+					QMsgClear(&q_sv_client_msg[i]);
 			}
 
 qsf_next:
@@ -956,6 +985,9 @@ U0 QNetParseClientdata(CQMsg *m)
 	I64 bits = QMsgReadShort(m) & 0xFFFF;
 	I64 j;
 
+	if (bits & QSU_EXTEND1)
+		bits |= QMsgReadByte(m) << 16;
+
 	if (bits & QSU_VIEWHEIGHT)
 		q_cl.view_height = ToF64(QMsgReadChar(m));
 	else
@@ -1005,6 +1037,9 @@ U0 QNetParseClientdata(CQMsg *m)
 	q_cl.ammo_rockets = QMsgReadByte(m);
 	q_cl.ammo_cells   = QMsgReadByte(m);
 	q_cl.weapon       = QMsgReadByte(m);
+
+	if (bits & QSU_WEAPON2)
+		q_cl.weaponmodel |= QMsgReadByte(m) << 8;
 }
 
 U0 QNetParseStatic(CQMsg *m, Bool large=FALSE)
@@ -1122,6 +1157,11 @@ U0 QNetParseBaseline(CQMsg *m, Bool large=FALSE)
 	b->angles[1]  = QMsgReadAngle(m);
 	b->origin[2]  = QMsgReadCoord(m);
 	b->angles[2]  = QMsgReadAngle(m);
+	if (bl_bits & QB_ALPHA)
+		QMsgReadByte(m);
+	if (bl_bits & QB_SCALE)
+		QMsgReadByte(m);
+
 	b->effects    = 0;
 	b->step       = FALSE;
 	b->active     = FALSE;
@@ -1153,10 +1193,23 @@ U0 QNetParseSound(CQMsg *m)
 		attenuation = ToF64(QMsgReadByte(m)) / 64.0;
 
 	//(entity << 3) | channel; svc_stopsound addresses the same pair.
-	i = QMsgReadShort(m);
-	ent_num   = i >> 3;
-	chan_num  = i & 7;
-	sound_num = QMsgReadByte(m);
+	//SND_LARGEENTITY splits them, SND_LARGESOUND widens the index.
+	if (field_mask & QSND_LARGEENTITY)
+	{
+		ent_num  = QMsgReadShort(m) & 0xFFFF;
+		chan_num = QMsgReadByte(m);
+	}
+	else
+	{
+		i = QMsgReadShort(m) & 0xFFFF;
+		ent_num  = i >> 3;
+		chan_num = i & 7;
+	}
+
+	if (field_mask & QSND_LARGESOUND)
+		sound_num = QMsgReadShort(m) & 0xFFFF;
+	else
+		sound_num = QMsgReadByte(m);
 
 	for (i = 0; i < 3; i++)
 		pos[i] = QMsgReadCoord(m);
@@ -1344,6 +1397,14 @@ Bool QNetClientParse(CQMsg *m)
 				for (i = 0; i < 3; i++)
 					QMsgReadCoord(m);
 				QMsgReadByte(m);		//sound number
+				QMsgReadByte(m);		//volume
+				QMsgReadByte(m);		//attenuation
+				break;
+
+			case QSVC_SPAWNSTATICSOUND2:
+				for (i = 0; i < 3; i++)
+					QMsgReadCoord(m);
+				QMsgReadShort(m);		//sound number
 				QMsgReadByte(m);		//volume
 				QMsgReadByte(m);		//attenuation
 				break;
@@ -1947,7 +2008,9 @@ I64 QSvAddClient(U32 ip, Bool local, I64 edict, F64 now)
 	F64	ang[3];
 	I64	i;
 
-	for (i = 0; i < QSV_MAX_CLIENTS; i++)
+		//svc_serverinfo carries q_sv_maxclients, and Ironwail rejects an
+		//svc_updatename above it
+	for (i = 0; i < q_sv_maxclients; i++)
 	{
 		if (q_sv_clients[i].active)
 			goto qsv_next;
@@ -2295,23 +2358,22 @@ U0 QNetWriteServerInfo(CQMsg *m, I64 slot)
 
 	QMsgWriteString(m, mapname);
 
-	//models 1..n then an empty terminator (WinQuake SV_SendServerinfo)
+	//models 1..n then an empty terminator (WinQuake SV_SendServerinfo). the
+	//loop stops on an empty slot: an empty string mid-list is the terminator.
 	for (i = 1; i < q_precache_model_count; i++)
 	{
-		if (q_precache_model[i] && q_precache_model[i][0])
-			QMsgWriteString(m, q_precache_model[i]);
-		else
-			QMsgWriteString(m, "");
+		if (!q_precache_model[i] || !q_precache_model[i][0])
+			break;
+		QMsgWriteString(m, q_precache_model[i]);
 	}
 	QMsgWriteString(m, "");
 
 	//sounds: the local table is 0-based, wire index is i+1. empty terminator.
 	for (i = 0; i < q_precache_sound_count; i++)
 	{
-		if (q_precache_sound[i] && q_precache_sound[i][0])
-			QMsgWriteString(m, q_precache_sound[i]);
-		else
-			QMsgWriteString(m, "");
+		if (!q_precache_sound[i] || !q_precache_sound[i][0])
+			break;
+		QMsgWriteString(m, q_precache_sound[i]);
 	}
 	QMsgWriteString(m, "");
 }
@@ -2807,9 +2869,20 @@ U0 QNetClientSendMove(F64 *view_angles, F64 forward, F64 side, F64 up,
 	//the client's clock, echoed back; never used as a time
 	QMsgWriteFloat(&q_net_cmd, time);
 
-	QMsgWriteAngle(&q_net_cmd, view_angles[0]);
-	QMsgWriteAngle(&q_net_cmd, view_angles[1]);
-	QMsgWriteAngle(&q_net_cmd, view_angles[2]);
+	//CL_SendMove writes clc_move angles with MSG_WriteAngle16 unless the
+	//protocol is 15
+	if (q_cl_protocol == QNET_PROTOCOL_NQ)
+	{
+		QMsgWriteAngle(&q_net_cmd, view_angles[0]);
+		QMsgWriteAngle(&q_net_cmd, view_angles[1]);
+		QMsgWriteAngle(&q_net_cmd, view_angles[2]);
+	}
+	else
+	{
+		QMsgWriteAngle16(&q_net_cmd, view_angles[0]);
+		QMsgWriteAngle16(&q_net_cmd, view_angles[1]);
+		QMsgWriteAngle16(&q_net_cmd, view_angles[2]);
+	}
 
 	//move intent is shorts in units per second, not a direction
 	QMsgWriteShort(&q_net_cmd, ToI64(forward));
@@ -2845,7 +2918,12 @@ Bool QNetServerReadMove(CQMsg *m, I64 ent, F64 server_time, I64 slot = -1)
 	q_net_move_ping = server_time - QMsgReadFloat(m);
 
 	for (j = 0; j < 3; j++)
-		q_net_move_angles[j] = QMsgReadAngle(m);
+	{
+		if (q_sv_protocol == QNET_PROTOCOL_NQ)
+			q_net_move_angles[j] = QMsgReadAngle(m);
+		else
+			q_net_move_angles[j] = QMsgReadAngle16(m);
+	}
 
 	q_net_move_cmd[0] = ToF64(QMsgReadShort(m));
 	q_net_move_cmd[1] = ToF64(QMsgReadShort(m));
