@@ -1,0 +1,2710 @@
+//VP9 decoder (VP9 bitstream spec v0.6). Keyframe and intra-only frames;
+//inter prediction is not implemented.
+//
+//Profile 0 only: 8 bit, 4:2:0. Tables live in VP9Tables.ZC, extracted from
+//libvpx's by utils/vp9tables.py.
+//
+//The boolean decoder is VP8's, one marker bit apart, so CVp8Br is reused
+//rather than copied.
+
+#define VP9_MAXDIM		8192
+#define VP9_SYNCCODE	0x498342
+
+//Block sizes, largest first, as the spec orders them.
+#define BS_64x64	0
+#define BS_64x32	1
+#define BS_32x64	2
+#define BS_32x32	3
+#define BS_32x16	4
+#define BS_16x32	5
+#define BS_16x16	6
+#define BS_16x8		7
+#define BS_8x16		8
+#define BS_8x8		9
+#define BS_8x4		10
+#define BS_4x8		11
+#define BS_4x4		12
+
+#define TX_4X4			0
+#define TX_8X8			1
+#define TX_16X16		2
+#define TX_32X32		3
+#define TX_SWITCHABLE	4
+
+//Transform type, indexed by intra mode through vp9_intra_txfm_type. The order
+//is libavcodec's, which the scan tables are indexed by.
+#define DCT_DCT		0
+#define DCT_ADST	1
+#define ADST_DCT	2
+#define ADST_ADST	3
+
+class CVp9Seg
+{
+	Bool	 q_enabled, lf_enabled, ref_enabled, skip_enabled;
+	I64		 q_val, lf_val, ref_val;
+	I64		 qmul[2][2];		//[plane is uv][is ac]
+	I64		 lflvl[4][2];		//[ref][mode]
+};
+
+//A frame context: what survives between frames and what a keyframe resets.
+class CVp9Ctx
+{
+	U8	coef[1728];				//[4][2][2][6][6][3]
+	U8	tx8p[2], tx16p[4], tx32p[6], skip[3];
+};
+
+class CVp9Dec
+{
+	//Uncompressed header.
+	I64		 profile;
+	Bool	 keyframe, show, errorres, intraonly, lossless;
+	I64		 resetctx, refreshrefmask, framectxid;
+	Bool	 refreshctx, parallelmode;
+	I64		 w, h;
+	I64		 cols, rows;			//8-pixel units
+	I64		 sb_cols, sb_rows;		//64-pixel units
+	I64		 filt_level, filt_sharp;
+	Bool	 lf_delta_en, lf_delta_upd;
+	I64		 lf_ref_delta[4], lf_mode_delta[2];
+	I64		 yac_qi, ydc_qdelta, uvdc_qdelta, uvac_qdelta;
+	Bool	 seg_en, seg_update_map, seg_temporal, seg_absolute;
+	U8		 seg_prob[7], seg_pred_prob[3];
+	CVp9Seg	 seg[8];
+	I64		 log2_tile_cols, log2_tile_rows;
+	I64		 header_size;			//Compressed header, bytes.
+	I64		 uncompressed_size;
+	//Bit reader over the uncompressed header.
+	U8		*bits;
+	I64		 bit_pos, bit_end;
+	Bool	 bit_eof;
+	//Compressed header and tile data.
+	CVp8Br	 br;
+	I64		 txfmmode;
+	CVp9Ctx	 fctx[4];
+	U8		 coef[6336];			//[4][2][2][6][6][11], 3 coded + 8 modelled
+	U8		 tx8p[2], tx16p[4], tx32p[6], skip_p[3];
+	I64		 fail;
+	//Tile and block state.
+	CVp8Br	 tc;
+	I64		 tile_col_start;
+	U8		*a_part, *a_skip, *a_tx, *a_ymode, *a_ynnz, *a_uvnnz;
+	U8		 l_part[8], l_skip[8], l_tx[8], l_ymode[16], l_ynnz[16];
+	U8		 l_uvnnz[16];
+	U8		*seg_map;
+	I64		 a_cols;			//Width the above arrays are sized for.
+	U8		 cache[1024];
+	I64		 row, col, row7, bs, tx, uvtx, seg_id;
+	Bool	 skip;
+	I64		 mode[4], uvmode;
+	I16		*blk;				//64x64 luma then two 32x32 chroma
+	I64		 eob_y[256], eob_uv[128];
+	I64		 blocks, slack;
+	//Frame planes, sized to whole superblocks.
+	U8		*py, *pu, *pv;
+	I64		 ys, uvs, ph, uvph;
+	U8		*lf_lvl, *lf_tx, *lf_uvtx;	//Per 8x8, for the loop filter.
+	I64		 tin[1024], ttmp[1024], tout[32];
+};
+
+/***** uncompressed header bit reader (MSB first) *****/
+
+I64 Vp9Bits(CVp9Dec *d, I64 n)
+{
+	I64 v = 0, byte;
+
+	while (n--)
+	{
+		byte = d->bit_pos >> 3;
+		if (byte >= d->bit_end)
+		{
+			d->bit_eof = TRUE;
+			return v << 1;
+		}
+		v = v << 1 | (d->bits[byte] >> (7 - (d->bit_pos & 7))) & 1;
+		d->bit_pos++;
+	}
+
+	return v;
+}
+
+I64 Vp9SBits(CVp9Dec *d, I64 n)
+{//Value then sign.
+	I64 v = Vp9Bits(d, n);
+
+	if (Vp9Bits(d, 1))
+		return -v;
+
+	return v;
+}
+
+I64 Vp9ClipQ(I64 v)
+{
+	if (v < 0)
+		return 0;
+	if (v > 255)
+		return 255;
+
+	return v;
+}
+
+I64 Vp9Clip6(I64 v)
+{
+	if (v < 0)
+		return 0;
+	if (v > 63)
+		return 63;
+
+	return v;
+}
+
+/***** compressed header *****/
+
+U8 vp9_inv_map[255] = {
+	7,20,33,46,59,72,85,98,111,124,137,150,163,176,
+	189,202,215,228,241,254,1,2,3,4,5,6,8,9,
+	10,11,12,13,14,15,16,17,18,19,21,22,23,24,
+	25,26,27,28,29,30,31,32,34,35,36,37,38,39,
+	40,41,42,43,44,45,47,48,49,50,51,52,53,54,
+	55,56,57,58,60,61,62,63,64,65,66,67,68,69,
+	70,71,73,74,75,76,77,78,79,80,81,82,83,84,
+	86,87,88,89,90,91,92,93,94,95,96,97,99,100,
+	101,102,103,104,105,106,107,108,109,110,112,113,114,115,
+	116,117,118,119,120,121,122,123,125,126,127,128,129,130,
+	131,132,133,134,135,136,138,139,140,141,142,143,144,145,
+	146,147,148,149,151,152,153,154,155,156,157,158,159,160,
+	161,162,164,165,166,167,168,169,170,171,172,173,174,175,
+	177,178,179,180,181,182,183,184,185,186,187,188,190,191,
+	192,193,194,195,196,197,198,199,200,201,203,204,205,206,
+	207,208,209,210,211,212,213,214,216,217,218,219,220,221,
+	222,223,224,225,226,227,229,230,231,232,233,234,235,236,
+	237,238,239,240,242,243,244,245,246,247,248,249,250,251,
+	252,253,253
+};
+
+I64 Vp9InvRecenter(I64 v, I64 m)
+{
+	if (v > 2 * m)
+		return v;
+	if (v & 1)
+		return m - ((v + 1) >> 1);
+
+	return m + (v >> 1);
+}
+
+I64 Vp9UpdateProb(CVp8Br *br, I64 p)
+{//Differential update: a VLC-coded distance, then recentred on p.
+	I64 dd;
+
+	if (!Vp8Bit(br, 128))
+		dd = Vp8Val(br, 4);
+	else if (!Vp8Bit(br, 128))
+		dd = Vp8Val(br, 4) + 16;
+	else if (!Vp8Bit(br, 128))
+		dd = Vp8Val(br, 5) + 32;
+	else
+	{
+		dd = Vp8Val(br, 7);
+		if (dd >= 65)
+			dd = (dd << 1) - 65 + Vp8Bit(br, 128);
+		dd += 64;
+	}
+	if (dd > 254)
+		dd = 254;
+
+	if (p <= 128)
+		return 1 + Vp9InvRecenter(vp9_inv_map[dd], p - 1);
+
+	return 255 - Vp9InvRecenter(vp9_inv_map[dd], 255 - p);
+}
+
+U0 Vp9CtxDefaults(CVp9Ctx *c)
+{
+	MemCopy(c->coef, vp9_coef_probs, 1728);
+	MemCopy(c->tx8p, vp9_tx8p_probs, 2);
+	MemCopy(c->tx16p, vp9_tx16p_probs, 4);
+	MemCopy(c->tx32p, vp9_tx32p_probs, 6);
+	MemCopy(c->skip, vp9_skip_probs, 3);
+}
+
+U0 Vp9CoefExpand(CVp9Dec *d, I64 i, I64 j, I64 k, I64 l, I64 m, U8 *ref,
+				 Bool update)
+{//Three coded probabilities per node; tokens 3..10 come from the Pareto model.
+	I64	 base3 = (((((i * 2 + j) * 2 + k) * 6 + l) * 6) + m) * 3;
+	I64	 base11 = (((((i * 2 + j) * 2 + k) * 6 + l) * 6) + m) * 11;
+	U8	*p = d->coef + base11;
+	U8	*r = ref + base3;
+	I64	 n;
+
+	for (n = 0; n < 3; n++)
+	{
+		if (update && Vp8Bit(&d->br, 252))
+			p[n] = Vp9UpdateProb(&d->br, r[n]);
+		else
+			p[n] = r[n];
+	}
+	MemCopy(p + 3, vp9_pareto8 + p[2] * 8, 8);
+}
+
+Bool Vp9CompressedHeader(CVp9Dec *d, U8 *buf, I64 size)
+{
+	CVp9Ctx	*fc = &d->fctx[d->framectxid];
+	I64		 i, j, k, l, m;
+	Bool	 update;
+
+	Vp8BrInit(&d->br, buf, size);
+	if (Vp8Bit(&d->br, 128))
+		return FALSE;			//Marker bit.
+
+	MemCopy(d->tx8p, fc->tx8p, 2);
+	MemCopy(d->tx16p, fc->tx16p, 4);
+	MemCopy(d->tx32p, fc->tx32p, 6);
+	MemCopy(d->skip_p, fc->skip, 3);
+
+	if (d->lossless)
+		d->txfmmode = TX_4X4;
+	else
+	{
+		d->txfmmode = Vp8Val(&d->br, 2);
+		if (d->txfmmode == 3)
+			d->txfmmode += Vp8Bit(&d->br, 128);
+		if (d->txfmmode == TX_SWITCHABLE)
+		{
+			for (i = 0; i < 2; i++)
+				if (Vp8Bit(&d->br, 252))
+					d->tx8p[i] = Vp9UpdateProb(&d->br, d->tx8p[i]);
+			for (i = 0; i < 4; i++)
+				if (Vp8Bit(&d->br, 252))
+					d->tx16p[i] = Vp9UpdateProb(&d->br, d->tx16p[i]);
+			for (i = 0; i < 6; i++)
+				if (Vp8Bit(&d->br, 252))
+					d->tx32p[i] = Vp9UpdateProb(&d->br, d->tx32p[i]);
+		}
+	}
+
+	for (i = 0; i < 4; i++)
+	{
+		update = Vp8Bit(&d->br, 128);
+		for (j = 0; j < 2; j++)
+			for (k = 0; k < 2; k++)
+				for (l = 0; l < 6; l++)
+					for (m = 0; m < 6; m++)
+					{//Band 0 codes three contexts, the rest six.
+						if (m >= 3 && !l)
+							break;
+						Vp9CoefExpand(d, i, j, k, l, m, fc->coef, update);
+					}
+		if (d->txfmmode == i)
+			break;
+	}
+
+	for (i = 0; i < 3; i++)
+		if (Vp8Bit(&d->br, 252))
+			d->skip_p[i] = Vp9UpdateProb(&d->br, d->skip_p[i]);
+
+	return ToBool(!d->br.eof);
+}
+
+/***** uncompressed header *****/
+
+U0 Vp9Quant(CVp9Dec *d)
+{//Dequantisation factors and loop filter level per segment.
+	I64	 i, j, qyac, qydc, quvac, quvdc, lflvl, sh, n = 1;
+
+	if (d->seg_en)
+		n = 8;
+	for (i = 0; i < n; i++)
+	{
+		qyac = d->yac_qi;
+		if (d->seg_en && d->seg[i].q_enabled)
+		{
+			if (d->seg_absolute)
+				qyac = d->seg[i].q_val;
+			else
+				qyac = d->yac_qi + d->seg[i].q_val;
+		}
+		qydc  = Vp9ClipQ(qyac + d->ydc_qdelta);
+		quvdc = Vp9ClipQ(qyac + d->uvdc_qdelta);
+		quvac = Vp9ClipQ(qyac + d->uvac_qdelta);
+		qyac  = Vp9ClipQ(qyac);
+		d->seg[i].qmul[0][0] = vp9_dc_qlookup[qydc];
+		d->seg[i].qmul[0][1] = vp9_ac_qlookup[qyac];
+		d->seg[i].qmul[1][0] = vp9_dc_qlookup[quvdc];
+		d->seg[i].qmul[1][1] = vp9_ac_qlookup[quvac];
+
+		sh = 0;
+		if (d->filt_level >= 32)
+			sh = 1;
+		lflvl = d->filt_level;
+		if (d->seg_en && d->seg[i].lf_enabled)
+		{
+			if (d->seg_absolute)
+				lflvl = d->seg[i].lf_val;
+			else
+				lflvl = d->filt_level + d->seg[i].lf_val;
+		}
+		lflvl = Vp9Clip6(lflvl);
+		if (d->lf_delta_en)
+		{
+			d->seg[i].lflvl[0][0] = Vp9Clip6(lflvl + (d->lf_ref_delta[0] << sh));
+			d->seg[i].lflvl[0][1] = d->seg[i].lflvl[0][0];
+			for (j = 1; j < 4; j++)
+			{
+				d->seg[i].lflvl[j][0] = Vp9Clip6(lflvl +
+					((d->lf_ref_delta[j] + d->lf_mode_delta[0]) << sh));
+				d->seg[i].lflvl[j][1] = Vp9Clip6(lflvl +
+					((d->lf_ref_delta[j] + d->lf_mode_delta[1]) << sh));
+			}
+		}
+		else
+			for (j = 0; j < 4; j++)
+			{
+				d->seg[i].lflvl[j][0] = lflvl;
+				d->seg[i].lflvl[j][1] = lflvl;
+			}
+	}
+}
+
+Bool Vp9FrameHeader(CVp9Dec *d, U8 *buf, I64 size)
+{//Returns FALSE on anything this decoder does not handle, d->fail says what.
+	I64	 i, max, bits;
+
+	d->bits = buf;
+	d->bit_pos = 0;
+	d->bit_end = size;
+	d->bit_eof = FALSE;
+	d->fail = 0;
+
+	if (Vp9Bits(d, 2) != 2)
+	{
+		d->fail = 1;
+		return FALSE;
+	}
+	d->profile = Vp9Bits(d, 1) | Vp9Bits(d, 1) << 1;
+	if (d->profile == 3)
+		d->profile += Vp9Bits(d, 1);
+	if (d->profile)
+	{
+		d->fail = 2;			//Profile 0 only: 8 bit, 4:2:0.
+		return FALSE;
+	}
+	if (Vp9Bits(d, 1))
+	{
+		d->fail = 3;			//show_existing_frame.
+		return FALSE;
+	}
+
+	d->keyframe = ToBool(!Vp9Bits(d, 1));
+	d->show     = ToBool(Vp9Bits(d, 1));
+	d->errorres = ToBool(Vp9Bits(d, 1));
+	d->intraonly = FALSE;
+	d->resetctx  = 0;
+
+	if (d->keyframe)
+	{
+		if (Vp9Bits(d, 24) != VP9_SYNCCODE)
+		{
+			d->fail = 4;
+			return FALSE;
+		}
+		Vp9Bits(d, 3);			//Colour space.
+		Vp9Bits(d, 1);			//Colour range.
+		d->refreshrefmask = 0xFF;
+		d->w = Vp9Bits(d, 16) + 1;
+		d->h = Vp9Bits(d, 16) + 1;
+		if (Vp9Bits(d, 1))
+			Vp9Bits(d, 32);		//Display size.
+	}
+	else
+	{
+		if (!d->show)
+			d->intraonly = ToBool(Vp9Bits(d, 1));
+		if (!d->errorres)
+			d->resetctx = Vp9Bits(d, 2);
+		if (!d->intraonly)
+		{
+			d->fail = 5;		//Inter frame.
+			return FALSE;
+		}
+		if (Vp9Bits(d, 24) != VP9_SYNCCODE)
+		{
+			d->fail = 4;
+			return FALSE;
+		}
+		d->refreshrefmask = Vp9Bits(d, 8);
+		d->w = Vp9Bits(d, 16) + 1;
+		d->h = Vp9Bits(d, 16) + 1;
+		if (Vp9Bits(d, 1))
+			Vp9Bits(d, 32);		//Display size.
+	}
+	if (!d->w || !d->h || d->w > VP9_MAXDIM || d->h > VP9_MAXDIM)
+	{
+		d->fail = 6;
+		return FALSE;
+	}
+
+	d->refreshctx   = TRUE;
+	d->parallelmode = TRUE;
+	if (!d->errorres)
+	{
+		d->refreshctx   = ToBool(Vp9Bits(d, 1));
+		d->parallelmode = ToBool(Vp9Bits(d, 1));
+	}
+	d->framectxid = Vp9Bits(d, 2);
+	if (d->keyframe || d->intraonly)
+		d->framectxid = 0;		//libvpx ignores the field on these frames.
+
+	if (d->keyframe || d->errorres || d->intraonly)
+	{
+		d->lf_ref_delta[0] = 1;
+		d->lf_ref_delta[1] = 0;
+		d->lf_ref_delta[2] = -1;
+		d->lf_ref_delta[3] = -1;
+		d->lf_mode_delta[0] = 0;
+		d->lf_mode_delta[1] = 0;
+		MemSet(d->seg, 0, 8 * sizeof(CVp9Seg));
+	}
+	d->filt_level = Vp9Bits(d, 6);
+	d->filt_sharp = Vp9Bits(d, 3);
+	d->lf_delta_en = ToBool(Vp9Bits(d, 1));
+	if (d->lf_delta_en)
+	{
+		d->lf_delta_upd = ToBool(Vp9Bits(d, 1));
+		if (d->lf_delta_upd)
+		{
+			for (i = 0; i < 4; i++)
+				if (Vp9Bits(d, 1))
+					d->lf_ref_delta[i] = Vp9SBits(d, 6);
+			for (i = 0; i < 2; i++)
+				if (Vp9Bits(d, 1))
+					d->lf_mode_delta[i] = Vp9SBits(d, 6);
+		}
+	}
+
+	d->yac_qi = Vp9Bits(d, 8);
+	d->ydc_qdelta = 0;
+	d->uvdc_qdelta = 0;
+	d->uvac_qdelta = 0;
+	if (Vp9Bits(d, 1))
+		d->ydc_qdelta = Vp9SBits(d, 4);
+	if (Vp9Bits(d, 1))
+		d->uvdc_qdelta = Vp9SBits(d, 4);
+	if (Vp9Bits(d, 1))
+		d->uvac_qdelta = Vp9SBits(d, 4);
+	d->lossless = ToBool(!d->yac_qi && !d->ydc_qdelta && !d->uvdc_qdelta &&
+						 !d->uvac_qdelta);
+
+	d->seg_en = ToBool(Vp9Bits(d, 1));
+	d->seg_update_map = FALSE;
+	d->seg_temporal = FALSE;
+	if (d->seg_en)
+	{
+		d->seg_update_map = ToBool(Vp9Bits(d, 1));
+		if (d->seg_update_map)
+		{
+			for (i = 0; i < 7; i++)
+			{
+				d->seg_prob[i] = 255;
+				if (Vp9Bits(d, 1))
+					d->seg_prob[i] = Vp9Bits(d, 8);
+			}
+			d->seg_temporal = ToBool(Vp9Bits(d, 1));
+			if (d->seg_temporal)
+				for (i = 0; i < 3; i++)
+				{
+					d->seg_pred_prob[i] = 255;
+					if (Vp9Bits(d, 1))
+						d->seg_pred_prob[i] = Vp9Bits(d, 8);
+				}
+		}
+		if (Vp9Bits(d, 1))
+		{
+			d->seg_absolute = ToBool(Vp9Bits(d, 1));
+			for (i = 0; i < 8; i++)
+			{
+				d->seg[i].q_enabled = ToBool(Vp9Bits(d, 1));
+				if (d->seg[i].q_enabled)
+					d->seg[i].q_val = Vp9SBits(d, 8);
+				d->seg[i].lf_enabled = ToBool(Vp9Bits(d, 1));
+				if (d->seg[i].lf_enabled)
+					d->seg[i].lf_val = Vp9SBits(d, 6);
+				d->seg[i].ref_enabled = ToBool(Vp9Bits(d, 1));
+				if (d->seg[i].ref_enabled)
+					d->seg[i].ref_val = Vp9Bits(d, 2);
+				d->seg[i].skip_enabled = ToBool(Vp9Bits(d, 1));
+			}
+		}
+	}
+	Vp9Quant(d);
+
+	d->cols = (d->w + 7) >> 3;
+	d->rows = (d->h + 7) >> 3;
+	d->sb_cols = (d->w + 63) >> 6;
+	d->sb_rows = (d->h + 63) >> 6;
+
+	//Tile columns: at least one per 64 superblocks, at most one per 4.
+	d->log2_tile_cols = 0;
+	while (d->sb_cols > (64 << d->log2_tile_cols))
+		d->log2_tile_cols++;
+	max = 0;
+	while ((d->sb_cols >> max) >= 4)
+		max++;
+	if (max)
+		max--;
+	while (max > d->log2_tile_cols)
+	{
+		if (!Vp9Bits(d, 1))
+			break;
+		d->log2_tile_cols++;
+	}
+	d->log2_tile_rows = Vp9Bits(d, 1);
+	if (d->log2_tile_rows)
+		d->log2_tile_rows += Vp9Bits(d, 1);
+
+	d->header_size = Vp9Bits(d, 16);
+	d->uncompressed_size = (d->bit_pos + 7) >> 3;
+	if (d->bit_eof || !d->header_size ||
+		d->uncompressed_size + d->header_size > size)
+	{
+		d->fail = 7;
+		return FALSE;
+	}
+
+	if (d->keyframe || d->errorres || (d->intraonly && d->resetctx == 3))
+		for (i = 0; i < 4; i++)
+			Vp9CtxDefaults(&d->fctx[i]);
+	else if (d->intraonly && d->resetctx == 2)
+		Vp9CtxDefaults(&d->fctx[d->framectxid]);
+
+	if (!Vp9CompressedHeader(d, buf + d->uncompressed_size, d->header_size))
+	{
+		d->fail = 8;
+		return FALSE;
+	}
+
+	return TRUE;
+}
+
+/***** tiles, blocks and coefficients *****/
+
+//Partition contexts written after a block, indexed by block size.
+U8 vp9_above_ctx[13] = {
+	0x0,0x0,0x8,0x8,0x8,0xC,0xC,0xC,0xE,0xE,0xE,0xF,0xF
+};
+
+U8 vp9_left_ctx[13] = {
+	0x0,0x8,0x0,0x8,0xC,0x8,0xC,0xE,0xC,0xE,0xF,0xE,0xF
+};
+
+//Largest transform each block size may use.
+U8 vp9_max_tx[13] = {
+	TX_32X32,TX_32X32,TX_32X32,TX_32X32,TX_16X16,TX_16X16,TX_16X16,
+	TX_8X8,TX_8X8,TX_8X8,TX_4X4,TX_4X4,TX_4X4
+};
+
+//Coefficients per band, per transform size.
+I64 vp9_band_counts[32] = {
+	1,2,3,4,3,3,0,0,
+	1,2,3,4,11,43,0,0,
+	1,2,3,4,11,235,0,0,
+	1,2,3,4,11,1003,0,0
+};
+
+I64 Vp9Tree(CVp8Br *br, I8 *tree, U8 *probs)
+{
+	I64 i = 0;
+
+	while (TRUE)
+	{//Node values index pairs, so the flat table steps by two.
+		i = tree[i * 2 + Vp8Bit(br, probs[i])];
+		if (i <= 0)
+			return -i;
+	}
+}
+
+U16 *Vp9Scan(I64 tx, I64 txtp)
+{//4x4..32x32 by transform type; 32x32 and the lossless walsh have one scan.
+	if (tx == TX_4X4)
+	{
+		if (txtp == DCT_ADST)
+			return vp9_col_scan_4x4;
+		if (txtp == ADST_DCT)
+			return vp9_row_scan_4x4;
+		return vp9_scan_4x4;
+	}
+	if (tx == TX_8X8)
+	{
+		if (txtp == DCT_ADST)
+			return vp9_col_scan_8x8;
+		if (txtp == ADST_DCT)
+			return vp9_row_scan_8x8;
+		return vp9_scan_8x8;
+	}
+	if (tx == TX_16X16)
+	{
+		if (txtp == DCT_ADST)
+			return vp9_col_scan_16x16;
+		if (txtp == ADST_DCT)
+			return vp9_row_scan_16x16;
+		return vp9_scan_16x16;
+	}
+
+	return vp9_scan_32x32;
+}
+
+U16 *Vp9ScanNb(I64 tx, I64 txtp)
+{
+	if (tx == TX_4X4)
+	{
+		if (txtp == DCT_ADST)
+			return vp9_col_nb_4x4;
+		if (txtp == ADST_DCT)
+			return vp9_row_nb_4x4;
+		return vp9_nb_4x4;
+	}
+	if (tx == TX_8X8)
+	{
+		if (txtp == DCT_ADST)
+			return vp9_col_nb_8x8;
+		if (txtp == ADST_DCT)
+			return vp9_row_nb_8x8;
+		return vp9_nb_8x8;
+	}
+	if (tx == TX_16X16)
+	{
+		if (txtp == DCT_ADST)
+			return vp9_col_nb_16x16;
+		if (txtp == ADST_DCT)
+			return vp9_row_nb_16x16;
+		return vp9_nb_16x16;
+	}
+
+	return vp9_nb_32x32;
+}
+
+I64 Vp9CoefBlock(CVp9Dec *d, I16 *coef, I64 n_coeffs, Bool is32, U8 *probs,
+				 I64 nnz, U16 *scan, U16 *nb, I64 *band_counts, I64 *qmul)
+{//One transform block. Returns the end-of-block index; coef holds
+//dequantised values in raster order.
+	CVp8Br	*br = &d->tc;
+	I64		 i = 0, band = 0, band_left = band_counts[0], val, rc, sign;
+	U8		*tp = probs + nnz * 11;
+	U8		*cache = d->cache;
+
+	MemSet(coef, 0, n_coeffs * sizeof(I16));
+	MemSet(cache, 0, n_coeffs);
+	while (TRUE)
+	{
+		if (!Vp8Bit(br, tp[0]))
+			break;
+skip_eob:
+		if (!Vp8Bit(br, tp[1]))
+		{
+			band_left--;
+			if (!band_left)
+			{
+				band++;
+				band_left = band_counts[band];
+			}
+			cache[scan[i]] = 0;
+			//nb is shifted: entry i holds the neighbours of the next token.
+			nnz = (1 + cache[nb[i * 2]] + cache[nb[i * 2 + 1]]) >> 1;
+			tp = probs + (band * 6 + nnz) * 11;
+			i++;
+			if (i == n_coeffs)
+				break;
+			goto skip_eob;
+		}
+
+		rc = scan[i];
+		if (!Vp8Bit(br, tp[2]))
+		{
+			val = 1;
+			cache[rc] = 1;
+		}
+		else if (!Vp8Bit(br, tp[3]))
+		{
+			if (!Vp8Bit(br, tp[4]))
+			{
+				val = 2;
+				cache[rc] = 2;
+			}
+			else
+			{
+				val = 3 + Vp8Bit(br, tp[5]);
+				cache[rc] = 3;
+			}
+		}
+		else if (!Vp8Bit(br, tp[6]))
+		{
+			cache[rc] = 4;
+			if (!Vp8Bit(br, tp[7]))
+				val = Vp8Bit(br, 159) + 5;
+			else
+			{
+				val = (Vp8Bit(br, 165) << 1) + 7;
+				val += Vp8Bit(br, 145);
+			}
+		}
+		else
+		{
+			cache[rc] = 5;
+			if (!Vp8Bit(br, tp[8]))
+			{
+				if (!Vp8Bit(br, tp[9]))
+				{
+					val  = 11 + (Vp8Bit(br, 173) << 2);
+					val += Vp8Bit(br, 148) << 1;
+					val += Vp8Bit(br, 140);
+				}
+				else
+				{
+					val  = 19 + (Vp8Bit(br, 176) << 3);
+					val += Vp8Bit(br, 155) << 2;
+					val += Vp8Bit(br, 140) << 1;
+					val += Vp8Bit(br, 135);
+				}
+			}
+			else if (!Vp8Bit(br, tp[10]))
+			{
+				val  = 35 + (Vp8Bit(br, 180) << 4);
+				val += Vp8Bit(br, 157) << 3;
+				val += Vp8Bit(br, 141) << 2;
+				val += Vp8Bit(br, 134) << 1;
+				val += Vp8Bit(br, 130);
+			}
+			else
+			{
+				val  = 67 + (Vp8Bit(br, 254) << 13);
+				val += Vp8Bit(br, 254) << 12;
+				val += Vp8Bit(br, 254) << 11;
+				val += Vp8Bit(br, 252) << 10;
+				val += Vp8Bit(br, 249) << 9;
+				val += Vp8Bit(br, 243) << 8;
+				val += Vp8Bit(br, 230) << 7;
+				val += Vp8Bit(br, 196) << 6;
+				val += Vp8Bit(br, 177) << 5;
+				val += Vp8Bit(br, 153) << 4;
+				val += Vp8Bit(br, 140) << 3;
+				val += Vp8Bit(br, 133) << 2;
+				val += Vp8Bit(br, 130) << 1;
+				val += Vp8Bit(br, 129);
+			}
+		}
+		band_left--;
+		if (!band_left)
+		{
+			band++;
+			band_left = band_counts[band];
+		}
+		sign = Vp8Bit(br, 128);
+		if (i)
+			val *= qmul[1];
+		else
+			val *= qmul[0];
+		if (is32)
+			val /= 2;
+		if (sign)
+			val = -val;
+		coef[rc] = val;
+		nnz = (1 + cache[nb[i * 2]] + cache[nb[i * 2 + 1]]) >> 1;
+		tp = probs + (band * 6 + nnz) * 11;
+		i++;
+		if (i >= n_coeffs)
+			break;
+	}
+
+	return i;
+}
+
+I64 Vp9AnyNz(U8 *p, I64 n)
+{
+	I64 i;
+
+	for (i = 0; i < n; i++)
+		if (p[i])
+			return 1;
+
+	return 0;
+}
+
+U0 Vp9SetNz(U8 *p, I64 n, I64 v)
+{
+	MemSet(p, v, n);
+}
+
+U0 Vp9DecodeCoeffs(CVp9Dec *d)
+{//Luma then chroma, in transform blocks of the size the mode chose. Blocks are
+//packed in decode order; reconstruction walks them the same way.
+	I64	 w4 = vp9_bwh_tab[26 + d->bs * 2] << 1;
+	I64	 h4 = vp9_bwh_tab[26 + d->bs * 2 + 1] << 1;
+	I64	 end_x = (d->cols - d->col) * 2, end_y = (d->rows - d->row) * 2;
+	I64	 step, n, x, y, pl, txtp, eob, nnz, ncoef, off, sa, sl;
+	I64	*qmul, *bandc;
+	U8	*probs, *a, *l;
+	U16	*scan, *nb;
+
+	if (end_x > w4)
+		end_x = w4;
+	if (end_y > h4)
+		end_y = h4;
+
+	probs = d->coef + ((d->tx * 2) * 2) * 6 * 6 * 11;
+	bandc = vp9_band_counts + d->tx * 8;
+	qmul  = d->seg[d->seg_id].qmul[0];
+	step  = 1 << d->tx;
+	ncoef = 16 << (d->tx * 2);
+	a = d->a_ynnz + d->col * 2;
+	l = d->l_ynnz + d->row7 * 2;
+	n = 0;
+	off = 0;
+	for (y = 0; y < end_y; y += step)
+		for (x = 0; x < end_x; x += step)
+		{
+			if (d->bs > BS_8x8)
+				txtp = vp9_intra_txfm_type[d->mode[n]];
+			else
+				txtp = vp9_intra_txfm_type[d->mode[0]];
+			if (d->lossless)
+			{
+				scan = vp9_scan_4x4;
+				nb   = vp9_nb_4x4;
+			}
+			else
+			{
+				scan = Vp9Scan(d->tx, txtp);
+				nb   = Vp9ScanNb(d->tx, txtp);
+			}
+			sa = step;
+			if (sa > end_x - x)
+				sa = end_x - x;
+			sl = step;
+			if (sl > end_y - y)
+				sl = end_y - y;
+			nnz = Vp9AnyNz(a + x, sa) + Vp9AnyNz(l + y, sl);
+			eob = Vp9CoefBlock(d, d->blk + off, ncoef,
+							   ToBool(d->tx == TX_32X32), probs, nnz, scan, nb,
+							   bandc, qmul);
+			d->eob_y[n] = eob;
+			MemSet(a + x, ToBool(eob), sa);
+			MemSet(l + y, ToBool(eob), sl);
+			off += ncoef;
+			n++;
+		}
+
+	//Chroma, at half resolution in both directions.
+	probs = d->coef + ((d->uvtx * 2 + 1) * 2) * 6 * 6 * 11;
+	bandc = vp9_band_counts + d->uvtx * 8;
+	qmul  = d->seg[d->seg_id].qmul[1];
+	step  = 1 << d->uvtx;
+	ncoef = 16 << (d->uvtx * 2);
+	end_x >>= 1;
+	end_y >>= 1;
+	scan  = Vp9Scan(d->uvtx, DCT_DCT);
+	nb    = Vp9ScanNb(d->uvtx, DCT_DCT);
+	for (pl = 0; pl < 2; pl++)
+	{
+		a = d->a_uvnnz + pl * d->a_cols + d->col;
+		l = d->l_uvnnz + pl * 8 + d->row7;
+		n = 0;
+		off = 4096 + pl * 1024;
+		for (y = 0; y < end_y; y += step)
+			for (x = 0; x < end_x; x += step)
+			{
+				sa = step;
+				if (sa > end_x - x)
+					sa = end_x - x;
+				sl = step;
+				if (sl > end_y - y)
+					sl = end_y - y;
+				nnz = Vp9AnyNz(a + x, sa) + Vp9AnyNz(l + y, sl);
+				eob = Vp9CoefBlock(d, d->blk + off, ncoef,
+								   ToBool(d->uvtx == TX_32X32), probs, nnz,
+								   scan, nb, bandc, qmul);
+				d->eob_uv[pl * 64 + n] = eob;
+				MemSet(a + x, ToBool(eob), sa);
+				MemSet(l + y, ToBool(eob), sl);
+				off += ncoef;
+				n++;
+			}
+	}
+}
+
+U0 Vp9DecodeMode(CVp9Dec *d)
+{//Keyframe and intra-only: segment id, skip, transform size, intra modes.
+	CVp8Br	*br = &d->tc;
+	I64		 bw4 = vp9_bwh_tab[13 * 2 + d->bs * 2];
+	I64		 bh4 = vp9_bwh_tab[13 * 2 + d->bs * 2 + 1];
+	I64		 w4 = bw4, h4 = bh4, max_tx = vp9_max_tx[d->bs];
+	I64		 c, i, y;
+	U8		*a, *l;
+
+	if (d->cols - d->col < w4)
+		w4 = d->cols - d->col;
+	if (d->rows - d->row < h4)
+		h4 = d->rows - d->row;
+
+	d->seg_id = 0;
+	if (d->seg_en && d->seg_update_map)
+		d->seg_id = Vp9Tree(br, vp9_segmentation_tree, d->seg_prob);
+	if (d->seg_en)
+		for (y = 0; y < h4; y++)
+			MemSet(d->seg_map + (d->row + y) * d->cols + d->col, d->seg_id, w4);
+
+	d->skip = FALSE;
+	if (d->seg_en && d->seg[d->seg_id].skip_enabled)
+		d->skip = TRUE;
+	else
+	{
+		c = d->l_skip[d->row7] + d->a_skip[d->col];
+		d->skip = ToBool(Vp8Bit(br, d->skip_p[c]));
+	}
+
+	if (d->txfmmode == TX_SWITCHABLE)
+	{
+		if (d->row)
+		{
+			if (d->col > d->tile_col_start)
+			{
+				c = d->a_tx[d->col];
+				if (d->a_skip[d->col])
+					c = max_tx;
+				i = d->l_tx[d->row7];
+				if (d->l_skip[d->row7])
+					i = max_tx;
+				c = ToBool(c + i > max_tx);
+			}
+			else if (d->a_skip[d->col])
+				c = 1;
+			else
+				c = ToBool(d->a_tx[d->col] * 2 > max_tx);
+		}
+		else if (d->col > d->tile_col_start)
+		{
+			if (d->l_skip[d->row7])
+				c = 1;
+			else
+				c = ToBool(d->l_tx[d->row7] * 2 > max_tx);
+		}
+		else
+			c = 1;
+
+		if (max_tx == TX_32X32)
+		{
+			d->tx = Vp8Bit(br, d->tx32p[c * 3]);
+			if (d->tx)
+			{
+				d->tx += Vp8Bit(br, d->tx32p[c * 3 + 1]);
+				if (d->tx == 2)
+					d->tx += Vp8Bit(br, d->tx32p[c * 3 + 2]);
+			}
+		}
+		else if (max_tx == TX_16X16)
+		{
+			d->tx = Vp8Bit(br, d->tx16p[c * 2]);
+			if (d->tx)
+				d->tx += Vp8Bit(br, d->tx16p[c * 2 + 1]);
+		}
+		else if (max_tx == TX_8X8)
+			d->tx = Vp8Bit(br, d->tx8p[c]);
+		else
+			d->tx = TX_4X4;
+	}
+	else
+	{
+		d->tx = max_tx;
+		if (d->txfmmode < max_tx)
+			d->tx = d->txfmmode;
+	}
+
+	a = d->a_ymode + d->col * 2;
+	l = d->l_ymode + d->row7 * 2;
+	if (d->bs > BS_8x8)
+	{//One mode per 4x4 subblock, each conditioned on its own neighbours.
+		d->mode[0] = Vp9Tree(br, vp9_intramode_tree,
+							 vp9_kf_ymode_probs + (a[0] * 10 + l[0]) * 9);
+		a[0] = d->mode[0];
+		if (d->bs != BS_8x4)
+		{
+			d->mode[1] = Vp9Tree(br, vp9_intramode_tree,
+								 vp9_kf_ymode_probs +
+								 (a[1] * 10 + d->mode[0]) * 9);
+			l[0] = d->mode[1];
+			a[1] = d->mode[1];
+		}
+		else
+		{
+			d->mode[1] = d->mode[0];
+			l[0] = d->mode[0];
+			a[1] = d->mode[0];
+		}
+		if (d->bs != BS_4x8)
+		{
+			d->mode[2] = Vp9Tree(br, vp9_intramode_tree,
+								 vp9_kf_ymode_probs + (a[0] * 10 + l[1]) * 9);
+			a[0] = d->mode[2];
+			if (d->bs != BS_8x4)
+			{
+				d->mode[3] = Vp9Tree(br, vp9_intramode_tree,
+									 vp9_kf_ymode_probs +
+									 (a[1] * 10 + d->mode[2]) * 9);
+				l[1] = d->mode[3];
+				a[1] = d->mode[3];
+			}
+			else
+			{
+				d->mode[3] = d->mode[2];
+				l[1] = d->mode[2];
+				a[1] = d->mode[2];
+			}
+		}
+		else
+		{
+			d->mode[2] = d->mode[0];
+			d->mode[3] = d->mode[1];
+			l[1] = d->mode[1];
+			a[1] = d->mode[1];
+		}
+	}
+	else
+	{
+		d->mode[0] = Vp9Tree(br, vp9_intramode_tree,
+							 vp9_kf_ymode_probs + (a[0] * 10 + l[0]) * 9);
+		d->mode[1] = d->mode[0];
+		d->mode[2] = d->mode[0];
+		d->mode[3] = d->mode[0];
+		MemSet(a, d->mode[0], vp9_bwh_tab[d->bs * 2]);
+		MemSet(l, d->mode[0], vp9_bwh_tab[d->bs * 2 + 1]);
+	}
+	d->uvmode = Vp9Tree(br, vp9_intramode_tree,
+						vp9_kf_uvmode_probs + d->mode[3] * 9);
+
+	MemSet(d->a_skip + d->col, d->skip, bw4);
+	MemSet(d->l_skip + d->row7, d->skip, bh4);
+	MemSet(d->a_tx + d->col, d->tx, bw4);
+	MemSet(d->l_tx + d->row7, d->tx, bh4);
+	MemSet(d->a_part + d->col, vp9_above_ctx[d->bs], bw4);
+	MemSet(d->l_part + d->row7, vp9_left_ctx[d->bs], bh4);
+}
+
+/***** intra prediction *****/
+//
+//Mirrors libavcodec/vp9dsp_template.c. Edge arrays follow its convention: a[-1]
+//is the corner, a[0..] the row above; l holds the left column bottom-first,
+//except HOR_UP which wants it top-first.
+
+#define VP9_VERT		0
+#define VP9_HOR			1
+#define VP9_DC			2
+#define VP9_D45			3
+#define VP9_D135		4
+#define VP9_D117		5
+#define VP9_D153		6
+#define VP9_D63			7
+#define VP9_D207		8
+#define VP9_TM			9
+#define VP9_LEFT_DC		10
+#define VP9_TOP_DC		11
+#define VP9_DC128		12
+#define VP9_DC127		13
+#define VP9_DC129		14
+
+//[mode][have_left][have_top]: the mode an unavailable edge falls back to.
+U8 vp9_mode_conv[40] = {
+	13,0,13,0,			//VERT
+	14,14,1,1,			//HOR
+	12,11,10,2,			//DC
+	13,3,13,3,			//D45
+	4,4,4,4,			//D135
+	5,5,5,5,			//D117
+	6,6,6,6,			//D153
+	13,7,13,7,			//D63
+	14,14,8,8,			//D207
+	14,0,1,9			//TM
+};
+
+//Bit 0 left, 1 top, 2 top-left, 3 top-right, 4 left is top-first.
+U8 vp9_edge_need[15] = {
+	2,1,3,10,7,7,7,10,17,7,1,2,0,0,0
+};
+
+U0 Vp9PredDC(U8 *dst, I64 stride, I64 size, U8 *a, U8 *l, I64 which)
+{//which: 0 both, 1 left only, 2 top only.
+	I64 i, j, sum = 0, n = 0, dc;
+
+	if (which != 1)
+		for (i = 0; i < size; i++)
+			sum += a[i];
+	if (which != 2)
+		for (i = 0; i < size; i++)
+			sum += l[i];
+	n = size;
+	if (!which)
+		n = size * 2;
+	dc = (sum + n / 2) / n;
+	for (j = 0; j < size; j++)
+		MemSet(dst + j * stride, dc, size);
+}
+
+U0 Vp9PredFill(U8 *dst, I64 stride, I64 size, I64 v)
+{
+	I64 j;
+
+	for (j = 0; j < size; j++)
+		MemSet(dst + j * stride, v, size);
+}
+
+U8 Vp9Clip8(I64 v)
+{
+	if (v < 0)
+		return 0;
+	if (v > 255)
+		return 255;
+
+	return v;
+}
+
+U0 Vp9PredTM(U8 *dst, I64 stride, I64 size, U8 *a, U8 *l)
+{
+	I64 x, y, tl = a[-1];
+
+	for (y = 0; y < size; y++)
+		for (x = 0; x < size; x++)
+			dst[y * stride + x] = Vp9Clip8(l[size - 1 - y] + a[x] - tl);
+}
+
+U0 Vp9PredVert(U8 *dst, I64 stride, I64 size, U8 *a)
+{
+	I64 y;
+
+	for (y = 0; y < size; y++)
+		MemCopy(dst + y * stride, a, size);
+}
+
+U0 Vp9PredHor(U8 *dst, I64 stride, I64 size, U8 *l)
+{
+	I64 y;
+
+	for (y = 0; y < size; y++)
+		MemSet(dst + y * stride, l[size - 1 - y], size);
+}
+
+I64 Vp9Avg2(I64 a, I64 b)
+{
+	return (a + b + 1) >> 1;
+}
+
+I64 Vp9Avg3(I64 a, I64 b, I64 c)
+{
+	return (a + b * 2 + c + 2) >> 2;
+}
+
+U0 Vp9PredD45(U8 *dst, I64 stride, I64 size, U8 *a)
+{
+	I64	 i, j, n;
+	U8	 v[32];
+
+	if (size == 4)
+	{//The 4x4 case reads the top-right run and ends on a[7].
+		dst[0] = Vp9Avg3(a[0], a[1], a[2]);
+		dst[1] = Vp9Avg3(a[1], a[2], a[3]);
+		dst[stride] = dst[1];
+		dst[2] = Vp9Avg3(a[2], a[3], a[4]);
+		dst[stride + 1] = dst[2];
+		dst[2 * stride] = dst[2];
+		dst[3] = Vp9Avg3(a[3], a[4], a[5]);
+		dst[stride + 2] = dst[3];
+		dst[2 * stride + 1] = dst[3];
+		dst[3 * stride] = dst[3];
+		dst[stride + 3] = Vp9Avg3(a[4], a[5], a[6]);
+		dst[2 * stride + 2] = dst[stride + 3];
+		dst[3 * stride + 1] = dst[stride + 3];
+		dst[2 * stride + 3] = Vp9Avg3(a[5], a[6], a[7]);
+		dst[3 * stride + 2] = dst[2 * stride + 3];
+		dst[3 * stride + 3] = a[7];
+		return;
+	}
+	for (i = 0; i < size - 2; i++)
+		v[i] = Vp9Avg3(a[i], a[i + 1], a[i + 2]);
+	v[size - 2] = (a[size - 2] + a[size - 1] * 3 + 2) >> 2;
+	for (j = 0; j < size; j++)
+	{
+		n = size - 1 - j;
+		MemCopy(dst + j * stride, v + j, n);
+		MemSet(dst + j * stride + n, a[size - 1], j + 1);
+	}
+}
+
+U0 Vp9PredD135(U8 *dst, I64 stride, I64 size, U8 *a, U8 *l)
+{
+	I64	 i, j;
+	U8	 v[64];
+
+	for (i = 0; i < size - 2; i++)
+	{
+		v[i]            = Vp9Avg3(l[i], l[i + 1], l[i + 2]);
+		v[size + 1 + i] = Vp9Avg3(a[i], a[i + 1], a[i + 2]);
+	}
+	v[size - 2] = Vp9Avg3(l[size - 2], l[size - 1], a[-1]);
+	v[size - 1] = Vp9Avg3(l[size - 1], a[-1], a[0]);
+	v[size]     = Vp9Avg3(a[-1], a[0], a[1]);
+	for (j = 0; j < size; j++)
+		MemCopy(dst + j * stride, v + size - 1 - j, size);
+}
+
+U0 Vp9PredD117(U8 *dst, I64 stride, I64 size, U8 *a, U8 *l)
+{
+	I64	 i, j, h = size / 2;
+	U8	 ve[48], vo[48];
+
+	for (i = 0; i < h - 2; i++)
+	{
+		vo[i] = Vp9Avg3(l[i * 2 + 3], l[i * 2 + 2], l[i * 2 + 1]);
+		ve[i] = Vp9Avg3(l[i * 2 + 4], l[i * 2 + 3], l[i * 2 + 2]);
+	}
+	vo[h - 2] = Vp9Avg3(l[size - 1], l[size - 2], l[size - 3]);
+	ve[h - 2] = Vp9Avg3(a[-1], l[size - 1], l[size - 2]);
+	ve[h - 1] = Vp9Avg2(a[-1], a[0]);
+	vo[h - 1] = Vp9Avg3(l[size - 1], a[-1], a[0]);
+	for (i = 0; i < size - 1; i++)
+	{
+		ve[h + i] = Vp9Avg2(a[i], a[i + 1]);
+		vo[h + i] = Vp9Avg3(a[i - 1], a[i], a[i + 1]);
+	}
+	for (j = 0; j < h; j++)
+	{
+		MemCopy(dst + j * 2 * stride, ve + h - 1 - j, size);
+		MemCopy(dst + (j * 2 + 1) * stride, vo + h - 1 - j, size);
+	}
+}
+
+U0 Vp9PredD153(U8 *dst, I64 stride, I64 size, U8 *a, U8 *l)
+{
+	I64	 i, j;
+	U8	 v[96];
+
+	for (i = 0; i < size - 2; i++)
+	{
+		v[i * 2]         = Vp9Avg2(l[i + 1], l[i]);
+		v[i * 2 + 1]     = Vp9Avg3(l[i + 2], l[i + 1], l[i]);
+		v[size * 2 + i]  = Vp9Avg3(a[i - 1], a[i], a[i + 1]);
+	}
+	v[size * 2 - 2] = Vp9Avg2(a[-1], l[size - 1]);
+	v[size * 2 - 4] = Vp9Avg2(l[size - 1], l[size - 2]);
+	v[size * 2 - 1] = Vp9Avg3(a[0], a[-1], l[size - 1]);
+	v[size * 2 - 3] = Vp9Avg3(a[-1], l[size - 1], l[size - 2]);
+	for (j = 0; j < size; j++)
+		MemCopy(dst + j * stride, v + size * 2 - 2 - j * 2, size);
+}
+
+U0 Vp9PredD63(U8 *dst, I64 stride, I64 size, U8 *a)
+{
+	I64	 i, j, n;
+	U8	 ve[32], vo[32];
+
+	if (size == 4)
+	{
+		dst[0]                = Vp9Avg2(a[0], a[1]);
+		dst[stride]           = Vp9Avg3(a[0], a[1], a[2]);
+		dst[1]                = Vp9Avg2(a[1], a[2]);
+		dst[2 * stride]       = dst[1];
+		dst[stride + 1]       = Vp9Avg3(a[1], a[2], a[3]);
+		dst[3 * stride]       = dst[stride + 1];
+		dst[2]                = Vp9Avg2(a[2], a[3]);
+		dst[2 * stride + 1]   = dst[2];
+		dst[stride + 2]       = Vp9Avg3(a[2], a[3], a[4]);
+		dst[3 * stride + 1]   = dst[stride + 2];
+		dst[3]                = Vp9Avg2(a[3], a[4]);
+		dst[2 * stride + 2]   = dst[3];
+		dst[stride + 3]       = Vp9Avg3(a[3], a[4], a[5]);
+		dst[3 * stride + 2]   = dst[stride + 3];
+		dst[2 * stride + 3]   = Vp9Avg2(a[4], a[5]);
+		dst[3 * stride + 3]   = Vp9Avg3(a[4], a[5], a[6]);
+		return;
+	}
+	for (i = 0; i < size - 2; i++)
+	{
+		ve[i] = Vp9Avg2(a[i], a[i + 1]);
+		vo[i] = Vp9Avg3(a[i], a[i + 1], a[i + 2]);
+	}
+	ve[size - 2] = Vp9Avg2(a[size - 2], a[size - 1]);
+	vo[size - 2] = (a[size - 2] + a[size - 1] * 3 + 2) >> 2;
+	for (j = 0; j < size / 2; j++)
+	{
+		n = size - j - 1;
+		MemCopy(dst + j * 2 * stride, ve + j, n);
+		MemSet(dst + j * 2 * stride + n, a[size - 1], j + 1);
+		MemCopy(dst + (j * 2 + 1) * stride, vo + j, n);
+		MemSet(dst + (j * 2 + 1) * stride + n, a[size - 1], j + 1);
+	}
+}
+
+U0 Vp9PredD207(U8 *dst, I64 stride, I64 size, U8 *l)
+{//l is top-first here.
+	I64	 i, j, n;
+	U8	 v[64];
+
+	if (size == 4)
+	{
+		dst[0] = Vp9Avg2(l[0], l[1]);
+		dst[1] = Vp9Avg3(l[0], l[1], l[2]);
+		dst[stride] = Vp9Avg2(l[1], l[2]);
+		dst[2] = dst[stride];
+		dst[stride + 1] = Vp9Avg3(l[1], l[2], l[3]);
+		dst[3] = dst[stride + 1];
+		dst[2 * stride] = Vp9Avg2(l[2], l[3]);
+		dst[stride + 2] = dst[2 * stride];
+		dst[2 * stride + 1] = (l[2] + l[3] * 3 + 2) >> 2;
+		dst[stride + 3] = dst[2 * stride + 1];
+		dst[2 * stride + 2] = l[3];
+		dst[2 * stride + 3] = l[3];
+		dst[3 * stride] = l[3];
+		dst[3 * stride + 1] = l[3];
+		dst[3 * stride + 2] = l[3];
+		dst[3 * stride + 3] = l[3];
+		return;
+	}
+	for (i = 0; i < size - 2; i++)
+	{
+		v[i * 2]     = Vp9Avg2(l[i], l[i + 1]);
+		v[i * 2 + 1] = Vp9Avg3(l[i], l[i + 1], l[i + 2]);
+	}
+	v[size * 2 - 4] = Vp9Avg2(l[size - 2], l[size - 1]);
+	v[size * 2 - 3] = (l[size - 2] + l[size - 1] * 3 + 2) >> 2;
+	for (j = 0; j < size / 2; j++)
+		MemCopy(dst + j * stride, v + j * 2, size);
+	for (j = size / 2; j < size; j++)
+	{
+		n = size * 2 - 2 - j * 2;
+		MemCopy(dst + j * stride, v + j * 2, n);
+		MemSet(dst + j * stride + n, l[size - 1], 2 + j * 2 - size);
+	}
+}
+
+U0 Vp9IntraPred(U8 *dst, I64 stride, I64 mode, I64 size, U8 *a, U8 *l)
+{
+	switch (mode)
+	{
+		case VP9_VERT:		Vp9PredVert(dst, stride, size, a);		break;
+		case VP9_HOR:		Vp9PredHor(dst, stride, size, l);		break;
+		case VP9_DC:		Vp9PredDC(dst, stride, size, a, l, 0);	break;
+		case VP9_LEFT_DC:	Vp9PredDC(dst, stride, size, a, l, 1);	break;
+		case VP9_TOP_DC:	Vp9PredDC(dst, stride, size, a, l, 2);	break;
+		case VP9_DC128:		Vp9PredFill(dst, stride, size, 128);	break;
+		case VP9_DC127:		Vp9PredFill(dst, stride, size, 127);	break;
+		case VP9_DC129:		Vp9PredFill(dst, stride, size, 129);	break;
+		case VP9_D45:		Vp9PredD45(dst, stride, size, a);		break;
+		case VP9_D135:		Vp9PredD135(dst, stride, size, a, l);	break;
+		case VP9_D117:		Vp9PredD117(dst, stride, size, a, l);	break;
+		case VP9_D153:		Vp9PredD153(dst, stride, size, a, l);	break;
+		case VP9_D63:		Vp9PredD63(dst, stride, size, a);		break;
+		case VP9_D207:		Vp9PredD207(dst, stride, size, l);		break;
+		case VP9_TM:		Vp9PredTM(dst, stride, size, a, l);		break;
+	}
+}
+
+//Inverse transforms, extracted from ffmpeg's vp9dsp_template.c by
+//utils/vp9txfm.py. Do not edit.
+
+U0 Vp9Idct4(I64 *in, I64 stride, I64 *out)
+{
+	I64 t0, t1, t2, t3;
+	t0 = ((in[0 * stride] + in[2 * stride]) * 11585 + (1 << 13)) >> 14;
+	t1 = ((in[0 * stride] - in[2 * stride]) * 11585 + (1 << 13)) >> 14;
+	t2 = (in[1 * stride] *  6270 - in[3 * stride] * 15137 + (1 << 13)) >> 14;
+	t3 = (in[1 * stride] * 15137 + in[3 * stride] *  6270 + (1 << 13)) >> 14;
+	out[0] = t0 + t3;
+	out[1] = t1 + t2;
+	out[2] = t1 - t2;
+	out[3] = t0 - t3;
+}
+
+U0 Vp9Iadst4(I64 *in, I64 stride, I64 *out)
+{
+	I64 t0, t1, t2, t3;
+	t0 =  5283 * in[0 * stride] + 15212 * in[2 * stride] +  9929 * in[3 * stride];
+	t1 =  9929 * in[0 * stride] -  5283 * in[2 * stride] - 15212 * in[3 * stride];
+	t2 = 13377 * (in[0 * stride] - in[2 * stride] + in[3 * stride]);
+	t3 = 13377 * in[1 * stride];
+	out[0] = (t0 + t3	  + (1 << 13)) >> 14;
+	out[1] = (t1 + t3	  + (1 << 13)) >> 14;
+	out[2] = (t2		   + (1 << 13)) >> 14;
+	out[3] = (t0 + t1 - t3 + (1 << 13)) >> 14;
+}
+
+U0 Vp9Idct8(I64 *in, I64 stride, I64 *out)
+{
+	I64 t0, t0a, t1, t1a, t2, t2a, t3, t3a, t4, t4a, t5, t5a, t6, t6a, t7, t7a;
+	t0a = ((in[0 * stride] + in[4 * stride]) * 11585 + (1 << 13)) >> 14;
+	t1a = ((in[0 * stride] - in[4 * stride]) * 11585 + (1 << 13)) >> 14;
+	t2a = (in[2 * stride] *  6270 - in[6 * stride] * 15137 + (1 << 13)) >> 14;
+	t3a = (in[2 * stride] * 15137 + in[6 * stride] *  6270 + (1 << 13)) >> 14;
+	t4a = (in[1 * stride] *  3196 - in[7 * stride] * 16069 + (1 << 13)) >> 14;
+	t5a = (in[5 * stride] * 13623 - in[3 * stride] *  9102 + (1 << 13)) >> 14;
+	t6a = (in[5 * stride] *  9102 + in[3 * stride] * 13623 + (1 << 13)) >> 14;
+	t7a = (in[1 * stride] * 16069 + in[7 * stride] *  3196 + (1 << 13)) >> 14;
+	t0  = t0a + t3a;
+	t1  = t1a + t2a;
+	t2  = t1a - t2a;
+	t3  = t0a - t3a;
+	t4  = t4a + t5a;
+	t5a = t4a - t5a;
+	t7  = t7a + t6a;
+	t6a = t7a - t6a;
+	t5  = ((t6a - t5a) * 11585 + (1 << 13)) >> 14;
+	t6  = ((t6a + t5a) * 11585 + (1 << 13)) >> 14;
+	out[0] = t0 + t7;
+	out[1] = t1 + t6;
+	out[2] = t2 + t5;
+	out[3] = t3 + t4;
+	out[4] = t3 - t4;
+	out[5] = t2 - t5;
+	out[6] = t1 - t6;
+	out[7] = t0 - t7;
+}
+
+U0 Vp9Iadst8(I64 *in, I64 stride, I64 *out)
+{
+	I64 t0, t0a, t1, t1a, t2, t2a, t3, t3a, t4, t4a, t5, t5a, t6, t6a, t7, t7a;
+	t0a = 16305 * in[7 * stride] +  1606 * in[0 * stride];
+	t1a =  1606 * in[7 * stride] - 16305 * in[0 * stride];
+	t2a = 14449 * in[5 * stride] +  7723 * in[2 * stride];
+	t3a =  7723 * in[5 * stride] - 14449 * in[2 * stride];
+	t4a = 10394 * in[3 * stride] + 12665 * in[4 * stride];
+	t5a = 12665 * in[3 * stride] - 10394 * in[4 * stride];
+	t6a =  4756 * in[1 * stride] + 15679 * in[6 * stride];
+	t7a = 15679 * in[1 * stride] -  4756 * in[6 * stride];
+	t0 = (t0a + t4a + (1 << 13)) >> 14;
+	t1 = (t1a + t5a + (1 << 13)) >> 14;
+	t2 = (t2a + t6a + (1 << 13)) >> 14;
+	t3 = (t3a + t7a + (1 << 13)) >> 14;
+	t4 = (t0a - t4a + (1 << 13)) >> 14;
+	t5 = (t1a - t5a + (1 << 13)) >> 14;
+	t6 = (t2a - t6a + (1 << 13)) >> 14;
+	t7 = (t3a - t7a + (1 << 13)) >> 14;
+	t4a = 15137 * t4 +  6270 * t5;
+	t5a =  6270 * t4 - 15137 * t5;
+	t6a = 15137 * t7 -  6270 * t6;
+	t7a =  6270 * t7 + 15137 * t6;
+	out[0] =   t0 + t2;
+	out[7] = -(t1 + t3);
+	t2	 =   t0 - t2;
+	t3	 =   t1 - t3;
+	out[1] = -(((1 << 13) + t4a + t6a) >> 14);
+	out[6] =   ((1 << 13) + t5a + t7a) >> 14;
+	t6	 =   ((1 << 13) + t4a - t6a) >> 14;
+	t7	 =   ((1 << 13) + t5a - t7a) >> 14;
+	out[3] = -(((t2 + t3) * 11585 + (1 << 13)) >> 14);
+	out[4] =   ((t2 - t3) * 11585 + (1 << 13)) >> 14;
+	out[2] =   ((t6 + t7) * 11585 + (1 << 13)) >> 14;
+	out[5] = -(((t6 - t7) * 11585 + (1 << 13)) >> 14);
+}
+
+U0 Vp9Idct16(I64 *in, I64 stride, I64 *out)
+{
+	I64 t0, t1, t2, t3, t4, t5, t6, t7, t8, t9, t10, t11, t12, t13, t14, t15;
+	I64 t0a, t1a, t2a, t3a, t4a, t5a, t6a, t7a;
+	I64 t8a, t9a, t10a, t11a, t12a, t13a, t14a, t15a;
+	t0a  = ((in[0 * stride] + in[8 * stride]) * 11585 + (1 << 13)) >> 14;
+	t1a  = ((in[0 * stride] - in[8 * stride]) * 11585 + (1 << 13)) >> 14;
+	t2a  = (in[4 * stride]  *  6270 - in[12 * stride] * 15137 + (1 << 13)) >> 14;
+	t3a  = (in[4 * stride]  * 15137 + in[12 * stride] *  6270 + (1 << 13)) >> 14;
+	t4a  = (in[2 * stride]  *  3196 - in[14 * stride] * 16069 + (1 << 13)) >> 14;
+	t7a  = (in[2 * stride]  * 16069 + in[14 * stride] *  3196 + (1 << 13)) >> 14;
+	t5a  = (in[10 * stride] * 13623 - in[6 * stride]  *  9102 + (1 << 13)) >> 14;
+	t6a  = (in[10 * stride] *  9102 + in[6 * stride]  * 13623 + (1 << 13)) >> 14;
+	t8a  = (in[1 * stride]  *  1606 - in[15 * stride] * 16305 + (1 << 13)) >> 14;
+	t15a = (in[1 * stride]  * 16305 + in[15 * stride] *  1606 + (1 << 13)) >> 14;
+	t9a  = (in[9 * stride]  * 12665 - in[7 * stride]  * 10394 + (1 << 13)) >> 14;
+	t14a = (in[9 * stride]  * 10394 + in[7 * stride]  * 12665 + (1 << 13)) >> 14;
+	t10a = (in[5 * stride]  *  7723 - in[11 * stride] * 14449 + (1 << 13)) >> 14;
+	t13a = (in[5 * stride]  * 14449 + in[11 * stride] *  7723 + (1 << 13)) >> 14;
+	t11a = (in[13 * stride] * 15679 - in[3 * stride]  *  4756 + (1 << 13)) >> 14;
+	t12a = (in[13 * stride] *  4756 + in[3 * stride]  * 15679 + (1 << 13)) >> 14;
+	t0  = t0a  + t3a;
+	t1  = t1a  + t2a;
+	t2  = t1a  - t2a;
+	t3  = t0a  - t3a;
+	t4  = t4a  + t5a;
+	t5  = t4a  - t5a;
+	t6  = t7a  - t6a;
+	t7  = t7a  + t6a;
+	t8  = t8a  + t9a;
+	t9  = t8a  - t9a;
+	t10 = t11a - t10a;
+	t11 = t11a + t10a;
+	t12 = t12a + t13a;
+	t13 = t12a - t13a;
+	t14 = t15a - t14a;
+	t15 = t15a + t14a;
+	t5a  = ((t6 - t5) * 11585 + (1 << 13)) >> 14;
+	t6a  = ((t6 + t5) * 11585 + (1 << 13)) >> 14;
+	t9a  = (  t14 *  6270 - t9  * 15137  + (1 << 13)) >> 14;
+	t14a = (  t14 * 15137 + t9  *  6270  + (1 << 13)) >> 14;
+	t10a = (-(t13 * 15137 + t10 *  6270) + (1 << 13)) >> 14;
+	t13a = (  t13 *  6270 - t10 * 15137  + (1 << 13)) >> 14;
+	t0a  = t0   + t7;
+	t1a  = t1   + t6a;
+	t2a  = t2   + t5a;
+	t3a  = t3   + t4;
+	t4   = t3   - t4;
+	t5   = t2   - t5a;
+	t6   = t1   - t6a;
+	t7   = t0   - t7;
+	t8a  = t8   + t11;
+	t9   = t9a  + t10a;
+	t10  = t9a  - t10a;
+	t11a = t8   - t11;
+	t12a = t15  - t12;
+	t13  = t14a - t13a;
+	t14  = t14a + t13a;
+	t15a = t15  + t12;
+	t10a = ((t13  - t10)  * 11585 + (1 << 13)) >> 14;
+	t13a = ((t13  + t10)  * 11585 + (1 << 13)) >> 14;
+	t11  = ((t12a - t11a) * 11585 + (1 << 13)) >> 14;
+	t12  = ((t12a + t11a) * 11585 + (1 << 13)) >> 14;
+	out[ 0] = t0a + t15a;
+	out[ 1] = t1a + t14;
+	out[ 2] = t2a + t13a;
+	out[ 3] = t3a + t12;
+	out[ 4] = t4  + t11;
+	out[ 5] = t5  + t10a;
+	out[ 6] = t6  + t9;
+	out[ 7] = t7  + t8a;
+	out[ 8] = t7  - t8a;
+	out[ 9] = t6  - t9;
+	out[10] = t5  - t10a;
+	out[11] = t4  - t11;
+	out[12] = t3a - t12;
+	out[13] = t2a - t13a;
+	out[14] = t1a - t14;
+	out[15] = t0a - t15a;
+}
+
+U0 Vp9Iadst16(I64 *in, I64 stride, I64 *out)
+{
+	I64 t0, t1, t2, t3, t4, t5, t6, t7, t8, t9, t10, t11, t12, t13, t14, t15;
+	I64 t0a, t1a, t2a, t3a, t4a, t5a, t6a, t7a;
+	I64 t8a, t9a, t10a, t11a, t12a, t13a, t14a, t15a;
+	t0  = in[15 * stride] * 16364 + in[0 * stride]  *   804;
+	t1  = in[15 * stride] *   804 - in[0 * stride]  * 16364;
+	t2  = in[13 * stride] * 15893 + in[2 * stride]  *  3981;
+	t3  = in[13 * stride] *  3981 - in[2 * stride]  * 15893;
+	t4  = in[11 * stride] * 14811 + in[4 * stride]  *  7005;
+	t5  = in[11 * stride] *  7005 - in[4 * stride]  * 14811;
+	t6  = in[9 * stride]  * 13160 + in[6 * stride]  *  9760;
+	t7  = in[9 * stride]  *  9760 - in[6 * stride]  * 13160;
+	t8  = in[7 * stride]  * 11003 + in[8 * stride]  * 12140;
+	t9  = in[7 * stride]  * 12140 - in[8 * stride]  * 11003;
+	t10 = in[5 * stride]  *  8423 + in[10 * stride] * 14053;
+	t11 = in[5 * stride]  * 14053 - in[10 * stride] *  8423;
+	t12 = in[3 * stride]  *  5520 + in[12 * stride] * 15426;
+	t13 = in[3 * stride]  * 15426 - in[12 * stride] *  5520;
+	t14 = in[1 * stride]  *  2404 + in[14 * stride] * 16207;
+	t15 = in[1 * stride]  * 16207 - in[14 * stride] *  2404;
+	t0a  = ((1 << 13) + t0 + t8 ) >> 14;
+	t1a  = ((1 << 13) + t1 + t9 ) >> 14;
+	t2a  = ((1 << 13) + t2 + t10) >> 14;
+	t3a  = ((1 << 13) + t3 + t11) >> 14;
+	t4a  = ((1 << 13) + t4 + t12) >> 14;
+	t5a  = ((1 << 13) + t5 + t13) >> 14;
+	t6a  = ((1 << 13) + t6 + t14) >> 14;
+	t7a  = ((1 << 13) + t7 + t15) >> 14;
+	t8a  = ((1 << 13) + t0 - t8 ) >> 14;
+	t9a  = ((1 << 13) + t1 - t9 ) >> 14;
+	t10a = ((1 << 13) + t2 - t10) >> 14;
+	t11a = ((1 << 13) + t3 - t11) >> 14;
+	t12a = ((1 << 13) + t4 - t12) >> 14;
+	t13a = ((1 << 13) + t5 - t13) >> 14;
+	t14a = ((1 << 13) + t6 - t14) >> 14;
+	t15a = ((1 << 13) + t7 - t15) >> 14;
+	t8   = t8a  * 16069 + t9a  *  3196;
+	t9   = t8a  *  3196 - t9a  * 16069;
+	t10  = t10a *  9102 + t11a * 13623;
+	t11  = t10a * 13623 - t11a *  9102;
+	t12  = t13a * 16069 - t12a *  3196;
+	t13  = t13a *  3196 + t12a * 16069;
+	t14  = t15a *  9102 - t14a * 13623;
+	t15  = t15a * 13623 + t14a *  9102;
+	t0   = t0a + t4a;
+	t1   = t1a + t5a;
+	t2   = t2a + t6a;
+	t3   = t3a + t7a;
+	t4   = t0a - t4a;
+	t5   = t1a - t5a;
+	t6   = t2a - t6a;
+	t7   = t3a - t7a;
+	t8a  = ((1 << 13) + t8  + t12) >> 14;
+	t9a  = ((1 << 13) + t9  + t13) >> 14;
+	t10a = ((1 << 13) + t10 + t14) >> 14;
+	t11a = ((1 << 13) + t11 + t15) >> 14;
+	t12a = ((1 << 13) + t8  - t12) >> 14;
+	t13a = ((1 << 13) + t9  - t13) >> 14;
+	t14a = ((1 << 13) + t10 - t14) >> 14;
+	t15a = ((1 << 13) + t11 - t15) >> 14;
+	t4a  = t4 * 15137 + t5 *  6270;
+	t5a  = t4 *  6270 - t5 * 15137;
+	t6a  = t7 * 15137 - t6 *  6270;
+	t7a  = t7 *  6270 + t6 * 15137;
+	t12  = t12a * 15137 + t13a *  6270;
+	t13  = t12a *  6270 - t13a * 15137;
+	t14  = t15a * 15137 - t14a *  6270;
+	t15  = t15a *  6270 + t14a * 15137;
+	out[ 0] =   t0 + t2;
+	out[15] = -(t1 + t3);
+	t2a	 =   t0 - t2;
+	t3a	 =   t1 - t3;
+	out[ 3] = -(((1 << 13) + t4a + t6a) >> 14);
+	out[12] =   ((1 << 13) + t5a + t7a) >> 14;
+	t6	  =   ((1 << 13) + t4a - t6a) >> 14;
+	t7	  =   ((1 << 13) + t5a - t7a) >> 14;
+	out[ 1] = -(t8a + t10a);
+	out[14] =   t9a + t11a;
+	t10	 =   t8a - t10a;
+	t11	 =   t9a - t11a;
+	out[ 2] =   ((1 << 13) + t12 + t14) >> 14;
+	out[13] = -(((1 << 13) + t13 + t15) >> 14);
+	t14a	=   ((1 << 13) + t12 - t14) >> 14;
+	t15a	=   ((1 << 13) + t13 - t15) >> 14;
+	out[ 7] = (-(t2a  + t3a)  * 11585  + (1 << 13)) >> 14;
+	out[ 8] = ( (t2a  - t3a)  * 11585  + (1 << 13)) >> 14;
+	out[ 4] = ( (t7   + t6)   * 11585  + (1 << 13)) >> 14;
+	out[11] = ( (t7   - t6)   * 11585  + (1 << 13)) >> 14;
+	out[ 6] = ( (t11  + t10)  * 11585  + (1 << 13)) >> 14;
+	out[ 9] = ( (t11  - t10)  * 11585  + (1 << 13)) >> 14;
+	out[ 5] = (-(t14a + t15a) * 11585  + (1 << 13)) >> 14;
+	out[10] = ( (t14a - t15a) * 11585  + (1 << 13)) >> 14;
+}
+
+U0 Vp9Idct32(I64 *in, I64 stride, I64 *out)
+{
+	I64 t0a  = ((in[0 * stride] + in[16 * stride]) * 11585		 + (1 << 13)) >> 14;
+	I64 t1a  = ((in[0 * stride] - in[16 * stride]) * 11585		 + (1 << 13)) >> 14;
+	I64 t2a  = (in[8 * stride] *  6270 - in[24 * stride] * 15137 + (1 << 13)) >> 14;
+	I64 t3a  = (in[8 * stride] * 15137 + in[24 * stride] *  6270 + (1 << 13)) >> 14;
+	I64 t4a  = (in[4 * stride] *  3196 - in[28 * stride] * 16069 + (1 << 13)) >> 14;
+	I64 t7a  = (in[4 * stride] * 16069 + in[28 * stride] *  3196 + (1 << 13)) >> 14;
+	I64 t5a  = (in[20 * stride] * 13623 - in[12 * stride] *  9102 + (1 << 13)) >> 14;
+	I64 t6a  = (in[20 * stride] *  9102 + in[12 * stride] * 13623 + (1 << 13)) >> 14;
+	I64 t8a  = (in[2 * stride] *  1606 - in[30 * stride] * 16305 + (1 << 13)) >> 14;
+	I64 t15a = (in[2 * stride] * 16305 + in[30 * stride] *  1606 + (1 << 13)) >> 14;
+	I64 t9a  = (in[18 * stride] * 12665 - in[14 * stride] * 10394 + (1 << 13)) >> 14;
+	I64 t14a = (in[18 * stride] * 10394 + in[14 * stride] * 12665 + (1 << 13)) >> 14;
+	I64 t10a = (in[10 * stride] *  7723 - in[22 * stride] * 14449 + (1 << 13)) >> 14;
+	I64 t13a = (in[10 * stride] * 14449 + in[22 * stride] *  7723 + (1 << 13)) >> 14;
+	I64 t11a = (in[26 * stride] * 15679 - in[6 * stride] *  4756 + (1 << 13)) >> 14;
+	I64 t12a = (in[26 * stride] *  4756 + in[6 * stride] * 15679 + (1 << 13)) >> 14;
+	I64 t16a = (in[1 * stride] *   804 - in[31 * stride] * 16364 + (1 << 13)) >> 14;
+	I64 t31a = (in[1 * stride] * 16364 + in[31 * stride] *   804 + (1 << 13)) >> 14;
+	I64 t17a = (in[17 * stride] * 12140 - in[15 * stride] * 11003 + (1 << 13)) >> 14;
+	I64 t30a = (in[17 * stride] * 11003 + in[15 * stride] * 12140 + (1 << 13)) >> 14;
+	I64 t18a = (in[9 * stride] *  7005 - in[23 * stride] * 14811 + (1 << 13)) >> 14;
+	I64 t29a = (in[9 * stride] * 14811 + in[23 * stride] *  7005 + (1 << 13)) >> 14;
+	I64 t19a = (in[25 * stride] * 15426 - in[7 * stride] *  5520 + (1 << 13)) >> 14;
+	I64 t28a = (in[25 * stride] *  5520 + in[7 * stride] * 15426 + (1 << 13)) >> 14;
+	I64 t20a = (in[5 * stride] *  3981 - in[27 * stride] * 15893 + (1 << 13)) >> 14;
+	I64 t27a = (in[5 * stride] * 15893 + in[27 * stride] *  3981 + (1 << 13)) >> 14;
+	I64 t21a = (in[21 * stride] * 14053 - in[11 * stride] *  8423 + (1 << 13)) >> 14;
+	I64 t26a = (in[21 * stride] *  8423 + in[11 * stride] * 14053 + (1 << 13)) >> 14;
+	I64 t22a = (in[13 * stride] *  9760 - in[19 * stride] * 13160 + (1 << 13)) >> 14;
+	I64 t25a = (in[13 * stride] * 13160 + in[19 * stride] *  9760 + (1 << 13)) >> 14;
+	I64 t23a = (in[29 * stride] * 16207 - in[3 * stride] *  2404 + (1 << 13)) >> 14;
+	I64 t24a = (in[29 * stride] *  2404 + in[3 * stride] * 16207 + (1 << 13)) >> 14;
+	I64 t0  = t0a  + t3a;
+	I64 t1  = t1a  + t2a;
+	I64 t2  = t1a  - t2a;
+	I64 t3  = t0a  - t3a;
+	I64 t4  = t4a  + t5a;
+	I64 t5  = t4a  - t5a;
+	I64 t6  = t7a  - t6a;
+	I64 t7  = t7a  + t6a;
+	I64 t8  = t8a  + t9a;
+	I64 t9  = t8a  - t9a;
+	I64 t10 = t11a - t10a;
+	I64 t11 = t11a + t10a;
+	I64 t12 = t12a + t13a;
+	I64 t13 = t12a - t13a;
+	I64 t14 = t15a - t14a;
+	I64 t15 = t15a + t14a;
+	I64 t16 = t16a + t17a;
+	I64 t17 = t16a - t17a;
+	I64 t18 = t19a - t18a;
+	I64 t19 = t19a + t18a;
+	I64 t20 = t20a + t21a;
+	I64 t21 = t20a - t21a;
+	I64 t22 = t23a - t22a;
+	I64 t23 = t23a + t22a;
+	I64 t24 = t24a + t25a;
+	I64 t25 = t24a - t25a;
+	I64 t26 = t27a - t26a;
+	I64 t27 = t27a + t26a;
+	I64 t28 = t28a + t29a;
+	I64 t29 = t28a - t29a;
+	I64 t30 = t31a - t30a;
+	I64 t31 = t31a + t30a;
+	t5a  = ((t6 - t5) * 11585			 + (1 << 13)) >> 14;
+	t6a  = ((t6 + t5) * 11585			 + (1 << 13)) >> 14;
+	t9a  = (  t14 *  6270 - t9  * 15137  + (1 << 13)) >> 14;
+	t14a = (  t14 * 15137 + t9  *  6270  + (1 << 13)) >> 14;
+	t10a = (-(t13 * 15137 + t10 *  6270) + (1 << 13)) >> 14;
+	t13a = (  t13 *  6270 - t10 * 15137  + (1 << 13)) >> 14;
+	t17a = (  t30 *  3196 - t17 * 16069  + (1 << 13)) >> 14;
+	t30a = (  t30 * 16069 + t17 *  3196  + (1 << 13)) >> 14;
+	t18a = (-(t29 * 16069 + t18 *  3196) + (1 << 13)) >> 14;
+	t29a = (  t29 *  3196 - t18 * 16069  + (1 << 13)) >> 14;
+	t21a = (  t26 * 13623 - t21 *  9102  + (1 << 13)) >> 14;
+	t26a = (  t26 *  9102 + t21 * 13623  + (1 << 13)) >> 14;
+	t22a = (-(t25 *  9102 + t22 * 13623) + (1 << 13)) >> 14;
+	t25a = (  t25 * 13623 - t22 *  9102  + (1 << 13)) >> 14;
+	t0a  = t0   + t7;
+	t1a  = t1   + t6a;
+	t2a  = t2   + t5a;
+	t3a  = t3   + t4;
+	t4a  = t3   - t4;
+	t5   = t2   - t5a;
+	t6   = t1   - t6a;
+	t7a  = t0   - t7;
+	t8a  = t8   + t11;
+	t9   = t9a  + t10a;
+	t10  = t9a  - t10a;
+	t11a = t8   - t11;
+	t12a = t15  - t12;
+	t13  = t14a - t13a;
+	t14  = t14a + t13a;
+	t15a = t15  + t12;
+	t16a = t16  + t19;
+	t17  = t17a + t18a;
+	t18  = t17a - t18a;
+	t19a = t16  - t19;
+	t20a = t23  - t20;
+	t21  = t22a - t21a;
+	t22  = t22a + t21a;
+	t23a = t23  + t20;
+	t24a = t24  + t27;
+	t25  = t25a + t26a;
+	t26  = t25a - t26a;
+	t27a = t24  - t27;
+	t28a = t31  - t28;
+	t29  = t30a - t29a;
+	t30  = t30a + t29a;
+	t31a = t31  + t28;
+	t10a = ((t13  - t10)  * 11585		   + (1 << 13)) >> 14;
+	t13a = ((t13  + t10)  * 11585		   + (1 << 13)) >> 14;
+	t11  = ((t12a - t11a) * 11585		   + (1 << 13)) >> 14;
+	t12  = ((t12a + t11a) * 11585		   + (1 << 13)) >> 14;
+	t18a = (  t29  *  6270 - t18  * 15137  + (1 << 13)) >> 14;
+	t29a = (  t29  * 15137 + t18  *  6270  + (1 << 13)) >> 14;
+	t19  = (  t28a *  6270 - t19a * 15137  + (1 << 13)) >> 14;
+	t28  = (  t28a * 15137 + t19a *  6270  + (1 << 13)) >> 14;
+	t20  = (-(t27a * 15137 + t20a *  6270) + (1 << 13)) >> 14;
+	t27  = (  t27a *  6270 - t20a * 15137  + (1 << 13)) >> 14;
+	t21a = (-(t26  * 15137 + t21  *  6270) + (1 << 13)) >> 14;
+	t26a = (  t26  *  6270 - t21  * 15137  + (1 << 13)) >> 14;
+	t0   = t0a + t15a;
+	t1   = t1a + t14;
+	t2   = t2a + t13a;
+	t3   = t3a + t12;
+	t4   = t4a + t11;
+	t5a  = t5  + t10a;
+	t6a  = t6  + t9;
+	t7   = t7a + t8a;
+	t8   = t7a - t8a;
+	t9a  = t6  - t9;
+	t10  = t5  - t10a;
+	t11a = t4a - t11;
+	t12a = t3a - t12;
+	t13  = t2a - t13a;
+	t14a = t1a - t14;
+	t15  = t0a - t15a;
+	t16  = t16a + t23a;
+	t17a = t17  + t22;
+	t18  = t18a + t21a;
+	t19a = t19  + t20;
+	t20a = t19  - t20;
+	t21  = t18a - t21a;
+	t22a = t17  - t22;
+	t23  = t16a - t23a;
+	t24  = t31a - t24a;
+	t25a = t30  - t25;
+	t26  = t29a - t26a;
+	t27a = t28  - t27;
+	t28a = t28  + t27;
+	t29  = t29a + t26a;
+	t30a = t30  + t25;
+	t31  = t31a + t24a;
+	t20  = ((t27a - t20a) * 11585 + (1 << 13)) >> 14;
+	t27  = ((t27a + t20a) * 11585 + (1 << 13)) >> 14;
+	t21a = ((t26  - t21 ) * 11585 + (1 << 13)) >> 14;
+	t26a = ((t26  + t21 ) * 11585 + (1 << 13)) >> 14;
+	t22  = ((t25a - t22a) * 11585 + (1 << 13)) >> 14;
+	t25  = ((t25a + t22a) * 11585 + (1 << 13)) >> 14;
+	t23a = ((t24  - t23 ) * 11585 + (1 << 13)) >> 14;
+	t24a = ((t24  + t23 ) * 11585 + (1 << 13)) >> 14;
+	out[ 0] = t0   + t31;
+	out[ 1] = t1   + t30a;
+	out[ 2] = t2   + t29;
+	out[ 3] = t3   + t28a;
+	out[ 4] = t4   + t27;
+	out[ 5] = t5a  + t26a;
+	out[ 6] = t6a  + t25;
+	out[ 7] = t7   + t24a;
+	out[ 8] = t8   + t23a;
+	out[ 9] = t9a  + t22;
+	out[10] = t10  + t21a;
+	out[11] = t11a + t20;
+	out[12] = t12a + t19a;
+	out[13] = t13  + t18;
+	out[14] = t14a + t17a;
+	out[15] = t15  + t16;
+	out[16] = t15  - t16;
+	out[17] = t14a - t17a;
+	out[18] = t13  - t18;
+	out[19] = t12a - t19a;
+	out[20] = t11a - t20;
+	out[21] = t10  - t21a;
+	out[22] = t9a  - t22;
+	out[23] = t8   - t23a;
+	out[24] = t7   - t24a;
+	out[25] = t6a  - t25;
+	out[26] = t5a  - t26a;
+	out[27] = t4   - t27;
+	out[28] = t3   - t28a;
+	out[29] = t2   - t29;
+	out[30] = t1   - t30a;
+	out[31] = t0   - t31;
+}
+
+U0 Vp9Txfm1D(Bool adst, I64 sz, I64 *in, I64 stride, I64 *out)
+{
+	if (adst)
+	{
+		if (sz == 4)
+			Vp9Iadst4(in, stride, out);
+		else if (sz == 8)
+			Vp9Iadst8(in, stride, out);
+		else
+			Vp9Iadst16(in, stride, out);
+		return;
+	}
+	if (sz == 4)
+		Vp9Idct4(in, stride, out);
+	else if (sz == 8)
+		Vp9Idct8(in, stride, out);
+	else if (sz == 16)
+		Vp9Idct16(in, stride, out);
+	else
+		Vp9Idct32(in, stride, out);
+}
+
+U0 Vp9AddTxfm(CVp9Dec *d, U8 *dst, I64 stride, I16 *coef, I64 tx, I64 txtp)
+{//Columns then rows, as libavcodec's itxfm_wrapper. The enum names the row
+//transform first, the function names the column one, so the two swap here.
+	I64	*in = d->tin, *tmp = d->ttmp, *out = d->tout;
+	I64	 sz = 4 << tx, bits = 4, i, j;
+	Bool col_adst, row_adst;
+
+	if (tx == TX_8X8)
+		bits = 5;
+	else if (tx >= TX_16X16)
+		bits = 6;
+	col_adst = ToBool(txtp == DCT_ADST || txtp == ADST_ADST);
+	row_adst = ToBool(txtp == ADST_DCT || txtp == ADST_ADST);
+	if (tx == TX_32X32)
+	{
+		col_adst = FALSE;
+		row_adst = FALSE;
+	}
+
+	for (i = 0; i < sz * sz; i++)
+		in[i] = coef[i];
+	for (i = 0; i < sz; i++)
+		Vp9Txfm1D(col_adst, sz, in + i, sz, tmp + i * sz);
+	for (i = 0; i < sz; i++)
+	{
+		Vp9Txfm1D(row_adst, sz, tmp + i, sz, out);
+		for (j = 0; j < sz; j++)
+			dst[j * stride + i] = Vp9Clip8(dst[j * stride + i] +
+										   ((out[j] + (1 << (bits - 1))) >> bits));
+	}
+}
+
+/***** reconstruction *****/
+
+U0 Vp9IWht4(I64 *in, I64 stride, I64 *out, Bool pass2)
+{//Lossless transform, RFC-free: see libavcodec iwht4_1d.
+	I64 t0, t1, t2, t3, t4;
+
+	t0 = in[0];
+	t1 = in[3 * stride];
+	t2 = in[stride];
+	t3 = in[2 * stride];
+	if (!pass2)
+	{
+		t0 >>= 2;
+		t1 >>= 2;
+		t2 >>= 2;
+		t3 >>= 2;
+	}
+	t0 += t2;
+	t3 -= t1;
+	t4 = (t0 - t3) >> 1;
+	t1 = t4 - t1;
+	t2 = t4 - t2;
+	t0 -= t1;
+	t3 += t2;
+	out[0] = t0;
+	out[1] = t1;
+	out[2] = t2;
+	out[3] = t3;
+}
+
+U0 Vp9AddWht(U8 *dst, I64 stride, I16 *coef)
+{
+	I64	 i, j, in[16], tmp[16], out[4];
+
+	for (i = 0; i < 16; i++)
+		in[i] = coef[i];
+	for (i = 0; i < 4; i++)
+		Vp9IWht4(in + i, 4, tmp + i * 4, FALSE);
+	for (i = 0; i < 4; i++)
+	{
+		Vp9IWht4(tmp + i, 4, out, TRUE);
+		for (j = 0; j < 4; j++)
+			dst[j * stride + i] = Vp9Clip8(dst[j * stride + i] + out[j]);
+	}
+}
+
+U0 Vp9Edges(U8 *plane, I64 stride, I64 px, I64 py, I64 pw, I64 ph,
+			I64 size, I64 mode, Bool have_top, Bool have_left, Bool have_right,
+			U8 *abuf, U8 *l, I64 *_mode)
+{//Fills abuf[1..] (the corner at abuf[0]) and l, and returns the mode the
+//available edges allow. Mirrors check_intra_mode.
+	U8	*a = abuf + 1;
+	I64	 need, i, have_px, want;
+
+	*_mode = vp9_mode_conv[mode * 4 + have_left * 2 + have_top];
+	mode = *_mode;
+	need = vp9_edge_need[mode];
+
+	if (need & 2)
+	{
+		want = size;
+		have_px = pw - px;
+		if (have_top)
+		{
+			i = want;
+			if (i > have_px)
+				i = have_px;
+			MemCopy(a, plane + (py - 1) * stride + px, i);
+			if (i < want)
+				MemSet(a + i, a[i - 1], want - i);
+		}
+		else
+			MemSet(a, 127, want);
+		if (need & 4)
+		{
+			if (have_left && have_top)
+				a[-1] = plane[(py - 1) * stride + px - 1];
+			else if (have_top)
+				a[-1] = 129;
+			else
+				a[-1] = 127;
+		}
+		if (size == 4 && need & 8)
+		{//4x4 is the only size that predicts from above-right.
+			if (have_top && have_right && have_px >= 8)
+				MemCopy(a + 4, plane + (py - 1) * stride + px + 4, 4);
+			else
+				MemSet(a + 4, a[3], 4);
+		}
+	}
+	if (need & 1)
+	{
+		if (have_left)
+		{
+			have_px = ph - py;
+			if (have_px > size)
+				have_px = size;
+			if (need & 16)
+			{//HOR_UP reads the column top-first.
+				for (i = 0; i < have_px; i++)
+					l[i] = plane[(py + i) * stride + px - 1];
+				for (i = have_px; i < size; i++)
+					l[i] = l[have_px - 1];
+			}
+			else
+			{
+				for (i = 0; i < have_px; i++)
+					l[size - 1 - i] = plane[(py + i) * stride + px - 1];
+				for (i = have_px; i < size; i++)
+					l[size - 1 - i] = l[size - have_px];
+			}
+		}
+		else
+			MemSet(l, 129, size);
+	}
+}
+
+U0 Vp9ReconPlane(CVp9Dec *d, U8 *plane, I64 stride, I64 pw, I64 ph, I64 bx,
+				 I64 by, I64 bw, I64 end_x, I64 end_y, I64 tx, I64 mode,
+				 Bool sub8, Bool chroma, I16 *coef, I64 *eobs, I64 lossless)
+{//One plane of one block: predict and add residual, transform block by
+//transform block, in the order the coefficients were read.
+	I64	 step = 1 << tx, size = 4 << tx, x, y, n = 0, off = 0, m, pm, txtp;
+	I64	 ncoef = 16 << (tx * 2);
+	U8	 abuf[80], l[64];
+	U8	*dst;
+
+	for (y = 0; y < end_y; y += step)
+		for (x = 0; x < end_x; x += step)
+		{
+			dst = plane + (by + y * 4) * stride + bx + x * 4;
+			m = mode;
+			if (sub8)
+				m = d->mode[(y & 1) * 2 + (x & 1)];
+			Vp9Edges(plane, stride, bx + x * 4, by + y * 4, pw, ph, size, m,
+					 ToBool(d->row || y), ToBool(d->col > d->tile_col_start || x),
+					 ToBool(x < bw - 1), abuf, l, &pm);
+			Vp9IntraPred(dst, stride, pm, size, abuf + 1, l);
+			if (eobs[n])
+			{
+				if (lossless)
+					Vp9AddWht(dst, stride, coef + off);
+				else
+				{//Chroma always takes the DCT; only luma follows the mode.
+					txtp = DCT_DCT;
+					if (!chroma)
+						txtp = vp9_intra_txfm_type[m];
+					Vp9AddTxfm(d, dst, stride, coef + off, tx, txtp);
+				}
+			}
+			off += ncoef;
+			n++;
+		}
+}
+
+U0 Vp9ReconBlock(CVp9Dec *d)
+{//Both planes of one block, in the order the coefficients were read.
+	I64	 w4 = vp9_bwh_tab[26 + d->bs * 2] << 1;
+	I64	 h4 = vp9_bwh_tab[26 + d->bs * 2 + 1] << 1;
+	I64	 end_x = (d->cols - d->col) * 2, end_y = (d->rows - d->row) * 2;
+	I64	 pl;
+
+	if (end_x > w4)
+		end_x = w4;
+	if (end_y > h4)
+		end_y = h4;
+
+	Vp9ReconPlane(d, d->py, d->ys, d->cols * 8, d->rows * 8, d->col * 8,
+				  d->row * 8, w4, end_x, end_y, d->tx, d->mode[0],
+				  ToBool(d->bs > BS_8x8 && d->tx == TX_4X4), FALSE, d->blk,
+				  d->eob_y, d->lossless);
+
+	end_x >>= 1;
+	end_y >>= 1;
+	w4 >>= 1;
+	for (pl = 0; pl < 2; pl++)
+	{
+		if (!pl)
+			Vp9ReconPlane(d, d->pu, d->uvs, d->cols * 4, d->rows * 4,
+						  d->col * 4, d->row * 4, w4, end_x, end_y, d->uvtx,
+						  d->uvmode, FALSE, TRUE, d->blk + 4096,
+						  d->eob_uv, d->lossless);
+		else
+			Vp9ReconPlane(d, d->pv, d->uvs, d->cols * 4, d->rows * 4,
+						  d->col * 4, d->row * 4, w4, end_x, end_y, d->uvtx,
+						  d->uvmode, FALSE, TRUE, d->blk + 4096 + 1024,
+						  d->eob_uv + 64, d->lossless);
+	}
+}
+
+/***** loop filter (VP9 spec par. 8.8) *****/
+//
+//Mirrors libvpx vp9_filter_block_plane_non420: masks per 8x8, vertical edges
+//of a superblock first, then its horizontal ones. On a keyframe every block is
+//intra, so the skip-this-edge cases never apply.
+
+I64 Vp9ClipS8(I64 v)
+{
+	if (v < -128)
+		return -128;
+	if (v > 127)
+		return 127;
+
+	return v;
+}
+
+U0 Vp9Filter(U8 *dst, I64 E, I64 I, I64 H, I64 stridea, I64 strideb, I64 wd)
+{
+	I64	 i, p7, p6, p5, p4, p3, p2, p1, p0, q0, q1, q2, q3, q4, q5, q6, q7;
+	I64	 f, f1, f2;
+	Bool fm, flat8in, flat8out, hev;
+
+	for (i = 0; i < 8; i++)
+	{
+		p3 = dst[strideb * -4];
+		p2 = dst[strideb * -3];
+		p1 = dst[strideb * -2];
+		p0 = dst[strideb * -1];
+		q0 = dst[0];
+		q1 = dst[strideb];
+		q2 = dst[strideb * 2];
+		q3 = dst[strideb * 3];
+		fm = ToBool(AbsI64(p3 - p2) <= I && AbsI64(p2 - p1) <= I &&
+					AbsI64(p1 - p0) <= I && AbsI64(q1 - q0) <= I &&
+					AbsI64(q2 - q1) <= I && AbsI64(q3 - q2) <= I &&
+					AbsI64(p0 - q0) * 2 + (AbsI64(p1 - q1) >> 1) <= E);
+		if (!fm)
+			goto next_line;
+
+		flat8out = FALSE;
+		flat8in  = FALSE;
+		if (wd >= 16)
+		{
+			p7 = dst[strideb * -8];
+			p6 = dst[strideb * -7];
+			p5 = dst[strideb * -6];
+			p4 = dst[strideb * -5];
+			q4 = dst[strideb * 4];
+			q5 = dst[strideb * 5];
+			q6 = dst[strideb * 6];
+			q7 = dst[strideb * 7];
+			flat8out = ToBool(AbsI64(p7 - p0) <= 1 && AbsI64(p6 - p0) <= 1 &&
+							  AbsI64(p5 - p0) <= 1 && AbsI64(p4 - p0) <= 1 &&
+							  AbsI64(q4 - q0) <= 1 && AbsI64(q5 - q0) <= 1 &&
+							  AbsI64(q6 - q0) <= 1 && AbsI64(q7 - q0) <= 1);
+		}
+		if (wd >= 8)
+			flat8in = ToBool(AbsI64(p3 - p0) <= 1 && AbsI64(p2 - p0) <= 1 &&
+							 AbsI64(p1 - p0) <= 1 && AbsI64(q1 - q0) <= 1 &&
+							 AbsI64(q2 - q0) <= 1 && AbsI64(q3 - q0) <= 1);
+
+		if (wd >= 16 && flat8out && flat8in)
+		{
+			dst[strideb * -7] = (p7 * 7 + p6 * 2 + p5 + p4 + p3 + p2 + p1 + p0 +
+								 q0 + 8) >> 4;
+			dst[strideb * -6] = (p7 * 6 + p6 + p5 * 2 + p4 + p3 + p2 + p1 + p0 +
+								 q0 + q1 + 8) >> 4;
+			dst[strideb * -5] = (p7 * 5 + p6 + p5 + p4 * 2 + p3 + p2 + p1 + p0 +
+								 q0 + q1 + q2 + 8) >> 4;
+			dst[strideb * -4] = (p7 * 4 + p6 + p5 + p4 + p3 * 2 + p2 + p1 + p0 +
+								 q0 + q1 + q2 + q3 + 8) >> 4;
+			dst[strideb * -3] = (p7 * 3 + p6 + p5 + p4 + p3 + p2 * 2 + p1 + p0 +
+								 q0 + q1 + q2 + q3 + q4 + 8) >> 4;
+			dst[strideb * -2] = (p7 * 2 + p6 + p5 + p4 + p3 + p2 + p1 * 2 + p0 +
+								 q0 + q1 + q2 + q3 + q4 + q5 + 8) >> 4;
+			dst[strideb * -1] = (p7 + p6 + p5 + p4 + p3 + p2 + p1 + p0 * 2 +
+								 q0 + q1 + q2 + q3 + q4 + q5 + q6 + 8) >> 4;
+			dst[0]            = (p6 + p5 + p4 + p3 + p2 + p1 + p0 + q0 * 2 +
+								 q1 + q2 + q3 + q4 + q5 + q6 + q7 + 8) >> 4;
+			dst[strideb]      = (p5 + p4 + p3 + p2 + p1 + p0 + q0 + q1 * 2 +
+								 q2 + q3 + q4 + q5 + q6 + q7 * 2 + 8) >> 4;
+			dst[strideb * 2]  = (p4 + p3 + p2 + p1 + p0 + q0 + q1 + q2 * 2 +
+								 q3 + q4 + q5 + q6 + q7 * 3 + 8) >> 4;
+			dst[strideb * 3]  = (p3 + p2 + p1 + p0 + q0 + q1 + q2 + q3 * 2 +
+								 q4 + q5 + q6 + q7 * 4 + 8) >> 4;
+			dst[strideb * 4]  = (p2 + p1 + p0 + q0 + q1 + q2 + q3 + q4 * 2 +
+								 q5 + q6 + q7 * 5 + 8) >> 4;
+			dst[strideb * 5]  = (p1 + p0 + q0 + q1 + q2 + q3 + q4 + q5 * 2 +
+								 q6 + q7 * 6 + 8) >> 4;
+			dst[strideb * 6]  = (p0 + q0 + q1 + q2 + q3 + q4 + q5 + q6 * 2 +
+								 q7 * 7 + 8) >> 4;
+		}
+		else if (wd >= 8 && flat8in)
+		{
+			dst[strideb * -3] = (p3 * 3 + p2 * 2 + p1 + p0 + q0 + 4) >> 3;
+			dst[strideb * -2] = (p3 * 2 + p2 + p1 * 2 + p0 + q0 + q1 + 4) >> 3;
+			dst[strideb * -1] = (p3 + p2 + p1 + p0 * 2 + q0 + q1 + q2 + 4) >> 3;
+			dst[0]            = (p2 + p1 + p0 + q0 * 2 + q1 + q2 + q3 + 4) >> 3;
+			dst[strideb]      = (p1 + p0 + q0 + q1 * 2 + q2 + q3 * 2 + 4) >> 3;
+			dst[strideb * 2]  = (p0 + q0 + q1 + q2 * 2 + q3 * 3 + 4) >> 3;
+		}
+		else
+		{
+			hev = ToBool(AbsI64(p1 - p0) > H || AbsI64(q1 - q0) > H);
+			if (hev)
+			{
+				f = Vp9ClipS8(p1 - q1);
+				f = Vp9ClipS8(3 * (q0 - p0) + f);
+			}
+			else
+				f = Vp9ClipS8(3 * (q0 - p0));
+			f1 = f + 4;
+			if (f1 > 127)
+				f1 = 127;
+			f1 >>= 3;
+			f2 = f + 3;
+			if (f2 > 127)
+				f2 = 127;
+			f2 >>= 3;
+			dst[strideb * -1] = Vp9Clip8(p0 + f2);
+			dst[0]            = Vp9Clip8(q0 - f1);
+			if (!hev)
+			{
+				f = (f1 + 1) >> 1;
+				dst[strideb * -2] = Vp9Clip8(p1 + f);
+				dst[strideb]      = Vp9Clip8(q1 - f);
+			}
+		}
+next_line:
+		dst += stridea;
+	}
+}
+
+U0 Vp9LfLimits(CVp9Dec *d, I64 lvl, I64 *_e, I64 *_i, I64 *_h)
+{
+	I64 lim = lvl, sh = d->filt_sharp;
+
+	if (sh > 0)
+	{
+		lim >>= 1;
+		if (sh > 4)
+			lim >>= 1;
+		if (lim > 9 - sh)
+			lim = 9 - sh;
+	}
+	if (lim < 1)
+		lim = 1;
+	*_i = lim;
+	*_e = 2 * (lvl + 2) + lim;
+	*_h = lvl >> 4;
+}
+
+U0 Vp9LfEdge(CVp9Dec *d, U8 *plane, I64 stride, I64 x, I64 y, I64 lvl,
+			 I64 wd, Bool vert)
+{//One 8-sample edge segment.
+	I64 e, i, h;
+
+	Vp9LfLimits(d, lvl, &e, &i, &h);
+	if (vert)
+		Vp9Filter(plane + y * stride + x, e, i, h, stride, 1, wd);
+	else
+		Vp9Filter(plane + y * stride + x, e, i, h, 1, stride, wd);
+}
+
+U0 Vp9LfPlane(CVp9Dec *d, U8 *plane, I64 stride, I64 ss, I64 sbr, I64 sbc,
+			  Bool uv)
+{
+	I64	 mi_row = sbr * 8, mi_col = sbc * 8, step = 1 << ss;
+	I64	 r, c, mr, mc, idx, lvl, tx, x, y, wd;
+	Bool border_c, border_r;
+
+	for (r = 0; r < 8; r++)
+	{
+		mr = mi_row + r;
+		if (mr >= d->rows || r & (step - 1))
+			goto next_vrow;
+		y = (mr * 8) >> ss;
+		for (c = 0; c < 8; c++)
+		{
+			mc = mi_col + c;
+			if (mc >= d->cols || c & (step - 1))
+				goto next_vcol;
+			idx = mr * d->cols + mc;
+			lvl = d->lf_lvl[idx];
+			if (!lvl)
+				goto next_vcol;
+			if (uv)
+				tx = d->lf_uvtx[idx];
+			else
+				tx = d->lf_tx[idx];
+			x = (mc * 8) >> ss;
+			border_c = ToBool(ss && mc == d->cols - 1);
+			wd = 0;
+			if (tx == TX_32X32)
+			{
+				if (!((c >> ss) & 3))
+					wd = 16;
+			}
+			else if (tx == TX_16X16)
+			{
+				if (!((c >> ss) & 1))
+					wd = 16;
+			}
+			else if (tx == TX_8X8 || !((c >> ss) & 3))
+				wd = 8;
+			else
+				wd = 4;
+			if (wd == 16 && border_c)
+				wd = 8;
+			//The frame's left edge has no block edge, but its interior 4x4
+			//edge is still filtered.
+			if (wd && mc)
+				Vp9LfEdge(d, plane, stride, x, y, lvl, wd, TRUE);
+			if (!tx && !border_c)
+				Vp9LfEdge(d, plane, stride, x + 4, y, lvl, 4, TRUE);
+next_vcol:;
+		}
+next_vrow:;
+	}
+
+	for (r = 0; r < 8; r++)
+	{
+		mr = mi_row + r;
+		if (mr >= d->rows || r & (step - 1))
+			goto next_hrow;
+		y = (mr * 8) >> ss;
+		border_r = ToBool(ss && mr == d->rows - 1);
+		for (c = 0; c < 8; c++)
+		{
+			mc = mi_col + c;
+			if (mc >= d->cols || c & (step - 1))
+				goto next_hcol;
+			idx = mr * d->cols + mc;
+			lvl = d->lf_lvl[idx];
+			if (!lvl)
+				goto next_hcol;
+			if (uv)
+				tx = d->lf_uvtx[idx];
+			else
+				tx = d->lf_tx[idx];
+			x = (mc * 8) >> ss;
+			wd = 0;
+			if (tx == TX_32X32)
+			{
+				if (!((r >> ss) & 3))
+					wd = 16;
+			}
+			else if (tx == TX_16X16)
+			{
+				if (!((r >> ss) & 1))
+					wd = 16;
+			}
+			else if (tx == TX_8X8 || !((r >> ss) & 3))
+				wd = 8;
+			else
+				wd = 4;
+			if (wd == 16 && border_r)
+				wd = 8;
+			if (wd && mr)
+				Vp9LfEdge(d, plane, stride, x, y, lvl, wd, FALSE);
+			if (!tx && !border_r)
+				Vp9LfEdge(d, plane, stride, x, y + 4, lvl, 4, FALSE);
+next_hcol:;
+		}
+next_hrow:;
+	}
+}
+
+U0 Vp9LoopFilter(CVp9Dec *d)
+{
+	I64 sbr, sbc;
+
+	if (!d->filt_level)
+		return;
+	for (sbr = 0; sbr < d->sb_rows; sbr++)
+		for (sbc = 0; sbc < d->sb_cols; sbc++)
+		{
+			Vp9LfPlane(d, d->py, d->ys, 0, sbr, sbc, FALSE);
+			Vp9LfPlane(d, d->pu, d->uvs, 1, sbr, sbc, TRUE);
+			Vp9LfPlane(d, d->pv, d->uvs, 1, sbr, sbc, TRUE);
+		}
+}
+
+U0 Vp9DecodeBlock(CVp9Dec *d, I64 row, I64 col, I64 bl, I64 bp)
+{
+	I64 w4, h4, pl, n;
+
+	d->row  = row;
+	d->col  = col;
+	d->row7 = row & 7;
+	d->bs   = bl * 3 + bp;
+	Vp9DecodeMode(d);
+
+	w4 = vp9_bwh_tab[26 + d->bs * 2];
+	h4 = vp9_bwh_tab[26 + d->bs * 2 + 1];
+	d->uvtx = d->tx;
+	if (w4 * 2 == (1 << d->tx) || h4 * 2 == (1 << d->tx))
+		d->uvtx--;			//4:2:0 halves both dimensions
+
+	if (!d->skip)
+		Vp9DecodeCoeffs(d);
+	else
+	{
+		MemSet(d->eob_y, 0, 256 * sizeof(I64));
+		MemSet(d->eob_uv, 0, 128 * sizeof(I64));
+		MemSet(d->a_ynnz + d->col * 2, 0, w4 * 2);
+		MemSet(d->l_ynnz + d->row7 * 2, 0, h4 * 2);
+		for (pl = 0; pl < 2; pl++)
+		{
+			MemSet(d->a_uvnnz + pl * d->a_cols + d->col, 0, w4);
+			MemSet(d->l_uvnnz + pl * 8 + d->row7, 0, h4);
+		}
+	}
+	Vp9ReconBlock(d);
+	n = w4;
+	if (n > d->cols - d->col)
+		n = d->cols - d->col;
+	for (pl = 0; pl < h4 && d->row + pl < d->rows; pl++)
+	{
+		MemSet(d->lf_lvl + (d->row + pl) * d->cols + d->col,
+			   d->seg[d->seg_id].lflvl[0][0], n);
+		MemSet(d->lf_tx + (d->row + pl) * d->cols + d->col, d->tx, n);
+		MemSet(d->lf_uvtx + (d->row + pl) * d->cols + d->col, d->uvtx, n);
+	}
+	d->blocks++;
+}
+
+U0 Vp9DecodeSb(CVp9Dec *d, I64 row, I64 col, I64 bl)
+{//Recursive quad split down to 8x8, then one more level inside the block.
+	CVp8Br	*br = &d->tc;
+	I64		 hbs = 4 >> bl, bp, c;
+	U8		*p;
+
+	c = (d->a_part[col] >> (3 - bl)) & 1 |
+		((d->l_part[row & 7] >> (3 - bl)) & 1) << 1;
+	p = vp9_kf_partition_probs + (bl * 4 + c) * 3;
+
+	if (bl == 3)
+	{
+		bp = Vp9Tree(br, vp9_partition_tree, p);
+		Vp9DecodeBlock(d, row, col, bl, bp);
+		return;
+	}
+	if (col + hbs < d->cols)
+	{
+		if (row + hbs < d->rows)
+		{
+			bp = Vp9Tree(br, vp9_partition_tree, p);
+			if (!bp)
+				Vp9DecodeBlock(d, row, col, bl, bp);
+			else if (bp == 1)
+			{
+				Vp9DecodeBlock(d, row, col, bl, bp);
+				Vp9DecodeBlock(d, row + hbs, col, bl, bp);
+			}
+			else if (bp == 2)
+			{
+				Vp9DecodeBlock(d, row, col, bl, bp);
+				Vp9DecodeBlock(d, row, col + hbs, bl, bp);
+			}
+			else
+			{
+				Vp9DecodeSb(d, row, col, bl + 1);
+				Vp9DecodeSb(d, row, col + hbs, bl + 1);
+				Vp9DecodeSb(d, row + hbs, col, bl + 1);
+				Vp9DecodeSb(d, row + hbs, col + hbs, bl + 1);
+			}
+		}
+		else if (Vp8Bit(br, p[1]))
+		{
+			Vp9DecodeSb(d, row, col, bl + 1);
+			Vp9DecodeSb(d, row, col + hbs, bl + 1);
+		}
+		else
+			Vp9DecodeBlock(d, row, col, bl, 1);
+	}
+	else if (row + hbs < d->rows)
+	{
+		if (Vp8Bit(br, p[2]))
+		{
+			Vp9DecodeSb(d, row, col, bl + 1);
+			Vp9DecodeSb(d, row + hbs, col, bl + 1);
+		}
+		else
+			Vp9DecodeBlock(d, row, col, bl, 2);
+	}
+	else
+		Vp9DecodeSb(d, row, col, bl + 1);
+}
+
+Bool Vp9Alloc(CVp9Dec *d)
+{
+	I64 pad = d->cols + 16;
+
+	if (d->a_cols == pad && d->a_part)
+		return TRUE;
+	Free(d->a_part);
+	Free(d->a_skip);
+	Free(d->a_tx);
+	Free(d->a_ymode);
+	Free(d->a_ynnz);
+	Free(d->a_uvnnz);
+	Free(d->seg_map);
+	Free(d->blk);
+	d->a_cols  = pad;
+	d->a_part  = CAlloc(pad);
+	d->a_skip  = CAlloc(pad);
+	d->a_tx    = CAlloc(pad);
+	d->a_ymode = CAlloc(pad * 2);
+	d->a_ynnz  = CAlloc(pad * 2);
+	d->a_uvnnz = CAlloc(pad * 2);
+	d->seg_map = CAlloc(d->cols * d->rows + 64);
+	Free(d->lf_lvl);
+	Free(d->lf_tx);
+	Free(d->lf_uvtx);
+	d->lf_lvl  = CAlloc(d->cols * d->rows + 64);
+	d->lf_tx   = CAlloc(d->cols * d->rows + 64);
+	d->lf_uvtx = CAlloc(d->cols * d->rows + 64);
+	d->blk     = MAlloc(6144 * sizeof(I16));
+	Free(d->py);
+	Free(d->pu);
+	Free(d->pv);
+	d->ys   = d->sb_cols * 64;
+	d->ph   = d->sb_rows * 64;
+	d->uvs  = d->ys / 2;
+	d->uvph = d->ph / 2;
+	d->py = CAlloc(d->ys * d->ph);
+	d->pu = CAlloc(d->uvs * d->uvph);
+	d->pv = CAlloc(d->uvs * d->uvph);
+
+	return ToBool(d->a_part && d->blk && d->seg_map && d->py && d->pu && d->pv);
+}
+
+Bool Vp9DecodeTiles(CVp9Dec *d, U8 *data, I64 size)
+{
+	I64	 rows = 1 << d->log2_tile_rows, cols = 1 << d->log2_tile_cols;
+	I64	 tr, tc, row, col, rs, re, cs, ce, tsize;
+
+	MemSet(d->a_part, 0, d->a_cols);
+	MemSet(d->a_skip, 0, d->a_cols);
+	MemSet(d->a_tx, 0, d->a_cols);
+	MemSet(d->a_ymode, 2, d->a_cols * 2);		//DC_PRED
+	MemSet(d->a_ynnz, 0, d->a_cols * 2);
+	MemSet(d->a_uvnnz, 0, d->a_cols * 2);
+	d->blocks = 0;
+	d->slack = 0;
+
+	for (tr = 0; tr < rows; tr++)
+	{
+		rs = ((tr * d->sb_rows) >> d->log2_tile_rows) << 3;
+		re = (((tr + 1) * d->sb_rows) >> d->log2_tile_rows) << 3;
+		if (re > d->rows)
+			re = d->rows;
+		for (tc = 0; tc < cols; tc++)
+		{
+			cs = ((tc * d->sb_cols) >> d->log2_tile_cols) << 3;
+			ce = (((tc + 1) * d->sb_cols) >> d->log2_tile_cols) << 3;
+			if (ce > d->cols)
+				ce = d->cols;
+
+			if (tr == rows - 1 && tc == cols - 1)
+				tsize = size;
+			else
+			{
+				if (size < 4)
+					return FALSE;
+				tsize = data[0] << 24 | data[1] << 16 | data[2] << 8 | data[3];
+				data += 4;
+				size -= 4;
+			}
+			if (tsize > size || tsize < 1)
+				return FALSE;
+			Vp8BrInit(&d->tc, data, tsize);
+			if (Vp8Bit(&d->tc, 128))
+				return FALSE;		//Marker bit.
+			d->tile_col_start = cs;
+
+			for (row = rs; row < re; row += 8)
+			{
+				MemSet(d->l_part, 0, 8);
+				MemSet(d->l_skip, 0, 8);
+				MemSet(d->l_tx, 0, 8);
+				MemSet(d->l_ymode, 2, 16);
+				MemSet(d->l_ynnz, 0, 16);
+				MemSet(d->l_uvnnz, 0, 16);
+				for (col = cs; col < ce; col += 8)
+					Vp9DecodeSb(d, row, col, 0);
+				if (d->tc.eof)
+					return FALSE;
+				Yield;
+			}
+			d->slack += tsize - d->tc.pos;
+			data += tsize;
+			size -= tsize;
+		}
+	}
+
+	return TRUE;
+}
+
+public Bool Vp9DecodeFrame(CVp9Dec *d, U8 *buf, I64 size)
+{//Header, then every tile. Reconstruction is not implemented: this parses the
+//frame and leaves the dequantised coefficients of the last block behind.
+	I64 off;
+
+	if (!Vp9FrameHeader(d, buf, size))
+		return FALSE;
+	if (!Vp9Alloc(d))
+	{
+		d->fail = 9;
+		return FALSE;
+	}
+	off = d->uncompressed_size + d->header_size;
+	if (!Vp9DecodeTiles(d, buf + off, size - off))
+	{
+		d->fail = 10;
+		return FALSE;
+	}
+	Vp9LoopFilter(d);
+
+	return TRUE;
+}
+
+/***** decoder context *****/
+
+public CVp9Dec *Vp9CtxOpen()
+{
+	return CAlloc(sizeof(CVp9Dec));
+}
+
+public U0 Vp9CtxClose(CVp9Dec *d)
+{
+	if (!d)
+		return;
+	Free(d->a_part);
+	Free(d->a_skip);
+	Free(d->a_tx);
+	Free(d->a_ymode);
+	Free(d->a_ynnz);
+	Free(d->a_uvnnz);
+	Free(d->seg_map);
+	Free(d->lf_lvl);
+	Free(d->lf_tx);
+	Free(d->lf_uvtx);
+	Free(d->blk);
+	Free(d->py);
+	Free(d->pu);
+	Free(d->pv);
+	Free(d);
+}
+
+U32 *Vp9ToArgb(CVp9Dec *d)
+{//BT.601, full frame.
+	U32	*argb = MAlloc(d->w * d->h * sizeof(U32));
+	I64	 x, y, cy, cu, cv, r, g, b;
+
+	for (y = 0; y < d->h; y++)
+	{
+		for (x = 0; x < d->w; x++)
+		{
+			cy = 298 * (d->py[y * d->ys + x] - 16);
+			cu = d->pu[(y >> 1) * d->uvs + (x >> 1)] - 128;
+			cv = d->pv[(y >> 1) * d->uvs + (x >> 1)] - 128;
+			r = Vp9Clip8((cy + 409 * cv + 128) >> 8);
+			g = Vp9Clip8((cy - 100 * cu - 208 * cv + 128) >> 8);
+			b = Vp9Clip8((cy + 516 * cu + 128) >> 8);
+			argb[y * d->w + x] = 0xFF000000 | r << 16 | g << 8 | b;
+		}
+		if (!(y & 63))
+			Yield;
+	}
+
+	return argb;
+}
+
+public U32 *Vp9CtxDecode(CVp9Dec *d, U8 *buf, I64 size, I64 *out_w, I64 *out_h)
+{//One frame. NULL when the frame cannot be decoded or is not shown. Inter
+//frames are rejected, so a stream decodes as its keyframes.
+	*out_w = 0;
+	*out_h = 0;
+	if (!d || !buf || size < 3)
+		return NULL;
+	if (!Vp9DecodeFrame(d, buf, size))
+		return NULL;
+	if (!d->show)
+		return NULL;
+	*out_w = d->w;
+	*out_h = d->h;
+
+	return Vp9ToArgb(d);
+}

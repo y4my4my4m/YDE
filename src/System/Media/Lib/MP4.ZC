@@ -1,0 +1,539 @@
+//ISOBMFF/MP4 demuxer (ISO/IEC 14496-12).
+//
+//A box tree, then per track the sample tables under stbl, flattened into one
+//array of samples: offset, size, time and sync flag. MP4 stores those five
+//facts across five tables, so the flattening is the whole job.
+//
+//The file is already in memory; sample data is borrowed from it, never copied.
+
+#define MP4_BOX_HDR		8
+
+I64 Mp4U16(U8 *b, I64 p)
+{
+	return b[p] << 8 | b[p + 1];
+}
+
+I64 Mp4U32(U8 *b, I64 p)
+{//Built a byte at a time: b[p] << 24 overflows a 32-bit int.
+	I64 v = b[p];
+
+	v = v << 8 | b[p + 1];
+	v = v << 8 | b[p + 2];
+
+	return v << 8 | b[p + 3];
+}
+
+I64 Mp4U64(U8 *b, I64 p)
+{
+	return Mp4U32(b, p) << 32 | Mp4U32(b, p + 4);
+}
+
+I64 Mp4Type(U8 *b, I64 p)
+{//Four character code as one integer, so boxes compare without StrCompare.
+	return Mp4U32(b, p);
+}
+
+#define MP4_FTYP	0x66747970
+#define MP4_MOOV	0x6D6F6F76
+#define MP4_TRAK	0x7472616B
+#define MP4_MDIA	0x6D646961
+#define MP4_MINF	0x6D696E66
+#define MP4_STBL	0x7374626C
+#define MP4_MDHD	0x6D646864
+#define MP4_HDLR	0x68646C72
+#define MP4_STSD	0x73747364
+#define MP4_STTS	0x73747473
+#define MP4_CTTS	0x63747473
+#define MP4_STSC	0x73747363
+#define MP4_STSZ	0x7374737A
+#define MP4_STZ2	0x73747A32
+#define MP4_STCO	0x7374636F
+#define MP4_CO64	0x636F3634
+#define MP4_STSS	0x73747373
+#define MP4_MVHD	0x6D766864
+#define MP4_VIDE	0x76696465
+#define MP4_SOUN	0x736F756E
+#define MP4_AVCC	0x61766343
+#define MP4_ESDS	0x65736473
+#define MP4_EDTS	0x65647473
+#define MP4_ELST	0x656C7374
+
+//Sample entry types under stsd.
+#define MP4_AVC1	0x61766331
+#define MP4_AVC3	0x61766333
+#define MP4_MP4A	0x6D703461
+#define MP4_VP09	0x76703039
+#define MP4_AV01	0x61763031
+#define MP4_HVC1	0x68766331
+#define MP4_HEV1	0x68657631
+
+class CMp4Tables
+{//Raw table positions inside the file, before flattening.
+	I64	 stts, stts_n, ctts, ctts_n, stsc, stsc_n;
+	I64	 stsz, stsz_n, stsz_uniform;
+	I64	 stco, stco_n, co64, stss, stss_n;
+};
+
+I64 Mp4CodecOf(I64 fourcc)
+{//if/else, not switch: a HolyC switch is a jump table over the case range, and
+//four character codes are a billion apart.
+	if (fourcc == MP4_AVC1 || fourcc == MP4_AVC3)
+		return MEDIA_CODEC_H264;
+	if (fourcc == MP4_MP4A)
+		return MEDIA_CODEC_AAC;
+	if (fourcc == MP4_VP09)
+		return MEDIA_CODEC_VP9;
+
+	return MEDIA_CODEC_NONE;
+}
+
+U0 Mp4ParseStsd(CMediaCtx *m, CMediaTrack *t, I64 pos, I64 end)
+{//One sample entry is enough: the decoder config that follows it is what the
+//codecs need.
+	I64	 n, e, esize, etype, p, bpos, bsize, btype;
+
+	if (pos + 8 > end)
+		return;
+	n = Mp4U32(m->buf, pos + 4);
+	p = pos + 8;
+	for (e = 0; e < n && p + 8 <= end; e++)
+	{
+		esize = Mp4U32(m->buf, p);
+		etype = Mp4Type(m->buf, p + 4);
+		if (esize < 8 || p + esize > end)
+			break;
+		if (!t->codec)
+		{
+			t->codec = Mp4CodecOf(etype);
+			StrPrint(t->codec_name, "%c%c%c%c", m->buf[p + 4], m->buf[p + 5],
+					 m->buf[p + 6], m->buf[p + 7]);
+			if (t->type == MEDIA_TRACK_VIDEO && p + 32 <= end)
+			{
+				t->width  = Mp4U16(m->buf, p + 32);
+				t->height = Mp4U16(m->buf, p + 34);
+				bpos = p + 86;		//VisualSampleEntry header
+			}
+			else
+			{
+				if (p + 28 <= end)
+				{
+					t->channels = Mp4U16(m->buf, p + 24);
+					t->rate     = Mp4U32(m->buf, p + 32) >> 16;
+				}
+				bpos = p + 36;		//AudioSampleEntry header
+			}
+			//Boxes after the sample entry header carry the decoder config.
+			while (bpos + 8 <= p + esize)
+			{
+				bsize = Mp4U32(m->buf, bpos);
+				btype = Mp4Type(m->buf, bpos + 4);
+				if (bsize < 8 || bpos + bsize > p + esize)
+					break;
+				if (btype == MP4_AVCC || btype == MP4_ESDS)
+				{
+					t->codec_priv     = m->buf + bpos + 8;
+					t->codec_priv_len = bsize - 8;
+				}
+				bpos += bsize;
+			}
+		}
+		p += esize;
+	}
+}
+
+U0 Mp4ParseStbl(CMediaCtx *m, CMp4Tables *tb, CMediaTrack *t, I64 pos,
+				I64 end)
+{
+	I64 size, type, p = pos;
+
+	MemSet(tb, 0, sizeof(CMp4Tables));
+	while (p + 8 <= end)
+	{
+		size = Mp4U32(m->buf, p);
+		type = Mp4Type(m->buf, p + 4);
+		if (size < 8 || p + size > end)
+			break;
+		if (type == MP4_STSD)
+			Mp4ParseStsd(m, t, p + 8, p + size);
+		else if (type == MP4_STTS)
+		{
+			tb->stts   = p + 16;
+			tb->stts_n = Mp4U32(m->buf, p + 12);
+		}
+		else if (type == MP4_CTTS)
+		{
+			tb->ctts   = p + 16;
+			tb->ctts_n = Mp4U32(m->buf, p + 12);
+		}
+		else if (type == MP4_STSC)
+		{
+			tb->stsc   = p + 16;
+			tb->stsc_n = Mp4U32(m->buf, p + 12);
+		}
+		else if (type == MP4_STSZ)
+		{
+			tb->stsz_uniform = Mp4U32(m->buf, p + 12);
+			tb->stsz_n       = Mp4U32(m->buf, p + 16);
+			tb->stsz         = p + 20;
+		}
+		else if (type == MP4_STCO)
+		{
+			tb->stco   = p + 16;
+			tb->stco_n = Mp4U32(m->buf, p + 12);
+		}
+		else if (type == MP4_CO64)
+		{
+			tb->co64   = p + 16;
+			tb->stco_n = Mp4U32(m->buf, p + 12);
+		}
+		else if (type == MP4_STSS)
+		{
+			tb->stss   = p + 16;
+			tb->stss_n = Mp4U32(m->buf, p + 12);
+		}
+		p += size;
+	}
+}
+
+Bool Mp4BuildSamples(CMediaCtx *m, CMp4Tables *tb, CMediaTrack *t)
+{//stsc maps samples to chunks, stco gives chunk offsets, stsz the sizes, stts
+//the durations and ctts the composition offsets. Walk them together once.
+	CMp4Sample	*s;
+	I64			 n = tb->stsz_n, i, chunk = 0, in_chunk = 0, off = 0;
+	I64			 sc_i = 0, sc_first = 1, sc_per = 0, sc_next = 0;
+	I64			 tt_i = 0, tt_left = 0, tt_delta = 0, dts = 0;
+	I64			 ct_i = 0, ct_left = 0, ct_off = 0;
+	I64			 ss_i = 0, ss_next = 0;
+	F64			 scale;
+
+	if (n < 1 || !tb->stsz || !tb->stsc || (!tb->stco && !tb->co64))
+		return FALSE;
+	s = CAlloc(n * sizeof(CMp4Sample));
+	if (!s)
+		return FALSE;
+	if (t->timescale < 1)
+		t->timescale = 1000;
+	scale = 1.0 / t->timescale;
+
+	if (tb->stss)
+		ss_next = Mp4U32(m->buf, tb->stss);
+	for (i = 0; i < n; i++)
+	{
+		if (!in_chunk)
+		{//Next chunk: stsc says how many samples it holds.
+			if (sc_i < tb->stsc_n &&
+				(!sc_next || chunk + 1 == sc_next))
+			{
+				sc_first = Mp4U32(m->buf, tb->stsc + sc_i * 12);
+				sc_per   = Mp4U32(m->buf, tb->stsc + sc_i * 12 + 4);
+				sc_i++;
+				sc_next = 0;
+				if (sc_i < tb->stsc_n)
+					sc_next = Mp4U32(m->buf, tb->stsc + sc_i * 12);
+			}
+			if (chunk >= tb->stco_n)
+				break;
+			if (tb->co64)
+				off = Mp4U64(m->buf, tb->co64 + chunk * 8);
+			else
+				off = Mp4U32(m->buf, tb->stco + chunk * 4);
+			in_chunk = sc_per;
+			chunk++;
+			if (in_chunk < 1)
+				break;
+		}
+
+		if (tb->stsz_uniform)
+			s[i].size = tb->stsz_uniform;
+		else
+			s[i].size = Mp4U32(m->buf, tb->stsz + i * 4);
+		s[i].off = off;
+		off += s[i].size;
+		in_chunk--;
+
+		if (!tt_left && tt_i < tb->stts_n)
+		{
+			tt_left  = Mp4U32(m->buf, tb->stts + tt_i * 8);
+			tt_delta = Mp4U32(m->buf, tb->stts + tt_i * 8 + 4);
+			tt_i++;
+		}
+		ct_off = 0;
+		if (tb->ctts)
+		{
+			if (!ct_left && ct_i < tb->ctts_n)
+			{
+				ct_left = Mp4U32(m->buf, tb->ctts + ct_i * 8);
+				ct_off  = Mp4U32(m->buf, tb->ctts + ct_i * 8 + 4);
+				ct_i++;
+			}
+			else if (ct_i > 0)
+				ct_off = Mp4U32(m->buf, tb->ctts + (ct_i - 1) * 8 + 4);
+			if (ct_left)
+				ct_left--;
+		}
+		s[i].time = ToF64(dts + ct_off) * scale - t->time_shift;
+		dts += tt_delta;
+		if (tt_left)
+			tt_left--;
+
+		if (!tb->stss)
+			s[i].key = TRUE;
+		else if (i + 1 == ss_next)
+		{
+			s[i].key = TRUE;
+			ss_i++;
+			ss_next = 0;
+			if (ss_i < tb->stss_n)
+				ss_next = Mp4U32(m->buf, tb->stss + ss_i * 4);
+		}
+
+		if (s[i].off + s[i].size > m->size)
+		{//Truncated file: keep what resolves.
+			n = i;
+			break;
+		}
+	}
+
+	t->samples      = s;
+	t->sample_count = n;
+	t->sample_pos   = 0;
+
+	return ToBool(n > 0);
+}
+
+U0 Mp4ParseTrak(CMediaCtx *m, I64 pos, I64 end)
+{
+	CMediaTrack	*t;
+	CMp4Tables	 tb;
+	I64			 size, type, p = pos, ver, hdlr = 0;
+	I64			 mdia = 0, mdia_end = 0, minf = 0, minf_end = 0;
+	I64			 stbl = 0, stbl_end = 0, mdhd = 0;
+	I64			 edts = 0, edts_end = 0, elst = 0, media_time = 0;
+
+	if (m->track_count >= MEDIA_TRACKS_MAX)
+		return;
+	t = &m->track[m->track_count];
+	MemSet(t, 0, sizeof(CMediaTrack));
+	t->num = m->track_count + 1;
+
+	//trak -> mdia -> minf -> stbl, with mdhd and hdlr along the way.
+	while (p + 8 <= end)
+	{
+		size = Mp4U32(m->buf, p);
+		type = Mp4Type(m->buf, p + 4);
+		if (size < 8 || p + size > end)
+			break;
+		if (type == MP4_MDIA)
+		{
+			mdia     = p + 8;
+			mdia_end = p + size;
+		}
+		else if (type == MP4_EDTS)
+		{
+			edts     = p + 8;
+			edts_end = p + size;
+		}
+		p += size;
+	}
+	if (!mdia)
+		return;
+
+	//An edit list starting past zero is the encoder delay; its media time comes
+	//off every sample. Empty edits (media_time -1) are not handled.
+	while (edts && edts + 8 <= edts_end)
+	{
+		size = Mp4U32(m->buf, edts);
+		type = Mp4Type(m->buf, edts + 4);
+		if (size < 8 || edts + size > edts_end)
+			break;
+		if (type == MP4_ELST && Mp4U32(m->buf, edts + 12) > 0)
+		{
+			elst = edts + 16;
+			if (m->buf[edts + 8])
+				media_time = Mp4U64(m->buf, elst + 8);
+			else
+				media_time = Mp4U32(m->buf, elst + 4);
+		}
+		edts += size;
+	}
+	p = mdia;
+	while (p + 8 <= mdia_end)
+	{
+		size = Mp4U32(m->buf, p);
+		type = Mp4Type(m->buf, p + 4);
+		if (size < 8 || p + size > mdia_end)
+			break;
+		if (type == MP4_MDHD)
+			mdhd = p + 8;
+		else if (type == MP4_HDLR)
+			hdlr = Mp4Type(m->buf, p + 16);
+		else if (type == MP4_MINF)
+		{
+			minf     = p + 8;
+			minf_end = p + size;
+		}
+		p += size;
+	}
+	if (mdhd)
+	{
+		ver = m->buf[mdhd];
+		if (ver)
+			t->timescale = Mp4U32(m->buf, mdhd + 20);
+		else
+			t->timescale = Mp4U32(m->buf, mdhd + 12);
+	}
+	if (elst && media_time > 0 && t->timescale > 0)
+		t->time_shift = ToF64(media_time) / t->timescale;
+	if (hdlr == MP4_VIDE)
+		t->type = MEDIA_TRACK_VIDEO;
+	else if (hdlr == MP4_SOUN)
+		t->type = MEDIA_TRACK_AUDIO;
+	else
+		return;
+	if (!minf)
+		return;
+
+	p = minf;
+	while (p + 8 <= minf_end)
+	{
+		size = Mp4U32(m->buf, p);
+		type = Mp4Type(m->buf, p + 4);
+		if (size < 8 || p + size > minf_end)
+			break;
+		if (type == MP4_STBL)
+		{
+			stbl     = p + 8;
+			stbl_end = p + size;
+		}
+		p += size;
+	}
+	if (!stbl)
+		return;
+
+	Mp4ParseStbl(m, &tb, t, stbl, stbl_end);
+	if (!Mp4BuildSamples(m, &tb, t))
+		return;
+	t->valid = TRUE;
+	m->track_count++;
+}
+
+U0 Mp4ParseMoov(CMediaCtx *m, I64 pos, I64 end)
+{
+	I64 size, type, p = pos, ts, dur;
+
+	while (p + 8 <= end)
+	{
+		size = Mp4U32(m->buf, p);
+		type = Mp4Type(m->buf, p + 4);
+		if (size < 8 || p + size > end)
+			break;
+		if (type == MP4_MVHD)
+		{
+			if (m->buf[p + 8])
+			{
+				ts  = Mp4U32(m->buf, p + 28);
+				dur = Mp4U64(m->buf, p + 32);
+			}
+			else
+			{
+				ts  = Mp4U32(m->buf, p + 20);
+				dur = Mp4U32(m->buf, p + 24);
+			}
+			if (ts > 0)
+				m->duration = ToF64(dur) / ts;
+		}
+		else if (type == MP4_TRAK)
+			Mp4ParseTrak(m, p + 8, p + size);
+		p += size;
+	}
+}
+
+public Bool MP4Open(CMediaCtx *m, U8 *buf, I64 size)
+{//Reads moov. Sample data stays where it is.
+	I64 p = 0, bsize, btype, hdr;
+
+	MemSet(m, 0, sizeof(CMediaCtx));
+	m->buf       = buf;
+	m->size      = size;
+	m->container = MEDIA_CONT_MP4;
+	if (!buf || size < 16)
+		return FALSE;
+	if (Mp4Type(buf, 4) != MP4_FTYP)
+		return FALSE;
+
+	while (p + 8 <= size)
+	{
+		bsize = Mp4U32(buf, p);
+		btype = Mp4Type(buf, p + 4);
+		hdr   = MP4_BOX_HDR;
+		if (bsize == 1)
+		{//64-bit size follows the type.
+			if (p + 16 > size)
+				break;
+			bsize = Mp4U64(buf, p + 8);
+			hdr   = 16;
+		}
+		else if (!bsize)
+			bsize = size - p;
+		if (bsize < hdr || p + bsize > size)
+			break;
+		if (btype == MP4_MOOV)
+			Mp4ParseMoov(m, p + hdr, p + bsize);
+		p += bsize;
+	}
+
+	return ToBool(m->track_count > 0);
+}
+
+public Bool MP4Next(CMediaCtx *m, CMediaPacket *pkt)
+{//Next sample across all tracks, earliest first. FALSE at end of stream.
+	CMediaTrack	*t, *pick = NULL;
+	CMp4Sample	*s;
+	I64			 i;
+	F64			 best = 0.0;
+
+	for (i = 0; i < m->track_count; i++)
+	{
+		t = &m->track[i];
+		if (t->valid && t->sample_pos < t->sample_count)
+		{
+			s = &t->samples[t->sample_pos];
+			if (!pick || s->time < best)
+			{
+				pick = t;
+				best = s->time;
+			}
+		}
+	}
+	if (!pick)
+		return FALSE;
+
+	s = &pick->samples[pick->sample_pos];
+	pick->sample_pos++;
+	pkt->data  = m->buf + s->off;
+	pkt->size  = s->size;
+	pkt->track = pick->num;
+	pkt->time  = s->time;
+	pkt->key   = s->key;
+
+	return TRUE;
+}
+
+public U0 MP4Rewind(CMediaCtx *m)
+{
+	I64 i;
+
+	for (i = 0; i < m->track_count; i++)
+		m->track[i].sample_pos = 0;
+}
+
+public U0 MP4Free(CMediaCtx *m)
+{
+	I64 i;
+
+	for (i = 0; i < m->track_count; i++)
+	{
+		Free(m->track[i].samples);
+		m->track[i].samples = NULL;
+	}
+}
