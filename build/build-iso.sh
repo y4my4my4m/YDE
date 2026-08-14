@@ -23,42 +23,40 @@ KVM=''
 # Set this true if you want to test ISOs in QEMU after building.
 TESTING=false
 
+for tool in qemu-system-x86_64 qemu-img xorriso mcopy mmd mdel git make tar
+do
+	command -v "$tool" >/dev/null || { echo "ERROR: $tool not found in \$PATH."; exit 1; }
+done
+
+[ -f AUTO.ISO ] || { echo "ERROR: no AUTO.ISO in $SCRIPT_DIR."; exit 1; }
+
 TMPDIR="$(mktemp -d)"
 TMPISODIR="$TMPDIR/iso"
+TMPSRC="$TMPDIR/src"
 TMPDISK="$TMPDIR/ZealOS.raw"
-TMPMOUNT="$TMPDIR/mnt"
 
 # Change this if your default QEMU version does not work and you have installed a different version elsewhere.
 QEMU_BIN_PATH="$(dirname "$(which qemu-system-x86_64)")"
 
-mount_tempdisk() {
-	sudo modprobe nbd
-	sudo "$QEMU_BIN_PATH/qemu-nbd" -c /dev/nbd0 -f raw "$TMPDISK"
-	sudo partprobe /dev/nbd0 || true
-	sudo mount /dev/nbd0p1 "$TMPMOUNT"
-}
+# The install is FAT32, so mtools reaches it with no root, no nbd and no kernel
+# filesystem driver. IMG is set once the partition table exists.
+export MTOOLS_SKIP_CHECK=1
+IMG=""
 
-umount_tempdisk() {
-	sync
-	sudo umount "$TMPMOUNT"
-	sudo "$QEMU_BIN_PATH/qemu-nbd" -d /dev/nbd0
+set_img() {
+	# MBR partition entry 0: LBA of first sector at byte 454, 4 bytes little-endian.
+	start=$(od -An -tu4 -j454 -N4 "$TMPDISK" | tr -d ' ')
+	IMG="$TMPDISK@@$((start * 512))"
 }
 
 script_cleanup() {
-    sync
-
-    sudo umount "$TMPMOUNT" >/dev/null 2>&1 || true
-    sudo "$QEMU_BIN_PATH/qemu-nbd" -d /dev/nbd0 >/dev/null 2>&1 || true
-
-    echo "Deleting temp folder ..."
-    sudo rm -rf "$TMPDIR"
-    sudo rm -rf "$TMPISODIR"
+	echo "Deleting temp folder ..."
+	rm -rf "$TMPDIR"
 }
 
 trap 'script_cleanup' EXIT
 
-mkdir -p "$TMPMOUNT"
-mkdir -p "$TMPISODIR"
+mkdir -p "$TMPISODIR" "$TMPSRC"
 
 echo "Building ZealBooter..."
 make -C ../zealbooter distclean all || ( echo "ERROR: ZealBooter build failed !" && false )
@@ -66,15 +64,25 @@ make -C ../zealbooter distclean all || ( echo "ERROR: ZealBooter build failed !"
 echo "Making temp vdisk, running auto-install ..."
 "$QEMU_BIN_PATH/qemu-img" create -f raw "$TMPDISK" 1024M
 "$QEMU_BIN_PATH/qemu-system-x86_64" -machine q35 $KVM -drive format=raw,file="$TMPDISK" -m 1G -rtc base=localtime -smp 4 -cdrom AUTO.ISO -device isa-debug-exit $QEMU_HEADLESS || true
+set_img
 
-echo "Copying all src/ code into vdisk Tmp/OSBuild/ ..."
+# Game data and other ignored blobs live under src/ but are not part of the OS,
+# and the bootstrap vdisk is 1 GiB. Take tracked and untracked-but-not-ignored
+# files only.
+echo "Staging src/ ..."
 rm -f ../src/Home/Registry.ZC
 rm -f ../src/Home/MakeHome.ZC
 rm -f ../src/Boot/Kernel.ZXE
-mount_tempdisk
-sudo mkdir -p "$TMPMOUNT/Tmp/OSBuild"
-sudo cp -r ../src/* "$TMPMOUNT/Tmp/OSBuild/"
-umount_tempdisk
+( cd .. && git ls-files -co --exclude-standard -z -- src | tar --null -T - -cf - ) | \
+	tar -xf - -C "$TMPSRC"
+
+echo "Copying all src/ code into vdisk Tmp/OSBuild/ ..."
+mmd -i "$IMG" ::/Tmp/OSBuild
+mcopy -s -Q -o -i "$IMG" "$TMPSRC"/src/* ::/Tmp/OSBuild/
+
+# The install carries the AUTO.ISO copy of the bootstrap chain, which is only as
+# new as the ISO. Run the ones in this tree instead.
+mcopy -Q -o -i "$IMG" ../src/Misc/Auto/AutoFullDistro*.ZC ::/Misc/Auto/
 
 echo "Rebuilding kernel headers, kernel, OS, and building Distro ISO ..."
 "$QEMU_BIN_PATH/qemu-system-x86_64" -machine q35 $KVM -drive format=raw,file="$TMPDISK" -m 1G -rtc base=localtime -smp 4 -device isa-debug-exit $QEMU_HEADLESS || true
@@ -107,26 +115,24 @@ cat limine/limine-bios-hdd.h >> limine/Limine-BIOS-HDD.HH
 sed -i 's/const uint8_t/U8/g' limine/Limine-BIOS-HDD.HH
 sed -i "s/\[\]/\[$(grep -o "0x" ./limine/limine-bios-hdd.h | wc -l)\]/g" limine/Limine-BIOS-HDD.HH
 
-mount_tempdisk
 echo "Extracting MyDistro ISO from vdisk ..."
-cp "$TMPMOUNT/Tmp/MyDistro.ISO.C" ./ZealOS-MyDistro.iso
-sudo rm -f "$TMPMOUNT/Tmp/MyDistro.ISO.C"
+mcopy -i "$IMG" ::/Tmp/MyDistro.ISO.C ./ZealOS-MyDistro.iso
+mdel -i "$IMG" ::/Tmp/MyDistro.ISO.C
 echo "Setting up temp ISO directory contents for use with limine xorriso command ..."
-sudo cp -rf "$TMPMOUNT"/* "$TMPISODIR/"
-sudo rm -f "$TMPISODIR/Boot/OldMBR.BIN"
-sudo rm -f "$TMPISODIR/Boot/BootMHD2.BIN"
-sudo mkdir -p "$TMPISODIR/EFI/BOOT"
-sudo cp limine/Limine-BIOS-HDD.HH "$TMPISODIR/Boot/Limine-BIOS-HDD.HH"
-sudo cp limine/BOOTX64.EFI "$TMPISODIR/EFI/BOOT/BOOTX64.EFI"
-sudo cp limine/limine-uefi-cd.bin "$TMPISODIR/Boot/Limine-UEFI-CD.BIN"
-sudo cp limine/limine-bios-cd.bin "$TMPISODIR/Boot/Limine-BIOS-CD.BIN"
-sudo cp limine/limine-bios.sys "$TMPISODIR/Boot/Limine-BIOS.SYS"
-sudo cp ../zealbooter/bin/kernel "$TMPISODIR/Boot/ZealBooter.ELF"
-sudo cp ../zealbooter/limine.conf "$TMPISODIR/Boot/Limine.CONF"
+mcopy -s -Q -i "$IMG" "::/*" "$TMPISODIR/"
+rm -f "$TMPISODIR/Boot/OldMBR.BIN"
+rm -f "$TMPISODIR/Boot/BootMHD2.BIN"
+mkdir -p "$TMPISODIR/EFI/BOOT"
+cp limine/Limine-BIOS-HDD.HH "$TMPISODIR/Boot/Limine-BIOS-HDD.HH"
+cp limine/BOOTX64.EFI "$TMPISODIR/EFI/BOOT/BOOTX64.EFI"
+cp limine/limine-uefi-cd.bin "$TMPISODIR/Boot/Limine-UEFI-CD.BIN"
+cp limine/limine-bios-cd.bin "$TMPISODIR/Boot/Limine-BIOS-CD.BIN"
+cp limine/limine-bios.sys "$TMPISODIR/Boot/Limine-BIOS.SYS"
+cp ../zealbooter/bin/kernel "$TMPISODIR/Boot/ZealBooter.ELF"
+cp ../zealbooter/limine.conf "$TMPISODIR/Boot/Limine.CONF"
 echo "Copying DVDKernel.ZXE over ISO Boot/Kernel.ZXE ..."
-sudo mv "$TMPMOUNT/Tmp/DVDKernel.ZXE" "$TMPISODIR/Boot/Kernel.ZXE"
-sudo rm -f "$TMPISODIR/Tmp/DVDKernel.ZXE"
-umount_tempdisk
+mcopy -i "$IMG" ::/Tmp/DVDKernel.ZXE "$TMPISODIR/Boot/Kernel.ZXE"
+rm -f "$TMPISODIR/Tmp/DVDKernel.ZXE"
 
 truncate -s 32K bios_boot.img
 

@@ -1,5 +1,4 @@
-//VP8 lossy decoder (RFC 6386). Keyframe/intra only; no loop filter, no inter
-//prediction. Tables live in GrWEBPTables.ZC.
+//VP8 lossy decoder (RFC 6386). Tables live in VP8Tables.ZC.
 //
 //Split out of GrWEBP.ZC so the still-image and video paths share one copy:
 //ZealC has a single global symbol table.
@@ -93,9 +92,47 @@ I64 Vp8SVal(CVp8Br *br, I64 nbits)
 #define VP8_U_OFF	(VP8_BPS * 20 + 4)
 #define VP8_V_OFF	(VP8_BPS * 20 + 20)
 
+//Reference slots, and the loop filter's ref-delta index: 0 is the current
+//frame, i.e. an intra macroblock.
+#define VP8_REF_INTRA	0
+#define VP8_REF_LAST	1
+#define VP8_REF_GOLDEN	2
+#define VP8_REF_ALT		3
+
+//Inter modes, also the loop filter's mode-delta index minus one; B_PRED is 0
+//there and intra 16x16 takes no mode delta.
+#define VP8_MV_NONE		0
+#define VP8_MV_ZERO		1
+#define VP8_MV_MV		2
+#define VP8_MV_SPLIT	3
+
+//Split partitionings, in coded order. 4 = whole macroblock.
+#define VP8_SPLIT_16x8	0
+#define VP8_SPLIT_8x16	1
+#define VP8_SPLIT_8x8	2
+#define VP8_SPLIT_4x4	3
+#define VP8_SPLIT_NONE	4
+
+//Quarter-pel luma, eighth-pel chroma.
+#define VP8_MV_MARGIN	64
+
+class CVp8MV
+{
+	I16	x, y;
+};
+
+class CVp8MB
+{
+	U8		 ref, mode, part, i4x4;
+	CVp8MV	 mv;
+	CVp8MV	 bmv[16];		//Indexed by partition, not by subblock.
+};
+
 class CVp8Dec
 {
 	I64	 w, h, mb_w, mb_h;
+	Bool	 keyframe, show;
+	I64	 version;
 	CVp8Br	 br;			//Partition 0.
 	CVp8Br	 parts[8];
 	I64	 num_parts;
@@ -129,7 +166,31 @@ class CVp8Dec
 	Bool	 lf_delta_en;
 	I64		 lf_ref_delta[4], lf_mode_delta[4];
 	U8		*mb_flevel, *mb_inner;
+	Bool	 no_y2;				//B_PRED and SPLITMV carry no Y2 block.
+	//Inter frames. Entropy state persists between frames; refresh_entropy = 0
+	//means this frame's updates are rolled back afterwards.
+	I64		 prob_intra, prob_last, prob_gf;
+	U8		 ymode_p[4], uvmode_p[3];
+	U8		 mvp[38];			//[2][19], row component first.
+	U8		*sv_probs;			//Snapshot taken before the token updates.
+	U8		 sv_ymode[4], sv_uvmode[3], sv_mvp[38];
+	Bool	 save_ent;
+	I64		 sign_bias[4];
+	Bool	 refresh_last, refresh_golden, refresh_alt;
+	I64		 copy_golden, copy_alt;
+	CVp8MB	*mbs;				//mb_w * mb_h.
+	U8		*seg_map;			//Persists when update_map is clear.
+	//Reference planes, indexed by VP8_REF_*; slot 0 unused. Allocated only for
+	//the video path.
+	Bool	 want_refs, sized;
+	I64		 fail, fail_row;	//Diagnostics for MediaVp8Hash.
+	I64		 a_mb_w, a_mb_h;	//Dimensions the buffers were sized for.
+	U8		*ref_y[4], *ref_u[4], *ref_v[4];
+	U8		*mcsrc, *mctmp;		//Motion compensation scratch, stride 32.
 };
+
+#define VP8_MCS		32
+#define VP8_MCSZ	(VP8_MCS * 32)
 
 I64 Vp8Clip127(I64 v, I64 m)
 {
@@ -543,11 +604,286 @@ U16 vp8_scan[16] = {
 	384, 388, 392, 396
 };
 
-U0 Vp8ParseIntraMode(CVp8Dec *d, I64 mb_x)
+//--- motion vectors (RFC 6386 par. 16-17) ----------------------------------
+//
+//Mirrors ffmpeg vp8.c: vectors are quarter-pel luma throughout, undoubled.
+
+CVp8MB *Vp8MBAt(CVp8Dec *d, I64 mb_x, I64 mb_y)
+{
+	if (mb_x < 0 || mb_y < 0)
+		return NULL;
+	return d->mbs + mb_y * d->mb_w + mb_x;
+}
+
+I64 Vp8ReadMVComp(CVp8Br *br, U8 *p)
+{//p: 0 is_short, 1 sign, 2..8 short tree, 9..18 long bits.
+	I64	 x = 0, i, bit;
+	U8	*ps;
+
+	if (Vp8Bit(br, p[0]))
+	{
+		for (i = 0; i < 3; i++)
+			x += Vp8Bit(br, p[9 + i]) << i;
+		for (i = 9; i > 3; i--)
+			x += Vp8Bit(br, p[9 + i]) << i;
+		if (!(x & 0xFFF0) || Vp8Bit(br, p[12]))
+			x += 8;
+	}
+	else
+	{
+		ps = p + 2;
+		bit = Vp8Bit(br, *ps);
+		ps += 1 + 3 * bit;
+		x += 4 * bit;
+		bit = Vp8Bit(br, *ps);
+		ps += 1 + bit;
+		x += 2 * bit;
+		x += Vp8Bit(br, *ps);
+	}
+	if (x && Vp8Bit(br, p[1]))
+		return -x;
+
+	return x;
+}
+
+U0 Vp8ClampMV(CVp8Dec *d, CVp8MV *dst, I64 x, I64 y, I64 mb_x, I64 mb_y)
+{//A vector may reach one macroblock plus the margin past the frame edge.
+	I64 lo, hi;
+
+	lo = -VP8_MV_MARGIN - (mb_x << 6);
+	hi = ((d->mb_w - 1 - mb_x) << 6) + VP8_MV_MARGIN;
+	if (x < lo)
+		x = lo;
+	else if (x > hi)
+		x = hi;
+	lo = -VP8_MV_MARGIN - (mb_y << 6);
+	hi = ((d->mb_h - 1 - mb_y) << 6) + VP8_MV_MARGIN;
+	if (y < lo)
+		y = lo;
+	else if (y > hi)
+		y = hi;
+	dst->x = x;
+	dst->y = y;
+}
+
+U0 Vp8MVEdge(CVp8Dec *d, CVp8MB *e, I64 n, I64 bias, CVp8MV *near, I64 *cnt,
+			 I64 *_idx)
+{//Above, left and above-left, weighted 2, 2 and 1. Intra neighbours count for
+//nothing; a neighbour with the opposite sign bias is negated.
+	I64 idx = *_idx, w = 2, x, y;
+
+	if (n == 2)
+		w = 1;
+	if (!e || !e->ref)
+		return;
+	x = e->mv.x;
+	y = e->mv.y;
+	if (!x && !y)
+	{
+		cnt[0] += w;
+		return;
+	}
+	if (bias != d->sign_bias[e->ref])
+	{
+		x = -x;
+		y = -y;
+	}
+	if (!n || x != near[idx].x || y != near[idx].y)
+	{
+		idx++;
+		near[idx].x = x;
+		near[idx].y = y;
+	}
+	cnt[idx] += w;
+	*_idx = idx;
+}
+
+U8 *Vp8SubMVProb(I64 lx, I64 ly, I64 ax, I64 ay)
+{//Rows: 0 normal, 1 left zero, 2 above zero, 3 left = above, 4 both zero.
+	if (lx == ax && ly == ay)
+	{
+		if (lx || ly)
+			return vp8_submv_prob + 3 * 3;
+		return vp8_submv_prob + 4 * 3;
+	}
+	if (!ax && !ay)
+		return vp8_submv_prob + 2 * 3;
+	if (!lx && !ly)
+		return vp8_submv_prob + 3;
+
+	return vp8_submv_prob;
+}
+
+I64 Vp8ParseSplitMV(CVp8Dec *d, CVp8MB *mb, CVp8MB *above, CVp8MB *left)
+{//Returns the partition count; bmv is indexed by partition.
+	CVp8Br	*br = &d->br;
+	U8		*ml, *ma, *mc, *fi, *p;
+	I64		 part, num, n, k, lx, ly, ax, ay;
+
+	if (Vp8Bit(br, vp8_mbsplit_prob[0]))
+	{
+		if (Vp8Bit(br, vp8_mbsplit_prob[1]))
+			part = VP8_SPLIT_16x8 + Vp8Bit(br, vp8_mbsplit_prob[2]);
+		else
+			part = VP8_SPLIT_8x8;
+	}
+	else
+		part = VP8_SPLIT_4x4;
+
+	if (left)
+		ml = vp8_mbsplits + left->part * 16;
+	else
+		ml = vp8_mbsplits + VP8_SPLIT_NONE * 16;
+	if (above)
+		ma = vp8_mbsplits + above->part * 16;
+	else
+		ma = vp8_mbsplits + VP8_SPLIT_NONE * 16;
+	mc  = vp8_mbsplits + part * 16;
+	fi  = vp8_mbfirstidx + part * 16;
+	num = vp8_mbsplit_count[part];
+	mb->part = part;
+
+	for (n = 0; n < num; n++)
+	{
+		k = fi[n];
+		lx = 0;
+		ly = 0;
+		ax = 0;
+		ay = 0;
+		if (!(k & 3))
+		{
+			if (left)
+			{
+				lx = left->bmv[ml[k + 3]].x;
+				ly = left->bmv[ml[k + 3]].y;
+			}
+		}
+		else
+		{
+			lx = mb->bmv[mc[k - 1]].x;
+			ly = mb->bmv[mc[k - 1]].y;
+		}
+		if (k <= 3)
+		{
+			if (above)
+			{
+				ax = above->bmv[ma[k + 12]].x;
+				ay = above->bmv[ma[k + 12]].y;
+			}
+		}
+		else
+		{
+			ax = mb->bmv[mc[k - 4]].x;
+			ay = mb->bmv[mc[k - 4]].y;
+		}
+
+		p = Vp8SubMVProb(lx, ly, ax, ay);
+		if (!Vp8Bit(br, p[0]))
+		{
+			mb->bmv[n].x = lx;
+			mb->bmv[n].y = ly;
+		}
+		else if (!Vp8Bit(br, p[1]))
+		{
+			mb->bmv[n].x = ax;
+			mb->bmv[n].y = ay;
+		}
+		else if (!Vp8Bit(br, p[2]))
+		{
+			mb->bmv[n].x = 0;
+			mb->bmv[n].y = 0;
+		}
+		else
+		{//NEW4x4 is a delta on the macroblock's best vector.
+			mb->bmv[n].y = mb->mv.y + Vp8ReadMVComp(br, d->mvp);
+			mb->bmv[n].x = mb->mv.x + Vp8ReadMVComp(br, d->mvp + 19);
+		}
+	}
+
+	return num;
+}
+
+U0 Vp8ParseInterMV(CVp8Dec *d, CVp8MB *mb, I64 mb_x, I64 mb_y)
 {
 	CVp8Br	*br = &d->br;
+	CVp8MB	*above, *left, *aleft;
+	CVp8MV	 near[4];
+	I64		 cnt[4], idx = 0, i, t, num, bias = d->sign_bias[mb->ref];
+
+	MemSet(near, 0, 4 * sizeof(CVp8MV));
+	MemSet(cnt, 0, 4 * sizeof(I64));
+	above = Vp8MBAt(d, mb_x, mb_y - 1);
+	left  = Vp8MBAt(d, mb_x - 1, mb_y);
+	aleft = Vp8MBAt(d, mb_x - 1, mb_y - 1);
+	Vp8MVEdge(d, above, 0, bias, near, cnt, &idx);
+	Vp8MVEdge(d, left,  1, bias, near, cnt, &idx);
+	Vp8MVEdge(d, aleft, 2, bias, near, cnt, &idx);
+
+	if (!Vp8Bit(br, vp8_mode_contexts[cnt[0] * 4]))
+	{
+		mb->mode = VP8_MV_ZERO;
+		return;
+	}
+	mb->mode = VP8_MV_MV;
+	//Three distinct vectors: the outer two merge when they match.
+	if (cnt[3] && near[1].x == near[3].x && near[1].y == near[3].y)
+		cnt[1]++;
+	if (cnt[2] > cnt[1])
+	{
+		t = cnt[1];
+		cnt[1] = cnt[2];
+		cnt[2] = t;
+		t = near[1].x;
+		near[1].x = near[2].x;
+		near[2].x = t;
+		t = near[1].y;
+		near[1].y = near[2].y;
+		near[2].y = t;
+	}
+	if (!Vp8Bit(br, vp8_mode_contexts[cnt[1] * 4 + 1]))
+	{
+		Vp8ClampMV(d, &mb->mv, near[1].x, near[1].y, mb_x, mb_y);
+		mb->bmv[0].x = mb->mv.x;
+		mb->bmv[0].y = mb->mv.y;
+		return;
+	}
+	if (!Vp8Bit(br, vp8_mode_contexts[cnt[2] * 4 + 2]))
+	{
+		Vp8ClampMV(d, &mb->mv, near[2].x, near[2].y, mb_x, mb_y);
+		mb->bmv[0].x = mb->mv.x;
+		mb->bmv[0].y = mb->mv.y;
+		return;
+	}
+	//Best of zero and nearest, then either a delta on it or a split.
+	i = 0;
+	if (cnt[1] >= cnt[0])
+		i = 1;
+	Vp8ClampMV(d, &mb->mv, near[i].x, near[i].y, mb_x, mb_y);
+	cnt[3] = (ToBool(left  && left->mode  == VP8_MV_SPLIT) +
+			  ToBool(above && above->mode == VP8_MV_SPLIT)) * 2 +
+			 ToBool(aleft && aleft->mode == VP8_MV_SPLIT);
+	if (Vp8Bit(br, vp8_mode_contexts[cnt[3] * 4 + 3]))
+	{
+		mb->mode = VP8_MV_SPLIT;
+		num = Vp8ParseSplitMV(d, mb, above, left);
+		mb->mv.x = mb->bmv[num - 1].x;
+		mb->mv.y = mb->bmv[num - 1].y;
+	}
+	else
+	{
+		mb->mv.y += Vp8ReadMVComp(br, d->mvp);
+		mb->mv.x += Vp8ReadMVComp(br, d->mvp + 19);
+		mb->bmv[0].x = mb->mv.x;
+		mb->bmv[0].y = mb->mv.y;
+	}
+}
+
+U0 Vp8ParseMBMode(CVp8Dec *d, I64 mb_x, I64 mb_y)
+{
+	CVp8Br	*br = &d->br;
+	CVp8MB	*mb = d->mbs + mb_y * d->mb_w + mb_x;
 	U8		*top = d->intra_t + 4 * mb_x;
-	I64		 x, y, ymode;
+	I64		 x, y, ymode = 0;
 	U8		*prob;
 
 	if (d->update_map)
@@ -556,7 +892,10 @@ U0 Vp8ParseIntraMode(CVp8Dec *d, I64 mb_x)
 			d->segment = Vp8Bit(br, d->seg_prob[1]);
 		else
 			d->segment = Vp8Bit(br, d->seg_prob[2]) + 2;
+		d->seg_map[mb_y * d->mb_w + mb_x] = d->segment;
 	}
+	else if (d->use_segment)
+		d->segment = d->seg_map[mb_y * d->mb_w + mb_x];
 	else
 		d->segment = 0;
 	if (d->use_skip)
@@ -564,22 +903,63 @@ U0 Vp8ParseIntraMode(CVp8Dec *d, I64 mb_x)
 	else
 		d->skip = FALSE;
 
-	d->is_i4x4 = !Vp8Bit(br, 145);
+	mb->ref  = VP8_REF_INTRA;
+	mb->mode = VP8_MV_NONE;
+	mb->part = VP8_SPLIT_NONE;
+	mb->mv.x = 0;
+	mb->mv.y = 0;
+	MemSet(mb->bmv, 0, 16 * sizeof(CVp8MV));
+
+	if (!d->keyframe && Vp8Bit(br, d->prob_intra))
+	{
+		if (Vp8Bit(br, d->prob_last))
+			mb->ref = VP8_REF_GOLDEN + Vp8Bit(br, d->prob_gf);
+		else
+			mb->ref = VP8_REF_LAST;
+		Vp8ParseInterMV(d, mb, mb_x, mb_y);
+		d->is_i4x4 = FALSE;
+		mb->i4x4 = FALSE;
+		return;
+	}
+
+	if (d->keyframe)
+		d->is_i4x4 = !Vp8Bit(br, 145);
+	else
+	{//ymode tree, updatable probabilities.
+		d->is_i4x4 = FALSE;
+		if (!Vp8Bit(br, d->ymode_p[0]))
+			ymode = 0;						//DC
+		else if (!Vp8Bit(br, d->ymode_p[1]))
+		{
+			if (!Vp8Bit(br, d->ymode_p[2]))
+				ymode = 2;					//VE
+			else
+				ymode = 3;					//HE
+		}
+		else if (!Vp8Bit(br, d->ymode_p[3]))
+			ymode = 1;						//TM
+		else
+			d->is_i4x4 = TRUE;
+	}
+	mb->i4x4 = d->is_i4x4;
 	if (!d->is_i4x4)
 	{//16x16 mode: 0 DC, 1 TM, 2 VE, 3 HE (libwebp enum order).
-		if (Vp8Bit(br, 156))
+		if (d->keyframe)
 		{
-			if (Vp8Bit(br, 128))
-				ymode = 1;	//TM
+			if (Vp8Bit(br, 156))
+			{
+				if (Vp8Bit(br, 128))
+					ymode = 1;	//TM
+				else
+					ymode = 3;	//HE
+			}
 			else
-				ymode = 3;	//HE
-		}
-		else
-		{
-			if (Vp8Bit(br, 163))
-				ymode = 2;	//VE
-			else
-				ymode = 0;	//DC
+			{
+				if (Vp8Bit(br, 163))
+					ymode = 2;	//VE
+				else
+					ymode = 0;	//DC
+			}
 		}
 		d->imodes[0] = ymode;
 		for (x = 0; x < 4; x++)
@@ -594,8 +974,11 @@ U0 Vp8ParseIntraMode(CVp8Dec *d, I64 mb_x)
 		{
 			ymode = d->intra_l[y];
 			for (x = 0; x < 4; x++)
-			{
-				prob = vp8_bmode_probs + (top[x] * 10 + ymode) * 9;
+			{//Inter frames drop the above/left context for one fixed set.
+				if (d->keyframe)
+					prob = vp8_bmode_probs + (top[x] * 10 + ymode) * 9;
+				else
+					prob = vp8_bmode_prob_inter;
 				if (!Vp8Bit(br, prob[0]))
 					ymode = 0;
 				else if (!Vp8Bit(br, prob[1]))
@@ -629,11 +1012,15 @@ U0 Vp8ParseIntraMode(CVp8Dec *d, I64 mb_x)
 		}
 	}
 	//UV mode.
-	if (!Vp8Bit(br, 142))
+	if (d->keyframe)
+		prob = vp8_uvmode_prob_kf;
+	else
+		prob = d->uvmode_p;
+	if (!Vp8Bit(br, prob[0]))
 		d->uvmode = 0;
-	else if (!Vp8Bit(br, 114))
+	else if (!Vp8Bit(br, prob[1]))
 		d->uvmode = 2;
-	else if (Vp8Bit(br, 183))
+	else if (Vp8Bit(br, prob[2]))
 		d->uvmode = 1;
 	else
 		d->uvmode = 3;
@@ -652,7 +1039,7 @@ U0 Vp8ParseResiduals(CVp8Dec *d, I64 mb_x, CVp8Br *tbr)
 	{
 		d->nz_t[1 + mb_x] = 0;
 		d->nz_t[0] = 0;
-		if (!d->is_i4x4)
+		if (!d->no_y2)
 		{
 			d->nzdc_t[1 + mb_x] = 0;
 			d->nzdc_t[0] = 0;
@@ -660,7 +1047,7 @@ U0 Vp8ParseResiduals(CVp8Dec *d, I64 mb_x, CVp8Br *tbr)
 		return;
 	}
 
-	if (!d->is_i4x4)
+	if (!d->no_y2)
 	{//Y2 (WHT) DC block.
 		MemSet(dc, 0, sizeof(dc));
 		ctx = d->nzdc_t[1 + mb_x] + d->nzdc_t[0];
@@ -742,11 +1129,236 @@ U0 Vp8ParseResiduals(CVp8Dec *d, I64 mb_x, CVp8Br *tbr)
 	d->nz_t[0] = nz_left;
 }
 
+//--- motion compensation (RFC 6386 par. 18) --------------------------------
+
+U0 Vp8McFetch(U8 *ref, I64 stride, I64 pw, I64 ph, I64 x0, I64 y0, I64 w,
+			  I64 h, U8 *dst, I64 ds)
+{//Clamped-edge fetch: vectors may point outside the reference plane.
+	I64	 x, y, sx, sy;
+	U8	*s;
+
+	if (x0 >= 0 && y0 >= 0 && x0 + w <= pw && y0 + h <= ph)
+	{
+		for (y = 0; y < h; y++)
+			MemCopy(dst + y * ds, ref + (y0 + y) * stride + x0, w);
+		return;
+	}
+	for (y = 0; y < h; y++)
+	{
+		sy = y0 + y;
+		if (sy < 0)
+			sy = 0;
+		else if (sy >= ph)
+			sy = ph - 1;
+		s = ref + sy * stride;
+		for (x = 0; x < w; x++)
+		{
+			sx = x0 + x;
+			if (sx < 0)
+				sx = 0;
+			else if (sx >= pw)
+				sx = pw - 1;
+			dst[y * ds + x] = s[sx];
+		}
+	}
+}
+
+U0 Vp8McPass(U8 *src, I64 ss, U8 *dst, I64 ds, I64 w, I64 h, I64 step, U8 *f,
+			 Bool six)
+{//One filter pass along step: 1 horizontal, the source stride vertical.
+	I64	 x, y, v;
+	U8	*s;
+
+	for (y = 0; y < h; y++)
+	{
+		s = src + y * ss;
+		for (x = 0; x < w; x++)
+		{
+			if (six)
+				v = (f[0] * s[-2 * step] - f[1] * s[-step] + f[2] * s[0]
+					 + f[3] * s[step] - f[4] * s[2 * step] + f[5] * s[3 * step]
+					 + 64) >> 7;
+			else
+				v = (f[0] * s[0] + f[1] * s[step] + 4) >> 3;
+			dst[y * ds + x] = Vp8Clip8(v);
+			s++;
+		}
+	}
+}
+
+U0 Vp8McBlock(CVp8Dec *d, U8 *ref, I64 stride, I64 pw, I64 ph, I64 sx, I64 sy,
+			  I64 mvx, I64 mvy, Bool chroma, I64 bw, I64 bh, U8 *dst, I64 ds)
+{//Version 0 interpolates with the 6-tap filters, 1 and 2 bilinear. Phases are
+//eighth-pel: quarter-pel luma vectors double, chroma vectors are already at
+//half the luma scale.
+	U8	*src = d->mcsrc, *tmp = d->mctmp, *fx = NULL, *fy = NULL;
+	U8	 bx[2], by[2];
+	I64	 ix, iy, mx, my, margin, extra;
+	Bool six = ToBool(!d->version);
+
+	if (chroma)
+	{
+		mx = mvx & 7;
+		my = mvy & 7;
+		ix = sx + (mvx >> 3);
+		iy = sy + (mvy >> 3);
+	}
+	else
+	{
+		mx = (mvx * 2) & 7;
+		my = (mvy * 2) & 7;
+		ix = sx + (mvx >> 2);
+		iy = sy + (mvy >> 2);
+	}
+	if (!mx && !my)
+	{
+		Vp8McFetch(ref, stride, pw, ph, ix, iy, bw, bh, dst, ds);
+		return;
+	}
+	if (six)
+	{
+		margin = 2;
+		extra = 5;
+		if (mx)
+			fx = vp8_subpel_filters + (mx - 1) * 6;
+		if (my)
+			fy = vp8_subpel_filters + (my - 1) * 6;
+	}
+	else
+	{
+		margin = 0;
+		extra = 1;
+		bx[0] = 8 - mx;
+		bx[1] = mx;
+		by[0] = 8 - my;
+		by[1] = my;
+		fx = bx;
+		fy = by;
+	}
+
+	if (mx && my)
+	{
+		Vp8McFetch(ref, stride, pw, ph, ix - margin, iy - margin, bw + extra,
+				   bh + extra, src, VP8_MCS);
+		Vp8McPass(src + margin, VP8_MCS, tmp, VP8_MCS, bw, bh + extra, 1, fx,
+				  six);
+		Vp8McPass(tmp + margin * VP8_MCS, VP8_MCS, dst, ds, bw, bh, VP8_MCS,
+				  fy, six);
+	}
+	else if (mx)
+	{
+		Vp8McFetch(ref, stride, pw, ph, ix - margin, iy, bw + extra, bh, src,
+				   VP8_MCS);
+		Vp8McPass(src + margin, VP8_MCS, dst, ds, bw, bh, 1, fx, six);
+	}
+	else
+	{
+		Vp8McFetch(ref, stride, pw, ph, ix, iy - margin, bw, bh + extra, src,
+				   VP8_MCS);
+		Vp8McPass(src + margin * VP8_MCS, VP8_MCS, dst, ds, bw, bh, VP8_MCS,
+				  fy, six);
+	}
+}
+
+U0 Vp8McPart(CVp8Dec *d, CVp8MB *mb, I64 mb_x, I64 mb_y, I64 bx, I64 by,
+			 I64 bw, I64 bh, I64 mvx, I64 mvy)
+{//Luma block and its chroma half. Offsets and sizes are in luma pixels.
+	U8	*yd = d->scratch + VP8_Y_OFF;
+	U8	*ud = d->scratch + VP8_U_OFF;
+	U8	*vd = d->scratch + VP8_V_OFF;
+	I64	 r = mb->ref, ux = mvx, uy = mvy;
+
+	Vp8McBlock(d, d->ref_y[r], d->ys, d->mb_w * 16, d->mb_h * 16,
+			   mb_x * 16 + bx, mb_y * 16 + by, mvx, mvy, FALSE, bw, bh,
+			   yd + by * VP8_BPS + bx, VP8_BPS);
+	if (d->version == 3)
+	{//Full-pixel chroma.
+		ux &= ~7;
+		uy &= ~7;
+	}
+	bx >>= 1;
+	by >>= 1;
+	bw >>= 1;
+	bh >>= 1;
+	Vp8McBlock(d, d->ref_u[r], d->uvs, d->mb_w * 8, d->mb_h * 8,
+			   mb_x * 8 + bx, mb_y * 8 + by, ux, uy, TRUE, bw, bh,
+			   ud + by * VP8_BPS + bx, VP8_BPS);
+	Vp8McBlock(d, d->ref_v[r], d->uvs, d->mb_w * 8, d->mb_h * 8,
+			   mb_x * 8 + bx, mb_y * 8 + by, ux, uy, TRUE, bw, bh,
+			   vd + by * VP8_BPS + bx, VP8_BPS);
+}
+
+U0 Vp8InterPredict(CVp8Dec *d, CVp8MB *mb, I64 mb_x, I64 mb_y)
+{
+	U8	*yd = d->scratch + VP8_Y_OFF;
+	U8	*ud = d->scratch + VP8_U_OFF;
+	U8	*vd = d->scratch + VP8_V_OFF;
+	I64	 n, x, y, r = mb->ref, mvx, mvy;
+
+	if (mb->part == VP8_SPLIT_NONE)
+		Vp8McPart(d, mb, mb_x, mb_y, 0, 0, 16, 16, mb->mv.x, mb->mv.y);
+	else if (mb->part == VP8_SPLIT_16x8)
+	{
+		Vp8McPart(d, mb, mb_x, mb_y, 0, 0, 16, 8, mb->bmv[0].x, mb->bmv[0].y);
+		Vp8McPart(d, mb, mb_x, mb_y, 0, 8, 16, 8, mb->bmv[1].x, mb->bmv[1].y);
+	}
+	else if (mb->part == VP8_SPLIT_8x16)
+	{
+		Vp8McPart(d, mb, mb_x, mb_y, 0, 0, 8, 16, mb->bmv[0].x, mb->bmv[0].y);
+		Vp8McPart(d, mb, mb_x, mb_y, 8, 0, 8, 16, mb->bmv[1].x, mb->bmv[1].y);
+	}
+	else if (mb->part == VP8_SPLIT_8x8)
+	{
+		for (n = 0; n < 4; n++)
+			Vp8McPart(d, mb, mb_x, mb_y, (n & 1) * 8, (n >> 1) * 8, 8, 8,
+					  mb->bmv[n].x, mb->bmv[n].y);
+	}
+	else
+	{//4x4: luma per subblock, each chroma block from the mean of its four.
+		for (n = 0; n < 16; n++)
+			Vp8McBlock(d, d->ref_y[r], d->ys, d->mb_w * 16, d->mb_h * 16,
+					   mb_x * 16 + (n & 3) * 4, mb_y * 16 + (n >> 2) * 4,
+					   mb->bmv[n].x, mb->bmv[n].y, FALSE, 4, 4,
+					   yd + (n >> 2) * 4 * VP8_BPS + (n & 3) * 4, VP8_BPS);
+		for (y = 0; y < 2; y++)
+			for (x = 0; x < 2; x++)
+			{
+				n = y * 8 + x * 2;
+				mvx = mb->bmv[n].x + mb->bmv[n + 1].x + mb->bmv[n + 4].x +
+					  mb->bmv[n + 5].x;
+				mvy = mb->bmv[n].y + mb->bmv[n + 1].y + mb->bmv[n + 4].y +
+					  mb->bmv[n + 5].y;
+				//Rounded away from zero.
+				if (mvx < 0)
+					mvx = (mvx + 1) >> 2;
+				else
+					mvx = (mvx + 2) >> 2;
+				if (mvy < 0)
+					mvy = (mvy + 1) >> 2;
+				else
+					mvy = (mvy + 2) >> 2;
+				if (d->version == 3)
+				{
+					mvx &= ~7;
+					mvy &= ~7;
+				}
+				Vp8McBlock(d, d->ref_u[r], d->uvs, d->mb_w * 8, d->mb_h * 8,
+						   mb_x * 8 + x * 4, mb_y * 8 + y * 4, mvx, mvy, TRUE,
+						   4, 4, ud + y * 4 * VP8_BPS + x * 4, VP8_BPS);
+				Vp8McBlock(d, d->ref_v[r], d->uvs, d->mb_w * 8, d->mb_h * 8,
+						   mb_x * 8 + x * 4, mb_y * 8 + y * 4, mvx, mvy, TRUE,
+						   4, 4, vd + y * 4 * VP8_BPS + x * 4, VP8_BPS);
+			}
+	}
+}
+
 U0 Vp8ReconstructMB(CVp8Dec *d, I64 mb_x, I64 mb_y)
 {
 	U8	*yd = d->scratch + VP8_Y_OFF;
 	U8	*ud = d->scratch + VP8_U_OFF;
 	U8	*vd = d->scratch + VP8_V_OFF;
+	CVp8MB	*mb = d->mbs + mb_y * d->mb_w + mb_x;
+	Bool	 inter = ToBool(mb->ref != VP8_REF_INTRA);
 	I64	 j, n, x, y, b, have_top = mb_y > 0, have_left = mb_x > 0;
 	I64	 mode;
 	U8	*dst;
@@ -791,7 +1403,13 @@ U0 Vp8ReconstructMB(CVp8Dec *d, I64 mb_x, I64 mb_y)
 		MemCopy(vd - VP8_BPS, d->top_v + mb_x * 8, 8);
 	}
 
-	if (d->is_i4x4)
+	if (inter)
+	{
+		Vp8InterPredict(d, mb, mb_x, mb_y);
+		for (n = 0; n < 16; n++)
+			Vp8Transform(&d->coeffs[n * 16], yd + vp8_scan[n]);
+	}
+	else if (d->is_i4x4)
 	{
 		//Top-right 4 pixels.
 		if (mb_y > 0)
@@ -825,8 +1443,11 @@ U0 Vp8ReconstructMB(CVp8Dec *d, I64 mb_x, I64 mb_y)
 		for (n = 0; n < 16; n++)
 			Vp8Transform(&d->coeffs[n * 16], yd + vp8_scan[n]);
 	}
-	Vp8PredNxN(ud, d->uvmode, 8, have_top, have_left);
-	Vp8PredNxN(vd, d->uvmode, 8, have_top, have_left);
+	if (!inter)
+	{
+		Vp8PredNxN(ud, d->uvmode, 8, have_top, have_left);
+		Vp8PredNxN(vd, d->uvmode, 8, have_top, have_left);
+	}
 	for (n = 0; n < 4; n++)
 	{
 		x = (n & 1) * 4;
@@ -1011,8 +1632,15 @@ U0 Vp8FilterMB(CVp8Dec *d, I64 mb_x, I64 mb_y, I64 level, Bool inner)
 	if (ilim < 1)
 		ilim = 1;
 
+	//RFC 15.2: an inter frame has one tier more than a keyframe.
 	hev_t = 0;
 	if (level >= 40)
+	{
+		hev_t = 2;
+		if (!d->keyframe)
+			hev_t = 3;
+	}
+	else if (level >= 20 && !d->keyframe)
 		hev_t = 2;
 	else if (level >= 15)
 		hev_t = 1;
@@ -1083,9 +1711,10 @@ U0 Vp8LoopFilterFrame(CVp8Dec *d)
 		}
 }
 
-U0 Vp8DecFree(CVp8Dec *d)
-{//Per-frame buffers. d itself belongs to the caller.
-	Free(d->probs);
+U0 Vp8DecFreeBufs(CVp8Dec *d)
+{//Everything sized from mb_w/mb_h.
+	I64 i;
+
 	Free(d->intra_t);
 	Free(d->nz_t);
 	Free(d->nzdc_t);
@@ -1098,27 +1727,107 @@ U0 Vp8DecFree(CVp8Dec *d)
 	Free(d->py);
 	Free(d->pu);
 	Free(d->pv);
+	Free(d->mbs);
+	Free(d->seg_map);
+	Free(d->mcsrc);
+	Free(d->mctmp);
+	d->intra_t = NULL;
+	d->nz_t = NULL;
+	d->nzdc_t = NULL;
+	d->top_y = NULL;
+	d->top_u = NULL;
+	d->top_v = NULL;
+	d->mb_flevel = NULL;
+	d->mb_inner = NULL;
+	d->scratch = NULL;
+	d->py = NULL;
+	d->pu = NULL;
+	d->pv = NULL;
+	d->mbs = NULL;
+	d->seg_map = NULL;
+	d->mcsrc = NULL;
+	d->mctmp = NULL;
+	for (i = 1; i < 4; i++)
+	{
+		Free(d->ref_y[i]);
+		Free(d->ref_u[i]);
+		Free(d->ref_v[i]);
+		d->ref_y[i] = NULL;
+		d->ref_u[i] = NULL;
+		d->ref_v[i] = NULL;
+	}
+	d->sized = FALSE;
 }
 
-U0 Vp8DecAlloc(CVp8Dec *d)
-{//Planes and per-MB state, sized from mb_w/mb_h.
+U0 Vp8DecFree(CVp8Dec *d)
+{//d itself belongs to the caller.
+	Vp8DecFreeBufs(d);
+	Free(d->probs);
+	Free(d->sv_probs);
+	d->probs = NULL;
+	d->sv_probs = NULL;
+}
+
+Bool Vp8DecAlloc(CVp8Dec *d)
+{//Planes and per-MB state. A size change drops everything, references
+//included; only a keyframe can change the size, and it refreshes them all.
+	I64 i, ysz, uvsz;
+
+	if (d->sized && d->a_mb_w == d->mb_w && d->a_mb_h == d->mb_h)
+		return TRUE;
+	Vp8DecFreeBufs(d);
+	d->a_mb_w = d->mb_w;
+	d->a_mb_h = d->mb_h;
+	d->ys  = d->mb_w * 16;
+	d->uvs = d->mb_w * 8;
+	ysz  = d->ys * d->mb_h * 16;
+	uvsz = d->uvs * d->mb_h * 8;
 	d->top_y = MAlloc(d->mb_w * 16);
 	d->top_u = MAlloc(d->mb_w * 8);
 	d->top_v = MAlloc(d->mb_w * 8);
 	d->scratch = MAlloc(VP8_BPS * 40);
 	d->mb_flevel = CAlloc(d->mb_w * d->mb_h);
 	d->mb_inner  = CAlloc(d->mb_w * d->mb_h);
-	d->ys = d->mb_w * 16;
-	d->uvs = d->mb_w * 8;
-	d->py = MAlloc(d->ys * d->mb_h * 16);
-	d->pu = MAlloc(d->uvs * d->mb_h * 8);
-	d->pv = MAlloc(d->uvs * d->mb_h * 8);
+	d->intra_t = MAlloc(4 * d->mb_w);
+	d->nz_t = CAlloc(d->mb_w + 1);
+	d->nzdc_t = CAlloc(d->mb_w + 1);
+	d->mbs = CAlloc(d->mb_w * d->mb_h * sizeof(CVp8MB));
+	d->seg_map = CAlloc(d->mb_w * d->mb_h);
+	d->py = MAlloc(ysz);
+	d->pu = MAlloc(uvsz);
+	d->pv = MAlloc(uvsz);
+	if (d->want_refs)
+	{
+		d->mcsrc = MAlloc(VP8_MCSZ);
+		d->mctmp = MAlloc(VP8_MCSZ);
+		for (i = 1; i < 4; i++)
+		{
+			d->ref_y[i] = CAlloc(ysz);
+			d->ref_u[i] = CAlloc(uvsz);
+			d->ref_v[i] = CAlloc(uvsz);
+			if (!d->ref_y[i] || !d->ref_u[i] || !d->ref_v[i])
+			{
+				Vp8DecFreeBufs(d);
+				return FALSE;
+			}
+		}
+	}
+	if (!d->py || !d->pu || !d->pv || !d->mbs || !d->scratch)
+	{
+		Vp8DecFreeBufs(d);
+		return FALSE;
+	}
+	d->sized = TRUE;
+
+	return TRUE;
 }
 
 Bool Vp8DecMBs(CVp8Dec *d)
 {//Mode, residual and reconstruct for every MB, then the loop filter.
 	CVp8Br	*tbr;
+	CVp8MB	*mb;
 	I64		 mb_x, mb_y, t;
+	Bool	 split;
 
 	for (mb_y = 0; mb_y < d->mb_h; mb_y++)
 	{
@@ -1127,15 +1836,19 @@ Bool Vp8DecMBs(CVp8Dec *d)
 		d->nzdc_t[0] = 0;
 		for (mb_x = 0; mb_x < d->mb_w; mb_x++)
 		{
-			Vp8ParseIntraMode(d, mb_x);
+			Vp8ParseMBMode(d, mb_x, mb_y);
+			mb = d->mbs + mb_y * d->mb_w + mb_x;
+			split = ToBool(mb->mode == VP8_MV_SPLIT);
+			d->no_y2 = ToBool(d->is_i4x4 || split);
 			//Residuals come from the row's token partition. Modes and
 			//coefficients interleave per MB.
 			tbr = &d->parts[mb_y & (d->num_parts - 1)];
 			Vp8ParseResiduals(d, mb_x, tbr);
 			Vp8ReconstructMB(d, mb_x, mb_y);
 			if (d->mb_flevel)
-			{//RFC 15.2: segment strength, then the intra-frame ref delta and
-			 //the B_PRED mode delta.
+			{//RFC 15.2: segment strength, then the reference and mode deltas.
+			 //Mode delta 0 is B_PRED, 1..3 the inter modes; intra 16x16 takes
+			 //none.
 				t = d->filt_level;
 				if (d->use_segment)
 				{
@@ -1146,17 +1859,24 @@ Bool Vp8DecMBs(CVp8Dec *d)
 				}
 				if (d->lf_delta_en)
 				{
-					t += d->lf_ref_delta[0];
+					t += d->lf_ref_delta[mb->ref];
 					if (d->is_i4x4)
 						t += d->lf_mode_delta[0];
+					else if (mb->mode)
+						t += d->lf_mode_delta[mb->mode];
 				}
 				t = Vp8Clip127(t, 63);
 				d->mb_flevel[mb_y * d->mb_w + mb_x] = t;
-				d->mb_inner[mb_y * d->mb_w + mb_x]  = ToBool(!d->skip || d->is_i4x4);
+				d->mb_inner[mb_y * d->mb_w + mb_x]  =
+					ToBool(!d->skip || d->is_i4x4 || split);
 			}
 		}
 		if (d->br.eof)
+		{
+			d->fail = 8;
+			d->fail_row = mb_y;
 			return FALSE;
+		}
 		Yield;
 	}
 
@@ -1190,40 +1910,81 @@ U32 *Vp8ToArgb(CVp8Dec *d)
 	return argb;
 }
 
-U32 *Vp8DecodeKeyframeInto(CVp8Dec *d, U8 *buf, I64 size, I64 *out_w,
-						   I64 *out_h)
-{//VP8 keyframe payload -> ARGB (opaque). d is the caller's and is left holding
-//the decoded planes; Vp8DecFree releases them.
-	I64		 bits, part0_size, i, t, b, c, p, s, np;
+Bool Vp8DecodeFrame(CVp8Dec *d, U8 *buf, I64 size)
+{//One frame, key or inter, into d's planes. Reference updates are separate.
+	I64		 bits, part0_size, i, t, b, c, p, s, np, off, v;
 	U8		*part_buf;
 	I64		 part_left, psize;
-	U32		*argb = NULL;
+	Bool	 ok;
 
-	if (size < 10)
-		goto vp8_fail;
+	if (size < 3)
+	{
+		d->fail = 1;
+		return FALSE;
+	}
 	bits = buf[0] | buf[1] << 8 | buf[2] << 16;
-	if (bits & 1)
-		goto vp8_fail;	//Not a keyframe.
-	part0_size = bits >> 5;
-	if (buf[3] != 0x9D || buf[4] != 0x01 || buf[5] != 0x2A)
-		goto vp8_fail;
-	d->w = (buf[6] | buf[7] << 8) & 0x3FFF;
-	d->h = (buf[8] | buf[9] << 8) & 0x3FFF;
-	if (!d->w || !d->h || d->w > VP8_MAXDIM || d->h > VP8_MAXDIM)
-		goto vp8_fail;
-	d->mb_w = (d->w + 15) >> 4;
-	d->mb_h = (d->h + 15) >> 4;
-	if (10 + part0_size > size)
-		goto vp8_fail;
+	d->keyframe = ToBool(!(bits & 1));
+	d->version  = (bits >> 1) & 7;
+	d->show     = ToBool((bits >> 4) & 1);
+	part0_size  = bits >> 5;
+	off = 3;
+	if (d->keyframe)
+	{
+		if (size < 10 || buf[3] != 0x9D || buf[4] != 0x01 || buf[5] != 0x2A)
+		{
+			d->fail = 2;
+			return FALSE;
+		}
+		d->w = (buf[6] | buf[7] << 8) & 0x3FFF;
+		d->h = (buf[8] | buf[9] << 8) & 0x3FFF;
+		if (!d->w || !d->h || d->w > VP8_MAXDIM || d->h > VP8_MAXDIM)
+		{
+			d->fail = 3;
+			return FALSE;
+		}
+		d->mb_w = (d->w + 15) >> 4;
+		d->mb_h = (d->h + 15) >> 4;
+		off = 10;
+	}
+	else if (!d->sized)
+	{
+		d->fail = 4;
+		return FALSE;			//No keyframe seen yet.
+	}
+	if (off + part0_size > size)
+	{
+		d->fail = 5;
+		return FALSE;
+	}
+	d->fail = 0;
 
-	Vp8BrInit(&d->br, buf + 10, part0_size);
-	Vp8Bit(&d->br, 128);	//Color space.
-	Vp8Bit(&d->br, 128);	//Clamping.
+	if (!d->probs)
+	{
+		d->probs    = MAlloc(4 * 8 * 3 * 11);
+		d->sv_probs = MAlloc(4 * 8 * 3 * 11);
+	}
+	if (d->keyframe)
+	{//Entropy state, mode probabilities and the filter deltas all reset.
+		MemCopy(d->probs, vp8_coeff_probs, 4 * 8 * 3 * 11);
+		MemCopy(d->ymode_p, vp8_ymode_prob_def, 4);
+		MemCopy(d->uvmode_p, vp8_uvmode_prob_def, 3);
+		MemCopy(d->mvp, vp8_mv_prob_def, 38);
+		MemSet(d->lf_ref_delta, 0, 4 * sizeof(I64));
+		MemSet(d->lf_mode_delta, 0, 4 * sizeof(I64));
+		MemSet(d->sign_bias, 0, 4 * sizeof(I64));
+		d->absolute_delta = TRUE;
+	}
+
+	Vp8BrInit(&d->br, buf + off, part0_size);
+	if (d->keyframe)
+	{
+		Vp8Bit(&d->br, 128);	//Color space.
+		Vp8Bit(&d->br, 128);	//Clamping.
+	}
 
 	d->seg_prob[0] = 255;
 	d->seg_prob[1] = 255;
 	d->seg_prob[2] = 255;
-	d->absolute_delta = TRUE;
 	d->use_segment = Vp8Bit(&d->br, 128);
 	if (d->use_segment)
 	{
@@ -1277,10 +2038,13 @@ U32 *Vp8DecodeKeyframeInto(CVp8Dec *d, U8 *buf, I64 size, I64 *out_w,
 
 	np = 1 << Vp8Val(&d->br, 2);
 	d->num_parts = np;
-	part_buf = buf + 10 + part0_size;
-	part_left = size - 10 - part0_size;
+	part_buf = buf + off + part0_size;
+	part_left = size - off - part0_size;
 	if (part_left < 3 * (np - 1))
-		goto vp8_fail;
+	{
+		d->fail = 6;
+		return FALSE;
+	}
 	{
 		U8	*sz = part_buf;
 		U8	*start = part_buf + (np - 1) * 3;
@@ -1300,9 +2064,37 @@ U32 *Vp8DecodeKeyframeInto(CVp8Dec *d, U8 *buf, I64 size, I64 *out_w,
 	}
 
 	Vp8ParseQuant(d);
-	Vp8Bit(&d->br, 128);	//update_proba (keyframe: ignored).
 
-	d->probs = MAlloc(4 * 8 * 3 * 11);
+	d->copy_golden = 0;
+	d->copy_alt    = 0;
+	if (d->keyframe)
+	{
+		d->save_ent = ToBool(!Vp8Bit(&d->br, 128));
+		d->refresh_last   = TRUE;
+		d->refresh_golden = TRUE;
+		d->refresh_alt    = TRUE;
+	}
+	else
+	{
+		d->refresh_golden = Vp8Bit(&d->br, 128);
+		d->refresh_alt    = Vp8Bit(&d->br, 128);
+		if (!d->refresh_golden)
+			d->copy_golden = Vp8Val(&d->br, 2);
+		if (!d->refresh_alt)
+			d->copy_alt = Vp8Val(&d->br, 2);
+		d->sign_bias[VP8_REF_GOLDEN] = Vp8Bit(&d->br, 128);
+		d->sign_bias[VP8_REF_ALT]    = Vp8Bit(&d->br, 128);
+		d->save_ent = ToBool(!Vp8Bit(&d->br, 128));
+		d->refresh_last = Vp8Bit(&d->br, 128);
+	}
+	if (d->save_ent)
+	{//refresh_entropy_probs = 0: this frame's updates last one frame.
+		MemCopy(d->sv_probs, d->probs, 4 * 8 * 3 * 11);
+		MemCopy(d->sv_ymode, d->ymode_p, 4);
+		MemCopy(d->sv_uvmode, d->uvmode_p, 3);
+		MemCopy(d->sv_mvp, d->mvp, 38);
+	}
+
 	for (t = 0; t < 4; t++)
 		for (b = 0; b < 8; b++)
 			for (c = 0; c < 3; c++)
@@ -1311,28 +2103,114 @@ U32 *Vp8DecodeKeyframeInto(CVp8Dec *d, U8 *buf, I64 size, I64 *out_w,
 					i = ((t * 8 + b) * 3 + c) * 11 + p;
 					if (Vp8Bit(&d->br, vp8_coeff_update[i]))
 						d->probs[i] = Vp8Val(&d->br, 8);
-					else
-						d->probs[i] = vp8_coeff_probs[i];
 				}
 	d->use_skip = Vp8Bit(&d->br, 128);
 	if (d->use_skip)
 		d->skip_p = Vp8Val(&d->br, 8);
 
-	d->intra_t = MAlloc(4 * d->mb_w);
-	MemSet(d->intra_t, 0, 4 * d->mb_w);	//B_DC_PRED.
-	d->nz_t = CAlloc(d->mb_w + 1);
-	d->nzdc_t = CAlloc(d->mb_w + 1);
-	Vp8DecAlloc(d);
-	if (!Vp8DecMBs(d))
-		goto vp8_fail;
+	if (!d->keyframe)
+	{
+		d->prob_intra = Vp8Val(&d->br, 8);
+		d->prob_last  = Vp8Val(&d->br, 8);
+		d->prob_gf    = Vp8Val(&d->br, 8);
+		if (Vp8Bit(&d->br, 128))
+			for (i = 0; i < 4; i++)
+				d->ymode_p[i] = Vp8Val(&d->br, 8);
+		if (Vp8Bit(&d->br, 128))
+			for (i = 0; i < 3; i++)
+				d->uvmode_p[i] = Vp8Val(&d->br, 8);
+		for (i = 0; i < 38; i++)
+			if (Vp8Bit(&d->br, vp8_mv_update_prob[i]))
+			{//7 bits, doubled; zero means one.
+				v = Vp8Val(&d->br, 7) << 1;
+				if (!v)
+					v = 1;
+				d->mvp[i] = v;
+			}
+	}
 
-	argb   = Vp8ToArgb(d);
+	if (!Vp8DecAlloc(d))
+	{
+		d->fail = 7;
+		return FALSE;
+	}
+	MemSet(d->intra_t, 0, 4 * d->mb_w);		//B_DC_PRED.
+	MemSet(d->nz_t, 0, d->mb_w + 1);
+	MemSet(d->nzdc_t, 0, d->mb_w + 1);
+	ok = Vp8DecMBs(d);
+	if (d->save_ent)
+	{
+		MemCopy(d->probs, d->sv_probs, 4 * 8 * 3 * 11);
+		MemCopy(d->ymode_p, d->sv_ymode, 4);
+		MemCopy(d->uvmode_p, d->sv_uvmode, 3);
+		MemCopy(d->mvp, d->sv_mvp, 38);
+	}
+
+	return ok;
+}
+
+U0 Vp8RefCopy(CVp8Dec *d, I64 dst, I64 src)
+{
+	MemCopy(d->ref_y[dst], d->ref_y[src], d->ys * d->mb_h * 16);
+	MemCopy(d->ref_u[dst], d->ref_u[src], d->uvs * d->mb_h * 8);
+	MemCopy(d->ref_v[dst], d->ref_v[src], d->uvs * d->mb_h * 8);
+}
+
+U0 Vp8RefStore(CVp8Dec *d, I64 dst)
+{
+	MemCopy(d->ref_y[dst], d->py, d->ys * d->mb_h * 16);
+	MemCopy(d->ref_u[dst], d->pu, d->uvs * d->mb_h * 8);
+	MemCopy(d->ref_v[dst], d->pv, d->uvs * d->mb_h * 8);
+}
+
+U0 Vp8RefUpdate(CVp8Dec *d)
+{//RFC 9.7. Both copies read the buffers as they stood before this frame, so
+//golden <-> altref is a swap and the other orders are forced.
+	U8	*t;
+
+	if (!d->want_refs || !d->sized)
+		return;
+	if (d->copy_golden == 2 && d->copy_alt == 2)
+	{
+		t = d->ref_y[VP8_REF_GOLDEN];
+		d->ref_y[VP8_REF_GOLDEN] = d->ref_y[VP8_REF_ALT];
+		d->ref_y[VP8_REF_ALT] = t;
+		t = d->ref_u[VP8_REF_GOLDEN];
+		d->ref_u[VP8_REF_GOLDEN] = d->ref_u[VP8_REF_ALT];
+		d->ref_u[VP8_REF_ALT] = t;
+		t = d->ref_v[VP8_REF_GOLDEN];
+		d->ref_v[VP8_REF_GOLDEN] = d->ref_v[VP8_REF_ALT];
+		d->ref_v[VP8_REF_ALT] = t;
+	}
+	else
+	{
+		if (d->copy_alt == 2)
+			Vp8RefCopy(d, VP8_REF_ALT, VP8_REF_GOLDEN);
+		if (d->copy_golden == 1)
+			Vp8RefCopy(d, VP8_REF_GOLDEN, VP8_REF_LAST);
+		else if (d->copy_golden == 2)
+			Vp8RefCopy(d, VP8_REF_GOLDEN, VP8_REF_ALT);
+		if (d->copy_alt == 1)
+			Vp8RefCopy(d, VP8_REF_ALT, VP8_REF_LAST);
+	}
+	if (d->refresh_golden)
+		Vp8RefStore(d, VP8_REF_GOLDEN);
+	if (d->refresh_alt)
+		Vp8RefStore(d, VP8_REF_ALT);
+	if (d->refresh_last)
+		Vp8RefStore(d, VP8_REF_LAST);
+}
+
+U32 *Vp8DecodeKeyframeInto(CVp8Dec *d, U8 *buf, I64 size, I64 *out_w,
+						   I64 *out_h)
+{//VP8 keyframe payload -> ARGB (opaque). d is the caller's and is left holding
+//the decoded planes; Vp8DecFree releases them.
+	if (!Vp8DecodeFrame(d, buf, size) || !d->keyframe)
+		return NULL;
 	*out_w = d->w;
 	*out_h = d->h;
 
-vp8_fail:;
-
-	return argb;
+	return Vp8ToArgb(d);
 }
 
 public U32 *Vp8DecodeKeyframe(U8 *buf, I64 size, I64 *out_w, I64 *out_h)
@@ -1340,6 +2218,8 @@ public U32 *Vp8DecodeKeyframe(U8 *buf, I64 size, I64 *out_w, I64 *out_h)
 	CVp8Dec	*d = CAlloc(sizeof(CVp8Dec));
 	U32		*argb;
 
+	*out_w = 0;
+	*out_h = 0;
 	argb = Vp8DecodeKeyframeInto(d, buf, size, out_w, out_h);
 	Vp8DecFree(d);
 	Free(d);
@@ -1347,54 +2227,166 @@ public U32 *Vp8DecodeKeyframe(U8 *buf, I64 size, I64 *out_w, I64 *out_h)
 	return argb;
 }
 
+//--- frame header scan -----------------------------------------------------
+//
+//Header-only walk of any frame, key or inter. Reads far enough to reach the
+//reference-refresh flags, which is everything needed to drive the reference
+//buffers; the macroblock data is not touched.
+//
+//Inter frames differ from keyframes before this point: no start code, no
+//dimensions, and no colour-space bits.
+
+class CVp8Info
+{
+	Bool	 key, show, ok;
+	I64		 version, part0;
+	I64		 w, h;				//keyframes only
+	I64		 base_q, filt_level, num_parts;
+	Bool	 refresh_last, refresh_golden, refresh_alt, refresh_entropy;
+	I64		 copy_golden, copy_alt;
+	Bool	 sign_golden, sign_alt;
+};
+
+U0 Vp8SkipQuant(CVp8Br *br, I64 *_base)
+{
+	I64 i;
+
+	*_base = Vp8Val(br, 7);
+	for (i = 0; i < 5; i++)
+		if (Vp8Bit(br, 128))
+			Vp8SVal(br, 4);
+}
+
+public Bool Vp8FrameScan(U8 *buf, I64 size, CVp8Info *fi)
+{//Header fields only. FALSE when the tag is malformed.
+	CVp8Br	br;
+	I64		bits, off, s;
+
+	MemSet(fi, 0, sizeof(CVp8Info));
+	if (!buf || size < 3)
+		return FALSE;
+
+	bits        = buf[0] | (buf[1] << 8) | (buf[2] << 16);
+	fi->key     = ToBool(!(bits & 1));
+	fi->version = (bits >> 1) & 7;
+	fi->show    = ToBool((bits >> 4) & 1);
+	fi->part0   = bits >> 5;
+	off         = 3;
+
+	if (fi->key)
+	{
+		if (size < 10 || buf[3] != 0x9D || buf[4] != 0x01 || buf[5] != 0x2A)
+			return FALSE;
+		fi->w = (buf[6] | (buf[7] << 8)) & 0x3FFF;
+		fi->h = (buf[8] | (buf[9] << 8)) & 0x3FFF;
+		off   = 10;
+	}
+	if (off + fi->part0 > size)
+		return FALSE;
+
+	Vp8BrInit(&br, buf + off, fi->part0);
+	if (fi->key)
+	{
+		Vp8Bit(&br, 128);		//colour space
+		Vp8Bit(&br, 128);		//clamping
+	}
+
+	//segmentation
+	if (Vp8Bit(&br, 128))
+	{
+		if (Vp8Bit(&br, 128))
+		{//update map: probabilities are read after the data block
+			s = 1;
+		}
+		else
+			s = 0;
+		if (Vp8Bit(&br, 128))
+		{
+			Vp8Bit(&br, 128);
+			for (bits = 0; bits < 4; bits++)
+				if (Vp8Bit(&br, 128))
+					Vp8SVal(&br, 7);
+			for (bits = 0; bits < 4; bits++)
+				if (Vp8Bit(&br, 128))
+					Vp8SVal(&br, 6);
+		}
+		if (s)
+			for (bits = 0; bits < 3; bits++)
+				if (Vp8Bit(&br, 128))
+					Vp8Val(&br, 8);
+	}
+
+	//filter header
+	Vp8Bit(&br, 128);					//simple
+	fi->filt_level = Vp8Val(&br, 6);
+	Vp8Val(&br, 3);						//sharpness
+	if (Vp8Bit(&br, 128))
+	{
+		if (Vp8Bit(&br, 128))
+		{
+			for (bits = 0; bits < 4; bits++)
+				if (Vp8Bit(&br, 128))
+					Vp8SVal(&br, 6);
+			for (bits = 0; bits < 4; bits++)
+				if (Vp8Bit(&br, 128))
+					Vp8SVal(&br, 6);
+		}
+	}
+
+	fi->num_parts = 1 << Vp8Val(&br, 2);
+	Vp8SkipQuant(&br, &fi->base_q);
+
+	if (fi->key)
+	{
+		fi->refresh_entropy = Vp8Bit(&br, 128);
+		fi->refresh_last    = TRUE;
+		fi->refresh_golden  = TRUE;
+		fi->refresh_alt     = TRUE;
+	}
+	else
+	{
+		fi->refresh_golden = Vp8Bit(&br, 128);
+		fi->refresh_alt    = Vp8Bit(&br, 128);
+		if (!fi->refresh_golden)
+			fi->copy_golden = Vp8Val(&br, 2);
+		if (!fi->refresh_alt)
+			fi->copy_alt = Vp8Val(&br, 2);
+		fi->sign_golden     = Vp8Bit(&br, 128);
+		fi->sign_alt        = Vp8Bit(&br, 128);
+		fi->refresh_entropy = Vp8Bit(&br, 128);
+		fi->refresh_last    = Vp8Bit(&br, 128);
+	}
+
+	fi->ok = ToBool(!br.eof);
+
+	return fi->ok;
+}
+
 //--- decoder context -------------------------------------------------------
 //
-//A still is one keyframe and needs no state; video needs the decoder, the
-//reference planes and the coefficient probabilities to survive between frames.
-//
-//Inter prediction is not implemented: an inter frame is rejected, so a stream
-//decodes as its keyframes. The reference planes are maintained regardless, so
-//adding prediction does not disturb this bookkeeping.
-
-#define VP8_REF_LAST	0
-#define VP8_REF_GOLDEN	1
-#define VP8_REF_ALTREF	2
+//A still is one keyframe and needs no state; video needs the decoder, its
+//reference planes and the entropy state to survive between frames.
 
 class CVp8Ctx
 {
 	CVp8Dec	*d;
-	U8		*ref_y[3], *ref_u[3], *ref_v[3];
-	I64		 mb_w, mb_h, ys, uvs;
-	Bool	 sized;
-	I64		 frames, inter_skipped;
+	I64		 frames, failed;
 };
 
 public CVp8Ctx *Vp8CtxOpen()
 {
-	return CAlloc(sizeof(CVp8Ctx));
-}
+	CVp8Ctx *c = CAlloc(sizeof(CVp8Ctx));
 
-U0 Vp8CtxRefFree(CVp8Ctx *c)
-{
-	I64 i;
+	c->d = CAlloc(sizeof(CVp8Dec));
+	c->d->want_refs = TRUE;
 
-	for (i = 0; i < 3; i++)
-	{
-		Free(c->ref_y[i]);
-		Free(c->ref_u[i]);
-		Free(c->ref_v[i]);
-		c->ref_y[i] = NULL;
-		c->ref_u[i] = NULL;
-		c->ref_v[i] = NULL;
-	}
-	c->sized = FALSE;
+	return c;
 }
 
 public U0 Vp8CtxClose(CVp8Ctx *c)
 {
 	if (!c)
 		return;
-	Vp8CtxRefFree(c);
 	if (c->d)
 	{
 		Vp8DecFree(c->d);
@@ -1403,83 +2395,88 @@ public U0 Vp8CtxClose(CVp8Ctx *c)
 	Free(c);
 }
 
-Bool Vp8CtxSize(CVp8Ctx *c, CVp8Dec *d)
-{//Reference planes follow the frame size; a size change drops them.
-	I64 i, ysz, uvsz;
-
-	if (c->sized && c->mb_w == d->mb_w && c->mb_h == d->mb_h)
-		return TRUE;
-
-	Vp8CtxRefFree(c);
-	c->mb_w = d->mb_w;
-	c->mb_h = d->mb_h;
-	c->ys   = d->ys;
-	c->uvs  = d->uvs;
-
-	ysz  = d->ys * d->mb_h * 16;
-	uvsz = d->uvs * d->mb_h * 8;
-	for (i = 0; i < 3; i++)
+public Bool Vp8CtxDecodeRaw(CVp8Ctx *c, U8 *buf, I64 size)
+{//One frame into the context's planes, no colour conversion.
+	if (!c || !c->d || !buf || size < 3)
+		return FALSE;
+	if (!Vp8DecodeFrame(c->d, buf, size))
 	{
-		c->ref_y[i] = CAlloc(ysz);
-		c->ref_u[i] = CAlloc(uvsz);
-		c->ref_v[i] = CAlloc(uvsz);
-		if (!c->ref_y[i] || !c->ref_u[i] || !c->ref_v[i])
-		{
-			Vp8CtxRefFree(c);
-			return FALSE;
-		}
+		c->failed++;
+		return FALSE;
 	}
-	c->sized = TRUE;
+	Vp8RefUpdate(c->d);
+	c->frames++;
 
 	return TRUE;
 }
 
-U0 Vp8CtxRefStore(CVp8Ctx *c, CVp8Dec *d, I64 slot)
+public I64 Vp8CtxFail(CVp8Ctx *c)
+{//Stage that rejected the last frame; 8 means the bool decoder ran dry.
+	if (!c || !c->d)
+		return -1;
+	return c->d->fail;
+}
+
+public I64 Vp8CtxFailRow(CVp8Ctx *c)
 {
-	MemCopy(c->ref_y[slot], d->py, d->ys * d->mb_h * 16);
-	MemCopy(c->ref_u[slot], d->pu, d->uvs * d->mb_h * 8);
-	MemCopy(c->ref_v[slot], d->pv, d->uvs * d->mb_h * 8);
+	if (!c || !c->d)
+		return -1;
+	return c->d->fail_row;
+}
+
+public Bool Vp8CtxShown(CVp8Ctx *c)
+{//An unshown frame updates references only.
+	if (!c || !c->d)
+		return FALSE;
+	return c->d->show;
+}
+
+public U64 Vp8CtxHash(CVp8Ctx *c)
+{//FNV-1a over the last frame's planes, cropped to the display size. Diffed
+//against the same hash over ffmpeg's yuv420p output.
+	CVp8Dec	*d;
+	U64		 h = 0xCBF29CE484222325;
+	I64		 x, y, cw, ch;
+	U8		*p;
+
+	if (!c || !c->d || !c->d->sized)
+		return 0;
+	d = c->d;
+	for (y = 0; y < d->h; y++)
+	{
+		p = d->py + y * d->ys;
+		for (x = 0; x < d->w; x++)
+			h = (h ^ p[x]) * 0x100000001B3;
+	}
+	cw = (d->w + 1) >> 1;
+	ch = (d->h + 1) >> 1;
+	for (y = 0; y < ch; y++)
+	{
+		p = d->pu + y * d->uvs;
+		for (x = 0; x < cw; x++)
+			h = (h ^ p[x]) * 0x100000001B3;
+	}
+	for (y = 0; y < ch; y++)
+	{
+		p = d->pv + y * d->uvs;
+		for (x = 0; x < cw; x++)
+			h = (h ^ p[x]) * 0x100000001B3;
+	}
+
+	return h;
 }
 
 public U32 *Vp8CtxDecode(CVp8Ctx *c, U8 *buf, I64 size, I64 *out_w, I64 *out_h)
-{//One frame. NULL when the frame cannot be decoded; the context stays usable.
-	CVp8Dec	*d;
-	U32		*argb = NULL;
-	I64		 bits;
-
+{//One frame. NULL when the frame cannot be decoded or is not shown; the
+//context stays usable either way.
 	*out_w = 0;
 	*out_h = 0;
-	if (!c || !buf || size < 10)
+	if (!Vp8CtxDecodeRaw(c, buf, size))
 		return NULL;
+	if (!c->d->show)
+		return NULL;		//Reference update, not a displayed frame.
+	*out_w = c->d->w;
+	*out_h = c->d->h;
 
-	bits = buf[0] | (buf[1] << 8) | (buf[2] << 16);
-	if (bits & 1)
-	{//Inter frame: no reference prediction yet.
-		c->inter_skipped++;
-		return NULL;
-	}
-
-	//A keyframe reallocates: mb_w/mb_h come from its own header.
-	if (c->d)
-	{
-		Vp8DecFree(c->d);
-		Free(c->d);
-	}
-	c->d = CAlloc(sizeof(CVp8Dec));
-	argb = Vp8DecodeKeyframeInto(c->d, buf, size, out_w, out_h);
-	if (!argb)
-		return NULL;
-
-	d = c->d;
-	if (Vp8CtxSize(c, d))
-	{//A keyframe refreshes every reference.
-		Vp8CtxRefStore(c, d, VP8_REF_LAST);
-		Vp8CtxRefStore(c, d, VP8_REF_GOLDEN);
-		Vp8CtxRefStore(c, d, VP8_REF_ALTREF);
-	}
-	c->frames++;
-
-	return argb;
+	return Vp8ToArgb(c->d);
 }
-
-
