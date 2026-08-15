@@ -70,6 +70,10 @@ class CH264Slice
 	I64		 idr_pic_id, poc_lsb, delta_poc_bottom;
 	I64		 ref_count[2], cabac_init;
 	I64		 qp, disable_deblock, alpha_off, beta_off;
+	//ref_pic_list_modification, list 0: op 0 subtracts, op 1 adds.
+	I64		 reorder_count, reorder_op[16], reorder_arg[16];
+	Bool	 long_term;			//an op or a marking this decoder refuses
+	Bool	 mmco_forget, mmco_reset;
 	I64		 header_bits;		//where the slice data begins
 };
 
@@ -134,6 +138,18 @@ I64 H264ReadUE(CH264Bits *b)
 		return 0;
 
 	return (1 << zeros) - 1 + H264Read(b, zeros);
+}
+
+Bool H264MoreData(CH264Bits *b)
+{//more_rbsp_data(): the stop bit is the last set bit of the payload, and only
+//zero padding follows it.
+	I64 i;
+
+	for (i = b->end - 1; i >= 0; i--)
+		if (b->buf[i >> 3] >> (7 - (i & 7)) & 1)
+			return ToBool(b->pos < i);
+
+	return FALSE;
 }
 
 I64 H264ReadSE(CH264Bits *b)
@@ -334,7 +350,7 @@ Bool H264ParsePPS(CH264Ctx *c, U8 *nal, I64 size)
 	p.constrained_intra  = ToBool(H264Read(&b, 1));
 	p.redundant_pic_cnt  = ToBool(H264Read(&b, 1));
 	//The trailing fields are present only in the longer form.
-	if (b.pos + 8 < b.end)
+	if (H264MoreData(&b))
 	{
 		p.transform_8x8 = ToBool(H264Read(&b, 1));
 		if (H264Read(&b, 1))
@@ -361,9 +377,9 @@ Bool H264ParsePPS(CH264Ctx *c, U8 *nal, I64 size)
 	return TRUE;
 }
 
-U0 H264RefListMod(CH264Bits *b)
+U0 H264RefListMod(CH264Bits *b, CH264Slice *sl, Bool keep)
 {//ref_pic_list_modification(): a list of ops ended by 3.
-	I64 op;
+	I64 op, arg;
 
 	if (!H264Read(b, 1))
 		return;
@@ -372,7 +388,15 @@ U0 H264RefListMod(CH264Bits *b)
 		op = H264ReadUE(b);
 		if (op == 3 || b->eof)
 			return;
-		H264ReadUE(b);
+		arg = H264ReadUE(b);
+		if (op == 2)
+			sl->long_term = TRUE;	//long term references are not kept
+		if (keep && op < 2 && sl->reorder_count < 16)
+		{
+			sl->reorder_op[sl->reorder_count]  = op;
+			sl->reorder_arg[sl->reorder_count] = arg;
+			sl->reorder_count++;
+		}
 	}
 }
 
@@ -432,8 +456,17 @@ U0 H264RefPicMarking(CH264Bits *b, CH264Slice *sl)
 			H264ReadUE(b);
 		if (op == 4)
 			H264ReadUE(b);
+		//Only the sliding window and a full reset are honoured; anything that
+		//names a long term picture is refused rather than decoded wrongly.
+		if (op == 2 || op == 3 || op == 4 || op == 6)
+			sl->long_term = TRUE;
+		if (op == 1)
+			sl->mmco_forget = TRUE;
 		if (op == 5)
+		{
+			sl->mmco_reset = TRUE;
 			return;
+		}
 	}
 }
 
@@ -507,9 +540,9 @@ public Bool H264ParseSliceHeader(CH264Ctx *c, U8 *nal, I64 size,
 	//marking commands: all skipped, but their bits have to be walked to reach
 	//the quantiser.
 	if (sl->type != H264_SLICE_I && sl->type != H264_SLICE_SI)
-		H264RefListMod(&b);
+		H264RefListMod(&b, sl, TRUE);
 	if (sl->type == H264_SLICE_B)
-		H264RefListMod(&b);
+		H264RefListMod(&b, sl, FALSE);
 	if ((p->weighted_pred && (sl->type == H264_SLICE_P ||
 							  sl->type == H264_SLICE_SP)) ||
 		(p->weighted_bipred == 1 && sl->type == H264_SLICE_B))
@@ -606,10 +639,14 @@ public CH264SPS *H264ActiveSPS(CH264Ctx *c)
 
 I64 H264Peek(CH264Bits *b, I64 n)
 {//Next n bits without consuming, zero padded past the end.
-	I64 save = b->pos, v;
+	I64 save = b->pos, avail = b->end - b->pos, v;
 	Bool eof = b->eof;
 
-	v = H264Read(b, n);
+	if (avail < 0)
+		avail = 0;
+	if (avail > n)
+		avail = n;
+	v = H264Read(b, avail) << (n - avail);
 	b->pos = save;
 	b->eof = eof;
 
@@ -813,12 +850,164 @@ I64 H264Residual(CH264Bits *b, I64 nc, I64 max_coeff, I16 *block, U8 *scan)
 	return total;
 }
 
+/***** CABAC *****/
+
+#define H264_CABAC_CTXS	1024
+
+class CH264Cabac
+{//Arithmetic decoder of 9.3.3.2, one context state per index.
+	U8	*buf;
+	I64	 pos, end;			//bit position of the next renormalisation bit
+	I64	 range, offset;
+	U8	 state[H264_CABAC_CTXS];
+	U8	 mps[H264_CABAC_CTXS];
+};
+
+I64 H264CabacBit1(CH264Cabac *c)
+{//Zero past the end: a correct stream never reads there.
+	I64 b;
+
+	if (c->pos >= c->end)
+		return 0;
+	b = c->buf[c->pos >> 3] >> (7 - (c->pos & 7)) & 1;
+	c->pos++;
+
+	return b;
+}
+
+U0 H264CabacEngine(CH264Cabac *c, I64 bit_pos)
+{//9.3.1.2. Context states are left alone: I_PCM restarts the engine only.
+	I64 i;
+
+	c->pos    = (bit_pos + 7) & -8;
+	c->range  = 510;
+	c->offset = 0;
+	for (i = 0; i < 9; i++)
+		c->offset = c->offset << 1 | H264CabacBit1(c);
+}
+
+U0 H264CabacStart(CH264Cabac *c, U8 *buf, I64 size, I64 bit_pos, I64 qp,
+				  Bool p_slice, I64 init_idc)
+{//bit_pos is where the slice data begins; cabac_alignment_one_bit rounds it up
+//to a byte boundary.
+	I64 i, m, n, pre, off = 0;
+
+	c->buf = buf;
+	c->end = size * 8;
+	if (qp < 0)
+		qp = 0;
+	if (qp > 51)
+		qp = 51;
+	if (init_idc > 2)
+		init_idc = 2;
+	if (init_idc < 0)
+		init_idc = 0;
+	off = init_idc * H264_CABAC_CTXS * 2;
+	for (i = 0; i < H264_CABAC_CTXS; i++)
+	{
+		m = h264_cabac_init_i[i * 2];
+		n = h264_cabac_init_i[i * 2 + 1];
+		if (p_slice)
+		{
+			m = h264_cabac_init_pb[off + i * 2];
+			n = h264_cabac_init_pb[off + i * 2 + 1];
+		}
+		pre = ((m * qp) >> 4) + n;
+		if (pre < 1)
+			pre = 1;
+		if (pre > 126)
+			pre = 126;
+		if (pre <= 63)
+		{
+			c->state[i] = 63 - pre;
+			c->mps[i]   = 0;
+		}
+		else
+		{
+			c->state[i] = pre - 64;
+			c->mps[i]   = 1;
+		}
+	}
+	H264CabacEngine(c, bit_pos);
+}
+
+U0 H264CabacRenorm(CH264Cabac *c)
+{
+	while (c->range < 256)
+	{
+		c->range  <<= 1;
+		c->offset   = c->offset << 1 | H264CabacBit1(c);
+	}
+}
+
+I64 H264CabacDec(CH264Cabac *c, I64 ctx)
+{//DecodeDecision.
+	I64 s = c->state[ctx], lps, bin;
+
+	lps = h264_cabac_range_lps[s * 4 + ((c->range >> 6) & 3)];
+	c->range -= lps;
+	if (c->offset >= c->range)
+	{
+		bin         = 1 - c->mps[ctx];
+		c->offset  -= c->range;
+		c->range    = lps;
+		if (!s)
+			c->mps[ctx] = 1 - c->mps[ctx];
+		c->state[ctx] = h264_cabac_trans_lps[s];
+	}
+	else
+	{
+		bin           = c->mps[ctx];
+		c->state[ctx] = h264_cabac_trans_mps[s];
+	}
+	H264CabacRenorm(c);
+
+	return bin;
+}
+
+I64 H264CabacBypass(CH264Cabac *c)
+{
+	c->offset = c->offset << 1 | H264CabacBit1(c);
+	if (c->offset >= c->range)
+	{
+		c->offset -= c->range;
+		return 1;
+	}
+
+	return 0;
+}
+
+I64 H264CabacTerm(CH264Cabac *c)
+{//Non zero at the end of a slice, or on an I_PCM macroblock.
+	c->range -= 2;
+	if (c->offset >= c->range)
+		return 1;
+	H264CabacRenorm(c);
+
+	return 0;
+}
+
 /***** macroblock layer, I slices *****/
+
+//16 luma DC, 16 luma AC blocks, 8 chroma DC, 8 chroma AC blocks.
+#define H264_BLK_COEFFS	(16 + 256 + 8 + 128)
 
 #define H264_MB_NONE	0
 #define H264_MB_I4X4	1
 #define H264_MB_I16X16	2
 #define H264_MB_IPCM	3
+#define H264_MB_INTER	4
+#define H264_MB_SKIP	5
+
+#define H264_REFS_MAX	17
+
+class CH264Frame
+{
+	U8		*pic[3];
+	I64		 stride[3];
+	I64		 frame_num, poc;
+	Bool	 used;
+};
 
 class CH264Dec
 {
@@ -833,40 +1022,269 @@ class CH264Dec
 	//block's nC, intra modes feed the next block's mode prediction.
 	U8			*nnz, *nnz_c[2], *modes;
 	U8			*mb_slice;			//which slice owns each macroblock
+	U8			*mb_qp;				//quantiser, for the loop filter
+	//CABAC neighbour context. mb_kind is 0 outside a slice, then I4x4, I16x16
+	//or I_PCM; mb_cbp packs coded block flags the way ffmpeg's cbp_table does:
+	//bits 0-3 luma 8x8, 4-5 chroma pattern, 6-7 chroma DC, 8 luma DC.
+	U8			*mb_kind, *mb_cmode, *mb_tx8;
+	U16			*mb_cbp;
+	CH264Cabac	 cabac;
+	I64			 last_qp_delta;
+	U8			*mb_deblock;		//disable_deblocking_filter_idc
+	I8			*mb_a, *mb_b;		//slice alpha and beta offsets
 	I64			 i16_mode, chroma_mode, cbp;
 	Bool		 tx8x8;
-	I16			 blk[16 * 25];
+	I16			 blk[H264_BLK_COEFFS];
 	I64			 mbs;
+	U8			*pic[3];			//the current picture's planes
+	I64			 stride[3];
+	CH264Frame	 frame[H264_REFS_MAX];
+	CH264Frame	*cur;
+	CH264Frame	*ref0[H264_REFS_MAX];	//list 0 for this slice
+	I64			 ref0_count;
+	I64			 poc, poc_msb, poc_lsb_prev, frame_num_prev;
+	//Motion state, one entry per 4x4 block of the picture.
+	I16			*mvx, *mvy;			//quarter pel
+	I8			*refidx;			//-1 where the block is intra
+	I16			*mvdx, *mvdy;		//motion vector difference, for CABAC ctx
 };
 
 U0 H264DecFree(CH264Dec *d)
 {
+	I64 i, p;
+
 	Free(d->nnz);
 	Free(d->nnz_c[0]);
 	Free(d->nnz_c[1]);
 	Free(d->modes);
 	Free(d->mb_slice);
-	d->nnz      = NULL;
-	d->nnz_c[0] = NULL;
-	d->nnz_c[1] = NULL;
-	d->modes    = NULL;
-	d->mb_slice = NULL;
+	Free(d->mb_qp);
+	Free(d->mb_kind);
+	Free(d->mb_cmode);
+	Free(d->mb_tx8);
+	Free(d->mb_cbp);
+	Free(d->mb_deblock);
+	Free(d->mb_a);
+	Free(d->mb_b);
+	Free(d->mvx);
+	Free(d->mvy);
+	Free(d->refidx);
+	Free(d->mvdx);
+	Free(d->mvdy);
+	d->mvdx = NULL;
+	d->mvdy = NULL;
+	for (i = 0; i < H264_REFS_MAX; i++)
+	{
+		for (p = 0; p < 3; p++)
+		{
+			Free(d->frame[i].pic[p]);
+			d->frame[i].pic[p] = NULL;
+		}
+		d->frame[i].used = FALSE;
+	}
+	d->nnz        = NULL;
+	d->nnz_c[0]   = NULL;
+	d->nnz_c[1]   = NULL;
+	d->modes      = NULL;
+	d->mb_slice   = NULL;
+	d->mb_qp      = NULL;
+	d->mb_kind    = NULL;
+	d->mb_cmode   = NULL;
+	d->mb_tx8     = NULL;
+	d->mb_cbp     = NULL;
+	d->mb_deblock = NULL;
+	d->mb_a       = NULL;
+	d->mb_b       = NULL;
+	d->mvx        = NULL;
+	d->mvy        = NULL;
+	d->refidx     = NULL;
+	d->cur        = NULL;
+	d->ref0_count = 0;
 }
 
 Bool H264DecSize(CH264Dec *d, CH264SPS *s)
 {
+	I64 i, p, n, blocks;
+
 	if (d->nnz && d->mb_w == s->mb_width && d->mb_h == s->mb_height)
 		return TRUE;
 	H264DecFree(d);
 	d->mb_w = s->mb_width;
 	d->mb_h = s->mb_height;
-	d->nnz      = CAlloc(d->mb_w * 4 * d->mb_h * 4);
-	d->nnz_c[0] = CAlloc(d->mb_w * 2 * d->mb_h * 2);
-	d->nnz_c[1] = CAlloc(d->mb_w * 2 * d->mb_h * 2);
-	d->modes    = CAlloc(d->mb_w * 4 * d->mb_h * 4);
-	d->mb_slice = CAlloc(d->mb_w * d->mb_h);
+	blocks  = d->mb_w * 4 * d->mb_h * 4;
+	d->nnz        = CAlloc(blocks);
+	d->nnz_c[0]   = CAlloc(d->mb_w * 2 * d->mb_h * 2);
+	d->nnz_c[1]   = CAlloc(d->mb_w * 2 * d->mb_h * 2);
+	d->modes      = CAlloc(blocks);
+	d->mb_slice   = CAlloc(d->mb_w * d->mb_h);
+	d->mb_qp      = CAlloc(d->mb_w * d->mb_h);
+	d->mb_kind    = CAlloc(d->mb_w * d->mb_h);
+	d->mb_cmode   = CAlloc(d->mb_w * d->mb_h);
+	d->mb_tx8     = CAlloc(d->mb_w * d->mb_h);
+	d->mb_cbp     = CAlloc(d->mb_w * d->mb_h * sizeof(U16));
+	d->mb_deblock = CAlloc(d->mb_w * d->mb_h);
+	d->mb_a       = CAlloc(d->mb_w * d->mb_h);
+	d->mb_b       = CAlloc(d->mb_w * d->mb_h);
+	d->mvx        = CAlloc(blocks * sizeof(I16));
+	d->mvy        = CAlloc(blocks * sizeof(I16));
+	d->refidx     = CAlloc(blocks);
+	d->mvdx       = CAlloc(blocks * sizeof(I16));
+	d->mvdy       = CAlloc(blocks * sizeof(I16));
+	d->stride[0]  = d->mb_w * 16;
+	d->stride[1]  = d->mb_w * 8;
+	d->stride[2]  = d->mb_w * 8;
+	//One frame per reference the sequence asks for, plus the one being built.
+	n = s->max_ref_frames + 1;
+	if (n < 2)
+		n = 2;
+	if (n > H264_REFS_MAX)
+		n = H264_REFS_MAX;
+	for (i = 0; i < n; i++)
+	{
+		for (p = 0; p < 3; p++)
+		{
+			d->frame[i].stride[p] = d->stride[p];
+			if (!p)
+				d->frame[i].pic[p] = CAlloc(d->stride[0] * d->mb_h * 16);
+			else
+				d->frame[i].pic[p] = CAlloc(d->stride[1] * d->mb_h * 8);
+			if (!d->frame[i].pic[p])
+				return FALSE;
+		}
+	}
 
-	return ToBool(d->nnz && d->modes && d->mb_slice);
+	return ToBool(d->nnz && d->modes && d->mb_slice && d->mb_qp && d->mb_kind &&
+				  d->mb_cmode && d->mb_tx8 && d->mb_cbp && d->mvx && d->mvy &&
+				  d->refidx && d->mvdx && d->mvdy);
+}
+
+CH264Frame *H264FrameFree(CH264Dec *d)
+{//A frame not held as a reference and not the one being decoded.
+	I64 i;
+
+	for (i = 0; i < H264_REFS_MAX; i++)
+		if (d->frame[i].pic[0] && !d->frame[i].used && &d->frame[i] != d->cur)
+			return &d->frame[i];
+
+	return NULL;
+}
+
+U0 H264RefsClear(CH264Dec *d)
+{
+	I64 i;
+
+	for (i = 0; i < H264_REFS_MAX; i++)
+		d->frame[i].used = FALSE;
+}
+
+/***** reference pictures *****/
+
+I64 H264FrameNumWrap(CH264Dec *d, CH264Frame *f, I64 max_frame_num)
+{//8.2.4.1: a reference ahead of the current frame_num belongs to the previous
+//cycle.
+	if (f->frame_num > d->cur->frame_num)
+		return f->frame_num - max_frame_num;
+
+	return f->frame_num;
+}
+
+U0 H264RefListBuild(CH264Dec *d, I64 max_frame_num)
+{//List 0 for a P slice: short term references, descending PicNum.
+	CH264Frame	*f;
+	I64			 i, j, best, n = 0, num[H264_REFS_MAX], v;
+
+	for (i = 0; i < H264_REFS_MAX; i++)
+	{
+		f = &d->frame[i];
+		if (!f->used || f == d->cur)
+			goto next_ref;
+		d->ref0[n] = f;
+		num[n]     = H264FrameNumWrap(d, f, max_frame_num);
+		n++;
+next_ref:;
+	}
+	for (i = 0; i < n; i++)
+	{
+		best = i;
+		for (j = i + 1; j < n; j++)
+			if (num[j] > num[best])
+				best = j;
+		f            = d->ref0[i];
+		d->ref0[i]   = d->ref0[best];
+		d->ref0[best] = f;
+		v            = num[i];
+		num[i]       = num[best];
+		num[best]    = v;
+	}
+	d->ref0_count = n;
+}
+
+U0 H264RefListReorder(CH264Dec *d, CH264Slice *sl, I64 max_frame_num)
+{//8.2.4.3, short term entries only. The picture named by each op is moved to
+//the front of the remaining list.
+	CH264Frame	*f;
+	I64			 i, j, pred = d->cur->frame_num, pic, op;
+
+	for (i = 0; i < sl->reorder_count; i++)
+	{
+		op = sl->reorder_op[i];
+		if (!op)
+			pred -= sl->reorder_arg[i] + 1;
+		else
+			pred += sl->reorder_arg[i] + 1;
+		if (pred < 0)
+			pred += max_frame_num;
+		if (pred >= max_frame_num)
+			pred -= max_frame_num;
+		pic = pred;
+		if (pic > d->cur->frame_num)
+			pic -= max_frame_num;
+		for (j = i; j < d->ref0_count; j++)
+			if (H264FrameNumWrap(d, d->ref0[j], max_frame_num) == pic)
+			{
+				f = d->ref0[j];
+				while (j > i)
+				{
+					d->ref0[j] = d->ref0[j - 1];
+					j--;
+				}
+				d->ref0[i] = f;
+				j = d->ref0_count;
+			}
+	}
+}
+
+U0 H264RefStore(CH264Dec *d, I64 max_ref_frames, I64 max_frame_num)
+{//Sliding window: the oldest short term reference makes way.
+	CH264Frame	*f, *old;
+	I64			 i, n = 0, worst, v;
+
+	for (i = 0; i < H264_REFS_MAX; i++)
+		if (d->frame[i].used && &d->frame[i] != d->cur)
+			n++;
+	while (n >= max_ref_frames && n > 0)
+	{
+		old   = NULL;
+		worst = 0;
+		for (i = 0; i < H264_REFS_MAX; i++)
+		{
+			f = &d->frame[i];
+			if (!f->used || f == d->cur)
+				goto next_old;
+			v = H264FrameNumWrap(d, f, max_frame_num);
+			if (!old || v < worst)
+			{
+				old   = f;
+				worst = v;
+			}
+next_old:;
+		}
+		if (!old)
+			break;
+		old->used = FALSE;
+		n--;
+	}
+	d->cur->used = TRUE;
 }
 
 I64 H264Blk4x4X(I64 blk)
@@ -929,6 +1347,341 @@ I64 H264PredIntraMode(CH264Dec *d, I64 x4, I64 y4)
 	return bb;
 }
 
+I64 H264Clip(I64 v)
+{
+	if (v < 0)
+		return 0;
+	if (v > 255)
+		return 255;
+
+	return v;
+}
+
+I64 H264ZOf(I64 x, I64 y)
+{//Inverse of H264Blk4x4X/Y.
+	return (x & 1) | (y & 1) << 1 | (x & 2) << 1 | (y & 2) << 2;
+}
+
+/***** motion compensation *****/
+
+I64 H264RefPix(U8 *p, I64 st, I64 w, I64 h, I64 x, I64 y)
+{//Samples outside the picture are the nearest edge sample.
+	if (x < 0)
+		x = 0;
+	if (x >= w)
+		x = w - 1;
+	if (y < 0)
+		y = 0;
+	if (y >= h)
+		y = h - 1;
+
+	return p[y * st + x];
+}
+
+I64 H264Tap6(I64 a, I64 b, I64 c, I64 e, I64 f, I64 g)
+{//The unrounded 6 tap of 8.4.2.2.1.
+	return a - 5 * b + 20 * c + 20 * e - 5 * f + g;
+}
+
+I64 H264HpelH(U8 *p, I64 st, I64 w, I64 h, I64 x, I64 y)
+{
+	I64 v = H264Tap6(H264RefPix(p, st, w, h, x - 2, y),
+					 H264RefPix(p, st, w, h, x - 1, y),
+					 H264RefPix(p, st, w, h, x,     y),
+					 H264RefPix(p, st, w, h, x + 1, y),
+					 H264RefPix(p, st, w, h, x + 2, y),
+					 H264RefPix(p, st, w, h, x + 3, y));
+
+	return H264Clip((v + 16) >> 5);
+}
+
+I64 H264HpelV(U8 *p, I64 st, I64 w, I64 h, I64 x, I64 y)
+{
+	I64 v = H264Tap6(H264RefPix(p, st, w, h, x, y - 2),
+					 H264RefPix(p, st, w, h, x, y - 1),
+					 H264RefPix(p, st, w, h, x, y),
+					 H264RefPix(p, st, w, h, x, y + 1),
+					 H264RefPix(p, st, w, h, x, y + 2),
+					 H264RefPix(p, st, w, h, x, y + 3));
+
+	return H264Clip((v + 16) >> 5);
+}
+
+I64 H264HpelRow(U8 *p, I64 st, I64 w, I64 h, I64 x, I64 y)
+{//Horizontal 6 tap without rounding, the intermediate the centre sample needs.
+	return H264Tap6(H264RefPix(p, st, w, h, x - 2, y),
+					H264RefPix(p, st, w, h, x - 1, y),
+					H264RefPix(p, st, w, h, x,     y),
+					H264RefPix(p, st, w, h, x + 1, y),
+					H264RefPix(p, st, w, h, x + 2, y),
+					H264RefPix(p, st, w, h, x + 3, y));
+}
+
+I64 H264HpelC(U8 *p, I64 st, I64 w, I64 h, I64 x, I64 y)
+{//The centre sample: a vertical 6 tap over the horizontal intermediates.
+	I64 v = H264Tap6(H264HpelRow(p, st, w, h, x, y - 2),
+					 H264HpelRow(p, st, w, h, x, y - 1),
+					 H264HpelRow(p, st, w, h, x, y),
+					 H264HpelRow(p, st, w, h, x, y + 1),
+					 H264HpelRow(p, st, w, h, x, y + 2),
+					 H264HpelRow(p, st, w, h, x, y + 3));
+
+	return H264Clip((v + 512) >> 10);
+}
+
+U0 H264McLuma(U8 *dst, I64 dst_st, U8 *ref, I64 ref_st, I64 pw, I64 ph,
+			  I64 x0, I64 y0, I64 bw, I64 bh, I64 mvx, I64 mvy)
+{//Quarter pel luma prediction, 8.4.2.2.1. The lettering of the standard: b is
+//the horizontal half sample, h the vertical, j the centre.
+	I64 xi = x0 + (mvx >> 2), yi = y0 + (mvy >> 2);
+	I64 fx = mvx & 3, fy = mvy & 3, x, y, sx, sy, v, b, hh, j, m, s, g;
+
+	for (y = 0; y < bh; y++)
+		for (x = 0; x < bw; x++)
+		{
+			sx = xi + x;
+			sy = yi + y;
+			if (!fx && !fy)
+				v = H264RefPix(ref, ref_st, pw, ph, sx, sy);
+			else if (!fy)
+			{//a b c
+				b = H264HpelH(ref, ref_st, pw, ph, sx, sy);
+				if (fx == 2)
+					v = b;
+				else
+				{
+					g = H264RefPix(ref, ref_st, pw, ph, sx + (fx >> 1), sy);
+					v = (g + b + 1) >> 1;
+				}
+			}
+			else if (!fx)
+			{//d h n
+				hh = H264HpelV(ref, ref_st, pw, ph, sx, sy);
+				if (fy == 2)
+					v = hh;
+				else
+				{
+					g = H264RefPix(ref, ref_st, pw, ph, sx, sy + (fy >> 1));
+					v = (g + hh + 1) >> 1;
+				}
+			}
+			else if (fx == 2 && fy == 2)
+				v = H264HpelC(ref, ref_st, pw, ph, sx, sy);
+			else if (fx == 2)
+			{//f q
+				j = H264HpelC(ref, ref_st, pw, ph, sx, sy);
+				b = H264HpelH(ref, ref_st, pw, ph, sx, sy + (fy >> 1));
+				v = (j + b + 1) >> 1;
+			}
+			else if (fy == 2)
+			{//i k
+				j  = H264HpelC(ref, ref_st, pw, ph, sx, sy);
+				hh = H264HpelV(ref, ref_st, pw, ph, sx + (fx >> 1), sy);
+				v  = (j + hh + 1) >> 1;
+			}
+			else
+			{//e g p r
+				b = H264HpelH(ref, ref_st, pw, ph, sx, sy + (fy >> 1));
+				m = H264HpelV(ref, ref_st, pw, ph, sx + (fx >> 1), sy);
+				v = (b + m + 1) >> 1;
+			}
+			dst[y * dst_st + x] = v;
+		}
+}
+
+U0 H264McChroma(U8 *dst, I64 dst_st, U8 *ref, I64 ref_st, I64 pw, I64 ph,
+				I64 x0, I64 y0, I64 bw, I64 bh, I64 mvx, I64 mvy)
+{//Eighth pel bilinear, 8.4.2.2.2.
+	I64 xi = x0 + (mvx >> 3), yi = y0 + (mvy >> 3);
+	I64 dx = mvx & 7, dy = mvy & 7, x, y, a, b, c, e;
+
+	for (y = 0; y < bh; y++)
+		for (x = 0; x < bw; x++)
+		{
+			a = H264RefPix(ref, ref_st, pw, ph, xi + x,     yi + y);
+			b = H264RefPix(ref, ref_st, pw, ph, xi + x + 1, yi + y);
+			c = H264RefPix(ref, ref_st, pw, ph, xi + x,     yi + y + 1);
+			e = H264RefPix(ref, ref_st, pw, ph, xi + x + 1, yi + y + 1);
+			dst[y * dst_st + x] = ((8 - dx) * (8 - dy) * a + dx * (8 - dy) * b +
+								  (8 - dx) * dy * c + dx * dy * e + 32) >> 6;
+		}
+}
+
+/***** macroblock layer, P slices *****/
+
+I64 H264MvAt(CH264Dec *d, I64 x4, I64 y4, I64 zcur, I64 *_mvx, I64 *_mvy)
+{//Motion of a neighbouring 4x4 block. -2 when the block does not exist, -1
+//when it exists but is intra: only the first substitutes another neighbour.
+//zcur is the Z order index of the partition asking.
+	I64 stride = d->mb_w * 4, i;
+
+	*_mvx = 0;
+	*_mvy = 0;
+	if (x4 < 0 || y4 < 0 || x4 >= stride || y4 >= d->mb_h * 4)
+		return -2;
+	if (!H264NeighbourOk(d, x4 >> 2, y4 >> 2))
+		return -2;
+	if (x4 >> 2 == d->mb_x && y4 >> 2 == d->mb_y &&
+		H264ZOf(x4 & 3, y4 & 3) >= zcur)
+		return -2;					//inside this macroblock, not decoded yet
+	i = y4 * stride + x4;
+	if (d->refidx[i] < 0)
+		return -1;
+	*_mvx = d->mvx[i];
+	*_mvy = d->mvy[i];
+
+	return d->refidx[i];
+}
+
+I64 H264Median(I64 a, I64 b, I64 c)
+{
+	if (a > b)
+	{
+		if (b > c)
+			return b;
+		if (a > c)
+			return c;
+		return a;
+	}
+	if (a > c)
+		return a;
+	if (b > c)
+		return c;
+
+	return b;
+}
+
+U0 H264MvPred(CH264Dec *d, I64 x4, I64 y4, I64 bw4, I64 ref,
+			  I64 part, I64 *_mvx, I64 *_mvy)
+{//8.4.1.3. part is 0 for a whole macroblock, 1 and 2 for the halves of a 16x8,
+//3 and 4 for the halves of an 8x16.
+	I64 ra, rb, rc, ax, ay, bx, by, cx, cy, n, z;
+
+	z  = H264ZOf(x4 & 3, y4 & 3);
+	ra = H264MvAt(d, x4 - 1, y4, z, &ax, &ay);
+	rb = H264MvAt(d, x4, y4 - 1, z, &bx, &by);
+	rc = H264MvAt(d, x4 + bw4, y4 - 1, z, &cx, &cy);
+	if (rc == -2)
+		rc = H264MvAt(d, x4 - 1, y4 - 1, z, &cx, &cy);
+	if (rb == -2 && rc == -2 && ra != -2)
+	{//Only the left neighbour exists: it stands in for the other two.
+		rb = ra;
+		rc = ra;
+		bx = ax;
+		by = ay;
+		cx = ax;
+		cy = ay;
+	}
+	if (part == 1 && rb == ref)
+	{
+		*_mvx = bx;
+		*_mvy = by;
+		return;
+	}
+	if (part == 2 && ra == ref)
+	{
+		*_mvx = ax;
+		*_mvy = ay;
+		return;
+	}
+	if (part == 3 && ra == ref)
+	{
+		*_mvx = ax;
+		*_mvy = ay;
+		return;
+	}
+	if (part == 4 && rc == ref)
+	{
+		*_mvx = cx;
+		*_mvy = cy;
+		return;
+	}
+	n = 0;
+	if (ra == ref)
+		n++;
+	if (rb == ref)
+		n++;
+	if (rc == ref)
+		n++;
+	if (n == 1)
+	{//Exactly one neighbour uses this reference; it is the prediction.
+		if (ra == ref)
+		{
+			*_mvx = ax;
+			*_mvy = ay;
+		}
+		else if (rb == ref)
+		{
+			*_mvx = bx;
+			*_mvy = by;
+		}
+		else
+		{
+			*_mvx = cx;
+			*_mvy = cy;
+		}
+		return;
+	}
+	*_mvx = H264Median(ax, bx, cx);
+	*_mvy = H264Median(ay, by, cy);
+}
+
+U0 H264MvSet(CH264Dec *d, I64 x4, I64 y4, I64 bw4, I64 bh4, I64 ref,
+			 I64 mvx, I64 mvy, I64 dx, I64 dy)
+{
+	I64 stride = d->mb_w * 4, x, y, i;
+
+	for (y = 0; y < bh4; y++)
+		for (x = 0; x < bw4; x++)
+		{
+			i = (y4 + y) * stride + x4 + x;
+			d->refidx[i] = ref;
+			d->mvx[i]    = mvx;
+			d->mvy[i]    = mvy;
+			d->mvdx[i]   = dx;
+			d->mvdy[i]   = dy;
+		}
+}
+
+U0 H264McBlock(CH264Dec *d, I64 x4, I64 y4, I64 bw4, I64 bh4, I64 ref,
+			   I64 mvx, I64 mvy)
+{//Prediction straight into the picture; the residual is added on top.
+	CH264Frame	*f;
+	I64			 pw = d->mb_w * 16, ph = d->mb_h * 16, pl;
+
+	if (ref < 0 || ref >= d->ref0_count)
+		ref = 0;
+	if (!d->ref0_count)
+		return;
+	f = d->ref0[ref];
+	H264McLuma(d->pic[0] + y4 * 4 * d->stride[0] + x4 * 4, d->stride[0],
+			   f->pic[0], f->stride[0], pw, ph, x4 * 4, y4 * 4,
+			   bw4 * 4, bh4 * 4, mvx, mvy);
+	for (pl = 0; pl < 2; pl++)
+		H264McChroma(d->pic[1 + pl] + y4 * 2 * d->stride[1 + pl] + x4 * 2,
+					 d->stride[1 + pl], f->pic[1 + pl], f->stride[1 + pl],
+					 pw >> 1, ph >> 1, x4 * 2, y4 * 2, bw4 * 2, bh4 * 2,
+					 mvx, mvy);
+}
+
+U0 H264SkipMv(CH264Dec *d, I64 *_mvx, I64 *_mvy)
+{//8.4.1.1: a skipped macroblock is zero motion when either neighbour is
+//missing or is itself zero motion on reference zero.
+	I64 x4 = d->mb_x * 4, y4 = d->mb_y * 4, ra, rb, ax, ay, bx, by;
+
+	*_mvx = 0;
+	*_mvy = 0;
+	ra = H264MvAt(d, x4 - 1, y4, 0, &ax, &ay);
+	rb = H264MvAt(d, x4, y4 - 1, 0, &bx, &by);
+	if (ra == -2 || rb == -2)
+		return;
+	if (!ra && !ax && !ay)
+		return;
+	if (!rb && !bx && !by)
+		return;
+	H264MvPred(d, x4, y4, 4, 0, 0, _mvx, _mvy);
+}
+
 Bool H264ResidualLuma(CH264Dec *d, I64 cbp_luma, Bool i16)
 {//DC first for I_16x16, then the AC or full blocks the pattern selects.
 	I64	 stride = d->mb_w * 4, blk, x4, y4, nc, n, off;
@@ -968,12 +1721,7 @@ next_luma:;
 Bool H264ResidualChroma(CH264Dec *d, I64 cbp_chroma)
 {
 	I64	 stride = d->mb_w * 2, pl, blk, x2, y2, nc, n, off;
-	U8	 dc_scan[4];
 
-	dc_scan[0] = 0;
-	dc_scan[1] = 1;
-	dc_scan[2] = 2;
-	dc_scan[3] = 3;
 	if (!cbp_chroma)
 	{
 		for (pl = 0; pl < 2; pl++)
@@ -989,7 +1737,7 @@ Bool H264ResidualChroma(CH264Dec *d, I64 cbp_chroma)
 	for (pl = 0; pl < 2; pl++)
 	{
 		off = 16 + 256 + pl * 4;
-		if (H264Residual(&d->b, -1, 4, d->blk + off, dc_scan) < 0)
+		if (H264Residual(&d->b, -1, 4, d->blk + off, h264_chroma_dc_scan) < 0)
 			return FALSE;
 	}
 	for (pl = 0; pl < 2; pl++)
@@ -1014,16 +1762,1225 @@ next_chroma:;
 	return TRUE;
 }
 
-Bool H264DecodeMbI(CH264Dec *d)
-{//One I macroblock: type, prediction modes, coded block pattern, residual.
-	CH264Bits	*b = &d->b;
-	I64			 stride = d->mb_w * 4, mb_type, t, blk, x4, y4, pred, mode;
-	I64			 cbp_luma = 0, cbp_chroma = 0, i, n;
+/***** reconstruction *****/
 
-	mb_type = H264ReadUE(b);
+I64 H264ChromaQP(CH264Dec *d, I64 plane)
+{
+	I64 q = d->qp + d->pps->chroma_qp_off;
+
+	if (plane)
+		q = d->qp + d->pps->chroma_qp_off2;
+	if (q < 0)
+		q = 0;
+	if (q > 51)
+		q = 51;
+
+	return h264_chroma_qp[q];
+}
+
+I64 H264Scale(I64 qp, I64 pos)
+{//normAdjust4x4 by position parity: both even, mixed, both odd. The flat
+//weight scale of 16 and the transform's rounding cancel in H264Idct4x4.
+	I64 idx = (pos & 1) + (pos >> 2 & 1);
+
+	return h264_dequant4_init[qp % 6 * 3 + idx] << (qp / 6);
+}
+
+I64 H264ScaleDC(I64 qp)
+{//dequant4_coeff[qp][0] as ffmpeg builds it: 16 * normAdjust << (qp / 6 + 2).
+	return h264_dequant4_init[qp % 6 * 3] << (qp / 6 + 6);
+}
+
+Bool H264Blk4Avail(CH264Dec *d, I64 bx, I64 by, I64 blk)
+{//Whether the 4x4 luma block at picture block coordinates (bx, by) is already
+//reconstructed and usable for prediction.
+	I64 mx = bx >> 2, my = by >> 2;
+
+	if (bx < 0 || by < 0 || mx >= d->mb_w || my >= d->mb_h)
+		return FALSE;
+	if (mx == d->mb_x && my == d->mb_y)
+		return ToBool(H264ZOf(bx & 3, by & 3) < blk);
+	if (my > d->mb_y || my == d->mb_y && mx > d->mb_x)
+		return FALSE;
+
+	return H264NeighbourOk(d, mx, my);
+}
+
+U0 H264Idct4x4(U8 *dst, I64 stride, I16 *blk)
+{//ffmpeg ff_h264_idct_add_c, rows then columns.
+	I64 t[16], i, z0, z1, z2, z3, x, y;
+
+	for (i = 0; i < 16; i++)
+		t[i] = blk[i];
+	t[0] += 32;
+	for (y = 0; y < 4; y++)
+	{
+		z0 = t[4 * y] + t[4 * y + 2];
+		z1 = t[4 * y] - t[4 * y + 2];
+		z2 = (t[4 * y + 1] >> 1) - t[4 * y + 3];
+		z3 = t[4 * y + 1] + (t[4 * y + 3] >> 1);
+		t[4 * y]     = z0 + z3;
+		t[4 * y + 1] = z1 + z2;
+		t[4 * y + 2] = z1 - z2;
+		t[4 * y + 3] = z0 - z3;
+	}
+	for (i = 0; i < 4; i++)
+	{
+		z0 = t[i] + t[i + 8];
+		z1 = t[i] - t[i + 8];
+		z2 = (t[i + 4] >> 1) - t[i + 12];
+		z3 = t[i + 4] + (t[i + 12] >> 1);
+		x = i;
+		dst[x]              = H264Clip(dst[x]              + ((z0 + z3) >> 6));
+		dst[stride + x]     = H264Clip(dst[stride + x]     + ((z1 + z2) >> 6));
+		dst[2 * stride + x] = H264Clip(dst[2 * stride + x] + ((z1 - z2) >> 6));
+		dst[3 * stride + x] = H264Clip(dst[3 * stride + x] + ((z0 - z3) >> 6));
+	}
+}
+
+U0 H264LumaDC(CH264Dec *d)
+{//4x4 Hadamard over the DC coefficients, scattered into the AC blocks.
+	I64 qmul = H264ScaleDC(d->qp), t[16], i, a, b, c, e, x, y;
+
+	for (y = 0; y < 4; y++)
+	{
+		a = d->blk[4 * y]     + d->blk[4 * y + 3];
+		b = d->blk[4 * y + 1] + d->blk[4 * y + 2];
+		c = d->blk[4 * y + 1] - d->blk[4 * y + 2];
+		e = d->blk[4 * y]     - d->blk[4 * y + 3];
+		t[4 * y]     = a + b;
+		t[4 * y + 1] = e + c;
+		t[4 * y + 2] = a - b;
+		t[4 * y + 3] = e - c;
+	}
+	for (x = 0; x < 4; x++)
+	{
+		a = t[x]     + t[x + 12];
+		b = t[x + 4] + t[x + 8];
+		c = t[x + 4] - t[x + 8];
+		e = t[x]     - t[x + 12];
+		for (y = 0; y < 4; y++)
+		{
+			if (!y)
+				i = a + b;
+			else if (y == 1)
+				i = e + c;
+			else if (y == 2)
+				i = a - b;
+			else
+				i = e - c;
+			d->blk[16 + H264ZOf(x, y) * 16] = (i * qmul + 128) >> 8;
+		}
+	}
+}
+
+U0 H264ChromaDC(CH264Dec *d, I64 pl)
+{//2x2 Hadamard, into the DC of the plane's four 4x4 blocks.
+	I64	 qmul = H264ScaleDC(H264ChromaQP(d, pl));
+	I16	*dc = d->blk + 16 + 256 + pl * 4;
+	I64	 a = dc[0] + dc[1], b = dc[0] - dc[1];
+	I64	 c = dc[2] + dc[3], e = dc[2] - dc[3], off = 16 + 256 + 8 + pl * 64;
+
+	d->blk[off]      = ((a + c) * qmul) >> 7;
+	d->blk[off + 16] = ((b + e) * qmul) >> 7;
+	d->blk[off + 32] = ((a - c) * qmul) >> 7;
+	d->blk[off + 48] = ((b - e) * qmul) >> 7;
+}
+
+I64 H264EdgeT(I64 *t, I64 tl, I64 k)
+{//p[k, -1], with k of -1 giving the corner sample.
+	if (k < 0)
+		return tl;
+
+	return t[k];
+}
+
+I64 H264EdgeL(I64 *l, I64 tl, I64 k)
+{//p[-1, k].
+	if (k < 0)
+		return tl;
+
+	return l[k];
+}
+
+U0 H264Intra4x4(CH264Dec *d, I64 blk, I64 mode)
+{
+	I64		 st = d->stride[0];
+	I64		 bx = d->mb_x * 4 + H264Blk4x4X(blk);
+	I64		 by = d->mb_y * 4 + H264Blk4x4Y(blk);
+	U8		*dst = d->pic[0] + by * 4 * st + bx * 4;
+	I64		 t[8], l[4], tl = 128, i, x, y, v, z, s;
+	Bool	 lok = H264Blk4Avail(d, bx - 1, by, blk);
+	Bool	 tok = H264Blk4Avail(d, bx, by - 1, blk);
+	Bool	 trok = H264Blk4Avail(d, bx + 1, by - 1, blk);
+	Bool	 tlok = H264Blk4Avail(d, bx - 1, by - 1, blk);
+
+	for (i = 0; i < 8; i++)
+		t[i] = 128;
+	for (i = 0; i < 4; i++)
+		l[i] = 128;
+	if (tok)
+		for (i = 0; i < 4; i++)
+			t[i] = dst[i - st];
+	if (trok)
+		for (i = 4; i < 8; i++)
+			t[i] = dst[i - st];
+	else
+		for (i = 4; i < 8; i++)
+			t[i] = t[3];
+	if (lok)
+		for (i = 0; i < 4; i++)
+			l[i] = dst[i * st - 1];
+	if (tlok)
+		tl = dst[-st - 1];
+
+	if (mode == 2)
+	{//DC over whichever edges exist.
+		s = 0;
+		if (lok && tok)
+		{
+			for (i = 0; i < 4; i++)
+				s += t[i] + l[i];
+			v = (s + 4) >> 3;
+		}
+		else if (lok)
+		{
+			for (i = 0; i < 4; i++)
+				s += l[i];
+			v = (s + 2) >> 2;
+		}
+		else if (tok)
+		{
+			for (i = 0; i < 4; i++)
+				s += t[i];
+			v = (s + 2) >> 2;
+		}
+		else
+			v = 128;
+	}
+	for (y = 0; y < 4; y++)
+		for (x = 0; x < 4; x++)
+		{
+			if (!mode)
+				v = t[x];
+			else if (mode == 1)
+				v = l[y];
+			else if (mode == 3)
+			{
+				if (x == 3 && y == 3)
+					v = (t[6] + 3 * t[7] + 2) >> 2;
+				else
+					v = (t[x + y] + 2 * t[x + y + 1] + t[x + y + 2] + 2) >> 2;
+			}
+			else if (mode == 4)
+			{
+				if (x > y)
+					v = (H264EdgeT(t, tl, x - y - 2) +
+						2 * H264EdgeT(t, tl, x - y - 1) + t[x - y] + 2) >> 2;
+				else if (x < y)
+					v = (H264EdgeL(l, tl, y - x - 2) +
+						2 * H264EdgeL(l, tl, y - x - 1) + l[y - x] + 2) >> 2;
+				else
+					v = (t[0] + 2 * tl + l[0] + 2) >> 2;
+			}
+			else if (mode == 5)
+			{
+				z = 2 * x - y;
+				if (z >= 0 && !(z & 1))
+					v = (H264EdgeT(t, tl, x - (y >> 1) - 1) +
+						t[x - (y >> 1)] + 1) >> 1;
+				else if (z >= 0)
+					v = (H264EdgeT(t, tl, x - (y >> 1) - 2) +
+						2 * H264EdgeT(t, tl, x - (y >> 1) - 1) +
+						t[x - (y >> 1)] + 2) >> 2;
+				else if (z == -1)
+					v = (l[0] + 2 * tl + t[0] + 2) >> 2;
+				else
+					v = (H264EdgeL(l, tl, y - 1) + 2 * H264EdgeL(l, tl, y - 2) +
+						H264EdgeL(l, tl, y - 3) + 2) >> 2;
+			}
+			else if (mode == 6)
+			{
+				z = 2 * y - x;
+				if (z >= 0 && !(z & 1))
+					v = (H264EdgeL(l, tl, y - (x >> 1) - 1) +
+						l[y - (x >> 1)] + 1) >> 1;
+				else if (z >= 0)
+					v = (H264EdgeL(l, tl, y - (x >> 1) - 2) +
+						2 * H264EdgeL(l, tl, y - (x >> 1) - 1) +
+						l[y - (x >> 1)] + 2) >> 2;
+				else if (z == -1)
+					v = (l[0] + 2 * tl + t[0] + 2) >> 2;
+				else
+					v = (H264EdgeT(t, tl, x - 1) + 2 * H264EdgeT(t, tl, x - 2) +
+						H264EdgeT(t, tl, x - 3) + 2) >> 2;
+			}
+			else if (mode == 7)
+			{
+				if (!(y & 1))
+					v = (t[x + (y >> 1)] + t[x + (y >> 1) + 1] + 1) >> 1;
+				else
+					v = (t[x + (y >> 1)] + 2 * t[x + (y >> 1) + 1] +
+						t[x + (y >> 1) + 2] + 2) >> 2;
+			}
+			else if (mode == 8)
+			{
+				z = x + 2 * y;
+				if (z > 5)
+					v = l[3];
+				else if (z == 5)
+					v = (l[2] + 3 * l[3] + 2) >> 2;
+				else if (!(z & 1))
+					v = (l[y + (x >> 1)] + l[y + (x >> 1) + 1] + 1) >> 1;
+				else
+					v = (l[y + (x >> 1)] + 2 * l[y + (x >> 1) + 1] +
+						l[y + (x >> 1) + 2] + 2) >> 2;
+			}
+			dst[y * st + x] = H264Clip(v);
+		}
+}
+
+U0 H264Intra16x16(CH264Dec *d, I64 mode)
+{
+	I64		 st = d->stride[0];
+	U8		*dst = d->pic[0] + d->mb_y * 16 * st + d->mb_x * 16;
+	I64		 i, x, y, v, s = 0, a, b, c, hh = 0, vv = 0;
+	Bool	 lok = H264NeighbourOk(d, d->mb_x - 1, d->mb_y);
+	Bool	 tok = H264NeighbourOk(d, d->mb_x, d->mb_y - 1);
+
+	//A mode whose edge is missing is not a legal stream; predict DC rather
+	//than read outside the picture.
+	if (!mode && !tok || mode == 1 && !lok || mode == 3 && !(lok && tok))
+		mode = 2;
+	if (!mode)
+	{
+		for (y = 0; y < 16; y++)
+			for (x = 0; x < 16; x++)
+				dst[y * st + x] = dst[x - st];
+		return;
+	}
+	if (mode == 1)
+	{
+		for (y = 0; y < 16; y++)
+			for (x = 0; x < 16; x++)
+				dst[y * st + x] = dst[y * st - 1];
+		return;
+	}
+	if (mode == 2)
+	{
+		if (lok && tok)
+		{
+			for (i = 0; i < 16; i++)
+				s += dst[i - st] + dst[i * st - 1];
+			v = (s + 16) >> 5;
+		}
+		else if (tok)
+		{
+			for (i = 0; i < 16; i++)
+				s += dst[i - st];
+			v = (s + 8) >> 4;
+		}
+		else if (lok)
+		{
+			for (i = 0; i < 16; i++)
+				s += dst[i * st - 1];
+			v = (s + 8) >> 4;
+		}
+		else
+			v = 128;
+		for (y = 0; y < 16; y++)
+			for (x = 0; x < 16; x++)
+				dst[y * st + x] = v;
+		return;
+	}
+	for (i = 0; i < 8; i++)
+	{
+		hh += (i + 1) * (dst[8 + i - st] - dst[6 - i - st]);
+		vv += (i + 1) * (dst[(8 + i) * st - 1] - dst[(6 - i) * st - 1]);
+	}
+	a = 16 * (dst[15 * st - 1] + dst[15 - st]);
+	b = (5 * hh + 32) >> 6;
+	c = (5 * vv + 32) >> 6;
+	for (y = 0; y < 16; y++)
+		for (x = 0; x < 16; x++)
+			dst[y * st + x] = H264Clip((a + b * (x - 7) + c * (y - 7) + 16) >> 5);
+}
+
+U0 H264IntraChroma(CH264Dec *d, I64 pl, I64 mode)
+{
+	I64		 st = d->stride[1 + pl];
+	U8		*dst = d->pic[1 + pl] + d->mb_y * 8 * st + d->mb_x * 8;
+	I64		 i, x, y, v, s, a, b, c, hh = 0, vv = 0, bx, by;
+	Bool	 lok = H264NeighbourOk(d, d->mb_x - 1, d->mb_y);
+	Bool	 tok = H264NeighbourOk(d, d->mb_x, d->mb_y - 1);
+
+	if (mode == 1 && !lok || mode == 2 && !tok || mode == 3 && !(lok && tok))
+		mode = 0;
+	if (mode == 1)
+	{
+		for (y = 0; y < 8; y++)
+			for (x = 0; x < 8; x++)
+				dst[y * st + x] = dst[y * st - 1];
+		return;
+	}
+	if (mode == 2)
+	{
+		for (y = 0; y < 8; y++)
+			for (x = 0; x < 8; x++)
+				dst[y * st + x] = dst[x - st];
+		return;
+	}
+	if (mode == 3)
+	{
+		for (i = 0; i < 4; i++)
+		{
+			hh += (i + 1) * (dst[4 + i - st] - dst[2 - i - st]);
+			vv += (i + 1) * (dst[(4 + i) * st - 1] - dst[(2 - i) * st - 1]);
+		}
+		a = 16 * (dst[7 * st - 1] + dst[7 - st]);
+		b = (34 * hh + 32) >> 6;
+		c = (34 * vv + 32) >> 6;
+		for (y = 0; y < 8; y++)
+			for (x = 0; x < 8; x++)
+				dst[y * st + x] =
+					H264Clip((a + b * (x - 3) + c * (y - 3) + 16) >> 5);
+		return;
+	}
+	//DC, per 4x4 block: the corner blocks prefer the edge that faces them.
+	for (by = 0; by < 2; by++)
+		for (bx = 0; bx < 2; bx++)
+		{
+			s = 0;
+			if (bx == by)
+			{
+				if (lok && tok)
+				{
+					for (i = 0; i < 4; i++)
+						s += dst[bx * 4 + i - st] + dst[(by * 4 + i) * st - 1];
+					v = (s + 4) >> 3;
+					goto chroma_fill;
+				}
+			}
+			else if (bx)
+			{
+				if (tok)
+				{
+					for (i = 0; i < 4; i++)
+						s += dst[bx * 4 + i - st];
+					v = (s + 2) >> 2;
+					goto chroma_fill;
+				}
+			}
+			else
+			{
+				if (lok)
+				{
+					for (i = 0; i < 4; i++)
+						s += dst[(by * 4 + i) * st - 1];
+					v = (s + 2) >> 2;
+					goto chroma_fill;
+				}
+			}
+			if (tok)
+			{
+				for (i = 0; i < 4; i++)
+					s += dst[bx * 4 + i - st];
+				v = (s + 2) >> 2;
+			}
+			else if (lok)
+			{
+				for (i = 0; i < 4; i++)
+					s += dst[(by * 4 + i) * st - 1];
+				v = (s + 2) >> 2;
+			}
+			else
+				v = 128;
+chroma_fill:
+			for (y = 0; y < 4; y++)
+				for (x = 0; x < 4; x++)
+					dst[(by * 4 + y) * st + bx * 4 + x] = v;
+		}
+}
+
+/***** 8x8 transform *****/
+
+I64 H264Scale8(I64 qp, I64 pos)
+{//dequant8_coeff as ffmpeg builds it: the flat weight scale of 16 times
+//normAdjust8x8, shifted by qp / 6. Its table is stored transposed, so the
+//position is transposed back before the class is looked up.
+	I64 x = (pos >> 3) | ((pos & 7) << 3);
+	I64 idx = h264_dequant8_init_scan[((x >> 1) & 12) | (x & 3)];
+
+	return (h264_dequant8_init[qp % 6 * 6 + idx] << 4) << (qp / 6);
+}
+
+U0 H264Dequant8(I16 *blk, I64 qp)
+{
+	I64 i, v;
+
+	for (i = 0; i < 64; i++)
+	{
+		v = blk[i] * H264Scale8(qp, i);
+		blk[i] = (v + 32) >> 6;
+	}
+}
+
+U0 H264Idct8x8(U8 *dst, I64 stride, I16 *blk)
+{//ffmpeg ff_h264_idct8_add_c. Rows first, then columns: the odd terms round
+//through >>1 and >>2, so running the passes the other way round is not the
+//same transform.
+	I64 t[64], i, x, a0, a1, a2, a3, a4, a5, a6, a7, b0, b1, b2, b3, b4, b5;
+	I64 b6, b7;
+
+	for (i = 0; i < 64; i++)
+		t[i] = blk[i];
+	t[0] += 32;
+	for (i = 0; i < 8; i++)
+	{
+		x  = i * 8;
+		a0 = t[x] + t[x + 4];
+		a2 = t[x] - t[x + 4];
+		a4 = (t[x + 2] >> 1) - t[x + 6];
+		a6 = (t[x + 6] >> 1) + t[x + 2];
+		b0 = a0 + a6;
+		b2 = a2 + a4;
+		b4 = a2 - a4;
+		b6 = a0 - a6;
+		a1 = -t[x + 3] + t[x + 5] - t[x + 7] - (t[x + 7] >> 1);
+		a3 =  t[x + 1] + t[x + 7] - t[x + 3] - (t[x + 3] >> 1);
+		a5 = -t[x + 1] + t[x + 7] + t[x + 5] + (t[x + 5] >> 1);
+		a7 =  t[x + 3] + t[x + 5] + t[x + 1] + (t[x + 1] >> 1);
+		b1 = (a7 >> 2) + a1;
+		b3 = a3 + (a5 >> 2);
+		b5 = (a3 >> 2) - a5;
+		b7 = a7 - (a1 >> 2);
+		t[x]     = b0 + b7;
+		t[x + 7] = b0 - b7;
+		t[x + 1] = b2 + b5;
+		t[x + 6] = b2 - b5;
+		t[x + 2] = b4 + b3;
+		t[x + 5] = b4 - b3;
+		t[x + 3] = b6 + b1;
+		t[x + 4] = b6 - b1;
+	}
+	for (i = 0; i < 8; i++)
+	{
+		a0 = t[i] + t[i + 32];
+		a2 = t[i] - t[i + 32];
+		a4 = (t[i + 16] >> 1) - t[i + 48];
+		a6 = (t[i + 48] >> 1) + t[i + 16];
+		b0 = a0 + a6;
+		b2 = a2 + a4;
+		b4 = a2 - a4;
+		b6 = a0 - a6;
+		a1 = -t[i + 24] + t[i + 40] - t[i + 56] - (t[i + 56] >> 1);
+		a3 =  t[i + 8]  + t[i + 56] - t[i + 24] - (t[i + 24] >> 1);
+		a5 = -t[i + 8]  + t[i + 56] + t[i + 40] + (t[i + 40] >> 1);
+		a7 =  t[i + 24] + t[i + 40] + t[i + 8]  + (t[i + 8]  >> 1);
+		b1 = (a7 >> 2) + a1;
+		b3 = a3 + (a5 >> 2);
+		b5 = (a3 >> 2) - a5;
+		b7 = a7 - (a1 >> 2);
+		dst[i]              = H264Clip(dst[i]              + ((b0 + b7) >> 6));
+		dst[stride + i]     = H264Clip(dst[stride + i]     + ((b2 + b5) >> 6));
+		dst[2 * stride + i] = H264Clip(dst[2 * stride + i] + ((b4 + b3) >> 6));
+		dst[3 * stride + i] = H264Clip(dst[3 * stride + i] + ((b6 + b1) >> 6));
+		dst[4 * stride + i] = H264Clip(dst[4 * stride + i] + ((b6 - b1) >> 6));
+		dst[5 * stride + i] = H264Clip(dst[5 * stride + i] + ((b4 - b3) >> 6));
+		dst[6 * stride + i] = H264Clip(dst[6 * stride + i] + ((b2 - b5) >> 6));
+		dst[7 * stride + i] = H264Clip(dst[7 * stride + i] + ((b0 - b7) >> 6));
+	}
+}
+
+U0 H264Intra8x8(CH264Dec *d, I64 i8, I64 mode)
+{//One 8x8 luma block. The edge samples are low pass filtered first, which is
+//what separates this from the 4x4 predictor.
+	I64		 st = d->stride[0];
+	I64		 bx = d->mb_x * 4 + (i8 & 1) * 2, by = d->mb_y * 4 + (i8 >> 1) * 2;
+	U8		*dst = d->pic[0] + by * 4 * st + bx * 4;
+	I64		 t[16], l[8], lt = 128, top[16], left[8], corner = 128, i, x, y, v, s;
+	I64		 z = i8 * 4;
+	Bool	 lok = H264Blk4Avail(d, bx - 1, by, z);
+	Bool	 tok = H264Blk4Avail(d, bx, by - 1, z);
+	Bool	 trok = H264Blk4Avail(d, bx + 2, by - 1, z);
+	Bool	 tlok = H264Blk4Avail(d, bx - 1, by - 1, z);
+
+	for (i = 0; i < 16; i++)
+		top[i] = 128;
+	for (i = 0; i < 8; i++)
+		left[i] = 128;
+	if (tok)
+		for (i = 0; i < 8; i++)
+			top[i] = dst[i - st];
+	if (trok)
+		for (i = 8; i < 16; i++)
+			top[i] = dst[i - st];
+	else
+		for (i = 8; i < 16; i++)
+			top[i] = top[7];
+	if (lok)
+		for (i = 0; i < 8; i++)
+			left[i] = dst[i * st - 1];
+	if (tlok)
+		corner = dst[-st - 1];
+
+	if (tlok)
+		l[0] = (corner + 2 * left[0] + left[1] + 2) >> 2;
+	else
+		l[0] = (left[0] + 2 * left[0] + left[1] + 2) >> 2;
+	for (i = 1; i < 7; i++)
+		l[i] = (left[i - 1] + 2 * left[i] + left[i + 1] + 2) >> 2;
+	l[7] = (left[6] + 3 * left[7] + 2) >> 2;
+
+	if (tlok)
+		t[0] = (corner + 2 * top[0] + top[1] + 2) >> 2;
+	else
+		t[0] = (top[0] + 2 * top[0] + top[1] + 2) >> 2;
+	for (i = 1; i < 7; i++)
+		t[i] = (top[i - 1] + 2 * top[i] + top[i + 1] + 2) >> 2;
+	if (trok)
+	{
+		t[7] = (top[8] + 2 * top[7] + top[6] + 2) >> 2;
+		for (i = 8; i < 15; i++)
+			t[i] = (top[i - 1] + 2 * top[i] + top[i + 1] + 2) >> 2;
+		t[15] = (top[14] + 3 * top[15] + 2) >> 2;
+	}
+	else
+	{
+		t[7] = (top[7] + 2 * top[7] + top[6] + 2) >> 2;
+		for (i = 8; i < 16; i++)
+			t[i] = top[7];			//the unfiltered sample, as ffmpeg has it
+	}
+	lt = (left[0] + 2 * corner + top[0] + 2) >> 2;
+
+	//Vertical, down left and vertical left need the row above; horizontal and
+	//horizontal up the column to the left; the diagonals through the corner
+	//need both. Anything else predicts DC.
+	if (mode == 3 || mode == 7)
+	{
+		if (!tok)
+			mode = 2;
+	}
+	else if (mode == 1 || mode == 8)
+	{
+		if (!lok)
+			mode = 2;
+	}
+	else if (!mode)
+	{
+		if (!tok)
+			mode = 2;
+	}
+	else if (mode != 2 && !(lok && tok))
+		mode = 2;
+	if (mode == 2)
+	{//DC over whichever edges exist.
+		s = 0;
+		if (lok && tok)
+		{
+			for (i = 0; i < 8; i++)
+				s += l[i] + t[i];
+			v = (s + 8) >> 4;
+		}
+		else if (lok)
+		{
+			for (i = 0; i < 8; i++)
+				s += l[i];
+			v = (s + 4) >> 3;
+		}
+		else if (tok)
+		{
+			for (i = 0; i < 8; i++)
+				s += t[i];
+			v = (s + 4) >> 3;
+		}
+		else
+			v = 128;
+		for (y = 0; y < 8; y++)
+			for (x = 0; x < 8; x++)
+				dst[y * st + x] = v;
+		return;
+	}
+	H264Pred8x8(dst, st, mode, t, l, lt);
+}
+
+U0 H264Dequant(I16 *blk, I64 qp, I64 start)
+{//In place, over the 16 raster positions of one 4x4 block.
+	I64 i;
+
+	for (i = start; i < 16; i++)
+		blk[i] = blk[i] * H264Scale(qp, i);
+}
+
+U0 H264ReconLuma(CH264Dec *d, I64 mb_type, I64 cbp_luma)
+{
+	I64	 st = d->stride[0], blk, x4, y4, mode, stride = d->mb_w * 4;
+	U8	*dst;
+
+	if (mb_type)
+	{
+		H264Intra16x16(d, d->i16_mode);
+		H264LumaDC(d);
+	}
+	for (blk = 0; blk < 16; blk++)
+	{
+		x4 = d->mb_x * 4 + H264Blk4x4X(blk);
+		y4 = d->mb_y * 4 + H264Blk4x4Y(blk);
+		if (!mb_type)
+		{
+			mode = d->modes[y4 * stride + x4];
+			H264Intra4x4(d, blk, mode);
+		}
+		dst = d->pic[0] + y4 * 4 * st + x4 * 4;
+		if (mb_type)
+		{
+			if (cbp_luma & 1 << (blk >> 2))
+				H264Dequant(d->blk + 16 + blk * 16, d->qp, 1);
+			H264Idct4x4(dst, st, d->blk + 16 + blk * 16);
+		}
+		else if (cbp_luma & 1 << (blk >> 2))
+		{
+			H264Dequant(d->blk + 16 + blk * 16, d->qp, 0);
+			H264Idct4x4(dst, st, d->blk + 16 + blk * 16);
+		}
+	}
+}
+
+U0 H264ReconLuma8(CH264Dec *d, I64 cbp_luma)
+{//Four 8x8 blocks, each predicted from the neighbours already rebuilt.
+	I64	 st = d->stride[0], stride = d->mb_w * 4, i8, mode, x4, y4;
+	U8	*dst;
+
+	for (i8 = 0; i8 < 4; i8++)
+	{
+		x4   = d->mb_x * 4 + (i8 & 1) * 2;
+		y4   = d->mb_y * 4 + (i8 >> 1) * 2;
+		mode = d->modes[y4 * stride + x4];
+		H264Intra8x8(d, i8, mode);
+		if (!(cbp_luma & 1 << i8))
+			goto next_8x8;
+		H264Dequant8(d->blk + 16 + i8 * 64, d->qp);
+		dst = d->pic[0] + y4 * 4 * st + x4 * 4;
+		H264Idct8x8(dst, st, d->blk + 16 + i8 * 64);
+next_8x8:;
+	}
+}
+
+U0 H264ReconChroma(CH264Dec *d, I64 cbp_chroma)
+{
+	I64	 pl, blk, st, qp, off;
+	U8	*dst;
+
+	for (pl = 0; pl < 2; pl++)
+	{
+		H264IntraChroma(d, pl, d->chroma_mode);
+		if (!cbp_chroma)
+			goto next_plane;
+		H264ChromaDC(d, pl);
+		st = d->stride[1 + pl];
+		qp = H264ChromaQP(d, pl);
+		for (blk = 0; blk < 4; blk++)
+		{
+			off = 16 + 256 + 8 + (pl * 4 + blk) * 16;
+			if (cbp_chroma > 1)
+				H264Dequant(d->blk + off, qp, 1);
+			dst = d->pic[1 + pl] + (d->mb_y * 8 + (blk >> 1) * 4) * st +
+				  d->mb_x * 8 + (blk & 1) * 4;
+			H264Idct4x4(dst, st, d->blk + off);
+		}
+next_plane:;
+	}
+}
+
+/***** macroblock layer, CABAC *****/
+
+//Context bases per residual category: 0 luma DC, 1 luma AC, 2 luma 4x4,
+//3 chroma DC, 4 chroma AC.
+I64 H264CabacSigBase(I64 cat)
+{
+	I64 b[6];
+
+	b[0] = 105;
+	b[1] = 120;
+	b[2] = 134;
+	b[3] = 149;
+	b[4] = 152;
+	b[5] = 402;
+
+	return b[cat];
+}
+
+I64 H264CabacLastBase(I64 cat)
+{
+	I64 b[6];
+
+	b[0] = 166;
+	b[1] = 181;
+	b[2] = 195;
+	b[3] = 210;
+	b[4] = 213;
+	b[5] = 417;
+
+	return b[cat];
+}
+
+I64 H264CabacAbsBase(I64 cat)
+{
+	I64 b[6];
+
+	b[0] = 227;
+	b[1] = 237;
+	b[2] = 247;
+	b[3] = 257;
+	b[4] = 266;
+	b[5] = 426;
+
+	return b[cat];
+}
+
+I64 H264CabacCbfBase(I64 cat)
+{
+	I64 b[6];
+
+	b[0] = 85;
+	b[1] = 89;
+	b[2] = 93;
+	b[3] = 97;
+	b[4] = 101;
+	b[5] = 1012;
+
+	return b[cat];
+}
+
+I64 H264MbCbp(CH264Dec *d, I64 mb_x, I64 mb_y, Bool intra)
+{//Neighbour coded block pattern. A neighbour outside the slice counts as
+//fully coded for an intra macroblock and as luma only for an inter one, which
+//is what 0x7CF and 0x00F stand for.
+	if (!H264NeighbourOk(d, mb_x, mb_y))
+	{
+		if (intra)
+			return 0x7CF;
+
+		return 0x00F;
+	}
+
+	return d->mb_cbp[mb_y * d->mb_w + mb_x];
+}
+
+I64 H264CabacIntraType(CH264Dec *d, I64 base, Bool i_slice)
+{//decode_cabac_intra_mb_type. An I slice takes a neighbour context for the
+//first bin and shifts the rest by two; a P slice reaches the same tree from
+//its own base.
+	CH264Cabac	*c = &d->cabac;
+	I64			 ctx = 0, t, one = 0, sb = base;
+	I64			 i = d->mb_y * d->mb_w + d->mb_x, k;
+
+	if (i_slice)
+	{
+		one = 1;
+		sb  = base + 2;
+		if (H264NeighbourOk(d, d->mb_x - 1, d->mb_y))
+		{
+			k = d->mb_kind[i - 1];
+			if (k == H264_MB_I16X16 || k == H264_MB_IPCM)
+				ctx++;
+		}
+		if (H264NeighbourOk(d, d->mb_x, d->mb_y - 1))
+		{
+			k = d->mb_kind[i - d->mb_w];
+			if (k == H264_MB_I16X16 || k == H264_MB_IPCM)
+				ctx++;
+		}
+	}
+	if (!H264CabacDec(c, base + ctx))
+		return 0;					//I_NxN
+	if (H264CabacTerm(c))
+		return 25;					//I_PCM
+
+	t  = 1;
+	t += 12 * H264CabacDec(c, sb + 1);
+	if (H264CabacDec(c, sb + 2))
+		t += 4 + 4 * H264CabacDec(c, sb + 2 + one);
+	t += 2 * H264CabacDec(c, sb + 3 + one);
+	t += H264CabacDec(c, sb + 3 + 2 * one);
+
+	return t;
+}
+
+I64 H264CabacMbType(CH264Dec *d)
+{
+	return H264CabacIntraType(d, 3, TRUE);
+}
+
+I64 H264CabacTx8(CH264Dec *d)
+{
+	I64 ctx = 0, i = d->mb_y * d->mb_w + d->mb_x;
+
+	if (H264NeighbourOk(d, d->mb_x - 1, d->mb_y) && d->mb_tx8[i - 1])
+		ctx++;
+	if (H264NeighbourOk(d, d->mb_x, d->mb_y - 1) && d->mb_tx8[i - d->mb_w])
+		ctx++;
+
+	return H264CabacDec(&d->cabac, 399 + ctx);
+}
+
+I64 H264CabacIntraMode(CH264Dec *d, I64 pred)
+{
+	CH264Cabac	*c = &d->cabac;
+	I64			 mode;
+
+	if (H264CabacDec(c, 68))
+		return pred;
+	mode  = H264CabacDec(c, 69);
+	mode += 2 * H264CabacDec(c, 69);
+	mode += 4 * H264CabacDec(c, 69);
+	if (mode >= pred)
+		mode++;
+
+	return mode;
+}
+
+I64 H264CabacChromaMode(CH264Dec *d)
+{
+	CH264Cabac	*c = &d->cabac;
+	I64			 ctx = 0, i = d->mb_y * d->mb_w + d->mb_x;
+
+	if (H264NeighbourOk(d, d->mb_x - 1, d->mb_y) && d->mb_cmode[i - 1])
+		ctx++;
+	if (H264NeighbourOk(d, d->mb_x, d->mb_y - 1) && d->mb_cmode[i - d->mb_w])
+		ctx++;
+	if (!H264CabacDec(c, 64 + ctx))
+		return 0;
+	if (!H264CabacDec(c, 64 + 3))
+		return 1;
+	if (!H264CabacDec(c, 64 + 3))
+		return 2;
+
+	return 3;
+}
+
+I64 H264CabacCbpLuma(CH264Dec *d, Bool intra)
+{
+	CH264Cabac	*c = &d->cabac;
+	I64			 a = H264MbCbp(d, d->mb_x - 1, d->mb_y, intra);
+	I64			 b = H264MbCbp(d, d->mb_x, d->mb_y - 1, intra), cbp = 0, ctx;
+
+	ctx  = ToI64(!(a & 0x02)) + 2 * ToI64(!(b & 0x04));
+	cbp += H264CabacDec(c, 73 + ctx);
+	ctx  = ToI64(!(cbp & 0x01)) + 2 * ToI64(!(b & 0x08));
+	cbp += H264CabacDec(c, 73 + ctx) << 1;
+	ctx  = ToI64(!(a & 0x08)) + 2 * ToI64(!(cbp & 0x01));
+	cbp += H264CabacDec(c, 73 + ctx) << 2;
+	ctx  = ToI64(!(cbp & 0x04)) + 2 * ToI64(!(cbp & 0x02));
+	cbp += H264CabacDec(c, 73 + ctx) << 3;
+
+	return cbp;
+}
+
+I64 H264CabacCbpChroma(CH264Dec *d, Bool intra)
+{
+	CH264Cabac	*c = &d->cabac;
+	I64			 a = (H264MbCbp(d, d->mb_x - 1, d->mb_y, intra) >> 4) & 3;
+	I64			 b = (H264MbCbp(d, d->mb_x, d->mb_y - 1, intra) >> 4) & 3, ctx = 0;
+
+	if (a > 0)
+		ctx++;
+	if (b > 0)
+		ctx += 2;
+	if (!H264CabacDec(c, 77 + ctx))
+		return 0;
+	ctx = 4;
+	if (a == 2)
+		ctx++;
+	if (b == 2)
+		ctx += 2;
+
+	return 1 + H264CabacDec(c, 77 + ctx);
+}
+
+U0 H264CabacQpDelta(CH264Dec *d)
+{
+	CH264Cabac	*c = &d->cabac;
+	I64			 val, ctx = 2;
+
+	if (!H264CabacDec(c, 60 + ToI64(d->last_qp_delta != 0)))
+	{
+		d->last_qp_delta = 0;
+		return;
+	}
+	val = 1;
+	while (H264CabacDec(c, 60 + ctx))
+	{
+		ctx = 3;
+		val++;
+		if (val > 102)
+			break;
+	}
+	if (val & 1)
+		val = (val + 1) >> 1;
+	else
+		val = -((val + 1) >> 1);
+	d->last_qp_delta = val;
+	d->qp = (d->qp + val + 52) % 52;
+}
+
+I64 H264CabacCbf(CH264Dec *d, I64 cat, I64 nza, I64 nzb)
+{//coded_block_flag. The caller resolves the two neighbouring flags.
+	I64 ctx = 0;
+
+	if (nza)
+		ctx++;
+	if (nzb)
+		ctx += 2;
+
+	return H264CabacDec(&d->cabac, H264CabacCbfBase(cat) + ctx);
+}
+
+I64 H264CabacResidual(CH264Dec *d, I64 cat, I16 *blk, U8 *scan, I64 max_coeff)
+{//Significance map then levels, highest frequency first. Returns the number of
+//coefficients.
+	CH264Cabac	*c = &d->cabac;
+	I64			 sig = H264CabacSigBase(cat), last = H264CabacLastBase(cat);
+	I64			 abs = H264CabacAbsBase(cat), sctx, lctx;
+	I64			 idx[64], count = 0, i, node = 0, level, j, k, bits;
+	I64			 ctx, trans1[8], transg[8], ctx1[8], ctxg[8];
+
+	//node ctx: 0..3 while every level so far is one, 4..7 after a larger one.
+	ctx1[0] = 1;	ctx1[1] = 2;	ctx1[2] = 3;	ctx1[3] = 4;
+	ctx1[4] = 0;	ctx1[5] = 0;	ctx1[6] = 0;	ctx1[7] = 0;
+	ctxg[0] = 5;	ctxg[1] = 5;	ctxg[2] = 5;	ctxg[3] = 5;
+	ctxg[4] = 6;	ctxg[5] = 7;	ctxg[6] = 8;	ctxg[7] = 9;
+	trans1[0] = 1;	trans1[1] = 2;	trans1[2] = 3;	trans1[3] = 3;
+	trans1[4] = 4;	trans1[5] = 5;	trans1[6] = 6;	trans1[7] = 7;
+	transg[0] = 4;	transg[1] = 4;	transg[2] = 4;	transg[3] = 4;
+	transg[4] = 5;	transg[5] = 6;	transg[6] = 7;	transg[7] = 7;
+
+	for (i = 0; i < max_coeff - 1; i++)
+	{//An 8x8 block shares contexts between positions; the others map one to one.
+		sctx = i;
+		lctx = i;
+		if (cat == 5)
+		{
+			sctx = h264_cabac_sig8x8[i];
+			lctx = h264_cabac_last8x8[i];
+		}
+		if (H264CabacDec(c, sig + sctx))
+		{
+			idx[count] = i;
+			count++;
+			if (H264CabacDec(c, last + lctx))
+			{
+				i = max_coeff;
+				goto sig_done;
+			}
+		}
+	}
+	if (i == max_coeff - 1)
+	{
+		idx[count] = i;
+		count++;
+	}
+sig_done:
+	if (!count)
+		return 0;
+
+	i = count;
+	while (i)
+	{
+		i--;
+		j   = scan[idx[i]];
+		ctx = abs + ctx1[node];
+		if (!H264CabacDec(c, ctx))
+		{
+			node  = trans1[node];
+			level = 1;
+		}
+		else
+		{
+			level = 2;
+			ctx   = abs + ctxg[node];
+			node  = transg[node];
+			while (level < 15 && H264CabacDec(c, ctx))
+				level++;
+			if (level >= 15)
+			{//Exp-Golomb suffix in bypass mode.
+				bits = 0;
+				while (H264CabacBypass(c) && bits < 23)
+					bits++;
+				level = 1;
+				for (k = 0; k < bits; k++)
+					level = level + level + H264CabacBypass(c);
+				level += 14;
+			}
+		}
+		if (H264CabacBypass(c))
+			level = -level;
+		blk[j] = level;
+	}
+
+	return count;
+}
+
+I64 H264NzAt(CH264Dec *d, U8 *plane, I64 stride, I64 x, I64 y, I64 scale,
+			 Bool intra)
+{//coded_block_flag of a neighbouring block. A block that does not exist counts
+//as coded for an intra macroblock and as uncoded for an inter one.
+	if (x < 0 || y < 0 || !H264NeighbourOk(d, x / scale, y / scale))
+		return ToI64(intra);
+
+	return ToI64(plane[y * stride + x] != 0);
+}
+
+U0 H264ReconLumaRes(CH264Dec *d, I64 cbp_luma)
+{//Residual only: the prediction is already in the picture.
+	I64	 st = d->stride[0], blk, x4, y4;
+	U8	*dst;
+
+	for (blk = 0; blk < 16; blk++)
+	{
+		if (!(cbp_luma & 1 << (blk >> 2)))
+			goto next_res;
+		x4  = d->mb_x * 4 + H264Blk4x4X(blk);
+		y4  = d->mb_y * 4 + H264Blk4x4Y(blk);
+		dst = d->pic[0] + y4 * 4 * st + x4 * 4;
+		H264Dequant(d->blk + 16 + blk * 16, d->qp, 0);
+		H264Idct4x4(dst, st, d->blk + 16 + blk * 16);
+next_res:;
+	}
+}
+
+U0 H264ReconLuma8Res(CH264Dec *d, I64 cbp_luma)
+{
+	I64	 st = d->stride[0], i8, x4, y4;
+	U8	*dst;
+
+	for (i8 = 0; i8 < 4; i8++)
+	{
+		if (!(cbp_luma & 1 << i8))
+			goto next_res8;
+		x4  = d->mb_x * 4 + (i8 & 1) * 2;
+		y4  = d->mb_y * 4 + (i8 >> 1) * 2;
+		dst = d->pic[0] + y4 * 4 * st + x4 * 4;
+		H264Dequant8(d->blk + 16 + i8 * 64, d->qp);
+		H264Idct8x8(dst, st, d->blk + 16 + i8 * 64);
+next_res8:;
+	}
+}
+
+U0 H264ReconChromaRes(CH264Dec *d, I64 cbp_chroma)
+{
+	I64	 pl, blk, st, qp, off;
+	U8	*dst;
+
+	if (!cbp_chroma)
+		return;
+	for (pl = 0; pl < 2; pl++)
+	{
+		H264ChromaDC(d, pl);
+		st = d->stride[1 + pl];
+		qp = H264ChromaQP(d, pl);
+		for (blk = 0; blk < 4; blk++)
+		{
+			off = 16 + 256 + 8 + (pl * 4 + blk) * 16;
+			if (cbp_chroma > 1)
+				H264Dequant(d->blk + off, qp, 1);
+			dst = d->pic[1 + pl] + (d->mb_y * 8 + (blk >> 1) * 4) * st +
+				  d->mb_x * 8 + (blk & 1) * 4;
+			H264Idct4x4(dst, st, d->blk + off);
+		}
+	}
+}
+
+Bool H264ResidualPCabac(CH264Dec *d, I64 cbp_luma, I64 cbp_chroma)
+{//Inter residual: no luma DC, and an 8x8 block carries no coded block flag.
+	I64	 stride = d->mb_w * 4, cstride = d->mb_w * 2;
+	I64	 i = d->mb_y * d->mb_w + d->mb_x;
+	I64	 blk, t, x4, y4, x2, y2, nza, nzb, off, n, pl;
+
+	if (d->tx8x8)
+	{
+		for (t = 0; t < 4; t++)
+		{
+			if (!(cbp_luma & 1 << t))
+				goto next_p8;
+			n = H264CabacResidual(d, 5, d->blk + 16 + t * 64, h264_zigzag8, 64);
+			for (blk = 0; blk < 4; blk++)
+			{
+				x4 = d->mb_x * 4 + H264Blk4x4X(t * 4 + blk);
+				y4 = d->mb_y * 4 + H264Blk4x4Y(t * 4 + blk);
+				d->nnz[y4 * stride + x4] = n;
+			}
+next_p8:;
+		}
+	}
+	else
+		for (blk = 0; blk < 16; blk++)
+		{
+			if (!(cbp_luma & 1 << (blk >> 2)))
+				goto next_p4;
+			x4  = d->mb_x * 4 + H264Blk4x4X(blk);
+			y4  = d->mb_y * 4 + H264Blk4x4Y(blk);
+			nza = H264NzAt(d, d->nnz, stride, x4 - 1, y4, 4, FALSE);
+			nzb = H264NzAt(d, d->nnz, stride, x4, y4 - 1, 4, FALSE);
+			off = 16 + blk * 16;
+			if (H264CabacCbf(d, 2, nza, nzb))
+				d->nnz[y4 * stride + x4] =
+					H264CabacResidual(d, 2, d->blk + off, h264_zigzag4, 16);
+next_p4:;
+		}
+
+	if (cbp_chroma)
+		for (pl = 0; pl < 2; pl++)
+		{
+			nza = ToI64((H264MbCbp(d, d->mb_x - 1, d->mb_y, FALSE) & 0x40 << pl) != 0);
+			nzb = ToI64((H264MbCbp(d, d->mb_x, d->mb_y - 1, FALSE) & 0x40 << pl) != 0);
+			if (!H264CabacCbf(d, 3, nza, nzb))
+				goto next_pdc;
+			off = 16 + 256 + pl * 4;
+			n   = H264CabacResidual(d, 3, d->blk + off, h264_chroma_dc_scan, 4);
+			if (n)
+				d->mb_cbp[i] |= 0x40 << pl;
+next_pdc:;
+		}
+	if (cbp_chroma > 1)
+		for (pl = 0; pl < 2; pl++)
+			for (blk = 0; blk < 4; blk++)
+			{
+				x2  = d->mb_x * 2 + (blk & 1);
+				y2  = d->mb_y * 2 + ((blk >> 1) & 1);
+				nza = H264NzAt(d, d->nnz_c[pl], cstride, x2 - 1, y2, 2, FALSE);
+				nzb = H264NzAt(d, d->nnz_c[pl], cstride, x2, y2 - 1, 2, FALSE);
+				off = 16 + 256 + 8 + (pl * 4 + blk) * 16;
+				if (H264CabacCbf(d, 4, nza, nzb))
+					d->nnz_c[pl][y2 * cstride + x2] =
+						H264CabacResidual(d, 4, d->blk + off,
+										  h264_zigzag4 + 1, 15);
+			}
+
+	return TRUE;
+}
+
+Bool H264MbIntraCavlc(CH264Dec *d, I64 mb_type)
+{//One intra macroblock: prediction modes, coded block pattern, residual.
+	CH264Bits	*b = &d->b;
+	I64			 stride = d->mb_w * 4, t, blk, x4, y4, pred, mode;
+	I64			 cbp_luma = 0, cbp_chroma = 0, i, n;
+	U8			*src;
+
+	//Intra: no motion, so neighbouring blocks predict around it.
+	H264MvSet(d, d->mb_x * 4, d->mb_y * 4, 4, 4, -1, 0, 0, 0, 0);
 	if (mb_type > 25)
 		return FALSE;
-	MemSet(d->blk, 0, sizeof(d->blk));
+	MemSet(d->blk, 0, H264_BLK_COEFFS * sizeof(I16));
+	//Marked before the prediction modes are read: blocks of this macroblock
+	//are neighbours of each other.
+	i = d->mb_y * d->mb_w + d->mb_x;
+	d->mb_slice[i]   = d->slice_id;
+	d->mb_deblock[i] = d->sl.disable_deblock;
+	d->mb_a[i]       = d->sl.alpha_off;
+	d->mb_b[i]       = d->sl.beta_off;
+	d->mb_qp[i]      = d->qp;
+	d->mb_kind[i]    = H264_MB_I4X4;
 
 	if (mb_type == 25)
 	{//I_PCM: byte aligned samples, no residual coding at all.
@@ -1031,7 +2988,16 @@ Bool H264DecodeMbI(CH264Dec *d)
 		n = 256 + 2 * 64;
 		if (b->pos + n * 8 > b->end)
 			return FALSE;
+		src = b->buf + (b->pos >> 3);
 		b->pos += n * 8;
+		for (i = 0; i < 16; i++)
+			MemCopy(d->pic[0] + (d->mb_y * 16 + i) * d->stride[0] +
+				   d->mb_x * 16, src + i * 16, 16);
+		for (t = 0; t < 2; t++)
+			for (i = 0; i < 8; i++)
+				MemCopy(d->pic[1 + t] + (d->mb_y * 8 + i) * d->stride[1 + t] +
+					   d->mb_x * 8, src + 256 + t * 64 + i * 8, 8);
+		d->mb_qp[d->mb_y * d->mb_w + d->mb_x] = 0;
 		for (blk = 0; blk < 16; blk++)
 		{
 			x4 = d->mb_x * 4 + H264Blk4x4X(blk);
@@ -1039,7 +3005,6 @@ Bool H264DecodeMbI(CH264Dec *d)
 			d->nnz[y4 * stride + x4] = 16;
 			d->modes[y4 * stride + x4] = 2;
 		}
-		d->mb_slice[d->mb_y * d->mb_w + d->mb_x] = d->slice_id;
 		return TRUE;
 	}
 
@@ -1106,12 +3071,12 @@ Bool H264DecodeMbI(CH264Dec *d)
 		cbp_luma   = d->cbp & 15;
 		cbp_chroma = d->cbp >> 4;
 	}
-	d->mb_slice[d->mb_y * d->mb_w + d->mb_x] = d->slice_id;
 
 	if (cbp_luma || cbp_chroma || mb_type)
 	{
 		d->qp += H264ReadSE(b);
 		d->qp = (d->qp + 52) % 52;
+		d->mb_qp[d->mb_y * d->mb_w + d->mb_x] = d->qp;
 		if (!H264ResidualLuma(d, cbp_luma, ToBool(mb_type)))
 			return FALSE;
 		if (!H264ResidualChroma(d, cbp_chroma))
@@ -1127,8 +3092,949 @@ Bool H264DecodeMbI(CH264Dec *d)
 		}
 		H264ResidualChroma(d, 0);
 	}
+	if (b->eof)
+		return FALSE;
+	if (d->tx8x8)
+		return FALSE;			//8x8 transform reconstruction is absent.
+	H264ReconLuma(d, mb_type, cbp_luma);
+	H264ReconChroma(d, cbp_chroma);
 
-	return ToBool(!b->eof);
+	return TRUE;
+}
+
+Bool H264MbIntraCabac(CH264Dec *d, I64 mb_type)
+{
+	I64	 stride = d->mb_w * 4, cstride = d->mb_w * 2;
+	I64	 i = d->mb_y * d->mb_w + d->mb_x;
+	I64	 t, blk, x4, y4, x2, y2, pred, mode, n, pl, off, nza, nzb;
+	I64	 cbp_luma = 0, cbp_chroma = 0, cbp = 0, bits;
+	U8	*src;
+
+	MemSet(d->blk, 0, H264_BLK_COEFFS * sizeof(I16));
+	d->mb_slice[i]   = d->slice_id;
+	d->mb_deblock[i] = d->sl.disable_deblock;
+	d->mb_a[i]       = d->sl.alpha_off;
+	d->mb_b[i]       = d->sl.beta_off;
+	d->mb_qp[i]      = d->qp;
+	d->mb_cmode[i]   = 0;
+	d->mb_cbp[i]     = 0;
+	//Cleared first: blocks of this macroblock are each other's neighbours, and
+	//a block the pattern skips must read as uncoded.
+	for (blk = 0; blk < 16; blk++)
+	{
+		x4 = d->mb_x * 4 + H264Blk4x4X(blk);
+		y4 = d->mb_y * 4 + H264Blk4x4Y(blk);
+		d->nnz[y4 * stride + x4] = 0;
+	}
+	for (pl = 0; pl < 2; pl++)
+		for (blk = 0; blk < 4; blk++)
+		{
+			x2 = d->mb_x * 2 + (blk & 1);
+			y2 = d->mb_y * 2 + ((blk >> 1) & 1);
+			d->nnz_c[pl][y2 * cstride + x2] = 0;
+		}
+
+	//Intra: no motion, so neighbouring blocks predict around it.
+	H264MvSet(d, d->mb_x * 4, d->mb_y * 4, 4, 4, -1, 0, 0, 0, 0);
+	if (mb_type == 25)
+	{//I_PCM: samples byte aligned in the bitstream, then the engine restarts.
+		d->mb_kind[i] = H264_MB_IPCM;
+		d->mb_cbp[i]  = 0x7CF;
+		d->mb_qp[i]   = 0;
+		bits = d->cabac.pos;
+		n    = 256 + 2 * 64;
+		if (((bits + 7) & -8) + n * 8 > d->cabac.end)
+			return FALSE;
+		src = d->cabac.buf + (((bits + 7) & -8) >> 3);
+		for (t = 0; t < 16; t++)
+			MemCopy(d->pic[0] + (d->mb_y * 16 + t) * d->stride[0] +
+					d->mb_x * 16, src + t * 16, 16);
+		for (pl = 0; pl < 2; pl++)
+			for (t = 0; t < 8; t++)
+				MemCopy(d->pic[1 + pl] + (d->mb_y * 8 + t) * d->stride[1 + pl] +
+						d->mb_x * 8, src + 256 + pl * 64 + t * 8, 8);
+		for (blk = 0; blk < 16; blk++)
+		{
+			x4 = d->mb_x * 4 + H264Blk4x4X(blk);
+			y4 = d->mb_y * 4 + H264Blk4x4Y(blk);
+			d->nnz[y4 * stride + x4]   = 16;
+			d->modes[y4 * stride + x4] = 2;
+		}
+		for (pl = 0; pl < 2; pl++)
+			for (blk = 0; blk < 4; blk++)
+			{
+				x2 = d->mb_x * 2 + (blk & 1);
+				y2 = d->mb_y * 2 + ((blk >> 1) & 1);
+				d->nnz_c[pl][y2 * cstride + x2] = 16;
+			}
+		H264CabacEngine(&d->cabac, ((bits + 7) & -8) + n * 8);
+		d->last_qp_delta = 0;
+
+		return TRUE;
+	}
+
+	d->tx8x8    = FALSE;
+	d->mb_tx8[i] = 0;
+	if (!mb_type)
+	{
+		d->mb_kind[i] = H264_MB_I4X4;
+		if (d->pps->transform_8x8)
+		{
+			d->tx8x8     = ToBool(H264CabacTx8(d));
+			d->mb_tx8[i] = d->tx8x8;
+		}
+		n = 16;
+		if (d->tx8x8)
+			n = 4;
+		for (t = 0; t < n; t++)
+		{
+			blk = t;
+			if (d->tx8x8)
+				blk = t * 4;
+			x4   = d->mb_x * 4 + H264Blk4x4X(blk);
+			y4   = d->mb_y * 4 + H264Blk4x4Y(blk);
+			pred = H264PredIntraMode(d, x4, y4);
+			mode = H264CabacIntraMode(d, pred);
+			if (!d->tx8x8)
+			{
+				d->modes[y4 * stride + x4] = mode;
+				goto next_mode;
+			}
+			for (n = 0; n < 4; n++)
+			{
+				x4 = d->mb_x * 4 + H264Blk4x4X(blk + n);
+				y4 = d->mb_y * 4 + H264Blk4x4Y(blk + n);
+				d->modes[y4 * stride + x4] = mode;
+			}
+			n = 4;
+next_mode:;
+		}
+	}
+	else
+	{
+		d->mb_kind[i] = H264_MB_I16X16;
+		t = mb_type - 1;
+		d->i16_mode = t & 3;
+		cbp_chroma  = (t / 4) % 3;
+		if (t >= 12)
+			cbp_luma = 15;
+		for (blk = 0; blk < 16; blk++)
+		{
+			x4 = d->mb_x * 4 + H264Blk4x4X(blk);
+			y4 = d->mb_y * 4 + H264Blk4x4Y(blk);
+			d->modes[y4 * stride + x4] = 2;
+		}
+	}
+	d->chroma_mode = H264CabacChromaMode(d);
+	d->mb_cmode[i] = d->chroma_mode;
+
+	if (!mb_type)
+	{
+		cbp_luma   = H264CabacCbpLuma(d, TRUE);
+		cbp_chroma = H264CabacCbpChroma(d, TRUE);
+	}
+	cbp = cbp_luma | cbp_chroma << 4;
+	d->mb_cbp[i] = cbp;
+
+	if (!cbp_luma && !cbp_chroma && !mb_type)
+	{
+		d->last_qp_delta = 0;
+		goto mb_recon;
+	}
+	H264CabacQpDelta(d);
+	d->mb_qp[i] = d->qp;
+
+	if (mb_type)
+	{//Luma DC, then the AC blocks the pattern selects.
+		nza = ToI64((H264MbCbp(d, d->mb_x - 1, d->mb_y, TRUE) & 0x100) != 0);
+		nzb = ToI64((H264MbCbp(d, d->mb_x, d->mb_y - 1, TRUE) & 0x100) != 0);
+		if (H264CabacCbf(d, 0, nza, nzb))
+		{
+			n = H264CabacResidual(d, 0, d->blk, h264_zigzag4, 16);
+			if (n)
+				d->mb_cbp[i] |= 0x100;
+		}
+	}
+	if (d->tx8x8)
+	{//One 64 coefficient block per 8x8, always coded when the pattern says so.
+		for (t = 0; t < 4; t++)
+		{
+			if (!(cbp_luma & 1 << t))
+				goto next_8x8;
+			n = H264CabacResidual(d, 5, d->blk + 16 + t * 64, h264_zigzag8, 64);
+			for (blk = 0; blk < 4; blk++)
+			{
+				x4 = d->mb_x * 4 + H264Blk4x4X(t * 4 + blk);
+				y4 = d->mb_y * 4 + H264Blk4x4Y(t * 4 + blk);
+				d->nnz[y4 * stride + x4] = n;
+			}
+next_8x8:;
+		}
+		goto luma_done;
+	}
+	for (blk = 0; blk < 16; blk++)
+	{
+		x4 = d->mb_x * 4 + H264Blk4x4X(blk);
+		y4 = d->mb_y * 4 + H264Blk4x4Y(blk);
+		if (!(cbp_luma & 1 << (blk >> 2)))
+			goto next_luma;
+		nza = H264NzAt(d, d->nnz, stride, x4 - 1, y4, 4, TRUE);
+		nzb = H264NzAt(d, d->nnz, stride, x4, y4 - 1, 4, TRUE);
+		off = 16 + blk * 16;
+		if (mb_type)
+		{
+			if (H264CabacCbf(d, 1, nza, nzb))
+				d->nnz[y4 * stride + x4] =
+					H264CabacResidual(d, 1, d->blk + off, h264_zigzag4 + 1, 15);
+		}
+		else
+		{
+			if (H264CabacCbf(d, 2, nza, nzb))
+				d->nnz[y4 * stride + x4] =
+					H264CabacResidual(d, 2, d->blk + off, h264_zigzag4, 16);
+		}
+next_luma:;
+	}
+luma_done:
+
+	if (cbp_chroma)
+	{//Chroma DC per plane, then the AC blocks when the pattern says 2.
+		for (pl = 0; pl < 2; pl++)
+		{
+			nza = ToI64((H264MbCbp(d, d->mb_x - 1, d->mb_y, TRUE) & 0x40 << pl) != 0);
+			nzb = ToI64((H264MbCbp(d, d->mb_x, d->mb_y - 1, TRUE) & 0x40 << pl) != 0);
+			if (!H264CabacCbf(d, 3, nza, nzb))
+				goto next_cdc;
+			off = 16 + 256 + pl * 4;
+			n   = H264CabacResidual(d, 3, d->blk + off, h264_chroma_dc_scan, 4);
+			if (n)
+				d->mb_cbp[i] |= 0x40 << pl;
+next_cdc:;
+		}
+	}
+	if (cbp_chroma > 1)
+		for (pl = 0; pl < 2; pl++)
+			for (blk = 0; blk < 4; blk++)
+			{
+				x2  = d->mb_x * 2 + (blk & 1);
+				y2  = d->mb_y * 2 + ((blk >> 1) & 1);
+				nza = H264NzAt(d, d->nnz_c[pl], cstride, x2 - 1, y2, 2, TRUE);
+				nzb = H264NzAt(d, d->nnz_c[pl], cstride, x2, y2 - 1, 2, TRUE);
+				off = 16 + 256 + 8 + (pl * 4 + blk) * 16;
+				if (H264CabacCbf(d, 4, nza, nzb))
+					d->nnz_c[pl][y2 * cstride + x2] =
+						H264CabacResidual(d, 4, d->blk + off,
+										  h264_zigzag4 + 1, 15);
+			}
+
+mb_recon:
+	if (d->tx8x8)
+		H264ReconLuma8(d, cbp_luma);
+	else
+		H264ReconLuma(d, mb_type, cbp_luma);
+	H264ReconChroma(d, cbp_chroma);
+
+	return TRUE;
+}
+
+/***** deblocking filter *****/
+
+I64 H264ClipTc(I64 v, I64 tc)
+{
+	if (v < -tc)
+		return -tc;
+	if (v > tc)
+		return tc;
+
+	return v;
+}
+
+U0 H264FilterLuma(U8 *pix, I64 xs, I64 ys, I64 alpha, I64 beta, I64 tc0)
+{//ffmpeg h264_loop_filter_luma, four samples of one edge. bS below 4: one
+//sample either side moves, two when the neighbouring sample is flat enough.
+	I64 d, p0, p1, p2, q0, q1, q2, tc, delta;
+
+	if (tc0 < 0)
+		return;
+	for (d = 0; d < 4; d++)
+	{
+		p0 = pix[-xs];
+		p1 = pix[-2 * xs];
+		p2 = pix[-3 * xs];
+		q0 = pix[0];
+		q1 = pix[xs];
+		q2 = pix[2 * xs];
+		if (AbsI64(p0 - q0) < alpha && AbsI64(p1 - p0) < beta &&
+			AbsI64(q1 - q0) < beta)
+		{
+			tc = tc0;
+			if (AbsI64(p2 - p0) < beta)
+			{
+				if (tc0)
+					pix[-2 * xs] = p1 + H264ClipTc(
+						((p2 + ((p0 + q0 + 1) >> 1)) >> 1) - p1, tc0);
+				tc++;
+			}
+			if (AbsI64(q2 - q0) < beta)
+			{
+				if (tc0)
+					pix[xs] = q1 + H264ClipTc(
+						((q2 + ((p0 + q0 + 1) >> 1)) >> 1) - q1, tc0);
+				tc++;
+			}
+			delta = H264ClipTc(((q0 - p0) * 4 + (p1 - q1) + 4) >> 3, tc);
+			pix[-xs] = H264Clip(p0 + delta);
+			pix[0]   = H264Clip(q0 - delta);
+		}
+		pix += ys;
+	}
+}
+
+U0 H264FilterLumaIntra(U8 *pix, I64 xs, I64 ys, I64 alpha, I64 beta)
+{//bS 4: up to three samples either side move.
+	I64 d, p0, p1, p2, p3, q0, q1, q2, q3;
+
+	for (d = 0; d < 4; d++)
+	{
+		p0 = pix[-xs];
+		p1 = pix[-2 * xs];
+		p2 = pix[-3 * xs];
+		q0 = pix[0];
+		q1 = pix[xs];
+		q2 = pix[2 * xs];
+		if (AbsI64(p0 - q0) < alpha && AbsI64(p1 - p0) < beta &&
+			AbsI64(q1 - q0) < beta)
+		{
+			if (AbsI64(p0 - q0) < (alpha >> 2) + 2)
+			{
+				if (AbsI64(p2 - p0) < beta)
+				{
+					p3 = pix[-4 * xs];
+					pix[-xs]     = (p2 + 2 * p1 + 2 * p0 + 2 * q0 + q1 + 4) >> 3;
+					pix[-2 * xs] = (p2 + p1 + p0 + q0 + 2) >> 2;
+					pix[-3 * xs] = (2 * p3 + 3 * p2 + p1 + p0 + q0 + 4) >> 3;
+				}
+				else
+					pix[-xs] = (2 * p1 + p0 + q1 + 2) >> 2;
+				if (AbsI64(q2 - q0) < beta)
+				{
+					q3 = pix[3 * xs];
+					pix[0]      = (p1 + 2 * p0 + 2 * q0 + 2 * q1 + q2 + 4) >> 3;
+					pix[xs]     = (p0 + q0 + q1 + q2 + 2) >> 2;
+					pix[2 * xs] = (2 * q3 + 3 * q2 + q1 + q0 + p0 + 4) >> 3;
+				}
+				else
+					pix[0] = (2 * q1 + q0 + p1 + 2) >> 2;
+			}
+			else
+			{
+				pix[-xs] = (2 * p1 + p0 + q1 + 2) >> 2;
+				pix[0]   = (2 * q1 + q0 + p1 + 2) >> 2;
+			}
+		}
+		pix += ys;
+	}
+}
+
+U0 H264FilterChroma(U8 *pix, I64 xs, I64 ys, I64 alpha, I64 beta, I64 tc)
+{
+	I64 d, p0, p1, q0, q1, delta;
+
+	if (tc <= 0)
+		return;
+	for (d = 0; d < 2; d++)
+	{
+		p0 = pix[-xs];
+		p1 = pix[-2 * xs];
+		q0 = pix[0];
+		q1 = pix[xs];
+		if (AbsI64(p0 - q0) < alpha && AbsI64(p1 - p0) < beta &&
+			AbsI64(q1 - q0) < beta)
+		{
+			delta = H264ClipTc(((q0 - p0) * 4 + (p1 - q1) + 4) >> 3, tc);
+			pix[-xs] = H264Clip(p0 + delta);
+			pix[0]   = H264Clip(q0 - delta);
+		}
+		pix += ys;
+	}
+}
+
+U0 H264FilterChromaIntra(U8 *pix, I64 xs, I64 ys, I64 alpha, I64 beta)
+{
+	I64 d, p0, p1, q0, q1;
+
+	for (d = 0; d < 2; d++)
+	{
+		p0 = pix[-xs];
+		p1 = pix[-2 * xs];
+		q0 = pix[0];
+		q1 = pix[xs];
+		if (AbsI64(p0 - q0) < alpha && AbsI64(p1 - p0) < beta &&
+			AbsI64(q1 - q0) < beta)
+		{
+			pix[-xs] = (2 * p1 + p0 + q1 + 2) >> 2;
+			pix[0]   = (2 * q1 + q0 + p1 + 2) >> 2;
+		}
+		pix += ys;
+	}
+}
+
+I64 H264QPIndex(I64 qp, I64 off)
+{
+	I64 i = qp + off;
+
+	if (i < 0)
+		return 0;
+	if (i > 51)
+		return 51;
+
+	return i;
+}
+
+U0 H264FilterEdge(CH264Dec *d, I64 plane, I64 px, I64 py, I64 dir, I64 qp,
+				  I64 *bs, I64 a_off, I64 b_off)
+{//dir 0 filters a vertical edge, so the samples either side run along x. The
+//strength is given per group of four luma samples, two chroma.
+	I64	 st = d->stride[plane], xs = 1, ys = st, k, step = 4;
+	I64	 ia = H264QPIndex(qp, a_off), ib = H264QPIndex(qp, b_off);
+	I64	 alpha = h264_alpha[ia], beta = h264_beta[ib], tc0;
+	U8	*pix = d->pic[plane] + py * st + px;
+
+	if (!alpha || !beta)
+		return;
+	if (dir)
+	{
+		xs = st;
+		ys = 1;
+	}
+	if (plane)
+		step = 2;
+	for (k = 0; k < 4; k++)
+	{
+		if (!bs[k])
+			goto next_group;
+		if (bs[k] >= 4)
+		{//tc0 carries a column per strength 1..3 only.
+			if (!plane)
+				H264FilterLumaIntra(pix, xs, ys, alpha, beta);
+			else
+				H264FilterChromaIntra(pix, xs, ys, alpha, beta);
+			goto next_group;
+		}
+		tc0 = h264_tc0[ia * 4 + bs[k]];
+		if (!plane)
+			H264FilterLuma(pix, xs, ys, alpha, beta, tc0);
+		else
+			H264FilterChroma(pix, xs, ys, alpha, beta, tc0 + 1);
+next_group:
+		pix += step * ys;
+	}
+}
+
+Bool H264MbIsIntra(CH264Dec *d, I64 i)
+{
+	return ToBool(d->mb_kind[i] && d->mb_kind[i] <= H264_MB_IPCM);
+}
+
+U0 H264EdgeStrength(CH264Dec *d, I64 x4, I64 y4, I64 dir, I64 *bs)
+{//8.7.2.1 for two inter blocks: coefficients first, then reference and motion.
+	I64 stride = d->mb_w * 4, k, i, j, ax, ay, bx, by;
+
+	for (k = 0; k < 4; k++)
+	{
+		if (dir)
+		{
+			i = y4 * stride + x4 + k;
+			j = i - stride;
+		}
+		else
+		{
+			i = (y4 + k) * stride + x4;
+			j = i - 1;
+		}
+		if (d->nnz[i] || d->nnz[j])
+		{
+			bs[k] = 2;
+			goto next_bs;
+		}
+		bs[k] = 0;
+		if (d->refidx[i] != d->refidx[j])
+		{
+			bs[k] = 1;
+			goto next_bs;
+		}
+		ax = d->mvx[i];
+		ay = d->mvy[i];
+		bx = d->mvx[j];
+		by = d->mvy[j];
+		if (AbsI64(ax - bx) >= 4 || AbsI64(ay - by) >= 4)
+			bs[k] = 1;
+next_bs:;
+	}
+}
+
+U0 H264FilterMb(CH264Dec *d, I64 mb_x, I64 mb_y)
+{//An edge with an intra macroblock either side takes strength 4 across a
+//macroblock edge and 3 inside one; between inter blocks it depends on their
+//coefficients, references and motion.
+	I64 i = mb_y * d->mb_w + mb_x, qp = d->mb_qp[i], nqp = qp;
+	I64 a = d->mb_a[i], b = d->mb_b[i];
+	I64 dir, edge, pl, ni, eqp, cqp, off, bs[4], k, x4, y4;
+
+	if (d->mb_deblock[i] == 1)
+		return;
+	for (dir = 0; dir < 2; dir++)
+		for (edge = 0; edge < 4; edge++)
+		{
+			eqp = qp;
+			ni  = i;
+			if (edge & 1 && d->mb_tx8[i])
+				goto next_edge;
+			if (!edge)
+			{
+				ni = i - 1;
+				if (dir)
+					ni = i - d->mb_w;
+				if (!dir && !mb_x || dir && !mb_y)
+					goto next_edge;
+				if (d->mb_deblock[i] == 2 && d->mb_slice[ni] != d->mb_slice[i])
+					goto next_edge;
+				nqp = d->mb_qp[ni];
+				eqp = (qp + nqp + 1) >> 1;
+			}
+			x4 = mb_x * 4;
+			y4 = mb_y * 4;
+			if (dir)
+				y4 += edge;
+			else
+				x4 += edge;
+			if (H264MbIsIntra(d, i) || H264MbIsIntra(d, ni))
+			{
+				k = 3;
+				if (!edge)
+					k = 4;
+				bs[0] = k;
+				bs[1] = k;
+				bs[2] = k;
+				bs[3] = k;
+			}
+			else
+				H264EdgeStrength(d, x4, y4, dir, bs);
+			if (!bs[0] && !bs[1] && !bs[2] && !bs[3])
+				goto next_edge;
+			if (dir)
+				H264FilterEdge(d, 0, mb_x * 16, mb_y * 16 + edge * 4, 1, eqp,
+							   bs, a, b);
+			else
+				H264FilterEdge(d, 0, mb_x * 16 + edge * 4, mb_y * 16, 0, eqp,
+							   bs, a, b);
+			//Chroma is filtered on every second luma edge.
+			if (edge & 1)
+				goto next_edge;
+			for (pl = 0; pl < 2; pl++)
+			{
+				off = d->pps->chroma_qp_off;
+				if (pl)
+					off = d->pps->chroma_qp_off2;
+				cqp = h264_chroma_qp[H264QPIndex(qp, off)];
+				if (!edge)
+					cqp = (cqp + h264_chroma_qp[H264QPIndex(nqp, off)] + 1) >> 1;
+				if (dir)
+					H264FilterEdge(d, 1 + pl, mb_x * 8, mb_y * 8 + edge * 2, 1,
+								   cqp, bs, a, b);
+				else
+					H264FilterEdge(d, 1 + pl, mb_x * 8 + edge * 2, mb_y * 8, 0,
+								   cqp, bs, a, b);
+			}
+next_edge:;
+		}
+}
+I64 H264CabacSkip(CH264Dec *d)
+{//mb_skip_flag: the context counts neighbours that were not skipped.
+	I64 ctx = 0, i = d->mb_y * d->mb_w + d->mb_x;
+
+	if (H264NeighbourOk(d, d->mb_x - 1, d->mb_y) &&
+		d->mb_kind[i - 1] != H264_MB_SKIP)
+		ctx++;
+	if (H264NeighbourOk(d, d->mb_x, d->mb_y - 1) &&
+		d->mb_kind[i - d->mb_w] != H264_MB_SKIP)
+		ctx++;
+
+	return H264CabacDec(&d->cabac, 11 + ctx);
+}
+
+I64 H264CabacMbTypeP(CH264Dec *d)
+{//0..4 are the P types, 5 and above an intra type offset by five, which is
+//the numbering the CAVLC form uses too.
+	CH264Cabac	*c = &d->cabac;
+	I64			 t;
+
+	if (H264CabacDec(c, 14))
+		return H264CabacIntraType(d, 17, FALSE) + 5;
+	if (!H264CabacDec(c, 15))
+		return 3 * H264CabacDec(c, 16);
+	t = H264CabacDec(c, 17);
+
+	return 2 - t;
+}
+
+I64 H264CabacSubType(CH264Dec *d)
+{//0 8x8, 1 8x4, 2 4x8, 3 4x4.
+	CH264Cabac *c = &d->cabac;
+
+	if (H264CabacDec(c, 21))
+		return 0;
+	if (!H264CabacDec(c, 22))
+		return 1;
+	if (H264CabacDec(c, 23))
+		return 2;
+
+	return 3;
+}
+
+I64 H264CabacRefIdx(CH264Dec *d, I64 x4, I64 y4)
+{//The context counts neighbours that already carry a reference above zero.
+	I64 ctx = 0, ref = 0, ra, rb, z, mx, my;
+
+	z  = H264ZOf(x4 & 3, y4 & 3);
+	ra = H264MvAt(d, x4 - 1, y4, z, &mx, &my);
+	rb = H264MvAt(d, x4, y4 - 1, z, &mx, &my);
+	if (ra > 0)
+		ctx++;
+	if (rb > 0)
+		ctx += 2;
+	while (H264CabacDec(&d->cabac, 54 + ctx))
+	{
+		ref++;
+		ctx = (ctx >> 2) + 4;
+		if (ref >= 32)
+			return 0;
+	}
+
+	return ref;
+}
+
+I64 H264CabacMvd(CH264Dec *d, I64 base, I64 amvd)
+{//9.3.2.3, the mvd magnitude in a unary prefix and a bypass suffix.
+	CH264Cabac	*c = &d->cabac;
+	I64			 ctx = 0, mvd, k;
+
+	if (amvd >= 3)
+		ctx = 1;
+	if (amvd > 32)
+		ctx = 2;
+	if (!H264CabacDec(c, base + ctx))
+		return 0;
+	mvd = 1;
+	ctx = 3;
+	while (mvd < 9 && H264CabacDec(c, base + ctx))
+	{
+		if (mvd < 4)
+			ctx++;
+		mvd++;
+	}
+	if (mvd >= 9)
+	{
+		k = 3;
+		while (H264CabacBypass(c) && k < 20)
+		{
+			mvd += 1 << k;
+			k++;
+		}
+		while (k)
+		{
+			k--;
+			mvd += H264CabacBypass(c) << k;
+		}
+	}
+	if (H264CabacBypass(c))
+		return -mvd;
+
+	return mvd;
+}
+
+I64 H264MvdAt(CH264Dec *d, I64 x4, I64 y4, I64 zcur, Bool vert)
+{//Magnitude of a neighbouring difference, zero where the block does not exist
+//or has not been decoded yet.
+	I64 stride = d->mb_w * 4, mx, my;
+
+	if (H264MvAt(d, x4, y4, zcur, &mx, &my) == -2)
+		return 0;
+	if (vert)
+		return AbsI64(d->mvdy[y4 * stride + x4]);
+
+	return AbsI64(d->mvdx[y4 * stride + x4]);
+}
+
+I64 H264MvdSum(CH264Dec *d, I64 x4, I64 y4, Bool vert)
+{//The context for a motion vector difference counts the neighbouring ones.
+	I64 z = H264ZOf(x4 & 3, y4 & 3);
+
+	return H264MvdAt(d, x4 - 1, y4, z, vert) +
+		   H264MvdAt(d, x4, y4 - 1, z, vert);
+}
+
+I64 H264ReadTE(CH264Bits *b, I64 range)
+{//te(v): one inverted bit when only two values are possible.
+	if (range < 2)
+		return 1 - H264Read(b, 1);
+
+	return H264ReadUE(b);
+}
+
+U0 H264MbPart(CH264Dec *d, Bool cabac, I64 x4, I64 y4, I64 bw4, I64 bh4,
+			  I64 part, I64 ref)
+{//One motion partition: the difference is read, added to the prediction, and
+//the block is fetched from its reference.
+	I64 px, py, dx, dy;
+
+	H264MvPred(d, x4, y4, bw4, ref, part, &px, &py);
+	if (cabac)
+	{
+		dx = H264CabacMvd(d, 40, H264MvdSum(d, x4, y4, FALSE));
+		dy = H264CabacMvd(d, 47, H264MvdSum(d, x4, y4, TRUE));
+	}
+	else
+	{
+		dx = H264ReadSE(&d->b);
+		dy = H264ReadSE(&d->b);
+	}
+	H264MvSet(d, x4, y4, bw4, bh4, ref, px + dx, py + dy, dx, dy);
+	H264McBlock(d, x4, y4, bw4, bh4, ref, px + dx, py + dy);
+}
+
+Bool H264DecodeMbP(CH264Dec *d, Bool cabac, Bool skip)
+{//One P macroblock. Skipped macroblocks carry no residual and predict with the
+//motion of their neighbours.
+	I64	 stride = d->mb_w * 4, i = d->mb_y * d->mb_w + d->mb_x;
+	I64	 mb_type, sub[4], ref[4], x4, y4, blk, n, t;
+	Bool ref0_only;
+	I64	 cbp_luma = 0, cbp_chroma = 0, mvx, mvy, nrefs = d->sl.ref_count[0];
+	I64	 x, y, bw, bh, np;
+
+	d->mb_slice[i]   = d->slice_id;
+	d->mb_deblock[i] = d->sl.disable_deblock;
+	d->mb_a[i]       = d->sl.alpha_off;
+	d->mb_b[i]       = d->sl.beta_off;
+	d->mb_qp[i]      = d->qp;
+	d->mb_cmode[i]   = 0;
+	d->mb_cbp[i]     = 0;
+	d->mb_tx8[i]     = 0;
+	d->tx8x8         = FALSE;
+	MemSet(d->blk, 0, H264_BLK_COEFFS * sizeof(I16));
+	for (blk = 0; blk < 16; blk++)
+	{
+		x4 = d->mb_x * 4 + H264Blk4x4X(blk);
+		y4 = d->mb_y * 4 + H264Blk4x4Y(blk);
+		d->nnz[y4 * stride + x4]  = 0;
+		d->mvdx[y4 * stride + x4] = 0;
+		d->mvdy[y4 * stride + x4] = 0;
+		//An intra block predicts DC from a neighbour that is not itself
+		//predicted in a 4x4 or 8x8 intra mode.
+		d->modes[y4 * stride + x4] = 2;
+	}
+	for (t = 0; t < 2; t++)
+		for (blk = 0; blk < 4; blk++)
+			d->nnz_c[t][(d->mb_y * 2 + (blk >> 1)) * (d->mb_w * 2) +
+						d->mb_x * 2 + (blk & 1)] = 0;
+
+	if (skip)
+	{
+		d->mb_kind[i] = H264_MB_SKIP;
+		H264SkipMv(d, &mvx, &mvy);
+		H264MvSet(d, d->mb_x * 4, d->mb_y * 4, 4, 4, 0, mvx, mvy, 0, 0);
+		H264McBlock(d, d->mb_x * 4, d->mb_y * 4, 4, 4, 0, mvx, mvy);
+		d->last_qp_delta = 0;
+
+		return TRUE;
+	}
+
+	if (cabac)
+		mb_type = H264CabacMbTypeP(d);
+	else
+		mb_type = H264ReadUE(&d->b);
+	if (mb_type >= 5)
+	{
+		d->mb_kind[i] = H264_MB_I4X4;
+		if (cabac)
+			return H264MbIntraCabac(d, mb_type - 5);
+
+		return H264MbIntraCavlc(d, mb_type - 5);
+	}
+	d->mb_kind[i] = H264_MB_INTER;
+	ref0_only = FALSE;
+	if (mb_type == 4)
+	{//P_8x8ref0: every partition uses reference zero, and none is coded.
+		mb_type   = 3;
+		ref0_only = TRUE;
+	}
+
+	//Reference indices first, then the differences, as the standard orders
+	//the macroblock layer.
+	for (n = 0; n < 4; n++)
+		ref[n] = 0;
+	if (!mb_type)
+		np = 1;
+	else if (mb_type == 3)
+		np = 4;
+	else
+		np = 2;
+	if (mb_type == 3)
+		for (n = 0; n < 4; n++)
+		{//Every sub type first: the standard reads the four of them together.
+			if (cabac)
+				sub[n] = H264CabacSubType(d);
+			else
+				sub[n] = H264ReadUE(&d->b);
+			if (sub[n] > 3)
+				return FALSE;
+		}
+	if (nrefs > 1 && !ref0_only)
+		for (n = 0; n < np; n++)
+		{
+			x4 = d->mb_x * 4;
+			y4 = d->mb_y * 4;
+			if (mb_type == 1)
+				y4 += n * 2;
+			else if (mb_type == 2)
+				x4 += n * 2;
+			else if (mb_type == 3)
+			{
+				x4 += (n & 1) * 2;
+				y4 += (n >> 1) * 2;
+			}
+			if (cabac)
+				ref[n] = H264CabacRefIdx(d, x4, y4);
+			else
+				ref[n] = H264ReadTE(&d->b, nrefs);
+			//Written now: the next partition's context reads it.
+			t = 4;
+			if (mb_type == 1)
+				t = 2;
+			if (mb_type == 1)
+				H264MvSet(d, x4, y4, 4, 2, ref[n], 0, 0, 0, 0);
+			else if (mb_type == 2)
+				H264MvSet(d, x4, y4, 2, 4, ref[n], 0, 0, 0, 0);
+			else
+				H264MvSet(d, x4, y4, 2, 2, ref[n], 0, 0, 0, 0);
+		}
+
+	if (!mb_type)
+		H264MbPart(d, cabac, d->mb_x * 4, d->mb_y * 4, 4, 4, 0, ref[0]);
+	else if (mb_type == 1)
+		for (n = 0; n < 2; n++)
+			H264MbPart(d, cabac, d->mb_x * 4, d->mb_y * 4 + n * 2, 4, 2,
+					   1 + n, ref[n]);
+	else if (mb_type == 2)
+		for (n = 0; n < 2; n++)
+			H264MbPart(d, cabac, d->mb_x * 4 + n * 2, d->mb_y * 4, 2, 4,
+					   3 + n, ref[n]);
+	else
+	{//P_8x8: each quarter carries its own partitioning.
+		for (n = 0; n < 4; n++)
+		{
+			bw = 2;
+			bh = 2;
+			if (sub[n] == 1)
+				bh = 1;
+			if (sub[n] == 2)
+				bw = 1;
+			if (sub[n] == 3)
+			{
+				bw = 1;
+				bh = 1;
+			}
+			for (y = 0; y < 2; y += bh)
+				for (x = 0; x < 2; x += bw)
+					H264MbPart(d, cabac,
+							   d->mb_x * 4 + (n & 1) * 2 + x,
+							   d->mb_y * 4 + (n >> 1) * 2 + y,
+							   bw, bh, 0, ref[n]);
+		}
+	}
+
+	if (cabac)
+	{
+		cbp_luma   = H264CabacCbpLuma(d, FALSE);
+		cbp_chroma = H264CabacCbpChroma(d, FALSE);
+	}
+	else
+	{
+		n = H264ReadUE(&d->b);
+		if (n > 47)
+			return FALSE;
+		cbp_luma   = h264_golomb_to_inter_cbp[n] & 15;
+		cbp_chroma = h264_golomb_to_inter_cbp[n] >> 4;
+	}
+	d->mb_cbp[i] = cbp_luma | cbp_chroma << 4;
+	if (!cbp_luma && !cbp_chroma)
+	{
+		d->last_qp_delta = 0;
+
+		return TRUE;
+	}
+	if (cabac)
+	{
+		if (d->pps->transform_8x8 && cbp_luma)
+		{
+			d->tx8x8     = ToBool(H264CabacTx8(d));
+			d->mb_tx8[i] = d->tx8x8;
+		}
+		H264CabacQpDelta(d);
+	}
+	else
+	{
+		if (d->pps->transform_8x8 && cbp_luma)
+			return FALSE;			//CAVLC 8x8 residuals are not implemented
+		d->qp = (d->qp + H264ReadSE(&d->b) + 52) % 52;
+	}
+	d->mb_qp[i] = d->qp;
+
+	if (cabac)
+	{
+		if (!H264ResidualPCabac(d, cbp_luma, cbp_chroma))
+			return FALSE;
+	}
+	else if (!H264ResidualLuma(d, cbp_luma, FALSE) ||
+			 !H264ResidualChroma(d, cbp_chroma))
+		return FALSE;
+
+	if (d->tx8x8)
+		H264ReconLuma8Res(d, cbp_luma);
+	else
+		H264ReconLumaRes(d, cbp_luma);
+	H264ReconChromaRes(d, cbp_chroma);
+
+	return TRUE;
+}
+
+Bool H264DecodeMbI(CH264Dec *d)
+{
+	return H264MbIntraCavlc(d, H264ReadUE(&d->b));
+}
+
+Bool H264DecodeMbICabac(CH264Dec *d)
+{
+	return H264MbIntraCabac(d, H264CabacMbType(d));
+}
+
+public U0 H264DecPicEnd(CH264Dec *d)
+{//The finished picture joins the short term references when the stream marks
+//it as one, and the oldest makes way.
+	if (!d->cur || !d->sps || !d->sl.nal_ref_idc)
+		return;
+	H264RefStore(d, d->sps->max_ref_frames, 1 << d->sps->log2_max_frame_num);
+}
+
+public U0 H264DecFilter(CH264Dec *d)
+{//Runs once the whole picture is decoded, in macroblock raster order.
+	I64 x, y;
+
+	if (!d->pic[0])
+		return;
+	for (y = 0; y < d->mb_h; y++)
+		for (x = 0; x < d->mb_w; x++)
+			H264FilterMb(d, x, y);
 }
 
 public CH264Dec *H264DecOpen(CH264Ctx *c)
@@ -1153,18 +4059,21 @@ public I64 H264DecodeSlice(CH264Dec *d, U8 *rbsp, I64 size)
 //over: a correct parse stops on the rbsp_stop_one_bit, so anything but 0..7
 //means the walk went wrong. Negative on a rejected slice.
 	CH264Ctx	*c = d->ctx;
-	I64			 addr, left, i;
+	I64			 addr, left, i, skip_run = 0;
+	Bool		 p_slice, skip, pending = FALSE;
 
 	if (!H264ParseSliceHeader(c, rbsp, size, &d->sl))
 		return -1;
-	if (d->sl.type != H264_SLICE_I)
-		return -2;					//Only I slices decode so far.
+	if (d->sl.type != H264_SLICE_I && d->sl.type != H264_SLICE_P)
+		return -2;					//B slices are not implemented.
+	if (d->sl.long_term)
+		return -7;					//Long term references are not kept.
 	d->pps = &c->pps[d->sl.pps_id];
 	d->sps = &c->sps[d->pps->sps_id];
-	if (d->pps->cabac)
-		return -3;					//CABAC is not implemented.
 	if (!H264DecSize(d, d->sps))
 		return -4;
+	if (d->pps->transform_8x8 && !d->pps->cabac)
+		return -6;					//CAVLC 8x8 residuals are not implemented.
 
 	//The header parse left the reader positioned at the slice data.
 	H264BitsInit(&d->b, rbsp, size);
@@ -1172,30 +4081,92 @@ public I64 H264DecodeSlice(CH264Dec *d, U8 *rbsp, I64 size)
 	d->b.pos = d->sl.header_bits;
 
 	if (d->sl.first_mb == 0)
-	{
+	{//A new picture: take a frame that is not held as a reference.
+		if (d->sl.nal_type == H264_NAL_IDR || d->sl.mmco_reset)
+			H264RefsClear(d);
+		d->cur = H264FrameFree(d);
+		if (!d->cur)
+			return -4;
+		d->cur->frame_num = d->sl.frame_num;
+		for (i = 0; i < 3; i++)
+			d->pic[i] = d->cur->pic[i];
 		MemSet(d->mb_slice, 0xFF, d->mb_w * d->mb_h);
 		d->slice_id = 0;
 	}
+	if (!d->cur)
+		return -4;
 	d->slice_id++;
-	d->qp   = d->sl.qp;
-	d->mbs  = 0;
-	addr    = d->sl.first_mb;
+	H264RefListBuild(d, 1 << d->sps->log2_max_frame_num);
+	H264RefListReorder(d, &d->sl, 1 << d->sps->log2_max_frame_num);
+	if (d->sl.type == H264_SLICE_P && !d->ref0_count)
+		return -8;					//No reference to predict from.
+	d->qp            = d->sl.qp;
+	d->mbs           = 0;
+	d->last_qp_delta = 0;
+	addr             = d->sl.first_mb;
+
+	p_slice = ToBool(d->sl.type == H264_SLICE_P);
+	if (d->pps->cabac)
+	{//No trailing bit walk: the arithmetic decoder ends the slice itself.
+		H264CabacStart(&d->cabac, rbsp, size, d->sl.header_bits, d->sl.qp,
+					   p_slice, d->sl.cabac_init);
+		while (addr < d->mb_w * d->mb_h)
+		{
+			d->mb_x = addr % d->mb_w;
+			d->mb_y = addr / d->mb_w;
+			if (p_slice)
+			{
+				skip = ToBool(H264CabacSkip(d));
+				if (!H264DecodeMbP(d, TRUE, skip))
+					return -5;
+			}
+			else if (!H264DecodeMbICabac(d))
+				return -5;
+			d->mbs++;
+			addr++;
+			if (H264CabacTerm(&d->cabac))
+				break;
+		}
+
+		return 0;
+	}
 
 	while (addr < d->mb_w * d->mb_h)
 	{
 		d->mb_x = addr % d->mb_w;
 		d->mb_y = addr / d->mb_w;
-		if (!H264DecodeMbI(d))
+		if (p_slice && !pending)
+		{//mb_skip_run precedes each coded macroblock.
+			skip_run = H264ReadUE(&d->b);
+			pending  = TRUE;
+		}
+		if (p_slice && skip_run > 0)
+		{
+			skip_run--;
+			if (!H264DecodeMbP(d, FALSE, TRUE))
+				return -5;
+		}
+		else if (p_slice)
+		{
+			pending = FALSE;
+			if (!H264DecodeMbP(d, FALSE, FALSE))
+				return -5;
+		}
+		else if (!H264DecodeMbI(d))
 			return -5;
 		d->mbs++;
 		addr++;
-		//more_rbsp_data(): a slice ends at the stop bit and its padding.
+		//more_rbsp_data(): a slice ends at the stop bit and its padding. A
+		//skip run still owed macroblocks outlives the last coded bit.
+		if (skip_run > 0)
+			goto next_mb;
 		left = d->b.end - d->b.pos;
 		for (i = d->b.end - 1; i > d->b.pos; i--)
 			if (rbsp[i >> 3] >> (7 - (i & 7)) & 1)
 				break;
 		if (i <= d->b.pos)
 			break;
+next_mb:;
 	}
 
 	left = d->b.end - d->b.pos;
@@ -1207,4 +4178,150 @@ public I64 H264DecodeSlice(CH264Dec *d, U8 *rbsp, I64 size)
 		}
 
 	return left;
+}
+
+/***** playback *****/
+
+class CH264Play
+{//Parameter sets and the decoder together, as one handle for a player.
+	CH264Ctx	*ctx;
+	CH264Dec	*dec;
+	I64			 w, h;
+	Bool		 got;			//a picture has been decoded
+};
+
+public CH264Play *H264PlayOpen()
+{
+	CH264Play *p = CAlloc(sizeof(CH264Play));
+
+	p->ctx = H264Open();
+	p->dec = H264DecOpen(p->ctx);
+	if (!p->ctx || !p->dec)
+	{
+		H264DecClose(p->dec);
+		H264Close(p->ctx);
+		Free(p);
+		return NULL;
+	}
+
+	return p;
+}
+
+public U0 H264PlayClose(CH264Play *p)
+{
+	if (!p)
+		return;
+	H264DecClose(p->dec);
+	H264Close(p->ctx);
+	Free(p);
+}
+
+public Bool H264PlayConfig(CH264Play *p, U8 *cfg, I64 size)
+{//The avcC record from the container.
+	if (!p)
+		return FALSE;
+
+	return H264ParseAvcC(p->ctx, cfg, size);
+}
+
+U32 *H264ToArgb(CH264Dec *d, I64 w, I64 h)
+{//BT.601, limited range.
+	U32	*argb = MAlloc(w * h * sizeof(U32));
+	I64	 x, y, cy, cu, cv, r, g, b;
+
+	if (!argb)
+		return NULL;
+	for (y = 0; y < h; y++)
+	{
+		for (x = 0; x < w; x++)
+		{
+			cy = 298 * (d->pic[0][y * d->stride[0] + x] - 16);
+			cu = d->pic[1][(y >> 1) * d->stride[1] + (x >> 1)] - 128;
+			cv = d->pic[2][(y >> 1) * d->stride[2] + (x >> 1)] - 128;
+			r = H264Clip((cy + 409 * cv + 128) >> 8);
+			g = H264Clip((cy - 100 * cu - 208 * cv + 128) >> 8);
+			b = H264Clip((cy + 516 * cu + 128) >> 8);
+			argb[y * w + x] = 0xFF000000 | r << 16 | g << 8 | b;
+		}
+		if (!(y & 63))
+			Yield;
+	}
+
+	return argb;
+}
+
+public Bool H264Playable(U8 *cfg, I64 size)
+{//Whether an avcC record describes a stream the decoder handles. The 8x8
+//transform is the one coding tool still missing. Inter prediction is absent
+//either way, so playable means the key frames decode.
+	CH264Ctx	*c = H264Open();
+	Bool		 ok = FALSE;
+	I64			 i;
+
+	if (!c)
+		return FALSE;
+	if (H264ParseAvcC(c, cfg, size))
+		for (i = 0; i < H264_PPS_MAX; i++)
+			if (c->pps[i].valid &&
+				!(c->pps[i].transform_8x8 && !c->pps[i].cabac))
+			{
+				ok = TRUE;
+				i = H264_PPS_MAX;
+			}
+	H264Close(c);
+
+	return ok;
+}
+
+public U32 *H264PlayDecode(CH264Play *p, U8 *data, I64 size, I64 *_w, I64 *_h)
+{//One access unit, length prefixed as MP4 stores it. NULL when nothing in it
+//decodes: only CAVLC I slices do, so a stream plays as its key frames.
+	CH264SPS	*s;
+	U8			*d;
+	I64			 off = 0, i, nlen, nal, rl, n = 0;
+
+	*_w = 0;
+	*_h = 0;
+	if (!p || !data || size < 1)
+		return NULL;
+	while (off + p->ctx->nal_len_size <= size)
+	{
+		nlen = 0;
+		for (i = 0; i < p->ctx->nal_len_size; i++)
+			nlen = nlen << 8 | data[off + i];
+		off += p->ctx->nal_len_size;
+		if (nlen < 1 || off + nlen > size)
+			break;
+		d   = data + off;
+		nal = d[0] & 0x1F;
+		if (nal == H264_NAL_SPS || nal == H264_NAL_PPS)
+		{
+			rl = H264Rbsp(p->ctx, d, nlen);
+			if (nal == H264_NAL_SPS)
+				H264ParseSPS(p->ctx, p->ctx->rbsp, rl);
+			else
+				H264ParsePPS(p->ctx, p->ctx->rbsp, rl);
+		}
+		else if (nal == H264_NAL_SLICE || nal == H264_NAL_IDR)
+		{
+			rl = H264Rbsp(p->ctx, d, nlen);
+			if (H264DecodeSlice(p->dec, p->ctx->rbsp, rl) >= 0)
+				n++;
+		}
+		off += nlen;
+	}
+	if (!n)
+		return NULL;
+	H264DecFilter(p->dec);
+	H264DecPicEnd(p->dec);
+	s = H264ActiveSPS(p->ctx);
+	if (!s)
+		return NULL;
+	p->w   = s->width;
+	p->h   = s->height;
+	p->got = TRUE;
+	*_w    = p->w;
+	*_h    = p->h;
+
+	return H264ToArgb(p->dec, p->w, p->h);
 }
