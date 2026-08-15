@@ -62,8 +62,16 @@ build/launchvm.sh       # QEMU, KVM, AC97, rtl8139
 build/sync.sh           # merge changes made inside the VM back to the repo
 ```
 
-Requires VT-x/AMD-V. The ISO installs to a qcow2 disk; after that, boot the
-disk and sync in either direction.
+Needs qemu, xorriso, mtools, git and a C toolchain, plus VT-x/AMD-V. No root.
+
+`build-iso.sh` boots `build/AUTO.ISO` to install a minimal system onto a
+scratch disk, copies this tree into it, recompiles the kernel and the OS, and
+writes two ISOs: a native RedSea one for BIOS and a limine hybrid for UEFI.
+Twenty minutes or so on the first run.
+
+`launchvm.sh` boots the newest of those ISOs against `build/ZealOS.qcow2`,
+creating that disk if it is absent. From the ISO, run `OSInstall;` to install
+onto it, then boot the disk and sync in either direction.
 
 ## Layout
 
