@@ -23,7 +23,7 @@ KVM=''
 # Set this true if you want to test ISOs in QEMU after building.
 TESTING=false
 
-for tool in qemu-system-x86_64 qemu-img xorriso mcopy mmd mdel git make tar
+for tool in qemu-system-x86_64 qemu-img xorriso mcopy mmd mdel mdeltree git make tar
 do
 	command -v "$tool" >/dev/null || { echo "ERROR: $tool not found in \$PATH."; exit 1; }
 done
@@ -50,6 +50,7 @@ set_img() {
 }
 
 script_cleanup() {
+	[ -n "$KEEPTMP" ] && { echo "Keeping $TMPDIR"; return; }
 	echo "Deleting temp folder ..."
 	rm -rf "$TMPDIR"
 }
@@ -73,16 +74,18 @@ echo "Staging src/ ..."
 rm -f ../src/Home/Registry.ZC
 rm -f ../src/Home/MakeHome.ZC
 rm -f ../src/Boot/Kernel.ZXE
-( cd .. && git ls-files -co --exclude-standard -z -- src | tar --null -T - -cf - ) | \
-	tar -xf - -C "$TMPSRC"
+# --ignore-failed-read: files deleted in the working tree are still in the index
+# until the deletion is committed, and ls-files reports them.
+( cd .. && git ls-files -co --exclude-standard -z -- src | \
+	tar --null -T - --ignore-failed-read -cf - ) | tar -xf - -C "$TMPSRC"
 
 echo "Copying all src/ code into vdisk Tmp/OSBuild/ ..."
 mmd -i "$IMG" ::/Tmp/OSBuild
-mcopy -s -Q -o -i "$IMG" "$TMPSRC"/src/* ::/Tmp/OSBuild/
+mcopy -s -Q -n -o -i "$IMG" "$TMPSRC"/src/* ::/Tmp/OSBuild/ < /dev/null
 
 # The install carries the AUTO.ISO copy of the bootstrap chain, which is only as
 # new as the ISO. Run the ones in this tree instead.
-mcopy -Q -o -i "$IMG" ../src/Misc/Auto/AutoFullDistro*.ZC ::/Misc/Auto/
+mcopy -Q -n -o -i "$IMG" ../src/Misc/Auto/AutoFullDistro*.ZC ::/Misc/Auto/ < /dev/null
 
 echo "Rebuilding kernel headers, kernel, OS, and building Distro ISO ..."
 "$QEMU_BIN_PATH/qemu-system-x86_64" -machine q35 $KVM -drive format=raw,file="$TMPDISK" -m 1G -rtc base=localtime -smp 4 -device isa-debug-exit $QEMU_HEADLESS || true
@@ -116,10 +119,15 @@ sed -i 's/const uint8_t/U8/g' limine/Limine-BIOS-HDD.HH
 sed -i "s/\[\]/\[$(grep -o "0x" ./limine/limine-bios-hdd.h | wc -l)\]/g" limine/Limine-BIOS-HDD.HH
 
 echo "Extracting MyDistro ISO from vdisk ..."
-mcopy -i "$IMG" ::/Tmp/MyDistro.ISO.C ./ZealOS-MyDistro.iso
+rm -f ./ZealOS-MyDistro.iso
+mcopy -n -o -i "$IMG" ::/Tmp/MyDistro.ISO.C ./ZealOS-MyDistro.iso < /dev/null
 mdel -i "$IMG" ::/Tmp/MyDistro.ISO.C
 echo "Setting up temp ISO directory contents for use with limine xorriso command ..."
-mcopy -s -Q -i "$IMG" "::/*" "$TMPISODIR/"
+# The staged source is not part of the distro, and ZealOS leaves it behind: its
+# FAT32 Del throws partway through a tree. Remove it here, where the FAT writer
+# is correct, or the recursive read below hits the broken cluster chains.
+mdeltree -i "$IMG" ::/Tmp/OSBuild >/dev/null 2>&1 || true
+mcopy -s -Q -n -o -i "$IMG" "::/*" "$TMPISODIR/" < /dev/null
 rm -f "$TMPISODIR/Boot/OldMBR.BIN"
 rm -f "$TMPISODIR/Boot/BootMHD2.BIN"
 mkdir -p "$TMPISODIR/EFI/BOOT"
@@ -131,7 +139,15 @@ cp limine/limine-bios.sys "$TMPISODIR/Boot/Limine-BIOS.SYS"
 cp ../zealbooter/bin/kernel "$TMPISODIR/Boot/ZealBooter.ELF"
 cp ../zealbooter/limine.conf "$TMPISODIR/Boot/Limine.CONF"
 echo "Copying DVDKernel.ZXE over ISO Boot/Kernel.ZXE ..."
-mcopy -i "$IMG" ::/Tmp/DVDKernel.ZXE "$TMPISODIR/Boot/Kernel.ZXE"
+# BootDVDIns swallows its own exceptions, so MakeMyISO builds a kernel-less ISO
+# rather than failing. Stop here instead of shipping one that cannot boot.
+rm -f "$TMPISODIR/Boot/Kernel.ZXE"
+if ! mcopy -n -o -i "$IMG" ::/Tmp/DVDKernel.ZXE "$TMPISODIR/Boot/Kernel.ZXE" < /dev/null 2>/dev/null
+then
+	echo "ERROR: ::/Tmp/DVDKernel.ZXE missing - BootDVDIns produced no kernel."
+	echo "./ZealOS-MyDistro.iso was written but has no kernel and will not boot."
+	exit 1
+fi
 rm -f "$TMPISODIR/Tmp/DVDKernel.ZXE"
 
 truncate -s 32K bios_boot.img
