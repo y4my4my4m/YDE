@@ -30,8 +30,19 @@ public Bool MediaNext(CMediaCtx *m, CMediaPacket *pkt)
 	return MkvNext(m, pkt);
 }
 
+public U0 MediaVideoDrop(CMediaCtx *m)
+{//Discard a decoded frame that was never presented.
+	if (!m)
+		return;
+	if (m->pend_dc)
+		DCDel(m->pend_dc);
+	m->pend_dc    = NULL;
+	m->pend_codec = MEDIA_CODEC_NONE;
+}
+
 public U0 MediaRewind(CMediaCtx *m)
 {
+	MediaVideoDrop(m);
 	if (m->container == MEDIA_CONT_MP4)
 		MP4Rewind(m);
 	else
@@ -42,6 +53,7 @@ public U0 MediaClose(CMediaCtx *m)
 {
 	if (!m)
 		return;
+	MediaVideoDrop(m);
 	if (m->vctx)
 		Vp8CtxClose(m->vctx);
 	if (m->v9ctx)
@@ -201,20 +213,20 @@ public I64 MediaPlayAudio(U8 *filename)
 	return AudioSFXPlayRef(frames, count, rate);
 }
 
-public CDC *MediaVideoNext(CMediaCtx *m, I64 track_num, F64 *_time)
-{//The codecs hand back a frame buffer they own and reuse; it is copied into
-//the returned DC, which the caller DCDels.//Next decodable video frame, as a DC the caller owns and DCDels.
+public Bool MediaVideoDecode(CMediaCtx *m, I64 track_num, F64 *_time)
+{//Next displayable video frame into the codec's planes, without converting it
+//to pixels. MediaVideoPresent turns it into a DC. A player that is behind
+//decodes through the frames it drops without paying for the conversion.
 //
-//MJPEG frames are whole JPEGs and all intra. A VP8 frame that decodes but is
-//not shown updates references only and is skipped here. VP9 has no inter
-//prediction yet, and H.264 decodes CAVLC I slices only, so those streams show
-//one frame per keyframe.
+//MJPEG frames are whole JPEGs and all intra, so they are decoded here and the
+//DC is held. A VP8 or VP9 frame that decodes but is not shown updates
+//references only and is skipped.
 	CMediaPacket p;
-	U32			*argb;
 	CDC			*dc;
-	I64			 w = 0, h = 0, ti, codec = MEDIA_CODEC_NONE;
+	I64			 ti, codec = MEDIA_CODEC_NONE;
 
 	*_time = 0.0;
+	MediaVideoDrop(m);
 	ti = MediaTrackByNum(m, track_num);
 	if (ti >= 0)
 		codec = m->track[ti].codec;
@@ -230,12 +242,9 @@ public CDC *MediaVideoNext(CMediaCtx *m, I64 track_num, F64 *_time)
 			dc = JPGReadBuf(p.data, p.size, NULL);
 			if (!dc)
 				goto next_frame;
-			*_time = p.time;
-
-			return dc;
+			m->pend_dc = dc;
 		}
-
-		if (codec == MEDIA_CODEC_H264)
+		else if (codec == MEDIA_CODEC_H264)
 		{
 			if (!m->h264ctx)
 			{
@@ -243,41 +252,103 @@ public CDC *MediaVideoNext(CMediaCtx *m, I64 track_num, F64 *_time)
 				H264PlayConfig(m->h264ctx, m->track[ti].codec_priv,
 							   m->track[ti].codec_priv_len);
 			}
-			argb = H264PlayDecode(m->h264ctx, p.data, p.size, &w, &h);
-			if (!argb)
+			if (!H264PlayDecodeRaw(m->h264ctx, p.data, p.size))
 				goto next_frame;
-			dc = WEBPArgbToDC(argb, w, h, FALSE, NULL);
-			if (!dc)
-				goto next_frame;
-			*_time = p.time;
-
-			return dc;
 		}
-
 		//Persistent context: reference planes and entropy state survive between
-		//frames. A frame that is decoded but not shown returns no image.
-		if (codec == MEDIA_CODEC_VP9)
+		//frames.
+		else if (codec == MEDIA_CODEC_VP9)
 		{
 			if (!m->v9ctx)
 				m->v9ctx = Vp9CtxOpen;
-			argb = Vp9CtxDecode(m->v9ctx, p.data, p.size, &w, &h);
+			if (!Vp9CtxDecodeRaw(m->v9ctx, p.data, p.size) ||
+				!Vp9CtxShown(m->v9ctx))
+				goto next_frame;
 		}
 		else
 		{
 			if (!m->vctx)
 				m->vctx = Vp8CtxOpen;
-			argb = Vp8CtxDecode(m->vctx, p.data, p.size, &w, &h);
+			if (!Vp8CtxDecodeRaw(m->vctx, p.data, p.size) ||
+				!Vp8CtxShown(m->vctx))
+				goto next_frame;
 		}
-		if (!argb)
-			goto next_frame;
-		dc = WEBPArgbToDC(argb, w, h, FALSE, NULL);
-		if (!dc)
-			goto next_frame;
-		*_time = p.time;
+		m->pend_codec = codec;
+		*_time        = p.time;
 
-		return dc;
+		return TRUE;
 next_frame:;
 	}
+
+	return FALSE;
+}
+
+public Bool MediaVideoPresentInto(CMediaCtx *m, CDC **_dc)
+{
+	U32	*argb;
+	CDC	*dc;
+	I64	 w = 0, h = 0, codec;
+
+	if (!m || !_dc)
+		return FALSE;
+	codec         = m->pend_codec;
+	m->pend_codec = MEDIA_CODEC_NONE;
+	if (codec == MEDIA_CODEC_MJPEG)
+	{//A JPEG decodes into a DC of its own, so the buffer is replaced.
+		if (!m->pend_dc)
+			return FALSE;
+		DCDel(*_dc);
+		*_dc       = m->pend_dc;
+		m->pend_dc = NULL;
+
+		return TRUE;
+	}
+	if (codec == MEDIA_CODEC_H264)
+		argb = H264PlayArgb(m->h264ctx, &w, &h);
+	else if (codec == MEDIA_CODEC_VP9)
+		argb = Vp9CtxArgb(m->v9ctx, &w, &h);
+	else if (codec == MEDIA_CODEC_VP8)
+		argb = Vp8CtxArgb(m->vctx, &w, &h);
+	else
+		return FALSE;
+	if (!argb || w < 1 || h < 1)
+		return FALSE;
+	dc = *_dc;
+	if (!dc || dc->width != w || dc->height != h)
+	{
+		DCDel(dc);
+		dc   = DCNew(w, h);
+		*_dc = dc;
+		if (!dc)
+			return FALSE;
+	}
+	WEBPArgbIntoDC(dc, argb, w, h, FALSE);
+
+	return TRUE;
+}
+
+public CDC *MediaVideoPresent(CMediaCtx *m)
+{//The frame MediaVideoDecode last accepted, as a DC the caller owns and
+//DCDels. NULL when nothing is pending.
+	CDC *dc = NULL;
+
+	if (!MediaVideoPresentInto(m, &dc))
+		return NULL;
+
+	return dc;
+}
+
+public CDC *MediaVideoNext(CMediaCtx *m, I64 track_num, F64 *_time)
+{//Next decodable video frame, as a DC the caller owns and DCDels.
+	CDC *dc;
+
+	while (MediaVideoDecode(m, track_num, _time))
+	{
+		dc = MediaVideoPresent(m);
+		if (dc)
+			return dc;
+	}
+	*_time = 0.0;
 
 	return NULL;
 }
