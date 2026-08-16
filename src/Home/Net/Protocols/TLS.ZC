@@ -85,6 +85,208 @@ U0 TLSTicketUnlock()
 	LBtr(&tls_ticket_lock, 0);
 }
 
+#define TLS_PIN_FILE		"::/Home/Net/Pins.DATA"
+#define TLS_PIN_LINE_MAX	160
+
+#define TLS_PIN_NEW			0
+#define TLS_PIN_MATCH		1
+#define TLS_PIN_MISMATCH	-1
+
+U0 TLSHexOf(U8 *sha, U8 *out)
+{//32 bytes to 64 lower-case hex digits plus a terminator.
+	I64	 i, v;
+	U8	*digits = "0123456789abcdef";
+
+	for (i = 0; i < 32; i++)
+	{
+		v = sha[i];
+		out[i * 2]     = digits[(v >> 4) & 15];
+		out[i * 2 + 1] = digits[v & 15];
+	}
+	out[64] = 0;
+}
+
+I64 TLSHexNib(I64 c)
+{
+	if (c > '9')
+		return (c & 0x0F) + 9;	//'a'..'f' and 'A'..'F' share the low nibble
+
+	return c & 0x0F;
+}
+
+U0 TLSHexTo(U8 *hex, U8 *out)
+{//64 hex digits back to 32 bytes.
+	I64 i;
+
+	for (i = 0; i < 32; i++)
+		out[i] = (TLSHexNib(hex[i * 2]) << 4) | TLSHexNib(hex[i * 2 + 1]);
+}
+
+U0 TLSCaptureLeaf(CTLS *tls, U8 *body, I64 len)
+{//Certificate, RFC 8446 4.4.2: a one byte request context, a three byte list
+//length, then each entry as a three byte length and its DER. The first entry
+//is the end-entity certificate.
+	I64		 pos, ctx_len, list_len, cert_len;
+	CSHA256	 c;
+
+	if (!tls || !body || len < 5)
+		return;
+	ctx_len = body[0];
+	pos     = 1 + ctx_len;
+	if (pos + 3 > len)
+		return;
+	list_len = (body[pos] << 16) | (body[pos + 1] << 8) | body[pos + 2];
+	pos += 3;
+	if (list_len < 3 || pos + 3 > len)
+		return;
+	cert_len = (body[pos] << 16) | (body[pos + 1] << 8) | body[pos + 2];
+	pos += 3;
+	if (cert_len < 1 || pos + cert_len > len)
+		return;
+	SHA256Init(&c);
+	SHA256Update(&c, body + pos, cert_len);
+	SHA256Final(&c, tls->cert_sha);
+	tls->cert_seen = TRUE;
+}
+
+I64 TLSPinLookup(U8 *host, U8 *sha_out)
+{//Reads the stored fingerprint for a host. TRUE when one exists.
+	U8	*txt, *line, *sp;
+	I64	 size = 0, n, found = FALSE;
+
+	txt = FileRead(TLS_PIN_FILE, &size);
+	if (!txt)
+		return FALSE;
+	line = txt;
+	while (line < txt + size && !found)
+	{
+		sp = line;
+		while (sp < txt + size && *sp != '\n')
+			sp++;
+		*sp = 0;
+		n   = StrLen(host);
+		if (!StrNCompare(line, host, n) && line[n] == ' ' &&
+			StrLen(line) >= n + 65)
+		{
+			TLSHexTo(line + n + 1, sha_out);
+			found = TRUE;
+		}
+		line = sp + 1;
+	}
+	Free(txt);
+
+	return found;
+}
+
+U0 TLSPinStore(U8 *host, U8 *sha)
+{//Appends a host and its fingerprint. Rewrites the file, since the pin list
+//is short and RedSea has no append.
+	U8	*txt, *out;
+	U8	 hex[72];
+	I64	 size = 0, n;
+
+	TLSHexOf(sha, hex);
+	txt = FileRead(TLS_PIN_FILE, &size);
+	if (!txt)
+	{
+		size = 0;
+		txt  = NULL;
+	}
+	n   = size + StrLen(host) + 70;
+	out = MAlloc(n);
+	if (!out)
+	{
+		Free(txt);
+		return;
+	}
+	out[0] = 0;
+	if (txt && size)
+	{
+		MemCopy(out, txt, size);
+		out[size] = 0;
+	}
+	StrPrint(out + size, "%s %s\n", host, hex);
+	FileWrite(TLS_PIN_FILE, out, StrLen(out));
+	Free(out);
+	Free(txt);
+}
+
+public U0 TLSPinForget(U8 *host)
+{//Drops a host's pin so the next connection stores whatever it is offered.
+//The equivalent of ssh-keygen -R, and the way a rotated certificate is
+//accepted.
+	U8	*txt, *out, *line, *sp;
+	I64	 size = 0, n, used = 0, keep;
+
+	txt = FileRead(TLS_PIN_FILE, &size);
+	if (!txt)
+	{
+		"TLS: no pin file.\n";
+		return;
+	}
+	out = MAlloc(size + 1);
+	if (!out)
+	{
+		Free(txt);
+		return;
+	}
+	n    = StrLen(host);
+	line = txt;
+	while (line < txt + size)
+	{
+		sp = line;
+		while (sp < txt + size && *sp != '\n')
+			sp++;
+		*sp  = 0;
+		keep = TRUE;
+		if (!StrNCompare(line, host, n) && line[n] == ' ')
+			keep = FALSE;
+		if (keep && StrLen(line))
+		{
+			StrCopy(out + used, line);
+			used += StrLen(line);
+			out[used] = '\n';
+			used++;
+		}
+		line = sp + 1;
+	}
+	out[used] = 0;
+	FileWrite(TLS_PIN_FILE, out, used);
+	Free(out);
+	Free(txt);
+	"TLS: pin for %s dropped.\n", host;
+}
+
+I64 TLSPinCheck(CTLS *tls, U8 *host)
+{//TLS_PIN_NEW, TLS_PIN_MATCH or TLS_PIN_MISMATCH.
+	U8	stored[32];
+	U8	a[72], b[72];
+
+	if (!tls->cert_seen)
+	{
+		NetLog("TLS: %s sent no certificate; nothing to pin.", host);
+		return TLS_PIN_MISMATCH;
+	}
+	if (!TLSPinLookup(host, stored))
+	{
+		TLSPinStore(host, tls->cert_sha);
+		TLSHexOf(tls->cert_sha, a);
+		NetLog("TLS: pinned %s on first use, %s.", host, a);
+		return TLS_PIN_NEW;
+	}
+	if (CryptoBytesEqual(stored, tls->cert_sha, 32))
+		return TLS_PIN_MATCH;
+	TLSHexOf(stored, a);
+	TLSHexOf(tls->cert_sha, b);
+	NetLog("TLS: CERTIFICATE CHANGED for %s.", host);
+	NetLog("TLS:   pinned  %s", a);
+	NetLog("TLS:   offered %s", b);
+	NetLog("TLS: refusing. If the certificate was renewed, run "
+		   "TLSPinForget(\"%s\"); and reconnect.", host);
+
+	return TLS_PIN_MISMATCH;
+}
+
 U0 TLSTicketWipe(CTLSTicket *t)
 {
 	Free(t->ticket);
@@ -252,6 +454,9 @@ class CTLS
 
 	I64			 recv_records;	// diagnostics, quoted in every failure line
 	I64			 recv_bytes;
+
+	U8			 cert_sha[32];	// SHA-256 of the leaf certificate, for pinning
+	Bool		 cert_seen;
 
 	Bool		 established;
 	Bool		 failed;		// record stream desynced; all further reads fail
@@ -1043,7 +1248,10 @@ I64 TLSReadServerFlight(CTLS *tls, U8 *th_after_sfin_out)
 				break;
 			}
 			else
-			{ // EncryptedExtensions / Certificate / CertificateVerify / etc: hash, ignore
+			{
+				if (msg_type == TLS_HS_CERTIFICATE)
+					TLSCaptureLeaf(tls, hs + hs_pos + 4, msg_len);
+				// EncryptedExtensions / CertificateVerify / etc: hash, ignore
 				SHA256Update(&tls->transcript, hs + hs_pos, msg_total);
 				hs_pos += msg_total;
 			}
@@ -1193,6 +1401,15 @@ CTLS *TLSConnect(U8 *hostname, CTCPSocket *sock)
 
 	TLSComputeAppKeys(tls, th_after_sfin);
 	TLSComputeResumptionSecret(tls);
+
+	//Checked after Finished so the transcript is intact either way. A resumed
+	//handshake carries no certificate, and its PSK already ties it to the
+	//session that was pinned.
+	if (!tls->resumed && TLSPinCheck(tls, hostname) == TLS_PIN_MISMATCH)
+	{
+		tls->failed = TRUE;
+		goto tls_fail;
+	}
 	tls->established = TRUE;
 
 	Free(ch);

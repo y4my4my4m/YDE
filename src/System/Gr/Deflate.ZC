@@ -1,0 +1,435 @@
+//DEFLATE compression, RFC 1951, with the zlib (RFC 1950) and gzip (RFC 1952)
+//wrappers. Inflate.ZC is the matching decompressor.
+//
+//One fixed-Huffman block per stream. Fixed codes cost a few percent against
+//dynamic ones but need no code-length table in the output, and the ratio is
+//not what git push or an HTTP body is waiting on. Incompressible input falls
+//back to stored blocks so it never grows by more than 5 bytes per 65535.
+
+#define DEFL_WINDOW			32768
+#define DEFL_MIN_MATCH		3
+#define DEFL_MAX_MATCH		258
+#define DEFL_HASH_BITS		15
+#define DEFL_HASH_SIZE		(1 << DEFL_HASH_BITS)
+#define DEFL_STORE_MAX		65535	//largest stored block LEN
+
+//Match search effort. Level 0 stores, 1 is a single candidate per position.
+#define DEFL_LEVEL_MAX		9
+
+//RFC 1951 3.2.5, length codes 257..285 and distance codes 0..29.
+I64 defl_len_base[29] = {
+	3,4,5,6,7,8,9,10,11,13,15,17,19,23,27,31,35,43,51,59,67,83,99,115,131,
+	163,195,227,258
+};
+I64 defl_len_extra[29] = {
+	0,0,0,0,0,0,0,0,1,1,1,1,2,2,2,2,3,3,3,3,4,4,4,4,5,5,5,5,0
+};
+I64 defl_dist_base[30] = {
+	1,2,3,4,5,7,9,13,17,25,33,49,65,97,129,193,257,385,513,769,1025,1537,
+	2049,3073,4097,6145,8193,12289,16385,24577
+};
+I64 defl_dist_extra[30] = {
+	0,0,0,0,1,1,2,2,3,3,4,4,5,5,6,6,7,7,8,8,9,9,10,10,11,11,12,12,13,13
+};
+
+class CDeflate
+{
+	U8	*out;
+	I64	 cap, len;			//bytes emitted
+	I64	 bitbuf, bitcnt;	//partial byte, filled from the low bit up
+	Bool oom;
+	I32	*head;				//hash to most recent position, -1 when empty
+	I32	*prev;				//position to the one before it, DEFL_WINDOW wide
+	I64	 chain_max;
+};
+
+U0 DeflByte(CDeflate *d, I64 v)
+{
+	U8 *bigger;
+
+	if (d->oom)
+		return;
+	if (d->len >= d->cap)
+	{
+		bigger = ReAlloc(d->out, d->cap * 2 + 64);
+		if (!bigger)
+		{
+			d->oom = TRUE;
+			return;
+		}
+		d->out = bigger;
+		d->cap = d->cap * 2 + 64;
+	}
+	d->out[d->len] = v;
+	d->len++;
+}
+
+U0 DeflBits(CDeflate *d, I64 v, I64 n)
+{//Least significant bit first, which is how DEFLATE packs a byte.
+	if (n < 1)
+		return;
+	d->bitbuf |= (v & ((1 << n) - 1)) << d->bitcnt;
+	d->bitcnt += n;
+	while (d->bitcnt >= 8)
+	{
+		DeflByte(d, d->bitbuf & 0xFF);
+		d->bitbuf = d->bitbuf >> 8;
+		d->bitcnt -= 8;
+	}
+}
+
+U0 DeflHuff(CDeflate *d, I64 code, I64 n)
+{//Huffman codes travel most significant bit first, unlike everything else.
+	I64 i;
+
+	for (i = n - 1; i >= 0; i--)
+		DeflBits(d, (code >> i) & 1, 1);
+}
+
+U0 DeflFlush(CDeflate *d)
+{
+	if (d->bitcnt)
+		DeflBits(d, 0, 8 - d->bitcnt);
+}
+
+U0 DeflLit(CDeflate *d, I64 sym)
+{//Fixed literal/length code, RFC 1951 3.2.6.
+	if (sym < 144)
+		DeflHuff(d, 0x30 + sym, 8);
+	else if (sym < 256)
+		DeflHuff(d, 0x190 + sym - 144, 9);
+	else if (sym < 280)
+		DeflHuff(d, sym - 256, 7);
+	else
+		DeflHuff(d, 0xC0 + sym - 280, 8);
+}
+
+U0 DeflMatch(CDeflate *d, I64 len, I64 dist)
+{
+	I64 i = 0;
+
+	while (i < 28 && defl_len_base[i + 1] <= len)
+		i++;
+	DeflLit(d, 257 + i);
+	DeflBits(d, len - defl_len_base[i], defl_len_extra[i]);
+	i = 0;
+	while (i < 29 && defl_dist_base[i + 1] <= dist)
+		i++;
+	DeflHuff(d, i, 5);			//fixed distance codes are 5 plain bits
+	DeflBits(d, dist - defl_dist_base[i], defl_dist_extra[i]);
+}
+
+I64 DeflHashAt(U8 *p)
+{
+	return ((p[0] << 10) ^ (p[1] << 5) ^ p[2]) & (DEFL_HASH_SIZE - 1);
+}
+
+I64 DeflStoredSize(I64 len)
+{//Header byte plus LEN and NLEN for each block, and one empty block when
+//there is nothing to store.
+	I64 blocks = (len + DEFL_STORE_MAX - 1) / DEFL_STORE_MAX;
+
+	if (!blocks)
+		blocks = 1;
+
+	return len + blocks * 5;
+}
+
+U0 DeflStored(CDeflate *d, U8 *src, I64 len, Bool final)
+{//Uncompressed blocks: BFINAL, BTYPE 00, pad to a byte, then LEN and ~LEN.
+	I64 off = 0, n;
+
+	if (!len)
+	{
+		DeflBits(d, ToI64(final), 1);
+		DeflBits(d, 0, 2);
+		DeflFlush(d);
+		DeflByte(d, 0);
+		DeflByte(d, 0);
+		DeflByte(d, 0xFF);
+		DeflByte(d, 0xFF);
+		return;
+	}
+	while (off < len)
+	{
+		n = len - off;
+		if (n > DEFL_STORE_MAX)
+			n = DEFL_STORE_MAX;
+		DeflBits(d, ToI64(final && off + n >= len), 1);
+		DeflBits(d, 0, 2);
+		DeflFlush(d);
+		DeflByte(d, n & 0xFF);
+		DeflByte(d, (n >> 8) & 0xFF);
+		DeflByte(d, (~n) & 0xFF);
+		DeflByte(d, ((~n) >> 8) & 0xFF);
+		while (n)
+		{
+			DeflByte(d, src[off]);
+			off++;
+			n--;
+		}
+	}
+}
+
+U0 DeflBlock(CDeflate *d, U8 *src, I64 len)
+{//One fixed-Huffman block over the whole input.
+	I64 pos = 0, i, h, cand, dist, n, chain, best_len, best_dist, limit;
+
+	DeflBits(d, 1, 1);			//BFINAL
+	DeflBits(d, 1, 2);			//BTYPE 01, fixed Huffman
+	while (pos < len)
+	{
+		best_len  = 0;
+		best_dist = 0;
+		if (pos + DEFL_MIN_MATCH <= len)
+		{
+			h     = DeflHashAt(src + pos);
+			cand  = d->head[h];
+			chain = d->chain_max;
+			while (cand >= 0 && chain > 0)
+			{
+				dist = pos - cand;
+				if (dist < 1 || dist > DEFL_WINDOW)
+					break;
+				limit = DEFL_MAX_MATCH;
+				if (len - pos < limit)
+					limit = len - pos;
+				n = 0;
+				while (n < limit && src[cand + n] == src[pos + n])
+					n++;
+				if (n > best_len)
+				{
+					best_len  = n;
+					best_dist = dist;
+					if (n >= DEFL_MAX_MATCH)
+						chain = 1;
+				}
+				cand = d->prev[cand & (DEFL_WINDOW - 1)];
+				chain--;
+			}
+		}
+		if (best_len >= DEFL_MIN_MATCH)
+		{
+			DeflMatch(d, best_len, best_dist);
+			n = best_len;
+		}
+		else
+		{
+			DeflLit(d, src[pos]);
+			best_len = 1;
+			n        = 1;
+		}
+		//Every covered position still has to enter the chain, or later matches
+		//cannot reach back past this one.
+		for (i = 0; i < n; i++)
+		{
+			if (pos + i + DEFL_MIN_MATCH > len)
+				break;
+			h = DeflHashAt(src + pos + i);
+			d->prev[(pos + i) & (DEFL_WINDOW - 1)] = d->head[h];
+			d->head[h] = pos + i;
+		}
+		pos += n;
+	}
+	DeflLit(d, 256);			//end of block
+	DeflFlush(d);
+}
+
+public U8 *DeflateRaw(U8 *src, I64 len, I64 *_out_len, I64 level=6)
+{//Raw DEFLATE. Caller frees. NULL on allocation failure.
+	CDeflate	*d = CAlloc(sizeof(CDeflate));
+	U8			*res;
+	I64			 i;
+
+	*_out_len = 0;
+	if (!d)
+		return NULL;
+	d->cap = len + (len >> 3) + 64;
+	d->out = MAlloc(d->cap);
+	if (!d->out)
+	{
+		Free(d);
+		return NULL;
+	}
+	if (level < 0)
+		level = 0;
+	if (level > DEFL_LEVEL_MAX)
+		level = DEFL_LEVEL_MAX;
+	d->chain_max = level * level + 1;
+	if (!level || len < DEFL_MIN_MATCH)
+		DeflStored(d, src, len, TRUE);
+	else
+	{
+		d->head = MAlloc(DEFL_HASH_SIZE * sizeof(I32));
+		d->prev = MAlloc(DEFL_WINDOW * sizeof(I32));
+		if (!d->head || !d->prev)
+		{
+			Free(d->head);
+			Free(d->prev);
+			Free(d->out);
+			Free(d);
+			return NULL;
+		}
+		for (i = 0; i < DEFL_HASH_SIZE; i++)
+			d->head[i] = -1;
+		for (i = 0; i < DEFL_WINDOW; i++)
+			d->prev[i] = -1;
+		DeflBlock(d, src, len);
+		Free(d->head);
+		Free(d->prev);
+		//Incompressible input costs about 9 bits a byte through the fixed
+		//literal codes. Stored blocks cap the loss at 5 bytes per 65535.
+		if (d->len > DeflStoredSize(len))
+		{
+			d->len    = 0;
+			d->bitbuf = 0;
+			d->bitcnt = 0;
+			DeflStored(d, src, len, TRUE);
+		}
+	}
+	if (d->oom)
+	{
+		Free(d->out);
+		Free(d);
+		return NULL;
+	}
+	res       = d->out;
+	*_out_len = d->len;
+	Free(d);
+
+	return res;
+}
+
+public U32 Adler32(U8 *p, I64 n)
+{//RFC 1950. 5552 is the most 8 bit sums that cannot overflow the modulus.
+	I64 a = 1, b = 0, k, i;
+
+	while (n)
+	{
+		k = n;
+		if (k > 5552)
+			k = 5552;
+		for (i = 0; i < k; i++)
+		{
+			a += p[i];
+			b += a;
+		}
+		a = a % 65521;
+		b = b % 65521;
+		p += k;
+		n -= k;
+	}
+
+	return (b << 16) | a;
+}
+
+U32 defl_crc_tab[256];
+Bool defl_crc_ready = FALSE;
+
+U0 DeflCrcInit()
+{
+	U32	c;
+	I64	i, k;
+
+	for (i = 0; i < 256; i++)
+	{
+		c = i;
+		for (k = 0; k < 8; k++)
+			if (c & 1)
+				c = 0xEDB88320 ^ (c >> 1);
+			else
+				c = c >> 1;
+		defl_crc_tab[i] = c;
+	}
+	defl_crc_ready = TRUE;
+}
+
+public U32 Crc32(U8 *p, I64 n)
+{//RFC 1952, the reflected polynomial gzip uses.
+	U32	c = 0xFFFFFFFF;
+	I64	i;
+
+	if (!defl_crc_ready)
+		DeflCrcInit;
+	for (i = 0; i < n; i++)
+		c = defl_crc_tab[(c ^ p[i]) & 0xFF] ^ (c >> 8);
+
+	return c ^ 0xFFFFFFFF;
+}
+
+public U8 *ZlibCompress(U8 *src, I64 len, I64 *_out_len, I64 level=6)
+{//RFC 1950: two header bytes, the deflate stream, then Adler-32 big endian.
+//This is what a git packfile and an HTTP deflate body carry.
+	U8	*body, *res;
+	I64	 n = 0, i;
+	U32	 sum;
+
+	*_out_len = 0;
+	body = DeflateRaw(src, len, &n, level);
+	if (!body)
+		return NULL;
+	res = MAlloc(n + 6);
+	if (!res)
+	{
+		Free(body);
+		return NULL;
+	}
+	//0x78 is a 32K window with deflate; 0x01 makes the pair a multiple of 31.
+	res[0] = 0x78;
+	res[1] = 0x01;
+	for (i = 0; i < n; i++)
+		res[2 + i] = body[i];
+	sum = Adler32(src, len);
+	res[2 + n] = (sum >> 24) & 0xFF;
+	res[3 + n] = (sum >> 16) & 0xFF;
+	res[4 + n] = (sum >> 8) & 0xFF;
+	res[5 + n] = sum & 0xFF;
+	Free(body);
+	*_out_len = n + 6;
+
+	return res;
+}
+
+public U8 *GZipCompress(U8 *src, I64 len, I64 *_out_len, I64 level=6)
+{//RFC 1952: a ten byte header, the deflate stream, then CRC-32 and the
+//uncompressed size, both little endian.
+	U8	*body, *res;
+	I64	 n = 0, i;
+	U32	 crc;
+
+	*_out_len = 0;
+	body = DeflateRaw(src, len, &n, level);
+	if (!body)
+		return NULL;
+	res = MAlloc(n + 18);
+	if (!res)
+	{
+		Free(body);
+		return NULL;
+	}
+	res[0] = 0x1F;
+	res[1] = 0x8B;
+	res[2] = 8;					//deflate
+	res[3] = 0;					//no name, no extra, no comment
+	res[4] = 0;
+	res[5] = 0;
+	res[6] = 0;
+	res[7] = 0;					//mtime left zero
+	res[8] = 0;
+	res[9] = 0xFF;				//unknown OS
+	for (i = 0; i < n; i++)
+		res[10 + i] = body[i];
+	crc = Crc32(src, len);
+	res[10 + n] = crc & 0xFF;
+	res[11 + n] = (crc >> 8) & 0xFF;
+	res[12 + n] = (crc >> 16) & 0xFF;
+	res[13 + n] = (crc >> 24) & 0xFF;
+	res[14 + n] = len & 0xFF;
+	res[15 + n] = (len >> 8) & 0xFF;
+	res[16 + n] = (len >> 16) & 0xFF;
+	res[17 + n] = (len >> 24) & 0xFF;
+	Free(body);
+	*_out_len = n + 18;
+
+	return res;
+}

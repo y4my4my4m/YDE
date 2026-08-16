@@ -1,11 +1,40 @@
-//USB HID boot-protocol keyboard + mouse.
+//USB HID keyboard, mouse and absolute pointer.
 //Keyboard: HID usages -> PS/2 set-1 scancodes -> kbd.fifo2 (reuses kernel KbdHandler).
 //Mouse: boot reports -> mouse_hard state (reuses kernel mouse pipeline).
+//Tablet: a non-boot HID interface whose report descriptor carries absolute X
+//and Y. QEMU's -device usb-tablet is one, and it is what lets the pointer
+//track the host cursor without grabbing it.
 
 #define USB_HIDS_MAX		8
 
 #define USB_HID_REPEAT_DELAY	0.400
 #define USB_HID_REPEAT_RATE		0.035
+
+#define USB_HID_RQ_GET_DESC		6
+#define USB_HID_DT_REPORT		0x22
+#define USB_HID_DESC_MAX		256
+#define USB_HID_USAGE_QUEUE		8
+
+//Report descriptor item prefixes, HID 1.11 6.2.2.
+#define HID_ITEM_INPUT			0x80
+#define HID_ITEM_USAGE_PAGE		0x04
+#define HID_ITEM_LOGICAL_MIN	0x14
+#define HID_ITEM_LOGICAL_MAX	0x24
+#define HID_ITEM_REPORT_SIZE	0x74
+#define HID_ITEM_REPORT_ID		0x84
+#define HID_ITEM_REPORT_COUNT	0x94
+#define HID_ITEM_USAGE			0x08
+#define HID_ITEM_USAGE_MIN		0x18
+#define HID_ITEM_USAGE_MAX		0x28
+
+#define HID_PAGE_DESKTOP		0x01
+#define HID_PAGE_BUTTON			0x09
+#define HID_USAGE_X				0x30
+#define HID_USAGE_Y				0x31
+#define HID_USAGE_WHEEL			0x38
+
+//Input item data bit 2: set means the field is a delta.
+#define HID_INPUT_RELATIVE		0x04
 
 class CUsbHid
 {
@@ -16,6 +45,15 @@ class CUsbHid
 	U8		 prev[8];
 	I64		 repeat_sc;		//held key scancode for software typematic
 	F64		 repeat_time;
+
+	//Absolute pointer layout, filled from the report descriptor. Offsets are
+	//in bits from the start of the report.
+	Bool	 absolute;
+	I64		 x_off, x_bits, x_max;
+	I64		 y_off, y_bits, y_max;
+	I64		 btn_off, btn_count;
+	I64		 wheel_off, wheel_bits;
+	I64		 rep_bits;
 };
 
 CUsbHid usb_hids[USB_HIDS_MAX];
@@ -128,6 +166,162 @@ U0 UsbKbdCB(U8 *d, U8 *e)
 	MemCopy(hid->prev, rep, 8);
 }
 
+I64 UsbHidField(U8 *rep, I64 off, I64 bits)
+{//Little endian bit field out of a report.
+	I64 v = 0, i;
+
+	for (i = 0; i < bits; i++)
+		if (rep[(off + i) >> 3] & (1 << ((off + i) & 7)))
+			v |= 1 << i;
+
+	return v;
+}
+
+Bool UsbHidParseReport(CUsbHid *hid, U8 *desc, I64 len)
+{//Walk the report descriptor far enough to place absolute X and Y, the
+//buttons and the wheel. Not a general HID parser: it tracks one report with
+//no report IDs, which is what a tablet or a plain mouse presents.
+	I64	 pos = 0, tag, size, val, i;
+	I64	 page = 0, lmax = 0, rsize = 0, rcount = 0, bit = 0;
+	I64	 usage[USB_HID_USAGE_QUEUE], n_usage = 0;
+	Bool got_x = FALSE, got_y = FALSE;
+
+	while (pos < len)
+	{
+		tag  = desc[pos] & 0xFC;
+		size = desc[pos] & 3;
+		if (size == 3)
+			size = 4;
+		pos++;
+		if (pos + size > len)
+			break;
+		val = 0;
+		for (i = 0; i < size; i++)
+			val |= desc[pos + i] << (8 * i);
+		pos += size;
+
+		if (tag == HID_ITEM_REPORT_ID)
+			return FALSE;		//numbered reports shift every offset by a byte
+		else if (tag == HID_ITEM_USAGE_PAGE)
+			page = val;
+		else if (tag == HID_ITEM_LOGICAL_MAX)
+			lmax = val;
+		else if (tag == HID_ITEM_REPORT_SIZE)
+			rsize = val;
+		else if (tag == HID_ITEM_REPORT_COUNT)
+			rcount = val;
+		else if (tag == HID_ITEM_USAGE)
+		{
+			if (n_usage < USB_HID_USAGE_QUEUE)
+			{
+				usage[n_usage] = (page << 16) | val;
+				n_usage++;
+			}
+		}
+		else if (tag == HID_ITEM_USAGE_MIN || tag == HID_ITEM_USAGE_MAX)
+		{//A button range; the page alone identifies it.
+			if (page == HID_PAGE_BUTTON && n_usage < USB_HID_USAGE_QUEUE)
+			{
+				usage[n_usage] = page << 16;
+				n_usage++;
+			}
+		}
+		else if (tag == HID_ITEM_INPUT)
+		{
+			for (i = 0; i < rcount; i++)
+			{
+				if (i < n_usage)
+				{
+					if (usage[i] == ((HID_PAGE_DESKTOP << 16) | HID_USAGE_X) &&
+						!(val & HID_INPUT_RELATIVE))
+					{
+						hid->x_off  = bit + i * rsize;
+						hid->x_bits = rsize;
+						hid->x_max  = lmax;
+						got_x       = TRUE;
+					}
+					else if (usage[i] == ((HID_PAGE_DESKTOP << 16) | HID_USAGE_Y) &&
+							 !(val & HID_INPUT_RELATIVE))
+					{
+						hid->y_off  = bit + i * rsize;
+						hid->y_bits = rsize;
+						hid->y_max  = lmax;
+						got_y       = TRUE;
+					}
+					else if (usage[i] == ((HID_PAGE_DESKTOP << 16) | HID_USAGE_WHEEL))
+					{
+						hid->wheel_off  = bit + i * rsize;
+						hid->wheel_bits = rsize;
+					}
+					else if (usage[i] >> 16 == HID_PAGE_BUTTON && !hid->btn_count)
+					{
+						hid->btn_off   = bit;
+						hid->btn_count = rcount;
+						if (hid->btn_count > 3)
+							hid->btn_count = 3;
+					}
+				}
+			}
+			bit    += rsize * rcount;
+			n_usage = 0;
+		}
+		else if (tag == 0xA0 || tag == 0xC0)
+			n_usage = 0;		//collection boundaries clear pending usages
+	}
+	hid->rep_bits = bit;
+	hid->absolute = got_x && got_y && hid->x_max > 1 && hid->y_max > 1;
+
+	return hid->absolute;
+}
+
+U0 UsbTabletCB(U8 *d, U8 *e)
+{//Absolute pointer: the report carries a position, not a delta, so the guest
+//cursor lands wherever the host cursor is and no grab is needed.
+	CUsbDev	*dev = d;
+	CUsbEP	*ep	 = e;
+	CUsbHid	*hid = NULL;
+	U8		*rep;
+	I64		 i, x, y, dz = 0;
+
+	if (!dev->present)
+		return;
+	for (i = 0; i < USB_HIDS_MAX; i++)
+		if (usb_hids[i].valid && usb_hids[i].ep == ep)
+		{
+			hid = &usb_hids[i];
+			break;
+		}
+	if (!hid || !hid->absolute)
+		return;
+	rep = ep->auto_buf;
+
+	x = UsbHidField(rep, hid->x_off, hid->x_bits);
+	y = UsbHidField(rep, hid->y_off, hid->y_bits);
+	if (hid->x_max > 0)
+		x = x * (sys_framebuffer_width  - 1) / hid->x_max;
+	if (hid->y_max > 0)
+		y = y * (sys_framebuffer_height - 1) / hid->y_max;
+	if (hid->wheel_bits)
+	{
+		dz = UsbHidField(rep, hid->wheel_off, hid->wheel_bits);
+		if (dz & (1 << (hid->wheel_bits - 1)))
+			dz -= 1 << hid->wheel_bits;
+	}
+
+	usb_mouse_x = ClampI64(x, 0, sys_framebuffer_width  - 1);
+	usb_mouse_y = ClampI64(y, 0, sys_framebuffer_height - 1);
+
+	mouse_hard.timestamp = TSCGet;
+	MemCopy(&mouse_hard_last, &mouse_hard, sizeof(CMouseHardStateGlobals));
+	mouse_hard.pos.x   = usb_mouse_x;
+	mouse_hard.pos.y   = usb_mouse_y;
+	mouse_hard.pos.z  += dz;
+	for (i = 0; i < hid->btn_count; i++)
+		mouse_hard.bttns[i] = (UsbHidField(rep, hid->btn_off + i, 1)) & 1;
+	mouse_hard.event = TRUE;
+	mouse.show       = TRUE;
+}
+
 U0 UsbMouseCB(U8 *d, U8 *e)
 {//Boot mouse report: buttons dx dy [wheel].
 	CUsbDev	*dev = d;
@@ -222,7 +416,9 @@ U0 UsbHidAttach(CUsbDev *dev, CUsbIf *uif)
 {
 	CUsbHid	*hid = NULL;
 	CUsbEP	*ep	 = NULL, *tmp;
-	I64		 i;
+	U8		*desc;
+	I64		 i, n;
+	Bool	 boot;
 
 	for (i = 0; i < uif->ep_count; i++)
 	{
@@ -249,20 +445,63 @@ U0 UsbHidAttach(CUsbDev *dev, CUsbIf *uif)
 	hid->proto = uif->if_proto;
 	hid->valid = TRUE;
 
+	boot = ToBool(uif->if_subclass == USB_HID_SUBCLASS_BOOT &&
+				  (uif->if_proto == USB_HID_PROTO_KBD ||
+				   uif->if_proto == USB_HID_PROTO_MOUSE));
+	if (!boot)
+	{//Non-boot interface: keep it only if the report descriptor describes an
+	//absolute pointer. Anything else is left alone.
+		//UsbCtrl returns an xHCI completion code, not a length. The buffer is
+		//zeroed instead: a report descriptor shorter than the request leaves
+		//trailing zero bytes, which parse as empty items and end the walk.
+		desc = CAlloc(USB_HID_DESC_MAX, sys_task->code_heap);
+		if (desc)
+		{
+			n = UsbCtrl(dev, USB_RT_DEV_TO_HOST | USB_RT_STD | USB_RT_RECIP_IF,
+						USB_HID_RQ_GET_DESC, (USB_HID_DT_REPORT << 8),
+						uif->if_num, desc, USB_HID_DESC_MAX);
+			if (n == XHCI_CC_SUCCESS || n == XHCI_CC_SHORT_PKT)
+				UsbHidParseReport(hid, desc, USB_HID_DESC_MAX);
+			else
+				SysLog("USB: port %d: report descriptor request failed, code %d.\n",
+					   dev->port, n);
+			Free(desc);
+		}
+		if (!hid->absolute)
+		{
+			hid->valid = FALSE;
+			SysLog("USB: port %d: HID iface %d not an absolute pointer "
+				   "(x %d/%d y %d/%d).\n", dev->port, uif->if_num,
+				   hid->x_bits, hid->x_max, hid->y_bits, hid->y_max);
+			return;
+		}
+	}
+	else
 //Boot protocol; idle=0 -> reports only on change.
-	UsbCtrl(dev, USB_RT_HOST_TO_DEV | USB_RT_CLASS | USB_RT_RECIP_IF,
-			USB_HID_RQ_SET_PROTOCOL, 0, uif->if_num, NULL, 0);
+		UsbCtrl(dev, USB_RT_HOST_TO_DEV | USB_RT_CLASS | USB_RT_RECIP_IF,
+				USB_HID_RQ_SET_PROTOCOL, 0, uif->if_num, NULL, 0);
 	UsbCtrl(dev, USB_RT_HOST_TO_DEV | USB_RT_CLASS | USB_RT_RECIP_IF,
 			USB_HID_RQ_SET_IDLE, 0, uif->if_num, NULL, 0);
 
 	if (!ep->auto_buf)
-		ep->auto_buf = CAlloc(8, sys_task->code_heap);
+		ep->auto_buf = CAlloc(16, sys_task->code_heap);
 	ep->auto_len = ep->max_packet;
-	if (ep->auto_len > 8)
-		ep->auto_len = 8;
+	if (ep->auto_len > 16)
+		ep->auto_len = 16;
 	if (ep->auto_len < 3)
 		ep->auto_len = 3;
-	if (uif->if_proto == USB_HID_PROTO_KBD)
+	if (hid->absolute)
+	{
+		n = (hid->rep_bits + 7) >> 3;
+		if (n > 0 && n < ep->auto_len)
+			ep->auto_len = n;
+		ep->auto_kind = USB_AUTO_TABLET;
+		mouse_hard.installed	= TRUE;
+		mouse_hard.irqs_working	= TRUE;
+		SysLog("USB: HID tablet on port %d, %d bits/report.\n", dev->port,
+			   hid->rep_bits);
+	}
+	else if (uif->if_proto == USB_HID_PROTO_KBD)
 	{
 		ep->auto_len = 8;
 		ep->auto_kind = USB_AUTO_KBD;

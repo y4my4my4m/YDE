@@ -251,10 +251,12 @@ class CUsbEPDesc
 #define USB_AUTO_MOUSE			2
 #define USB_AUTO_ECM			3	//CDC-ECM bulk-IN: receive ethernet frame
 #define USB_AUTO_AUDIO			4	//UAC isoc-OUT: refill and requeue one frame
+#define USB_AUTO_TABLET			5	//HID absolute pointer: position, not delta
 
 //XhciEventPoll dispatches to handlers compiled after it.
 extern U0 UsbKbdCB(U8 *dev, U8 *ep);
 extern U0 UsbMouseCB(U8 *dev, U8 *ep);
+extern U0 UsbTabletCB(U8 *dev, U8 *ep);
 extern U0 UsbEcmRxCB(U8 *dev, U8 *ep);
 
 class CXhciTRB
