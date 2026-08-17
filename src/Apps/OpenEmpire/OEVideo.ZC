@@ -1,0 +1,1061 @@
+// frame composition: the render list, the overlays and the HUD
+//
+// Video.c, Vram.c, Tiles.c and Tile.c onto the 8bpp canvas in OEDraw.
+//
+// Video_Draw's phase order, unchanged: clear, units, unit health bars, map,
+// floating units, mouse tile select, unit selections, flash dimension grids,
+// flash units, selection box, motive row, HUD. terrain draws after the units:
+// OE_PRIO_TERRAIN is 1, OE_PRIO_UNIT is 5, and OEPlot writes only on a
+// strictly greater priority, so terrain reaches the pixels no sprite claimed.
+//
+// upstream fans Vram_DrawUnits and the terrain batch across SDL threads and
+// joins per frame. both run in list order here.
+//
+// carried from Vram.c: Clear (OEClear), DrawTile (OEBlitFrame), DrawUnits,
+// DrawUnitHealthBars, DrawMap without its blend pass, DrawMouseTileSelect,
+// DrawUnitSelections, FlashDimensionGrids, FlashUnits, DrawSelectionBox,
+// DrawMotiveRow, DrawHud.
+//
+// absent:
+//	Vram_Lock / Unlock / Free		no streaming texture; the canvas is resident
+//	Vram_DrawMap's blend pass		blendomatic.dat is not parsed and no mask
+//									blitter exists, so two terrains meet hard
+//	Vram_DrawMiniMap				the per-terrain minimap colour lives in
+//									Map.color, which COEMap does not carry
+//	Vram_DrawCross
+//	Vram_DrawDebugDimensionGrids
+//	Vram_DrawSelectedDimensionGrids
+//
+// Video_Render composites text over the presented canvas through the SDL
+// renderer. here the glyphs go into the same canvas at OE_PRIO_HIGHEST, so
+// OEVideoRender must run after OEVideoDraw and before the compositor reads.
+
+#define OE_VIDEO_TITLE			"Open Empire"
+
+#define OE_TILE_MAX				OE_UNITS_MAX
+#define OE_TILE_FLOAT_MAX		OE_UNITS_FLOAT_BUFFER
+
+//Vram_DrawHud clips FILE_INTERFAC_HUD_0 to this rect
+#define OE_VIDEO_HUD_W			393
+#define OE_VIDEO_HUD_H			50
+
+#define OE_VIDEO_HEALTH_W		30
+#define OE_VIDEO_HEALTH_W_BIG	60
+#define OE_VIDEO_HEALTH_H		2
+
+#define OE_VIDEO_ICON_ROWS		3
+#define OE_VIDEO_ICON_COLS		5
+#define OE_VIDEO_HOTKEYS		15
+
+//PrintResources: five counters on the HUD strip
+#define OE_VIDEO_RES_X0			38
+#define OE_VIDEO_RES_Y0			7
+#define OE_VIDEO_RES_SPACE		77
+
+#define OE_VIDEO_PERF_RATE		10
+#define OE_VIDEO_PERIOD			10
+#define OE_VIDEO_PERIODS		6
+
+//Text_Build opens Terminus at 24 and 12 px; the cell font is 8 px tall
+#define OE_VIDEO_BIG			2
+#define OE_VIDEO_SMALL			1
+
+#define OE_VIDEO_BUF			64
+
+class COETile
+{
+	COEUnit	 *ref;
+	COEFrame *frame;
+	I64		  x;			//iso hotspot, canvas pixels
+	I64		  y;
+	I64		  z;
+	I64		  key;			//iso y of ref->cell, the painter's key
+	Bool	  flip;
+};
+
+COETile	*oe_tile       = NULL;
+COETile	*oe_tile_float = NULL;
+COETile	*oe_tile_swap  = NULL;
+
+I64	 oe_video_red    = 0;
+I64	 oe_video_green  = 0;
+I64	 oe_video_yellow = 0;
+I64	 oe_video_white  = 0;
+U8	*oe_video_redout = NULL;
+I64	 oe_video_dt_hold = 0;
+
+U8 oe_video_hotkey[OE_VIDEO_HOTKEYS] = {
+	'Q', 'W', 'E', 'R', 'T',
+	'A', 'S', 'D', 'F', 'G',
+	'Z', 'X', 'C', 'V', 'B'
+};
+
+U8 *oe_video_period[OE_VIDEO_PERIODS] = {
+	"", ".", "..", "...", "....", "....."
+};
+
+//the four colour keys and the red out table snap against the loaded palette;
+//call after OEPalLoad.
+U0 OEVideoInit()
+{
+	I64 i;
+	I64 r;
+
+	OETextInit;
+	oe_video_red    = OEPalNearest(0xFF, 0x00, 0x00);
+	oe_video_green  = OEPalNearest(0x00, 0xFF, 0x00);
+	oe_video_yellow = OEPalNearest(0xFF, 0xFF, 0x00);
+	oe_video_white  = OEPalNearest(0xFF, 0xFF, 0xFF);
+
+	if (!oe_video_redout)
+	{
+		oe_video_redout = CAlloc(OEPAL_COUNT);
+	}
+	//DrawWithBounds' red out is pixel &= 0xFF0000
+	for (i = 0; i < OEPAL_COUNT; i++)
+	{
+		r = (oe_argb[i] >> 16) & 0xFF;
+		oe_video_redout[i] = OEPalNearest(r, 0, 0);
+	}
+
+	if (!oe_tile)
+	{
+		oe_tile = CAlloc(sizeof(COETile) * OE_TILE_MAX);
+	}
+	if (!oe_tile_float)
+	{
+		oe_tile_float = CAlloc(sizeof(COETile) * OE_TILE_FLOAT_MAX);
+	}
+	if (!oe_tile_swap)
+	{
+		oe_tile_swap = CAlloc(sizeof(COETile) * OE_TILE_MAX);
+	}
+}
+
+//Vram.c Put: no priority test, and the stored priority is the argument.
+U0 OEVideoPut(I64 x, I64 y, I64 index, I64 z)
+{
+	I64 p;
+
+	if (!oe_screen || x < 0 || x >= oe_w || y < 0 || y >= oe_h)
+	{
+		return;
+	}
+	p = y * OE_W_MAX + x;
+	oe_screen[p] = index;
+	oe_zbuf[p]   = z;
+}
+
+//DrawWithBounds, clipped to a bw x bh window of the frame.
+U0 OEVideoBlitFlat(COEFrame *f, I64 x, I64 y, I64 bw, I64 bh, I64 color,
+	Bool red_out)
+{
+	I64	 base = OEPalPlayerBase(color);
+	I64	 row;
+	I64	 i;
+	I64	 sx;
+	I64	 len;
+	I64	 kind;
+	I64	 j;
+	I64	 v;
+	U8	*s;
+
+	if (!f || !f->span)
+	{
+		return;
+	}
+	s = f->span;
+
+	for (row = 0; row < f->h && row < bh; row++)
+	{
+		if (f->row[row] >= 0)
+		{
+			i = f->row[row];
+			while (TRUE)
+			{
+				sx = s[i] | (s[i + 1] << 8);
+				if (sx == OESLP_ROW_END)
+				{
+					break;
+				}
+				len  = s[i + 2] | (s[i + 3] << 8);
+				kind = s[i + 4];
+				i += 5;
+
+				if (kind != OESLP_KIND_SHADOW)
+				{
+					for (j = 0; j < len; j++)
+					{
+						if (sx + j < bw)
+						{
+							v = s[i + j];
+							if (kind == OESLP_KIND_PLAYER)
+							{
+								v += base;
+							}
+							v &= 0xFF;
+							if (red_out)
+							{
+								v = oe_video_redout[v];
+							}
+							OEVideoPut(x + sx + j, y + row, v, OE_PRIO_NONE);
+						}
+					}
+					i += len;
+				}
+			}
+		}
+	}
+}
+
+//DrawTileOutline reads the SLP outline table; the span cache drops it, so the
+//row edges come from the first and last span of the row. right is exclusive.
+Bool OEVideoRowEdge(COEFrame *f, I64 row, I64 *_l, I64 *_r)
+{
+	I64	 i;
+	I64	 sx;
+	I64	 len;
+	I64	 kind;
+	Bool first = TRUE;
+	U8	*s;
+
+	if (!f || !f->span || row < 0 || row >= f->h || f->row[row] < 0)
+	{
+		return FALSE;
+	}
+	s = f->span;
+	i = f->row[row];
+
+	while (TRUE)
+	{
+		sx = s[i] | (s[i + 1] << 8);
+		if (sx == OESLP_ROW_END)
+		{
+			break;
+		}
+		len  = s[i + 2] | (s[i + 3] << 8);
+		kind = s[i + 4];
+		i += 5;
+
+		if (first)
+		{
+			*_l   = sx;
+			first = FALSE;
+		}
+		*_r = sx + len;
+
+		if (kind != OESLP_KIND_SHADOW)
+		{
+			i += len;
+		}
+	}
+	return !first;
+}
+
+//DrawTileOutline. terrain frames carry hotspot (0,0), so iso is the top left.
+U0 OEVideoTileOutline(I64 ix, I64 iy, I64 index)
+{
+	COEFrame *f = OERegFrame(OEREG_TERRAIN, 0, OETerrDrsId(OETR_DIRT), 0);
+	I64		  row;
+	I64		  l;
+	I64		  r;
+	I64		  ox;
+	I64		  oy;
+
+	if (!f)
+	{
+		return;
+	}
+	for (row = 0; row < f->h; row++)
+	{
+		if (OEVideoRowEdge(f, row, &l, &r))
+		{
+			for (oy = 0; oy < 2; oy++)
+			{
+				for (ox = 0; ox < 2; ox++)
+				{
+					OEPlotUI(ix + l + ox, iy + row + oy, index);
+					OEPlotUI(ix + r + ox, iy + row + oy, index);
+				}
+			}
+		}
+	}
+}
+
+U0 OEVideoDimensionGrid(COEOverview *over, COEGrid *grid, COEUnit *u, I64 index)
+{
+	COEPoint shift;
+	COEPoint cart;
+	COEPoint iso;
+	I64		 x;
+	I64		 y;
+
+	for (x = 0; x < u->trait.dimensions.x; x++)
+	{
+		for (y = 0; y < u->trait.dimensions.y; y++)
+		{
+			OEPtSet(&shift, x, y);
+			OEPtAdd(&cart, &shift, &u->cart);
+			OEOverCartToIso(over, grid, &iso, &cart);
+			OEVideoTileOutline(iso.x, iso.y, index);
+		}
+	}
+}
+
+//Rect_GetEllipse then DrawEllipse. width is trait.width in cells.
+U0 OEVideoEllipse(I64 cx, I64 cy, I64 width, I64 index)
+{
+	I64 ax  = cx - width;
+	I64 ay  = cy - width / 2;
+	I64 bx  = cx + width;
+	I64 by  = cy + width / 2;
+	I64 ea  = OEAbs(bx - ax);
+	I64 eb  = OEAbs(by - ay);
+	I64 ec  = eb & 1;
+	I64 dx  = 4 * (1 - ea) * eb * eb;
+	I64 dy  = 4 * (1 + ec) * ea * ea;
+	I64 err = dx + dy + ec * ea * ea;
+	I64 e2;
+
+	if (ax > bx)
+	{
+		ax = bx;
+		bx = bx + ea;
+	}
+	if (ay > by)
+	{
+		ay = by;
+	}
+	ay += (eb + 1) / 2;
+	by  = ay - ec;
+	ea *= 8 * ea;
+	ec  = 8 * eb * eb;
+
+	while (TRUE)
+	{
+		OEPlotUI(bx, ay, index);
+		OEPlotUI(ax, ay, index);
+		OEPlotUI(ax, by, index);
+		OEPlotUI(bx, by, index);
+
+		e2 = 2 * err;
+		if (e2 >= dx)
+		{
+			ax++;
+			bx--;
+			dx  += ec;
+			err += dx;
+		}
+		if (e2 <= dy)
+		{
+			ay++;
+			by--;
+			dy  += ea;
+			err += dy;
+		}
+		if (ax > bx)
+		{
+			break;
+		}
+	}
+
+	while (ay - by < eb)
+	{
+		OEPlotUI(ax - 1, ay, index);
+		OEPlotUI(bx + 1, ay, index);
+		OEPlotUI(ax - 1, by, index);
+		OEPlotUI(bx + 1, by, index);
+		ay++;
+		by--;
+	}
+}
+
+//DrawHealthBar: 30 wide, 60 for an inanimate. Vram.c uses 90.
+U0 OEVideoHealthBar(COEUnit *u, I64 tx, I64 ty)
+{
+	I64 w = OE_VIDEO_HEALTH_W;
+	I64 max;
+	I64 percent;
+	I64 x0;
+	I64 y0;
+	I64 x;
+	I64 y;
+	I64 index;
+
+	if (u->trait.is_inanimate)
+	{
+		w = OE_VIDEO_HEALTH_W_BIG;
+	}
+	max = u->trait.max_health;
+	if (max < 1)
+	{
+		max = 1;
+	}
+	percent = (w * u->health) / max;
+	x0 = tx - w / 2;
+	y0 = ty - OE_VIDEO_HEALTH_H / 2;
+
+	for (y = 0; y < OE_VIDEO_HEALTH_H; y++)
+	{
+		for (x = 0; x < w; x++)
+		{
+			index = oe_video_green;
+			if (x > percent)
+			{
+				index = oe_video_red;
+			}
+			OEVideoPut(x0 + x, y0 + y, index, OE_PRIO_HIGHEST);
+		}
+	}
+}
+
+// ------------------------------------------------------------- render list
+
+//CompareByY over CompareByDetail. descending iso y, so the frontmost tile is
+//drawn first: OEPlot's z test is a strict >, which makes the first writer of a
+//pixel keep it against later tiles of the same priority.
+//
+//CompareByY returns a bool, never a negative, so under qsort's contract a
+//smaller y sorts later. the order is descending, not ascending.
+Bool OETileBefore(COETile *a, COETile *b)
+{
+	if (a->key != b->key)
+	{
+		return a->key > b->key;
+	}
+	return !a->ref->trait.is_detail && b->ref->trait.is_detail;
+}
+
+//Tiles.c Sort, bottom up through oe_tile_swap. CompareBySurface is dropped:
+//there is no surface pointer here, and it only bought cache locality.
+U0 OETileSort(COETile *t, I64 n)
+{
+	COETile *src = t;
+	COETile *dst = oe_tile_swap;
+	COETile *tmp;
+	I64		 w = 1;
+	I64		 lo;
+	I64		 mid;
+	I64		 hi;
+	I64		 i;
+	I64		 j;
+	I64		 k;
+
+	if (n < 2 || !oe_tile_swap)
+	{
+		return;
+	}
+
+	while (w < n)
+	{
+		lo = 0;
+		while (lo < n)
+		{
+			mid = lo + w;
+			hi  = mid + w;
+			if (mid > n)
+			{
+				mid = n;
+			}
+			if (hi > n)
+			{
+				hi = n;
+			}
+			i = lo;
+			j = mid;
+			k = lo;
+			while (i < mid || j < hi)
+			{
+				if (j >= hi)
+				{
+					MemCopy(&dst[k], &src[i], sizeof(COETile));
+					i++;
+				}
+				else if (i >= mid)
+				{
+					MemCopy(&dst[k], &src[j], sizeof(COETile));
+					j++;
+				}
+				else if (OETileBefore(&src[j], &src[i]))
+				{
+					MemCopy(&dst[k], &src[j], sizeof(COETile));
+					j++;
+				}
+				else
+				{
+					MemCopy(&dst[k], &src[i], sizeof(COETile));
+					i++;
+				}
+				k++;
+			}
+			lo = hi;
+		}
+		tmp = src;
+		src = dst;
+		dst = tmp;
+		w  *= 2;
+	}
+
+	if (src != t)
+	{
+		MemCopy(t, src, sizeof(COETile) * n);
+	}
+}
+
+//Tile_GetGraphics with GetDynamics folded in. cart is the overrider point.
+Bool OEVideoTileMake(COETile *t, COEUnit *ref, COEPoint *cart,
+	COEOverview *over, COEGrid *grid)
+{
+	COEPoint shifted;
+	COEPoint gshift;
+	COEPoint offset;
+	COEPoint rubble;
+	COEPoint iso;
+	COEPoint isooff;
+	COEPoint cell_iso;
+	I64		 file    = ref->file;
+	I64		 index   = 0;
+	I64		 count;
+	I64		 per_dir;
+	I64		 divisor;
+	I64		 ticks;
+	I64		 percent;
+	I64		 id;
+	I64		 dir;
+	Bool	 flip = FALSE;
+
+	if (OEUnitIsConstruction(ref))
+	{
+		file = OEUnitGetConstructionFile(ref);
+	}
+	count = OEUnitAnimCount(file);
+	if (count < 1)
+	{
+		return FALSE;
+	}
+
+	if (ref->trait.is_single_frame)
+	{
+		if (ref->is_being_built)
+		{
+			percent = 100;
+			if (ref->trait.max_health > 0)
+			{
+				percent = (100 * ref->health) / ref->trait.max_health;
+			}
+			index = (count * percent) / 100;
+			if (index >= count)
+			{
+				index = count - 1;
+			}
+		}
+		else
+		{
+			id = ref->id;
+			if (ref->parent)
+			{
+				id = ref->parent_id;
+			}
+			if (ref->is_floating)
+			{
+				id = 0;
+			}
+			index = id % count;
+		}
+	}
+	else if (ref->trait.is_multi_state)
+	{
+		per_dir = count / OEDIR_NOT_MIRRORED;
+		if (per_dir < 1)
+		{
+			return FALSE;
+		}
+		dir     = OEDirFix(ref->dir, &flip);
+		divisor = OE_ANIM_DIVISOR;
+		if (ref->state == OEST_DECAY)
+		{
+			divisor = OE_ANIM_DECAY_DIVISOR;
+		}
+		ticks = ref->state_timer / divisor;
+		index = per_dir * dir + (ticks % per_dir);
+	}
+	else
+	{
+		ticks = ref->state_timer / OE_ANIM_DIVISOR;
+		index = ticks % count;
+	}
+
+	OEUnitGetShift(ref, cart, &shifted);
+	OEGfxShift(&gshift, ref->file);
+	OEPtAdd(&shifted, &shifted, &gshift);
+
+	OEPtCopy(&offset, &ref->cart_grid_offset);
+	if (ref->trait.type == OET_RUBBLE)
+	{
+		OEGridRubbleShift(grid, &rubble);
+		OEPtAdd(&offset, &offset, &rubble);
+	}
+
+	OEOverCartToIso(over, grid, &iso, &shifted);
+	OEPtToIso(&isooff, &offset);
+	OEPtToIso(&cell_iso, &ref->cell);
+
+	t->ref   = ref;
+	t->frame = OERegFrame(OEREG_GRAPHICS, 0, OEGfxDrsId(file), index);
+	t->x     = iso.x + isooff.x;
+	t->y     = iso.y + isooff.y;
+	t->z     = OEGfxHeight(ref->file);
+	if (ref->is_floating)
+	{
+		t->z = OE_PRIO_HIGHEST;
+	}
+	t->key  = cell_iso.y;
+	t->flip = flip;
+	return t->frame != NULL;
+}
+
+//Tiles_PrepGraphics over Window_Make's unit render box. Quad_GetRenderPoints'
+//two-triangle trim is absent, so the scan is a superset of upstream's points.
+I64 OEVideoTilePrep(COETile *list, I64 cap, COEUnits *us, COEOverview *over,
+	COEGrid *grid)
+{
+	COERect	  box;
+	COEPoint  point;
+	COEPoint  cart;
+	COEStack *stack;
+	COEUnit	 *ref;
+	I64		  n = 0;
+	I64		  x;
+	I64		  y;
+	I64		  j;
+	Bool	  skip;
+
+	OEOverGetRenderBox(over, grid, &box, OE_BORDER_UNITS);
+
+	for (y = box.a.y; y < box.b.y; y++)
+	{
+		for (x = box.a.x; x < box.b.x; x++)
+		{
+			OEPtSet(&point, x, y);
+			stack = OEUnitsGetStackCart(us, &point);
+			if (stack)
+			{
+				for (j = 0; j < stack->count; j++)
+				{
+					ref = stack->unit[j];
+					if (!ref->is_already_tiled && n < cap)
+					{
+						ref->is_already_tiled = TRUE;
+						skip = FALSE;
+						if (!ref->is_floating)
+						{
+							if (ref->trait.is_inanimate && ref->parent &&
+								ref->parent->is_being_built)
+							{
+								skip = TRUE;
+							}
+							if (ref->parent && ref->parent->rally &&
+								ref->file == OEG_WAYPOINT_FLAG &&
+								!OEUnitIsSelectedByColor(ref->parent,
+									over->color))
+							{
+								skip = TRUE;
+							}
+						}
+						if (!skip)
+						{
+							OEPtCopy(&cart, &point);
+							if (ref->trait.is_inanimate)
+							{
+								OEPtCopy(&cart, &ref->cart);
+							}
+							if (OEVideoTileMake(&list[n], ref, &cart, over,
+								grid))
+							{
+								n++;
+							}
+						}
+					}
+				}
+			}
+		}
+	}
+	OEUnitsResetTiled(us);
+	return n;
+}
+
+// ------------------------------------------------------------------ phases
+
+U0 OEVideoDrawTiles(COETile *t, I64 n)
+{
+	I64 i;
+
+	for (i = 0; i < n; i++)
+	{
+		OEBlitFrame(t[i].frame, t[i].x, t[i].y, t[i].ref->color, t[i].z,
+			t[i].flip, t[i].ref->is_floating);
+	}
+}
+
+U0 OEVideoHealthBars(COETile *t, I64 n, I64 color)
+{
+	COEUnit *u;
+	I64		 i;
+
+	for (i = 0; i < n; i++)
+	{
+		u = t[i].ref;
+		if (OEUnitIsSelectedByColor(u, color) || u->is_being_built)
+		{
+			OEVideoHealthBar(u, t[i].x, t[i].y - OE_HEALTH_BAR_HEIGHT);
+		}
+	}
+}
+
+//Vram_DrawMap's terrain pass. Tiles_PrepTerrain sorts by surface pointer only,
+//which has no meaning here, so the tiles draw in render box order.
+U0 OEVideoTerrain(COEMap *map, COEOverview *over, COEGrid *grid)
+{
+	COERect	  box;
+	COEPoint  point;
+	COEPoint  iso;
+	COEFrame *f;
+	I64		  terrain;
+	I64		  x;
+	I64		  y;
+
+	OEOverGetRenderBox(over, grid, &box, OE_BORDER_TERRAIN);
+
+	for (y = box.a.y; y < box.b.y; y++)
+	{
+		for (x = box.a.x; x < box.b.x; x++)
+		{
+			OEPtSet(&point, x, y);
+			terrain = OEMapGetTerrain(map, &point);
+			if (terrain != OETR_NONE)
+			{
+				f = OERegFrame(OEREG_TERRAIN, 0, OETerrDrsId(terrain),
+					OEMapTerrainFrame(map, &point));
+				if (f)
+				{
+					OEOverCartToIso(over, grid, &iso, &point);
+					OEBlitFrame(f, iso.x, iso.y, OECLR_GAIA,
+						OETerrHeight(terrain), FALSE, FALSE);
+				}
+			}
+		}
+	}
+}
+
+U0 OEVideoMouseTile(COEOverview *over, COEGrid *grid)
+{
+	COEPoint snap;
+
+	OEOverIsoSnapTo(over, grid, &snap, &over->mouse_cursor);
+	OEVideoTileOutline(snap.x, snap.y, oe_video_red);
+}
+
+U0 OEVideoSelections(COETile *t, I64 n, I64 color)
+{
+	COEUnit *u;
+	I64		 i;
+	I64		 w;
+	I64		 index;
+
+	for (i = 0; i < n; i++)
+	{
+		u = t[i].ref;
+		w = u->trait.width / OE_CELL_SIZE;
+		if (!OEUnitIsExempt(u))
+		{
+			if (OEUnitIsSelectedByColor(u, color))
+			{
+				index = oe_video_green;
+				if (u->is_engaged_in_melee)
+				{
+					index = oe_video_red;
+				}
+				else if (u->using_aggro_move)
+				{
+					index = oe_video_yellow;
+				}
+				else if (u->has_direct)
+				{
+					index = oe_video_white;
+				}
+				OEVideoEllipse(t[i].x, t[i].y, w, index);
+			}
+			else if (u->has_parent_lock)
+			{
+				OEVideoEllipse(t[i].x, t[i].y, w, oe_video_white);
+			}
+		}
+	}
+}
+
+U0 OEVideoFlashGrids(COETile *t, I64 n, COEOverview *over, COEGrid *grid)
+{
+	COEUnit *u;
+	I64		 i;
+
+	for (i = 0; i < n; i++)
+	{
+		u = t[i].ref;
+		if (!OEUnitIsExempt(u) && u->trait.is_inanimate && u->is_flash_on &&
+			u->grid_flash_timer < OE_FLASH_TIMER_MAX)
+		{
+			OEVideoDimensionGrid(over, grid, u, oe_video_white);
+		}
+	}
+}
+
+U0 OEVideoFlashUnits(COETile *t, I64 n)
+{
+	COEUnit *u;
+	I64		 i;
+
+	for (i = 0; i < n; i++)
+	{
+		u = t[i].ref;
+		if (!OEUnitIsExempt(u) && !u->trait.is_inanimate && u->is_flash_on &&
+			u->grid_flash_timer < OE_FLASH_TIMER_MAX)
+		{
+			OEVideoEllipse(t[i].x, t[i].y, u->trait.width / OE_CELL_SIZE,
+				oe_video_white);
+		}
+	}
+}
+
+//Rect_CorrectOrientation by min and max. OEUnitsRectCorrect is the parked copy.
+U0 OEVideoSelectionBox(COEOverview *over)
+{
+	I64 ax;
+	I64 ay;
+	I64 bx;
+	I64 by;
+
+	if (!(over->event & OEEV_MOUSE_L) || (over->event & OEEV_KEY_LALT))
+	{
+		return;
+	}
+	if (!OEOverIsSelectionBoxBigEnough(over))
+	{
+		return;
+	}
+	ax = OEMin(over->selection_box.a.x, over->selection_box.b.x);
+	ay = OEMin(over->selection_box.a.y, over->selection_box.b.y);
+	bx = OEMax(over->selection_box.a.x, over->selection_box.b.x);
+	by = OEMax(over->selection_box.a.y, over->selection_box.b.y);
+	OEDrawRect(ax, ay, bx - ax + 1, by - ay + 1, oe_video_white,
+		OE_PRIO_HIGHEST);
+}
+
+I64 OEVideoIconFile(I64 icon_type)
+{
+	if (icon_type == OEICON_BUILD)
+	{
+		return OEIF_BUILDING_ICONS;
+	}
+	if (icon_type == OEICON_TECH)
+	{
+		return OEIF_TECH_ICONS;
+	}
+	if (icon_type == OEICON_UNIT)
+	{
+		return OEIF_UNIT_ICONS;
+	}
+	if (icon_type == OEICON_COMMAND)
+	{
+		return OEIF_COMMAND_ICONS;
+	}
+	return OEIF_NONE;
+}
+
+//Point_Layout: a 5 x 3 grid of OE_ICON_SIZE cells, bottom centre.
+U0 OEVideoLayout(COEPoint *out, I64 index, I64 xres, I64 yres)
+{
+	I64 res = OE_VIDEO_ICON_COLS * OE_ICON_SIZE;
+
+	out->x = xres / 2 - OE_ICON_SIZE * OE_VIDEO_ICON_COLS / 2 +
+		((index * OE_ICON_SIZE) % res);
+	out->y = yres - OE_ICON_SIZE * OE_VIDEO_ICON_ROWS +
+		OE_ICON_SIZE * ((OE_ICON_SIZE * index) / res);
+}
+
+U0 OEVideoMotiveRow(COEOverview *over)
+{
+	COEButtons	buttons;
+	COEButton	b;
+	COEPoint	at;
+	COEFrame   *f;
+	I64			selected = OEEventGetIndex(over->event);
+	I64			i;
+	I64			ox = 0;
+	I64			oy = 0;
+	Bool		red_out;
+
+	OEButtonsFromMotive(&buttons, &over->share.motive, over->share.status.age);
+	if (!buttons.button)
+	{
+		return;
+	}
+
+	for (i = 0; i < buttons.count; i++)
+	{
+		MemCopy(&b, &buttons.button[i], sizeof(COEButton));
+		OEButtonUpgrade(&b, over->share.bits);
+		OEVideoLayout(&at, i, over->xres, over->yres);
+		f = OERegFrame(OEREG_INTERFAC, 1,
+			OEIfaceDrsId(OEVideoIconFile(b.icon_type)), b.index);
+		if (f)
+		{
+			//Bits_MustRedOut
+			red_out = OEBitsGet(over->share.bits, b.trigger) ||
+				OEBitsGet(over->share.busy, b.trigger);
+			OEVideoBlitFlat(f, at.x, at.y, f->w, f->h, over->color, red_out);
+		}
+		if (i == selected)
+		{
+			ox = at.x;
+			oy = at.y;
+		}
+	}
+
+	if (selected >= 0 && selected < buttons.count)
+	{
+		OEDrawRect(ox, oy, OE_ICON_SIZE, OE_ICON_SIZE, oe_video_white,
+			OE_PRIO_HIGHEST);
+	}
+}
+
+U0 OEVideoHud()
+{
+	COEFrame *f = OERegFrame(OEREG_INTERFAC, 1, OEIfaceDrsId(OEIF_HUD_0), 0);
+
+	if (f)
+	{
+		OEVideoBlitFlat(f, 0, 0, OE_VIDEO_HUD_W, OE_VIDEO_HUD_H, OECLR_GAIA,
+			FALSE);
+	}
+}
+
+U0 OEVideoDraw(COEUnits *units, COEUnits *floats, COEMap *map, COEGrid *grid,
+	COEOverview *over)
+{
+	I64 n;
+	I64 nf;
+
+	if (!oe_tile || !oe_tile_float)
+	{
+		return;
+	}
+
+	n  = OEVideoTilePrep(oe_tile, OE_TILE_MAX, units, over, grid);
+	nf = OEVideoTilePrep(oe_tile_float, OE_TILE_FLOAT_MAX, floats, over, grid);
+	OETileSort(oe_tile, n);
+	OETileSort(oe_tile_float, nf);
+
+	OEClear(0);
+	OEVideoDrawTiles(oe_tile, n);
+	OEVideoHealthBars(oe_tile, n, over->color);
+	OEVideoTerrain(map, over, grid);
+	OEVideoDrawTiles(oe_tile_float, nf);
+	OEVideoMouseTile(over, grid);
+	OEVideoSelections(oe_tile, n, over->color);
+	OEVideoFlashGrids(oe_tile, n, over, grid);
+	OEVideoFlashUnits(oe_tile, n);
+	OEVideoSelectionBox(over);
+	OEVideoMotiveRow(over);
+	OEVideoHud;
+}
+
+// -------------------------------------------------------------------- text
+
+U0 OEVideoTextRight(I64 x, I64 line, U8 *s)
+{//POSITION_TOP_RITE
+	OETextPut(x - OETextWidth(s, OE_VIDEO_SMALL), line * OETEXT_H, s,
+		oe_text_yellow, OE_VIDEO_SMALL);
+}
+
+U0 OEVideoTextMid(I64 cx, I64 y, U8 *s)
+{//POSITION_MIDDLE, on one line
+	OETextPut(cx - OETextWidth(s, OE_VIDEO_BIG) / 2, y, s, oe_text_red,
+		OE_VIDEO_BIG);
+}
+
+U0 OEVideoPerf(COEUnits *units, COEOverview *over, I64 dt, I64 cycles, I64 ping)
+{
+	U8	buf[OE_VIDEO_BUF];
+	I64	x = over->xres;
+
+	if (!(cycles % OE_VIDEO_PERF_RATE))
+	{
+		oe_video_dt_hold = dt;
+	}
+	StrPrint(buf, "units.count   : %6d", units->count);
+	OEVideoTextRight(x, 0, buf);
+	StrPrint(buf, "ping          : %6d", ping);
+	OEVideoTextRight(x, 1, buf);
+	StrPrint(buf, "dt (ms) video : %6d", oe_video_dt_hold);
+	OEVideoTextRight(x, 2, buf);
+	StrPrint(buf, "cycles        : %6d", cycles);
+	OEVideoTextRight(x, 3, buf);
+}
+
+U0 OEVideoResources(COEUnits *units)
+{
+	COEStatus *st = &units->share[units->color].status;
+	I64		   y  = OE_VIDEO_RES_Y0;
+
+	OETextPrint(OE_VIDEO_RES_X0, y, oe_text_yellow, OE_VIDEO_SMALL, "%6d",
+		st->wood);
+	OETextPrint(OE_VIDEO_RES_X0 + OE_VIDEO_RES_SPACE, y, oe_text_yellow,
+		OE_VIDEO_SMALL, "%6d", st->food);
+	OETextPrint(OE_VIDEO_RES_X0 + 2 * OE_VIDEO_RES_SPACE, y, oe_text_yellow,
+		OE_VIDEO_SMALL, "%6d", st->gold);
+	OETextPrint(OE_VIDEO_RES_X0 + 3 * OE_VIDEO_RES_SPACE, y, oe_text_yellow,
+		OE_VIDEO_SMALL, "%6d", st->stone);
+	OETextPrint(OE_VIDEO_RES_X0 + 4 * OE_VIDEO_RES_SPACE, y, oe_text_yellow,
+		OE_VIDEO_SMALL, "%6d", st->population);
+}
+
+U0 OEVideoHotkeys(COEOverview *over)
+{
+	COEPoint at;
+	U8		 buf[2];
+	I64		 i;
+
+	buf[1] = 0;
+	for (i = 0; i < OE_VIDEO_HOTKEYS; i++)
+	{
+		OEVideoLayout(&at, i, over->xres, over->yres);
+		buf[0] = oe_video_hotkey[i];
+		OETextPut(at.x, at.y, buf, oe_text_yellow, OE_VIDEO_SMALL);
+	}
+}
+
+U0 OEVideoRender(COEUnits *units, COEOverview *over, COEMap *map, I64 dt,
+	I64 cycles, I64 ping)
+{
+	no_warn map;
+
+	OEVideoPerf(units, over, dt, cycles, ping);
+	OEVideoResources(units);
+	OEVideoHotkeys(over);
+}
+
+U0 OEVideoLobby(I64 users_connected, I64 users, I64 cycles, U8 *message)
+{
+	U8	buf[OE_VIDEO_BUF];
+	I64	mx = oe_w / 2;
+	I64	my = oe_h / 2;
+	I64	h  = OETEXT_H * OE_VIDEO_BIG;
+	I64	i  = (cycles % (OE_VIDEO_PERIOD * OE_VIDEO_PERIODS)) / OE_VIDEO_PERIOD;
+
+	OEClear(0);
+	OEVideoTextMid(mx, my - h / 2, OE_VIDEO_TITLE);
+	StrPrint(buf, "%d / %d", users_connected, users);
+	OEVideoTextMid(mx, my - h / 2 + h, buf);
+	OEVideoTextMid(mx, my - h / 2 + 2 * h, message);
+	OEVideoTextMid(mx, my - h / 2 + 3 * h, oe_video_period[i]);
+}

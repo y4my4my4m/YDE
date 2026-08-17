@@ -1,0 +1,510 @@
+// SLP sprite archives: header parse and span-cache decode
+//
+// header (32 bytes): version[4], U32 num_frames, comment[24].
+// frame header (32 bytes, num_frames of them): U32 cmd_table_offset,
+// U32 outline_table_offset, U32 palette_offset, U32 properties,
+// I32 width, I32 height, I32 hotspot_x, I32 hotspot_y.
+//
+// all offsets are relative to the start of the SLP payload. cmd_table[y] is
+// already absolute in that payload - checked over all 19379 Trial frames -
+// so it indexes the blob directly rather than through Image_Load's rebase.
+//
+// outline table: h entries of U16 left_padding, U16 right_padding. either
+// half at 0x8000 marks the row fully transparent.
+//
+// a decoded frame is stored as row spans rather than a rectangle: the
+// blitter then never touches a transparent pixel, and one cache entry serves
+// every player colour because player-colour spans keep the band-relative
+// byte and the blit adds 16 * (color + 1).
+//
+// span stream, per row, terminated by x == OESLP_ROW_END:
+//	U16 x, U16 len, U8 kind, then len index bytes for kind NORMAL / PLAYER.
+//	kind SHADOW carries no index bytes.
+
+#define OESLP_HEADER		32
+#define OESLP_FRAME			32
+#define OESLP_OUTLINE_CLEAR	0x8000
+#define OESLP_ROW_END		0xFFFF
+
+#define OESLP_KIND_NORMAL	0
+#define OESLP_KIND_PLAYER	1
+#define OESLP_KIND_SHADOW	2
+
+#define OESLP_MAX_W			4096
+
+class COEFrame
+{
+	I64	 w;
+	I64	 h;
+	I64	 hx;			//hotspot
+	I64	 hy;
+	I64	*row;			//byte offset of row y in span, -1 when empty
+	U8	*span;
+	I64	 span_size;
+};
+
+class COESlp
+{
+	I64			 num_frames;
+	COEFrame	*frame;
+	Bool		 ok;
+};
+
+//decode scratch, one row wide. reused across every frame.
+U8	*oe_slp_idx  = NULL;
+U8	*oe_slp_kind = NULL;
+U8	*oe_slp_row  = NULL;
+
+U0 OESlpScratchInit()
+{
+	if (oe_slp_idx)
+		return;
+	oe_slp_idx  = CAlloc(OESLP_MAX_W);
+	oe_slp_kind = CAlloc(OESLP_MAX_W);
+	oe_slp_row  = CAlloc(OESLP_MAX_W * 6 + 8);
+}
+
+//run-lengths the scratch row into oe_slp_row, returns the byte count.
+//kind OESLP_CLEAR_KIND marks a transparent column.
+#define OESLP_CLEAR_KIND	255
+
+I64 OESlpPackRow(I64 w)
+{
+	I64 n = 0;
+	I64 x = 0;
+	I64 x0;
+	I64 k;
+	I64 len;
+	I64 i;
+
+	while (x < w)
+	{
+		k = oe_slp_kind[x];
+		if (k == OESLP_CLEAR_KIND)
+		{
+			x++;
+		}
+		else
+		{
+			x0 = x;
+			while (x < w && oe_slp_kind[x] == k)
+				x++;
+			len = x - x0;
+
+			oe_slp_row[n]     = x0 & 0xFF;
+			oe_slp_row[n + 1] = (x0 >> 8) & 0xFF;
+			oe_slp_row[n + 2] = len & 0xFF;
+			oe_slp_row[n + 3] = (len >> 8) & 0xFF;
+			oe_slp_row[n + 4] = k;
+			n += 5;
+
+			if (k != OESLP_KIND_SHADOW)
+			{
+				for (i = 0; i < len; i++)
+					oe_slp_row[n + i] = oe_slp_idx[x0 + i];
+				n += len;
+			}
+		}
+	}
+
+	oe_slp_row[n]     = OESLP_ROW_END & 0xFF;
+	oe_slp_row[n + 1] = (OESLP_ROW_END >> 8) & 0xFF;
+	return n + 2;
+}
+
+//decodes one row of commands into the scratch. mirrors Scanline_Get, with
+//the player-colour bias left for the blitter and shadow kept as a kind.
+U0 OESlpRow(U8 *blob, I64 blob_size, I64 at, I64 w, I64 left)
+{
+	I64 x = left;
+	I64 i = at;
+	I64 cmd;
+	I64 low;
+	I64 high;
+	I64 shift;
+	I64 count;
+	I64 v;
+	I64 j;
+
+	while (i < blob_size)
+	{
+		cmd  = blob[i++];
+		low  = cmd & 0x0F;
+		high = cmd & 0xF0;
+
+		if (low == 0x0F)
+			break;
+
+		if (low == 0x0 || low == 0x4 || low == 0x8 || low == 0xC)
+		{//lesser block copy
+			count = cmd >> 2;
+			for (j = 0; j < count; j++)
+			{
+				if (x < w && i < blob_size)
+				{
+					oe_slp_idx[x]  = blob[i];
+					oe_slp_kind[x] = OESLP_KIND_NORMAL;
+				}
+				i++;
+				x++;
+			}
+		}
+		else if (low == 0x1 || low == 0x5 || low == 0x9 || low == 0xD)
+		{//lesser skip
+			shift = cmd >> 2;
+			count = shift;
+			if (!shift)
+				count = blob[i++];
+			x += count;
+		}
+		else if (low == 0x2)
+		{//greater block copy
+			count = (high << 4) + blob[i++];
+			for (j = 0; j < count; j++)
+			{
+				if (x < w && i < blob_size)
+				{
+					oe_slp_idx[x]  = blob[i];
+					oe_slp_kind[x] = OESLP_KIND_NORMAL;
+				}
+				i++;
+				x++;
+			}
+		}
+		else if (low == 0x3)
+		{//greater skip
+			count = (high << 4) + blob[i++];
+			x += count;
+		}
+		else if (low == 0x6)
+		{//player colour block copy
+			shift = cmd >> 4;
+			count = shift;
+			if (!shift)
+				count = blob[i++];
+			for (j = 0; j < count; j++)
+			{
+				if (x < w && i < blob_size)
+				{
+					oe_slp_idx[x]  = blob[i];
+					oe_slp_kind[x] = OESLP_KIND_PLAYER;
+				}
+				i++;
+				x++;
+			}
+		}
+		else if (low == 0x7)
+		{//fill
+			shift = cmd >> 4;
+			count = shift;
+			if (!shift)
+				count = blob[i++];
+			v = blob[i++];
+			for (j = 0; j < count; j++)
+			{
+				if (x < w)
+				{
+					oe_slp_idx[x]  = v;
+					oe_slp_kind[x] = OESLP_KIND_NORMAL;
+				}
+				x++;
+			}
+		}
+		else if (low == 0xA)
+		{//fill player colour
+			shift = cmd >> 4;
+			count = shift;
+			if (!shift)
+				count = blob[i++];
+			v = blob[i++];
+			for (j = 0; j < count; j++)
+			{
+				if (x < w)
+				{
+					oe_slp_idx[x]  = v;
+					oe_slp_kind[x] = OESLP_KIND_PLAYER;
+				}
+				x++;
+			}
+		}
+		else if (low == 0xB)
+		{//shadow
+			shift = cmd >> 4;
+			count = shift;
+			if (!shift)
+				count = blob[i++];
+			for (j = 0; j < count; j++)
+			{
+				if (x < w)
+				{
+					oe_slp_idx[x]  = 0;
+					oe_slp_kind[x] = OESLP_KIND_SHADOW;
+				}
+				x++;
+			}
+		}
+		else if (low == 0xE)
+		{//extended
+			if (cmd == 0x4E)
+			{//outline player colour
+				if (x < w)
+				{
+					oe_slp_idx[x]  = 0;
+					oe_slp_kind[x] = OESLP_KIND_PLAYER;
+				}
+				x++;
+			}
+			else if (cmd == 0x5E)
+			{//fill player colour
+				count = blob[i++];
+				for (j = 0; j < count; j++)
+				{
+					if (x < w)
+					{
+						oe_slp_idx[x]  = 0;
+						oe_slp_kind[x] = OESLP_KIND_PLAYER;
+					}
+					x++;
+				}
+			}
+			else if (cmd == 0x6E)
+			{//outline, second table
+				if (x < w)
+				{
+					oe_slp_idx[x]  = 0;
+					oe_slp_kind[x] = OESLP_KIND_NORMAL;
+				}
+				x++;
+			}
+			else if (cmd == 0x7E)
+			{//fill, second table
+				count = blob[i++];
+				for (j = 0; j < count; j++)
+				{
+					if (x < w)
+					{
+						oe_slp_idx[x]  = 0;
+						oe_slp_kind[x] = OESLP_KIND_NORMAL;
+					}
+					x++;
+				}
+			}
+			//0x0E/0x1E xflip hint, 0x2E/0x3E table select, 0x8E dither,
+			//0x9E/0xAE alpha mode: no pixels, nothing to record.
+		}
+		else
+		{
+			break;
+		}
+
+		if (x > w + OESLP_MAX_W)
+			break;
+	}
+}
+
+Bool OESlpDecode(COESlp *slp, U8 *blob, I64 blob_size)
+{
+	I64		  i;
+	I64		  y;
+	I64		  n;
+	I64		  cap;
+	I64		  used;
+	I64		  cmd_off;
+	I64		  out_off;
+	I64		  left;
+	I64		  right;
+	I64		  at;
+	Bool	  ok;
+	U8		 *buf;
+	COEFrame *f;
+
+	MemSet(slp, 0, sizeof(COESlp));
+	OESlpScratchInit;
+
+	if (!blob || blob_size < OESLP_HEADER)
+		return FALSE;
+
+	slp->num_frames = OERdU32(blob + 4);
+	if (slp->num_frames < 1 || blob_size < OESLP_HEADER + slp->num_frames * OESLP_FRAME)
+		return FALSE;
+
+	slp->frame = CAlloc(sizeof(COEFrame) * slp->num_frames);
+
+	for (i = 0; i < slp->num_frames; i++)
+	{
+		f = &slp->frame[i];
+		at = OESLP_HEADER + i * OESLP_FRAME;
+
+		cmd_off = OERdU32(blob + at);
+		out_off = OERdU32(blob + at + 4);
+		f->w  = OERdI32(blob + at + 16);
+		f->h  = OERdI32(blob + at + 20);
+		f->hx = OERdI32(blob + at + 24);
+		f->hy = OERdI32(blob + at + 28);
+
+		if (f->w < 1 || f->h < 1 || f->w > OESLP_MAX_W)
+		{
+			f->w = 0;
+			f->h = 0;
+			f->row  = NULL;
+			f->span = NULL;
+		}
+		else
+		{
+			f->row = CAlloc(sizeof(I64) * f->h);
+			cap  = f->h * 8 + 1024;
+			buf  = MAlloc(cap);
+			used = 0;
+
+			for (y = 0; y < f->h; y++)
+			{
+				f->row[y] = -1;
+				ok = out_off + 4 * y + 4 <= blob_size &&
+					 cmd_off + 4 * y + 4 <= blob_size;
+
+				if (ok)
+				{
+					left  = OERdU16(blob + out_off + 4 * y);
+					right = OERdU16(blob + out_off + 4 * y + 2);
+					at    = OERdU32(blob + cmd_off + 4 * y);
+					ok = left != OESLP_OUTLINE_CLEAR &&
+						 right != OESLP_OUTLINE_CLEAR &&
+						 at < blob_size;
+				}
+
+				if (ok)
+				{
+					MemSet(oe_slp_kind, OESLP_CLEAR_KIND, f->w);
+					OESlpRow(blob, blob_size, at, f->w, left);
+					n = OESlpPackRow(f->w);
+
+					//an empty row still packs to the 2-byte terminator
+					if (n > 2)
+					{
+						if (used + n > cap)
+						{
+							while (used + n > cap)
+								cap *= 2;
+							buf = ReAlloc(buf, cap);
+						}
+						MemCopy(buf + used, oe_slp_row, n);
+						f->row[y] = used;
+						used += n;
+					}
+				}
+			}
+
+			f->span      = buf;
+			f->span_size = used;
+		}
+	}
+
+	slp->ok = TRUE;
+	return TRUE;
+}
+
+U0 OESlpFree(COESlp *slp)
+{
+	I64 i;
+
+	if (!slp->frame)
+		return;
+	for (i = 0; i < slp->num_frames; i++)
+	{
+		if (slp->frame[i].row)
+			Free(slp->frame[i].row);
+		if (slp->frame[i].span)
+			Free(slp->frame[i].span);
+	}
+	Free(slp->frame);
+	slp->frame = NULL;
+	slp->num_frames = 0;
+	slp->ok = FALSE;
+}
+
+// ---------------------------------------------------------------- registrar
+//
+// decoded archives keyed by (which DRS, table, file). openempire pre-decodes
+// every SLP into an SDL_Surface per player colour; the span cache is colour
+// agnostic, so one entry covers all eight.
+
+#define OEREG_GRAPHICS	0
+#define OEREG_INTERFAC	1
+#define OEREG_TERRAIN	2
+#define OEREG_DRS_COUNT	3
+
+#define OEREG_SLOTS		1024	//open addressed, power of two
+
+class COERegEntry
+{
+	I64		 key;		//(which << 40) | (table << 20) | file, -1 when free
+	COESlp	 slp;
+};
+
+COERegEntry *oe_reg = NULL;
+I64			 oe_reg_used = 0;
+
+U0 OERegInit()
+{
+	I64 i;
+
+	if (!oe_reg)
+		oe_reg = CAlloc(sizeof(COERegEntry) * OEREG_SLOTS);
+	for (i = 0; i < OEREG_SLOTS; i++)
+		oe_reg[i].key = -1;
+	oe_reg_used = 0;
+}
+
+COEDrs *OERegDrs(I64 which)
+{
+	if (which == OEREG_GRAPHICS)
+		return &oe_drs_graphics;
+	if (which == OEREG_INTERFAC)
+		return &oe_drs_interfac;
+	return &oe_drs_terrain;
+}
+
+COESlp *OERegGet(I64 which, I64 table, I64 file)
+{
+	I64	 key = (which << 40) | (table << 20) | file;
+	I64	 h   = ((key * 2654435761) >> 8) & (OEREG_SLOTS - 1);
+	I64	 n   = 0;
+	I64	 size = 0;
+	U8	*blob;
+
+	if (!oe_reg)
+		OERegInit;
+
+	while (n < OEREG_SLOTS)
+	{
+		if (oe_reg[h].key == key)
+			return &oe_reg[h].slp;
+		if (oe_reg[h].key == -1)
+		{
+			blob = OEDrsData(OERegDrs(which), table, file, &size);
+			if (!blob)
+				return NULL;
+			if (!OESlpDecode(&oe_reg[h].slp, blob, size))
+				return NULL;
+			oe_reg[h].key = key;
+			oe_reg_used++;
+			return &oe_reg[h].slp;
+		}
+		h = (h + 1) & (OEREG_SLOTS - 1);
+		n++;
+	}
+	return NULL;
+}
+
+COEFrame *OERegFrame(I64 which, I64 table, I64 file, I64 frame)
+{
+	COESlp *slp = OERegGet(which, table, file);
+
+	if (!slp || !slp->ok)
+		return NULL;
+	if (frame < 0 || frame >= slp->num_frames)
+		return NULL;
+	if (!slp->frame[frame].span)
+		return NULL;
+	return &slp->frame[frame];
+}

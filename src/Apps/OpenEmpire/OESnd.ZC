@@ -1,0 +1,420 @@
+// WAV decode, sfx cache and voice pool
+//
+// openempire has no audio at all: sounds.drs ships in the Trial data and
+// nothing in the C tree opens it. this whole file is addition, not port, and
+// follows D1Snd.ZC rather than any openempire counterpart.
+//
+// sounds.drs is one " vaw" table of 286 RIFF files, PCM mono, 16-bit, at
+// 22050 or 16000 Hz. sounds are addressed by DRS file id, decoded once,
+// resampled to 48kHz stereo and cached.
+//
+// AudioSFXPlayRef (System/Audio/Mixer.ZC) borrows the frame buffer rather
+// than copying it, so a cache entry must outlive every voice reading it.
+// entries are only evicted when no voice holds them.
+
+#define OESND_RATE		48000
+#define OESND_CACHE		48
+#define OESND_VOICES	12
+#define OESND_SFX_VOL	200
+
+I64	 oe_snd_vol   = OESND_SFX_VOL;
+Bool oe_snd_on    = FALSE;
+Bool oe_snd_ready = FALSE;
+I64	 oe_snd_stamp = 0;
+
+class COESndCache
+{
+	I64	 id;			//DRS file id, -1 free
+	U32	*frames;		//48kHz stereo, L16 | R16 << 16
+	I64	 count;
+	I64	 stamp;
+	Bool missing;
+};
+
+class COESndVoice
+{
+	I64 handle;			//mixer voice handle, -1 free
+	I64 cache_idx;
+};
+
+COESndCache oe_snd_cache[OESND_CACHE];
+COESndVoice oe_snd_voice[OESND_VOICES];
+
+Bool OESndTag(U8 *p, U8 *tag)
+{
+	return p[0] == tag[0] && p[1] == tag[1] && p[2] == tag[2] &&
+		p[3] == tag[3];
+}
+
+I64 OESndS16(I64 v)
+{
+	v &= 0xFFFF;
+	if (v & 0x8000)
+		v -= 0x10000;
+	return v;
+}
+
+//RIFF/WAVE walk. returns frame count, writes a freshly allocated stereo
+//buffer at the file's own rate.
+I64 OESndDecode(U8 *raw, I64 size, U32 **_frames, I64 *_rate)
+{
+	U8	*p;
+	U8	*end;
+	U8	*data = NULL;
+	U8	*s;
+	I64	 chunk;
+	I64	 tag      = 1;
+	I64	 channels = 1;
+	I64	 rate     = 22050;
+	I64	 bits     = 16;
+	I64	 dsize    = 0;
+	I64	 in_count;
+	I64	 i;
+	I64	 l;
+	I64	 r;
+	U32	*out;
+
+	*_frames = NULL;
+	*_rate   = 0;
+
+	if (!raw || size < 44)
+		return 0;
+	if (!OESndTag(raw, "RIFF") || !OESndTag(raw + 8, "WAVE"))
+		return 0;
+
+	p   = raw + 12;
+	end = raw + size;
+	while (p + 8 <= end)
+	{
+		chunk = OERdU32(p + 4);
+		if (p + 8 + chunk > end)
+			chunk = end - (p + 8);
+		if (OESndTag(p, "fmt ") && chunk >= 16)
+		{
+			tag      = OERdU16(p + 8);
+			channels = OERdU16(p + 10);
+			rate     = OERdU32(p + 12);
+			bits     = OERdU16(p + 22);
+		}
+		else if (OESndTag(p, "data"))
+		{
+			data  = p + 8;
+			dsize = chunk;
+		}
+		p += 8 + chunk + (chunk & 1);
+	}
+
+	if (tag != 1 || !data || dsize < 1 || rate < 1)
+		return 0;
+	if (channels < 1 || channels > 2)
+		return 0;
+	if (bits != 8 && bits != 16)
+		return 0;
+
+	in_count = dsize / (channels * (bits / 8));
+	if (in_count < 1)
+		return 0;
+
+	out = CAlloc(in_count * 4, sys_task);
+	for (i = 0; i < in_count; i++)
+	{
+		if (bits == 8)
+		{
+			s = data + i * channels;
+			l = (s[0] - 128) << 8;
+			r = l;
+			if (channels > 1)
+				r = (s[1] - 128) << 8;
+		}
+		else
+		{
+			s = data + i * channels * 2;
+			l = OESndS16(OERdU16(s));
+			r = l;
+			if (channels > 1)
+				r = OESndS16(OERdU16(s + 2));
+		}
+		out[i] = (l & 0xFFFF) | ((r & 0xFFFF) << 16);
+	}
+
+	*_frames = out;
+	*_rate   = rate;
+	return in_count;
+}
+
+//linear interpolation to OESND_RATE, 16.16 step
+U32 *OESndResample(U32 *src, I64 in_count, I64 src_rate, I64 *_out_count)
+{
+	I64	 step_fp;
+	I64	 out_count;
+	I64	 pos_fp;
+	I64	 idx;
+	I64	 frac;
+	I64	 i;
+	I64	 l0;
+	I64	 r0;
+	I64	 l1;
+	I64	 r1;
+	I64	 l;
+	I64	 r;
+	U32	*out;
+
+	*_out_count = 0;
+	if (!src || in_count < 1 || src_rate < 1)
+		return NULL;
+
+	step_fp   = (src_rate << 16) / OESND_RATE;
+	out_count = (in_count * OESND_RATE) / src_rate;
+	if (out_count < 1)
+		out_count = 1;
+
+	out = CAlloc(out_count * 4, sys_task);
+	for (i = 0; i < out_count; i++)
+	{
+		pos_fp = i * step_fp;
+		idx    = pos_fp >> 16;
+		frac   = pos_fp & 0xFFFF;
+		if (idx > in_count - 1)
+			idx = in_count - 1;
+		l0 = OESndS16(src[idx]);
+		r0 = OESndS16(src[idx] >> 16);
+		if (idx < in_count - 1)
+		{
+			l1 = OESndS16(src[idx + 1]);
+			r1 = OESndS16(src[idx + 1] >> 16);
+		}
+		else
+		{
+			l1 = l0;
+			r1 = r0;
+		}
+		l = l0 + (((l1 - l0) * frac) >> 16);
+		r = r0 + (((r1 - r0) * frac) >> 16);
+		out[i] = (l & 0xFFFF) | ((r & 0xFFFF) << 16);
+	}
+
+	*_out_count = out_count;
+	return out;
+}
+
+U0 OESndInit()
+{
+	I64 i;
+
+	for (i = 0; i < OESND_CACHE; i++)
+	{
+		oe_snd_cache[i].id      = -1;
+		oe_snd_cache[i].frames  = NULL;
+		oe_snd_cache[i].count   = 0;
+		oe_snd_cache[i].stamp   = 0;
+		oe_snd_cache[i].missing = FALSE;
+	}
+	for (i = 0; i < OESND_VOICES; i++)
+	{
+		oe_snd_voice[i].handle    = -1;
+		oe_snd_voice[i].cache_idx = -1;
+	}
+	oe_snd_on    = audio_present;
+	oe_snd_ready = TRUE;
+}
+
+//TRUE while any voice still reads this cache slot
+Bool OESndSlotBusy(I64 idx)
+{
+	I64 i;
+
+	for (i = 0; i < OESND_VOICES; i++)
+	{
+		if (oe_snd_voice[i].cache_idx == idx && oe_snd_voice[i].handle >= 0)
+		{
+			if (AudioSFXPlaying(oe_snd_voice[i].handle))
+				return TRUE;
+			oe_snd_voice[i].handle    = -1;
+			oe_snd_voice[i].cache_idx = -1;
+		}
+	}
+	return FALSE;
+}
+
+I64 OESndEvict()
+{//oldest slot no voice is reading, or -1
+	I64 i;
+	I64 best   = -1;
+	I64 best_s = 0;
+
+	for (i = 0; i < OESND_CACHE; i++)
+	{
+		if (oe_snd_cache[i].id == -1)
+			return i;
+	}
+	for (i = 0; i < OESND_CACHE; i++)
+	{
+		if (!OESndSlotBusy(i))
+		{
+			if (best < 0 || oe_snd_cache[i].stamp < best_s)
+			{
+				best   = i;
+				best_s = oe_snd_cache[i].stamp;
+			}
+		}
+	}
+	return best;
+}
+
+//decodes on first use. returns a cache index or -1.
+I64 OESndLoad(I64 id)
+{
+	I64	 i;
+	I64	 idx;
+	I64	 size = 0;
+	I64	 rate = 0;
+	I64	 raw_count;
+	I64	 out_count = 0;
+	I64	 table = 0;
+	I64	 file  = 0;
+	U8	*blob;
+	U32	*raw;
+	U32	*res;
+
+	if (!oe_snd_ready)
+		OESndInit;
+
+	for (i = 0; i < OESND_CACHE; i++)
+	{
+		if (oe_snd_cache[i].id == id)
+		{
+			oe_snd_stamp++;
+			oe_snd_cache[i].stamp = oe_snd_stamp;
+			if (oe_snd_cache[i].missing)
+				return -1;
+			return i;
+		}
+	}
+
+	if (!oe_drs_sounds.loaded)
+		return -1;
+	if (!OEDrsFind(&oe_drs_sounds, id, &table, &file))
+		return -1;
+
+	idx = OESndEvict();
+	if (idx < 0)
+		return -1;
+
+	if (oe_snd_cache[idx].frames)
+		Free(oe_snd_cache[idx].frames);
+	oe_snd_cache[idx].frames  = NULL;
+	oe_snd_cache[idx].count   = 0;
+	oe_snd_cache[idx].missing = FALSE;
+	oe_snd_cache[idx].id      = id;
+	oe_snd_stamp++;
+	oe_snd_cache[idx].stamp = oe_snd_stamp;
+
+	blob = OEDrsData(&oe_drs_sounds, table, file, &size);
+	raw_count = OESndDecode(blob, size, &raw, &rate);
+	if (!raw_count)
+	{
+		oe_snd_cache[idx].missing = TRUE;
+		return -1;
+	}
+
+	res = OESndResample(raw, raw_count, rate, &out_count);
+	Free(raw);
+	if (!res)
+	{
+		oe_snd_cache[idx].missing = TRUE;
+		return -1;
+	}
+
+	oe_snd_cache[idx].frames = res;
+	oe_snd_cache[idx].count  = out_count;
+	return idx;
+}
+
+I64 OESndFreeVoice()
+{
+	I64 i;
+
+	for (i = 0; i < OESND_VOICES; i++)
+	{
+		if (oe_snd_voice[i].handle < 0)
+			return i;
+		if (!AudioSFXPlaying(oe_snd_voice[i].handle))
+		{
+			oe_snd_voice[i].handle    = -1;
+			oe_snd_voice[i].cache_idx = -1;
+			return i;
+		}
+	}
+	return -1;
+}
+
+//volume 0..256. returns the voice handle, or -1.
+I64 OESndPlayVol(I64 id, I64 vol)
+{
+	I64 idx;
+	I64 v;
+	I64 handle;
+
+	if (!oe_snd_on)
+		return -1;
+
+	idx = OESndLoad(id);
+	if (idx < 0)
+		return -1;
+
+	v = OESndFreeVoice();
+	if (v < 0)
+		return -1;
+
+	handle = AudioSFXPlayRef(oe_snd_cache[idx].frames, oe_snd_cache[idx].count,
+		OESND_RATE, vol, vol, FALSE);
+	if (handle < 0)
+		return -1;
+
+	oe_snd_voice[v].handle    = handle;
+	oe_snd_voice[v].cache_idx = idx;
+	return handle;
+}
+
+I64 OESndPlay(I64 id)
+{
+	return OESndPlayVol(id, oe_snd_vol);
+}
+
+//one of a run of consecutive ids, chosen off the sim RNG so peers agree
+I64 OESndPlayOneOf(I64 id, I64 count)
+{
+	if (count < 2)
+		return OESndPlay(id);
+	return OESndPlay(id + OERand() % count);
+}
+
+U0 OESndStopAll()
+{
+	I64 i;
+
+	if (!oe_snd_on)
+		return;
+	for (i = 0; i < OESND_VOICES; i++)
+	{
+		if (oe_snd_voice[i].handle >= 0)
+			AudioSFXStop(oe_snd_voice[i].handle);
+		oe_snd_voice[i].handle    = -1;
+		oe_snd_voice[i].cache_idx = -1;
+	}
+}
+
+U0 OESndFree()
+{
+	I64 i;
+
+	OESndStopAll;
+	for (i = 0; i < OESND_CACHE; i++)
+	{
+		if (oe_snd_cache[i].frames)
+			Free(oe_snd_cache[i].frames);
+		oe_snd_cache[i].frames = NULL;
+		oe_snd_cache[i].id     = -1;
+	}
+	oe_snd_ready = FALSE;
+}

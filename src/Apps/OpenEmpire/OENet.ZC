@@ -1,0 +1,542 @@
+// deterministic lockstep: the host cache and the client packet ring
+//
+// Sockets.c, Cache.c, Packet.c, Packets.c and History.h. no transport lives
+// here. OEHostRecv and OEHostSend take and return whole records, so a UDP or
+// TCP layer sits underneath without touching the arithmetic.
+//
+// clients integrate the simulation themselves and exchange only input. the
+// host never simulates: it timestamps overviews, damps client rates with a
+// PI loop, and stamps every packet with the cycle number all clients must
+// run it on.
+//
+// upstream has no offline mode. main.c splits --server and --client at argv
+// and a match needs two human clients plus a spectator process. OELocalStart
+// runs the host inside the client task, users = 1, zero sockets.
+//
+// with one peer the generic host code degenerates rather than branches:
+// min and max cycle are equal so the PI error and the control are zero, the
+// parity scan compares a client against itself, and every ping reads 0. the
+// per-5-cycle send cadence and the exec_cycle arithmetic are untouched, so a
+// solo game and a LAN game step the simulation through identical code.
+//
+// absent: Restore.c and Sockets_Reset. recovering a diverged client means
+// shipping the spectator's whole unit array, and there is no unit array yet.
+// Ping.c goes with it - ping is a transport measurement and reads 0 until a
+// transport supplies it.
+
+#define OENET_CYCLES_PER_SEND	5		//CONFIG_SOCKETS_SERVER_CYCLES_PER_SEND
+#define OENET_CYCLE_LENGTH_MS	10		//CONFIG_SOCKETS_SERVER_CYCLE_LENGTH_MS
+#define OENET_THRESHOLD_START	15		//CONFIG_SOCKETS_THRESHOLD_START
+#define OENET_EXEC_BUFFER		3		//Sockets.c Send
+#define OENET_QUEUE				32		//Packets_Make max
+
+//higher kp and ki lower the PI drive strength; si saturates the integral
+#define OENET_KP				32
+#define OENET_KI				64
+#define OENET_SI				1024
+
+// ------------------------------------------------------------ host cache
+
+//History.h. upstream stores parity as int32_t while the cache holds
+//uint64_t; both are U64 here so a ring entry compares against the value it
+//came from.
+class COEHistory
+{
+	U64	parity[OE_HISTORY_COUNT];
+	I64	cycles[OE_HISTORY_COUNT];
+	I64	count;
+};
+
+//Cache.h. connected has no Cache counterpart: upstream reads socket != NULL
+//out of Sockets.
+class COECache
+{
+	COEPacket	packet;
+	COEHistory	history[OECLR_COUNT];
+	U64			parity[OECLR_COUNT];
+	I64			cycles[OECLR_COUNT];
+	I64			queue_size[OECLR_COUNT];
+	I64			pings[OECLR_COUNT];
+	I64			control[OECLR_COUNT];
+	I64			integral[OECLR_COUNT];
+	Bool		connected[OECLR_COUNT];
+	I64			turn;
+	I64			users_connected;
+	I64			users;
+	I64			seed;
+	Bool		is_stable;
+	Bool		is_out_of_sync;
+};
+
+COECache	oe_host;
+COEPacket	oe_host_out;
+I64			oe_host_cycles = 0;
+Bool		oe_host_due = FALSE;
+
+//Cache_Make draws the seed from rand(). the caller supplies it here so a
+//match can be replayed.
+U0 OEHostInit(I64 users, I64 seed)
+{
+	MemSet(&oe_host, 0, sizeof(COECache));
+	MemSet(&oe_host_out, 0, sizeof(COEPacket));
+	oe_host.users	= users;
+	oe_host.seed	= seed;
+	oe_host_cycles	= 0;
+	oe_host_due		= FALSE;
+}
+
+//Sockets_Recv's per-socket body.
+U0 OEHostRecv(I64 client, COEOverview *ov)
+{
+	COEHistory *h;
+	I64			count;
+
+	if (client < 0 || client >= OECLR_COUNT)
+	{
+		return;
+	}
+	oe_host.connected[client] = TRUE;
+
+	//Cache.c writes history[count] and resets on count == OE_HISTORY_COUNT,
+	//one element past the ring. the reset precedes the write here.
+	h = &oe_host.history[client];
+	if (h->count >= OE_HISTORY_COUNT)
+	{
+		h->count = 0;
+	}
+	count = h->count;
+	h->count++;
+
+	oe_host.cycles[client]		= ov->cycles;
+	oe_host.parity[client]		= ov->parity;
+	h->cycles[count]			= ov->cycles;
+	h->parity[count]			= ov->parity;
+	oe_host.queue_size[client]	= ov->queue_size;
+	oe_host.pings[client]		= ov->ping;
+
+	//Overview_UsedAction: a button release is the only input that carries an
+	//order, so the host relays a slot only for a client that acted.
+	if (ov->event & (OEEV_MOUSE_LU | OEEV_MOUSE_RU))
+	{
+		MemCopy(&oe_host.packet.overview[client], ov, sizeof(COEOverview));
+	}
+}
+
+//Cache.c MisMatch. it reads cache->cycles[i] and cache->parity[i], the
+//latest sample, not history[j], so the inner loop repeats one comparison
+//count times. kept: the alternative changes when the host calls desync.
+Bool OEHostMisMatch(I64 cycles_check, U64 parity_check)
+{
+	COEHistory *h;
+	I64			i;
+	I64			j;
+
+	for (i = 0; i < OECLR_COUNT; i++)
+	{
+		h = &oe_host.history[i];
+		for (j = 0; j < h->count; j++)
+		{
+			if (oe_host.cycles[i] == cycles_check &&
+				oe_host.parity[i] != parity_check)
+			{
+				return TRUE;
+			}
+		}
+	}
+	return FALSE;
+}
+
+//Cache_CheckParity. parity is only meaningful once the clients are inside
+//the stability threshold; before that they are still spreading out.
+U0 OEHostCheckParity()
+{
+	COEHistory *h;
+	I64			i;
+	I64			j;
+
+	if (!oe_host.is_stable)
+	{
+		return;
+	}
+	for (i = 0; i < OECLR_COUNT; i++)
+	{
+		h = &oe_host.history[i];
+		for (j = 0; j < h->count; j++)
+		{
+			if (OEHostMisMatch(h->cycles[j], h->parity[j]))
+			{
+				oe_host.is_out_of_sync = TRUE;
+				return;
+			}
+		}
+	}
+	oe_host.is_out_of_sync = FALSE;
+}
+
+I64 OEHostCycleMax()
+{
+	I64 i;
+	I64 max = 0;
+
+	for (i = 0; i < OECLR_COUNT; i++)
+	{
+		if (oe_host.cycles[i] > max)
+		{
+			max = oe_host.cycles[i];
+		}
+	}
+	return max;
+}
+
+//Cache_GetCycleMin skips a colour that has never reported. all zero is 0.
+I64 OEHostCycleMin()
+{
+	I64 i;
+	I64 min = -1;
+
+	for (i = 0; i < OECLR_COUNT; i++)
+	{
+		if (oe_host.cycles[i] > 0 && (min < 0 || oe_host.cycles[i] < min))
+		{
+			min = oe_host.cycles[i];
+		}
+	}
+	if (min < 0)
+	{
+		return 0;
+	}
+	return min;
+}
+
+//milliseconds, round trip
+I64 OEHostPingMax()
+{
+	I64 i;
+	I64 max = 0;
+
+	for (i = 0; i < OECLR_COUNT; i++)
+	{
+		if (oe_host.pings[i] > max)
+		{
+			max = oe_host.pings[i];
+		}
+	}
+	return max;
+}
+
+Bool OEHostActive(I64 color)
+{
+	return oe_host.cycles[color] > 0;
+}
+
+//Cache.c IsUnderSaturated / IsOverSaturated: an AND across the active
+//colours, so with no active colour both hold and the control resets.
+Bool OEHostSaturated()
+{
+	I64	 i;
+	Bool under = TRUE;
+	Bool over = TRUE;
+
+	for (i = 0; i < OECLR_COUNT; i++)
+	{
+		if (OEHostActive(i))
+		{
+			if (oe_host.control[i] >= 0)
+			{
+				under = FALSE;
+			}
+			if (oe_host.control[i] <= 0)
+			{
+				over = FALSE;
+			}
+		}
+	}
+	return under || over;
+}
+
+//Cache_CalculateControl. setpoint is the midpoint of the client cycle
+//spread; a positive control tells that client to skip renders and catch up,
+//a negative one tells it to wait. all-same-sign means the whole field is
+//being driven one way, which is the setpoint moving, not the clients, so
+//the loop resets rather than winding up.
+U0 OEHostControl(I64 setpoint)
+{
+	I64 i;
+	I64 diff;
+
+	for (i = 0; i < OECLR_COUNT; i++)
+	{
+		if (OEHostActive(i))
+		{
+			diff = setpoint - oe_host.cycles[i];
+			oe_host.integral[i] = OEClamp(oe_host.integral[i] + diff,
+				-OENET_SI, OENET_SI);
+			oe_host.control[i] = ((OENET_KI * diff) +
+				(OENET_KP * oe_host.integral[i])) / (OENET_KP * OENET_KI);
+		}
+	}
+	if (OEHostSaturated())
+	{
+		for (i = 0; i < OECLR_COUNT; i++)
+		{
+			oe_host.control[i] = 0;
+			oe_host.integral[i] = 0;
+		}
+	}
+}
+
+//Sockets.c Send, up to the per-client fields. exec_cycle is the cycle every
+//client runs this packet on: the furthest ahead client, plus the worst round
+//trip expressed in cycles, plus three cycles of slack.
+U0 OEHostBuild(I64 max_cycle, I64 max_ping)
+{
+	I64 i;
+
+	MemCopy(&oe_host_out, &oe_host.packet, sizeof(COEPacket));
+	oe_host_out.turn			= oe_host.turn;
+	oe_host_out.exec_cycle		= max_cycle + (max_ping / OE_LOOP_SPEED_MS) +
+								  OENET_EXEC_BUFFER;
+	oe_host_out.is_stable		= oe_host.is_stable;
+	oe_host_out.is_out_of_sync	= oe_host.is_out_of_sync;
+	oe_host_out.users_connected	= oe_host.users_connected;
+	oe_host_out.users			= oe_host.users;
+	oe_host_out.seed			= oe_host.seed;
+	//Cache_GetGameRunning
+	oe_host_out.game_running	= oe_host.users_connected == oe_host.users;
+
+	//an unstable or diverged field must not act on orders it may replay
+	if (!oe_host.is_stable || oe_host.is_out_of_sync)
+	{
+		for (i = 0; i < OECLR_COUNT; i++)
+		{
+			MemSet(&oe_host_out.overview[i], 0, sizeof(COEOverview));
+		}
+	}
+}
+
+//Cache_ClearPacket
+U0 OEHostClearPacket()
+{
+	MemSet(&oe_host.packet, 0, sizeof(COEPacket));
+	oe_host.turn++;
+}
+
+//CountConnectedPlayers counts open sockets. with no transport the stand-in
+//is whether a colour has ever delivered an overview.
+I64 OEHostConnected()
+{
+	I64 i;
+	I64 count = 0;
+
+	for (i = 0; i < OECLR_COUNT; i++)
+	{
+		if (oe_host.connected[i])
+		{
+			count++;
+		}
+	}
+	return count;
+}
+
+//one host cycle: Sockets_Recv's parity tail, then Sockets_Send's body on
+//every fifth cycle. call after every pending overview for this cycle has
+//gone through OEHostRecv and before OEHostSend.
+//
+//base.turn is read before Cache_ClearPacket increments it, so the first
+//packet of a match carries turn 0 and Packet_IsAlive rejects it.
+U0 OEHostTick()
+{
+	I64 max_cycle;
+	I64 min_cycle;
+	I64 max_ping;
+	I64 setpoint;
+
+	OEHostCheckParity();
+
+	oe_host_due = FALSE;
+	if ((oe_host_cycles % OENET_CYCLES_PER_SEND) == 0)
+	{
+		max_cycle = OEHostCycleMax();
+		min_cycle = OEHostCycleMin();
+		//clients further apart than the window cannot be brought back by the
+		//control loop
+		if (max_cycle - min_cycle > OE_PLAYER_CYCLE_WINDOW)
+		{
+			oe_host.is_out_of_sync = TRUE;
+		}
+		setpoint = (max_cycle + min_cycle) / 2;
+		OEHostControl(setpoint);
+		//Cache_CheckStability
+		oe_host.is_stable = setpoint > OENET_THRESHOLD_START;
+		oe_host.users_connected = OEHostConnected();
+		max_ping = OEHostPingMax();
+		OEHostBuild(max_cycle, max_ping);
+		oe_host_due = TRUE;
+		OEHostClearPacket();
+	}
+	oe_host_cycles++;
+}
+
+//TRUE when a packet is due this cycle for a client that has connected.
+//control and client_id are the only per-client fields; the rest of the
+//packet is shared, which is what makes the field deterministic.
+Bool OEHostSend(I64 client, COEPacket *out)
+{
+	if (client < 0 || client >= OECLR_COUNT)
+	{
+		return FALSE;
+	}
+	if (!oe_host_due || !oe_host.connected[client])
+	{
+		return FALSE;
+	}
+	MemCopy(out, &oe_host_out, sizeof(COEPacket));
+	out->control	= oe_host.control[client];
+	out->client_id	= client;
+	return TRUE;
+}
+
+Bool OEHostOutOfSync()
+{
+	return oe_host.is_out_of_sync;
+}
+
+// ---------------------------------------------------------- client ring
+
+//Packets.c. a in b out, both free running; the index is the wrap.
+class COEPackets
+{
+	COEPacket  *packet;
+	I64			a;
+	I64			b;
+	I64			max;
+};
+
+COEPackets oe_packets;
+
+U0 OEPacketsMake()
+{
+	MemSet(&oe_packets, 0, sizeof(COEPackets));
+	oe_packets.packet	= CAlloc(sizeof(COEPacket) * OENET_QUEUE);
+	oe_packets.max		= OENET_QUEUE;
+}
+
+//Packets_Free
+U0 OEPacketsFree()
+{
+	if (oe_packets.packet)
+	{
+		Free(oe_packets.packet);
+	}
+	MemSet(&oe_packets, 0, sizeof(COEPackets));
+}
+
+I64 OEPacketsSize()
+{
+	return oe_packets.b - oe_packets.a;
+}
+
+Bool OEPacketsActive()
+{
+	return oe_packets.b > oe_packets.a;
+}
+
+//Packets_Peek's exec_cycle. valid only while the ring is active.
+I64 OEPacketsHeadExec()
+{
+	return oe_packets.packet[oe_packets.a % oe_packets.max].exec_cycle;
+}
+
+//Packets_Queue: b overwrites the oldest entry when it laps a.
+U0 OEPacketsQueue(COEPacket *p)
+{
+	I64 index;
+
+	index = oe_packets.b % oe_packets.max;
+	MemCopy(&oe_packets.packet[index], p, sizeof(COEPacket));
+	oe_packets.b++;
+	if ((oe_packets.b % oe_packets.max) == (oe_packets.a % oe_packets.max))
+	{
+		oe_packets.a++;
+	}
+}
+
+//Packets_Dequeue, guarded. upstream is unguarded and its callers gate on
+//Active.
+Bool OEPacketsDequeue(COEPacket *out)
+{
+	I64 index;
+
+	if (!OEPacketsActive())
+	{
+		return FALSE;
+	}
+	index = oe_packets.a % oe_packets.max;
+	MemCopy(out, &oe_packets.packet[index], sizeof(COEPacket));
+	oe_packets.a++;
+	return TRUE;
+}
+
+//Packets_ClearStale: a packet whose exec cycle already passed can never be
+//run, and holding it stalls the head.
+U0 OEPacketsClearStale(I64 cycles)
+{
+	COEPacket waste;
+
+	while (OEPacketsActive() && OEPacketsHeadExec() < cycles)
+	{
+		OEPacketsDequeue(&waste);
+	}
+}
+
+//Packets_MustExecute: the head runs on exactly its exec cycle, so every
+//client applies the same orders on the same cycle number.
+Bool OEPacketsMustExecute(I64 cycles)
+{
+	return OEPacketsActive() && (OEPacketsHeadExec() == cycles);
+}
+
+//Packets_Clear
+U0 OEPacketsClear()
+{
+	COEPacket waste;
+
+	while (OEPacketsActive())
+	{
+		OEPacketsDequeue(&waste);
+	}
+}
+
+// ------------------------------------------------------------ local host
+//
+// zero sockets, one peer, one task. the client hands its overview to the
+// host and takes the packet back in the same call.
+//
+// the cadence and the exec_cycle arithmetic are the LAN ones: the host still
+// emits on every fifth of its own cycles and exec_cycle is still
+// max_cycle + max_ping / OE_LOOP_SPEED_MS + OENET_EXEC_BUFFER, with max_ping
+// 0. parity, control and ping are no-ops because one peer cannot diverge
+// from itself, and there is no restore path to reach.
+//
+// the host cycle counter advances once per client cycle here, so a send
+// falls every 5 * OE_LOOP_SPEED_MS instead of the standalone host's
+// 5 * OENET_CYCLE_LENGTH_MS.
+//
+// users is 1 and the client keeps OECLR_BLU. upstream makes the last colour
+// the spectator; with one peer there is no spectator.
+
+U0 OELocalStart(I64 seed)
+{
+	OEHostInit(1, seed);
+}
+
+//Packet_Get hands back a zeroed packet when nothing arrived, and
+//Packet_IsAlive rejects it on turn 0. out is zeroed for the cycles between
+//sends for the same reason.
+U0 OELocalExchange(COEOverview *ov, COEPacket *out)
+{
+	MemSet(out, 0, sizeof(COEPacket));
+	OEHostRecv(OECLR_BLU, ov);
+	OEHostTick();
+	OEHostSend(OECLR_BLU, out);
+}

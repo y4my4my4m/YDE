@@ -1,0 +1,1059 @@
+// one unit: construction, the state machine, steering, melee
+//
+// Unit.c. both peers of a match run this, so it is integer only and draws
+// randomness only from OERand.
+//
+// upstream returns Point and Resource by value; ZealC has no struct return,
+// so those become a trailing out pointer and the reassignment at the call
+// site disappears.
+
+I64 oe_id_next            = 0;
+I64 oe_command_group_next = 0;
+
+I64 OEUnitGetIdNext()
+{
+	return oe_id_next;
+}
+
+U0 OEUnitSetIdNext(I64 id)
+{
+	oe_id_next = id;
+}
+
+I64 OEUnitGetCommandGroupNext()
+{
+	return oe_command_group_next;
+}
+
+U0 OEUnitSetCommandGroupNext(I64 command_group)
+{
+	oe_command_group_next = command_group;
+}
+
+U0 OEUnitIncrementCommandGroup()
+{
+	oe_command_group_next++;
+}
+
+//Rect_ContainsPoint: a is inclusive, b exclusive
+Bool OERectContainsPoint(COERect *r, COEPoint *p)
+{
+	return p->x >= r->a.x && p->y >= r->a.y && p->x < r->b.x && p->y < r->b.y;
+}
+
+// ------------------------------------------------------------ art lookups
+//
+// openempire caches an Animation per (colour, graphics id) in the Registrar
+// and reads its frame count. the span cache is colour agnostic, so the count
+// comes straight off the decoded SLP.
+
+I64 OEUnitAnimCount(I64 file)
+{
+	COESlp *slp;
+	I64		drs;
+
+	if (file == OEG_NONE)
+	{
+		return 0;
+	}
+	drs = OEGfxDrsId(file);
+	if (drs < 0)
+	{
+		return 0;
+	}
+	slp = OERegGet(OEREG_GRAPHICS, 0, drs);
+	if (!slp || !slp->ok)
+	{
+		return 0;
+	}
+	return slp->num_frames;
+}
+
+//Animation_GetFramesPerDirection
+I64 OEUnitFramesPerDir(I64 file, I64 state)
+{
+	return OEUnitAnimCount(OEGfxState(file, state)) / OEDIR_NOT_MIRRORED;
+}
+
+#define OE_SQUARE_COUNT	4
+
+I64 oe_construction_file[OE_SQUARE_COUNT] = {
+	OEG_CONSTRUCTION_1X1, OEG_CONSTRUCTION_2X2,
+	OEG_CONSTRUCTION_3X3, OEG_CONSTRUCTION_4X4
+};
+
+I64 oe_rubble_file[OE_SQUARE_COUNT] = {
+	OEG_RUBBLE_1X1, OEG_RUBBLE_2X2, OEG_RUBBLE_3X3, OEG_RUBBLE_4X4
+};
+
+//Graphics_EqualDimension: construction and rubble art is square, and a
+//footprint matches on its smaller edge. every other file compares as 1x1.
+Bool OEUnitEqualDim(I64 file, COEPoint *dim)
+{
+	I64 i;
+	I64 min = OEMin(dim->x, dim->y);
+
+	for (i = 0; i < OE_SQUARE_COUNT; i++)
+	{
+		if (oe_construction_file[i] == file || oe_rubble_file[i] == file)
+		{
+			return min == i + 1;
+		}
+	}
+	return min == 1;
+}
+
+// ------------------------------------------------------------- predicates
+
+Bool OEUnitIsDead(COEUnit *u)
+{
+	return u->health <= 0;
+}
+
+Bool OEUnitIsExempt(COEUnit *u)
+{
+	return OEStateIsDead(u->state) || u->trait.is_detail ||
+		u->must_garbage_collect;
+}
+
+Bool OEUnitIsDifferent(COEUnit *u, COEUnit *other)
+{
+	return u->id != other->id;
+}
+
+Bool OEUnitSameColor(COEUnit *u, COEUnit *other)
+{
+	return u->color == other->color;
+}
+
+Bool OEUnitInPlatoon(COEUnit *u, COEUnit *other)
+{
+	return u->command_group == other->command_group &&
+		OEUnitSameColor(u, other);
+}
+
+Bool OEUnitAreEnemies(COEUnit *u, COEUnit *other)
+{
+	return !OEUnitSameColor(u, other) && !OEUnitIsExempt(other);
+}
+
+Bool OEUnitHasNoPath(COEUnit *u)
+{
+	return u->path.count == 0;
+}
+
+Bool OEUnitHasPath(COEUnit *u)
+{
+	return u->path.count > 0;
+}
+
+Bool OEUnitIsVillager(COEUnit *u)
+{
+	return u->trait.type == OET_VILLAGER_FEMALE ||
+		u->trait.type == OET_VILLAGER_MALE;
+}
+
+Bool OEUnitIsConstruction(COEUnit *u)
+{
+	return u->trait.is_inanimate && u->is_being_built;
+}
+
+Bool OEUnitIsType(COEUnit *u, I64 color, I64 type)
+{
+	return u->color == color && !OEUnitIsExempt(u) && u->trait.type == type;
+}
+
+Bool OEUnitIsFloatingDifferent(COEUnit *u, COEUnit *other)
+{
+	return u->is_floating && !other->is_floating;
+}
+
+//floating animates clip floating animates only, and likewise for the rest
+Bool OEUnitCanAnimateClipAnimate(COEUnit *u, COEUnit *other)
+{
+	return OEUnitIsFloatingDifferent(other, u) ||
+		OEUnitIsFloatingDifferent(u, other);
+}
+
+Bool OEUnitFlashTimerTick(COEUnit *u)
+{
+	return !(u->grid_flash_timer % OE_FLASH_TIMER_RATE);
+}
+
+// -------------------------------------------------------------- selection
+
+Bool OEUnitIsSelectedByColor(COEUnit *u, I64 color)
+{
+	return (u->is_selected_by >> color) & 1;
+}
+
+U0 OEUnitClearSelectedColor(COEUnit *u, I64 color)
+{
+	u->is_selected_by &= ~(1 << color);
+}
+
+U0 OEUnitClearSelectedAllColors(COEUnit *u)
+{
+	u->is_selected_by = 0;
+}
+
+U0 OEUnitSetSelectedColor(COEUnit *u, I64 color)
+{
+	u->is_selected_by |= 1 << color;
+}
+
+// ------------------------------------------------------------------ state
+
+U0 OEUnitLock(COEUnit *u)
+{
+	u->is_state_locked = TRUE;
+}
+
+U0 OEUnitUnlock(COEUnit *u)
+{
+	u->is_state_locked = FALSE;
+}
+
+U0 OEUnitSetState(COEUnit *u, I64 state, Bool reset_state_timer)
+{
+	I64 file;
+
+	if (!u->was_wall_pushed && !u->is_state_locked && u->trait.is_multi_state)
+	{
+		file     = OEGfxState(u->file, state);
+		u->state = state;
+		u->file  = file;
+		if (reset_state_timer)
+		{
+			u->state_timer = 0;
+		}
+	}
+}
+
+U0 OEUnitSetDir(COEUnit *u, COEPoint *dir)
+{
+	if (u->dir_timer > OE_DIR_TIMER_EXPIRE)
+	{
+		u->dir       = OEDirCartToIso(OEDirGetCart(dir));
+		u->dir_timer = 0;
+	}
+}
+
+// --------------------------------------------------------------- movement
+
+U0 OEUnitUpdatePathIndex(COEUnit *u, I64 index, Bool reset_path_index_timer)
+{
+	u->path_index = index;
+	if (reset_path_index_timer)
+	{
+		u->path_index_timer = 0;
+	}
+}
+
+U0 OEUnitFreePath(COEUnit *u)
+{
+	OEUnitUpdatePathIndex(u, 0, TRUE);
+	OEPointsFree(&u->path);
+}
+
+U0 OEUnitUpdateCart(COEUnit *u, COEGrid *g)
+{
+	OEGridCellToOffset(g, &u->cart_grid_offset, &u->cell);
+	OEGridCellToCart(g, &u->cart, &u->cell);
+}
+
+U0 OEUnitUndoMove(COEUnit *u, COEGrid *g)
+{
+	OEPtCopy(&u->cell, &u->cell_last);
+	OEUnitUpdateCart(u, g);
+	OEPtSet(&u->velocity, 0, 0);
+}
+
+U0 OEUnitMove(COEUnit *u, COEGrid *g)
+{
+	OEPtCopy(&u->cell_last, &u->cell);
+	OEPtAdd(&u->cell, &u->cell, &u->velocity);
+	OEUnitUpdateCart(u, g);
+	if (u->state != OEST_MOVE)
+	{
+		OEUnitSetState(u, OEST_MOVE, FALSE);
+	}
+	if (OEPtMag(&u->velocity) < OE_VELOCITY_DEADZONE)
+	{
+		OEUnitSetState(u, OEST_IDLE, FALSE);
+	}
+}
+
+// ------------------------------------------------------------------- make
+
+U0 OEUnitMake(COEUnit *u, COEPoint *cart, COEPoint *offset, COEGrid *g,
+	I64 file, I64 color, Bool at_center, Bool is_floating, I64 trigger,
+	Bool is_being_built)
+{
+	COEPoint temp;
+	COEPoint center;
+	COEPoint shift;
+
+	MemSet(u, 0, sizeof(COEUnit));
+	OETraitBuild(&u->trait, file);
+	u->file = file;
+	u->id   = oe_id_next;
+	OEUnitIncrementCommandGroup;
+	u->command_group = OEUnitGetCommandGroupNext();
+	if (!is_floating)
+	{
+		oe_id_next++;
+	}
+	u->is_being_built = is_being_built;
+	u->is_floating    = is_floating;
+	if (!is_floating)
+	{
+		OEPtRand(&u->entropy);
+		u->entropy_static = OERand();
+	}
+	if (is_being_built && !u->trait.is_inanimate)
+	{
+		u->is_floating = TRUE;
+	}
+	u->child_lock_id = -1;
+	u->parent_id     = -1;
+	u->interest_id   = -1;
+	u->rally_id      = -1;
+	u->color         = color;
+	u->state         = OEST_IDLE;
+	//a unit spawns at nine tenths health; the last tenth is the build bar
+	if (u->trait.max_health > 0)
+	{
+		u->health = (9 * u->trait.max_health) / 10;
+	}
+	u->trigger = trigger;
+
+	OEPtCopy(&temp, cart);
+	if (at_center)
+	{
+		OEPtDiv(&center, &u->trait.dimensions, 2);
+		OEPtSub(&temp, &temp, &center);
+	}
+	OEGridCartToCell(g, &u->cell, &temp);
+	//an even footprint has no centre tile, so it sits half a tile back
+	if (OEPtIsEven(&u->trait.dimensions))
+	{
+		shift.x = g->tile_cart_mid.x * OE_CELL_SIZE;
+		shift.y = g->tile_cart_mid.y * OE_CELL_SIZE;
+		OEPtSub(&u->cell, &u->cell, &shift);
+	}
+	OEGridOffsetToCell(&temp, offset);
+	OEPtAdd(&u->cell, &u->cell, &temp);
+	OEUnitUpdateCart(u, g);
+
+	//cached at spawn: the per-state frame counts drive every tick compare
+	if (u->trait.is_multi_state)
+	{
+		u->attack_frames_per_dir = OEUnitFramesPerDir(u->file, OEST_ATTACK);
+		u->fall_frames_per_dir   = OEUnitFramesPerDir(u->file, OEST_FALL);
+		u->decay_frames_per_dir  = OEUnitFramesPerDir(u->file, OEST_DECAY);
+	}
+	if (u->trait.can_expire)
+	{
+		u->expire_frames = OEUnitAnimCount(u->file);
+	}
+	if (u->trait.type == OET_FIRE || u->trait.type == OET_RUBBLE)
+	{
+		u->is_timing_to_collect = TRUE;
+	}
+}
+
+U0 OEUnitMakeRubble(COEUnit *u, COEGrid *g)
+{
+	COEPoint none;
+	I64		 i;
+	I64		 file = OEG_NONE;
+
+	for (i = 0; i < OE_SQUARE_COUNT; i++)
+	{
+		if (OEUnitEqualDim(oe_rubble_file[i], &u->trait.dimensions))
+		{
+			file = oe_rubble_file[i];
+		}
+	}
+	if (file != OEG_NONE)
+	{
+		OEPtSet(&none, 0, 0);
+		OEUnitFreePath(u);
+		OEUnitMake(u, &u->cart, &none, g, file, u->color, FALSE, FALSE,
+			OETRG_NONE, FALSE);
+	}
+}
+
+I64 OEUnitGetConstructionFile(COEUnit *u)
+{
+	I64 i;
+
+	for (i = 0; i < OE_SQUARE_COUNT; i++)
+	{
+		if (OEUnitEqualDim(oe_construction_file[i], &u->trait.dimensions))
+		{
+			return oe_construction_file[i];
+		}
+	}
+	return OEG_NONE;
+}
+
+// ------------------------------------------------------------------- flow
+
+U0 OEUnitGetDelta(COEUnit *u, COEGrid *g, COEPoint *o)
+{
+	COEPoint offset;
+	COEPoint cell;
+	COEPoint goal;
+
+	OEPtSet(&offset, 0, 0);
+	if (u->path_index == u->path.count - 1)
+	{
+		OEPtCopy(&offset, &u->cart_grid_offset_goal);
+	}
+	OEGridOffsetToCell(&offset, &offset);
+	OEGridCartToCell(g, &cell, &u->path.point[u->path_index]);
+	OEPtAdd(&goal, &offset, &cell);
+	OEPtSub(o, &goal, &u->cell);
+}
+
+U0 OEUnitReachGoal(COEUnit *u)
+{
+	OEUnitUpdatePathIndex(u, u->path_index + 1, TRUE);
+	if (u->path_index >= u->path.count)
+	{
+		OEUnitFreePath(u);
+	}
+}
+
+U0 OEUnitGotoGoal(COEUnit *u, COEPoint *delta)
+{
+	COEPoint velocity;
+	COEPoint cell;
+	COEPoint dir;
+
+	OEPtNormalize(&velocity, delta, u->trait.max_speed);
+	//the new and the previous vector are averaged, which smooths the turn
+	OEPtAdd(&u->velocity, &velocity, &u->velocity);
+	OEPtDiv(&u->velocity, &u->velocity, 2);
+	if (u->state == OEST_ATTACK)
+	{
+		OEPtSet(&u->velocity, 0, 0);
+	}
+	if (u->is_engaged_in_melee)
+	{
+		OEPtCopy(&cell, &u->interest->cell);
+		if (u->interest->trait.is_inanimate)
+		{
+			OEPtCopy(&cell, &u->cell_interest_inanimate);
+		}
+		OEPtSub(&dir, &cell, &u->cell);
+		OEUnitSetDir(u, &dir);
+	}
+	else
+	{
+		OEUnitSetDir(u, &u->velocity);
+	}
+}
+
+U0 OEUnitFollowPath(COEUnit *u, COEGrid *g)
+{
+	COEPoint delta;
+
+	if (u->path.count > 0)
+	{
+		if (u->path.count > 1 && u->path_index == 0)
+		{
+			u->path_index++;
+		}
+		OEUnitGetDelta(u, g, &delta);
+		if (OEPtMag(&delta) < OE_GOAL_CLOSE_ENOUGH)
+		{
+			OEUnitReachGoal(u);
+		}
+		else
+		{
+			OEUnitGotoGoal(u, &delta);
+		}
+	}
+	else
+	{
+		if (OEPtMag(&u->velocity) > 0)
+		{
+			OEPtSet(&u->velocity, 0, 0);
+		}
+	}
+}
+
+//ApplyStressors. resistance 3 is upstream, flat for every unit.
+U0 OEUnitApplyStressors(COEUnit *u)
+{
+	COEPoint stressors;
+
+	OEPtCopy(&stressors, &u->stressors);
+	if (u->state == OEST_ATTACK)
+	{
+		OEPtDiv(&stressors, &stressors, 3);
+	}
+	OEPtAdd(&u->velocity, &u->velocity, &stressors);
+}
+
+U0 OEUnitCapSpeed(COEUnit *u)
+{
+	if (OEPtMag(&u->velocity) > u->trait.max_speed)
+	{
+		OEPtNormalize(&u->velocity, &u->velocity, u->trait.max_speed);
+	}
+}
+
+U0 OEUnitFlow(COEUnit *u, COEGrid *g)
+{
+	OEUnitFollowPath(u, g);
+	OEUnitApplyStressors(u);
+	OEUnitCapSpeed(u);
+}
+
+// ------------------------------------------------------------------ paths
+
+//raycast from the unit cell to the goal, one grid cell per step
+Bool OEUnitHasDirectPath(COEUnit *u, COEGrid *g, COEField *f)
+{
+	COEPoint goal;
+	COEPoint off;
+	COEPoint dir;
+	COEPoint mag;
+	COEPoint cell;
+	COEPoint cart;
+
+	if (OEPtEqual(&u->cart, &u->cart_goal))
+	{
+		return TRUE;
+	}
+	OEGridCartToCell(g, &goal, &u->cart_goal);
+	OEGridOffsetToCell(&off, &u->cart_grid_offset_goal);
+	OEPtAdd(&goal, &goal, &off);
+	OEPtSub(&dir, &goal, &u->cell);
+	OEPtNormalize(&mag, &dir, OE_CELL_SIZE);
+	//a sub-cell delta normalises to zero and the reference walks forever
+	if (OEPtIsZero(&mag))
+	{
+		return TRUE;
+	}
+
+	OEPtCopy(&cell, &u->cell);
+	while (TRUE)
+	{
+		OEGridCellToCart(g, &cart, &cell);
+		if (!OEFieldIsWalkable(f, &cart))
+		{
+			return FALSE;
+		}
+		if (OEPtEqual(&cart, &u->cart_goal))
+		{
+			return TRUE;
+		}
+		OEPtAdd(&cell, &cell, &mag);
+	}
+	return FALSE;
+}
+
+U0 OEUnitMockPath(COEUnit *u, COEPoint *cart_goal, COEPoint *offset_goal)
+{
+	if (!OEUnitIsExempt(u))
+	{
+		OEUnitFreePath(u);
+		OEPtCopy(&u->cart_goal, cart_goal);
+		OEPtCopy(&u->cart_grid_offset_goal, offset_goal);
+		OEPointsStraight(&u->path, &u->cart, cart_goal);
+	}
+}
+
+// ------------------------------------------------------------------ death
+
+U0 OEUnitFlag(COEUnit *u)
+{
+	u->health         = 0;
+	u->is_being_built = FALSE;
+	OEUnitClearSelectedAllColors(u);
+	if (u->trait.is_inanimate)
+	{
+		u->must_garbage_collect = TRUE;
+	}
+	else
+	{
+		OEUnitUnlock(u);
+		OEUnitSetState(u, OEST_FALL, TRUE);
+	}
+}
+
+I64 OEUnitGetLastExpireTick(COEUnit *u)
+{
+	return u->expire_frames * OE_ANIM_DIVISOR - 1;
+}
+
+I64 OEUnitGetLastAttackTick(COEUnit *u)
+{
+	return u->attack_frames_per_dir * OE_ANIM_DIVISOR - 1;
+}
+
+I64 OEUnitGetLastDecayTick(COEUnit *u)
+{
+	return u->decay_frames_per_dir * OE_ANIM_DECAY_DIVISOR - 1;
+}
+
+I64 OEUnitGetLastFallTick(COEUnit *u)
+{
+	return u->fall_frames_per_dir * OE_ANIM_DIVISOR - 1;
+}
+
+// ------------------------------------------------------------------ melee
+
+Bool OEUnitCanEngage(COEUnit *u, COEGrid *g)
+{
+	COERect	 rect;
+	COEPoint diff;
+	COEPoint feeler;
+	COEPoint cell;
+	COEPoint cart;
+	I64		 width;
+	I64		 reach;
+
+	OEPtCopy(&cell, &u->interest->cell);
+	if (u->interest->trait.is_inanimate)
+	{
+		OEPtCopy(&cell, &u->cell_interest_inanimate);
+	}
+	OEPtSub(&diff, &cell, &u->cell);
+	width = OEMax(u->trait.width, u->interest->trait.width);
+
+	if (u->interest->trait.is_inanimate)
+	{
+		reach = width / 2 + OE_SWORD_LENGTH;
+		//a finished mill is worked from the whole farm, not from arm reach
+		if (u->interest->trait.type == OET_MILL &&
+			!u->interest->is_being_built)
+		{
+			reach = width / 2 + OE_FARM_HARVEST_LENGTH;
+		}
+		OEPtNormalize(&feeler, &diff, reach);
+		OEPtAdd(&cell, &u->cell, &feeler);
+		OEGridCellToCart(g, &cart, &cell);
+		OEPtCopy(&rect.a, &u->interest->cart);
+		OEPtAdd(&rect.b, &rect.a, &u->interest->trait.dimensions);
+		return OERectContainsPoint(&rect, &cart);
+	}
+	reach = OE_SWORD_LENGTH + width;
+	return OEPtMag(&diff) < reach;
+}
+
+//Collect: the four resource types are fixed for all of Age II
+U0 OEUnitCollect(COEUnit *u, I64 amount, COEResource *out)
+{
+	out->type   = OET_NONE;
+	out->amount = amount;
+	if (u->trait.type == OET_TREE)
+	{
+		out->type = OET_WOOD;
+	}
+	if (u->trait.type == OET_STONE_MINE)
+	{
+		out->type = OET_STONE;
+	}
+	if (u->trait.type == OET_GOLD_MINE)
+	{
+		out->type = OET_GOLD;
+	}
+	if (u->trait.type == OET_BERRY_BUSH)
+	{
+		out->type = OET_FOOD;
+	}
+	u->health -= amount;
+}
+
+Bool OEUnitMustDisengage(COEUnit *u)
+{
+	return u->state == OEST_ATTACK &&
+		u->state_timer >= OEUnitGetLastAttackTick(u) &&
+		!OEUnitIsDead(u->interest);
+}
+
+U0 OEUnitDoVillagerAction(COEUnit *u, COEResource *out)
+{
+	OEResourceNone(out);
+	if (OEUnitSameColor(u, u->interest))
+	{
+		if (OEUnitIsConstruction(u->interest))
+		{
+			u->interest->health += u->trait.attack;
+		}
+		else if (u->interest->trait.type == OET_MILL)
+		{
+			out->type   = OET_FOOD;
+			out->amount = u->trait.attack;
+		}
+	}
+	else if (u->interest->trait.is_resource)
+	{
+		OEUnitCollect(u->interest, u->trait.attack, out);
+	}
+	else
+	{
+		u->interest->health -= u->trait.attack;
+	}
+}
+
+Bool OEUnitCanMelee(COEUnit *u)
+{
+	//a flag carries a research trigger and is never a target
+	return u->interest != NULL && !OEUnitIsExempt(u) && !u->is_floating &&
+		!OEUnitIsExempt(u->interest) && !u->interest->is_floating &&
+		OEUnitIsDifferent(u, u->interest) &&
+		u->interest->trait.type != OET_FLAG;
+}
+
+Bool OEUnitMustEngage(COEUnit *u)
+{
+	//only villagers harvest; no unit cuts a tree to fight it
+	if (!OEUnitIsVillager(u) && u->interest->trait.is_resource)
+	{
+		return FALSE;
+	}
+	if (OEUnitSameColor(u, u->interest) && u->interest->is_being_built &&
+		OEUnitIsVillager(u))
+	{
+		return TRUE;
+	}
+	if (OEUnitSameColor(u, u->interest) &&
+		u->interest->trait.type == OET_MILL)
+	{
+		return TRUE;
+	}
+	return !OEUnitSameColor(u, u->interest);
+}
+
+U0 OEUnitMelee(COEUnit *u, COEGrid *g, COEResource *out)
+{
+	OEResourceNone(out);
+	if (!OEUnitCanMelee(u))
+	{
+		OEUnitUnlock(u);
+		return;
+	}
+	if (OEUnitCanEngage(u, g))
+	{
+		if (OEUnitMustEngage(u))
+		{
+			u->is_engaged_in_melee = TRUE;
+			OEUnitSetState(u, OEST_ATTACK, TRUE);
+			OEUnitLock(u);
+		}
+		else
+		{
+			OEUnitFreePath(u);
+		}
+	}
+	if (OEUnitMustDisengage(u))
+	{
+		OEUnitUnlock(u);
+		//range is retested: a quick change of interest would otherwise land
+		//a hit at any distance
+		if (OEUnitCanEngage(u, g))
+		{
+			if (OEUnitIsVillager(u))
+			{
+				OEUnitDoVillagerAction(u, out);
+			}
+			else
+			{
+				u->interest->health -= u->trait.attack;
+			}
+		}
+	}
+}
+
+// --------------------------------------------------------------- steering
+
+#define OE_NUDGE_MAG	65535	//UINT16_MAX
+
+//Util_Rand yields 15 bits and OERand 31, so the entropy is narrowed to keep
+//the nudge inside the reference range.
+U0 OEUnitNudge(COEUnit *u, COEPoint *out)
+{
+	I64 half = OE_NUDGE_MAG / 2;
+
+	out->x = OEWrap32(((u->entropy.x & 0x7FFF) - half) * OE_NUDGE_MAG);
+	out->y = OEWrap32(((u->entropy.y & 0x7FFF) - half) * OE_NUDGE_MAG);
+}
+
+U0 OEUnitSeparate(COEUnit *u, COEUnit *other, COEPoint *out)
+{
+	COEPoint diff;
+	COEPoint push;
+	I64		 width;
+
+	OEPtSet(out, 0, 0);
+	if (OEUnitIsExempt(other) || !OEUnitIsDifferent(u, other))
+	{
+		return;
+	}
+	OEPtSub(&diff, &other->cell, &u->cell);
+	if (OEPtIsZero(&diff))
+	{
+		OEUnitNudge(u, out);
+		return;
+	}
+	width = OEMax(u->trait.width, other->trait.width);
+	if (OEPtMag(&diff) < width)
+	{
+		OEPtNormalize(&push, &diff, width);
+		OEPtSub(out, &push, &diff);
+	}
+}
+
+//Unit_GetShift: the art hangs one tile south of the footprint centre
+U0 OEUnitGetShift(COEUnit *u, COEPoint *cart, COEPoint *out)
+{
+	COEPoint half;
+
+	OEPtDiv(&half, &u->trait.dimensions, 2);
+	OEPtAdd(out, cart, &half);
+	out->y += 1;
+}
+
+Bool OEUnitIsPointWithinDimensions(COEUnit *u, COEPoint *cart)
+{
+	COERect rect;
+
+	OEPtCopy(&rect.a, &u->cart);
+	OEPtAdd(&rect.b, &u->cart, &u->trait.dimensions);
+	return OERectContainsPoint(&rect, cart);
+}
+
+// ----------------------------------------------------------- interest ties
+
+U0 OEUnitMorphState(COEUnit *u, I64 file)
+{
+	u->file           = file;
+	u->state          = OEST_IDLE;
+	u->state_timer    = 0;
+	u->is_state_locked = FALSE;
+}
+
+//Morph picks the villager idle art from what the interest is. the trait is
+//not rebuilt, so trait.type stays the villager gender.
+I64 OEUnitMorphFile(COEUnit *u, I64 idle, I64 builder, I64 woodcutter,
+	I64 forager, I64 miner)
+{
+	I64 type = u->interest->trait.type;
+
+	if (u->interest->is_being_built)
+	{
+		return builder;
+	}
+	if (type == OET_TREE)
+	{
+		return woodcutter;
+	}
+	if (type == OET_BERRY_BUSH || type == OET_MILL)
+	{
+		return forager;
+	}
+	if (type == OET_STONE_MINE || type == OET_GOLD_MINE)
+	{
+		return miner;
+	}
+	return idle;
+}
+
+U0 OEUnitMorph(COEUnit *u)
+{
+	if (u->trait.type == OET_VILLAGER_MALE)
+	{
+		OEUnitMorphState(u, OEUnitMorphFile(u,
+			OEG_MALE_VILLAGER_IDLE,
+			OEG_MALE_VILLAGER_BUILDER_IDLE,
+			OEG_MALE_VILLAGER_WOODCUTTER_IDLE,
+			OEG_MALE_VILLAGER_FORAGER_IDLE,
+			OEG_MALE_VILLAGER_MINER_IDLE));
+	}
+	if (u->trait.type == OET_VILLAGER_FEMALE)
+	{
+		OEUnitMorphState(u, OEUnitMorphFile(u,
+			OEG_FEMALE_VILLAGER_IDLE,
+			OEG_FEMALE_VILLAGER_BUILDER_IDLE,
+			OEG_FEMALE_VILLAGER_WOODCUTTER_IDLE,
+			OEG_FEMALE_VILLAGER_FORAGER_IDLE,
+			OEG_FEMALE_VILLAGER_MINER_IDLE));
+	}
+}
+
+U0 OEUnitSetInterest(COEUnit *u, COEUnit *interest)
+{
+	if (interest != u)
+	{
+		u->interest = interest;
+		if (interest)
+		{
+			u->interest_id = interest->id;
+			OEUnitMorph(u);
+		}
+		else
+		{
+			u->interest_id = -1;
+		}
+	}
+}
+
+U0 OEUnitSetRally(COEUnit *u, COEUnit *rally)
+{
+	if (rally != u)
+	{
+		u->rally = rally;
+		if (rally)
+		{
+			u->rally_id = rally->id;
+		}
+		else
+		{
+			u->rally_id = -1;
+		}
+	}
+}
+
+U0 OEUnitSetParent(COEUnit *child, COEUnit *parent)
+{
+	child->parent = parent;
+	if (parent)
+	{
+		parent->child_count++;
+		parent->has_children = TRUE;
+		child->parent_id     = parent->id;
+	}
+	else
+	{
+		child->parent_id = -1;
+	}
+}
+
+//nearest tile of an inanimate footprint, in cell space
+U0 OEUnitUpdateCellInterestInanimate(COEUnit *u, COEGrid *g)
+{
+	COEUnit	 *interest = u->interest;
+	COEPoint  shift;
+	COEPoint  cart;
+	COEPoint  cell;
+	COEPoint  diff;
+	I64		  x;
+	I64		  y;
+	I64		  mag;
+	I64		  min = OE_I32_MAX;
+
+	if (!interest->trait.is_inanimate)
+	{
+		return;
+	}
+	for (x = 0; x < interest->trait.dimensions.x; x++)
+	{
+		for (y = 0; y < interest->trait.dimensions.y; y++)
+		{
+			OEPtSet(&shift, x, y);
+			OEPtAdd(&cart, &interest->cart, &shift);
+			OEGridCartToCell(g, &cell, &cart);
+			OEPtSub(&diff, &u->cell, &cell);
+			mag = OEPtMag(&diff);
+			if (mag < min)
+			{
+				min = mag;
+				OEPtCopy(&u->cell_interest_inanimate, &cell);
+			}
+		}
+	}
+}
+
+U0 OEUnitEngageWithMock(COEUnit *u, COEUnit *closest, COEGrid *g)
+{
+	COEPoint cart;
+	COEPoint offset;
+
+	OEPtSet(&cart, 0, 0);
+	OEPtSet(&offset, 0, 0);
+	if (closest->trait.is_inanimate)
+	{
+		OEGridCellToCart(g, &cart, &u->cell_interest_inanimate);
+	}
+	else
+	{
+		OEPtCopy(&cart, &closest->cart);
+		OEPtCopy(&offset, &closest->cart_grid_offset);
+	}
+	OEUnitMockPath(u, &cart, &offset);
+}
+
+// ---------------------------------------------------------------- upgrade
+
+//Unit_Preserve. pointers are left alone: the ids remap them at the end of
+//the cycle.
+U0 OEUnitPreserve(COEUnit *to, COEUnit *from)
+{
+	OEPtCopy(&to->cell, &from->cell);
+	OEPtCopy(&to->cart, &from->cart);
+	OEPtCopy(&to->cart_grid_offset, &from->cart_grid_offset);
+	OEPtCopy(&to->cart_goal, &from->cart_goal);
+	OEPtCopy(&to->cart_grid_offset_goal, &from->cart_grid_offset_goal);
+	to->is_selected_by  = from->is_selected_by;
+	to->id              = from->id;
+	to->rally_id        = from->rally_id;
+	to->parent_id       = from->parent_id;
+	to->interest_id     = from->interest_id;
+	to->child_lock_id   = from->child_lock_id;
+	to->has_parent_lock = from->has_parent_lock;
+	to->has_children    = from->has_children;
+	MemCopy(&to->path, &from->path, sizeof(COEPoints));
+	to->dir             = from->dir;
+	to->health          = from->health;
+	to->using_aggro_move = from->using_aggro_move;
+	to->is_being_built  = from->is_being_built;
+	to->is_floating     = from->is_floating;
+}
+
+U0 OEUnitPreservedUpgrade(COEUnit *u, COEGrid *g, I64 upgrade)
+{
+	COEUnit	 temp;
+	COEPoint zero;
+	I64		 color = u->color;
+
+	MemSet(&temp, 0, sizeof(COEUnit));
+	OEUnitPreserve(&temp, u);
+	OEPtSet(&zero, 0, 0);
+	//position comes back with the preserve, so it spawns at the origin
+	OEUnitMake(u, &zero, &zero, g, upgrade, color, FALSE, FALSE, OETRG_NONE,
+		FALSE);
+	OEUnitPreserve(u, &temp);
+}
+
+// ------------------------------------------------------------------- farm
+
+U0 OEUnitLayFarm(COEUnit *u, COEMap *map)
+{
+	COEPoint shift;
+	COEPoint cart;
+	I64		 width = 2;
+	I64		 x;
+	I64		 y;
+
+	for (x = -width; x < u->trait.dimensions.x + width; x++)
+	{
+		for (y = -width; y < u->trait.dimensions.y + width; y++)
+		{
+			//the mill footprint keeps its own terrain
+			if (x < 0 || y < 0 || x >= u->trait.dimensions.x ||
+				y >= u->trait.dimensions.y)
+			{
+				OEPtSet(&shift, x, y);
+				OEPtAdd(&cart, &u->cart, &shift);
+				OEMapSetTerrain(map, &cart, OETR_FARM_READY);
+			}
+		}
+	}
+}
