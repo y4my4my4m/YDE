@@ -1,6 +1,6 @@
 # YDE
 
-The Y Desktop Environment, on a heavily modified [ZealOS](https://github.com/Zeal-Operating-System/ZealOS).
+The Y4m Desktop Environment, on a heavily modified [ZealOS](https://github.com/Zeal-Operating-System/ZealOS).
 64-bit, ring-0, single address space, written in ZealC. No ELFs, no libc, no X.
 
 ![](/screenshots/yde-desktop.png)
