@@ -1,0 +1,644 @@
+//virtio-serial (virtio-console, VIRTIO_ID 3) plus the SPICE vdagent clipboard
+//protocol, so QEMU shares the clipboard with no agent process on the host:
+//
+//  -device virtio-serial-pci
+//  -chardev qemu-vdagent,id=vd,clipboard=on
+//  -device virtserialport,chardev=vd,name=com.redhat.spice.0
+//
+//The device is transitional on q35: PCI 1af4:1003 with an I/O BAR, so the
+//legacy port interface VirtIONet.ZC uses is available and the modern MMIO
+//capability layout is not needed.
+//
+//Presence is the gate. A 1af4 device exists only under a hypervisor, so on
+//real hardware VSerFind returns nothing and none of this runs.
+
+#define VSER_PCI_VENDOR		0x1AF4
+#define VSER_PCI_DEVICE		0x1003		//transitional virtio-console
+
+//Legacy virtio port registers and ring structures are declared here rather
+//than shared with VirtIONet.ZC: that file is only loaded when a virtio NIC is
+//found, and ZealC has one global symbol table, so the names are prefixed.
+//Nothing here touches the network stack; the transport is a PCI device.
+#define VSER_R_HOST_FEAT	0
+#define VSER_R_GUEST_FEAT	4
+#define VSER_R_QUEUE_PFN	8
+#define VSER_R_QUEUE_SIZE	12
+#define VSER_R_QUEUE_SEL	14
+#define VSER_R_QUEUE_NOTIFY	16
+#define VSER_R_STATUS		18
+
+#define VSER_ST_ACK			1
+#define VSER_ST_DRIVER		2
+#define VSER_ST_DRIVER_OK	4
+#define VSER_ST_FAILED		0x80
+
+#define VSER_DESC_NEXT		1
+#define VSER_DESC_WRITE		2
+
+//A split virtqueue is laid out from the negotiated queue size, not a fixed
+//number of entries: descriptors at 0, the available ring at 16*num, and the
+//used ring on the next 4096 boundary after that. Hardcoding 256 entries put
+//the available ring inside the descriptor array, so QEMU read a descriptor
+//length as a head index and refused the device with "Guest says index 4096 is
+//available" - 4096 being VSER_BUF_SIZE.
+#define VSER_DESC_BYTES		16
+
+class CVSerVq
+{
+	U8	*base;			//one allocation covering all three rings
+	I64	 num;			//negotiated queue size
+	U8	*desc;			//num entries of VSER_DESC_BYTES
+	U16	*avail;			//flags, index, ring[num], used_event
+	U16	*used;			//flags, index, then num 8-byte items
+	I64	 last_used;
+	U8	*buf;			//num * VSER_BUF_SIZE payload slots
+};
+
+//Feature bits, virtio 1.1 5.3.3.
+#define VSER_F_MULTIPORT	2			//bit 1: control queues and port ids
+
+//Control events, virtio 1.1 5.3.6.
+#define VSER_EV_DEVICE_READY	0
+#define VSER_EV_PORT_ADD		1
+#define VSER_EV_PORT_REMOVE		2
+#define VSER_EV_PORT_READY		3
+#define VSER_EV_CONSOLE_PORT	4
+#define VSER_EV_RESIZE			5
+#define VSER_EV_PORT_OPEN		6
+#define VSER_EV_PORT_NAME		7
+
+//Queue 0 and 1 belong to port 0; 2 and 3 are the control pair; port N above
+//zero uses 2N+2 and 2N+3.
+#define VSER_QUEUE_MAX		8
+#define VSER_BUF_SIZE		4096
+
+#define VSER_PORT_NAME		"com.redhat.spice.0"
+
+/***** vdagent, spice-protocol vdagent.h *****/
+
+#define VD_PORT_CLIENT		1			//guest to client
+#define VD_PROTOCOL			1
+
+#define VD_MSG_CLIPBOARD			4
+#define VD_MSG_ANNOUNCE_CAPS		6
+#define VD_MSG_CLIPBOARD_GRAB		7
+#define VD_MSG_CLIPBOARD_REQUEST	8
+#define VD_MSG_CLIPBOARD_RELEASE	9
+
+#define VD_CAP_CLIPBOARD_BY_DEMAND	5
+#define VD_CLIPBOARD_UTF8_TEXT		1
+
+//A chunk carries at most this much payload; longer messages are split.
+#define VD_MAX_CHUNK		2048
+#define VD_CLIP_MAX			65536
+
+class CVSerCtl
+{//virtio_console_control
+	U32	id;
+	U16	event;
+	U16	value;
+};
+
+class CVdChunk
+{//VDIChunkHeader
+	U32	port;
+	U32	size;
+};
+
+class CVdMsg
+{//VDAgentMessage. ZealC lays classes out packed, so this is 20 bytes on the
+//wire and not the 24 natural alignment of the U64 would give. VirtIONet's
+//10-byte header relies on the same thing.
+	U32	protocol;
+	U32	type;
+	U64	opaque;
+	U32	size;
+};
+
+class CVSer
+{
+	U16				 port;			//I/O BAR base
+	Bool			 present, ready;
+	I64				 vd_port;		//port id carrying the vdagent channel
+	CVSerVq			 q[VSER_QUEUE_MAX];
+
+	//Reassembly. Inbound bytes are a stream of VDIChunkHeader plus payload,
+	//and a message may span chunks, so the chunk framing is peeled off first
+	//and the message assembled from what is left.
+	U8				 chdr[8];
+	I64				 chdr_len, chunk_left;
+	U8				*msg;
+	I64				 msg_len, msg_want;
+
+	//Clipboard state. The protocol is demand driven: a grab says "I have
+	//something", and the data only moves when the peer asks for it.
+	U8				*ours;			//what the guest last published
+	U8				*theirs;		//what the host last sent
+	Bool			 host_has;		//host grabbed, contents not fetched yet
+	Bool			 waiting;		//a request is outstanding
+
+	//Counters, so a silent channel can be told apart from an absent one.
+	I64				 ctl_rx, ctl_names, data_rx, msg_rx, grabs, reqs, sent;
+	I64				 last_type, last_len, peer_caps;	//last message the host sent
+};
+
+CVSer vser;
+//A global is garbage until written; VirtIONet.ZC zeroes its state for the same
+//reason. VSerInit reads vser.q before filling it.
+MemSet(&vser, 0, sizeof(CVSer));
+
+U0 VSerNotify(I64 q)
+{
+	OutU16(vser.port + VSER_R_QUEUE_NOTIFY, q);
+}
+
+U0 VSerDescSet(CVSerVq *v, I64 i, U8 *addr, I64 len, I64 flags)
+{
+	U8 *d = v->desc + i * VSER_DESC_BYTES;
+
+	*d(U64 *)       = addr;
+	*(d + 8)(U32 *) = len;
+	*(d + 12)(U16 *) = flags;
+	*(d + 14)(U16 *) = 0;
+}
+
+U0 VSerPublish(CVSerVq *v, I64 slot)
+{//Put a descriptor in the available ring and advance the index.
+	v->avail[2 + v->avail[1] % v->num] = slot;
+	v->avail[1]++;
+}
+
+U0 VSerQueueInit(I64 q, Bool device_writes)
+{//One descriptor per slot. Device-written queues are published immediately;
+//guest-written ones are published as they are filled.
+	CVSerVq	*v = &vser.q[q];
+	I64		 avail_off, used_off, total, i;
+
+	OutU16(vser.port + VSER_R_QUEUE_SEL, q);
+	v->num = InU16(vser.port + VSER_R_QUEUE_SIZE);
+	if (v->num < 1 || v->num > 1024)
+	{
+		v->num = 0;
+		return;
+	}
+	avail_off = VSER_DESC_BYTES * v->num;
+	used_off  = (avail_off + 6 + 2 * v->num + 4095) & ~4095;
+	total     = used_off + 6 + 8 * v->num;
+
+	v->base = CAllocAligned(total, 4096, Fs->code_heap);
+	if (!v->base)
+	{
+		v->num = 0;
+		return;
+	}
+	v->desc  = v->base;
+	v->avail = v->base + avail_off;
+	v->used  = v->base + used_off;
+	v->buf   = CAlloc(VSER_BUF_SIZE * v->num);
+	v->last_used = 0;
+	OutU32(vser.port + VSER_R_QUEUE_PFN, v->base / 4096);
+
+	for (i = 0; i < v->num; i++)
+	{
+		if (device_writes)
+		{
+			VSerDescSet(v, i, v->buf + i * VSER_BUF_SIZE, VSER_BUF_SIZE,
+						VSER_DESC_WRITE);
+			VSerPublish(v, i);
+		}
+		else
+			VSerDescSet(v, i, v->buf + i * VSER_BUF_SIZE, VSER_BUF_SIZE, 0);
+	}
+}
+
+U0 VSerSend(I64 q, U8 *data, I64 len)
+{//Copies into the slot the ring is about to publish.
+	CVSerVq	*v = &vser.q[q];
+	I64		 slot;
+	U8		*dst;
+
+	if (!v->num || len < 1 || len > VSER_BUF_SIZE)
+		return;
+	slot = v->avail[1] % v->num;
+	dst  = v->buf + slot * VSER_BUF_SIZE;
+	MemCopy(dst, data, len);
+	VSerDescSet(v, slot, dst, len, 0);
+	VSerPublish(v, slot);
+	VSerNotify(q);
+}
+
+I64 VSerPortRx(I64 port)
+{
+	if (!port)
+		return 0;
+
+	return 2 * port + 2;
+}
+
+I64 VSerPortTx(I64 port)
+{
+	if (!port)
+		return 1;
+
+	return 2 * port + 3;
+}
+
+U0 VSerCtlSend(I64 id, I64 event, I64 value)
+{
+	CVSerCtl c;
+
+	c.id    = id;
+	c.event = event;
+	c.value = value;
+	VSerSend(3, &c, sizeof(CVSerCtl));
+}
+
+/***** vdagent *****/
+
+U0 VdSend(I64 type, U8 *body, I64 body_len)
+{//One VDIChunkHeader, one VDAgentMessage, then the body, split into chunks no
+//larger than VD_MAX_CHUNK.
+	CVdChunk	 ch;
+	CVdMsg		 m;
+	U8			*pkt;
+	I64			 total = sizeof(CVdMsg) + body_len, off = 0, n, q;
+
+	if (!vser.ready)
+		return;
+	q   = VSerPortTx(vser.vd_port);
+	pkt = MAlloc(sizeof(CVdChunk) + VD_MAX_CHUNK);
+	if (!pkt)
+		return;
+	m.protocol = VD_PROTOCOL;
+	m.type     = type;
+	m.opaque   = 0;
+	m.size     = body_len;
+
+	while (off < total)
+	{
+		n = total - off;
+		if (n > VD_MAX_CHUNK)
+			n = VD_MAX_CHUNK;
+		ch.port = VD_PORT_CLIENT;
+		ch.size = n;
+		MemCopy(pkt, &ch, sizeof(CVdChunk));
+		//The message header occupies the front of the first chunk only.
+		if (!off)
+		{
+			MemCopy(pkt + sizeof(CVdChunk), &m, sizeof(CVdMsg));
+			if (n > sizeof(CVdMsg))
+				MemCopy(pkt + sizeof(CVdChunk) + sizeof(CVdMsg), body,
+						n - sizeof(CVdMsg));
+		}
+		else
+			MemCopy(pkt + sizeof(CVdChunk), body + off - sizeof(CVdMsg), n);
+		VSerSend(q, pkt, sizeof(CVdChunk) + n);
+		vser.sent++;
+		off += n;
+	}
+	Free(pkt);
+}
+
+U0 VdAnnounce(Bool request)
+{//Only CLIPBOARD_BY_DEMAND. Leaving CLIPBOARD_SELECTION unannounced keeps the
+//selection field out of every clipboard message.
+//
+//request asks the peer to announce back. It is set when opening the port and
+//clear when replying, so the two sides do not bounce announces forever.
+	U32 body[2];
+
+	body[0] = ToI64(request);
+	body[1] = 1 << VD_CAP_CLIPBOARD_BY_DEMAND;
+	VdSend(VD_MSG_ANNOUNCE_CAPS, body, sizeof(U32) * 2);
+}
+
+U0 VdGrab()
+{
+	U32 t = VD_CLIPBOARD_UTF8_TEXT;
+
+	vser.grabs++;
+
+	VdSend(VD_MSG_CLIPBOARD_GRAB, &t, sizeof(U32));
+}
+
+U0 VdRequest()
+{
+	U32 t = VD_CLIPBOARD_UTF8_TEXT;
+
+	VdSend(VD_MSG_CLIPBOARD_REQUEST, &t, sizeof(U32));
+}
+
+U0 VdClipboard(U8 *text)
+{
+	U8	*body;
+	I64	 n = StrLen(text);
+
+	body = MAlloc(sizeof(U32) + n);
+	if (!body)
+		return;
+	*body(U32 *) = VD_CLIPBOARD_UTF8_TEXT;
+	MemCopy(body + sizeof(U32), text, n);
+	VdSend(VD_MSG_CLIPBOARD, body, sizeof(U32) + n);
+	Free(body);
+}
+
+U0 VdOnMessage(I64 type, U8 *body, I64 len)
+{
+	U8 *s;
+
+	vser.msg_rx++;
+	vser.last_type = type;
+	vser.last_len  = len;
+
+	if (type == VD_MSG_ANNOUNCE_CAPS)
+	{//Answering is what tells the peer the clipboard is handled here.
+	//Announcing only at port open races the host's own setup, and a message
+	//sent before it is listening is simply lost.
+		if (len >= sizeof(U32) * 2)
+			vser.peer_caps = *(body + sizeof(U32))(U32 *);
+		if (len >= sizeof(U32) && *body(U32 *))
+			VdAnnounce(FALSE);
+		if (vser.ours)
+			VdGrab;					//re-advertise whatever the guest holds
+	}
+	else if (type == VD_MSG_CLIPBOARD_GRAB)
+	{
+		vser.host_has = TRUE;
+		vser.waiting  = FALSE;
+	}
+	else if (type == VD_MSG_CLIPBOARD_REQUEST)
+	{
+		vser.reqs++;
+		if (vser.ours)
+			VdClipboard(vser.ours);
+	}
+	else if (type == VD_MSG_CLIPBOARD_RELEASE)
+		vser.host_has = FALSE;
+	else if (type == VD_MSG_CLIPBOARD && len > sizeof(U32))
+	{
+		s = MAlloc(len - sizeof(U32) + 1);
+		if (s)
+		{
+			MemCopy(s, body + sizeof(U32), len - sizeof(U32));
+			s[len - sizeof(U32)] = 0;
+			Free(vser.theirs);
+			vser.theirs = s;
+		}
+		vser.host_has = FALSE;
+		vser.waiting  = FALSE;
+	}
+}
+
+U0 VdFeed(U8 *data, I64 len)
+{//The port carries VDIChunkHeader framing, not bare messages. Feeding the
+//header into the message assembler makes chunk.port look like a protocol
+//field, which is 1 in both cases, so the mistake survives the sanity check
+//and every type is then read eight bytes early.
+	CVdMsg	*m;
+	I64		 take;
+
+	while (len > 0)
+	{
+		if (!vser.chunk_left)
+		{//still gathering the chunk header
+			take = 8 - vser.chdr_len;
+			if (take > len)
+				take = len;
+			MemCopy(vser.chdr + vser.chdr_len, data, take);
+			vser.chdr_len += take;
+			data          += take;
+			len           -= take;
+			if (vser.chdr_len >= 8)
+			{
+				vser.chunk_left = *(vser.chdr + 4)(U32 *);
+				vser.chdr_len   = 0;
+				if (vser.chunk_left < 0 || vser.chunk_left > VD_CLIP_MAX)
+					vser.chunk_left = 0;		//drop a nonsense chunk
+			}
+		}
+		else
+		{
+			if (!vser.msg)
+			{
+				vser.msg      = MAlloc(sizeof(CVdMsg) + VD_CLIP_MAX);
+				vser.msg_len  = 0;
+				vser.msg_want = sizeof(CVdMsg);
+			}
+			take = vser.msg_want - vser.msg_len;
+			if (take > len)
+				take = len;
+			if (take > vser.chunk_left)
+				take = vser.chunk_left;
+			MemCopy(vser.msg + vser.msg_len, data, take);
+			vser.msg_len    += take;
+			data            += take;
+			len             -= take;
+			vser.chunk_left -= take;
+			if (vser.msg_len >= vser.msg_want)
+			{
+				m = vser.msg;
+				if (vser.msg_want == sizeof(CVdMsg))
+				{//header complete; the declared body length extends the target
+					if (m->protocol != VD_PROTOCOL || m->size > VD_CLIP_MAX)
+					{
+						Free(vser.msg);
+						vser.msg = NULL;
+						return;
+					}
+					vser.msg_want = sizeof(CVdMsg) + m->size;
+				}
+				if (vser.msg_len >= vser.msg_want)
+				{
+					VdOnMessage(m->type, vser.msg + sizeof(CVdMsg), m->size);
+					Free(vser.msg);
+					vser.msg = NULL;
+				}
+			}
+		}
+	}
+}
+
+/***** receive pump *****/
+
+U0 VSerDrain(I64 q, Bool is_ctl)
+{
+	CVSerVq		*v = &vser.q[q];
+	CVSerCtl	*c;
+	U8			*buf, *name, *item;
+	I64			 used, len, slot;
+
+	if (!v->num)
+		return;
+	used = v->used[1];
+	while (v->last_used != used)
+	{//used ring: flags and index, then num items of {U32 id, U32 len}
+		item = v->used + 2;
+		item = item + (v->last_used % v->num) * 8;
+		slot = *item(U32 *);
+		len  = *(item + 4)(U32 *);
+		buf  = v->buf + slot * VSER_BUF_SIZE;
+		if (len > 0 && len <= VSER_BUF_SIZE && slot < v->num)
+		{
+			if (is_ctl)
+			{
+				vser.ctl_rx++;
+				c = buf;
+				if (c->event == VSER_EV_PORT_ADD)
+					VSerCtlSend(c->id, VSER_EV_PORT_READY, 1);
+				else if (c->event == VSER_EV_PORT_NAME)
+				{//the name follows the control struct, not terminated
+					vser.ctl_names++;
+					name = buf + sizeof(CVSerCtl);
+					if (len > sizeof(CVSerCtl) &&
+						!MemCompare(name, VSER_PORT_NAME,
+									StrLen(VSER_PORT_NAME)))
+					{
+						vser.vd_port = c->id;
+						vser.ready   = TRUE;
+						VSerCtlSend(c->id, VSER_EV_PORT_OPEN, 1);
+						VdAnnounce(TRUE);
+					}
+				}
+			}
+			else
+			{
+				vser.data_rx += len;
+				VdFeed(buf, len);
+			}
+		}
+		//hand the slot back
+		VSerDescSet(v, slot, v->buf + slot * VSER_BUF_SIZE, VSER_BUF_SIZE,
+					VSER_DESC_WRITE);
+		VSerPublish(v, slot);
+		v->last_used++;
+	}
+	VSerNotify(q);
+}
+
+U0 VSerTask()
+{
+	while (vser.present)
+	{
+		VSerDrain(2, TRUE);
+		if (vser.ready)
+			VSerDrain(VSerPortRx(vser.vd_port), FALSE);
+		Sleep(50);
+	}
+}
+
+/***** public *****/
+
+public Bool VSerPresent()
+{
+	return vser.ready;
+}
+
+public U0 VSerRep()
+{//Where the handshake stopped. present without ready means the control queue
+//never named a port matching VSER_PORT_NAME.
+	I64 i;
+
+	"virtio-serial: present %d  ready %d  vd_port %d  io 0x%04X\n",
+		vser.present, vser.ready, vser.vd_port, vser.port;
+	"queues:";
+	for (i = 0; i < VSER_QUEUE_MAX; i++)
+		" %d", vser.q[i].num;
+	"\n";
+	"control msgs %d (names %d)  data bytes %d  vdagent msgs %d\n",
+		vser.ctl_rx, vser.ctl_names, vser.data_rx, vser.msg_rx;
+	"grabs sent %d  requests in %d  chunks sent %d\n",
+		vser.grabs, vser.reqs, vser.sent;
+	//4 clipboard, 6 announce, 7 grab, 8 request, 9 release
+	"last host msg: type %d, %d bytes  peer caps 0x%08X\n",
+		vser.last_type, vser.last_len, vser.peer_caps;
+	if (vser.ours)
+		"published: \"%s\"\n", vser.ours;
+	if (vser.theirs)
+		"pending from host: \"%s\"\n", vser.theirs;
+}
+
+public I64 VSerPortOf()
+{//Which virtio-serial port carries vdagent; -1 before the name arrives.
+	if (!vser.ready)
+		return -1;
+
+	return vser.vd_port;
+}
+
+public U8 *VSerClipGet()
+{//What the host last published, or NULL. Caller frees. Asks once and returns
+//NULL until the reply lands, so the poller sees it on a later tick.
+	U8 *s;
+
+	if (!vser.ready)
+		return NULL;
+	if (vser.theirs)
+	{
+		s           = vser.theirs;
+		vser.theirs = NULL;
+		return s;
+	}
+	if (vser.host_has && !vser.waiting)
+	{
+		vser.waiting = TRUE;
+		VdRequest;
+	}
+
+	return NULL;
+}
+
+public Bool VSerClipSet(U8 *text)
+{//Publish the guest clipboard. The bytes only travel when the host asks.
+	if (!vser.ready || !text)
+		return FALSE;
+	Free(vser.ours);
+	vser.ours = StrNew(text);
+	VdGrab;
+
+	return TRUE;
+}
+
+public Bool VSerInit()
+{
+	CPCIDev	*dev = PCIDevFind(,, VSER_PCI_VENDOR, VSER_PCI_DEVICE);
+	I64		 feat, i;
+
+	if (!dev)
+		return FALSE;
+	vser.port = PCIReadU32(dev->bus, dev->dev, dev->fun, 0x10) & 0xFFFFFFFC;
+	if (!vser.port)
+		return FALSE;
+
+	OutU8(vser.port + VSER_R_STATUS, 0);
+	OutU8(vser.port + VSER_R_STATUS, VSER_ST_ACK |
+										 VSER_ST_DRIVER);
+	feat = InU32(vser.port + VSER_R_HOST_FEAT);
+	if (!(feat & VSER_F_MULTIPORT))
+	{//Without multiport there is no control queue and no port names, so the
+	//vdagent channel cannot be identified.
+		OutU8(vser.port + VSER_R_STATUS, VSER_ST_FAILED);
+		return FALSE;
+	}
+	OutU32(vser.port + VSER_R_GUEST_FEAT, VSER_F_MULTIPORT);
+
+	for (i = 0; i < VSER_QUEUE_MAX; i++)
+		VSerQueueInit(i, ToBool(!(i & 1)));
+
+	OutU8(vser.port + VSER_R_STATUS,
+		  InU8(vser.port + VSER_R_STATUS) | VSER_ST_DRIVER_OK);
+	vser.present = TRUE;
+	VSerCtlSend(0, VSER_EV_DEVICE_READY, 1);
+	//the device-written rings were filled before DRIVER_OK
+	for (i = 0; i < VSER_QUEUE_MAX; i += 2)
+		if (vser.q[i].num)
+			VSerNotify(i);
+	Spawn(&VSerTask, NULL, "VSerRx");
+
+	return TRUE;
+}
+
+//Presence is the gate: no 1af4 device, nothing runs. Reported so a boot with
+//the device present but the handshake stalled is distinguishable from a boot
+//without one.
+if (VSerInit)
+	"$$GREEN$$virtio-serial found; vdagent clipboard armed.$$FG$$\n";
