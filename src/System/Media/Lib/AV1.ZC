@@ -507,6 +507,33 @@ Bool Av1ObuDrop(CAv1Seq *s, CAv1Obu *o)
 #define AV1_RESTORE_WIENER			1
 #define AV1_RESTORE_SGRPROJ			2
 #define AV1_RESTORE_SWITCHABLE		3
+//RESTORE_SWITCHABLE_TYPES: a switchable unit codes one of the first three.
+#define AV1_RESTORE_TYPES_SW		3
+//5.11.58 and 7.17.2. SGRPROJ_PRJ_BITS is the precision of the projection
+//weights, SGRPROJ_RST_BITS the extra precision the box filter output carries,
+//SGRPROJ_SGR_BITS that of the blend factor a.
+#define AV1_SGRPROJ_PARAMS_BITS		4
+#define AV1_SGRPROJ_PRJ_SUBEXP_K	4
+#define AV1_SGRPROJ_PRJ_BITS		7
+#define AV1_SGRPROJ_RST_BITS		4
+#define AV1_SGRPROJ_SGR_BITS		8
+#define AV1_SGRPROJ_MTABLE_BITS		20
+#define AV1_SGRPROJ_RECIP_BITS		12
+//7.17.6. The seven Wiener taps and the radius two box filter with its one
+//sample of A and B border both reach three samples out.
+#define AV1_LR_BORDER				3
+//7.17.1: a filter stripe is 64 luma rows and sits eight rows above the
+//superblock grid.
+#define AV1_LR_STRIPE				64
+#define AV1_LR_UNIT_OFFSET			8
+//A restoration unit at the end of a row or column runs to 150 per cent of
+//LoopRestorationSize, so the widest is RESTORATION_UNITSIZE_MAX * 3 / 2.
+#define AV1_LR_UNIT_W				384
+#define AV1_LR_SRC_ROWS				70			//a stripe and its border
+#define AV1_LR_TMP					26880		//70 by 384
+#define AV1_LR_AB					25476		//66 by 386
+#define AV1_LR_FLT					24576		//64 by 384
+#define AV1_LR_COL					390			//384 plus 2 * 2 + 2
 #define AV1_ONLY_4X4				0
 #define AV1_TX_MODE_LARGEST			1
 #define AV1_TX_MODE_SELECT			2
@@ -519,6 +546,20 @@ I64 av1_seg_feature_max[AV1_SEG_LVL_MAX]   = {255, 63, 63, 63, 63, 7, 0, 0};
 //5.9.20: the coded value is not the restoration type.
 U8 av1_remap_lr_type[4] = {AV1_RESTORE_NONE, AV1_RESTORE_SWITCHABLE,
 						   AV1_RESTORE_WIENER, AV1_RESTORE_SGRPROJ};
+//Wiener_Taps_Min, Wiener_Taps_Max and Wiener_Taps_K of 5.11.58. libaom writes
+//these as WIENER_FILT_TAPn_MINV, _MAXV and _SUBEXP_K rather than as arrays,
+//so there is nothing upstream for utils/av1tables.py to extract.
+I64 av1_wiener_taps_min[3] = { -5, -23, -17};
+I64 av1_wiener_taps_max[3] = { 10,   8,  46};
+I64 av1_wiener_taps_k[3]   = {  1,   2,   3};
+//Wiener_Taps_Mid and Sgrproj_Xqd_Mid, what 5.11.2 starts each tile's
+//references at. -32 is (SGRPROJ_PRJ_MIN0 + SGRPROJ_PRJ_MAX0) / 2 truncated
+//toward zero, which is not what ZealC lowers a divide by two to.
+I64 av1_wiener_taps_mid[3] = {  3,  -7,  15};
+I64 av1_sgrproj_xqd_mid[2] = {-32,  31};
+//Sgrproj_Xqd_Min and Sgrproj_Xqd_Max, libaom's SGRPROJ_PRJ_MINn and _MAXn.
+I64 av1_sgrproj_xqd_min[2] = {-96, -32};
+I64 av1_sgrproj_xqd_max[2] = { 31,  95};
 
 class CAv1Frame
 {
@@ -568,6 +609,7 @@ class CAv1Frame
 	Bool	 uses_lr;
 	I64		 tx_mode;
 	Bool	 reduced_tx_set;
+	Bool	 apply_grain;			//5.9.30; synthesis of 7.18.3 is absent
 };
 
 I64 Av1TileLog2(I64 blkSize, I64 target)
@@ -654,7 +696,7 @@ U0 Av1TileInfo(CAv1Bits *b, CAv1Seq *s, CAv1Frame *f)
 	I64 sbCols, sbRows, sbShift, sbSize, maxTileWidthSb, maxTileAreaSb;
 	I64 minLog2TileCols, maxLog2TileCols, maxLog2TileRows, minLog2Tiles;
 	I64 minLog2TileRows, widestTileSb, maxTileHeightSb;
-	I64 i, startSb, sizeSb, maxWidth, maxHeight, tileWidthSb, tileHeightSb;
+	I64 i, startSb, sizeSb, maxWidth, maxHeight, tileWidthSb, tileHeightSb, n;
 
 	sbShift = 4;
 	if (s->use_128x128_superblock)
@@ -665,10 +707,17 @@ U0 Av1TileInfo(CAv1Bits *b, CAv1Seq *s, CAv1Frame *f)
 	maxTileWidthSb  = AV1_MAX_TILE_WIDTH >> sbSize;
 	maxTileAreaSb   = AV1_MAX_TILE_AREA >> (2 * sbSize);
 	minLog2TileCols = Av1TileLog2(maxTileWidthSb, sbCols);
-	maxLog2TileCols = Av1TileLog2(1, sbCols);
-	if (maxLog2TileCols > AV1_MAX_TILE_COLS)
-		maxLog2TileCols = AV1_MAX_TILE_COLS;
-	maxLog2TileRows = Av1TileLog2(1, sbRows);
+	//5.9.15 clamps the superblock count, not the log2 of it: a log2 clamped
+	//to 64 is no clamp at all, and the boundary loops below index arrays of
+	//AV1_MAX_TILE_COLS + 1.
+	n = sbCols;
+	if (n > AV1_MAX_TILE_COLS)
+		n = AV1_MAX_TILE_COLS;
+	maxLog2TileCols = Av1TileLog2(1, n);
+	n = sbRows;
+	if (n > AV1_MAX_TILE_ROWS)
+		n = AV1_MAX_TILE_ROWS;
+	maxLog2TileRows = Av1TileLog2(1, n);
 	minLog2Tiles    = Av1TileLog2(maxTileAreaSb, sbRows * sbCols);
 	if (minLog2Tiles < minLog2TileCols)
 		minLog2Tiles = minLog2TileCols;
@@ -687,7 +736,7 @@ U0 Av1TileInfo(CAv1Bits *b, CAv1Seq *s, CAv1Frame *f)
 					  f->tile_cols_log2;
 		i = 0;
 		startSb = 0;
-		while (startSb < sbCols)
+		while (startSb < sbCols && i < AV1_MAX_TILE_COLS)
 		{
 			f->mi_col_starts[i] = startSb << sbShift;
 			i++;
@@ -710,7 +759,7 @@ U0 Av1TileInfo(CAv1Bits *b, CAv1Seq *s, CAv1Frame *f)
 					   f->tile_rows_log2;
 		i = 0;
 		startSb = 0;
-		while (startSb < sbRows)
+		while (startSb < sbRows && i < AV1_MAX_TILE_ROWS)
 		{
 			f->mi_row_starts[i] = startSb << sbShift;
 			i++;
@@ -901,23 +950,26 @@ U0 Av1DeltaLfParams(CAv1Bits *b, CAv1Frame *f)
 }
 
 U0 Av1LoopFilterParams(CAv1Bits *b, CAv1Seq *s, CAv1Frame *f)
-{//5.9.11.
+{//5.9.11. The deltas are what setup_past_independence leaves, since every
+//frame this decoder accepts carries primary_ref_frame PRIMARY_REF_NONE.
+//Index order is INTRA, LAST, LAST2, LAST3, GOLDEN, BWDREF, ALTREF2, ALTREF.
 	I64 i;
 
+	f->loop_filter_delta_enabled  = TRUE;
+	f->loop_filter_ref_deltas[0]  = 1;
+	f->loop_filter_ref_deltas[1]  = 0;
+	f->loop_filter_ref_deltas[2]  = 0;
+	f->loop_filter_ref_deltas[3]  = 0;
+	f->loop_filter_ref_deltas[4]  = -1;
+	f->loop_filter_ref_deltas[5]  = 0;
+	f->loop_filter_ref_deltas[6]  = -1;
+	f->loop_filter_ref_deltas[7]  = -1;
+	f->loop_filter_mode_deltas[0] = 0;
+	f->loop_filter_mode_deltas[1] = 0;
 	if (f->coded_lossless || f->allow_intrabc)
 	{
 		f->loop_filter_level[0] = 0;
 		f->loop_filter_level[1] = 0;
-		f->loop_filter_ref_deltas[0] = 1;
-		f->loop_filter_ref_deltas[1] = 0;
-		f->loop_filter_ref_deltas[2] = 0;
-		f->loop_filter_ref_deltas[3] = 0;
-		f->loop_filter_ref_deltas[4] = -1;
-		f->loop_filter_ref_deltas[5] = 0;
-		f->loop_filter_ref_deltas[6] = -1;
-		f->loop_filter_ref_deltas[7] = -1;
-		f->loop_filter_mode_deltas[0] = 0;
-		f->loop_filter_mode_deltas[1] = 0;
 
 		return;
 	}
@@ -1035,20 +1087,25 @@ U0 Av1ReadTxMode(CAv1Bits *b, CAv1Frame *f)
 		f->tx_mode = AV1_TX_MODE_SELECT;
 }
 
-I64 Av1GetQIndex(CAv1Frame *f, I64 segmentId)
-{//7.12.2 with ignoreDeltaQ set: segment feature 0 is SEG_LVL_ALT_Q.
-	I64 data, qindex;
+I64 Av1SegQIndex(CAv1Frame *f, I64 segmentId, I64 base)
+{//7.12.2 get_qindex over an explicit base, which is CurrentQIndex when
+//delta_q_present. Segment feature 0 is SEG_LVL_ALT_Q.
+	I64 data;
 
 	if (f->segmentation_enabled &&
 		f->feature_enabled[segmentId * AV1_SEG_LVL_MAX])
 	{
-		data   = f->feature_data[segmentId * AV1_SEG_LVL_MAX];
-		qindex = f->base_q_idx + data;
+		data = f->feature_data[segmentId * AV1_SEG_LVL_MAX];
 
-		return Av1Clip3(0, 255, qindex);
+		return Av1Clip3(0, 255, base + data);
 	}
 
-	return f->base_q_idx;
+	return base;
+}
+
+I64 Av1GetQIndex(CAv1Frame *f, I64 segmentId)
+{//7.12.2 with ignoreDeltaQ set.
+	return Av1SegQIndex(f, segmentId, f->base_q_idx);
 }
 
 U0 Av1LosslessArray(CAv1Frame *f)
@@ -1081,6 +1138,7 @@ U0 Av1FilmGrainParams(CAv1Bits *b, CAv1Seq *s, CAv1Frame *f)
 		return;
 	if (!Av1F(b, 1))					//apply_grain
 		return;
+	f->apply_grain = TRUE;
 	Av1F(b, 16);						//grain_seed
 	//update_grain is only coded on an inter frame; an intra frame always
 	//carries its own parameters.
@@ -1152,6 +1210,12 @@ I64 Av1UncompressedHeader(CAv1Bits *b, CAv1Seq *s, CAv1Frame *f)
 	I64		i, id_len = 0, all_frames = (1 << AV1_NUM_REF_FRAMES) - 1;
 	Bool	buffer_removal_time_present;
 
+	//Stands in for setup_past_independence, 7.20: every frame this decoder
+	//accepts has primary_ref_frame PRIMARY_REF_NONE, so the whole header is
+	//rebuilt from defaults. CAv1Frame is reused across frames, and the
+	//last_active_seg_id derivation at the end of Av1SegmentationParams reads
+	//feature_enabled without gating on segmentation_enabled, so this wipe is
+	//load bearing rather than tidiness.
 	MemSet(f, 0, sizeof(CAv1Frame));
 	if (s->frame_id_numbers_present)
 		id_len = s->additional_frame_id_length + s->delta_frame_id_length;
@@ -1560,4 +1624,5160 @@ U0 Av1CdfReset(CAv1Cdf *f)
 U0 Av1CdfCopy(CAv1Cdf *dst, CAv1Cdf *src)
 {
 	MemCopy(dst->c, src->c, AV1_CDF_TOTAL * sizeof(U16));
+}
+
+/***** tile decoder, 5.11.2 through 5.11.5 *****/
+
+#define AV1_BLOCK_4X4				0
+#define AV1_BLOCK_8X8				3
+#define AV1_BLOCK_64X64				12
+#define AV1_BLOCK_128X128			15
+#define AV1_BLOCK_INVALID			255
+#define AV1_PARTITION_NONE			0
+#define AV1_PARTITION_HORZ			1
+#define AV1_PARTITION_VERT			2
+#define AV1_PARTITION_SPLIT			3
+#define AV1_PARTITION_HORZ_A		4
+#define AV1_PARTITION_HORZ_B		5
+#define AV1_PARTITION_VERT_A		6
+#define AV1_PARTITION_VERT_B		7
+#define AV1_PARTITION_HORZ_4		8
+#define AV1_PARTITION_VERT_4		9
+#define AV1_PARTITION_TYPES			4
+#define AV1_EXT_PARTITION_TYPES		10
+#define AV1_PARTITION_PLOFFSET		4
+#define AV1_INTRA_FRAME				0
+#define AV1_REF_NONE				-1
+#define AV1_FRAME_LF_COUNT			4
+//(32 + TX_PAD_HOR) * (32 + TX_PAD_VER) + TX_PAD_END, the level buffer of
+//5.11.39; 32x32 is the largest transform that codes coefficients.
+#define AV1_TX_PAD_2D				1312
+#define AV1_MAX_TX_2D				1024
+//Residual, 7.13.3, runs to the full 64x64 the transform reaches.
+#define AV1_MAX_RESIDUAL			4096
+//BlockDecoded, 5.11.3. Indices run -1 to sbSize4 inclusive in both axes, so a
+//128x128 superblock needs 34 either way; Av1BdAt adds the border.
+#define AV1_BD_STRIDE				34
+#define AV1_BD_PLANE				1156
+#define AV1_BD_TOTAL				3468
+//NUM_INTRA_NEIGHBOUR_PIXELS, and the offset AboveRow and LeftCol sit at
+//inside it: AboveRow[-1] is the corner and 7.11.2.11 writes AboveRow[-2].
+#define AV1_INTRA_BUF				160
+#define AV1_INTRA_PAD				16
+//7.11.2.3 works in a buffer one row and one column larger than the block,
+//capped at 32x32.
+#define AV1_FI_STRIDE				33
+#define AV1_FI_TOTAL				1089
+#define AV1_CFL_MAX					1024		//32x32, the largest CfL block
+
+class CAv1Dec
+{
+	CAv1Seq		*seq;
+	CAv1Frame	*frame;
+	CAv1Frame	 hdr;				//what Av1DecodeFrameObu parses into
+	CAv1Tile	*tiles;
+	I64			 tiles_max;
+	CAv1Cdf		 cdf;				//tile context, adapted in place
+	CAv1Cdf		 frame_cdf;			//what a tile starts from, 8.2.2
+	CAv1Cdf		 saved_cdf;			//the context_update_tile_id copy, 8.2.4
+	CAv1Msac	 msac;
+	U8			*plane[3];
+	I64			 stride[3], plane_h[3];
+	I64			 num_planes, ss_x, ss_y;
+	//Per 4x4 over the frame, mi_stride wide and mi_alloc_rows tall. Both round
+	//up to a superblock: a block may run past the frame edge and 5.11.5 writes
+	//its whole extent.
+	I64			 mi_stride, mi_alloc_rows;
+	U8			*mi_sizes, *y_modes, *uv_modes, *tx_sizes;
+	U8			*segment_ids, *skips;
+	I8			*ref_frames;		//two per 4x4: RefFrame[0] then RefFrame[1]
+	//5.11.2 contexts. Above is indexed by column and left by row, both in the
+	//plane's own 4x4 units.
+	U8			*above_level[3], *above_dc[3];
+	U8			*left_level[3], *left_dc[3];
+	U8			*above_seg_pred, *left_seg_pred;
+	//Transform dimension in pixels of the last block to cover the column or
+	//row, 5.11.15.
+	U8			*above_txfm, *left_txfm;
+	//LoopfilterTxSizes, 5.11.35, one per 4x4 of the plane at mi_stride.
+	U8			*lf_tx_sizes[3];
+	//DeltaLFs, 5.11.5: FRAME_LF_COUNT entries per 4x4 at mi_stride.
+	I8			*delta_lfs;
+	I64			 mi_row_start, mi_row_end, mi_col_start, mi_col_end;
+	I64			 sb_size, sb_size4;
+	I64			 cur_q_index;
+	I64			 delta_lf[AV1_FRAME_LF_COUNT];
+	//7.14.4 thresholds indexed by filter level, rebuilt per frame from
+	//loop_filter_sharpness. MAX_LOOP_FILTER is 63.
+	U8			 lf_lim[64], lf_blim[64], lf_thr[64];
+	Bool		 read_deltas;
+	//cdef_idx of 5.11.56, one per 64x64 unit over a grid cdef_cols wide.
+	//-1 where no block in the unit coded a strength, which 7.15 leaves alone.
+	I8			*cdef_idx;
+	I64			 cdef_cols;
+	//The deblocked frame 7.15 reads. Separate from plane[] because a unit
+	//samples its neighbours before they are filtered. U16 with a two sample
+	//border of CDEF_VERY_LARGE, so a tap outside the frame needs no test.
+	U16			*cdef_src[3];
+	I64			 cdef_src_stride[3];
+	//Per 8x8 of one 64x64 unit: the direction and variance of 7.15.2, and
+	//whether the block is filtered at all.
+	I64			 cdef_dir[64], cdef_var[64];
+	U8			 cdef_mark[64];
+	//5.11.58 per restoration unit, one grid per plane, lr_cols wide.
+	//lr_wiener holds two passes of three coefficients, lr_sgr_xqd two weights.
+	U8			*lr_type_u[3], *lr_sgr_set[3];
+	I8			*lr_wiener[3], *lr_sgr_xqd[3];
+	I64			 lr_cols[3], lr_rows[3];
+	//RefLrWiener and RefSgrXqd, 5.11.2: per plane and pass, reset per tile.
+	I64			 lr_ref_wiener[18], lr_ref_xqd[6];
+	//UpscaledCurrFrame of 7.17.6, the deblocked frame taken before CDEF
+	//overwrites it.
+	U8			*lr_pre[3];
+	//get_source_sample over one stripe of one plane, gathered once and read by
+	//every unit that crosses it, with AV1_LR_BORDER samples of edge
+	//replication either side.
+	U8			*lr_src;
+	I64			 lr_src_stride;
+	I32			*lr_tmp;			//Wiener intermediate, 7.17.4
+	I32			*lr_a, *lr_b;		//A and B of 7.17.3, stride unit width + 2
+	I32			*lr_flt0, *lr_flt1;
+	I64			*lr_colv, *lr_colq;	//box filter column sums and their squares
+	//Mode info of the block being decoded, what 5.11.34 residual reads back.
+	I64			 blk_row, blk_col, blk_size, blk_seg_id, blk_skip;
+	I64			 blk_tx_size, blk_y_mode, blk_uv_mode, blk_intra_dir;
+	//Angle deltas already multiplied by nothing: 7.11.2.6 scales by ANGLE_STEP.
+	I64			 blk_angle_y, blk_angle_uv;
+	I64			 blk_filter_mode;	//7.11.2.3 mode, or -1 for no filter intra
+	I64			 blk_cfl_alpha_u, blk_cfl_alpha_v;
+	Bool		 blk_has_chroma;
+	Bool		 blk_avail_u, blk_avail_l;
+	Bool		 blk_avail_u_chroma, blk_avail_l_chroma;
+	//Extent of the luma reconstruction 7.11.5 may sample, in luma pixels.
+	I64			 max_luma_w, max_luma_h;
+	U8			 block_decoded[AV1_BD_TOTAL];
+	U8			 above_data[AV1_INTRA_BUF], left_data[AV1_INTRA_BUF];
+	U8			 fi_buf[AV1_FI_TOTAL];
+	I32			 cfl_luma[AV1_CFL_MAX];
+	//One transform block. levels is column major with TX_PAD_HOR spare rows
+	//per column, 5.11.39; coeffs is column major at the adjusted transform
+	//height and holds dequantised values, 7.12.3.
+	U8			*levels;
+	I32			*coeffs;
+	I32			*residual;			//7.13.3 output, row major w by h
+	I64			 eob;
+	I64			 plane_tx_type;		//PlaneTxType of the last transform block
+	I64			 blocks, err;
+};
+
+U0 Av1LrFree(CAv1Dec *d)
+{
+	I64 p;
+
+	for (p = 0; p < 3; p++)
+	{
+		Free(d->lr_type_u[p]);
+		Free(d->lr_wiener[p]);
+		Free(d->lr_sgr_set[p]);
+		Free(d->lr_sgr_xqd[p]);
+		Free(d->lr_pre[p]);
+		d->lr_type_u[p]  = NULL;
+		d->lr_wiener[p]  = NULL;
+		d->lr_sgr_set[p] = NULL;
+		d->lr_sgr_xqd[p] = NULL;
+		d->lr_pre[p]     = NULL;
+		d->lr_cols[p]    = 0;
+		d->lr_rows[p]    = 0;
+	}
+	Free(d->lr_src);
+	Free(d->lr_tmp);
+	Free(d->lr_a);
+	Free(d->lr_b);
+	Free(d->lr_flt0);
+	Free(d->lr_flt1);
+	Free(d->lr_colv);
+	Free(d->lr_colq);
+	d->lr_src    = NULL;
+	d->lr_tmp    = NULL;
+	d->lr_a      = NULL;
+	d->lr_b      = NULL;
+	d->lr_flt0   = NULL;
+	d->lr_flt1   = NULL;
+	d->lr_colv   = NULL;
+	d->lr_colq   = NULL;
+}
+
+U0 Av1DecFree(CAv1Dec *d)
+{
+	I64 p;
+
+	Av1LrFree(d);
+	for (p = 0; p < 3; p++)
+	{
+		Free(d->plane[p]);
+		Free(d->above_level[p]);
+		Free(d->above_dc[p]);
+		Free(d->left_level[p]);
+		Free(d->left_dc[p]);
+		Free(d->lf_tx_sizes[p]);
+		Free(d->cdef_src[p]);
+		d->plane[p]        = NULL;
+		d->above_level[p]  = NULL;
+		d->above_dc[p]     = NULL;
+		d->left_level[p]   = NULL;
+		d->left_dc[p]      = NULL;
+		d->lf_tx_sizes[p]  = NULL;
+		d->cdef_src[p]     = NULL;
+	}
+	Free(d->mi_sizes);
+	Free(d->y_modes);
+	Free(d->uv_modes);
+	Free(d->tx_sizes);
+	Free(d->segment_ids);
+	Free(d->skips);
+	Free(d->ref_frames);
+	Free(d->delta_lfs);
+	Free(d->above_seg_pred);
+	Free(d->left_seg_pred);
+	Free(d->above_txfm);
+	Free(d->left_txfm);
+	Free(d->cdef_idx);
+	d->above_txfm     = NULL;
+	d->left_txfm      = NULL;
+	d->cdef_idx       = NULL;
+	d->mi_sizes       = NULL;
+	d->y_modes        = NULL;
+	d->uv_modes       = NULL;
+	d->tx_sizes       = NULL;
+	d->segment_ids    = NULL;
+	d->skips          = NULL;
+	d->ref_frames     = NULL;
+	d->delta_lfs      = NULL;
+	d->above_seg_pred = NULL;
+	d->left_seg_pred  = NULL;
+	d->mi_stride      = 0;
+	d->mi_alloc_rows  = 0;
+	d->num_planes     = 0;
+}
+
+public U0 Av1DecClose(CAv1Dec *d)
+{
+	if (!d)
+		return;
+	Av1DecFree(d);
+	Av1CdfClose(&d->cdf);
+	Av1CdfClose(&d->frame_cdf);
+	Av1CdfClose(&d->saved_cdf);
+	Free(d->levels);
+	Free(d->coeffs);
+	Free(d->residual);
+	Free(d->tiles);
+	Free(d);
+}
+
+public CAv1Dec *Av1DecOpen(CAv1Seq *s)
+{
+	CAv1Dec *d = CAlloc(sizeof(CAv1Dec));
+
+	if (!d)
+		return NULL;
+	d->seq      = s;
+	d->levels   = CAlloc(AV1_TX_PAD_2D);
+	d->coeffs   = CAlloc(AV1_MAX_TX_2D * sizeof(I32));
+	d->residual = CAlloc(AV1_MAX_RESIDUAL * sizeof(I32));
+	if (!d->levels || !d->coeffs || !d->residual)
+	{
+		Av1DecClose(d);
+
+		return NULL;
+	}
+	if (!Av1CdfOpen(&d->cdf) || !Av1CdfOpen(&d->frame_cdf) ||
+		!Av1CdfOpen(&d->saved_cdf))
+	{
+		Av1DecClose(d);
+
+		return NULL;
+	}
+	Av1CdfReset(&d->frame_cdf);
+
+	return d;
+}
+
+I64 Av1LrCountUnits(I64 unitSize, I64 planeSize)
+{//count_units_in_frame, 5.11.57: rounded to nearest rather than up, because a
+//unit at the end of a row or column stretches instead of a partial one being
+//coded. A plane smaller than half a unit still holds one.
+	I64 n = (planeSize + (unitSize >> 1)) / unitSize;
+
+	if (n < 1)
+		return 1;
+
+	return n;
+}
+
+I64 Av1LrPlaneW(CAv1Frame *f, I64 subx)
+{//Round2(UpscaledWidth, subX). Restoration works over the visible frame, not
+//the 4x4 grid the reconstruction fills out to.
+	return (f->upscaled_width + subx) >> subx;
+}
+
+I64 Av1LrPlaneH(CAv1Frame *f, I64 suby)
+{//Round2(FrameHeight, subY).
+	return (f->frame_height + suby) >> suby;
+}
+
+Bool Av1LrAlloc(CAv1Dec *d, CAv1Frame *f)
+{//The per unit syntax of 5.11.58 and the scratch 7.17 filters through. A
+//frame that selects no restoration takes none of it.
+	I64 p, subx, suby, cols, rows, n;
+
+	if (!f->uses_lr)
+		return TRUE;
+	for (p = 0; p < d->num_planes; p++)
+	{
+		subx = 0;
+		suby = 0;
+		if (p)
+		{
+			subx = d->ss_x;
+			suby = d->ss_y;
+		}
+		cols = Av1LrCountUnits(f->loop_restoration_size[p],
+							   Av1LrPlaneW(f, subx));
+		rows = Av1LrCountUnits(f->loop_restoration_size[p],
+							   Av1LrPlaneH(f, suby));
+		if (d->lr_type_u[p] && d->lr_cols[p] == cols && d->lr_rows[p] == rows)
+			goto next_plane;
+		Free(d->lr_type_u[p]);
+		Free(d->lr_wiener[p]);
+		Free(d->lr_sgr_set[p]);
+		Free(d->lr_sgr_xqd[p]);
+		n                = cols * rows;
+		d->lr_cols[p]    = cols;
+		d->lr_rows[p]    = rows;
+		d->lr_type_u[p]  = CAlloc(n);
+		d->lr_wiener[p]  = CAlloc(n * 6);
+		d->lr_sgr_set[p] = CAlloc(n);
+		d->lr_sgr_xqd[p] = CAlloc(n * 2);
+		if (!d->lr_type_u[p] || !d->lr_wiener[p] || !d->lr_sgr_set[p] ||
+			!d->lr_sgr_xqd[p])
+			goto fail;
+next_plane:;
+		if (d->lr_pre[p])
+			goto next_pre;
+		d->lr_pre[p] = CAlloc(d->stride[p] * d->plane_h[p]);
+		if (!d->lr_pre[p])
+			goto fail;
+next_pre:;
+	}
+	if (d->lr_src)
+		return TRUE;
+	d->lr_src_stride = d->mi_stride * 4 + 2 * AV1_LR_BORDER;
+	d->lr_src   = CAlloc(d->lr_src_stride * AV1_LR_SRC_ROWS);
+	d->lr_tmp   = CAlloc(AV1_LR_TMP * sizeof(I32));
+	d->lr_a     = CAlloc(AV1_LR_AB * sizeof(I32));
+	d->lr_b     = CAlloc(AV1_LR_AB * sizeof(I32));
+	d->lr_flt0  = CAlloc(AV1_LR_FLT * sizeof(I32));
+	d->lr_flt1  = CAlloc(AV1_LR_FLT * sizeof(I32));
+	d->lr_colv  = CAlloc(AV1_LR_COL * sizeof(I64));
+	d->lr_colq  = CAlloc(AV1_LR_COL * sizeof(I64));
+	if (!d->lr_src || !d->lr_tmp || !d->lr_a || !d->lr_b || !d->lr_flt0 ||
+		!d->lr_flt1 || !d->lr_colv || !d->lr_colq)
+		goto fail;
+
+	return TRUE;
+fail:
+	//A partial allocation must not pass either reuse test above.
+	Av1LrFree(d);
+
+	return FALSE;
+}
+
+Bool Av1DecSize(CAv1Dec *d, CAv1Seq *s, CAv1Frame *f)
+{
+	I64 sb4 = 16, cols, rows, n, p, w, h, subx, suby;
+
+	if (s->bit_depth != 8)
+		return FALSE;					//samples are stored eight bits wide
+	d->sb_size = AV1_BLOCK_64X64;
+	if (s->use_128x128_superblock)
+	{
+		sb4        = 32;
+		d->sb_size = AV1_BLOCK_128X128;
+	}
+	cols = (f->mi_cols + sb4 - 1) & ~(sb4 - 1);
+	rows = (f->mi_rows + sb4 - 1) & ~(sb4 - 1);
+	d->seq      = s;
+	d->frame    = f;
+	d->sb_size4 = sb4;
+	//Every plane stride and allocation derives from the subsampling too, so a
+	//second sequence with the same block grid and plane count but a different
+	//chroma format must not reuse these buffers.
+	if (d->mi_sizes && d->mi_stride == cols && d->mi_alloc_rows == rows &&
+		d->num_planes == s->num_planes && d->ss_x == s->subsampling_x &&
+		d->ss_y == s->subsampling_y)
+		return Av1LrAlloc(d, f);
+	Av1DecFree(d);
+	d->mi_stride     = cols;
+	d->mi_alloc_rows = rows;
+	d->num_planes    = s->num_planes;
+	d->ss_x          = s->subsampling_x;
+	d->ss_y          = s->subsampling_y;
+	n = cols * rows;
+	d->mi_sizes       = CAlloc(n);
+	d->y_modes        = CAlloc(n);
+	d->uv_modes       = CAlloc(n);
+	d->tx_sizes       = CAlloc(n);
+	d->segment_ids    = CAlloc(n);
+	d->skips          = CAlloc(n);
+	d->ref_frames     = CAlloc(n * 2);
+	d->delta_lfs      = CAlloc(n * AV1_FRAME_LF_COUNT);
+	d->above_seg_pred = CAlloc(cols);
+	d->left_seg_pred  = CAlloc(rows);
+	d->above_txfm     = CAlloc(cols);
+	d->left_txfm      = CAlloc(rows);
+	//The cdef grid divides exactly: cols and rows are already rounded up to a
+	//superblock, which is 64 or 128 wide.
+	d->cdef_cols      = cols >> 4;
+	d->cdef_idx       = CAlloc(d->cdef_cols * (rows >> 4));
+	for (p = 0; p < s->num_planes; p++)
+	{
+		subx = 0;
+		suby = 0;
+		if (p > 0)
+		{
+			subx = s->subsampling_x;
+			suby = s->subsampling_y;
+		}
+		w = (cols * 4) >> subx;
+		h = (rows * 4) >> suby;
+		d->stride[p]       = w;
+		d->plane_h[p]      = h;
+		d->plane[p]        = CAlloc(w * h);
+		d->above_level[p]  = CAlloc(cols);
+		d->above_dc[p]     = CAlloc(cols);
+		d->left_level[p]   = CAlloc(rows);
+		d->left_dc[p]      = CAlloc(rows);
+		d->lf_tx_sizes[p]  = CAlloc(cols * rows);
+		if (!d->plane[p] || !d->above_level[p] || !d->above_dc[p] ||
+			!d->left_level[p] || !d->left_dc[p] || !d->lf_tx_sizes[p])
+			goto fail;
+	}
+	if (!d->mi_sizes || !d->y_modes || !d->uv_modes || !d->tx_sizes ||
+		!d->segment_ids || !d->skips || !d->ref_frames || !d->delta_lfs ||
+		!d->above_seg_pred || !d->left_seg_pred || !d->above_txfm ||
+		!d->left_txfm || !d->cdef_idx)
+		goto fail;
+
+	return Av1LrAlloc(d, f);
+fail:
+	//A partial allocation must not pass the reuse test above, or the next
+	//call returns TRUE and hands out NULL planes.
+	Av1DecFree(d);
+	d->mi_stride     = 0;
+	d->mi_alloc_rows = 0;
+	d->num_planes    = 0;
+	d->ss_x          = -1;
+	d->ss_y          = -1;
+
+	return FALSE;
+}
+
+U0 Av1ClearAboveContext(CAv1Dec *d)
+{//5.11.2. 6.10.2 clears the whole frame width; libaom clears only the tile's
+//columns.
+	I64 p;
+
+	for (p = 0; p < d->num_planes; p++)
+	{
+		MemSet(d->above_level[p], 0, d->mi_stride);
+		MemSet(d->above_dc[p], 0, d->mi_stride);
+	}
+	MemSet(d->above_seg_pred, 0, d->mi_stride);
+	//tx_size_wide[TX_64X64], the value av1_zero_above_context writes.
+	MemSet(d->above_txfm, 64, d->mi_stride);
+}
+
+U0 Av1ClearLeftContext(CAv1Dec *d)
+{//5.11.2. Indexed by absolute mi row, so the whole frame height is cleared.
+	I64 p;
+
+	for (p = 0; p < d->num_planes; p++)
+	{
+		MemSet(d->left_level[p], 0, d->mi_alloc_rows);
+		MemSet(d->left_dc[p], 0, d->mi_alloc_rows);
+	}
+	MemSet(d->left_seg_pred, 0, d->mi_alloc_rows);
+	MemSet(d->left_txfm, 64, d->mi_alloc_rows);
+}
+
+Bool Av1IsInside(CAv1Dec *d, I64 r, I64 c)
+{//5.11.1 is_inside: tile relative, not frame relative.
+	return ToBool(c >= d->mi_col_start && c < d->mi_col_end &&
+				  r >= d->mi_row_start && r < d->mi_row_end);
+}
+
+I64 Av1CdfProb(U16 *icdf, I64 i)
+{//cdf_element_prob. icdf holds 32768 - cdf, so a symbol's probability is the
+//fall from the previous entry.
+	if (!i)
+		return AV1_CDF_PROB_TOP - icdf[0];
+
+	return icdf[i - 1] - icdf[i];
+}
+
+I64 Av1PartitionCdfRow(CAv1Dec *d, I64 r, I64 c, I64 bSize)
+{//9.3. The row is picked by bsl = Mi_Width_Log2[bSize] and by whether the
+//above and left neighbours are narrower than this block.
+	I64 bsl = av1_mi_size_wide_log2[bSize], above = 0, left = 0, nb;
+
+	if (Av1IsInside(d, r - 1, c))
+	{
+		nb    = d->mi_sizes[(r - 1) * d->mi_stride + c];
+		above = ToI64(av1_mi_size_wide_log2[nb] < bsl);
+	}
+	if (Av1IsInside(d, r, c - 1))
+	{
+		nb   = d->mi_sizes[r * d->mi_stride + c - 1];
+		left = ToI64(av1_mi_size_high_log2[nb] < bsl);
+	}
+
+	return (bsl - 1) * AV1_PARTITION_PLOFFSET + left * 2 + above;
+}
+
+I64 Av1ReadPartition(CAv1Dec *d, I64 r, I64 c, I64 bSize, Bool hasRows,
+					 Bool hasCols)
+{//5.11.4 partition, split_or_horz and split_or_vert, as libaom's
+//read_partition. A 128x128 block cannot take the 4:1 splits, so it reads two
+//symbols fewer.
+	U16	*pcdf, cdf2[3];
+	I64	 row, nsyms, psum;
+
+	if (!hasRows && !hasCols)
+		return AV1_PARTITION_SPLIT;
+	row  = Av1PartitionCdfRow(d, r, c, bSize);
+	pcdf = d->cdf.c + AV1_CDF_PARTITION_CDF_O +
+		   row * AV1_CDF_PARTITION_CDF_S0;
+	if (hasRows && hasCols)
+	{
+		nsyms = AV1_EXT_PARTITION_TYPES;
+		if (bSize <= AV1_BLOCK_8X8)
+			nsyms = AV1_PARTITION_TYPES;
+		else if (bSize == AV1_BLOCK_128X128)
+			nsyms = AV1_EXT_PARTITION_TYPES - 2;
+
+		return Av1ReadSymbol(&d->msac, pcdf, nsyms);
+	}
+	//9.3 builds a two symbol cdf by summing the partitions that cut the edge
+	//the block still has room for. cdf2[2] is the adaptation counter; the
+	//array is local and discarded.
+	psum = Av1CdfProb(pcdf, AV1_PARTITION_SPLIT) +
+		   Av1CdfProb(pcdf, AV1_PARTITION_HORZ_A) +
+		   Av1CdfProb(pcdf, AV1_PARTITION_VERT_A);
+	if (hasCols)
+	{
+		psum += Av1CdfProb(pcdf, AV1_PARTITION_VERT) +
+				Av1CdfProb(pcdf, AV1_PARTITION_VERT_B);
+		if (bSize != AV1_BLOCK_128X128)
+			psum += Av1CdfProb(pcdf, AV1_PARTITION_VERT_4);
+	}
+	else
+	{
+		psum += Av1CdfProb(pcdf, AV1_PARTITION_HORZ) +
+				Av1CdfProb(pcdf, AV1_PARTITION_HORZ_B);
+		if (bSize != AV1_BLOCK_128X128)
+			psum += Av1CdfProb(pcdf, AV1_PARTITION_HORZ_4);
+	}
+	cdf2[0] = psum;
+	cdf2[1] = 0;
+	cdf2[2] = 0;
+	if (Av1ReadSymbol(&d->msac, cdf2, 2))
+		return AV1_PARTITION_SPLIT;
+	if (hasCols)
+		return AV1_PARTITION_HORZ;
+
+	return AV1_PARTITION_VERT;
+}
+
+/***** intra frame mode info, 5.11.5 through 5.11.28 *****/
+
+#define AV1_DC_PRED					0
+#define AV1_V_PRED					1
+#define AV1_D67_PRED				8
+#define AV1_UV_DC_PRED				0
+#define AV1_UV_CFL_PRED				13
+#define AV1_UV_INTRA_MODES			14
+#define AV1_MAX_ANGLE_DELTA			3
+#define AV1_TX_4X4					0
+#define AV1_MAX_TX_DEPTH			2
+#define AV1_SEG_LVL_SKIP			6
+#define AV1_DELTA_SMALL				3
+#define AV1_MAX_LOOP_FILTER			63
+#define AV1_MAXQ					255
+#define AV1_CFL_SIGNS				3
+#define AV1_CFL_ALPHABET_SIZE		16
+#define AV1_CDEF_UNIT4				16			//64x64 in 4x4 units
+#define AV1_MAX_PALETTE_BLOCK		64
+#define AV1_MAX_FILTER_INTRA_BLOCK	32
+//Refusals raised by the block layer; the frame header owns -1 through -6.
+#define AV1_ERR_PALETTE				-20
+#define AV1_ERR_INTRABC				-21
+#define AV1_ERR_SEGMENT				-22
+
+I64 Av1TxSizeCat(I64 bSize)
+{//bsize_to_tx_size_cat, run as the loop blockd.h documents its table with.
+	I64 tx = av1_max_txsize_rect_lookup[bSize], depth = 0;
+
+	while (tx != AV1_TX_4X4)
+	{
+		depth++;
+		tx = av1_sub_tx_size_map[tx];
+	}
+
+	return depth - 1;
+}
+
+I64 Av1MaxTxDepth(I64 bSize)
+{//bsize_to_max_depth, same generator capped at MAX_TX_DEPTH.
+	I64 tx = av1_max_txsize_rect_lookup[bSize], depth = 0;
+
+	while (depth < AV1_MAX_TX_DEPTH && tx != AV1_TX_4X4)
+	{
+		depth++;
+		tx = av1_sub_tx_size_map[tx];
+	}
+
+	return depth;
+}
+
+I64 Av1DepthToTxSize(I64 depth, I64 bSize)
+{//depth_to_tx_size.
+	I64 tx = av1_max_txsize_rect_lookup[bSize], i;
+
+	for (i = 0; i < depth; i++)
+		tx = av1_sub_tx_size_map[tx];
+
+	return tx;
+}
+
+I64 Av1TxSizeFromTxMode(I64 bSize, I64 txMode)
+{//tx_size_from_tx_mode.
+	I64 largest = av1_tx_mode_to_biggest_tx_size[txMode];
+	I64 rect    = av1_max_txsize_rect_lookup[bSize];
+
+	if (bSize == AV1_BLOCK_4X4)
+	{
+		if (av1_max_txsize_lookup[bSize] < largest)
+			return av1_max_txsize_lookup[bSize];
+
+		return largest;
+	}
+	if (av1_txsize_sqr_map[rect] <= largest)
+		return rect;
+
+	return largest;
+}
+
+Bool Av1SegFeatureActive(CAv1Frame *f, I64 segId, I64 feature)
+{//segfeature_active.
+	return ToBool(f->segmentation_enabled &&
+				  f->feature_enabled[segId * AV1_SEG_LVL_MAX + feature]);
+}
+
+I64 Av1NegDeinterleave(I64 diff, I64 ref, I64 max)
+{//av1_neg_deinterleave.
+	if (!ref)
+		return diff;
+	if (ref >= max - 1)
+		return max - diff - 1;
+	if (2 * ref < max)
+	{
+		if (diff > 2 * ref)
+			return diff;
+	}
+	else if (diff > 2 * (max - ref - 1))
+		return max - (diff + 1);
+	if (diff & 1)
+		return ref + ((diff + 1) >> 1);
+
+	return ref - (diff >> 1);
+}
+
+I64 Av1SpatialSegPred(CAv1Dec *d, I64 r, I64 c, I64 *_cdfNum)
+{//av1_get_spatial_seg_pred with skip_over4x4 zero. 255 stands for the
+//UINT8_MAX libaom uses for an unavailable neighbour; the map itself never
+//holds more than MAX_SEGMENTS - 1.
+	I64		up = 255, left = 255, ul = 255;
+	Bool	availU = Av1IsInside(d, r - 1, c);
+	Bool	availL = Av1IsInside(d, r, c - 1);
+
+	if (availU && availL)
+		ul = d->segment_ids[(r - 1) * d->mi_stride + c - 1];
+	if (availU)
+		up = d->segment_ids[(r - 1) * d->mi_stride + c];
+	if (availL)
+		left = d->segment_ids[r * d->mi_stride + c - 1];
+	*_cdfNum = 0;
+	if (ul != 255)
+	{
+		if (ul == up && ul == left)
+			*_cdfNum = 2;
+		else if (ul == up || ul == left || up == left)
+			*_cdfNum = 1;
+	}
+	if (up == 255)
+	{
+		if (left == 255)
+			return 0;
+
+		return left;
+	}
+	if (left == 255 || ul == up)
+		return up;
+
+	return left;
+}
+
+I64 Av1ReadSegmentId(CAv1Dec *d, I64 r, I64 c, Bool skip)
+{//5.11.9 read_segment_id. Negative marks a segment id outside the frame's
+//active range, which 6.10.8 makes a bitstream conformance failure.
+	CAv1Frame	*f = d->frame;
+	I64			 cdfNum, pred, coded, segId;
+	U16			*cdf;
+
+	pred = Av1SpatialSegPred(d, r, c, &cdfNum);
+	if (skip)
+		return pred;
+	cdf   = d->cdf.c + AV1_CDF_SPATIAL_PRED_SEG_TREE_CDF_O +
+			cdfNum * AV1_CDF_SPATIAL_PRED_SEG_TREE_CDF_S0;
+	coded = Av1ReadSymbol(&d->msac, cdf, AV1_MAX_SEGMENTS);
+	segId = Av1NegDeinterleave(coded, pred, f->last_active_seg_id + 1);
+	if (segId < 0 || segId > f->last_active_seg_id)
+		return -1;
+
+	return segId;
+}
+
+I64 Av1IntraSegmentId(CAv1Dec *d, I64 r, I64 c, I64 bw4, I64 bh4, Bool skip)
+{//5.11.8 intra_segment_id. The map is written here because the next block
+//reads it as its predictor, and only over the part inside the frame, which is
+//all av1_get_spatial_seg_pred can reach.
+	CAv1Frame	*f = d->frame;
+	I64			 segId, x, y, xMis = bw4, yMis = bh4;
+
+	if (!f->segmentation_enabled)
+		return 0;
+	segId = Av1ReadSegmentId(d, r, c, skip);
+	if (segId < 0)
+		return segId;
+	if (f->mi_cols - c < xMis)
+		xMis = f->mi_cols - c;
+	if (f->mi_rows - r < yMis)
+		yMis = f->mi_rows - r;
+	for (y = 0; y < yMis; y++)
+		for (x = 0; x < xMis; x++)
+			d->segment_ids[(r + y) * d->mi_stride + c + x] = segId;
+
+	return segId;
+}
+
+I64 Av1ReadSkip(CAv1Dec *d, I64 r, I64 c, I64 segId)
+{//5.11.11 read_skip. SegIdPreSkip is 1 whenever SEG_LVL_SKIP is enabled, so
+//segId is already known when the feature can fire.
+	I64		 ctx = 0;
+	U16		*cdf;
+
+	if (Av1SegFeatureActive(d->frame, segId, AV1_SEG_LVL_SKIP))
+		return 1;
+	if (Av1IsInside(d, r - 1, c))
+		ctx += d->skips[(r - 1) * d->mi_stride + c];
+	if (Av1IsInside(d, r, c - 1))
+		ctx += d->skips[r * d->mi_stride + c - 1];
+	cdf = d->cdf.c + AV1_CDF_SKIP_TXFM_CDFS_O +
+		  ctx * AV1_CDF_SKIP_TXFM_CDFS_S0;
+
+	return Av1ReadSymbol(&d->msac, cdf, 2);
+}
+
+U0 Av1ReadCdef(CAv1Dec *d, I64 r, I64 c, I64 bSize, I64 skip)
+{//5.11.56 read_cdef, with the clear_cdef of 5.11.3 folded in at the
+//superblock's first block. A cdef unit is 64x64 whatever the superblock
+//size, so a 128x128 superblock holds four and the first non skipped block in
+//each codes the strength. A block wider or taller than 64 covers several
+//units and carries its index into every one of them.
+	CAv1Frame	*f = d->frame;
+	I64			 mask = d->sb_size4 - 1, base, k, i, j, w4, h4;
+
+	if (f->coded_lossless || f->allow_intrabc)
+		return;
+	if (!(r & mask) && !(c & mask))
+	{
+		base              = (r >> 4) * d->cdef_cols + (c >> 4);
+		d->cdef_idx[base] = -1;
+		if (d->sb_size == AV1_BLOCK_128X128)
+		{
+			d->cdef_idx[base + 1]                = -1;
+			d->cdef_idx[base + d->cdef_cols]     = -1;
+			d->cdef_idx[base + d->cdef_cols + 1] = -1;
+		}
+	}
+	k = ((r >> 4) * d->cdef_cols) + (c >> 4);
+	if (d->cdef_idx[k] >= 0 || skip)
+		return;
+	d->cdef_idx[k] = Av1ReadLiteral(&d->msac, f->cdef_bits);
+	w4 = av1_mi_size_wide[bSize];
+	h4 = av1_mi_size_high[bSize];
+	for (i = 0; i < h4; i += AV1_CDEF_UNIT4)
+		for (j = 0; j < w4; j += AV1_CDEF_UNIT4)
+			d->cdef_idx[k + (i >> 4) * d->cdef_cols + (j >> 4)] =
+				d->cdef_idx[k];
+}
+
+I64 Av1ReadQuniform(CAv1Dec *d, I64 n)
+{//read_primitive_quniform of aom_dsp/binary_codes_reader.c: ns(n) read as
+//equiprobable bools rather than from the bit buffer.
+	I64 l, m, v;
+
+	if (n <= 1)
+		return 0;
+	l = Av1FloorLog2(n) + 1;
+	m = (1 << l) - n;
+	v = Av1ReadLiteral(&d->msac, l - 1);
+	if (v < m)
+		return v;
+
+	return (v << 1) - m + Av1ReadBool(&d->msac);
+}
+
+I64 Av1ReadSubexpFin(CAv1Dec *d, I64 n, I64 k)
+{//decode_subexp_bool, 5.9.27. Each refused prefix bit doubles the bucket the
+//value is finally read from.
+	I64 i = 0, mk = 0, b, a;
+
+	while (TRUE)
+	{
+		b = k;
+		if (i)
+			b = k + i - 1;
+		a = 1 << b;
+		if (n <= mk + 3 * a)
+			return Av1ReadQuniform(d, n - mk) + mk;
+		if (!Av1ReadBool(&d->msac))
+			return Av1ReadLiteral(&d->msac, b) + mk;
+		i++;
+		mk += a;
+	}
+
+	return 0;
+}
+
+I64 Av1InvRecenter(I64 r, I64 v)
+{//inverse_recenter, 5.9.28.
+	if (v > (r << 1))
+		return v;
+	if (!(v & 1))
+		return (v >> 1) + r;
+
+	return r - ((v + 1) >> 1);
+}
+
+I64 Av1ReadRefSubexp(CAv1Dec *d, I64 mn, I64 mx, I64 k, I64 ref)
+{//decode_signed_subexp_with_ref_bool, 5.9.26, over the closed range mn..mx.
+	I64 n = mx - mn + 1, v = Av1ReadSubexpFin(d, n, k), r = ref - mn;
+
+	if ((r << 1) <= n)
+		return Av1InvRecenter(r, v) + mn;
+
+	return n - 1 - Av1InvRecenter(n - 1 - r, v) + mn;
+}
+
+U0 Av1ReadLrUnit(CAv1Dec *d, I64 plane, I64 unitRow, I64 unitCol)
+{//5.11.58 read_lr_unit. The references carry across units within a tile, so
+//a unit codes only the step from the last one that coded anything.
+	CAv1Frame	*f = d->frame;
+	I64			 k = unitRow * d->lr_cols[plane] + unitCol;
+	I64			 rtype, pass, j, first, v, mn, mx, tk, i, set, radius;
+	U16			*cdf;
+
+	rtype = f->frame_restoration_type[plane];
+	if (rtype == AV1_RESTORE_SWITCHABLE)
+	{
+		cdf   = d->cdf.c + AV1_CDF_SWITCHABLE_RESTORE_CDF_O;
+		rtype = Av1ReadSymbol(&d->msac, cdf, AV1_RESTORE_TYPES_SW);
+	}
+	else
+	{
+		cdf = d->cdf.c + AV1_CDF_WIENER_RESTORE_CDF_O;
+		if (rtype == AV1_RESTORE_SGRPROJ)
+			cdf = d->cdf.c + AV1_CDF_SGRPROJ_RESTORE_CDF_O;
+		if (!Av1ReadSymbol(&d->msac, cdf, 2))
+			rtype = AV1_RESTORE_NONE;
+	}
+	d->lr_type_u[plane][k] = rtype;
+	if (rtype == AV1_RESTORE_WIENER)
+	{
+		for (pass = 0; pass < 2; pass++)
+		{
+			first = 0;
+			if (plane)
+			{//Chroma codes a five tap filter, so the outer tap is zero.
+				first = 1;
+				d->lr_wiener[plane][k * 6 + pass * 3] = 0;
+			}
+			for (j = first; j < 3; j++)
+			{
+				mn = av1_wiener_taps_min[j];
+				mx = av1_wiener_taps_max[j];
+				tk = av1_wiener_taps_k[j];
+				i  = plane * 6 + pass * 3 + j;
+				v  = Av1ReadRefSubexp(d, mn, mx, tk, d->lr_ref_wiener[i]);
+				d->lr_wiener[plane][k * 6 + pass * 3 + j] = v;
+				d->lr_ref_wiener[i] = v;
+			}
+		}
+
+		return;
+	}
+	if (rtype != AV1_RESTORE_SGRPROJ)
+		return;
+	set = Av1ReadLiteral(&d->msac, AV1_SGRPROJ_PARAMS_BITS);
+	d->lr_sgr_set[plane][k] = set;
+	for (i = 0; i < 2; i++)
+	{
+		radius = av1_sgr_params[set * AV1_SGR_PARAMS_S0 + i];
+		mn     = av1_sgrproj_xqd_min[i];
+		mx     = av1_sgrproj_xqd_max[i];
+		v      = 0;
+		if (radius)
+			v = Av1ReadRefSubexp(d, mn, mx, AV1_SGRPROJ_PRJ_SUBEXP_K,
+								 d->lr_ref_xqd[plane * 2 + i]);
+		else if (i == 1)
+			//The two weights sum to one, so the second is implied by the
+			//first when its own radius disables the pass.
+			v = Av1Clip3(mn, mx, (1 << AV1_SGRPROJ_PRJ_BITS) -
+						 d->lr_ref_xqd[plane * 2]);
+		d->lr_sgr_xqd[plane][k * 2 + i] = v;
+		d->lr_ref_xqd[plane * 2 + i]    = v;
+	}
+}
+
+U0 Av1ReadLr(CAv1Dec *d, I64 r, I64 c, I64 bSize)
+{//5.11.57 read_lr. The unit grid is the plane's own, so a superblock covers
+//none, one or several units of each plane and codes every unit whose top left
+//corner falls inside it.
+	CAv1Frame	*f = d->frame;
+	I64			 plane, w4, h4, subx, suby, unitSize, num, den;
+	I64			 rowStart, rowEnd, colStart, colEnd, ur, uc;
+
+	if (f->allow_intrabc)
+		return;
+	w4 = av1_mi_size_wide[bSize];
+	h4 = av1_mi_size_high[bSize];
+	for (plane = 0; plane < d->num_planes; plane++)
+	{
+		if (f->frame_restoration_type[plane] == AV1_RESTORE_NONE)
+			goto next_plane;
+		subx = 0;
+		suby = 0;
+		if (plane)
+		{
+			subx = d->ss_x;
+			suby = d->ss_y;
+		}
+		unitSize = f->loop_restoration_size[plane];
+		den      = unitSize;
+		num      = 4 >> suby;
+		rowStart = (r * num + den - 1) / den;
+		rowEnd   = ((r + h4) * num + den - 1) / den;
+		if (rowEnd > d->lr_rows[plane])
+			rowEnd = d->lr_rows[plane];
+		num      = 4 >> subx;
+		colStart = (c * num + den - 1) / den;
+		colEnd   = ((c + w4) * num + den - 1) / den;
+		if (colEnd > d->lr_cols[plane])
+			colEnd = d->lr_cols[plane];
+		for (ur = rowStart; ur < rowEnd; ur++)
+			for (uc = colStart; uc < colEnd; uc++)
+				Av1ReadLrUnit(d, plane, ur, uc);
+next_plane:;
+	}
+}
+
+I64 Av1ReadDeltaValue(CAv1Dec *d, U16 *cdf)
+{//The magnitude and sign shared by read_delta_qindex and read_delta_lflevel;
+//DELTA_Q_SMALL and DELTA_LF_SMALL are both 3.
+	I64 abs, remBits, thr, sign = 1;
+
+	abs = Av1ReadSymbol(&d->msac, cdf, AV1_DELTA_SMALL + 1);
+	if (abs == AV1_DELTA_SMALL)
+	{
+		remBits = Av1ReadLiteral(&d->msac, 3) + 1;
+		thr     = (1 << remBits) + 1;
+		abs     = Av1ReadLiteral(&d->msac, remBits) + thr;
+	}
+	if (abs)
+		sign = Av1ReadBool(&d->msac);
+	if (sign)
+		return -abs;
+
+	return abs;
+}
+
+U0 Av1ReadDeltaParams(CAv1Dec *d, I64 r, I64 c, I64 bSize, I64 skip)
+{//5.11.12 and 5.11.13, as read_delta_q_params. Only the block at the
+//superblock's top left corner codes them. delta_q_res and delta_lf_res hold
+//the coded exponent, so the step is 1 << res.
+	CAv1Frame	*f = d->frame;
+	I64			 mask = d->sb_size4 - 1, i, n = AV1_FRAME_LF_COUNT, lvl;
+	U16			*cdf;
+
+	if (!d->read_deltas || (r & mask) || (c & mask))
+		return;
+	if (bSize == d->sb_size && skip)
+		return;
+	cdf            = d->cdf.c + AV1_CDF_DELTA_Q_CDF_O;
+	lvl            = d->cur_q_index +
+					 Av1ReadDeltaValue(d, cdf) * (1 << f->delta_q_res);
+	d->cur_q_index = Av1Clip3(1, AV1_MAXQ, lvl);
+	if (!f->delta_lf_present)
+		return;
+	if (d->num_planes == 1)
+		n = AV1_FRAME_LF_COUNT - 2;
+	if (!f->delta_lf_multi)
+	{//delta_lf[0] carries delta_lf_from_base; the two forms never coexist.
+		cdf = d->cdf.c + AV1_CDF_DELTA_LF_CDF_O;
+		lvl = d->delta_lf[0] +
+			  Av1ReadDeltaValue(d, cdf) * (1 << f->delta_lf_res);
+		d->delta_lf[0] = Av1Clip3(-AV1_MAX_LOOP_FILTER, AV1_MAX_LOOP_FILTER,
+								  lvl);
+
+		return;
+	}
+	for (i = 0; i < n; i++)
+	{
+		cdf = d->cdf.c + AV1_CDF_DELTA_LF_MULTI_CDF_O +
+			  i * AV1_CDF_DELTA_LF_MULTI_CDF_S0;
+		lvl = d->delta_lf[i] +
+			  Av1ReadDeltaValue(d, cdf) * (1 << f->delta_lf_res);
+		d->delta_lf[i] = Av1Clip3(-AV1_MAX_LOOP_FILTER, AV1_MAX_LOOP_FILTER,
+								  lvl);
+	}
+}
+
+I64 Av1ReadIntraFrameYMode(CAv1Dec *d, I64 r, I64 c)
+{//5.11.42 intra_frame_y_mode. Intra_Mode_Context of the above and the left
+//mode picks the row and the column, 9.3.
+	I64		 above = AV1_DC_PRED, left = AV1_DC_PRED;
+	U16		*cdf;
+
+	if (Av1IsInside(d, r - 1, c))
+		above = d->y_modes[(r - 1) * d->mi_stride + c];
+	if (Av1IsInside(d, r, c - 1))
+		left = d->y_modes[r * d->mi_stride + c - 1];
+	cdf = d->cdf.c + AV1_CDF_KF_Y_MODE_CDF_O +
+		  av1_intra_mode_context[above] * AV1_CDF_KF_Y_MODE_CDF_S0 +
+		  av1_intra_mode_context[left] * AV1_CDF_KF_Y_MODE_CDF_S1;
+
+	return Av1ReadSymbol(&d->msac, cdf, AV1_CDF_KF_Y_MODE_CDF_N);
+}
+
+Bool Av1IsDirectional(I64 mode)
+{//av1_is_directional_mode.
+	return ToBool(mode >= AV1_V_PRED && mode <= AV1_D67_PRED);
+}
+
+I64 Av1ReadAngleDelta(CAv1Dec *d, I64 mode)
+{//5.11.25 angle_delta, indexed by mode - V_PRED. The symbol codes the delta
+//biased by MAX_ANGLE_DELTA; 7.11.2.6 scales it by ANGLE_STEP.
+	U16 *cdf = d->cdf.c + AV1_CDF_ANGLE_DELTA_CDF_O +
+			   (mode - AV1_V_PRED) * AV1_CDF_ANGLE_DELTA_CDF_S0;
+
+	return Av1ReadSymbol(&d->msac, cdf, AV1_CDF_ANGLE_DELTA_CDF_N) -
+		   AV1_MAX_ANGLE_DELTA;
+}
+
+Bool Av1CflAllowed(CAv1Dec *d, I64 bSize, I64 segId)
+{//is_cfl_allowed. Lossless tests the chroma plane's own block size.
+	CAv1Seq	*s = d->seq;
+	I64		 plane;
+
+	if (d->frame->lossless[segId])
+	{
+		plane = av1_ss_size_lookup[bSize * AV1_SS_SIZE_LOOKUP_S0 +
+								   s->subsampling_x * AV1_SS_SIZE_LOOKUP_S1 +
+								   s->subsampling_y];
+
+		return ToBool(plane == AV1_BLOCK_4X4);
+	}
+
+	return ToBool(av1_block_size_wide[bSize] <= 32 &&
+				  av1_block_size_high[bSize] <= 32);
+}
+
+U0 Av1ReadCflAlphas(CAv1Dec *d, I64 *_alphaU, I64 *_alphaV)
+{//5.11.45 read_cfl_alphas, then cfl_idx_to_alpha. A magnitude is coded only
+//for a non zero sign; CFL_SIGN_NEG is 1 and CFL_SIGN_POS is 2. The signed
+//alpha runs -16 to +16.
+	I64		 joint, signU, signV, sym;
+	U16		*cdf;
+
+	*_alphaU = 0;
+	*_alphaV = 0;
+	joint = Av1ReadSymbol(&d->msac, d->cdf.c + AV1_CDF_CFL_SIGN_CDF_O,
+						  AV1_CDF_CFL_SIGN_CDF_N);
+	signU = ((joint + 1) * 11) >> 5;
+	signV = joint + 1 - AV1_CFL_SIGNS * signU;
+	if (signU)
+	{
+		cdf = d->cdf.c + AV1_CDF_CFL_ALPHA_CDF_O +
+			  (joint + 1 - AV1_CFL_SIGNS) * AV1_CDF_CFL_ALPHA_CDF_S0;
+		sym      = Av1ReadSymbol(&d->msac, cdf, AV1_CFL_ALPHABET_SIZE);
+		*_alphaU = sym + 1;
+		if (signU == 1)
+			*_alphaU = -(sym + 1);
+	}
+	if (signV)
+	{
+		cdf = d->cdf.c + AV1_CDF_CFL_ALPHA_CDF_O +
+			  (signV * AV1_CFL_SIGNS + signU - AV1_CFL_SIGNS) *
+			  AV1_CDF_CFL_ALPHA_CDF_S0;
+		sym      = Av1ReadSymbol(&d->msac, cdf, AV1_CFL_ALPHABET_SIZE);
+		*_alphaV = sym + 1;
+		if (signV == 1)
+			*_alphaV = -(sym + 1);
+	}
+}
+
+Bool Av1AllowPalette(CAv1Frame *f, I64 bSize)
+{//av1_allow_palette.
+	return ToBool(f->allow_screen_content_tools && bSize >= AV1_BLOCK_8X8 &&
+				  av1_block_size_wide[bSize] <= AV1_MAX_PALETTE_BLOCK &&
+				  av1_block_size_high[bSize] <= AV1_MAX_PALETTE_BLOCK);
+}
+
+Bool Av1PaletteModeInfo(CAv1Dec *d, I64 bSize, I64 yMode, I64 uvMode,
+						Bool hasChroma)
+{//5.11.46 palette_mode_info, flags only. A palette is refused, so no block
+//ever carries one and both neighbour contexts stay zero. FALSE means the
+//stream asked for a palette.
+	I64		 bctx = av1_num_pels_log2_lookup[bSize] -
+				   av1_num_pels_log2_lookup[AV1_BLOCK_8X8];
+	U16		*cdf;
+
+	if (yMode == AV1_DC_PRED)
+	{
+		cdf = d->cdf.c + AV1_CDF_PALETTE_Y_MODE_CDF_O +
+			  bctx * AV1_CDF_PALETTE_Y_MODE_CDF_S0;
+		if (Av1ReadSymbol(&d->msac, cdf, 2))
+			return FALSE;
+	}
+	if (d->num_planes > 1 && uvMode == AV1_UV_DC_PRED && hasChroma)
+	{
+		cdf = d->cdf.c + AV1_CDF_PALETTE_UV_MODE_CDF_O;
+		if (Av1ReadSymbol(&d->msac, cdf, 2))
+			return FALSE;
+	}
+
+	return TRUE;
+}
+
+I64 Av1FilterIntraModeInfo(CAv1Dec *d, I64 bSize, I64 yMode, I64 *_fiMode)
+{//5.11.28 filter_intra_mode_info, as av1_filter_intra_allowed. A palette is
+//refused, so palette_size is zero on every block. The filter intra mode goes
+//to 7.11.2.3; the return is the direction it stands for, which 5.11.47 needs
+//for the transform type CDF row.
+	I64	 mode;
+	U16	*cdf;
+
+	*_fiMode = -1;
+	if (yMode != AV1_DC_PRED || !d->seq->enable_filter_intra)
+		return yMode;
+	if (av1_block_size_wide[bSize] > AV1_MAX_FILTER_INTRA_BLOCK ||
+		av1_block_size_high[bSize] > AV1_MAX_FILTER_INTRA_BLOCK)
+		return yMode;
+	cdf = d->cdf.c + AV1_CDF_FILTER_INTRA_CDFS_O +
+		  bSize * AV1_CDF_FILTER_INTRA_CDFS_S0;
+	if (!Av1ReadSymbol(&d->msac, cdf, 2))
+		return yMode;
+	mode = Av1ReadSymbol(&d->msac,
+						 d->cdf.c + AV1_CDF_FILTER_INTRA_MODE_CDF_O,
+						 AV1_CDF_FILTER_INTRA_MODE_CDF_N);
+	*_fiMode = mode;
+
+	return av1_fimode_to_intradir[mode];
+}
+
+I64 Av1TxSizeCtx(CAv1Dec *d, I64 r, I64 c, I64 bSize)
+{//get_tx_size_context. Every block on a key frame is intra, so the override
+//that takes an inter neighbour's own width never applies.
+	I64		maxTx = av1_max_txsize_rect_lookup[bSize], above, left;
+	Bool	availU = Av1IsInside(d, r - 1, c);
+	Bool	availL = Av1IsInside(d, r, c - 1);
+
+	above = ToI64(d->above_txfm[c] >= av1_tx_size_wide[maxTx]);
+	left  = ToI64(d->left_txfm[r] >= av1_tx_size_high[maxTx]);
+	if (availU && availL)
+		return above + left;
+	if (availU)
+		return above;
+	if (availL)
+		return left;
+
+	return 0;
+}
+
+I64 Av1ReadTxSize(CAv1Dec *d, I64 r, I64 c, I64 bSize, I64 segId)
+{//5.11.15 read_tx_size on the intra path, where the variable transform tree
+//of 5.11.16 never applies.
+	CAv1Frame	*f = d->frame;
+	I64			 depth, ctx;
+	U16			*cdf;
+
+	if (f->lossless[segId])
+		return AV1_TX_4X4;
+	if (bSize == AV1_BLOCK_4X4)
+		return av1_max_txsize_rect_lookup[bSize];
+	if (f->tx_mode != AV1_TX_MODE_SELECT)
+		return Av1TxSizeFromTxMode(bSize, f->tx_mode);
+	ctx   = Av1TxSizeCtx(d, r, c, bSize);
+	cdf   = d->cdf.c + AV1_CDF_TX_SIZE_CDF_O +
+			Av1TxSizeCat(bSize) * AV1_CDF_TX_SIZE_CDF_S0 +
+			ctx * AV1_CDF_TX_SIZE_CDF_S1;
+	depth = Av1ReadSymbol(&d->msac, cdf, Av1MaxTxDepth(bSize) + 1);
+
+	return Av1DepthToTxSize(depth, bSize);
+}
+
+U0 Av1SetTxfmCtx(CAv1Dec *d, I64 r, I64 c, I64 bw4, I64 bh4, I64 txSize)
+{//set_txfm_ctxs. Its skip form covers the whole block instead and is inter
+//only, so the transform dimensions always stand here.
+	I64 i;
+
+	for (i = 0; i < bw4; i++)
+		d->above_txfm[c + i] = av1_tx_size_wide[txSize];
+	for (i = 0; i < bh4; i++)
+		d->left_txfm[r + i] = av1_tx_size_high[txSize];
+}
+
+/***** coefficients, 5.11.34 through 5.11.49 *****/
+
+#define AV1_TX_16X16				2
+#define AV1_TX_32X32				3
+#define AV1_TX_64X64				4
+#define AV1_TX_16X32				9
+#define AV1_TX_32X16				10
+#define AV1_TX_32X64				11
+#define AV1_TX_64X32				12
+#define AV1_TX_16X64				17
+#define AV1_TX_64X16				18
+#define AV1_DCT_DCT					0
+#define AV1_TX_CLASS_2D				0
+#define AV1_TX_CLASS_HORIZ			1
+#define AV1_TX_CLASS_VERT			2
+#define AV1_EXT_TX_SET_DCTONLY		0
+#define AV1_EXT_TX_SET_DCT_IDTX		1
+#define AV1_EXT_TX_SET_DTT4_IDTX	2
+#define AV1_TX_PAD_HOR				4
+#define AV1_TX_PAD_HOR_LOG2			2
+#define AV1_TX_PAD_VER				4
+#define AV1_TX_PAD_END				16
+#define AV1_NUM_BASE_LEVELS			2
+#define AV1_COEFF_BASE_RANGE		12
+#define AV1_BR_CDF_SIZE				4
+#define AV1_MAX_BASE_BR_RANGE		15
+#define AV1_COEFF_CONTEXT_MASK		7
+#define AV1_SIG_COEF_CONTEXTS_2D	26
+#define AV1_MU_BLOCKS				16			//64x64 in 4x4 units
+//Range of a dequantised coefficient at eight bits, 1 << (7 + BitDepth).
+#define AV1_DQ_MIN					-32768
+#define AV1_DQ_MAX					32767
+#define AV1_ERR_COEFF				-23
+#define AV1_ERR_CHROMASZ			-25
+#define AV1_ERR_PARTITION			-26
+
+I64 Av1AdjustedTxSize(I64 txSize)
+{//av1_get_adjusted_tx_size: a 64 dimension transform codes coefficients over
+//its lower 32 only.
+	if (txSize == AV1_TX_64X64 || txSize == AV1_TX_64X32 ||
+		txSize == AV1_TX_32X64)
+		return AV1_TX_32X32;
+	if (txSize == AV1_TX_64X16)
+		return AV1_TX_32X16;
+	if (txSize == AV1_TX_16X64)
+		return AV1_TX_16X32;
+
+	return txSize;
+}
+
+I64 Av1TxSizeEntropyCtx(I64 txSize)
+{//get_txsize_entropy_ctx.
+	return (av1_txsize_sqr_map[txSize] + av1_txsize_sqr_up_map[txSize] + 1)
+		   >> 1;
+}
+
+I64 Av1TxScale(I64 txSize)
+{//av1_get_tx_scale, the dqDenom exponent of 7.12.3.
+	I64 pels = av1_tx_size_2d[txSize];
+
+	return ToI64(pels > 256) + ToI64(pels > 1024);
+}
+
+I64 Av1QCtx(I64 q)
+{//get_q_ctx. Av1CdfInit copies all four quantiser contexts into the live
+//context, so the coefficient CDFs carry this as their first index instead of
+//being selected at reset the way av1_default_coef_probs does.
+	if (q <= 20)
+		return 0;
+	if (q <= 60)
+		return 1;
+	if (q <= 120)
+		return 2;
+
+	return 3;
+}
+
+I64 Av1NzMapOffset(I64 txSize, I64 idx)
+{//av1_nz_map_ctx_offset[txSize][idx], run as the generator txb_common.h
+//documents its tables with. The category comes from the coded transform
+//dimensions and the column stride from the adjusted ones.
+	I64 bhl = av1_tx_size_high_log2[Av1AdjustedTxSize(txSize)];
+	I64 col = idx >> bhl, row = idx - (col << bhl);
+
+	if (!idx)
+		return 0;
+	if (av1_tx_size_wide[txSize] < av1_tx_size_high[txSize])
+	{
+		if (row < 2)
+			return 11;
+	}
+	else if (av1_tx_size_wide[txSize] > av1_tx_size_high[txSize])
+	{
+		if (col < 2)
+			return 16;
+	}
+	if (row + col < 2)
+		return 1;
+	if (row + col < 4)
+		return 6;
+
+	return 21;
+}
+
+I64 Av1NzOffset1d(I64 i)
+{//nz_map_ctx_offset_1d.
+	if (!i)
+		return AV1_SIG_COEF_CONTEXTS_2D;
+	if (i == 1)
+		return AV1_SIG_COEF_CONTEXTS_2D + 5;
+
+	return AV1_SIG_COEF_CONTEXTS_2D + 10;
+}
+
+I64 Av1PaddedIdx(I64 idx, I64 bhl)
+{//get_padded_idx. The level buffer is column major at (1 << bhl) + TX_PAD_HOR
+//so the mag reads of a last column stay inside it.
+	return idx + ((idx >> bhl) << AV1_TX_PAD_HOR_LOG2);
+}
+
+I64 Av1NzMag(U8 *p, I64 bhl, I64 txClass)
+{//get_nz_mag. { 0,1 } and { 1,0 } always, then three more the class picks.
+	I64 st = (1 << bhl) + AV1_TX_PAD_HOR;
+	I64 mag = Av1Clip3(0, 3, p[st]) + Av1Clip3(0, 3, p[1]);
+
+	if (txClass == AV1_TX_CLASS_2D)
+		return mag + Av1Clip3(0, 3, p[st + 1]) + Av1Clip3(0, 3, p[2 * st]) +
+			   Av1Clip3(0, 3, p[2]);
+	if (txClass == AV1_TX_CLASS_VERT)
+		return mag + Av1Clip3(0, 3, p[2]) + Av1Clip3(0, 3, p[3]) +
+			   Av1Clip3(0, 3, p[4]);
+
+	return mag + Av1Clip3(0, 3, p[2 * st]) + Av1Clip3(0, 3, p[3 * st]) +
+		   Av1Clip3(0, 3, p[4 * st]);
+}
+
+I64 Av1LowerLevelsCtx(U8 *lv, I64 idx, I64 bhl, I64 txSize, I64 txClass)
+{//get_lower_levels_ctx then get_nz_map_ctx_from_stats. Stands in for
+//get_lower_levels_ctx_2d as well: the five neighbours that one sums are the
+//ones get_nz_mag reads for TX_CLASS_2D, and the two differ only at idx zero,
+//which libaom routes here.
+	I64 stats, ctx, col;
+
+	if (!txClass && !idx)
+		return 0;
+	stats = Av1NzMag(lv + Av1PaddedIdx(idx, bhl), bhl, txClass);
+	ctx   = Av1Clip3(0, 4, (stats + 1) >> 1);
+	if (txClass == AV1_TX_CLASS_2D)
+		return ctx + Av1NzMapOffset(txSize, idx);
+	col = idx >> bhl;
+	if (txClass == AV1_TX_CLASS_HORIZ)
+		return ctx + Av1NzOffset1d(col);
+
+	return ctx + Av1NzOffset1d(idx - (col << bhl));
+}
+
+I64 Av1LowerLevelsCtxEob(I64 bhl, I64 width, I64 scanIdx)
+{//get_lower_levels_ctx_eob.
+	I64 n = width << bhl;
+
+	if (!scanIdx)
+		return 0;
+	if (scanIdx <= n / 8)
+		return 1;
+	if (scanIdx <= n / 4)
+		return 2;
+
+	return 3;
+}
+
+I64 Av1BrCtx(U8 *lv, I64 pos, I64 bhl, I64 txClass)
+{//get_br_ctx. Stands in for get_br_ctx_2d too: that one clamps each
+//neighbour to MAX_BASE_BR_RANGE, which no stored level exceeds, and the two
+//differ only at pos zero, which libaom routes here.
+	I64	 st = (1 << bhl) + AV1_TX_PAD_HOR;
+	I64	 col = pos >> bhl, row = pos - (col << bhl), mag;
+	U8	*p = lv + col * st + row;
+
+	mag = p[1] + p[st];
+	if (txClass == AV1_TX_CLASS_2D)
+	{
+		mag = Av1Clip3(0, 6, (mag + p[st + 1] + 1) >> 1);
+		if (!pos)
+			return mag;
+		if (row < 2 && col < 2)
+			return mag + 7;
+	}
+	else if (txClass == AV1_TX_CLASS_HORIZ)
+	{
+		mag = Av1Clip3(0, 6, (mag + p[2 * st] + 1) >> 1);
+		if (!pos)
+			return mag;
+		if (!col)
+			return mag + 7;
+	}
+	else
+	{
+		mag = Av1Clip3(0, 6, (mag + p[2] + 1) >> 1);
+		if (!pos)
+			return mag;
+		if (!row)
+			return mag + 7;
+	}
+
+	return mag + 14;
+}
+
+I64 Av1BrCtxEob(I64 pos, I64 bhl, I64 txClass)
+{//get_br_ctx_eob.
+	I64 col = pos >> bhl, row = pos - (col << bhl);
+
+	if (!pos)
+		return 0;
+	if (txClass == AV1_TX_CLASS_2D && row < 2 && col < 2)
+		return 7;
+	if (txClass == AV1_TX_CLASS_HORIZ && !col)
+		return 7;
+	if (txClass == AV1_TX_CLASS_VERT && !row)
+		return 7;
+
+	return 14;
+}
+
+I64 Av1ExtTxSetType(I64 txSize, Bool isInter, Bool reduced)
+{//av1_get_ext_tx_set_type.
+	I64 up = av1_txsize_sqr_up_map[txSize];
+
+	if (up > AV1_TX_32X32)
+		return AV1_EXT_TX_SET_DCTONLY;
+	if (up == AV1_TX_32X32)
+	{
+		if (isInter)
+			return AV1_EXT_TX_SET_DCT_IDTX;
+
+		return AV1_EXT_TX_SET_DCTONLY;
+	}
+	if (reduced)
+	{
+		if (isInter)
+			return AV1_EXT_TX_SET_DCT_IDTX;
+
+		return AV1_EXT_TX_SET_DTT4_IDTX;
+	}
+
+	return av1_ext_tx_set_lookup[ToI64(isInter) * AV1_EXT_TX_SET_LOOKUP_S0 +
+								 ToI64(av1_txsize_sqr_map[txSize] ==
+									   AV1_TX_16X16)];
+}
+
+I64 Av1ExtTxSet(I64 txSize, Bool isInter, Bool reduced)
+{//get_ext_tx_set.
+	I64 t = Av1ExtTxSetType(txSize, isInter, reduced);
+
+	return av1_ext_tx_set_index[ToI64(isInter) * AV1_EXT_TX_SET_INDEX_S0 + t];
+}
+
+I64 Av1ReadTxType(CAv1Dec *d, I64 txSize)
+{//5.11.47 transform_type, as av1_read_tx_type on the intra path. Its two skip
+//guards are dropped: 5.11.39 reads a transform type only after all_zero came
+//back zero, which a skipped block never does. The lossless test is on the
+//frame quantiser index, not on CurrentQIndex.
+	CAv1Frame	*f = d->frame;
+	I64			 setType, sym;
+	U16			*cdf;
+
+	if (!Av1GetQIndex(f, d->blk_seg_id))
+		return AV1_DCT_DCT;
+	setType = Av1ExtTxSetType(txSize, FALSE, f->reduced_tx_set);
+	if (av1_num_ext_tx_set[setType] <= 1)
+		return AV1_DCT_DCT;
+	cdf = d->cdf.c + AV1_CDF_INTRA_EXT_TX_CDF_O +
+		  Av1ExtTxSet(txSize, FALSE, f->reduced_tx_set) *
+		  AV1_CDF_INTRA_EXT_TX_CDF_S0 +
+		  av1_txsize_sqr_map[txSize] * AV1_CDF_INTRA_EXT_TX_CDF_S1 +
+		  d->blk_intra_dir * AV1_CDF_INTRA_EXT_TX_CDF_S2;
+	sym = Av1ReadSymbol(&d->msac, cdf, av1_num_ext_tx_set[setType]);
+
+	return av1_ext_tx_inv[setType * AV1_EXT_TX_INV_S0 + sym];
+}
+
+I64 Av1TxTypeFor(CAv1Dec *d, I64 plane, I64 txSize, I64 yTxType)
+{//av1_get_tx_type. Only luma codes a type; chroma takes the one its
+//prediction mode implies, dropped to DCT_DCT when the set does not hold it.
+	CAv1Frame	*f = d->frame;
+	I64			 mode = d->blk_uv_mode, t, setType;
+
+	if (f->lossless[d->blk_seg_id] ||
+		av1_txsize_sqr_up_map[txSize] > AV1_TX_32X32)
+		return AV1_DCT_DCT;
+	if (!plane)
+		return yTxType;
+	if (mode == AV1_UV_CFL_PRED)
+		mode = AV1_DC_PRED;				//get_uv_mode
+	t       = av1_intra_mode_to_tx_type[mode];
+	setType = Av1ExtTxSetType(txSize, FALSE, f->reduced_tx_set);
+	if (!av1_ext_tx_used[setType * AV1_EXT_TX_USED_S0 + t])
+		return AV1_DCT_DCT;
+
+	return t;
+}
+
+I64 Av1ReadGolomb(CAv1Dec *d)
+{//read_golomb.
+	I64 x = 1, length = 0, i = 0;
+
+	while (!i)
+	{
+		i = Av1ReadBool(&d->msac);
+		length++;
+		if (length > 20)
+		{
+			d->err = AV1_ERR_COEFF;
+
+			return 0;
+		}
+	}
+	for (i = 0; i < length - 1; i++)
+		x = (x << 1) + Av1ReadBool(&d->msac);
+
+	return x - 1;
+}
+
+I64 Av1DcQ(I64 qindex, I64 delta)
+{//7.12.2 dc_q. The eight bit Dc_Qlookup is byte identical to VP9's.
+	return vp9_dc_qlookup[Av1Clip3(0, 255, qindex + delta)];
+}
+
+I64 Av1AcQ(I64 qindex, I64 delta)
+{//7.12.2 ac_q.
+	return vp9_ac_qlookup[Av1Clip3(0, 255, qindex + delta)];
+}
+
+I64 Av1MaxBlockWide(CAv1Dec *d, I64 planeBSize, I64 ssx)
+{//max_block_wide, in the plane's own 4x4 units.
+	I64 w = av1_block_size_wide[planeBSize], edge;
+
+	edge = d->frame->mi_cols - av1_mi_size_wide[d->blk_size] - d->blk_col;
+	if (edge < 0)
+		w += (edge * 4) >> ssx;
+
+	return w >> 2;
+}
+
+I64 Av1MaxBlockHigh(CAv1Dec *d, I64 planeBSize, I64 ssy)
+{//max_block_high.
+	I64 h = av1_block_size_high[planeBSize], edge;
+
+	edge = d->frame->mi_rows - av1_mi_size_high[d->blk_size] - d->blk_row;
+	if (edge < 0)
+		h += (edge * 4) >> ssy;
+
+	return h >> 2;
+}
+
+I64 Av1TxbSkipCtx(CAv1Dec *d, I64 plane, I64 planeBSize, I64 txSize,
+				  I64 aOff, I64 lOff)
+{//get_txb_ctx, the all_zero half, run as the skip_contexts generator its
+//comment gives. A packed entropy context is non zero exactly when its
+//cumulative level is, so only the level array is read.
+	I64	 tw = av1_tx_size_wide_unit[txSize];
+	I64	 th = av1_tx_size_high_unit[txSize];
+	I64	 i, top = 0, left = 0, hi, lo, off;
+	U8	*a = d->above_level[plane] + aOff;
+	U8	*l = d->left_level[plane] + lOff;
+
+	for (i = 0; i < tw; i++)
+		top |= a[i];
+	for (i = 0; i < th; i++)
+		left |= l[i];
+	if (plane)
+	{
+		off = 7;
+		if (av1_num_pels_log2_lookup[planeBSize] >
+			av1_num_pels_log2_lookup[av1_txsize_to_bsize[txSize]])
+			off = 10;
+
+		return off + ToI64(top != 0) + ToI64(left != 0);
+	}
+	if (planeBSize == av1_txsize_to_bsize[txSize])
+		return 0;
+	top  = Av1Clip3(0, 4, top & AV1_COEFF_CONTEXT_MASK);
+	left = Av1Clip3(0, 4, left & AV1_COEFF_CONTEXT_MASK);
+	hi   = Av1Clip3(0, 4, top | left);
+	lo   = left;
+	if (top < lo)
+		lo = top;
+	if (!hi)
+		return 1;
+	if (!lo)
+		return 2 + ToI64(hi > 3);
+	if (hi <= 3)
+		return 4;
+	if (lo <= 3)
+		return 5;
+
+	return 6;
+}
+
+I64 Av1DcSignCtx(CAv1Dec *d, I64 plane, I64 txSize, I64 aOff, I64 lOff)
+{//get_txb_ctx, the dc_sign half. A context holds 0, 1 or 2 for a zero,
+//negative or positive dc, which are the signs[] entries 0, -1 and 1.
+	I64	 n = av1_tx_size_wide_unit[txSize], i, sum = 0;
+	U8	*a = d->above_dc[plane] + aOff;
+	U8	*l = d->left_dc[plane] + lOff;
+
+	for (i = 0; i < n; i++)
+	{
+		if (a[i] == 1)
+			sum--;
+		else if (a[i] == 2)
+			sum++;
+	}
+	n = av1_tx_size_high_unit[txSize];
+	for (i = 0; i < n; i++)
+	{
+		if (l[i] == 1)
+			sum--;
+		else if (l[i] == 2)
+			sum++;
+	}
+	if (sum < 0)
+		return 1;
+	if (sum > 0)
+		return 2;
+
+	return 0;
+}
+
+U0 Av1SetEntropyCtx(CAv1Dec *d, I64 plane, I64 txSize, I64 aOff, I64 lOff,
+					I64 availW, I64 availH, I64 level, I64 dcSign)
+{//av1_set_entropy_contexts. availW and availH count the plane 4x4 units the
+//block still has left inside the frame; the transform beyond them takes a
+//zero context rather than the coded one.
+	I64 tw = av1_tx_size_wide_unit[txSize];
+	I64 th = av1_tx_size_high_unit[txSize];
+	I64 n;
+
+	n = Av1Clip3(0, tw, availW);
+	MemSet(d->above_level[plane] + aOff, level, n);
+	MemSet(d->above_dc[plane] + aOff, dcSign, n);
+	MemSet(d->above_level[plane] + aOff + n, 0, tw - n);
+	MemSet(d->above_dc[plane] + aOff + n, 0, tw - n);
+	n = Av1Clip3(0, th, availH);
+	MemSet(d->left_level[plane] + lOff, level, n);
+	MemSet(d->left_dc[plane] + lOff, dcSign, n);
+	MemSet(d->left_level[plane] + lOff + n, 0, th - n);
+	MemSet(d->left_dc[plane] + lOff + n, 0, th - n);
+}
+
+U0 Av1EobCdf(CAv1Dec *d, I64 txSize, I64 qctx, I64 ptype, I64 ectx,
+			 U16 **_cdf, I64 *_nsyms)
+{//The eob_pt CDF and its symbol count, one multisize per transform area.
+	I64 sz = av1_txsize_log2_minus4[txSize];
+
+	if (!sz)
+	{
+		*_cdf   = d->cdf.c + AV1_CDF_EOB_MULTI16_CDFS_O +
+				  qctx * AV1_CDF_EOB_MULTI16_CDFS_S0 +
+				  ptype * AV1_CDF_EOB_MULTI16_CDFS_S1 +
+				  ectx * AV1_CDF_EOB_MULTI16_CDFS_S2;
+		*_nsyms = AV1_CDF_EOB_MULTI16_CDFS_N;
+	}
+	else if (sz == 1)
+	{
+		*_cdf   = d->cdf.c + AV1_CDF_EOB_MULTI32_CDFS_O +
+				  qctx * AV1_CDF_EOB_MULTI32_CDFS_S0 +
+				  ptype * AV1_CDF_EOB_MULTI32_CDFS_S1 +
+				  ectx * AV1_CDF_EOB_MULTI32_CDFS_S2;
+		*_nsyms = AV1_CDF_EOB_MULTI32_CDFS_N;
+	}
+	else if (sz == 2)
+	{
+		*_cdf   = d->cdf.c + AV1_CDF_EOB_MULTI64_CDFS_O +
+				  qctx * AV1_CDF_EOB_MULTI64_CDFS_S0 +
+				  ptype * AV1_CDF_EOB_MULTI64_CDFS_S1 +
+				  ectx * AV1_CDF_EOB_MULTI64_CDFS_S2;
+		*_nsyms = AV1_CDF_EOB_MULTI64_CDFS_N;
+	}
+	else if (sz == 3)
+	{
+		*_cdf   = d->cdf.c + AV1_CDF_EOB_MULTI128_CDFS_O +
+				  qctx * AV1_CDF_EOB_MULTI128_CDFS_S0 +
+				  ptype * AV1_CDF_EOB_MULTI128_CDFS_S1 +
+				  ectx * AV1_CDF_EOB_MULTI128_CDFS_S2;
+		*_nsyms = AV1_CDF_EOB_MULTI128_CDFS_N;
+	}
+	else if (sz == 4)
+	{
+		*_cdf   = d->cdf.c + AV1_CDF_EOB_MULTI256_CDFS_O +
+				  qctx * AV1_CDF_EOB_MULTI256_CDFS_S0 +
+				  ptype * AV1_CDF_EOB_MULTI256_CDFS_S1 +
+				  ectx * AV1_CDF_EOB_MULTI256_CDFS_S2;
+		*_nsyms = AV1_CDF_EOB_MULTI256_CDFS_N;
+	}
+	else if (sz == 5)
+	{
+		*_cdf   = d->cdf.c + AV1_CDF_EOB_MULTI512_CDFS_O +
+				  qctx * AV1_CDF_EOB_MULTI512_CDFS_S0 +
+				  ptype * AV1_CDF_EOB_MULTI512_CDFS_S1 +
+				  ectx * AV1_CDF_EOB_MULTI512_CDFS_S2;
+		*_nsyms = AV1_CDF_EOB_MULTI512_CDFS_N;
+	}
+	else
+	{
+		*_cdf   = d->cdf.c + AV1_CDF_EOB_MULTI1024_CDFS_O +
+				  qctx * AV1_CDF_EOB_MULTI1024_CDFS_S0 +
+				  ptype * AV1_CDF_EOB_MULTI1024_CDFS_S1 +
+				  ectx * AV1_CDF_EOB_MULTI1024_CDFS_S2;
+		*_nsyms = AV1_CDF_EOB_MULTI1024_CDFS_N;
+	}
+}
+
+Bool Av1CoeffsTxb(CAv1Dec *d, I64 plane, I64 blkRow, I64 blkCol, I64 txSize,
+				  I64 planeBSize, I64 blocksWide, I64 blocksHigh)
+{//5.11.39 coeffs, as av1_read_coeffs_txb and read_coeffs_txb. Dequantised
+//values land in d->coeffs, column major at the adjusted transform height,
+//which is the layout inv_txfm2d_add_c reads. Nothing above d->eob is written.
+	CAv1Seq		*s = d->seq;
+	CAv1Frame	*f = d->frame;
+	I64			 adj = Av1AdjustedTxSize(txSize);
+	I64			 bhl = av1_tx_size_high_log2[adj];
+	I64			 txw = av1_tx_size_wide[adj], txh = av1_tx_size_high[adj];
+	I64			 txsCtx = Av1TxSizeEntropyCtx(txSize);
+	I64			 ptype = ToI64(plane > 0), qctx = Av1QCtx(f->base_q_idx);
+	I64			 ssx = 0, ssy = 0, aOff, lOff, dcCtx, i, c, k;
+	I64			 availW = blocksWide - blkCol, availH = blocksHigh - blkRow;
+	I64			 eobPt, eobExtra, eobBits, brTxs, txType, txClass;
+	I64			 pos, level, sign, dcVal = 0, cul = 0, dcSign = 0;
+	I64			 qindex, dcQ, acQ, dqv, mag, shift = Av1TxScale(txSize);
+	U16			*cdf, *scan;
+	U8			*lv = d->levels;
+
+	if (plane)
+	{
+		ssx = s->subsampling_x;
+		ssy = s->subsampling_y;
+	}
+	aOff   = (d->blk_col >> ssx) + blkCol;
+	lOff   = (d->blk_row >> ssy) + blkRow;
+	dcCtx  = Av1DcSignCtx(d, plane, txSize, aOff, lOff);
+	d->eob = 0;
+	cdf    = d->cdf.c + AV1_CDF_TXB_SKIP_CDFS_O +
+			 qctx * AV1_CDF_TXB_SKIP_CDFS_S0 +
+			 txsCtx * AV1_CDF_TXB_SKIP_CDFS_S1 +
+			 Av1TxbSkipCtx(d, plane, planeBSize, txSize, aOff, lOff) *
+			 AV1_CDF_TXB_SKIP_CDFS_S2;
+	if (Av1ReadSymbol(&d->msac, cdf, 2))
+	{
+		Av1SetEntropyCtx(d, plane, txSize, aOff, lOff, availW, availH, 0, 0);
+
+		return TRUE;
+	}
+	txType = AV1_DCT_DCT;
+	if (!plane)
+		txType = Av1ReadTxType(d, txSize);
+	txType  = Av1TxTypeFor(d, plane, txSize, txType);
+	txClass = av1_tx_type_to_class[txType];
+	d->plane_tx_type = txType;
+	scan    = av1_scan + av1_scan_off[txSize * AV1_SCAN_OFF_S0 + txType];
+	Av1EobCdf(d, txSize, qctx, ptype, ToI64(txClass != AV1_TX_CLASS_2D),
+			  &cdf, &i);
+	eobPt    = Av1ReadSymbol(&d->msac, cdf, i) + 1;
+	eobBits  = av1_eob_offset_bits[eobPt];
+	eobExtra = 0;
+	if (eobBits > 0)
+	{
+		cdf = d->cdf.c + AV1_CDF_EOB_EXTRA_CDFS_O +
+			  qctx * AV1_CDF_EOB_EXTRA_CDFS_S0 +
+			  txsCtx * AV1_CDF_EOB_EXTRA_CDFS_S1 +
+			  ptype * AV1_CDF_EOB_EXTRA_CDFS_S2 +
+			  (eobPt - 3) * AV1_CDF_EOB_EXTRA_CDFS_S3;
+		if (Av1ReadSymbol(&d->msac, cdf, 2))
+			eobExtra += 1 << (eobBits - 1);
+		for (i = 1; i < eobBits; i++)
+			if (Av1ReadBool(&d->msac))
+				eobExtra += 1 << (eobBits - 1 - i);
+	}
+	d->eob = av1_eob_group_start[eobPt];
+	if (d->eob > 2)
+		d->eob += eobExtra;
+	MemSet(lv, 0, (txh + AV1_TX_PAD_HOR) * (txw + AV1_TX_PAD_VER) +
+		   AV1_TX_PAD_END);
+	MemSet(d->coeffs, 0, txw * txh * sizeof(I32));
+	brTxs = Av1Clip3(0, AV1_TX_32X32, txsCtx);
+	//The coefficient at eob - 1 has its own alphabet: it is known non zero.
+	c     = d->eob - 1;
+	pos   = scan[c];
+	cdf   = d->cdf.c + AV1_CDF_COEFF_BASE_EOB_MULTI_CDFS_O +
+			qctx * AV1_CDF_COEFF_BASE_EOB_MULTI_CDFS_S0 +
+			txsCtx * AV1_CDF_COEFF_BASE_EOB_MULTI_CDFS_S1 +
+			ptype * AV1_CDF_COEFF_BASE_EOB_MULTI_CDFS_S2 +
+			Av1LowerLevelsCtxEob(bhl, txw, c) *
+			AV1_CDF_COEFF_BASE_EOB_MULTI_CDFS_S3;
+	level = Av1ReadSymbol(&d->msac, cdf,
+						  AV1_CDF_COEFF_BASE_EOB_MULTI_CDFS_N) + 1;
+	if (level > AV1_NUM_BASE_LEVELS)
+	{
+		cdf = d->cdf.c + AV1_CDF_COEFF_LPS_MULTI_CDFS_O +
+			  qctx * AV1_CDF_COEFF_LPS_MULTI_CDFS_S0 +
+			  brTxs * AV1_CDF_COEFF_LPS_MULTI_CDFS_S1 +
+			  ptype * AV1_CDF_COEFF_LPS_MULTI_CDFS_S2 +
+			  Av1BrCtxEob(pos, bhl, txClass) *
+			  AV1_CDF_COEFF_LPS_MULTI_CDFS_S3;
+		for (i = 0; i < AV1_COEFF_BASE_RANGE; i += AV1_BR_CDF_SIZE - 1)
+		{
+			k      = Av1ReadSymbol(&d->msac, cdf, AV1_BR_CDF_SIZE);
+			level += k;
+			if (k < AV1_BR_CDF_SIZE - 1)
+				break;
+		}
+	}
+	lv[Av1PaddedIdx(pos, bhl)] = level;
+	//read_coeffs_reverse and read_coeffs_reverse_2d, merged: the contexts
+	//their two forms compute differ only at scan index zero, which
+	//Av1LowerLevelsCtx and Av1BrCtx both carry.
+	for (c = d->eob - 2; c >= 0; c--)
+	{
+		pos   = scan[c];
+		cdf   = d->cdf.c + AV1_CDF_COEFF_BASE_MULTI_CDFS_O +
+				qctx * AV1_CDF_COEFF_BASE_MULTI_CDFS_S0 +
+				txsCtx * AV1_CDF_COEFF_BASE_MULTI_CDFS_S1 +
+				ptype * AV1_CDF_COEFF_BASE_MULTI_CDFS_S2 +
+				Av1LowerLevelsCtx(lv, pos, bhl, txSize, txClass) *
+				AV1_CDF_COEFF_BASE_MULTI_CDFS_S3;
+		level = Av1ReadSymbol(&d->msac, cdf,
+							  AV1_CDF_COEFF_BASE_MULTI_CDFS_N);
+		if (level > AV1_NUM_BASE_LEVELS)
+		{
+			cdf = d->cdf.c + AV1_CDF_COEFF_LPS_MULTI_CDFS_O +
+				  qctx * AV1_CDF_COEFF_LPS_MULTI_CDFS_S0 +
+				  brTxs * AV1_CDF_COEFF_LPS_MULTI_CDFS_S1 +
+				  ptype * AV1_CDF_COEFF_LPS_MULTI_CDFS_S2 +
+				  Av1BrCtx(lv, pos, bhl, txClass) *
+				  AV1_CDF_COEFF_LPS_MULTI_CDFS_S3;
+			for (i = 0; i < AV1_COEFF_BASE_RANGE; i += AV1_BR_CDF_SIZE - 1)
+			{
+				k      = Av1ReadSymbol(&d->msac, cdf, AV1_BR_CDF_SIZE);
+				level += k;
+				if (k < AV1_BR_CDF_SIZE - 1)
+					break;
+			}
+		}
+		lv[Av1PaddedIdx(pos, bhl)] = level;
+	}
+	qindex = Av1GetQIndex(f, d->blk_seg_id);
+	if (f->delta_q_present)
+		qindex = Av1SegQIndex(f, d->blk_seg_id, d->cur_q_index);
+	dcQ = Av1DcQ(qindex, f->delta_q_y_dc);
+	acQ = Av1AcQ(qindex, 0);
+	if (plane == 1)
+	{
+		dcQ = Av1DcQ(qindex, f->delta_q_u_dc);
+		acQ = Av1AcQ(qindex, f->delta_q_u_ac);
+	}
+	else if (plane == 2)
+	{
+		dcQ = Av1DcQ(qindex, f->delta_q_v_dc);
+		acQ = Av1AcQ(qindex, f->delta_q_v_ac);
+	}
+	for (c = 0; c < d->eob; c++)
+	{
+		pos   = scan[c];
+		level = lv[Av1PaddedIdx(pos, bhl)];
+		if (!level)
+			goto next_c;
+		if (!c)
+		{
+			cdf  = d->cdf.c + AV1_CDF_DC_SIGN_CDFS_O +
+				   qctx * AV1_CDF_DC_SIGN_CDFS_S0 +
+				   ptype * AV1_CDF_DC_SIGN_CDFS_S1 +
+				   dcCtx * AV1_CDF_DC_SIGN_CDFS_S2;
+			sign = Av1ReadSymbol(&d->msac, cdf, 2);
+		}
+		else
+			sign = Av1ReadBool(&d->msac);
+		if (level >= AV1_MAX_BASE_BR_RANGE)
+		{
+			level += Av1ReadGolomb(d);
+			if (d->err)
+				return FALSE;
+		}
+		if (!c)
+		{
+			dcVal = level;
+			if (sign)
+				dcVal = -level;
+		}
+		//7.12.3. The magnitude is masked to 24 bits before the divide, and
+		//the sign goes back on after, so the truncation is toward zero.
+		level &= 0xFFFFF;
+		cul   += level;
+		dqv    = acQ;
+		if (!pos)
+			dqv = dcQ;
+		mag = ((level * dqv) & 0xFFFFFF) >> shift;
+		if (sign)
+			mag = -mag;
+		d->coeffs[pos] = Av1Clip3(AV1_DQ_MIN, AV1_DQ_MAX, mag);
+next_c:;
+	}
+	if (dcVal < 0)
+		dcSign = 1;
+	else if (dcVal > 0)
+		dcSign = 2;
+	Av1SetEntropyCtx(d, plane, txSize, aOff, lOff, availW, availH,
+					 Av1Clip3(0, AV1_COEFF_CONTEXT_MASK, cul), dcSign);
+
+	return TRUE;
+}
+
+U0 Av1ResetEntropyCtx(CAv1Dec *d)
+{//av1_reset_entropy_context. A skipped block leaves a zero context over its
+//whole extent.
+	CAv1Seq	*s = d->seq;
+	I64		 n = 1, p, ssx, ssy, pbs, aOff, lOff, w, h;
+
+	if (d->blk_has_chroma)
+		n = d->num_planes;
+	for (p = 0; p < n; p++)
+	{
+		ssx = 0;
+		ssy = 0;
+		if (p)
+		{
+			ssx = s->subsampling_x;
+			ssy = s->subsampling_y;
+		}
+		pbs  = av1_ss_size_lookup[d->blk_size * AV1_SS_SIZE_LOOKUP_S0 +
+								  ssx * AV1_SS_SIZE_LOOKUP_S1 + ssy];
+		aOff = d->blk_col >> ssx;
+		lOff = d->blk_row >> ssy;
+		w    = av1_mi_size_wide[pbs];
+		h    = av1_mi_size_high[pbs];
+		MemSet(d->above_level[p] + aOff, 0, w);
+		MemSet(d->above_dc[p] + aOff, 0, w);
+		MemSet(d->left_level[p] + lOff, 0, h);
+		MemSet(d->left_dc[p] + lOff, 0, h);
+	}
+}
+
+/***** intra prediction, 7.11.2 *****/
+
+#define AV1_H_PRED					2
+#define AV1_SMOOTH_PRED				9
+#define AV1_SMOOTH_V_PRED			10
+#define AV1_SMOOTH_H_PRED			11
+#define AV1_PAETH_PRED				12
+#define AV1_ANGLE_STEP				3
+#define AV1_INTRA_EDGE_TAPS			5
+#define AV1_MAX_UPSAMPLE			16
+//Unavailable reference samples at eight bits, 7.11.2.1: 1 << (BitDepth - 1)
+//less one above, plus one left, and the corner unbiased.
+#define AV1_BASE_ABOVE				127
+#define AV1_BASE_LEFT				129
+#define AV1_BASE_CORNER				128
+
+//Intra_Edge_Kernel, 7.11.2.9. Three strengths of five taps.
+I64 av1_edge_kernel[15] = {
+	0, 4, 8, 4, 0,
+	0, 5, 6, 5, 0,
+	2, 4, 4, 4, 2,
+};
+
+I64 Av1Round2(I64 x, I64 n)
+{//4.7. A zero shift is the identity, which (1 << (n - 1)) is not.
+	if (!n)
+		return x;
+
+	return (x + (1 << (n - 1))) >> n;
+}
+
+I64 Av1Round2Signed(I64 x, I64 n)
+{//4.7. A negative argument rounds away from zero, so this is not
+//(x + (1 << (n - 1))) >> n.
+	if (x < 0)
+		return -Av1Round2(-x, n);
+
+	return Av1Round2(x, n);
+}
+
+U0 Av1ClearBlockDecoded(CAv1Dec *d, I64 r, I64 c)
+{//5.11.3 clear_block_decoded_flags. The border at -1 stands for the samples
+//already reconstructed above and to the left of the superblock.
+	CAv1Seq	*s = d->seq;
+	I64		 p, x, y, subX, subY, w4, h4, mx, my, v;
+	U8		*bd;
+
+	for (p = 0; p < d->num_planes; p++)
+	{
+		subX = 0;
+		subY = 0;
+		if (p)
+		{
+			subX = s->subsampling_x;
+			subY = s->subsampling_y;
+		}
+		bd = d->block_decoded + p * AV1_BD_PLANE;
+		w4 = (d->mi_col_end - c) >> subX;
+		h4 = (d->mi_row_end - r) >> subY;
+		mx = d->sb_size4 >> subX;
+		my = d->sb_size4 >> subY;
+		for (y = -1; y <= my; y++)
+			for (x = -1; x <= mx; x++)
+			{
+				v = 0;
+				if (y < 0 && x < w4)
+					v = 1;
+				else if (x < 0 && y < h4)
+					v = 1;
+				bd[(y + 1) * AV1_BD_STRIDE + x + 1] = v;
+			}
+		//The sample below the left border belongs to the superblock row that
+		//has not been decoded, whatever the tile still has room for.
+		bd[(my + 1) * AV1_BD_STRIDE] = 0;
+	}
+}
+
+U0 Av1PredDc(U8 *dst, I64 stride, I64 log2W, I64 log2H, U8 *ar, U8 *lc,
+			 Bool haveA, Bool haveL)
+{//7.11.2.5 dcPred.
+	I64 w = 1 << log2W, h = 1 << log2H, i, sum = 0, avg = AV1_BASE_CORNER;
+
+	if (haveA && haveL)
+	{
+		for (i = 0; i < w; i++)
+			sum += ar[i];
+		for (i = 0; i < h; i++)
+			sum += lc[i];
+		avg = (sum + ((w + h) >> 1)) / (w + h);
+	}
+	else if (haveL)
+	{
+		for (i = 0; i < h; i++)
+			sum += lc[i];
+		avg = Av1Round2(sum, log2H);
+	}
+	else if (haveA)
+	{
+		for (i = 0; i < w; i++)
+			sum += ar[i];
+		avg = Av1Round2(sum, log2W);
+	}
+	for (i = 0; i < h; i++)
+		MemSet(dst + i * stride, avg, w);
+}
+
+U0 Av1PredV(U8 *dst, I64 stride, I64 w, I64 h, U8 *ar)
+{//7.11.2.2 V_PRED.
+	I64 i;
+
+	for (i = 0; i < h; i++)
+		MemCopy(dst + i * stride, ar, w);
+}
+
+U0 Av1PredH(U8 *dst, I64 stride, I64 w, I64 h, U8 *lc)
+{//7.11.2.2 H_PRED.
+	I64 i;
+
+	for (i = 0; i < h; i++)
+		MemSet(dst + i * stride, lc[i], w);
+}
+
+U0 Av1PredPaeth(U8 *dst, I64 stride, I64 w, I64 h, U8 *ar, U8 *lc)
+{//7.11.2.2 PAETH_PRED: whichever of the three neighbours is nearest their
+//linear combination, not VP9's clipped l + a - tl.
+	I64 i, j, tl = ar[-1], base, pl, pt, ptl;
+
+	for (i = 0; i < h; i++)
+		for (j = 0; j < w; j++)
+		{
+			base = ar[j] + lc[i] - tl;
+			pl   = AbsI64(base - lc[i]);
+			pt   = AbsI64(base - ar[j]);
+			ptl  = AbsI64(base - tl);
+			if (pl <= pt && pl <= ptl)
+				dst[i * stride + j] = lc[i];
+			else if (pt <= ptl)
+				dst[i * stride + j] = ar[j];
+			else
+				dst[i * stride + j] = tl;
+		}
+}
+
+U0 Av1PredSmooth(U8 *dst, I64 stride, I64 w, I64 h, U8 *ar, U8 *lc)
+{//7.11.2.6 SMOOTH_PRED. Sm_Weights[log2N] lives at av1_smooth_weights + N - 4.
+	I64	*wx = av1_smooth_weights + w - 4;
+	I64	*wy = av1_smooth_weights + h - 4;
+	I64	 below = lc[h - 1], right = ar[w - 1], i, j, v;
+
+	for (i = 0; i < h; i++)
+		for (j = 0; j < w; j++)
+		{
+			v = wy[i] * ar[j] + (256 - wy[i]) * below +
+				wx[j] * lc[i] + (256 - wx[j]) * right;
+			dst[i * stride + j] = Av1Round2(v, 9);
+		}
+}
+
+U0 Av1PredSmoothV(U8 *dst, I64 stride, I64 w, I64 h, U8 *ar, U8 *lc)
+{//7.11.2.6 SMOOTH_V_PRED.
+	I64	*wy = av1_smooth_weights + h - 4;
+	I64	 below = lc[h - 1], i, j, v;
+
+	for (i = 0; i < h; i++)
+		for (j = 0; j < w; j++)
+		{
+			v                   = wy[i] * ar[j] + (256 - wy[i]) * below;
+			dst[i * stride + j] = Av1Round2(v, 8);
+		}
+}
+
+U0 Av1PredSmoothH(U8 *dst, I64 stride, I64 w, I64 h, U8 *ar, U8 *lc)
+{//7.11.2.6 SMOOTH_H_PRED.
+	I64	*wx = av1_smooth_weights + w - 4;
+	I64	 right = ar[w - 1], i, j, v;
+
+	for (i = 0; i < h; i++)
+		for (j = 0; j < w; j++)
+		{
+			v                   = wx[j] * lc[i] + (256 - wx[j]) * right;
+			dst[i * stride + j] = Av1Round2(v, 8);
+		}
+}
+
+U0 Av1PredZ1(U8 *dst, I64 stride, I64 w, I64 h, U8 *ar, I64 up, I64 dx)
+{//7.11.2.6 zone one, 0 < pAngle < 90, as av1_dr_prediction_z1.
+	I64 maxBase = (w + h - 1) << up, i, j, idx, base, shift;
+
+	for (i = 0; i < h; i++)
+	{
+		idx   = (i + 1) * dx;
+		shift = ((idx << up) >> 1) & 0x1F;
+		for (j = 0; j < w; j++)
+		{
+			base = (idx >> (6 - up)) + (j << up);
+			if (base < maxBase)
+				dst[i * stride + j] = Av1Round2(ar[base] * (32 - shift) +
+												ar[base + 1] * shift, 5);
+			else
+				dst[i * stride + j] = ar[maxBase];
+		}
+	}
+}
+
+U0 Av1PredZ2(U8 *dst, I64 stride, I64 w, I64 h, U8 *ar, U8 *lc, I64 upA,
+			 I64 upL, I64 dx, I64 dy)
+{//7.11.2.6 zone two, 90 < pAngle < 180, as av1_dr_prediction_z2. AboveRow[-2]
+//is live here: the base floor is -(1 << upsampleAbove). The upsample scale is
+//a multiply, not the shift 7.11.2.6 writes, because idx is negative.
+	I64 minBase = -(1 << upA), i, j, idx, base, shift, v;
+
+	for (i = 0; i < h; i++)
+		for (j = 0; j < w; j++)
+		{
+			idx  = (j << 6) - (i + 1) * dx;
+			base = idx >> (6 - upA);
+			if (base >= minBase)
+			{
+				shift = ((idx * (1 << upA)) >> 1) & 0x1F;
+				v     = Av1Round2(ar[base] * (32 - shift) +
+								  ar[base + 1] * shift, 5);
+			}
+			else
+			{
+				idx   = (i << 6) - (j + 1) * dy;
+				base  = idx >> (6 - upL);
+				shift = ((idx * (1 << upL)) >> 1) & 0x1F;
+				v     = Av1Round2(lc[base] * (32 - shift) +
+								  lc[base + 1] * shift, 5);
+			}
+			dst[i * stride + j] = v;
+		}
+}
+
+U0 Av1PredZ3(U8 *dst, I64 stride, I64 w, I64 h, U8 *lc, I64 up, I64 dy)
+{//7.11.2.6 zone three, 180 < pAngle < 270, as av1_dr_prediction_z3.
+	I64 maxBase = (w + h - 1) << up, i, j, idx, base, shift;
+
+	for (j = 0; j < w; j++)
+	{
+		idx   = (j + 1) * dy;
+		shift = ((idx << up) >> 1) & 0x1F;
+		for (i = 0; i < h; i++)
+		{
+			base = (idx >> (6 - up)) + (i << up);
+			if (base < maxBase)
+				dst[i * stride + j] = Av1Round2(lc[base] * (32 - shift) +
+												lc[base + 1] * shift, 5);
+			else
+				dst[i * stride + j] = lc[maxBase];
+		}
+	}
+}
+
+I64 Av1EdgeStrength(I64 bs0, I64 bs1, I64 delta, I64 type)
+{//7.11.2.10 intra_edge_filter_strength.
+	I64 dd = AbsI64(delta), wh = bs0 + bs1, strength = 0;
+
+	if (!type)
+	{
+		if (wh <= 8)
+		{
+			if (dd >= 56)
+				strength = 1;
+		}
+		else if (wh <= 16)
+		{
+			if (dd >= 40)
+				strength = 1;
+		}
+		else if (wh <= 24)
+		{
+			if (dd >= 8)
+				strength = 1;
+			if (dd >= 16)
+				strength = 2;
+			if (dd >= 32)
+				strength = 3;
+		}
+		else if (wh <= 32)
+		{
+			if (dd >= 1)
+				strength = 1;
+			if (dd >= 4)
+				strength = 2;
+			if (dd >= 32)
+				strength = 3;
+		}
+		else if (dd >= 1)
+			strength = 3;
+
+		return strength;
+	}
+	if (wh <= 8)
+	{
+		if (dd >= 40)
+			strength = 1;
+		if (dd >= 64)
+			strength = 2;
+	}
+	else if (wh <= 16)
+	{
+		if (dd >= 20)
+			strength = 1;
+		if (dd >= 48)
+			strength = 2;
+	}
+	else if (wh <= 24)
+	{
+		if (dd >= 4)
+			strength = 3;
+	}
+	else if (dd >= 1)
+		strength = 3;
+
+	return strength;
+}
+
+Bool Av1UseEdgeUpsample(I64 bs0, I64 bs1, I64 delta, I64 type)
+{//7.11.2.11 use_intra_edge_upsample.
+	I64 dd = AbsI64(delta), wh = bs0 + bs1;
+
+	if (!dd || dd >= 40)
+		return FALSE;
+	if (type)
+		return ToBool(wh <= 8);
+
+	return ToBool(wh <= 16);
+}
+
+U0 Av1FilterEdge(U8 *p, I64 sz, I64 strength)
+{//7.11.2.9 intra_edge_filter. p is the sample before the edge, AboveRow - 1
+//or LeftCol - 1, and the corner itself is left alone.
+	U8	 edge[129];
+	I64	 i, j, k, s, filt;
+
+	if (!strength)
+		return;
+	filt = (strength - 1) * AV1_INTRA_EDGE_TAPS;
+	MemCopy(edge, p, sz);
+	for (i = 1; i < sz; i++)
+	{
+		s = 0;
+		for (j = 0; j < AV1_INTRA_EDGE_TAPS; j++)
+		{
+			k  = Av1Clip3(0, sz - 1, i - 2 + j);
+			s += av1_edge_kernel[filt + j] * edge[k];
+		}
+		p[i] = (s + 8) >> 4;
+	}
+}
+
+U0 Av1FilterEdgeCorner(U8 *ar, U8 *lc)
+{//7.11.2.9 filterCorner: taps 5, 6, 5 over LeftCol[0], AboveRow[-1] and
+//AboveRow[0].
+	I64 s = lc[0] * 5 + ar[-1] * 6 + ar[0] * 5;
+
+	ar[-1] = (s + 8) >> 4;
+	lc[-1] = ar[-1];
+}
+
+U0 Av1UpsampleEdge(U8 *p, I64 sz)
+{//7.11.2.11 intra_edge_upsample. The half sample positions land at odd
+//indices, so the edge afterwards spans p[-2] to p[2 * sz - 2].
+	U8	 dup[AV1_MAX_UPSAMPLE + 3];
+	I64	 i, s;
+
+	dup[0] = p[-1];
+	dup[1] = p[-1];
+	for (i = 0; i < sz; i++)
+		dup[i + 2] = p[i];
+	dup[sz + 2] = p[sz - 1];
+	p[-2] = dup[0];
+	for (i = 0; i < sz; i++)
+	{
+		s            = 9 * dup[i + 1] + 9 * dup[i + 2] - dup[i] - dup[i + 3];
+		p[2 * i - 1] = Av1Clip3(0, 255, (s + 8) >> 4);
+		p[2 * i]     = dup[i + 2];
+	}
+}
+
+U0 Av1PredFilterIntra(CAv1Dec *d, U8 *dst, I64 stride, I64 w, I64 h, U8 *ar,
+					  U8 *lc, I64 mode)
+{//7.11.2.3 recursiveIntraPrediction, as av1_filter_intra_predictor. The
+//working buffer carries LeftCol in column zero and AboveRow[-1..] in row
+//zero, so each 4x2 patch reads five samples above and two to the left.
+	U8	*buf = d->fi_buf;
+	I64	 p[7];
+	I64	 r, c, k, i, pr, base = mode * AV1_FILTER_INTRA_TAPS_S0;
+
+	for (r = 0; r < h; r++)
+		buf[(r + 1) * AV1_FI_STRIDE] = lc[r];
+	MemCopy(buf, ar - 1, w + 1);
+	for (r = 1; r < h + 1; r += 2)
+		for (c = 1; c < w + 1; c += 4)
+		{
+			p[0] = buf[(r - 1) * AV1_FI_STRIDE + c - 1];
+			p[1] = buf[(r - 1) * AV1_FI_STRIDE + c];
+			p[2] = buf[(r - 1) * AV1_FI_STRIDE + c + 1];
+			p[3] = buf[(r - 1) * AV1_FI_STRIDE + c + 2];
+			p[4] = buf[(r - 1) * AV1_FI_STRIDE + c + 3];
+			p[5] = buf[r * AV1_FI_STRIDE + c - 1];
+			p[6] = buf[(r + 1) * AV1_FI_STRIDE + c - 1];
+			for (k = 0; k < 8; k++)
+			{
+				pr = 0;
+				for (i = 0; i < 7; i++)
+					pr += av1_filter_intra_taps[base +
+						  k * AV1_FILTER_INTRA_TAPS_S1 + i] * p[i];
+				buf[(r + (k >> 2)) * AV1_FI_STRIDE + c + (k & 3)] =
+					Av1Clip3(0, 255, Av1Round2Signed(pr, 4));
+			}
+		}
+	for (r = 0; r < h; r++)
+		MemCopy(dst + r * stride, buf + (r + 1) * AV1_FI_STRIDE + 1, w);
+}
+
+Bool Av1IsSmoothAt(CAv1Dec *d, I64 r, I64 c, I64 plane)
+{//7.11.2.8 is_smooth.
+	I64 mode, k = r * d->mi_stride + c;
+
+	if (!plane)
+		mode = d->y_modes[k];
+	else
+	{
+		if (d->ref_frames[k * 2] > AV1_INTRA_FRAME)
+			return FALSE;
+		mode = d->uv_modes[k];
+	}
+
+	return ToBool(mode == AV1_SMOOTH_PRED || mode == AV1_SMOOTH_V_PRED ||
+				  mode == AV1_SMOOTH_H_PRED);
+}
+
+I64 Av1EdgeFilterType(CAv1Dec *d, I64 plane)
+{//7.11.2.8 get_filter_type. A chroma neighbour is the bottom right 4x4 of the
+//luma region the neighbouring chroma prediction covers.
+	CAv1Seq	*s = d->seq;
+	I64		 r, c;
+	Bool	 availU = d->blk_avail_u, availL = d->blk_avail_l;
+
+	if (plane)
+	{
+		availU = d->blk_avail_u_chroma;
+		availL = d->blk_avail_l_chroma;
+	}
+	if (availU)
+	{
+		r = d->blk_row - 1;
+		c = d->blk_col;
+		if (plane)
+		{
+			if (s->subsampling_x && !(d->blk_col & 1))
+				c++;
+			if (s->subsampling_y && (d->blk_row & 1))
+				r--;
+		}
+		if (Av1IsSmoothAt(d, r, c, plane))
+			return 1;
+	}
+	if (availL)
+	{
+		r = d->blk_row;
+		c = d->blk_col - 1;
+		if (plane)
+		{
+			if (s->subsampling_x && (d->blk_col & 1))
+				c--;
+			if (s->subsampling_y && !(d->blk_row & 1))
+				r++;
+		}
+		if (Av1IsSmoothAt(d, r, c, plane))
+			return 1;
+	}
+
+	return 0;
+}
+
+U0 Av1PredictIntra(CAv1Dec *d, I64 plane, I64 x, I64 y, Bool haveL, Bool haveA,
+				   Bool haveAR, Bool haveBL, I64 mode, I64 angleDelta,
+				   I64 fiMode, I64 log2W, I64 log2H)
+{//7.11.2.1 predict_intra. AboveRow and LeftCol get w + h samples: zone one
+//reads AboveRow[w + h - 1] and zone three the matching left sample.
+	CAv1Seq	*s = d->seq;
+	U8		*ar = d->above_data + AV1_INTRA_PAD;
+	U8		*lc = d->left_data + AV1_INTRA_PAD;
+	U8		*pl = d->plane[plane];
+	U8		*dst;
+	I64		 st = d->stride[plane], w = 1 << log2W, h = 1 << log2H;
+	I64		 maxX, maxY, i, k, lim, nTop, nLeft, ftype, pAngle;
+	I64		 upA = 0, upL = 0, numPx;
+
+	maxX = d->frame->mi_cols * 4 - 1;
+	maxY = d->frame->mi_rows * 4 - 1;
+	if (plane)
+	{
+		maxX = ((d->frame->mi_cols * 4) >> s->subsampling_x) - 1;
+		maxY = ((d->frame->mi_rows * 4) >> s->subsampling_y) - 1;
+	}
+	dst   = pl + y * st + x;
+	nTop  = maxX - x + 1;
+	nLeft = maxY - y + 1;
+	if (nTop > w)
+		nTop = w;
+	if (nLeft > h)
+		nLeft = h;
+	if (!haveA)
+	{
+		k = AV1_BASE_ABOVE;
+		if (haveL)
+			k = pl[y * st + x - 1];
+		MemSet(ar, k, w + h);
+	}
+	else
+	{
+		lim = x + w - 1;
+		if (haveAR)
+			lim = x + 2 * w - 1;
+		if (lim > maxX)
+			lim = maxX;
+		for (i = 0; i < w + h; i++)
+		{
+			k = x + i;
+			if (k > lim)
+				k = lim;
+			ar[i] = pl[(y - 1) * st + k];
+		}
+	}
+	if (!haveL)
+	{
+		k = AV1_BASE_LEFT;
+		if (haveA)
+			k = pl[(y - 1) * st + x];
+		MemSet(lc, k, w + h);
+	}
+	else
+	{
+		lim = y + h - 1;
+		if (haveBL)
+			lim = y + 2 * h - 1;
+		if (lim > maxY)
+			lim = maxY;
+		for (i = 0; i < w + h; i++)
+		{
+			k = y + i;
+			if (k > lim)
+				k = lim;
+			lc[i] = pl[k * st + x - 1];
+		}
+	}
+	if (haveA && haveL)
+		ar[-1] = pl[(y - 1) * st + x - 1];
+	else if (haveA)
+		ar[-1] = pl[(y - 1) * st + x];
+	else if (haveL)
+		ar[-1] = pl[y * st + x - 1];
+	else
+		ar[-1] = AV1_BASE_CORNER;
+	lc[-1] = ar[-1];
+	if (fiMode >= 0)
+	{
+		Av1PredFilterIntra(d, dst, st, w, h, ar, lc, fiMode);
+
+		return;
+	}
+	if (!Av1IsDirectional(mode))
+	{
+		if (mode == AV1_SMOOTH_PRED)
+			Av1PredSmooth(dst, st, w, h, ar, lc);
+		else if (mode == AV1_SMOOTH_V_PRED)
+			Av1PredSmoothV(dst, st, w, h, ar, lc);
+		else if (mode == AV1_SMOOTH_H_PRED)
+			Av1PredSmoothH(dst, st, w, h, ar, lc);
+		else if (mode == AV1_PAETH_PRED)
+			Av1PredPaeth(dst, st, w, h, ar, lc);
+		else
+			Av1PredDc(dst, st, log2W, log2H, ar, lc, haveA, haveL);
+
+		return;
+	}
+	pAngle = av1_mode_to_angle_map[mode] + angleDelta * AV1_ANGLE_STEP;
+	if (s->enable_intra_edge_filter)
+	{
+		ftype = Av1EdgeFilterType(d, plane);
+		if (pAngle != 90 && pAngle != 180)
+		{//A zone one angle needs no left edge and a zone three angle no above.
+			if (pAngle > 90 && pAngle < 180 && (w + h) >= 24)
+				Av1FilterEdgeCorner(ar, lc);
+			if (haveA && pAngle < 180)
+			{
+				numPx = nTop + 1;
+				if (pAngle < 90)
+					numPx += h;
+				Av1FilterEdge(ar - 1, numPx,
+							  Av1EdgeStrength(w, h, pAngle - 90, ftype));
+			}
+			if (haveL && pAngle > 90)
+			{
+				numPx = nLeft + 1;
+				if (pAngle > 180)
+					numPx += w;
+				Av1FilterEdge(lc - 1, numPx,
+							  Av1EdgeStrength(h, w, pAngle - 180, ftype));
+			}
+		}
+		if (Av1UseEdgeUpsample(w, h, pAngle - 90, ftype))
+		{
+			upA   = 1;
+			numPx = w;
+			if (pAngle < 90)
+				numPx += h;
+			Av1UpsampleEdge(ar, numPx);
+		}
+		if (Av1UseEdgeUpsample(h, w, pAngle - 180, ftype))
+		{
+			upL   = 1;
+			numPx = h;
+			if (pAngle > 180)
+				numPx += w;
+			Av1UpsampleEdge(lc, numPx);
+		}
+	}
+	if (pAngle < 90)
+		Av1PredZ1(dst, st, w, h, ar, upA, av1_dr_intra_derivative[pAngle]);
+	else if (pAngle == 90)
+		Av1PredV(dst, st, w, h, ar);
+	else if (pAngle < 180)
+		Av1PredZ2(dst, st, w, h, ar, lc, upA, upL,
+				  av1_dr_intra_derivative[180 - pAngle],
+				  av1_dr_intra_derivative[pAngle - 90]);
+	else if (pAngle == 180)
+		Av1PredH(dst, st, w, h, lc);
+	else
+		Av1PredZ3(dst, st, w, h, lc, upL,
+				  av1_dr_intra_derivative[270 - pAngle]);
+}
+
+U0 Av1PredictCfl(CAv1Dec *d, I64 plane, I64 startX, I64 startY, I64 txSize)
+{//7.11.5 predict_chroma_from_luma. The DC prediction is already in the plane;
+//this adds the scaled luma AC. Luma beyond MaxLumaW or MaxLumaH is the last
+//column or row repeated, which is what cfl_pad does in the subsampled domain.
+	CAv1Seq	*s = d->seq;
+	I64		 w = av1_tx_size_wide[txSize], h = av1_tx_size_high[txSize];
+	I64		 subX = s->subsampling_x, subY = s->subsampling_y;
+	I64		 alpha = d->blk_cfl_alpha_u, avg = 0;
+	I64		 i, j, dx, dy, lumaX, lumaY, t, v, off;
+	I64		 ls = d->stride[0], cs = d->stride[plane];
+	U8		*luma = d->plane[0], *dst = d->plane[plane];
+	I32		*lb = d->cfl_luma;
+
+	if (plane == 2)
+		alpha = d->blk_cfl_alpha_v;
+	for (i = 0; i < h; i++)
+	{
+		lumaY = (startY + i) << subY;
+		if (lumaY > d->max_luma_h - (1 << subY))
+			lumaY = d->max_luma_h - (1 << subY);
+		for (j = 0; j < w; j++)
+		{
+			lumaX = (startX + j) << subX;
+			if (lumaX > d->max_luma_w - (1 << subX))
+				lumaX = d->max_luma_w - (1 << subX);
+			t = 0;
+			for (dy = 0; dy <= subY; dy++)
+				for (dx = 0; dx <= subX; dx++)
+					t += luma[(lumaY + dy) * ls + lumaX + dx];
+			v             = t << (3 - subX - subY);
+			lb[i * w + j] = v;
+			avg          += v;
+		}
+	}
+	avg = Av1Round2(avg, av1_tx_size_wide_log2[txSize] +
+					av1_tx_size_high_log2[txSize]);
+	for (i = 0; i < h; i++)
+		for (j = 0; j < w; j++)
+		{
+			off      = (startY + i) * cs + startX + j;
+			v        = Av1Round2Signed(alpha * (lb[i * w + j] - avg), 6);
+			dst[off] = Av1Clip3(0, 255, dst[off] + v);
+		}
+}
+
+/***** inverse transform, 7.13 *****/
+
+#define AV1_SINPI_1_9				1321
+#define AV1_SINPI_2_9				2482
+#define AV1_SINPI_3_9				3344
+#define AV1_SINPI_4_9				3803
+#define AV1_TXFM_1D_DCT				0
+#define AV1_TXFM_1D_ADST			1
+#define AV1_TXFM_1D_FLIPADST		2
+#define AV1_TXFM_1D_IDTX			3
+
+//Cos128_Lookup of 7.13.2.1 expanded over its whole 256 sample period, so
+//cos128(angle) is a masked load av1_cos128[angle & 255] and sin128(angle) is
+//av1_cos128[(angle - 64) & 255]. Entry k is Round(4096 * cos(k * pi / 128)).
+I16 av1_cos128[256] = {
+	 4096,  4095,  4091,  4085,  4076,  4065,  4052,  4036,
+	 4017,  3996,  3973,  3948,  3920,  3889,  3857,  3822,
+	 3784,  3745,  3703,  3659,  3612,  3564,  3513,  3461,
+	 3406,  3349,  3290,  3229,  3166,  3102,  3035,  2967,
+	 2896,  2824,  2751,  2675,  2598,  2520,  2440,  2359,
+	 2276,  2191,  2106,  2019,  1931,  1842,  1751,  1660,
+	 1567,  1474,  1380,  1285,  1189,  1092,   995,   897,
+	  799,   700,   601,   501,   401,   301,   201,   101,
+	    0,  -101,  -201,  -301,  -401,  -501,  -601,  -700,
+	 -799,  -897,  -995, -1092, -1189, -1285, -1380, -1474,
+	-1567, -1660, -1751, -1842, -1931, -2019, -2106, -2191,
+	-2276, -2359, -2440, -2520, -2598, -2675, -2751, -2824,
+	-2896, -2967, -3035, -3102, -3166, -3229, -3290, -3349,
+	-3406, -3461, -3513, -3564, -3612, -3659, -3703, -3745,
+	-3784, -3822, -3857, -3889, -3920, -3948, -3973, -3996,
+	-4017, -4036, -4052, -4065, -4076, -4085, -4091, -4095,
+	-4096, -4095, -4091, -4085, -4076, -4065, -4052, -4036,
+	-4017, -3996, -3973, -3948, -3920, -3889, -3857, -3822,
+	-3784, -3745, -3703, -3659, -3612, -3564, -3513, -3461,
+	-3406, -3349, -3290, -3229, -3166, -3102, -3035, -2967,
+	-2896, -2824, -2751, -2675, -2598, -2520, -2440, -2359,
+	-2276, -2191, -2106, -2019, -1931, -1842, -1751, -1660,
+	-1567, -1474, -1380, -1285, -1189, -1092,  -995,  -897,
+	 -799,  -700,  -601,  -501,  -401,  -301,  -201,  -101,
+	    0,   101,   201,   301,   401,   501,   601,   700,
+	  799,   897,   995,  1092,  1189,  1285,  1380,  1474,
+	 1567,  1660,  1751,  1842,  1931,  2019,  2106,  2191,
+	 2276,  2359,  2440,  2520,  2598,  2675,  2751,  2824,
+	 2896,  2967,  3035,  3102,  3166,  3229,  3290,  3349,
+	 3406,  3461,  3513,  3564,  3612,  3659,  3703,  3745,
+	 3784,  3822,  3857,  3889,  3920,  3948,  3973,  3996,
+	 4017,  4036,  4052,  4065,  4076,  4085,  4091,  4095,
+};
+
+//Transform_Row_Shift, 7.13.3. The column shift is 4 for every size.
+U8 av1_txfm_row_shift[19] = {
+	0, 1, 2, 2, 2, 0, 0, 1, 1, 1, 1, 1, 1, 1, 1, 2, 2, 2, 2,
+};
+
+I64 Av1Brev(I64 numBits, I64 x)
+{//7.13.2.1.
+	I64 i, t = 0;
+
+	for (i = 0; i < numBits; i++)
+		t += ((x >> i) & 1) << (numBits - 1 - i);
+
+	return t;
+}
+
+U0 Av1TxB(I64 *t, I64 a, I64 b, I64 angle, I64 flip)
+{//7.13.2.1 B, the butterfly rotation. No clamp here: the spec states the
+//range of what B writes as a conformance requirement, not as a saturation.
+	I64 c = av1_cos128[angle & 255], s = av1_cos128[(angle - 64) & 255];
+	I64 x = t[a] * c - t[b] * s;
+	I64 y = t[a] * s + t[b] * c;
+
+	if (flip)
+	{
+		t[b] = Av1Round2(x, 12);
+		t[a] = Av1Round2(y, 12);
+	}
+	else
+	{
+		t[a] = Av1Round2(x, 12);
+		t[b] = Av1Round2(y, 12);
+	}
+}
+
+U0 Av1TxH(I64 *t, I64 a, I64 b, I64 flip, I64 r)
+{//7.13.2.1 H, the Hadamard rotation, and the only clamp in the bank.
+	I64 i = a, j = b, x, y, hi = (1 << (r - 1)) - 1;
+
+	if (flip)
+	{
+		i = b;
+		j = a;
+	}
+	x    = t[i];
+	y    = t[j];
+	t[i] = Av1Clip3(-hi - 1, hi, x + y);
+	t[j] = Av1Clip3(-hi - 1, hi, x - y);
+}
+
+U0 Av1InvDctPerm(I64 *t, I64 n)
+{//7.13.2.2.
+	I64 i, n0 = 1 << n, cp[64];
+
+	for (i = 0; i < n0; i++)
+		cp[i] = t[i];
+	for (i = 0; i < n0; i++)
+		t[i] = cp[Av1Brev(n, i)];
+}
+
+U0 Av1InvDct(I64 *t, I64 n, I64 r)
+{//7.13.2.3, for n = 2..6.
+	I64 i, j, angle;
+
+	Av1InvDctPerm(t, n);
+	if (n == 6)
+		for (i = 0; i < 16; i++)
+			Av1TxB(t, 32 + i, 63 - i, 63 - 4 * Av1Brev(4, i), 0);
+	if (n >= 5)
+		for (i = 0; i < 8; i++)
+			Av1TxB(t, 16 + i, 31 - i, 6 + (Av1Brev(3, 7 - i) << 3), 0);
+	if (n == 6)
+		for (i = 0; i < 16; i++)
+			Av1TxH(t, 32 + i * 2, 33 + i * 2, i & 1, r);
+	if (n >= 4)
+		for (i = 0; i < 4; i++)
+			Av1TxB(t, 8 + i, 15 - i, 12 + (Av1Brev(2, 3 - i) << 4), 0);
+	if (n >= 5)
+		for (i = 0; i < 8; i++)
+			Av1TxH(t, 16 + 2 * i, 17 + 2 * i, i & 1, r);
+	if (n == 6)
+		for (i = 0; i < 4; i++)
+			for (j = 0; j < 2; j++)
+				Av1TxB(t, 62 - i * 4 - j, 33 + i * 4 + j,
+					   60 - 16 * Av1Brev(2, i) + 64 * j, 1);
+	if (n >= 3)
+		for (i = 0; i < 2; i++)
+			Av1TxB(t, 4 + i, 7 - i, 56 - 32 * i, 0);
+	if (n >= 4)
+		for (i = 0; i < 4; i++)
+			Av1TxH(t, 8 + 2 * i, 9 + 2 * i, i & 1, r);
+	if (n >= 5)
+		for (i = 0; i < 2; i++)
+			for (j = 0; j < 2; j++)
+				Av1TxB(t, 30 - 4 * i - j, 17 + 4 * i + j,
+					   24 + (j << 6) + ((1 - i) << 5), 1);
+	if (n == 6)
+		for (i = 0; i < 8; i++)
+			for (j = 0; j < 2; j++)
+				Av1TxH(t, 32 + i * 4 + j, 35 + i * 4 - j, i & 1, r);
+	for (i = 0; i < 2; i++)
+		Av1TxB(t, 2 * i, 2 * i + 1, 32 + 16 * i, 1 - i);
+	if (n >= 3)
+		for (i = 0; i < 2; i++)
+			Av1TxH(t, 4 + 2 * i, 5 + 2 * i, i, r);
+	if (n >= 4)
+		for (i = 0; i < 2; i++)
+			Av1TxB(t, 14 - i, 9 + i, 48 + 64 * i, 1);
+	if (n >= 5)
+		for (i = 0; i < 4; i++)
+			for (j = 0; j < 2; j++)
+				Av1TxH(t, 16 + 4 * i + j, 19 + 4 * i - j, i & 1, r);
+	if (n == 6)
+		for (i = 0; i < 2; i++)
+			for (j = 0; j < 4; j++)
+				Av1TxB(t, 61 - i * 8 - j, 34 + i * 8 + j,
+					   56 - i * 32 + (j >> 1) * 64, 1);
+	for (i = 0; i < 2; i++)
+		Av1TxH(t, i, 3 - i, 0, r);
+	if (n >= 3)
+		Av1TxB(t, 6, 5, 32, 1);
+	if (n >= 4)
+		for (i = 0; i < 2; i++)
+			for (j = 0; j < 2; j++)
+				Av1TxH(t, 8 + 4 * i + j, 11 + 4 * i - j, i, r);
+	if (n >= 5)
+		for (i = 0; i < 4; i++)
+			Av1TxB(t, 29 - i, 18 + i, 48 + (i >> 1) * 64, 1);
+	if (n == 6)
+		for (i = 0; i < 4; i++)
+			for (j = 0; j < 4; j++)
+				Av1TxH(t, 32 + 8 * i + j, 39 + 8 * i - j, i & 1, r);
+	if (n >= 3)
+		for (i = 0; i < 4; i++)
+			Av1TxH(t, i, 7 - i, 0, r);
+	if (n >= 4)
+		for (i = 0; i < 2; i++)
+			Av1TxB(t, 13 - i, 10 + i, 32, 1);
+	if (n >= 5)
+		for (i = 0; i < 2; i++)
+			for (j = 0; j < 4; j++)
+				Av1TxH(t, 16 + i * 8 + j, 23 + i * 8 - j, i, r);
+	if (n == 6)
+		for (i = 0; i < 8; i++)
+		{
+			angle = 112;
+			if (i < 4)
+				angle = 48;
+			Av1TxB(t, 59 - i, 36 + i, angle, 1);
+		}
+	if (n >= 4)
+		for (i = 0; i < 8; i++)
+			Av1TxH(t, i, 15 - i, 0, r);
+	if (n >= 5)
+		for (i = 0; i < 4; i++)
+			Av1TxB(t, 27 - i, 20 + i, 32, 1);
+	if (n == 6)
+		for (i = 0; i < 8; i++)
+		{
+			Av1TxH(t, 32 + i, 47 - i, 0, r);
+			Av1TxH(t, 48 + i, 63 - i, 1, r);
+		}
+	if (n >= 5)
+		for (i = 0; i < 16; i++)
+			Av1TxH(t, i, 31 - i, 0, r);
+	if (n == 6)
+	{
+		for (i = 0; i < 8; i++)
+			Av1TxB(t, 55 - i, 40 + i, 32, 1);
+		for (i = 0; i < 32; i++)
+			Av1TxH(t, i, 63 - i, 0, r);
+	}
+}
+
+U0 Av1InvAdstInPerm(I64 *t, I64 n)
+{//7.13.2.4, for n = 3..4.
+	I64 i, idx, n0 = 1 << n, cp[16];
+
+	for (i = 0; i < n0; i++)
+		cp[i] = t[i];
+	for (i = 0; i < n0; i++)
+	{
+		idx = n0 - i - 1;
+		if (i & 1)
+			idx = i - 1;
+		t[i] = cp[idx];
+	}
+}
+
+U0 Av1InvAdstOutPerm(I64 *t, I64 n)
+{//7.13.2.5, for n = 3..4.
+	I64 i, a, b, c, d, idx, n0 = 1 << n, cp[16];
+
+	for (i = 0; i < n0; i++)
+		cp[i] = t[i];
+	for (i = 0; i < n0; i++)
+	{
+		a    = (i >> 3) & 1;
+		b    = ((i >> 2) & 1) ^ ((i >> 3) & 1);
+		c    = ((i >> 1) & 1) ^ ((i >> 2) & 1);
+		d    = (i & 1) ^ ((i >> 1) & 1);
+		idx  = ((d << 3) | (c << 2) | (b << 1) | a) >> (4 - n);
+		t[i] = cp[idx];
+		if (i & 1)
+			t[i] = -cp[idx];
+	}
+}
+
+U0 Av1InvAdst4(I64 *t)
+{//7.13.2.6. Takes no clamping range: it uses no Hadamard rotation, and the
+//range of s, x, a7 and b7 is a conformance requirement.
+	I64 s0, s1, s2, s3, s4, s5, s6, x0, x1, x2, x3, a7, b7;
+
+	s0 = AV1_SINPI_1_9 * t[0];
+	s1 = AV1_SINPI_2_9 * t[0];
+	s2 = AV1_SINPI_3_9 * t[1];
+	s3 = AV1_SINPI_4_9 * t[2];
+	s4 = AV1_SINPI_1_9 * t[2];
+	s5 = AV1_SINPI_2_9 * t[3];
+	s6 = AV1_SINPI_4_9 * t[3];
+	a7 = t[0] - t[2];
+	b7 = a7 + t[3];
+	s0 = s0 + s3;
+	s1 = s1 - s4;
+	s3 = s2;
+	s2 = AV1_SINPI_3_9 * b7;
+	s0 = s0 + s5;
+	s1 = s1 - s6;
+	x0 = s0 + s3;
+	x1 = s1 + s3;
+	x2 = s2;
+	x3 = s0 + s1;
+	x3 = x3 - s3;
+	t[0] = Av1Round2(x0, 12);
+	t[1] = Av1Round2(x1, 12);
+	t[2] = Av1Round2(x2, 12);
+	t[3] = Av1Round2(x3, 12);
+}
+
+U0 Av1InvAdst8(I64 *t, I64 r)
+{//7.13.2.7.
+	I64 i, j;
+
+	Av1InvAdstInPerm(t, 3);
+	for (i = 0; i < 4; i++)
+		Av1TxB(t, 2 * i, 2 * i + 1, 60 - 16 * i, 1);
+	for (i = 0; i < 4; i++)
+		Av1TxH(t, i, 4 + i, 0, r);
+	for (i = 0; i < 2; i++)
+		Av1TxB(t, 4 + 3 * i, 5 + i, 48 - 32 * i, 1);
+	for (i = 0; i < 2; i++)
+		for (j = 0; j < 2; j++)
+			Av1TxH(t, 4 * j + i, 2 + 4 * j + i, 0, r);
+	for (i = 0; i < 2; i++)
+		Av1TxB(t, 2 + 4 * i, 3 + 4 * i, 32, 1);
+	Av1InvAdstOutPerm(t, 3);
+}
+
+U0 Av1InvAdst16(I64 *t, I64 r)
+{//7.13.2.8.
+	I64 i, j;
+
+	Av1InvAdstInPerm(t, 4);
+	for (i = 0; i < 8; i++)
+		Av1TxB(t, 2 * i, 2 * i + 1, 62 - 8 * i, 1);
+	for (i = 0; i < 8; i++)
+		Av1TxH(t, i, 8 + i, 0, r);
+	for (i = 0; i < 2; i++)
+	{
+		Av1TxB(t, 8 + 2 * i, 9 + 2 * i, 56 - 32 * i, 1);
+		Av1TxB(t, 13 + 2 * i, 12 + 2 * i, 8 + 32 * i, 1);
+	}
+	for (i = 0; i < 4; i++)
+		for (j = 0; j < 2; j++)
+			Av1TxH(t, 8 * j + i, 4 + 8 * j + i, 0, r);
+	for (i = 0; i < 2; i++)
+		for (j = 0; j < 2; j++)
+			Av1TxB(t, 4 + 8 * j + 3 * i, 5 + 8 * j + i, 48 - 32 * i, 1);
+	for (i = 0; i < 2; i++)
+		for (j = 0; j < 4; j++)
+			Av1TxH(t, 4 * j + i, 2 + 4 * j + i, 0, r);
+	for (i = 0; i < 4; i++)
+		Av1TxB(t, 2 + 4 * i, 3 + 4 * i, 32, 1);
+	Av1InvAdstOutPerm(t, 4);
+}
+
+U0 Av1InvAdst(I64 *t, I64 n, I64 r)
+{//7.13.2.9, for n = 2..4. FLIPADST reaches this too: 7.12.3 flips the
+//residual on the way into the frame, so the bank has no flipped variant.
+	if (n == 2)
+		Av1InvAdst4(t);
+	else if (n == 3)
+		Av1InvAdst8(t, r);
+	else
+		Av1InvAdst16(t, r);
+}
+
+U0 Av1InvWht(I64 *t, I64 shift)
+{//7.13.2.10, the lossless transform.
+	I64 a, b, c, d, e;
+
+	a  = t[0] >> shift;
+	c  = t[1] >> shift;
+	d  = t[2] >> shift;
+	b  = t[3] >> shift;
+	a += c;
+	d -= b;
+	e  = (a - d) >> 1;
+	b  = e - b;
+	c  = e - c;
+	a -= b;
+	d += c;
+	t[0] = a;
+	t[1] = b;
+	t[2] = c;
+	t[3] = d;
+}
+
+U0 Av1InvIdentity(I64 *t, I64 n)
+{//7.13.2.15, dispatching 7.13.2.11 through 7.13.2.14 for n = 2..5.
+	I64 i;
+
+	if (n == 2)
+		for (i = 0; i < 4; i++)
+			t[i] = Av1Round2(t[i] * 5793, 12);
+	else if (n == 3)
+		for (i = 0; i < 8; i++)
+			t[i] *= 2;
+	else if (n == 4)
+		for (i = 0; i < 16; i++)
+			t[i] = Av1Round2(t[i] * 11586, 12);
+	else
+		for (i = 0; i < 32; i++)
+			t[i] *= 4;
+}
+
+Bool Av1TxfmFlipLr(I64 txType)
+{//7.12.3 flipLR.
+	return ToBool(av1_htx_tab[txType] == AV1_TXFM_1D_FLIPADST);
+}
+
+Bool Av1TxfmFlipUd(I64 txType)
+{//7.12.3 flipUD.
+	return ToBool(av1_vtx_tab[txType] == AV1_TXFM_1D_FLIPADST);
+}
+
+U0 Av1InvTxfm2d(I32 *dq, I32 *res, I64 txSize, I64 txType, Bool lossless)
+{//7.13.3. dq holds Dequant column major at Min(32, h), the layout 5.11.39
+//writes; res takes Residual row major, w by h. Eight bit only: rowClampRange
+//is BitDepth + 8 and colClampRange Max(BitDepth + 6, 16), both 16.
+	I64 log2W = av1_tx_size_wide_log2[txSize];
+	I64 log2H = av1_tx_size_high_log2[txSize];
+	I64 w = 1 << log2W, h = 1 << log2H;
+	I64 rowShift = av1_txfm_row_shift[txSize], colShift = 4;
+	I64 rowType = av1_htx_tab[txType], colType = av1_vtx_tab[txType];
+	I64 i, j, th, hi = (1 << 15) - 1, t[64];
+
+	if (lossless)
+	{
+		rowShift = 0;
+		colShift = 0;
+	}
+	th = h;
+	if (th > 32)
+		th = 32;
+	for (i = 0; i < h; i++)
+	{
+		for (j = 0; j < w; j++)
+		{
+			t[j] = 0;
+			if (i < 32 && j < 32)
+				t[j] = dq[j * th + i];
+		}
+		//2896 is Round(4096 / Sqrt(2)). Only a 2:1 shape carries the extra
+		//factor; Abs(log2W - log2H) is 2 on the 4:1 ones.
+		if (log2W - log2H == 1 || log2H - log2W == 1)
+			for (j = 0; j < w; j++)
+				t[j] = Av1Round2(t[j] * 2896, 12);
+		if (lossless)
+			Av1InvWht(t, 2);
+		else if (rowType == AV1_TXFM_1D_DCT)
+			Av1InvDct(t, log2W, 16);
+		else if (rowType == AV1_TXFM_1D_IDTX)
+			Av1InvIdentity(t, log2W);
+		else
+			Av1InvAdst(t, log2W, 16);
+		for (j = 0; j < w; j++)
+			res[i * w + j] = Av1Round2(t[j], rowShift);
+	}
+	for (j = 0; j < w; j++)
+	{
+		//The clamp between the two passes, folded into the column read.
+		for (i = 0; i < h; i++)
+			t[i] = Av1Clip3(-hi - 1, hi, res[i * w + j]);
+		if (lossless)
+			Av1InvWht(t, 0);
+		else if (colType == AV1_TXFM_1D_DCT)
+			Av1InvDct(t, log2H, 16);
+		else if (colType == AV1_TXFM_1D_IDTX)
+			Av1InvIdentity(t, log2H);
+		else
+			Av1InvAdst(t, log2H, 16);
+		for (i = 0; i < h; i++)
+			res[i * w + j] = Av1Round2(t[i], colShift);
+	}
+}
+
+/***** reconstruction, 7.12.3 *****/
+
+U0 Av1Reconstruct(CAv1Dec *d, I64 plane, I64 x, I64 y, I64 txSize)
+{//7.12.3 steps 2 and 3. Step 1 is 5.11.39's, which leaves Dequant in
+//d->coeffs. x and y are plane pixels.
+	I64		 w = av1_tx_size_wide[txSize], h = av1_tx_size_high[txSize];
+	I64		 stride = d->stride[plane], txType = d->plane_tx_type;
+	I64		 i, j, xx, yy, k;
+	Bool	 flipLr = Av1TxfmFlipLr(txType), flipUd = Av1TxfmFlipUd(txType);
+	Bool	 lossless = ToBool(d->frame->lossless[d->blk_seg_id]);
+	I32		*res = d->residual;
+	U8		*p = d->plane[plane] + y * stride + x;
+
+	Av1InvTxfm2d(d->coeffs, res, txSize, txType, lossless);
+	for (i = 0; i < h; i++)
+	{
+		yy = i;
+		if (flipUd)
+			yy = h - i - 1;
+		for (j = 0; j < w; j++)
+		{
+			xx = j;
+			if (flipLr)
+				xx = w - j - 1;
+			k    = yy * stride + xx;
+			p[k] = Av1Clip3(0, 255, p[k] + res[i * w + j]);
+		}
+	}
+}
+
+Bool Av1TransformBlock(CAv1Dec *d, I64 plane, I64 blkRow, I64 blkCol,
+					   I64 txSize, I64 planeBSize, I64 bw, I64 bh)
+{//5.11.35 transform_block.
+	CAv1Seq	*s = d->seq;
+	I64		 subX = 0, subY = 0, startX, startY, sbRow, sbCol, mask;
+	I64		 stepX = av1_tx_size_wide_unit[txSize];
+	I64		 stepY = av1_tx_size_high_unit[txSize];
+	I64		 mode, fiMode = -1, angle, i, j;
+	Bool	 haveL, haveA, haveAR, haveBL;
+	U8		*bd, *lf;
+
+	if (plane)
+	{
+		subX = s->subsampling_x;
+		subY = s->subsampling_y;
+	}
+	startX = ((d->blk_col >> subX) + blkCol) * 4;
+	startY = ((d->blk_row >> subY) + blkRow) * 4;
+	mask   = d->sb_size4 - 1;
+	sbRow  = (((startY << subY) >> 2) & mask) >> subY;
+	sbCol  = (((startX << subX) >> 2) & mask) >> subX;
+	haveL  = ToBool(d->blk_avail_l || blkCol);
+	haveA  = ToBool(d->blk_avail_u || blkRow);
+	mode   = d->blk_y_mode;
+	angle  = d->blk_angle_y;
+	if (plane)
+	{
+		haveL = ToBool(d->blk_avail_l_chroma || blkCol);
+		haveA = ToBool(d->blk_avail_u_chroma || blkRow);
+		mode  = d->blk_uv_mode;
+		angle = d->blk_angle_uv;
+		if (mode == AV1_UV_CFL_PRED)
+			mode = AV1_DC_PRED;			//get_uv_mode
+	}
+	else
+		fiMode = d->blk_filter_mode;
+	bd     = d->block_decoded + plane * AV1_BD_PLANE;
+	haveAR = ToBool(bd[sbRow * AV1_BD_STRIDE + sbCol + stepX + 1]);
+	haveBL = ToBool(bd[(sbRow + stepY + 1) * AV1_BD_STRIDE + sbCol]);
+	Av1PredictIntra(d, plane, startX, startY, haveL, haveA, haveAR, haveBL,
+					mode, angle, fiMode, av1_tx_size_wide_log2[txSize],
+					av1_tx_size_high_log2[txSize]);
+	if (plane && d->blk_uv_mode == AV1_UV_CFL_PRED)
+		Av1PredictCfl(d, plane, startX, startY, txSize);
+	if (!plane)
+	{
+		d->max_luma_w = startX + stepX * 4;
+		d->max_luma_h = startY + stepY * 4;
+	}
+	if (!d->blk_skip)
+	{
+		if (!Av1CoeffsTxb(d, plane, blkRow, blkCol, txSize, planeBSize, bw, bh))
+			return FALSE;
+		if (d->eob > 0)
+			Av1Reconstruct(d, plane, startX, startY, txSize);
+	}
+	lf = d->lf_tx_sizes[plane] + (startY >> 2) * d->mi_stride + (startX >> 2);
+	for (i = 0; i < stepY; i++)
+		for (j = 0; j < stepX; j++)
+		{
+			lf[i * d->mi_stride + j] = txSize;
+			bd[(sbRow + i + 1) * AV1_BD_STRIDE + sbCol + j + 1] = 1;
+		}
+
+	return TRUE;
+}
+
+Bool Av1Residual(CAv1Dec *d)
+{//5.11.34 residual, as decode_token_recon_block on the intra path. The
+//transform loop walks 64x64 units so that a larger block interleaves its
+//planes one unit at a time. A skipped block still predicts every transform
+//block; only the coefficients go away.
+	CAv1Seq		*s = d->seq;
+	CAv1Frame	*f = d->frame;
+	I64			 maxW, maxH, muW, muH, row, col, p, ssx, ssy, pbs, tx;
+	I64			 stepR, stepC, unitW, unitH, bw, bh, br, bc;
+
+	if (d->blk_skip)
+		Av1ResetEntropyCtx(d);
+	maxW = Av1MaxBlockWide(d, d->blk_size, 0);
+	maxH = Av1MaxBlockHigh(d, d->blk_size, 0);
+	muW  = Av1Clip3(0, AV1_MU_BLOCKS, maxW);
+	muH  = Av1Clip3(0, AV1_MU_BLOCKS, maxH);
+	for (row = 0; row < maxH; row += muH)
+		for (col = 0; col < maxW; col += muW)
+			for (p = 0; p < d->num_planes; p++)
+			{
+				if (p && !d->blk_has_chroma)
+					break;
+				ssx = 0;
+				ssy = 0;
+				if (p)
+				{
+					ssx = s->subsampling_x;
+					ssy = s->subsampling_y;
+				}
+				pbs = av1_ss_size_lookup[d->blk_size *
+										 AV1_SS_SIZE_LOOKUP_S0 +
+										 ssx * AV1_SS_SIZE_LOOKUP_S1 + ssy];
+				//av1_get_tx_size: lossless holds every plane at 4x4, chroma
+				//included.
+				tx  = d->blk_tx_size;
+				if (f->lossless[d->blk_seg_id])
+					tx = AV1_TX_4X4;
+				else if (p)
+					tx = Av1AdjustedTxSize(av1_max_txsize_rect_lookup[pbs]);
+				bw    = Av1MaxBlockWide(d, pbs, ssx);
+				bh    = Av1MaxBlockHigh(d, pbs, ssy);
+				stepR = av1_tx_size_high_unit[tx];
+				stepC = av1_tx_size_wide_unit[tx];
+				unitW = Av1Clip3(0, maxW, muW + col);
+				unitH = Av1Clip3(0, maxH, muH + row);
+				//ROUND_POWER_OF_TWO rounds up, so a subsampled plane covers
+				//an odd luma unit whole.
+				unitW = (unitW + ((1 << ssx) >> 1)) >> ssx;
+				unitH = (unitH + ((1 << ssy) >> 1)) >> ssy;
+				for (br = row >> ssy; br < unitH; br += stepR)
+					for (bc = col >> ssx; bc < unitW; bc += stepC)
+						if (!Av1TransformBlock(d, p, br, bc, tx, pbs, bw,
+											   bh))
+							return FALSE;
+			}
+
+	return TRUE;
+}
+
+Bool Av1DecodeBlock(CAv1Dec *d, I64 r, I64 c, I64 bSize)
+{//5.11.5 decode_block, taking mode_info through 5.11.7 intra_frame_mode_info,
+//then read_block_tx_size and 5.11.34 residual. palette_tokens and
+//compute_prediction are absent.
+	CAv1Seq		*s = d->seq;
+	CAv1Frame	*f = d->frame;
+	I64			 bw4 = av1_mi_size_wide[bSize];
+	I64			 bh4 = av1_mi_size_high[bSize];
+	I64			 segId = 0, skip, yMode, uvMode = AV1_UV_DC_PRED, txSize;
+	I64			 nsyms, mode, x, y, i, k, intraDir, fiMode;
+	I64			 angleY = 0, angleUV = 0, alphaU = 0, alphaV = 0;
+	Bool		 hasChroma = TRUE, useAngle, cflOk;
+	Bool		 availUC = FALSE, availLC = FALSE;
+	U16			*cdf;
+
+	if (f->allow_intrabc)
+	{
+		d->err = AV1_ERR_INTRABC;
+
+		return FALSE;
+	}
+	//is_chroma_reference: a block one 4x4 wide or high under subsampling
+	//leaves chroma to the second of the pair, which then covers both.
+	if (s->subsampling_y && bh4 == 1 && !(r & 1))
+		hasChroma = FALSE;
+	if (s->subsampling_x && bw4 == 1 && !(c & 1))
+		hasChroma = FALSE;
+	if (hasChroma)
+	{//AvailUChroma and AvailLChroma, 5.11.5: a chroma reference block one 4x4
+	//wide or high looks past its own pair to the neighbouring one.
+		availUC = Av1IsInside(d, r - 1, c);
+		availLC = Av1IsInside(d, r, c - 1);
+		if (s->subsampling_y && bh4 == 1)
+			availUC = Av1IsInside(d, r - 2, c);
+		if (s->subsampling_x && bw4 == 1)
+			availLC = Av1IsInside(d, r, c - 2);
+	}
+	if (f->seg_id_pre_skip)
+		segId = Av1IntraSegmentId(d, r, c, bw4, bh4, FALSE);
+	if (segId < 0)
+	{
+		d->err = AV1_ERR_SEGMENT;
+
+		return FALSE;
+	}
+	skip = Av1ReadSkip(d, r, c, segId);
+	if (!f->seg_id_pre_skip)
+		segId = Av1IntraSegmentId(d, r, c, bw4, bh4, ToBool(skip));
+	if (segId < 0)
+	{
+		d->err = AV1_ERR_SEGMENT;
+
+		return FALSE;
+	}
+	Av1ReadCdef(d, r, c, bSize, skip);
+	Av1ReadDeltaParams(d, r, c, bSize, skip);
+	yMode    = Av1ReadIntraFrameYMode(d, r, c);
+	useAngle = ToBool(bSize >= AV1_BLOCK_8X8);
+	if (useAngle && Av1IsDirectional(yMode))
+		angleY = Av1ReadAngleDelta(d, yMode);
+	if (!s->mono_chrome && hasChroma)
+	{
+		cflOk  = Av1CflAllowed(d, bSize, segId);
+		nsyms  = AV1_UV_INTRA_MODES - 1;
+		if (cflOk)
+			nsyms = AV1_UV_INTRA_MODES;
+		cdf    = d->cdf.c + AV1_CDF_UV_MODE_CDF_O +
+				 ToI64(cflOk) * AV1_CDF_UV_MODE_CDF_S0 +
+				 yMode * AV1_CDF_UV_MODE_CDF_S1;
+		uvMode = Av1ReadSymbol(&d->msac, cdf, nsyms);
+		mode   = uvMode;
+		if (uvMode == AV1_UV_CFL_PRED)
+		{
+			Av1ReadCflAlphas(d, &alphaU, &alphaV);
+			mode = AV1_DC_PRED;			//get_uv_mode, identity elsewhere
+		}
+		if (useAngle && Av1IsDirectional(mode))
+			angleUV = Av1ReadAngleDelta(d, mode);
+	}
+	if (Av1AllowPalette(f, bSize) &&
+		!Av1PaletteModeInfo(d, bSize, yMode, uvMode, hasChroma))
+	{
+		d->err = AV1_ERR_PALETTE;
+
+		return FALSE;
+	}
+	intraDir = Av1FilterIntraModeInfo(d, bSize, yMode, &fiMode);
+	txSize   = Av1ReadTxSize(d, r, c, bSize, segId);
+	Av1SetTxfmCtx(d, r, c, bw4, bh4, txSize);
+	for (y = 0; y < bh4; y++)
+		for (x = 0; x < bw4; x++)
+		{
+			k = (r + y) * d->mi_stride + c + x;
+			d->mi_sizes[k]           = bSize;
+			d->y_modes[k]            = yMode;
+			d->uv_modes[k]           = uvMode;
+			d->tx_sizes[k]           = txSize;
+			d->skips[k]              = skip;
+			d->ref_frames[k * 2]     = AV1_INTRA_FRAME;
+			d->ref_frames[k * 2 + 1] = AV1_REF_NONE;
+			for (i = 0; i < AV1_FRAME_LF_COUNT; i++)
+				d->delta_lfs[k * AV1_FRAME_LF_COUNT + i] = d->delta_lf[i];
+		}
+	d->blk_row            = r;
+	d->blk_col            = c;
+	d->blk_size           = bSize;
+	d->blk_seg_id         = segId;
+	d->blk_skip           = skip;
+	d->blk_tx_size        = txSize;
+	d->blk_y_mode         = yMode;
+	d->blk_uv_mode        = uvMode;
+	d->blk_intra_dir      = intraDir;
+	d->blk_angle_y        = angleY;
+	d->blk_angle_uv       = angleUV;
+	d->blk_filter_mode    = fiMode;
+	d->blk_cfl_alpha_u    = alphaU;
+	d->blk_cfl_alpha_v    = alphaV;
+	d->blk_has_chroma     = hasChroma;
+	d->blk_avail_u        = Av1IsInside(d, r - 1, c);
+	d->blk_avail_l        = Av1IsInside(d, r, c - 1);
+	d->blk_avail_u_chroma = availUC;
+	d->blk_avail_l_chroma = availLC;
+	if (!Av1Residual(d))
+		return FALSE;
+	d->blocks++;
+
+	return TRUE;
+}
+
+Bool Av1DecodePartition(CAv1Dec *d, I64 r, I64 c, I64 bSize)
+{//5.11.4.
+	CAv1Seq		*s = d->seq;
+	CAv1Frame	*f = d->frame;
+	I64			 num4x4, half4x4, quarter4x4, sqr, partition;
+	I64			 subSize, splitSize, i, rr, cc;
+	Bool		 hasRows, hasCols;
+
+	if (r >= f->mi_rows || c >= f->mi_cols)
+		return TRUE;
+	num4x4     = av1_mi_size_wide[bSize];
+	half4x4    = num4x4 >> 1;
+	quarter4x4 = half4x4 >> 1;
+	hasRows    = ToBool(r + half4x4 < f->mi_rows);
+	hasCols    = ToBool(c + half4x4 < f->mi_cols);
+	if (bSize < AV1_BLOCK_8X8)
+		partition = AV1_PARTITION_NONE;
+	else
+		partition = Av1ReadPartition(d, r, c, bSize, hasRows, hasCols);
+	//av1_subsize_lookup is indexed by the square block sizes only, whose index
+	//is Mi_Width_Log2.
+	sqr       = av1_mi_size_wide_log2[bSize];
+	subSize   = av1_subsize_lookup[partition * AV1_SUBSIZE_LOOKUP_S0 + sqr];
+	splitSize = av1_subsize_lookup[AV1_PARTITION_SPLIT *
+								   AV1_SUBSIZE_LOOKUP_S0 + sqr];
+	if (subSize == AV1_BLOCK_INVALID)
+	{
+		d->err = AV1_ERR_PARTITION;
+
+		return FALSE;
+	}
+	//6.10.4: get_plane_residual_size(subSize, 1) must not be BLOCK_INVALID,
+	//which it is for a chroma aspect ratio outside 1:4 to 4:1. Only 4:2:2
+	//reaches it, on a partition narrower than eight luma samples.
+	if (av1_ss_size_lookup[subSize * AV1_SS_SIZE_LOOKUP_S0 +
+						   s->subsampling_x * AV1_SS_SIZE_LOOKUP_S1 +
+						   s->subsampling_y] == AV1_BLOCK_INVALID)
+	{
+		d->err = AV1_ERR_CHROMASZ;
+
+		return FALSE;
+	}
+	if (partition == AV1_PARTITION_NONE)
+		return Av1DecodeBlock(d, r, c, subSize);
+	else if (partition == AV1_PARTITION_HORZ)
+	{
+		if (!Av1DecodeBlock(d, r, c, subSize))
+			return FALSE;
+		if (hasRows)
+			return Av1DecodeBlock(d, r + half4x4, c, subSize);
+	}
+	else if (partition == AV1_PARTITION_VERT)
+	{
+		if (!Av1DecodeBlock(d, r, c, subSize))
+			return FALSE;
+		if (hasCols)
+			return Av1DecodeBlock(d, r, c + half4x4, subSize);
+	}
+	else if (partition == AV1_PARTITION_SPLIT)
+	{
+		if (!Av1DecodePartition(d, r, c, subSize))
+			return FALSE;
+		if (!Av1DecodePartition(d, r, c + half4x4, subSize))
+			return FALSE;
+		if (!Av1DecodePartition(d, r + half4x4, c, subSize))
+			return FALSE;
+		if (!Av1DecodePartition(d, r + half4x4, c + half4x4, subSize))
+			return FALSE;
+	}
+	else if (partition == AV1_PARTITION_HORZ_A)
+	{
+		if (!Av1DecodeBlock(d, r, c, splitSize) ||
+			!Av1DecodeBlock(d, r, c + half4x4, splitSize) ||
+			!Av1DecodeBlock(d, r + half4x4, c, subSize))
+			return FALSE;
+	}
+	else if (partition == AV1_PARTITION_HORZ_B)
+	{
+		if (!Av1DecodeBlock(d, r, c, subSize) ||
+			!Av1DecodeBlock(d, r + half4x4, c, splitSize) ||
+			!Av1DecodeBlock(d, r + half4x4, c + half4x4, splitSize))
+			return FALSE;
+	}
+	else if (partition == AV1_PARTITION_VERT_A)
+	{
+		if (!Av1DecodeBlock(d, r, c, splitSize) ||
+			!Av1DecodeBlock(d, r + half4x4, c, splitSize) ||
+			!Av1DecodeBlock(d, r, c + half4x4, subSize))
+			return FALSE;
+	}
+	else if (partition == AV1_PARTITION_VERT_B)
+	{
+		if (!Av1DecodeBlock(d, r, c, subSize) ||
+			!Av1DecodeBlock(d, r, c + half4x4, splitSize) ||
+			!Av1DecodeBlock(d, r + half4x4, c + half4x4, splitSize))
+			return FALSE;
+	}
+	else if (partition == AV1_PARTITION_HORZ_4)
+	{//hasRows held when the symbol was read, so only the fourth quarter can
+	//fall outside the frame.
+		for (i = 0; i < 4; i++)
+		{
+			rr = r + quarter4x4 * i;
+			if (i == 3 && rr >= f->mi_rows)
+				break;
+			if (!Av1DecodeBlock(d, rr, c, subSize))
+				return FALSE;
+		}
+	}
+	else
+	{
+		for (i = 0; i < 4; i++)
+		{
+			cc = c + quarter4x4 * i;
+			if (i == 3 && cc >= f->mi_cols)
+				break;
+			if (!Av1DecodeBlock(d, r, cc, subSize))
+				return FALSE;
+		}
+	}
+
+	return TRUE;
+}
+
+Bool Av1DecodeTile(CAv1Dec *d, CAv1Tile *t, U8 *obu)
+{//5.11.1 per tile setup, then 5.11.2.
+	CAv1Frame	*f = d->frame;
+	I64			 r, c, i, j, k;
+
+	d->mi_row_start = t->mi_row_start;
+	d->mi_row_end   = t->mi_row_end;
+	d->mi_col_start = t->mi_col_start;
+	d->mi_col_end   = t->mi_col_end;
+	d->cur_q_index  = f->base_q_idx;
+	d->err          = 0;
+	Av1CdfCopy(&d->cdf, &d->frame_cdf);
+	Av1MsacInit(&d->msac, obu + t->offset, t->size, !f->disable_cdf_update);
+	Av1ClearAboveContext(d);
+	for (i = 0; i < AV1_FRAME_LF_COUNT; i++)
+		d->delta_lf[i] = 0;
+	for (i = 0; i < 3; i++)
+		for (j = 0; j < 2; j++)
+		{
+			d->lr_ref_xqd[i * 2 + j] = av1_sgrproj_xqd_mid[j];
+			for (k = 0; k < 3; k++)
+				d->lr_ref_wiener[i * 6 + j * 3 + k] = av1_wiener_taps_mid[k];
+		}
+	for (r = d->mi_row_start; r < d->mi_row_end; r += d->sb_size4)
+	{
+		Av1ClearLeftContext(d);
+		for (c = d->mi_col_start; c < d->mi_col_end; c += d->sb_size4)
+		{
+			d->read_deltas = f->delta_q_present;
+			Av1ClearBlockDecoded(d, r, c);
+			Av1ReadLr(d, r, c, d->sb_size);
+			if (!Av1DecodePartition(d, r, c, d->sb_size))
+				return FALSE;
+		}
+	}
+	if (!f->disable_frame_end_update_cdf &&
+		t->num == f->context_update_tile_id)
+		Av1CdfCopy(&d->saved_cdf, &d->cdf);
+
+	return Av1MsacExitOk(&d->msac, t->size);
+}
+
+U0 Av1FrameEndUpdateCdf(CAv1Dec *d)
+{//7.7.
+	Av1CdfCopy(&d->frame_cdf, &d->saved_cdf);
+}
+
+/***** deblocking loop filter, 7.14 *****/
+//
+//Mirrors libaom av1_loop_filter_frame and set_lpf_parameters in
+//av1/common/av1_loopfilter.c, with the sample kernels of aom_dsp/loopfilter.c.
+
+#define AV1_SEG_LVL_ALT_LF_Y_V		1
+
+I64 Av1ClipS8(I64 v)
+{//signed_char_clamp. 7.14.6.3 works on samples biased by 0x80, so its
+//intermediates saturate at -128 and 127, not at the sample range.
+	if (v < -128)
+		return -128;
+	if (v > 127)
+		return 127;
+
+	return v;
+}
+
+U0 Av1Filter4(U8 *dst, I64 step, I64 thresh)
+{//7.14.6.3 narrow filter, as libaom filter4, including its high edge variance
+//test. The caller owns the filter mask; filter6, filter8 and filter14 fall
+//back here with their own.
+	I64		p1 = dst[step * -2], p0 = dst[step * -1];
+	I64		q0 = dst[0], q1 = dst[step], f, f1, f2;
+	Bool	hev = ToBool(AbsI64(p1 - p0) > thresh || AbsI64(q1 - q0) > thresh);
+
+	f = 0;
+	if (hev)
+		f = Av1ClipS8(p1 - q1);
+	f  = Av1ClipS8(f + 3 * (q0 - p0));
+	f1 = Av1ClipS8(f + 4) >> 3;
+	f2 = Av1ClipS8(f + 3) >> 3;
+	dst[step * -1] = Av1Clip3(0, 255, p0 + f2);
+	dst[0]         = Av1Clip3(0, 255, q0 - f1);
+	if (hev)
+		return;
+	f = (f1 + 1) >> 1;
+	dst[step * -2] = Av1Clip3(0, 255, p1 + f);
+	dst[step]      = Av1Clip3(0, 255, q1 - f);
+}
+
+U0 Av1Filter6(U8 *dst, I64 step)
+{//7.14.6.4 with filterSize 8 on a chroma plane, as libaom filter6: the five
+//tap [1, 2, 2, 2, 1].
+	I64 p2 = dst[step * -3], p1 = dst[step * -2], p0 = dst[step * -1];
+	I64 q0 = dst[0], q1 = dst[step], q2 = dst[step * 2];
+
+	dst[step * -2] = (p2 * 3 + p1 * 2 + p0 * 2 + q0 + 4) >> 3;
+	dst[step * -1] = (p2 + p1 * 2 + p0 * 2 + q0 * 2 + q1 + 4) >> 3;
+	dst[0]         = (p1 + p0 * 2 + q0 * 2 + q1 * 2 + q2 + 4) >> 3;
+	dst[step]      = (p0 + q0 * 2 + q1 * 2 + q2 * 3 + 4) >> 3;
+}
+
+U0 Av1Filter8(U8 *dst, I64 step)
+{//7.14.6.4 with filterSize 8 on luma, as libaom filter8: the seven tap
+//[1, 1, 1, 2, 1, 1, 1].
+	I64 p3 = dst[step * -4], p2 = dst[step * -3], p1 = dst[step * -2];
+	I64 p0 = dst[step * -1], q0 = dst[0], q1 = dst[step];
+	I64 q2 = dst[step * 2], q3 = dst[step * 3];
+
+	dst[step * -3] = (p3 * 3 + p2 * 2 + p1 + p0 + q0 + 4) >> 3;
+	dst[step * -2] = (p3 * 2 + p2 + p1 * 2 + p0 + q0 + q1 + 4) >> 3;
+	dst[step * -1] = (p3 + p2 + p1 + p0 * 2 + q0 + q1 + q2 + 4) >> 3;
+	dst[0]         = (p2 + p1 + p0 + q0 * 2 + q1 + q2 + q3 + 4) >> 3;
+	dst[step]      = (p1 + p0 + q0 + q1 * 2 + q2 + q3 * 2 + 4) >> 3;
+	dst[step * 2]  = (p0 + q0 + q1 + q2 * 2 + q3 * 3 + 4) >> 3;
+}
+
+U0 Av1Filter14(U8 *dst, I64 step)
+{//7.14.6.4 with filterSize 16, as libaom filter14: the thirteen tap
+//[1, 1, 1, 1, 1, 2, 2, 2, 1, 1, 1, 1, 1]. p6 and q6 are read but not written.
+	I64 p6 = dst[step * -7], p5 = dst[step * -6], p4 = dst[step * -5];
+	I64 p3 = dst[step * -4], p2 = dst[step * -3], p1 = dst[step * -2];
+	I64 p0 = dst[step * -1], q0 = dst[0], q1 = dst[step];
+	I64 q2 = dst[step * 2], q3 = dst[step * 3], q4 = dst[step * 4];
+	I64 q5 = dst[step * 5], q6 = dst[step * 6];
+
+	dst[step * -6] = (p6 * 7 + p5 * 2 + p4 * 2 + p3 + p2 + p1 + p0 + q0 +
+					  8) >> 4;
+	dst[step * -5] = (p6 * 5 + p5 * 2 + p4 * 2 + p3 * 2 + p2 + p1 + p0 + q0 +
+					  q1 + 8) >> 4;
+	dst[step * -4] = (p6 * 4 + p5 + p4 * 2 + p3 * 2 + p2 * 2 + p1 + p0 + q0 +
+					  q1 + q2 + 8) >> 4;
+	dst[step * -3] = (p6 * 3 + p5 + p4 + p3 * 2 + p2 * 2 + p1 * 2 + p0 + q0 +
+					  q1 + q2 + q3 + 8) >> 4;
+	dst[step * -2] = (p6 * 2 + p5 + p4 + p3 + p2 * 2 + p1 * 2 + p0 * 2 + q0 +
+					  q1 + q2 + q3 + q4 + 8) >> 4;
+	dst[step * -1] = (p6 + p5 + p4 + p3 + p2 + p1 * 2 + p0 * 2 + q0 * 2 + q1 +
+					  q2 + q3 + q4 + q5 + 8) >> 4;
+	dst[0]         = (p5 + p4 + p3 + p2 + p1 + p0 * 2 + q0 * 2 + q1 * 2 + q2 +
+					  q3 + q4 + q5 + q6 + 8) >> 4;
+	dst[step]      = (p4 + p3 + p2 + p1 + p0 + q0 * 2 + q1 * 2 + q2 * 2 + q3 +
+					  q4 + q5 + q6 * 2 + 8) >> 4;
+	dst[step * 2]  = (p3 + p2 + p1 + p0 + q0 + q1 * 2 + q2 * 2 + q3 * 2 + q4 +
+					  q5 + q6 * 3 + 8) >> 4;
+	dst[step * 3]  = (p2 + p1 + p0 + q0 + q1 + q2 * 2 + q3 * 2 + q4 * 2 + q5 +
+					  q6 * 4 + 8) >> 4;
+	dst[step * 4]  = (p1 + p0 + q0 + q1 + q2 + q3 * 2 + q4 * 2 + q5 * 2 +
+					  q6 * 5 + 8) >> 4;
+	dst[step * 5]  = (p0 + q0 + q1 + q2 + q3 + q4 * 2 + q5 * 2 + q6 * 7 +
+					  8) >> 4;
+}
+
+U0 Av1Deblock4(U8 *dst, I64 step, I64 blimit, I64 limit, I64 thresh)
+{//aom_lpf_horizontal_4_c and aom_lpf_vertical_4_c: filter_mask2 over p1
+//through q1, then filter4.
+	I64 p1 = dst[step * -2], p0 = dst[step * -1];
+	I64 q0 = dst[0], q1 = dst[step];
+
+	if (AbsI64(p1 - p0) > limit || AbsI64(q1 - q0) > limit ||
+		AbsI64(p0 - q0) * 2 + (AbsI64(p1 - q1) >> 1) > blimit)
+		return;
+	Av1Filter4(dst, step, thresh);
+}
+
+U0 Av1Deblock6(U8 *dst, I64 step, I64 blimit, I64 limit, I64 thresh)
+{//aom_lpf_horizontal_6_c and aom_lpf_vertical_6_c: filter_mask3_chroma and
+//flat_mask3_chroma over p2 through q2, then filter6.
+	I64 p2 = dst[step * -3], p1 = dst[step * -2], p0 = dst[step * -1];
+	I64 q0 = dst[0], q1 = dst[step], q2 = dst[step * 2];
+
+	if (AbsI64(p2 - p1) > limit || AbsI64(p1 - p0) > limit ||
+		AbsI64(q1 - q0) > limit || AbsI64(q2 - q1) > limit ||
+		AbsI64(p0 - q0) * 2 + (AbsI64(p1 - q1) >> 1) > blimit)
+		return;
+	if (AbsI64(p1 - p0) > 1 || AbsI64(q1 - q0) > 1 || AbsI64(p2 - p0) > 1 ||
+		AbsI64(q2 - q0) > 1)
+	{
+		Av1Filter4(dst, step, thresh);
+
+		return;
+	}
+	Av1Filter6(dst, step);
+}
+
+U0 Av1Deblock8(U8 *dst, I64 step, I64 blimit, I64 limit, I64 thresh)
+{//aom_lpf_horizontal_8_c and aom_lpf_vertical_8_c: filter_mask and flat_mask4
+//over p3 through q3, then filter8.
+	I64 p3 = dst[step * -4], p2 = dst[step * -3], p1 = dst[step * -2];
+	I64 p0 = dst[step * -1], q0 = dst[0], q1 = dst[step];
+	I64 q2 = dst[step * 2], q3 = dst[step * 3];
+
+	if (AbsI64(p3 - p2) > limit || AbsI64(p2 - p1) > limit ||
+		AbsI64(p1 - p0) > limit || AbsI64(q1 - q0) > limit ||
+		AbsI64(q2 - q1) > limit || AbsI64(q3 - q2) > limit ||
+		AbsI64(p0 - q0) * 2 + (AbsI64(p1 - q1) >> 1) > blimit)
+		return;
+	if (AbsI64(p1 - p0) > 1 || AbsI64(q1 - q0) > 1 || AbsI64(p2 - p0) > 1 ||
+		AbsI64(q2 - q0) > 1 || AbsI64(p3 - p0) > 1 || AbsI64(q3 - q0) > 1)
+	{
+		Av1Filter4(dst, step, thresh);
+
+		return;
+	}
+	Av1Filter8(dst, step);
+}
+
+U0 Av1Deblock14(U8 *dst, I64 step, I64 blimit, I64 limit, I64 thresh)
+{//aom_lpf_horizontal_14_c and aom_lpf_vertical_14_c: filter_mask and
+//flat_mask4 over p3 through q3, a second flat_mask4 over p6, p5, p4 and q4,
+//q5, q6, then filter14.
+	I64 p6 = dst[step * -7], p5 = dst[step * -6], p4 = dst[step * -5];
+	I64 p3 = dst[step * -4], p2 = dst[step * -3], p1 = dst[step * -2];
+	I64 p0 = dst[step * -1], q0 = dst[0], q1 = dst[step];
+	I64 q2 = dst[step * 2], q3 = dst[step * 3], q4 = dst[step * 4];
+	I64 q5 = dst[step * 5], q6 = dst[step * 6];
+
+	if (AbsI64(p3 - p2) > limit || AbsI64(p2 - p1) > limit ||
+		AbsI64(p1 - p0) > limit || AbsI64(q1 - q0) > limit ||
+		AbsI64(q2 - q1) > limit || AbsI64(q3 - q2) > limit ||
+		AbsI64(p0 - q0) * 2 + (AbsI64(p1 - q1) >> 1) > blimit)
+		return;
+	if (AbsI64(p1 - p0) > 1 || AbsI64(q1 - q0) > 1 || AbsI64(p2 - p0) > 1 ||
+		AbsI64(q2 - q0) > 1 || AbsI64(p3 - p0) > 1 || AbsI64(q3 - q0) > 1)
+	{
+		Av1Filter4(dst, step, thresh);
+
+		return;
+	}
+	if (AbsI64(p5 - p0) > 1 || AbsI64(q4 - q0) > 1 || AbsI64(p4 - p0) > 1 ||
+		AbsI64(q5 - q0) > 1 || AbsI64(p6 - p0) > 1 || AbsI64(q6 - q0) > 1)
+	{
+		Av1Filter8(dst, step);
+
+		return;
+	}
+	Av1Filter14(dst, step);
+}
+
+U0 Av1LfSharpness(CAv1Dec *d)
+{//limit, blimit and thresh of 7.14.4 for every level, as libaom
+//update_sharpness plus the hev threshold av1_loop_filter_init fills in.
+	I64 sharp = d->frame->loop_filter_sharpness, lvl, lim;
+
+	for (lvl = 0; lvl <= AV1_MAX_LOOP_FILTER; lvl++)
+	{
+		lim = lvl >> (ToI64(sharp > 0) + ToI64(sharp > 4));
+		if (sharp > 0 && lim > 9 - sharp)
+			lim = 9 - sharp;
+		if (lim < 1)
+			lim = 1;
+		d->lf_lim[lvl]  = lim;
+		d->lf_blim[lvl] = 2 * (lvl + 2) + lim;
+		d->lf_thr[lvl]  = lvl >> 4;
+	}
+}
+
+I64 Av1LfStrength(CAv1Dec *d, I64 row, I64 col, I64 plane, I64 pass)
+{//The lvl of 7.14.4 through the selection of 7.14.5, as libaom
+//get_filter_level. idx selects the level, the delta_lf slot and the segment
+//feature alike: 0 and 1 are luma vertical and horizontal, 2 is U, 3 is V.
+	CAv1Frame	*f = d->frame;
+	I64			 k = row * d->mi_stride + col, idx = pass, seg, feat, lvl;
+	I64			 nShift;
+
+	if (plane)
+		idx = plane + 1;
+	lvl = f->loop_filter_level[idx];
+	if (f->delta_lf_present)
+	{
+		if (f->delta_lf_multi)
+			lvl += d->delta_lfs[k * AV1_FRAME_LF_COUNT + idx];
+		else
+			lvl += d->delta_lfs[k * AV1_FRAME_LF_COUNT];
+		lvl = Av1Clip3(0, AV1_MAX_LOOP_FILTER, lvl);
+	}
+	seg  = d->segment_ids[k];
+	feat = AV1_SEG_LVL_ALT_LF_Y_V + idx;
+	if (Av1SegFeatureActive(f, seg, feat))
+		lvl = Av1Clip3(0, AV1_MAX_LOOP_FILTER,
+					   lvl + f->feature_data[seg * AV1_SEG_LVL_MAX + feat]);
+	if (!f->loop_filter_delta_enabled)
+		return lvl;
+	//RefFrame[0] is INTRA_FRAME on every block of an intra frame, so the mode
+	//delta of 7.14.5 never applies.
+	nShift = lvl >> 5;
+	lvl   += f->loop_filter_ref_deltas[AV1_INTRA_FRAME] << nShift;
+
+	return Av1Clip3(0, AV1_MAX_LOOP_FILTER, lvl);
+}
+
+U0 Av1LfEdge(CAv1Dec *d, I64 plane, I64 pass, I64 row, I64 col)
+{//7.14.2 for one 4x4 of the plane and the edge on its left, pass 0, or above
+//it, pass 1. row and col are in luma 4x4 units.
+	CAv1Seq	*s = d->seq;
+	I64		 subX = 0, subY = 0, x, y, xP, yP, coord, prevRow, prevCol;
+	I64		 txSz, prevTx, base, sz, lvl, blim, lim, thr, i, step, run;
+	U8		*dst;
+
+	if (plane)
+	{
+		subX = s->subsampling_x;
+		subY = s->subsampling_y;
+	}
+	//onScreen, in luma coordinates. The 4x4 grid rounds the frame up to eight
+	//samples; an edge past the visible width is left alone even though its
+	//taps reach back inside it.
+	x = col * 4;
+	y = row * 4;
+	if (x >= d->frame->frame_width || y >= d->frame->frame_height)
+		return;
+	if (!pass && !x)
+		return;
+	if (pass && !y)
+		return;
+	xP = x >> subX;
+	yP = y >> subY;
+	//The mode info of a subsampled plane sits in the bottom right 4x4 of the
+	//luma group it covers.
+	row     = row | subY;
+	col     = col | subX;
+	prevRow = row;
+	prevCol = col;
+	if (pass)
+		prevRow = row - (1 << subY);
+	else
+		prevCol = col - (1 << subX);
+	txSz   = d->lf_tx_sizes[plane][(row >> subY) * d->mi_stride +
+								   (col >> subX)];
+	prevTx = d->lf_tx_sizes[plane][(prevRow >> subY) * d->mi_stride +
+								   (prevCol >> subX)];
+	coord = xP;
+	base  = av1_tx_size_wide[txSz];
+	if (pass)
+	{
+		coord = yP;
+		base  = av1_tx_size_high[txSz];
+	}
+	if (coord & (base - 1))
+		return;							//not a transform block edge
+	//Every block of an intra frame is intra, so the skip pair of 7.14.2 never
+	//suppresses a transform edge and isBlockEdge goes untested.
+	if (pass)
+	{
+		if (av1_tx_size_high[prevTx] < base)
+			base = av1_tx_size_high[prevTx];
+	}
+	else if (av1_tx_size_wide[prevTx] < base)
+		base = av1_tx_size_wide[prevTx];
+	//7.14.3: filterSize caps at eight samples on chroma, sixteen on luma.
+	sz = base;
+	if (plane)
+	{
+		if (sz > 8)
+			sz = 8;
+	}
+	else if (sz > 16)
+		sz = 16;
+	lvl = Av1LfStrength(d, row, col, plane, pass);
+	if (!lvl)
+		lvl = Av1LfStrength(d, prevRow, prevCol, plane, pass);
+	if (!lvl)
+		return;
+	blim = d->lf_blim[lvl];
+	lim  = d->lf_lim[lvl];
+	thr  = d->lf_thr[lvl];
+	dst  = d->plane[plane] + yP * d->stride[plane] + xP;
+	step = 1;						//across the edge
+	run  = d->stride[plane];		//along it
+	if (pass)
+	{
+		step = d->stride[plane];
+		run  = 1;
+	}
+	for (i = 0; i < 4; i++)
+	{
+		if (sz == 4)
+			Av1Deblock4(dst, step, blim, lim, thr);
+		else if (sz == 16)
+			Av1Deblock14(dst, step, blim, lim, thr);
+		else if (plane)
+			Av1Deblock6(dst, step, blim, lim, thr);
+		else
+			Av1Deblock8(dst, step, blim, lim, thr);
+		dst += run;
+	}
+}
+
+U0 Av1LoopFilterFrame(CAv1Dec *d)
+{//7.14.1, as libaom av1_loop_filter_frame: every vertical edge of a plane
+//before any of its horizontal ones.
+	CAv1Frame	*f = d->frame;
+	I64			 plane, pass, row, col, rowStep, colStep;
+
+	if (!f->loop_filter_level[0] && !f->loop_filter_level[1])
+		return;
+	Av1LfSharpness(d);
+	for (plane = 0; plane < d->num_planes; plane++)
+	{
+		if (plane && !f->loop_filter_level[plane + 1])
+			goto next_plane;
+		rowStep = 1;
+		colStep = 1;
+		if (plane)
+		{
+			rowStep = 1 << d->ss_y;
+			colStep = 1 << d->ss_x;
+		}
+		for (pass = 0; pass < 2; pass++)
+			for (row = 0; row < f->mi_rows; row += rowStep)
+				for (col = 0; col < f->mi_cols; col += colStep)
+					Av1LfEdge(d, plane, pass, row, col);
+next_plane:;
+	}
+}
+
+/***** constrained directional enhancement filter, 7.15 *****/
+//
+//Mirrors libaom av1_cdef_frame and cdef_filter_block_internal in
+//av1/common/cdef.c and av1/common/cdef_block.c, with the direction search of
+//cdef_find_dir_c and the constrain of av1/common/cdef.h.
+
+//CDEF_VERY_LARGE, the sample libaom writes outside the frame. A tap that
+//lands on it contributes nothing: its difference from any real sample shifts
+//past every legal strength, so constrain returns zero.
+#define AV1_CDEF_LARGE				0x4000
+//No offset in Cdef_Directions exceeds two in either axis, so two samples of
+//padding is the whole reach of the twelve taps.
+#define AV1_CDEF_BORDER				2
+
+//7.15.3 Cdef_Directions as row then column offsets, with libaom's two entry
+//padding either side so the secondary directions dir-2 and dir+2 need no
+//wrap. Row i is direction (i + 6) & 7; each row holds the k = 0 and k = 1
+//taps.
+I8 av1_cdef_dir_y[24] = { 1,  2,  1,  2, -1, -2,  0, -1,  0,  0,  0,  1,
+						  1,  2,  1,  2,  1,  2,  1,  2, -1, -2,  0, -1};
+I8 av1_cdef_dir_x[24] = { 0,  0,  0, -1,  1,  2,  1,  2,  1,  2,  1,  2,
+						  1,  2,  0,  1,  0,  0,  0, -1,  1,  2,  1,  2};
+//Div_Table, 7.15.2: 840 / n at n taps, so a partial sum is normalised by a
+//multiply. The output is 840 times the variance, which only ever gets
+//compared.
+I64 av1_cdef_div[9] = {0, 840, 420, 280, 210, 168, 140, 120, 105};
+//7.15.3 Cdef_Pri_Taps, indexed by the low bit of the primary strength, and
+//Cdef_Sec_Taps, which does not vary.
+U8 av1_cdef_pri_taps[4] = {4, 2, 3, 3};
+U8 av1_cdef_sec_taps[2] = {2, 1};
+//Cdef_Uv_Dir[1][0] of 7.15.1. The other three entries are the identity or
+//the 4:4:0 row, which AV1 has no chroma format for.
+U8 av1_cdef_conv422[8] = {7, 0, 2, 4, 5, 6, 6, 6};
+
+I64 Av1CdefShift(I64 threshold, I64 damping)
+{//The shift of constrain, 7.15.3, hoisted out of the sample loop.
+	I64 s;
+
+	if (!threshold)
+		return 0;
+	s = damping - Av1FloorLog2(threshold);
+	if (s < 0)
+		s = 0;
+
+	return s;
+}
+
+I64 Av1CdefConstrain(I64 diff, I64 threshold, I64 shift)
+{//constrain, 7.15.3, with its shift already taken.
+	I64 a = diff, v;
+
+	if (a < 0)
+		a = -a;
+	v = threshold - (a >> shift);
+	if (v < 0)
+		v = 0;
+	if (v > a)
+		v = a;
+	if (diff < 0)
+		return -v;
+
+	return v;
+}
+
+I64 Av1CdefFindDir(U16 *img, I64 stride, I64 *_var)
+{//7.15.2, as libaom cdef_find_dir_c. cost is the weighted variance along the
+//lines of a direction; the sum of squares is common to all eight and is
+//never formed. Eight bit only, so coeff_shift is zero. partial is eight rows
+//of fifteen.
+	I64 partial[120], cost[8];
+	I64 i, j, x, best = 0, dir = 0;
+
+	for (i = 0; i < 120; i++)
+		partial[i] = 0;
+	for (i = 0; i < 8; i++)
+		cost[i] = 0;
+	for (i = 0; i < 8; i++)
+		for (j = 0; j < 8; j++)
+		{
+			//Biased by 128 to halve the range of the squared sums.
+			x = img[i * stride + j] - 128;
+			partial[i + j]                 += x;
+			partial[15 + i + (j >> 1)]     += x;
+			partial[30 + i]                += x;
+			partial[48 + i - (j >> 1)]     += x;
+			partial[67 + i - j]            += x;
+			partial[78 - (i >> 1) + j]     += x;
+			partial[90 + j]                += x;
+			partial[105 + (i >> 1) + j]    += x;
+		}
+	for (i = 0; i < 8; i++)
+	{
+		cost[2] += partial[30 + i] * partial[30 + i];
+		cost[6] += partial[90 + i] * partial[90 + i];
+	}
+	cost[2] *= av1_cdef_div[8];
+	cost[6] *= av1_cdef_div[8];
+	for (i = 0; i < 7; i++)
+	{
+		cost[0] += (partial[i] * partial[i] +
+					partial[14 - i] * partial[14 - i]) * av1_cdef_div[i + 1];
+		cost[4] += (partial[60 + i] * partial[60 + i] +
+					partial[74 - i] * partial[74 - i]) * av1_cdef_div[i + 1];
+	}
+	cost[0] += partial[7] * partial[7] * av1_cdef_div[8];
+	cost[4] += partial[67] * partial[67] * av1_cdef_div[8];
+	for (i = 1; i < 8; i += 2)
+	{
+		for (j = 0; j < 5; j++)
+			cost[i] += partial[i * 15 + 3 + j] * partial[i * 15 + 3 + j];
+		cost[i] *= av1_cdef_div[8];
+		for (j = 0; j < 3; j++)
+			cost[i] += (partial[i * 15 + j] * partial[i * 15 + j] +
+						partial[i * 15 + 10 - j] *
+						partial[i * 15 + 10 - j]) * av1_cdef_div[2 * j + 2];
+	}
+	for (i = 0; i < 8; i++)
+		if (cost[i] > best)
+		{
+			best = cost[i];
+			dir  = i;
+		}
+	//The variance difference against the orthogonal direction, divided by
+	//1024 rather than 840 because only its magnitude is used.
+	*_var = (best - cost[(dir + 4) & 7]) >> 10;
+
+	return dir;
+}
+
+I64 Av1CdefAdjust(I64 strength, I64 var)
+{//adjust_strength of av1/common/cdef_block.c: a luma 8x8 with a highly
+//directional pattern takes more of the primary strength than a flat one.
+	I64 i = 0;
+
+	if (!var)
+		return 0;
+	if (var >> 6)
+	{
+		i = Av1FloorLog2(var >> 6);
+		if (i > 12)
+			i = 12;
+	}
+
+	return (strength * (4 + i) + 8) >> 4;
+}
+
+U0 Av1CdefFilter(U8 *dst, I64 dstride, U16 *in, I64 istride, I64 pri,
+				 I64 sec, I64 dir, I64 priDamp, I64 secDamp, I64 bw, I64 bh,
+				 Bool doPri, Bool doSec)
+{//cdef_filter_block of 7.15.3, as libaom cdef_filter_block_internal. in
+//points at the block inside the padded source, so every tap is in bounds and
+//the ones outside the frame read the sentinel. The min and max clip only
+//applies when both filters run.
+	I64		 i, j, k, sum, x, y, mn, mx, priShift, secShift, base;
+	I64		 po[2], ao[2], bo[2], p0, p1, s0, s1, s2, s3, tap;
+	U8		*pt = av1_cdef_pri_taps + (pri & 1) * 2;
+	Bool	 clip = ToBool(doPri && doSec);
+
+	priShift = Av1CdefShift(pri, priDamp);
+	secShift = Av1CdefShift(sec, secDamp);
+	for (k = 0; k < 2; k++)
+	{
+		po[k] = av1_cdef_dir_y[(dir + 2) * 2 + k] * istride +
+				av1_cdef_dir_x[(dir + 2) * 2 + k];
+		ao[k] = av1_cdef_dir_y[(dir + 4) * 2 + k] * istride +
+				av1_cdef_dir_x[(dir + 4) * 2 + k];
+		bo[k] = av1_cdef_dir_y[dir * 2 + k] * istride +
+				av1_cdef_dir_x[dir * 2 + k];
+	}
+	for (i = 0; i < bh; i++)
+		for (j = 0; j < bw; j++)
+		{
+			base = i * istride + j;
+			x    = in[base];
+			sum  = 0;
+			mn   = x;
+			mx   = x;
+			for (k = 0; k < 2; k++)
+			{
+				if (doPri)
+				{
+					p0   = in[base + po[k]];
+					p1   = in[base - po[k]];
+					tap  = pt[k];
+					sum += tap * Av1CdefConstrain(p0 - x, pri, priShift);
+					sum += tap * Av1CdefConstrain(p1 - x, pri, priShift);
+					if (clip)
+					{
+						if (p0 != AV1_CDEF_LARGE && p0 > mx)
+							mx = p0;
+						if (p1 != AV1_CDEF_LARGE && p1 > mx)
+							mx = p1;
+						if (p0 < mn)
+							mn = p0;
+						if (p1 < mn)
+							mn = p1;
+					}
+				}
+				if (doSec)
+				{
+					s0   = in[base + ao[k]];
+					s1   = in[base - ao[k]];
+					s2   = in[base + bo[k]];
+					s3   = in[base - bo[k]];
+					if (clip)
+					{
+						if (s0 != AV1_CDEF_LARGE && s0 > mx)
+							mx = s0;
+						if (s1 != AV1_CDEF_LARGE && s1 > mx)
+							mx = s1;
+						if (s2 != AV1_CDEF_LARGE && s2 > mx)
+							mx = s2;
+						if (s3 != AV1_CDEF_LARGE && s3 > mx)
+							mx = s3;
+						if (s0 < mn)
+							mn = s0;
+						if (s1 < mn)
+							mn = s1;
+						if (s2 < mn)
+							mn = s2;
+						if (s3 < mn)
+							mn = s3;
+					}
+					tap  = av1_cdef_sec_taps[k];
+					sum += tap * Av1CdefConstrain(s0 - x, sec, secShift);
+					sum += tap * Av1CdefConstrain(s1 - x, sec, secShift);
+					sum += tap * Av1CdefConstrain(s2 - x, sec, secShift);
+					sum += tap * Av1CdefConstrain(s3 - x, sec, secShift);
+				}
+			}
+			//Round to nearest, ties away from zero.
+			y = x + ((8 + sum - ToI64(sum < 0)) >> 4);
+			if (clip)
+			{
+				if (y < mn)
+					y = mn;
+				if (y > mx)
+					y = mx;
+			}
+			dst[i * dstride + j] = y;
+		}
+}
+
+Bool Av1CdefAlloc(CAv1Dec *d)
+{//The padded source is taken the first frame that turns CDEF on. Av1DecFree
+//releases it with the plane it shadows.
+	I64 p, i, subx, suby, w, h;
+
+	if (d->cdef_src[0])
+		return TRUE;
+	for (p = 0; p < d->num_planes; p++)
+	{
+		subx = 0;
+		suby = 0;
+		if (p)
+		{
+			subx = d->ss_x;
+			suby = d->ss_y;
+		}
+		w = ((d->mi_stride * 4) >> subx) + 2 * AV1_CDEF_BORDER;
+		h = ((d->mi_alloc_rows * 4) >> suby) + 2 * AV1_CDEF_BORDER;
+		d->cdef_src_stride[p] = w;
+		d->cdef_src[p]        = CAlloc(w * h * sizeof(U16));
+		if (!d->cdef_src[p])
+			goto fail;
+	}
+
+	return TRUE;
+fail:
+	//A partial allocation must not pass the reuse test above.
+	for (i = 0; i < 3; i++)
+	{
+		Free(d->cdef_src[i]);
+		d->cdef_src[i] = NULL;
+	}
+
+	return FALSE;
+}
+
+U0 Av1CdefFillSrc(CAv1Dec *d)
+{//The pre CDEF copy 7.15 reads. Only the mi grid is a real sample; the two
+//sample border round it is the sentinel, which is exactly where libaom's
+//per unit window fills CDEF_VERY_LARGE instead of copying a line buffer.
+	CAv1Frame	*f = d->frame;
+	I64			 p, x, y, w, h, st, subx, suby;
+	U8			*src;
+	U16			*row;
+
+	for (p = 0; p < d->num_planes; p++)
+	{
+		subx = 0;
+		suby = 0;
+		if (p)
+		{
+			subx = d->ss_x;
+			suby = d->ss_y;
+		}
+		w  = (f->mi_cols * 4) >> subx;
+		h  = (f->mi_rows * 4) >> suby;
+		st = d->cdef_src_stride[p];
+		for (y = -AV1_CDEF_BORDER; y < h + AV1_CDEF_BORDER; y++)
+		{
+			row = d->cdef_src[p] + (y + AV1_CDEF_BORDER) * st;
+			if (y < 0 || y >= h)
+			{
+				for (x = 0; x < w + 2 * AV1_CDEF_BORDER; x++)
+					row[x] = AV1_CDEF_LARGE;
+				goto next_row;
+			}
+			for (x = 0; x < AV1_CDEF_BORDER; x++)
+			{
+				row[x]                       = AV1_CDEF_LARGE;
+				row[w + AV1_CDEF_BORDER + x] = AV1_CDEF_LARGE;
+			}
+			src = d->plane[p] + y * d->stride[p];
+			for (x = 0; x < w; x++)
+				row[x + AV1_CDEF_BORDER] = src[x];
+next_row:;
+		}
+	}
+}
+
+U0 Av1CdefUnit(CAv1Dec *d, I64 fbr, I64 fbc)
+{//One 64x64 cdef unit through every plane, as libaom cdef_fb_col. The
+//direction of 7.15.2 is searched on luma and reused by chroma.
+	CAv1Frame	*f = d->frame;
+	I64			 idx, yPri = 0, ySec = 0, uvPri = 0, uvSec = 0;
+	I64			 maxr, maxc, br, bc, bi, cnt = 0, k, p, subx, suby;
+	I64			 rowo, colo, bw, bh, st, dstride, damp, pri, sec, t, dd;
+	Bool		 zeroY, zeroUV = TRUE;
+	U16			*in;
+
+	idx = d->cdef_idx[fbr * d->cdef_cols + fbc];
+	if (idx < 0)
+		return;
+	yPri  = f->cdef_y_pri[idx];
+	ySec  = f->cdef_y_sec[idx];
+	zeroY = ToBool(!yPri && !ySec);
+	if (d->num_planes > 1)
+	{
+		uvPri  = f->cdef_uv_pri[idx];
+		uvSec  = f->cdef_uv_sec[idx];
+		zeroUV = ToBool(!uvPri && !uvSec);
+	}
+	if (zeroY && zeroUV)
+		return;
+	rowo = fbr * AV1_CDEF_UNIT4;
+	colo = fbc * AV1_CDEF_UNIT4;
+	maxr = f->mi_rows - rowo;
+	maxc = f->mi_cols - colo;
+	if (maxr > AV1_CDEF_UNIT4)
+		maxr = AV1_CDEF_UNIT4;
+	if (maxc > AV1_CDEF_UNIT4)
+		maxc = AV1_CDEF_UNIT4;
+	st = d->cdef_src_stride[0];
+	for (br = 0; br < maxr; br += 2)
+		for (bc = 0; bc < maxc; bc += 2)
+		{
+			//is_8x8_block_skip: an 8x8 whose four 4x4 all carry skip is left
+			//as the deblocker wrote it.
+			bi               = (br >> 1) * 8 + (bc >> 1);
+			d->cdef_mark[bi] = 0;
+			k                = (rowo + br) * d->mi_stride + colo + bc;
+			if (d->skips[k] && d->skips[k + 1] &&
+				d->skips[k + d->mi_stride] && d->skips[k + d->mi_stride + 1])
+				goto next_search;
+			d->cdef_mark[bi] = 1;
+			cnt++;
+			in = d->cdef_src[0] +
+				 ((rowo + br) * 4 + AV1_CDEF_BORDER) * st +
+				 (colo + bc) * 4 + AV1_CDEF_BORDER;
+			d->cdef_dir[bi] = Av1CdefFindDir(in, st, &d->cdef_var[bi]);
+next_search:;
+		}
+	if (!cnt)
+		return;
+	for (p = 0; p < d->num_planes; p++)
+	{
+		if (p && zeroUV)
+			goto next_plane;
+		subx = 0;
+		suby = 0;
+		pri  = yPri;
+		sec  = ySec;
+		damp = f->cdef_damping;
+		if (p)
+		{
+			subx  = d->ss_x;
+			suby  = d->ss_y;
+			pri   = uvPri;
+			sec   = uvSec;
+			damp -= 1;				//7.15: chroma damps one step lower
+		}
+		//4:2:2 is the only chroma format whose two subsampling factors
+		//differ, and its chroma directions are not the luma ones.
+		if (p == 1 && subx && !suby)
+			for (bi = 0; bi < 64; bi++)
+				if (d->cdef_mark[bi])
+					d->cdef_dir[bi] = av1_cdef_conv422[d->cdef_dir[bi]];
+		bw      = 8 >> subx;
+		bh      = 8 >> suby;
+		st      = d->cdef_src_stride[p];
+		dstride = d->stride[p];
+		for (br = 0; br < maxr; br += 2)
+			for (bc = 0; bc < maxc; bc += 2)
+			{
+				bi = (br >> 1) * 8 + (bc >> 1);
+				if (!d->cdef_mark[bi])
+					goto next_block;
+				t = pri;
+				if (!p)
+					t = Av1CdefAdjust(pri, d->cdef_var[bi]);
+				dd = 0;
+				if (pri)
+					dd = d->cdef_dir[bi];
+				k  = ((colo + bc) * 4) >> subx;
+				in = d->cdef_src[p] +
+					 (((((rowo + br) * 4) >> suby) + AV1_CDEF_BORDER) * st) +
+					 k + AV1_CDEF_BORDER;
+				Av1CdefFilter(d->plane[p] +
+							  ((((rowo + br) * 4) >> suby) * dstride) + k,
+							  dstride, in, st, t, sec, dd, damp, damp, bw,
+							  bh, ToBool(t != 0), ToBool(sec != 0));
+next_block:;
+			}
+next_plane:;
+	}
+}
+
+Bool Av1CdefFrame(CAv1Dec *d)
+{//7.15, as libaom av1_cdef_frame. The unit grid is 64x64 whatever the
+//superblock size. Returns FALSE only when the padded source cannot be taken.
+	CAv1Frame	*f = d->frame;
+	I64			 n, i, fbr, fbc, nvfb, nhfb;
+	Bool		 any = FALSE;
+
+	if (f->coded_lossless || f->allow_intrabc)
+		return TRUE;
+	n = 1 << f->cdef_bits;
+	for (i = 0; i < n; i++)
+	{
+		if (f->cdef_y_pri[i] || f->cdef_y_sec[i])
+			any = TRUE;
+		if (d->num_planes > 1 && (f->cdef_uv_pri[i] || f->cdef_uv_sec[i]))
+			any = TRUE;
+	}
+	if (!any)
+		return TRUE;
+	if (!Av1CdefAlloc(d))
+		return FALSE;
+	Av1CdefFillSrc(d);
+	nvfb = (f->mi_rows + AV1_CDEF_UNIT4 - 1) >> 4;
+	nhfb = (f->mi_cols + AV1_CDEF_UNIT4 - 1) >> 4;
+	for (fbr = 0; fbr < nvfb; fbr++)
+		for (fbc = 0; fbc < nhfb; fbc++)
+			Av1CdefUnit(d, fbr, fbc);
+
+	return TRUE;
+}
+
+/***** loop restoration, 7.17 *****/
+//
+//Mirrors libaom av1_loop_restoration_filter_frame in av1/common/restoration.c,
+//with the Wiener leaf of av1_wiener_convolve_add_src_c in
+//av1/common/convolve.c and the self guided leaf of
+//av1_apply_selfguided_restoration_c.
+
+U0 Av1LrSavePre(CAv1Dec *d)
+{//UpscaledCurrFrame of 7.17.6: the deblocked frame, taken before CDEF
+//overwrites it. Only the two rows either side of a stripe boundary are ever
+//read back, but the whole plane costs less to take than to index.
+	CAv1Frame	*f = d->frame;
+	I64			 p;
+
+	if (!f->uses_lr)
+		return;
+	for (p = 0; p < d->num_planes; p++)
+		MemCopy(d->lr_pre[p], d->plane[p], d->stride[p] * d->plane_h[p]);
+}
+
+U0 Av1LrFillStripe(CAv1Dec *d, I64 plane, I64 sy, I64 h, I64 startY, I64 endY,
+				   I64 planeW, I64 planeH)
+{//get_source_sample of 7.17.6 for one stripe, gathered once. A row inside the
+//stripe comes from the CDEF output, a row outside from the deblocked copy at
+//most two rows beyond the stripe; both are clamped to the plane first. The
+//three columns either side replicate the edge sample, which is what the Min
+//and Max on x amount to.
+	I64		 k, ya, yc, ys, x, st = d->lr_src_stride;
+	U8		*src, *row;
+
+	for (k = -AV1_LR_BORDER; k < h + AV1_LR_BORDER; k++)
+	{
+		ya  = sy + k;
+		yc  = Av1Clip3(0, planeH - 1, ya);
+		ys  = yc;
+		src = d->plane[plane];
+		if (yc < startY)
+		{
+			src = d->lr_pre[plane];
+			ys  = startY - 2;
+			if (ys < yc)
+				ys = yc;
+		}
+		else if (yc > endY)
+		{
+			src = d->lr_pre[plane];
+			ys  = endY + 2;
+			if (ys > yc)
+				ys = yc;
+		}
+		src += ys * d->stride[plane];
+		row  = d->lr_src + (k + AV1_LR_BORDER) * st;
+		for (x = 0; x < AV1_LR_BORDER; x++)
+		{
+			row[x]                          = src[0];
+			row[planeW + AV1_LR_BORDER + x] = src[planeW - 1];
+		}
+		MemCopy(row + AV1_LR_BORDER, src, planeW);
+	}
+}
+
+U0 Av1LrWiener(CAv1Dec *d, U8 *dst, I64 dstride, U8 *src, I64 sstride, I64 w,
+			   I64 h, I64 *vf, I64 *hf)
+{//7.17.4, as libaom av1_wiener_convolve_add_src_c. src points at the first
+//output sample inside the gathered stripe, so every tap is in bounds. The
+//horizontal pass runs three rows above and three below the block because the
+//vertical pass reads them.
+	I64		 r, c, t, s, v;
+	I32		*tmp = d->lr_tmp;
+	U8		*p;
+
+	for (r = 0; r < h + 6; r++)
+		for (c = 0; c < w; c++)
+		{
+			p = src + (r - 3) * sstride + c;
+			s = 0;
+			for (t = 0; t < 7; t++)
+				s += hf[t] * p[t - 3];
+			//The centre tap carries an implicit 1 << WIENER_FILT_PREC_BITS,
+			//so the sample is added back rather than coded. The second bias
+			//holds the intermediate non negative.
+			v = s + (p[0] << 7) + (1 << 14);
+			tmp[r * w + c] = Av1Clip3(0, 8191, (v + 4) >> 3);
+		}
+	for (r = 0; r < h; r++)
+		for (c = 0; c < w; c++)
+		{
+			s = 0;
+			for (t = 0; t < 7; t++)
+				s += vf[t] * tmp[(r + t) * w + c];
+			v = s + (tmp[(r + 3) * w + c] << 7) - (1 << 18);
+			dst[r * dstride + c] = Av1Clip3(0, 255, (v + 1024) >> 11);
+		}
+}
+
+U0 Av1LrSgrBox(CAv1Dec *d, I32 *flt, U8 *src, I64 sstride, I64 w, I64 h,
+			   I64 r, I64 s)
+{//box_filter of 7.17.3, as libaom calculate_intermediate_result followed by
+//selfguided_restoration_internal. A and B are formed over the block plus a
+//one sample border. The (2r + 1) squared window is taken as a column sum per
+//source column and then a running horizontal sum, which is the same integer
+//sum reassociated. Radius two computes the odd rows only, which is all the
+//six-and-five combination below reads.
+	I32		*A = d->lr_a, *B = d->lr_b;
+	I64		*cv = d->lr_colv, *cq = d->lr_colq;
+	I64		 abst = w + 2, n = (2 * r + 1) * (2 * r + 1), one, step = 1;
+	I64		 i, j, dy, k, x, cs, cw, bs, bq, a, b, p, z, a2, nb, sh, v;
+	U8		*q;
+
+	one = av1_one_by_x[n - 1];
+	if (r == 2)
+		step = 2;
+	for (i = -1; i < h + 1; i += step)
+	{
+		for (j = -1 - r; j <= w + r; j++)
+		{
+			cs = 0;
+			cw = 0;
+			q  = src + (i - r) * sstride + j;
+			for (dy = -r; dy <= r; dy++)
+			{
+				x   = q[0];
+				cs += x;
+				cw += x * x;
+				q  += sstride;
+			}
+			cv[j + r + 1] = cs;
+			cq[j + r + 1] = cw;
+		}
+		bs = 0;
+		bq = 0;
+		for (j = 0; j < 2 * r + 1; j++)
+		{
+			bs += cv[j];
+			bq += cq[j];
+		}
+		for (j = -1; j <= w; j++)
+		{
+			b = bs;
+			a = bq;
+			//n times the variance, which Popoviciu holds below 2^14 n
+			//squared. It can only go negative above eight bits, where the
+			//rounding of a and b is not the identity.
+			p = a * n - b * b;
+			if (p < 0)
+				p = 0;
+			z = (p * s + (1 << (AV1_SGRPROJ_MTABLE_BITS - 1))) >>
+				AV1_SGRPROJ_MTABLE_BITS;
+			if (z > 255)
+				z = 255;
+			a2   = av1_x_by_xplus1[z];
+			k    = (i + 1) * abst + j + 1;
+			A[k] = a2;
+			B[k] = (((1 << AV1_SGRPROJ_SGR_BITS) - a2) * b * one +
+					(1 << (AV1_SGRPROJ_RECIP_BITS - 1))) >>
+				   AV1_SGRPROJ_RECIP_BITS;
+			if (j < w)
+			{
+				bs += cv[j + 2 * r + 2] - cv[j + 1];
+				bq += cq[j + 2 * r + 2] - cq[j + 1];
+			}
+		}
+	}
+	for (i = 0; i < h; i++)
+		for (j = 0; j < w; j++)
+		{
+			k  = (i + 1) * abst + j + 1;
+			nb = 5;
+			if (r != 2)
+			{
+				a = (A[k] + A[k - 1] + A[k + 1] + A[k - abst] +
+					 A[k + abst]) * 4 +
+					(A[k - abst - 1] + A[k - abst + 1] + A[k + abst - 1] +
+					 A[k + abst + 1]) * 3;
+				b = (B[k] + B[k - 1] + B[k + 1] + B[k - abst] +
+					 B[k + abst]) * 4 +
+					(B[k - abst - 1] + B[k - abst + 1] + B[k + abst - 1] +
+					 B[k + abst + 1]) * 3;
+			}
+			else if (i & 1)
+			{//An odd row sits on a row of A and B, an even one between two.
+				nb = 4;
+				a  = A[k] * 6 + (A[k - 1] + A[k + 1]) * 5;
+				b  = B[k] * 6 + (B[k - 1] + B[k + 1]) * 5;
+			}
+			else
+			{
+				a = (A[k - abst] + A[k + abst]) * 6 +
+					(A[k - abst - 1] + A[k - abst + 1] + A[k + abst - 1] +
+					 A[k + abst + 1]) * 5;
+				b = (B[k - abst] + B[k + abst]) * 6 +
+					(B[k - abst - 1] + B[k - abst + 1] + B[k + abst - 1] +
+					 B[k + abst + 1]) * 5;
+			}
+			sh = AV1_SGRPROJ_SGR_BITS + nb - AV1_SGRPROJ_RST_BITS;
+			v  = a * src[i * sstride + j] + b;
+			flt[i * w + j] = (v + (1 << (sh - 1))) >> sh;
+		}
+}
+
+U0 Av1LrSgr(CAv1Dec *d, U8 *dst, I64 dstride, U8 *src, I64 sstride, I64 w,
+			I64 h, I64 set, I64 xqd0, I64 xqd1)
+{//7.17.2, as libaom av1_apply_selfguided_restoration_c. The two passes differ
+//only in radius; a zero radius disables one, and the projection weights sum
+//to 1 << SGRPROJ_PRJ_BITS.
+	I64		 base = set * AV1_SGR_PARAMS_S0;
+	I64		 r0 = av1_sgr_params[base], r1 = av1_sgr_params[base + 1];
+	I64		 xq0, xq1, i, j, k, u, v;
+	I32		*f0 = d->lr_flt0, *f1 = d->lr_flt1;
+
+	if (r0)
+		Av1LrSgrBox(d, f0, src, sstride, w, h, r0, av1_sgr_params[base + 2]);
+	if (r1)
+		Av1LrSgrBox(d, f1, src, sstride, w, h, r1, av1_sgr_params[base + 3]);
+	//av1_decode_xq.
+	xq0 = xqd0;
+	xq1 = (1 << AV1_SGRPROJ_PRJ_BITS) - xq0 - xqd1;
+	if (!r0)
+	{
+		xq0 = 0;
+		xq1 = (1 << AV1_SGRPROJ_PRJ_BITS) - xqd1;
+	}
+	else if (!r1)
+		xq1 = 0;
+	for (i = 0; i < h; i++)
+		for (j = 0; j < w; j++)
+		{
+			k = i * w + j;
+			u = src[i * sstride + j] << AV1_SGRPROJ_RST_BITS;
+			v = u << AV1_SGRPROJ_PRJ_BITS;
+			if (r0)
+				v += xq0 * (f0[k] - u);
+			if (r1)
+				v += xq1 * (f1[k] - u);
+			dst[i * dstride + j] = Av1Clip3(0, 255, (v + 1024) >> 11);
+		}
+}
+
+U0 Av1LrStripeUnits(CAv1Dec *d, I64 plane, I64 sy, I64 h, I64 uRow,
+					I64 planeW, I64 unitSize)
+{//One stripe across the restoration units of one unit row, as libaom
+//av1_foreach_rest_unit_in_row. RESTORE_NONE copies the CDEF output, which is
+//already what the plane holds.
+	I64		 ext = unitSize * 3 / 2, x0 = 0, uCol = 0, uw, rem, k, base;
+	I64		 vf[7], hf[7], rtype, pass, c0, c1, c2;
+	I64		*tp;
+	U8		*src, *dst;
+
+	while (x0 < planeW)
+	{
+		rem = planeW - x0;
+		uw  = unitSize;
+		if (rem < ext)
+			uw = rem;
+		k     = uRow * d->lr_cols[plane] + uCol;
+		rtype = d->lr_type_u[plane][k];
+		if (rtype == AV1_RESTORE_NONE)
+			goto next_unit;
+		src = d->lr_src + AV1_LR_BORDER * d->lr_src_stride + AV1_LR_BORDER +
+			  x0;
+		dst = d->plane[plane] + sy * d->stride[plane] + x0;
+		if (rtype == AV1_RESTORE_WIENER)
+		{
+			base = k * 6;
+			for (pass = 0; pass < 2; pass++)
+			{//Pass zero is the vertical filter, pass one the horizontal.
+				tp = vf;
+				if (pass)
+					tp = hf;
+				c0 = d->lr_wiener[plane][base + pass * 3];
+				c1 = d->lr_wiener[plane][base + pass * 3 + 1];
+				c2 = d->lr_wiener[plane][base + pass * 3 + 2];
+				tp[0] = c0;
+				tp[1] = c1;
+				tp[2] = c2;
+				//The seven taps sum to WIENER_FILT_STEP, and the step itself
+				//is implicit at the centre.
+				tp[3] = -2 * (c0 + c1 + c2);
+				tp[4] = c2;
+				tp[5] = c1;
+				tp[6] = c0;
+			}
+			Av1LrWiener(d, dst, d->stride[plane], src, d->lr_src_stride, uw,
+						h, vf, hf);
+		}
+		else
+			Av1LrSgr(d, dst, d->stride[plane], src, d->lr_src_stride, uw, h,
+					 d->lr_sgr_set[plane][k], d->lr_sgr_xqd[plane][k * 2],
+					 d->lr_sgr_xqd[plane][k * 2 + 1]);
+next_unit:;
+		x0 += uw;
+		uCol++;
+	}
+}
+
+U0 Av1LrPlane(CAv1Dec *d, I64 plane)
+{//7.17.1 over one plane, as libaom foreach_rest_unit_in_plane: unit rows,
+//then the filter stripes each of them covers. LoopRestorationSize is a
+//multiple of the stripe height and both grids sit the same eight luma rows
+//above the superblock grid, so no stripe straddles two unit rows.
+	CAv1Frame	*f = d->frame;
+	I64			 subx = 0, suby = 0, planeW, planeH, unitSize, ext;
+	I64			 y0 = 0, uRow = 0, uh, rem, vStart, vEnd, i, h;
+	I64			 stripeH, voff, fs, startY, endY, nominal;
+
+	if (plane)
+	{
+		subx = d->ss_x;
+		suby = d->ss_y;
+	}
+	planeW   = Av1LrPlaneW(f, subx);
+	planeH   = Av1LrPlaneH(f, suby);
+	unitSize = f->loop_restoration_size[plane];
+	ext      = unitSize * 3 / 2;
+	stripeH  = AV1_LR_STRIPE >> suby;
+	voff     = AV1_LR_UNIT_OFFSET >> suby;
+	while (y0 < planeH)
+	{
+		rem = planeH - y0;
+		uh  = unitSize;
+		if (rem < ext)
+			uh = rem;
+		vStart = y0 - voff;
+		if (vStart < 0)
+			vStart = 0;
+		vEnd = y0 + uh;
+		if (vEnd < planeH)
+			vEnd -= voff;
+		i = vStart;
+		while (i < vEnd)
+		{
+			fs      = (i + voff) / stripeH;
+			startY  = fs * stripeH - voff;
+			endY    = startY + stripeH - 1;
+			//The topmost stripe of a plane is short by the grid offset.
+			nominal = stripeH;
+			if (!fs)
+				nominal -= voff;
+			h = nominal;
+			if (h > vEnd - i)
+				h = vEnd - i;
+			Av1LrFillStripe(d, plane, i, h, startY, endY, planeW, planeH);
+			Av1LrStripeUnits(d, plane, i, h, uRow, planeW, unitSize);
+			i += h;
+		}
+		y0 += uh;
+		uRow++;
+	}
+}
+
+Bool Av1LrFrame(CAv1Dec *d)
+{//7.17. LrFrame is not a third buffer here: everything a stripe reads is in
+//the copy Av1LrFillStripe gathered, and the CDEF rows it gathered are exactly
+//the rows this stripe writes, so the plane is filtered in place. Returns
+//FALSE only when the scratch cannot be taken.
+	CAv1Frame	*f = d->frame;
+	I64			 p;
+
+	if (!f->uses_lr)
+		return TRUE;
+	if (!Av1LrAlloc(d, f))
+		return FALSE;
+	for (p = 0; p < d->num_planes; p++)
+	{
+		if (f->frame_restoration_type[p] == AV1_RESTORE_NONE)
+			goto next_plane;
+		Av1LrPlane(d, p);
+next_plane:;
+	}
+
+	return TRUE;
+}
+
+/***** open bitstream unit dispatch, 5.3.1 *****/
+
+#define AV1_ERR_SEQ					-40
+#define AV1_ERR_OBU					-41
+#define AV1_ERR_NO_FRAME			-42
+#define AV1_ERR_TILEGRP				-43
+#define AV1_ERR_MEM					-44
+#define AV1_ERR_EXIT_SYMBOL			-45
+
+I64 Av1FrameStart(CAv1Dec *d, CAv1Seq *s, CAv1Frame *f)
+{//7.4 up to the tile loop: size the buffers and load the frame context.
+	I64 total = f->tile_cols * f->tile_rows;
+
+	if (!Av1DecSize(d, s, f))
+		return AV1_ERR_MEM;
+	if (total > d->tiles_max)
+	{
+		Free(d->tiles);
+		d->tiles     = MAlloc(total * sizeof(CAv1Tile));
+		d->tiles_max = total;
+		if (!d->tiles)
+		{
+			d->tiles_max = 0;
+
+			return AV1_ERR_MEM;
+		}
+	}
+	//primary_ref_frame is PRIMARY_REF_NONE on every intra frame, so 7.20 loads
+	//the defaults rather than a saved context.
+	Av1CdfReset(&d->frame_cdf);
+	Av1CdfCopy(&d->saved_cdf, &d->frame_cdf);
+	d->blocks = 0;
+	d->err    = 0;
+
+	return 0;
+}
+
+I64 Av1DecodeTileGroupObu(CAv1Dec *d, U8 *p, I64 sz, I64 off)
+{//5.11.1 then 5.11.2 for every tile of one tile group OBU. p is the OBU
+//payload and off the byte the tile_group_obu syntax starts at within it.
+	CAv1Bits	b;
+	I64			n, i;
+
+	Av1BitsInit(&b, p, sz);
+	b.pos = off << 3;
+	n     = Av1TileGroup(&b, d->frame, p + off, sz - off, d->tiles,
+						 d->tiles_max);
+	if (n < 0)
+		return AV1_ERR_TILEGRP;
+	for (i = 0; i < n; i++)
+		if (!Av1DecodeTile(d, &d->tiles[i], p + off))
+		{
+			if (d->err)
+				return d->err;
+
+			return AV1_ERR_EXIT_SYMBOL;
+		}
+
+	return n;
+}
+
+public I64 Av1DecodeFrameObu(CAv1Dec *d, CAv1Seq *s, U8 *buf, I64 size)
+{//5.6 over one temporal unit: the sequence header, one frame header, then the
+//tile group units that complete that frame. Returns the tile count, or the
+//negative code of the element that stopped it.
+	CAv1Frame	*f = &d->hdr;
+	CAv1Obu		 o;
+	CAv1Bits	 b;
+	I64			 pos = 0, next, off, r, total = 0, done = 0;
+	//A container carries the sequence header out of band: MP4 puts it in the
+	//av1C record, which Av1ParseConfig has already parsed. Only a raw stream
+	//has to wait for one in band.
+	Bool		 have_seq = ToBool(s && s->valid), have_hdr = FALSE;
+
+	while (pos < size)
+	{
+		if (!Av1ObuAt(&o, buf, size, pos, &next))
+			return AV1_ERR_OBU;
+		if (Av1ObuDrop(s, &o))
+			goto next_obu;
+		if (o.type == AV1_OBU_SEQUENCE_HEADER)
+		{
+			if (!Av1ParseSeqHeader(s, buf + o.offset, o.size))
+				return AV1_ERR_SEQ;
+			have_seq = TRUE;
+		}
+		else if (o.type == AV1_OBU_FRAME_HEADER || o.type == AV1_OBU_FRAME)
+		{
+			if (!have_seq)
+				return AV1_ERR_SEQ;
+			Av1BitsInit(&b, buf + o.offset, o.size);
+			r = Av1UncompressedHeader(&b, s, f);
+			if (r)
+				return r;
+			r = Av1FrameStart(d, s, f);
+			if (r)
+				return r;
+			have_hdr = TRUE;
+			total    = f->tile_cols * f->tile_rows;
+			done     = 0;
+			if (o.type == AV1_OBU_FRAME_HEADER)
+				goto next_obu;
+			//5.10.2: the tile group follows the header inside one OBU, byte
+			//aligned.
+			Av1ByteAlign(&b);
+			off = b.pos >> 3;
+			r   = Av1DecodeTileGroupObu(d, buf + o.offset, o.size, off);
+			if (r < 0)
+				return r;
+			done += r;
+		}
+		else if (o.type == AV1_OBU_TILE_GROUP)
+		{
+			if (!have_hdr)
+				return AV1_ERR_NO_FRAME;
+			r = Av1DecodeTileGroupObu(d, buf + o.offset, o.size, 0);
+			if (r < 0)
+				return r;
+			done += r;
+		}
+		if (have_hdr && done >= total)
+		{
+			if (!f->disable_frame_end_update_cdf)
+				Av1FrameEndUpdateCdf(d);
+			Av1LoopFilterFrame(d);
+			Av1LrSavePre(d);
+			if (!Av1CdefFrame(d))
+				return AV1_ERR_MEM;
+			if (!Av1LrFrame(d))
+				return AV1_ERR_MEM;
+
+			return done;
+		}
+next_obu:;
+		pos = next;
+	}
+
+	return AV1_ERR_NO_FRAME;
+}
+
+/***** playback *****/
+
+#define AV1_ERR_DEPTH				-46
+#define AV1_ERR_GRAIN				-47
+
+public U8 *Av1Why(I64 r)
+{//What a refusal code names, for a player to say out loud.
+	if (r == -1)
+		return "show_existing_frame";
+	if (r == -2)
+		return "inter prediction";
+	if (r == -3)
+		return "a truncated frame header";
+	if (r == -4)
+		return "quantiser matrices";
+	if (r == -5)
+		return "superres upscaling";
+	if (r == -6)
+		return "intra block copy";
+	if (r == AV1_ERR_PALETTE)
+		return "a palette";
+	if (r == AV1_ERR_INTRABC)
+		return "intra block copy";
+	if (r == AV1_ERR_SEGMENT)
+		return "a segment feature";
+	if (r == AV1_ERR_COEFF)
+		return "a coefficient out of range";
+	if (r == AV1_ERR_CHROMASZ)
+		return "a chroma block size";
+	if (r == AV1_ERR_PARTITION)
+		return "a partition";
+	if (r == AV1_ERR_SEQ)
+		return "this sequence header";
+	if (r == AV1_ERR_OBU)
+		return "a malformed open bitstream unit";
+	if (r == AV1_ERR_NO_FRAME)
+		return "a temporal unit with no frame in it";
+	if (r == AV1_ERR_TILEGRP)
+		return "this tile group";
+	if (r == AV1_ERR_MEM)
+		return "more memory than there is";
+	if (r == AV1_ERR_EXIT_SYMBOL)
+		return "a tile that does not end where it should";
+	if (r == AV1_ERR_DEPTH)
+		return "more than eight bits a sample";
+	if (r == AV1_ERR_GRAIN)
+		return "film grain synthesis";
+
+	return "an unsupported feature";
+}
+
+public U8 *Av1ConfigWhy(U8 *cfg, I64 size)
+{//What stops an av1C record from being playable, or NULL. The record carries
+//the sequence header and nothing else, so every refusal that lives in a frame
+//header is out of its reach; Av1PlayScan is what sees those.
+	CAv1Seq	*s = CAlloc(sizeof(CAv1Seq));
+	U8		*why = NULL;
+
+	if (!s)
+		return "more memory than there is";
+	if (!Av1ParseConfig(s, cfg, size) || !s->valid)
+		why = "this av1C record";
+	else if (s->bit_depth != 8)
+		why = "more than eight bits a sample";
+	Free(s);
+
+	return why;
+}
+
+public Bool Av1Playable(U8 *cfg, I64 size)
+{
+	return ToBool(!Av1ConfigWhy(cfg, size));
+}
+
+class CAv1Play
+{
+	CAv1Seq		 seq;			//from av1C, or from an in band sequence header
+	CAv1Frame	 scan;			//Av1PlayScan's header walk, apart from decoding
+	CAv1Dec		*dec;
+	U32			*argb;			//reused between frames; the caller borrows it
+	I64			 argb_pixels;
+	I64			 w, h;
+	Bool		 got, shown;
+	I64			 fail;			//refusal code of the last decode, 0 when none
+};
+
+public CAv1Play *Av1PlayOpen()
+{
+	CAv1Play *p = CAlloc(sizeof(CAv1Play));
+
+	if (!p)
+		return NULL;
+	p->dec = Av1DecOpen(&p->seq);
+	if (!p->dec)
+	{
+		Free(p);
+		return NULL;
+	}
+
+	return p;
+}
+
+public U0 Av1PlayClose(CAv1Play *p)
+{
+	if (!p)
+		return;
+	Av1DecClose(p->dec);
+	Free(p->argb);
+	Free(p);
+}
+
+public Bool Av1PlayConfig(CAv1Play *p, U8 *cfg, I64 size)
+{//The av1C record from the container. A stream that carries its sequence
+//header in band only leaves this FALSE and still decodes.
+	if (!p)
+		return FALSE;
+
+	return Av1ParseConfig(&p->seq, cfg, size);
+}
+
+public U0 Av1PlayReset(CAv1Play *p)
+{//A seek. Every frame this decoder accepts is intra, so nothing carries over
+//but the pending output.
+	if (!p)
+		return;
+	p->got   = FALSE;
+	p->shown = FALSE;
+	p->fail  = 0;
+}
+
+public I64 Av1PlayScan(CAv1Play *p, U8 *data, I64 size)
+{//5.6 over one temporal unit, frame headers only: 0 when the decoder accepts
+//every frame in it, else the code of the first it does not. No tile data is
+//read, so a whole track costs a demux pass rather than a decode.
+	CAv1Obu		o;
+	CAv1Bits	b;
+	I64			pos = 0, next, r, n = 0;
+
+	if (!p || !data || size < 1)
+		return AV1_ERR_OBU;
+	while (pos < size)
+	{
+		if (!Av1ObuAt(&o, data, size, pos, &next))
+			return AV1_ERR_OBU;
+		if (Av1ObuDrop(&p->seq, &o))
+			goto next_scan;
+		if (o.type == AV1_OBU_SEQUENCE_HEADER)
+		{
+			if (!Av1ParseSeqHeader(&p->seq, data + o.offset, o.size))
+				return AV1_ERR_SEQ;
+		}
+		else if (o.type == AV1_OBU_FRAME_HEADER || o.type == AV1_OBU_FRAME)
+		{
+			if (!p->seq.valid)
+				return AV1_ERR_SEQ;
+			if (p->seq.bit_depth != 8)
+				return AV1_ERR_DEPTH;
+			Av1BitsInit(&b, data + o.offset, o.size);
+			r = Av1UncompressedHeader(&b, &p->seq, &p->scan);
+			if (r)
+				return r;
+			if (p->scan.apply_grain)
+				return AV1_ERR_GRAIN;
+			n++;
+		}
+next_scan:;
+		pos = next;
+	}
+	if (!n)
+		return AV1_ERR_NO_FRAME;
+
+	return 0;
+}
+
+public Bool Av1PlayDecodeRaw(CAv1Play *p, U8 *data, I64 size)
+{//One temporal unit, as a container sample holds it, into the decoder's
+//planes. No colour conversion.
+	I64 r;
+
+	if (!p || !data || size < 1)
+		return FALSE;
+	p->got   = FALSE;
+	p->shown = FALSE;
+	r = Av1DecodeFrameObu(p->dec, &p->seq, data, size);
+	if (r < 0)
+	{
+		p->fail = r;
+
+		return FALSE;
+	}
+	p->fail  = 0;
+	p->w     = p->dec->hdr.upscaled_width;
+	p->h     = p->dec->hdr.frame_height;
+	p->got   = TRUE;
+	p->shown = p->dec->hdr.show_frame;
+
+	return TRUE;
+}
+
+public Bool Av1PlayShown(CAv1Play *p)
+{//A frame with show_frame clear is a reference update, and this decoder keeps
+//no references, so it is dropped.
+	if (!p)
+		return FALSE;
+
+	return p->shown;
+}
+
+public U8 *Av1PlayWhy(CAv1Play *p)
+{//What the last decode refused, or NULL.
+	if (!p || !p->fail)
+		return NULL;
+
+	return Av1Why(p->fail);
+}
+
+public U32 *Av1PlayArgb(CAv1Play *p, I64 *_w, I64 *_h)
+{//The last decoded frame in ARGB. The buffer belongs to the player and the
+//next conversion overwrites it.
+	*_w = 0;
+	*_h = 0;
+	if (!p || !p->got || !p->dec->plane[0] || p->w < 1 || p->h < 1)
+		return NULL;
+	if (p->argb_pixels < p->w * p->h)
+	{//Grown once, then kept: a buffer a frame is a lot of heap churn.
+		Free(p->argb);
+		p->argb        = MAlloc(p->w * p->h * sizeof(U32));
+		p->argb_pixels = p->w * p->h;
+	}
+	if (!p->argb)
+		return NULL;
+	*_w = p->w;
+	*_h = p->h;
+	MediaYuvArgb(p->argb, p->dec->plane[0], p->dec->plane[1], p->dec->plane[2],
+				 p->dec->stride[0], p->dec->stride[1], p->dec->stride[2],
+				 p->w, p->h, p->dec->ss_x, p->dec->ss_y);
+
+	return p->argb;
+}
+
+public U32 *Av1PlayDecode(CAv1Play *p, U8 *data, I64 size, I64 *_w, I64 *_h)
+{//One temporal unit. NULL when nothing in it decodes or the frame is not
+//shown.
+	*_w = 0;
+	*_h = 0;
+	if (!Av1PlayDecodeRaw(p, data, size) || !Av1PlayShown(p))
+		return NULL;
+
+	return Av1PlayArgb(p, _w, _h);
 }
